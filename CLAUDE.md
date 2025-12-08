@@ -27,3 +27,15 @@ bun link               # Install globally as 'qmd'
 - sqlite-vec for vector similarity search
 - Ollama for embeddings (embeddinggemma) and reranking (qwen3-reranker)
 - Reciprocal Rank Fusion (RRF) for combining results
+
+## Important: Do NOT run automatically
+
+- Never run `qmd add`, `qmd add-context`, `qmd embed`, or `qmd update-all` automatically
+- Never modify the SQLite database directly
+- Write out example commands for the user to run manually
+- Index is stored at `~/.cache/qmd/index.sqlite`
+
+## Do NOT compile
+
+- Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
+- The `qmd` file is a shell script that runs `bun qmd.ts` - do not replace it

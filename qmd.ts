@@ -1,15 +1,39 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { Glob } from "bun";
-import { mkdirSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { Glob, $ } from "bun";
+import { parseArgs } from "util";
 import * as sqliteVec from "sqlite-vec";
+
+const HOME = Bun.env.HOME || "/tmp";
+
+function homedir(): string {
+  return HOME;
+}
+
+function resolve(...paths: string[]): string {
+  // Simple path resolution
+  let result = paths[0].startsWith('/') ? '' : Bun.env.PWD || process.cwd();
+  for (const p of paths) {
+    if (p.startsWith('/')) {
+      result = p;
+    } else {
+      result = result + '/' + p;
+    }
+  }
+  // Normalize: remove // and resolve . and ..
+  const parts = result.split('/').filter(Boolean);
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (part === '..') normalized.pop();
+    else if (part !== '.') normalized.push(part);
+  }
+  return '/' + normalized.join('/');
+}
 
 // On macOS, use Homebrew's SQLite which supports extensions
 if (process.platform === "darwin") {
   const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  if (existsSync(homebrewSqlitePath)) {
+  if (Bun.file(homebrewSqlitePath).size > 0) {
     Database.setCustomSQLite(homebrewSqlitePath);
   }
 }
@@ -19,6 +43,10 @@ const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
 const DEFAULT_GLOB = "**/*.md";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
+
+// Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
+const CHUNK_TOKEN_LENGTH = 2000;
+const CHUNK_BYTE_SIZE = 6 * 1024;
 
 // Terminal colors (respects NO_COLOR env)
 const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
@@ -35,6 +63,16 @@ const c = {
 
 // Global state for --index option
 let customIndexName: string | null = null;
+
+// Terminal cursor control
+const cursor = {
+  hide() { process.stderr.write('\x1b[?25l'); },
+  show() { process.stderr.write('\x1b[?25h'); },
+};
+
+// Ensure cursor is restored on exit
+process.on('SIGINT', () => { cursor.show(); process.exit(130); });
+process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
@@ -60,15 +98,27 @@ function formatETA(seconds: number): string {
 }
 
 function getDbPath(): string {
-  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  mkdirSync(qmdCacheDir, { recursive: true });
+  // Ensure cache directory exists
+  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch {}
   const dbName = customIndexName || "index";
   return resolve(qmdCacheDir, `${dbName}.sqlite`);
 }
 
 function getPwd(): string {
   return process.env.PWD || process.cwd();
+}
+
+// Get canonical realpath, falling back to resolved path if file doesn't exist
+function getRealPath(path: string): string {
+  try {
+    const result = Bun.spawnSync(["realpath", path]);
+    if (result.success) {
+      return result.stdout.toString().trim();
+    }
+  } catch {}
+  return resolve(path);
 }
 
 /*
@@ -97,10 +147,17 @@ CREATE TABLE documents (
 );
 
 CREATE TABLE content_vectors (
-  hash TEXT PRIMARY KEY,
-  embedding BLOB NOT NULL,
+  hash TEXT NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,  -- chunk sequence (0, 1, 2...)
+  pos INTEGER NOT NULL DEFAULT 0,  -- character position in document
   model TEXT NOT NULL,
-  embedded_at TEXT NOT NULL
+  embedded_at TEXT NOT NULL,
+  PRIMARY KEY (hash, seq)
+);
+
+CREATE VIRTUAL TABLE vectors_vec USING vec0(
+  hash_seq TEXT PRIMARY KEY,  -- "{hash}_{seq}"
+  embedding float[N]
 );
 
 CREATE VIRTUAL TABLE documents_fts USING fts5(...);
@@ -118,7 +175,28 @@ function getDb(): Database {
       pwd TEXT NOT NULL,
       glob_pattern TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      context TEXT,
       UNIQUE(pwd, glob_pattern)
+    )
+  `);
+
+  // Path-based context (more flexible than collection-level)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS path_contexts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path_prefix TEXT NOT NULL UNIQUE,
+      context TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_path_contexts_prefix ON path_contexts(path_prefix)`);
+
+  // Cache table for Ollama API calls (not embeddings)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ollama_cache (
+      hash TEXT PRIMARY KEY,
+      result TEXT NOT NULL,
+      created_at TEXT NOT NULL
     )
   `);
 
@@ -139,12 +217,23 @@ function getDb(): Database {
     )
   `);
 
-  // Content vectors keyed by hash (UNIQUE)
+  // Content vectors keyed by (hash, seq) for chunked embeddings
+  // Migration: check if old schema (no seq column) and recreate
+  const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+  const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
+  if (cvInfo.length > 0 && !hasSeqColumn) {
+    // Old schema without chunking - drop and recreate (embeddings need regenerating anyway)
+    db.exec(`DROP TABLE IF EXISTS content_vectors`);
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS content_vectors (
-      hash TEXT PRIMARY KEY,
+      hash TEXT NOT NULL,
+      seq INTEGER NOT NULL DEFAULT 0,
+      pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
-      embedded_at TEXT NOT NULL
+      embedded_at TEXT NOT NULL,
+      PRIMARY KEY (hash, seq)
     )
   `);
 
@@ -180,6 +269,8 @@ function getDb(): Database {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection_id, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_filepath ON documents(filepath, active)`);
+  // Ensure only one active document per filepath
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_filepath_active ON documents(filepath) WHERE active = 1`);
 
   return db;
 }
@@ -187,18 +278,22 @@ function getDb(): Database {
 function ensureVecTable(db: Database, dimensions: number): void {
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
+    // Check for correct dimensions and hash_seq key (not old 'hash' key)
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
-    if (match && parseInt(match[1]) === dimensions) return;
+    const hasHashSeq = tableInfo.sql.includes('hash_seq');
+    if (match && parseInt(match[1]) === dimensions && hasHashSeq) return;
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
-  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash TEXT PRIMARY KEY, embedding float[${dimensions}])`);
+  // Use hash_seq as composite key: "{hash}_{seq}" (e.g., "abc123_0", "abc123_1")
+  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}])`);
 }
 
 function getHashesNeedingEmbedding(db: Database): number {
+  // Check for hashes missing the first chunk (seq=0)
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
   `).get() as { count: number };
   return result.count;
@@ -210,10 +305,45 @@ async function hashContent(content: string): Promise<string> {
   return hash.digest("hex");
 }
 
+// Cache helpers for Ollama API calls (not embeddings)
+function getCacheKey(url: string, body: object): string {
+  const hash = new Bun.CryptoHasher("sha256");
+  hash.update(url);
+  hash.update(JSON.stringify(body));
+  return hash.digest("hex");
+}
+
+function getCachedResult(db: Database, cacheKey: string): string | null {
+  const row = db.prepare(`SELECT result FROM ollama_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
+  return row?.result || null;
+}
+
+function setCachedResult(db: Database, cacheKey: string, result: string): void {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT OR REPLACE INTO ollama_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
+
+  // 1 in 100 chance to truncate to most recent 1000 entries
+  if (Math.random() < 0.01) {
+    db.exec(`DELETE FROM ollama_cache WHERE hash NOT IN (SELECT hash FROM ollama_cache ORDER BY created_at DESC LIMIT 1000)`);
+  }
+}
+
+function clearCache(db: Database): void {
+  db.exec(`DELETE FROM ollama_cache`);
+}
+
 // Extract title from first markdown headline, or use filename as fallback
 function extractTitle(content: string, filename: string): string {
   const match = content.match(/^##?\s+(.+)$/m);
-  if (match) return match[1].trim();
+  if (match) {
+    const title = match[1].trim();
+    // Skip generic "📝 Notes" heading, find next ## instead
+    if (title === "📝 Notes" || title === "Notes") {
+      const nextMatch = content.match(/^##\s+(.+)$/m);
+      if (nextMatch) return nextMatch[1].trim();
+    }
+    return title;
+  }
   return filename.replace(/\.md$/, "").split("/").pop() || filename;
 }
 
@@ -224,6 +354,76 @@ function formatQueryForEmbedding(query: string): string {
 
 function formatDocForEmbedding(text: string, title?: string): string {
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+// Chunk document into ~6KB pieces, breaking at word boundaries
+function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZE): { text: string; pos: number }[] {
+  const encoder = new TextEncoder();
+  const totalBytes = encoder.encode(content).length;
+
+  // Single chunk if small enough
+  if (totalBytes <= maxBytes) {
+    return [{ text: content, pos: 0 }];
+  }
+
+  const chunks: { text: string; pos: number }[] = [];
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    // Find chunk boundary at ~maxBytes
+    let endPos = charPos;
+    let byteCount = 0;
+
+    // Advance character by character, counting bytes
+    while (endPos < content.length && byteCount < maxBytes) {
+      const charBytes = encoder.encode(content[endPos]).length;
+      if (byteCount + charBytes > maxBytes) break;
+      byteCount += charBytes;
+      endPos++;
+    }
+
+    // Back up to word boundary (paragraph, newline, or space)
+    if (endPos < content.length && endPos > charPos) {
+      const slice = content.slice(charPos, endPos);
+      // Prefer paragraph break, then sentence end, then newline, then space
+      const paragraphBreak = slice.lastIndexOf('\n\n');
+      const sentenceEnd = Math.max(
+        slice.lastIndexOf('. '),
+        slice.lastIndexOf('.\n'),
+        slice.lastIndexOf('? '),
+        slice.lastIndexOf('?\n'),
+        slice.lastIndexOf('! '),
+        slice.lastIndexOf('!\n')
+      );
+      const lineBreak = slice.lastIndexOf('\n');
+      const spaceBreak = slice.lastIndexOf(' ');
+
+      let breakPoint = -1;
+      if (paragraphBreak > slice.length * 0.5) {
+        breakPoint = paragraphBreak + 2; // Include the double newline
+      } else if (sentenceEnd > slice.length * 0.5) {
+        breakPoint = sentenceEnd + 2; // Include period and space
+      } else if (lineBreak > slice.length * 0.3) {
+        breakPoint = lineBreak + 1;
+      } else if (spaceBreak > slice.length * 0.3) {
+        breakPoint = spaceBreak + 1;
+      }
+
+      if (breakPoint > 0) {
+        endPos = charPos + breakPoint;
+      }
+    }
+
+    // Ensure we make progress (at least one character)
+    if (endPos <= charPos) {
+      endPos = charPos + 1;
+    }
+
+    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+    charPos = endPos;
+  }
+
+  return chunks;
 }
 
 // Auto-pull model if not found
@@ -293,7 +493,26 @@ type RerankResponse = {
   logprobs?: LogProb[];
 };
 
-async function rerankSingle(prompt: string, model: string, retried: boolean = false): Promise<number> {
+function parseRerankResponse(data: RerankResponse): number {
+  if (!data.logprobs || data.logprobs.length === 0) {
+    throw new Error("Reranker response missing logprobs");
+  }
+
+  const firstToken = data.logprobs[0];
+  const token = firstToken.token.toLowerCase().trim();
+  const confidence = Math.exp(firstToken.logprob);
+
+  if (token === "yes") {
+    return confidence;
+  }
+  if (token === "no") {
+    return (1 - confidence) * 0.3;
+  }
+
+  throw new Error(`Unexpected reranker token: "${token}"`);
+}
+
+async function rerankSingle(prompt: string, model: string, db?: Database, retried: boolean = false): Promise<number> {
   // Use generate with raw template for qwen3-reranker format
   // Include empty <think> tags as per HuggingFace reference implementation
   const fullPrompt = `<|im_start|>system
@@ -307,53 +526,51 @@ ${prompt}<|im_end|>
 
 `;
 
+  const requestBody = {
+    model,
+    prompt: fullPrompt,
+    raw: true,
+    stream: false,
+    logprobs: true,
+    options: { num_predict: 1 },
+  };
+
+  // Check cache
+  const cacheKey = db ? getCacheKey(`${OLLAMA_URL}/api/generate`, requestBody) : "";
+  if (db) {
+    const cached = getCachedResult(db, cacheKey);
+    if (cached) {
+      const data = JSON.parse(cached) as RerankResponse;
+      return parseRerankResponse(data);
+    }
+  }
+
   const response = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      prompt: fullPrompt,
-      raw: true,
-      stream: false,
-      logprobs: true,
-      options: { num_predict: 1 },
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
     if (!retried && (errorText.includes("not found") || errorText.includes("does not exist"))) {
       await ensureModelAvailable(model);
-      return rerankSingle(prompt, model, true);
+      return rerankSingle(prompt, model, db, true);
     }
     throw new Error(`Ollama API error: ${response.status} - ${errorText}`);
   }
 
   const data = await response.json() as RerankResponse;
 
-  // Extract score from logprobs - required for proper reranking
-  if (!data.logprobs || data.logprobs.length === 0) {
-    throw new Error("Reranker response missing logprobs - ensure Ollama supports logprobs");
+  // Cache the result
+  if (db) {
+    setCachedResult(db, cacheKey, JSON.stringify(data));
   }
 
-  const firstToken = data.logprobs[0];
-  const token = firstToken.token.toLowerCase().trim();
-  const confidence = Math.exp(firstToken.logprob); // 0-1, higher = more confident
-
-  if (token === "yes") {
-    // Relevant: return confidence (e.g., 0.93 for high confidence yes)
-    return confidence;
-  }
-  if (token === "no") {
-    // Not relevant: return low score, scaled by inverse confidence
-    // High confidence "no" → very low score
-    return (1 - confidence) * 0.3; // Cap at 0.3 for uncertain "no"
-  }
-
-  throw new Error(`Unexpected reranker token: "${token}" (expected "yes" or "no")`);
+  return parseRerankResponse(data);
 }
 
-async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL): Promise<{ file: string; score: number }[]> {
+async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db?: Database): Promise<{ file: string; score: number }[]> {
   const results: { file: string; score: number }[] = [];
   const total = documents.length;
   const PARALLEL = 5;
@@ -370,7 +587,7 @@ async function rerank(query: string, documents: { file: string; text: string }[]
           // Extract title from filename for reranker context
           const title = doc.file.split('/').pop()?.replace(/\.md$/, '') || doc.file;
           const prompt = formatRerankPrompt(query, title, doc.text.slice(0, 4000));
-          const score = await rerankSingle(prompt, model);
+          const score = await rerankSingle(prompt, model, db);
           return { file: doc.file, score };
         } catch (err) {
           return { file: doc.file, score: 0 };
@@ -477,12 +694,24 @@ function showStatus(): void {
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
+  // Get all path contexts
+  const pathContexts = db.prepare(`SELECT path_prefix, context FROM path_contexts ORDER BY path_prefix`).all() as { path_prefix: string; context: string }[];
+
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
       const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
       console.log(`  ${c.cyan}${col.pwd}${c.reset}`);
       console.log(`    ${col.glob_pattern} → ${col.active_count} docs (updated ${lastMod})`);
+
+      // Show contexts that match this collection's path
+      const matchingContexts = pathContexts.filter(ctx =>
+        ctx.path_prefix.startsWith(col.pwd) || col.pwd.startsWith(ctx.path_prefix)
+      );
+      for (const ctx of matchingContexts) {
+        const displayPath = shortPath(ctx.path_prefix);
+        console.log(`    ${c.dim}context: ${displayPath} → "${ctx.context}"${c.reset}`);
+      }
     }
   } else {
     console.log(`\n${c.dim}No collections. Run 'qmd add .' to index markdown files.${c.reset}`);
@@ -494,6 +723,10 @@ function showStatus(): void {
 async function updateAllCollections(): Promise<void> {
   const db = getDb();
   cleanupDuplicateCollections(db);
+
+  // Clear Ollama cache on update
+  clearCache(db);
+
   const collections = db.prepare(`SELECT id, pwd, glob_pattern FROM collections`).all() as { id: number; pwd: string; glob_pattern: string }[];
 
   if (collections.length === 0) {
@@ -519,6 +752,71 @@ async function updateAllCollections(): Promise<void> {
   }
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
+}
+
+async function addContext(pathArg: string, contextText: string): Promise<void> {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // Resolve path - could be relative, absolute, or use ~
+  let pathPrefix = pathArg;
+  if (pathPrefix === '.' || pathPrefix === './') {
+    pathPrefix = getPwd();
+  } else if (pathPrefix.startsWith('~/')) {
+    pathPrefix = homedir() + pathPrefix.slice(1);
+  } else if (!pathPrefix.startsWith('/')) {
+    pathPrefix = resolve(getPwd(), pathPrefix);
+  }
+
+  // Get realpath and normalize: remove trailing slash
+  pathPrefix = getRealPath(pathPrefix).replace(/\/$/, '');
+
+  // Insert or update
+  db.prepare(`INSERT INTO path_contexts (path_prefix, context, created_at) VALUES (?, ?, ?)
+              ON CONFLICT(path_prefix) DO UPDATE SET context = excluded.context`).run(pathPrefix, contextText, now);
+
+  console.log(`${c.green}✓${c.reset} Added context for: ${shortPath(pathPrefix)}`);
+  console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+  db.close();
+}
+
+function getDocument(filename: string): void {
+  const db = getDb();
+
+  // Expand ~ to home directory
+  let filepath = filename;
+  if (filepath.startsWith('~/')) {
+    filepath = homedir() + filepath.slice(1);
+  }
+
+  // Try exact match first
+  let doc = db.prepare(`SELECT body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { body: string } | null;
+
+  // Try matching by filename ending (allows partial paths)
+  if (!doc) {
+    doc = db.prepare(`SELECT body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { body: string } | null;
+  }
+
+  if (!doc) {
+    console.error(`Document not found: ${filename}`);
+    db.close();
+    process.exit(1);
+  }
+
+  console.log(doc.body);
+  db.close();
+}
+
+// Get context for a filepath (finds most specific matching path prefix)
+function getContextForFile(db: Database, filepath: string): string | null {
+  // Find all matching prefixes and return the longest (most specific) one
+  const result = db.prepare(`
+    SELECT context FROM path_contexts
+    WHERE ? LIKE path_prefix || '%'
+    ORDER BY LENGTH(path_prefix) DESC
+    LIMIT 1
+  `).get(filepath) as { context: string } | null;
+  return result?.context || null;
 }
 
 async function dropCollection(globPattern: string): Promise<void> {
@@ -552,6 +850,9 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
+  // Clear Ollama cache on index
+  clearCache(db);
+
   // Get or create collection for this (pwd, glob)
   const collectionId = getOrCreateCollection(db, pwd, globPattern);
   console.log(`Collection: ${pwd} (${globPattern})`);
@@ -582,25 +883,32 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
 
   const insertStmt = db.prepare(`INSERT INTO documents (collection_id, name, title, hash, filepath, body, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`);
   const deactivateStmt = db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND filepath = ? AND active = 1`);
-  const findActiveStmt = db.prepare(`SELECT id, hash FROM documents WHERE collection_id = ? AND filepath = ? AND active = 1`);
+  const findActiveStmt = db.prepare(`SELECT id, hash, title FROM documents WHERE collection_id = ? AND filepath = ? AND active = 1`);
+  const updateTitleStmt = db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`);
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenFiles = new Set<string>();
   const startTime = Date.now();
 
   for (const relativeFile of files) {
-    const filepath = resolve(pwd, relativeFile);
+    const filepath = getRealPath(resolve(pwd, relativeFile));
     seenFiles.add(filepath);
 
     const content = await Bun.file(filepath).text();
     const hash = await hashContent(content);
     const name = relativeFile.replace(/\.md$/, "").split("/").pop() || relativeFile;
     const title = extractTitle(content, relativeFile);
-    const existing = findActiveStmt.get(collectionId, filepath) as { id: number; hash: string } | null;
+    const existing = findActiveStmt.get(collectionId, filepath) as { id: number; hash: string; title: string } | null;
 
     if (existing) {
       if (existing.hash === hash) {
-        unchanged++;
+        // Hash unchanged, but check if title needs updating (e.g., extraction logic improved)
+        if (existing.title !== title) {
+          updateTitleStmt.run(title, now, existing.id);
+          updated++;
+        } else {
+          unchanged++;
+        }
       } else {
         deactivateStmt.run(collectionId, filepath);
         updated++;
@@ -664,12 +972,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Find unique hashes that need embedding (from active documents)
+  // Use MIN(filepath) to get one representative filepath per hash
   const hashesToEmbed = db.prepare(`
-    SELECT DISTINCT d.hash, d.title, d.body
+    SELECT d.hash, d.body, MIN(d.filepath) as filepath
     FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
-  `).all() as { hash: string; title: string; body: string }[];
+    GROUP BY d.hash
+  `).all() as { hash: string; body: string; filepath: string }[];
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -677,87 +987,88 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     return;
   }
 
-  // Calculate total bytes for accurate progress tracking, skip empty files
-  // Truncate documents larger than 64KB
-  const MAX_EMBED_BYTES = 64 * 1024;
-  const truncated: string[] = [];
+  // Prepare documents with chunks
+  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; bytes: number; displayName: string };
+  const allChunks: ChunkItem[] = [];
+  let multiChunkDocs = 0;
 
-  const itemsWithSize = hashesToEmbed
-    .map(item => {
-      const originalBytes = new TextEncoder().encode(item.body).length;
-      let body = item.body;
-      if (originalBytes > MAX_EMBED_BYTES) {
-        // Truncate to MAX_EMBED_BYTES
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        body = decoder.decode(encoder.encode(item.body).slice(0, MAX_EMBED_BYTES));
-        truncated.push(item.title);
-      }
-      return {
-        ...item,
-        body,
-        bytes: new TextEncoder().encode(body).length
-      };
-    })
-    .filter(item => item.bytes > 0);  // Skip empty documents
+  for (const item of hashesToEmbed) {
+    const encoder = new TextEncoder();
+    const bodyBytes = encoder.encode(item.body).length;
+    if (bodyBytes === 0) continue; // Skip empty
 
-  if (itemsWithSize.length === 0) {
+    const title = extractTitle(item.body, item.filepath);
+    const displayName = shortPath(item.filepath);
+    const chunks = chunkDocument(item.body, CHUNK_BYTE_SIZE);
+
+    if (chunks.length > 1) multiChunkDocs++;
+
+    for (let seq = 0; seq < chunks.length; seq++) {
+      allChunks.push({
+        hash: item.hash,
+        title,
+        text: chunks[seq].text,
+        seq,
+        pos: chunks[seq].pos,
+        bytes: encoder.encode(chunks[seq].text).length,
+        displayName,
+      });
+    }
+  }
+
+  if (allChunks.length === 0) {
     console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     db.close();
     return;
   }
 
-  const totalBytes = itemsWithSize.reduce((sum, item) => sum + item.bytes, 0);
-  const total = itemsWithSize.length;
-  const skipped = hashesToEmbed.length - total;
+  const totalBytes = allChunks.reduce((sum, c) => sum + c.bytes, 0);
+  const totalChunks = allChunks.length;
+  const totalDocs = hashesToEmbed.length;
 
-  console.log(`${c.bold}Embedding ${total} documents${c.reset} ${c.dim}(${formatBytes(totalBytes)})${c.reset}`);
-  if (skipped > 0) {
-    console.log(`${c.dim}Skipped ${skipped} empty documents${c.reset}`);
-  }
-  if (truncated.length > 0) {
-    console.log(`${c.yellow}⚠ Truncated ${truncated.length} large documents to 64KB:${c.reset}`);
-    for (const title of truncated.slice(0, 5)) {
-      console.log(`${c.dim}  - ${title}${c.reset}`);
-    }
-    if (truncated.length > 5) {
-      console.log(`${c.dim}  ... and ${truncated.length - 5} more${c.reset}`);
-    }
+  console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
+  if (multiChunkDocs > 0) {
+    console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
   console.log(`${c.dim}Model: ${model}${c.reset}\n`);
 
+  // Hide cursor during embedding
+  cursor.hide();
+
+  // Get embedding dimensions from first chunk
   progress.indeterminate();
-  const firstEmbedding = await getEmbedding(itemsWithSize[0].body, model, false, itemsWithSize[0].title);
+  const firstEmbedding = await getEmbedding(allChunks[0].text, model, false, allChunks[0].title);
   ensureVecTable(db, firstEmbedding.length);
 
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, model, embedded_at) VALUES (?, ?, ?)`);
+  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
-  let embedded = 0, errors = 0, bytesProcessed = 0;
+  let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
   const startTime = Date.now();
 
-  // Insert first
-  insertVecStmt.run(itemsWithSize[0].hash, new Float32Array(firstEmbedding));
-  insertContentVectorStmt.run(itemsWithSize[0].hash, model, now);
-  embedded++;
-  bytesProcessed += itemsWithSize[0].bytes;
+  // Insert first chunk
+  const firstHashSeq = `${allChunks[0].hash}_${allChunks[0].seq}`;
+  insertVecStmt.run(firstHashSeq, new Float32Array(firstEmbedding));
+  insertContentVectorStmt.run(allChunks[0].hash, allChunks[0].seq, allChunks[0].pos, model, now);
+  chunksEmbedded++;
+  bytesProcessed += allChunks[0].bytes;
 
-  for (let i = 1; i < itemsWithSize.length; i++) {
-    const item = itemsWithSize[i];
+  for (let i = 1; i < allChunks.length; i++) {
+    const chunk = allChunks[i];
     try {
-      const embedding = await getEmbedding(item.body, model, false, item.title);
-      insertVecStmt.run(item.hash, new Float32Array(embedding));
-      insertContentVectorStmt.run(item.hash, model, now);
-      embedded++;
-      bytesProcessed += item.bytes;
+      const embedding = await getEmbedding(chunk.text, model, false, chunk.title);
+      const hashSeq = `${chunk.hash}_${chunk.seq}`;
+      insertVecStmt.run(hashSeq, new Float32Array(embedding));
+      insertContentVectorStmt.run(chunk.hash, chunk.seq, chunk.pos, model, now);
+      chunksEmbedded++;
+      bytesProcessed += chunk.bytes;
     } catch (err) {
       errors++;
-      bytesProcessed += item.bytes;
+      bytesProcessed += chunk.bytes;
       progress.error();
-      console.error(`\n${c.yellow}⚠ Error embedding "${item.title}": ${err}${c.reset}`);
+      console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${err}${c.reset}`);
     }
 
-    const processed = embedded + errors;
     const percent = (bytesProcessed / totalBytes) * 100;
     progress.set(percent);
 
@@ -772,17 +1083,18 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const eta = elapsed > 2 ? formatETA(etaSec) : "...";
     const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
-    process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${embedded}/${total}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+    process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
   }
 
   progress.clear();
+  cursor.show();
   const totalTimeSec = (Date.now() - startTime) / 1000;
   const avgThroughput = formatBytes(totalBytes / totalTimeSec);
 
   console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${embedded}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
   if (errors > 0) {
-    console.log(`${c.yellow}⚠ ${errors} documents failed${c.reset}`);
+    console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
   }
   db.close();
 }
@@ -794,8 +1106,23 @@ function escapeCSV(value: string): string {
   return value;
 }
 
-function extractSnippet(body: string, query: string, maxLen = 500): { line: number; snippet: string } {
-  const lines = body.split('\n');
+function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): { line: number; snippet: string } {
+  // If chunkPos provided, calculate line offset and focus search there
+  let lineOffset = 0;
+  let searchBody = body;
+  if (chunkPos && chunkPos > 0) {
+    // Count lines before chunkPos to get line offset
+    const beforeChunk = body.slice(0, chunkPos);
+    lineOffset = beforeChunk.split('\n').length - 1;
+    // Focus search on the chunk area (with some context before)
+    const contextStart = Math.max(0, chunkPos - 200);
+    searchBody = body.slice(contextStart);
+    if (contextStart > 0) {
+      lineOffset = body.slice(0, contextStart).split('\n').length - 1;
+    }
+  }
+
+  const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
   let bestLine = 0, bestScore = -1;
 
@@ -815,23 +1142,33 @@ function extractSnippet(body: string, query: string, maxLen = 500): { line: numb
   const endLine = Math.min(lines.length, bestLine + 2);
   let snippet = lines.slice(startLine, endLine).join('\n');
   if (snippet.length > maxLen) snippet = snippet.substring(0, maxLen - 3) + "...";
-  return { line: bestLine + 1, snippet };
+  return { line: lineOffset + bestLine + 1, snippet };
 }
 
-type SearchResult = { file: string; body: string; score: number; source: "fts" | "vec" };
+type SearchResult = { file: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
+
+// Sanitize a term for FTS5: remove punctuation except apostrophes
+function sanitizeFTS5Term(term: string): string {
+  // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
+  return term.replace(/[^\w']/g, '').trim();
+}
 
 // Build FTS5 query: phrase-aware with fallback to individual terms
 function buildFTS5Query(query: string): string {
+  // Sanitize the full query for phrase matching
+  const sanitizedQuery = query.replace(/[^\w\s']/g, '').trim();
+
   const terms = query
     .split(/\s+/)
-    .filter(term => term.length >= 2); // Skip single chars
+    .map(sanitizeFTS5Term)
+    .filter(term => term.length >= 2); // Skip single chars and empty
 
   if (terms.length === 0) return "";
   if (terms.length === 1) return `"${terms[0].replace(/"/g, '""')}"`;
 
   // Strategy: exact phrase OR proximity match OR individual terms
   // Exact phrase matches rank highest, then close proximity, then any term
-  const phrase = `"${query.replace(/"/g, '""')}"`;
+  const phrase = `"${sanitizedQuery.replace(/"/g, '""')}"`;
   const quotedTerms = terms.map(t => `"${t.replace(/"/g, '""')}"`);
 
   // FTS5 NEAR syntax: NEAR(term1 term2, distance)
@@ -881,21 +1218,37 @@ async function searchVec(db: Database, query: string, model: string, limit: numb
   const queryEmbedding = await getEmbedding(query, model, true);
   const queryVec = new Float32Array(queryEmbedding);
 
-  // Join: documents -> content_vectors -> vectors_vec
+  // Join: vectors_vec -> content_vectors -> documents
+  // Over-retrieve to handle multiple chunks per document, then dedupe
   const stmt = db.prepare(`
-    SELECT d.filepath, d.body, vec.distance
+    SELECT d.filepath, d.body, vec.distance, cv.pos
     FROM vectors_vec vec
-    JOIN documents d ON d.hash = vec.hash
-    WHERE vec.embedding MATCH ? AND k = ? AND d.active = 1
+    JOIN content_vectors cv ON vec.hash_seq = cv.hash || '_' || cv.seq
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    WHERE vec.embedding MATCH ? AND k = ?
     ORDER BY vec.distance
   `);
-  const results = stmt.all(queryVec, limit) as { filepath: string; body: string; distance: number }[];
-  return results.map(r => ({
-    file: r.filepath,
-    body: r.body,
-    score: 1 / (1 + r.distance),
-    source: "vec" as const,
-  }));
+  const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; body: string; distance: number; pos: number }[];
+
+  // Dedupe: keep best-scoring chunk per document
+  const bestByFile = new Map<string, { filepath: string; body: string; distance: number; pos: number }>();
+  for (const r of rawResults) {
+    const existing = bestByFile.get(r.filepath);
+    if (!existing || r.distance < existing.distance) {
+      bestByFile.set(r.filepath, r);
+    }
+  }
+
+  return Array.from(bestByFile.values())
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit)
+    .map(r => ({
+      file: r.filepath,
+      body: r.body,
+      score: 1 / (1 + r.distance),
+      source: "vec" as const,
+      chunkPos: r.pos,
+    }));
 }
 
 function normalizeScores(results: SearchResult[]): SearchResult[] {
@@ -946,7 +1299,7 @@ function reciprocalRankFusion(
     .sort((a, b) => b.score - a.score);
 }
 
-type OutputFormat = "cli" | "csv" | "md" | "xml";
+type OutputFormat = "cli" | "csv" | "md" | "xml" | "files" | "json";
 type OutputOptions = {
   format: OutputFormat;
   full: boolean;
@@ -955,8 +1308,19 @@ type OutputOptions = {
 };
 
 // Extract snippet with more context lines for CLI display
-function extractSnippetWithContext(body: string, query: string, contextLines = 3): { line: number; snippet: string; hasMatch: boolean } {
-  const lines = body.split('\n');
+function extractSnippetWithContext(body: string, query: string, contextLines = 3, chunkPos?: number): { line: number; snippet: string; hasMatch: boolean } {
+  // If chunkPos provided, focus search on that area
+  let lineOffset = 0;
+  let searchBody = body;
+  if (chunkPos && chunkPos > 0) {
+    const contextStart = Math.max(0, chunkPos - 200);
+    searchBody = body.slice(contextStart);
+    if (contextStart > 0) {
+      lineOffset = body.slice(0, contextStart).split('\n').length - 1;
+    }
+  }
+
+  const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
   let bestLine = 0, bestScore = -1;
 
@@ -972,16 +1336,16 @@ function extractSnippetWithContext(body: string, query: string, contextLines = 3
     }
   }
 
-  // No query match found - return beginning of file
+  // No query match found - return beginning of chunk area or file
   if (bestScore <= 0) {
     const preview = lines.slice(0, contextLines * 2).join('\n').trim();
-    return { line: 1, snippet: preview, hasMatch: false };
+    return { line: lineOffset + 1, snippet: preview, hasMatch: false };
   }
 
   const startLine = Math.max(0, bestLine - contextLines);
   const endLine = Math.min(lines.length, bestLine + contextLines + 1);
   const snippet = lines.slice(startLine, endLine).join('\n').trim();
-  return { line: bestLine + 1, snippet, hasMatch: true };
+  return { line: lineOffset + bestLine + 1, snippet, hasMatch: true };
 }
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1005,21 +1369,16 @@ function formatScore(score: number): string {
   return `${c.dim}${pct}%${c.reset}`;
 }
 
-// Shorten filepath for display
+// Shorten filepath for display - always relative to $HOME
 function shortPath(filepath: string): string {
-  const cwd = getPwd();
-  if (filepath.startsWith(cwd)) {
-    return filepath.slice(cwd.length + 1);
-  }
-  // Show last 2 path components
-  const parts = filepath.split('/');
-  if (parts.length > 2) {
-    return '.../' + parts.slice(-2).join('/');
+  const home = homedir();
+  if (filepath.startsWith(home)) {
+    return '~' + filepath.slice(home.length);
   }
   return filepath;
 }
 
-function outputResults(results: { file: string; body: string; score: number }[], query: string, opts: OutputOptions): void {
+function outputResults(results: { file: string; body: string; score: number; context?: string | null; chunkPos?: number }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1027,10 +1386,27 @@ function outputResults(results: { file: string; body: string; score: number }[],
     return;
   }
 
-  if (opts.format === "cli") {
+  if (opts.format === "json") {
+    // JSON output for LLM consumption
+    const output = filtered.map(row => ({
+      score: Math.round(row.score * 100) / 100,
+      file: shortPath(row.file),
+      ...(row.context && { context: row.context }),
+      ...(opts.full && { body: row.body }),
+      ...(!opts.full && { snippet: extractSnippet(row.body, query, 300, row.chunkPos).snippet }),
+    }));
+    console.log(JSON.stringify(output, null, 2));
+  } else if (opts.format === "files") {
+    // Simple score,filepath,context output
+    for (const row of filtered) {
+      const path = shortPath(row.file);
+      const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
+      console.log(`${row.score.toFixed(2)},${path}${ctx}`);
+    }
+  } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
-      const { line, snippet, hasMatch } = extractSnippetWithContext(row.body, query, 2);
+      const { line, snippet, hasMatch } = extractSnippetWithContext(row.body, query, 2, row.chunkPos);
 
       // Header: score and filename
       const score = formatScore(row.score);
@@ -1047,29 +1423,31 @@ function outputResults(results: { file: string; body: string; score: number }[],
     }
   } else if (opts.format === "md") {
     for (const row of filtered) {
+      const path = shortPath(row.file);
       if (opts.full) {
-        console.log(`---\n# ${row.file}\n\n${row.body}\n`);
+        console.log(`---\n# ${path}\n\n${row.body}\n`);
       } else {
-        const { snippet } = extractSnippet(row.body, query);
-        console.log(`---\n# ${row.file}\n\n${snippet}\n`);
+        const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+        console.log(`---\n# ${path}\n\n${snippet}\n`);
       }
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
+      const path = shortPath(row.file);
       if (opts.full) {
-        console.log(`<file name="${row.file}">\n${row.body}\n</file>\n`);
+        console.log(`<file name="${path}">\n${row.body}\n</file>\n`);
       } else {
-        const { snippet } = extractSnippet(row.body, query);
-        console.log(`<file name="${row.file}">\n${snippet}\n</file>\n`);
+        const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+        console.log(`<file name="${path}">\n${snippet}\n</file>\n`);
       }
     }
   } else {
     // CSV format
     console.log("score,file,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
       const content = opts.full ? row.body : snippet;
-      console.log(`${row.score.toFixed(4)},${escapeCSV(row.file)},${line},${escapeCSV(content)}`);
+      console.log(`${row.score.toFixed(4)},${escapeCSV(shortPath(row.file))},${line},${escapeCSV(content)}`);
     }
   }
 }
@@ -1077,13 +1455,20 @@ function outputResults(results: { file: string; body: string; score: number }[],
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
   const results = searchFTS(db, query, 50);
+
+  // Add context to results
+  const resultsWithContext = results.map(r => ({
+    ...r,
+    context: getContextForFile(db, r.file),
+  }));
+
   db.close();
 
-  if (results.length === 0) {
+  if (resultsWithContext.length === 0) {
     console.log("No results found.");
     return;
   }
-  outputResults(results, query, opts);
+  outputResults(resultsWithContext, query, opts);
 }
 
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
@@ -1096,8 +1481,8 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     return;
   }
 
-  // Expand query to multiple variations
-  const queries = await expandQuery(query);
+  // Expand query to multiple variations (with caching)
+  const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
   process.stderr.write(`Searching with ${queries.length} query variations...\n`);
 
   // Collect results from all query variations
@@ -1113,12 +1498,13 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     }
   }
 
-  db.close();
-
   // Sort by max score and limit to requested count
   const results = Array.from(allResults.values())
     .sort((a, b) => b.score - a.score)
-    .slice(0, opts.limit);
+    .slice(0, opts.limit)
+    .map(r => ({ ...r, context: getContextForFile(db, r.file) }));
+
+  db.close();
 
   if (results.length === 0) {
     console.log("No results found.");
@@ -1127,56 +1513,78 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   outputResults(results, query, { ...opts, limit: results.length }); // Already limited
 }
 
-async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL): Promise<string[]> {
+async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db?: Database): Promise<string[]> {
   process.stderr.write("Generating query variations...\n");
 
-  const prompt = `Generate 3 search query variations to find documents about this topic.
+  const prompt = `You are a search query expander. Given a search query, generate 2 alternative queries that would help find relevant documents.
 
-IMPORTANT: Keep multi-word phrases intact if they look like names (e.g., "Build a Business" should stay as "Build a Business", not "create a company").
+Rules:
+- Use synonyms and related terminology (e.g., "craft" → "craftsmanship", "quality", "excellence")
+- Rephrase to capture different angles (e.g., "engineering culture" → "technical excellence", "developer practices")
+- Keep proper nouns and named concepts exactly as written (e.g., "Build a Business", "Stripe", "Shopify")
+- Each variation should be 3-8 words, natural search terms
+- Do NOT just append words like "search" or "find" or "documents"
 
 Query: "${query}"
 
-Output 3 variations, one per line:`;
+Output exactly 2 variations, one per line, no numbering or bullets:`;
 
-  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      prompt,
-      stream: false,
-      think: false,  // Disable thinking mode for qwen3 models
-      options: { num_predict: 150 },
-    }),
-  });
+  const requestBody = {
+    model,
+    prompt,
+    stream: false,
+    think: false,
+    options: { num_predict: 150 },
+  };
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    if (errorText.includes("not found") || errorText.includes("does not exist")) {
-      await ensureModelAvailable(model);
-      return expandQuery(query, model);
+  // Check cache
+  const cacheDb = db || getDb();
+  const cacheKey = getCacheKey(`${OLLAMA_URL}/api/generate`, requestBody);
+  const cached = getCachedResult(cacheDb, cacheKey);
+
+  let responseText: string;
+  if (cached) {
+    responseText = cached;
+  } else {
+    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      if (errorText.includes("not found") || errorText.includes("does not exist")) {
+        await ensureModelAvailable(model);
+        if (!db) cacheDb.close();
+        return expandQuery(query, model, db);
+      }
+      if (!db) cacheDb.close();
+      return [query];
     }
-    // Fall back to original query if expansion fails
-    return [query];
+
+    const data = await response.json() as { response: string };
+    responseText = data.response;
+    setCachedResult(cacheDb, cacheKey, responseText);
   }
 
-  const data = await response.json() as { response: string };
-  const lines = data.response.trim().split('\n')
-    .map(l => l.replace(/^[\d\.\-\*\"\s]+/, '').replace(/["\s]+$/, '').trim())
-    .filter(l => l.length > 0 && !l.startsWith('<'))
-    .slice(0, 1);  // Only 1 expanded query to preserve original query signal
+  if (!db) cacheDb.close();
 
-  // Original query + expansions (original gets 2x weight in RRF)
+  const lines = responseText.trim().split('\n')
+    .map(l => l.replace(/^[\d\.\-\*\"\s]+/, '').replace(/["\s]+$/, '').trim())
+    .filter(l => l.length > 2 && l.length < 100 && !l.startsWith('<') && !l.toLowerCase().includes('variation'))
+    .slice(0, 2);
+
   const allQueries = [query, ...lines];
-  process.stderr.write(`Queries:\n  - ${allQueries.join('\n  - ')}\n`);
+  process.stderr.write(`${c.dim}Queries: ${allQueries.join(' | ')}${c.reset}\n`);
   return allQueries;
 }
 
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
-  // Expand query to multiple variations
-  const queries = await expandQuery(query);
+  // Expand query to multiple variations (with caching)
+  const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
   process.stderr.write(`Searching with ${queries.length} query variations...\n`);
 
   // Collect ranked result lists for RRF fusion
@@ -1211,14 +1619,13 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     return;
   }
 
-  // Rerank with the original query
+  // Rerank with the original query (with caching)
   const reranked = await rerank(
     query,
     candidates.map(c => ({ file: c.file, text: c.body })),
-    rerankModel
+    rerankModel,
+    db
   );
-
-  db.close();
 
   // Blend RRF position score with reranker score using position-aware weights
   // Top retrieval results get more protection from reranker disagreement
@@ -1245,82 +1652,97 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       file: r.file,
       body: bodyMap.get(r.file) || "",
       score: blendedScore,
+      context: getContextForFile(db, r.file),
     };
   }).sort((a, b) => b.score - a.score);
 
+  db.close();
   outputResults(finalResults, query, opts);
 }
 
-// Parse CLI options
-function parseOptions(args: string[], defaultMinScore: number = 0): { opts: OutputOptions; query: string } {
-  let format: OutputFormat = "cli";
-  let full = false;
-  let limit = 5;
-  let minScore = defaultMinScore;
-  const queryParts: string[] = [];
+// Parse CLI arguments using util.parseArgs
+function parseCLI() {
+  const { values, positionals } = parseArgs({
+    args: Bun.argv.slice(2), // Skip bun and script path
+    options: {
+      // Global options
+      index: { type: "string" },
+      help: { type: "boolean", short: "h" },
+      // Search options
+      n: { type: "string" },
+      "min-score": { type: "string" },
+      full: { type: "boolean" },
+      csv: { type: "boolean" },
+      md: { type: "boolean" },
+      xml: { type: "boolean" },
+      files: { type: "boolean" },
+      json: { type: "boolean" },
+      // Add options
+      drop: { type: "boolean" },
+      // Embed options
+      force: { type: "boolean", short: "f" },
+    },
+    allowPositionals: true,
+    strict: false, // Allow unknown options to pass through
+  });
 
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "-n" && i + 1 < args.length) {
-      limit = parseInt(args[++i], 10) || 5;
-    } else if (arg === "--min-score" && i + 1 < args.length) {
-      minScore = parseFloat(args[++i]) || defaultMinScore;
-    } else if (arg === "--full") {
-      full = true;
-    } else if (arg === "-csv" || arg === "--csv") {
-      format = "csv";
-    } else if (arg === "-md" || arg === "--md") {
-      format = "md";
-    } else if (arg === "-xml" || arg === "--xml") {
-      format = "xml";
-    } else if (!arg.startsWith("-")) {
-      queryParts.push(arg);
-    }
+  // Set global index name
+  if (values.index) {
+    customIndexName = values.index;
   }
 
+  // Determine output format
+  let format: OutputFormat = "cli";
+  if (values.csv) format = "csv";
+  else if (values.md) format = "md";
+  else if (values.xml) format = "xml";
+  else if (values.files) format = "files";
+  else if (values.json) format = "json";
+
+  // Default limit: 20 for --files/--json, 5 otherwise
+  const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
+
+  const opts: OutputOptions = {
+    format,
+    full: values.full || false,
+    limit: values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit,
+    minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
+  };
+
   return {
-    opts: { format, full, limit, minScore },
-    query: queryParts.join(" "),
+    command: positionals[0] || "",
+    args: positionals.slice(1),
+    query: positionals.slice(1).join(" "),
+    opts,
+    values,
   };
 }
 
-// Parse global options and extract remaining args
-function parseGlobalOptions(args: string[]): string[] {
-  const remaining: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--index" && i + 1 < args.length) {
-      customIndexName = args[++i];
-    } else {
-      remaining.push(args[i]);
-    }
-  }
-  return remaining;
-}
-
-// Main CLI
-const rawArgs = process.argv.slice(2);
-const args = parseGlobalOptions(rawArgs);
-
-if (args.length === 0) {
+function showHelp(): void {
   console.log("Usage:");
-  console.log("  qmd add [--drop] [glob]    - Add/update collection from $PWD (default: **/*.md)");
-  console.log("  qmd status                 - Show index status and collections");
-  console.log("  qmd update-all             - Re-index all collections");
-  console.log("  qmd embed [-f]             - Create vector embeddings for all content");
-  console.log("  qmd search <query>         - Full-text search (BM25)");
-  console.log("  qmd vsearch <query>        - Vector similarity search");
-  console.log("  qmd query <query>          - Combined search with query expansion + reranking");
+  console.log("  qmd add [--drop] [glob]       - Add/update collection from $PWD (default: **/*.md)");
+  console.log("  qmd add-context <path> <text> - Add context description for files under path");
+  console.log("  qmd get <file>                - Get document body by filepath");
+  console.log("  qmd status                    - Show index status and collections");
+  console.log("  qmd update-all                - Re-index all collections");
+  console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
+  console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
+  console.log("  qmd search <query>            - Full-text search (BM25)");
+  console.log("  qmd vsearch <query>           - Vector similarity search");
+  console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
   console.log("");
   console.log("Search options:");
-  console.log("  -n <num>                   - Number of results (default: 5)");
+  console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  -csv                       - CSV output (default is colorized CLI)");
-  console.log("  -md                        - Markdown output");
-  console.log("  -xml                       - XML output");
+  console.log("  --files                    - Output score,filepath,context (default: 20 results)");
+  console.log("  --json                     - JSON output with snippets (default: 20 results)");
+  console.log("  --csv                      - CSV output with snippets");
+  console.log("  --md                       - Markdown output");
+  console.log("  --xml                      - XML output");
   console.log("");
   console.log("Environment:");
   console.log("  OLLAMA_URL                 - Ollama server URL (default: http://localhost:11434)");
@@ -1330,54 +1752,151 @@ if (args.length === 0) {
   console.log(`  Reranking: ${DEFAULT_RERANK_MODEL}`);
   console.log("");
   console.log(`Index: ${getDbPath()}`);
-  process.exit(1);
 }
 
-const cmd = args[0];
+// Main CLI
+const cli = parseCLI();
 
-if (cmd === "add") {
-  const addArgs = args.slice(1);
-  const drop = addArgs.includes("--drop");
-  const globArg = addArgs.find(a => !a.startsWith("-"));
-  // Treat "." as "use default glob in current directory"
-  const globPattern = (!globArg || globArg === ".") ? DEFAULT_GLOB : globArg;
+if (!cli.command || cli.values.help) {
+  showHelp();
+  process.exit(cli.values.help ? 0 : 1);
+}
 
-  if (drop) {
-    await dropCollection(globPattern);
-  } else {
-    await indexFiles(globPattern);
+switch (cli.command) {
+  case "add": {
+    const globArg = cli.args[0];
+    // Treat "." as "use default glob in current directory"
+    const globPattern = (!globArg || globArg === ".") ? DEFAULT_GLOB : globArg;
+    if (cli.values.drop) {
+      await dropCollection(globPattern);
+    } else {
+      await indexFiles(globPattern);
+    }
+    break;
   }
-} else if (cmd === "status") {
-  showStatus();
-} else if (cmd === "update-all") {
-  await updateAllCollections();
-} else if (cmd === "embed") {
-  const embedArgs = args.slice(1);
-  const force = embedArgs.includes("-f") || embedArgs.includes("--force");
-  await vectorIndex(DEFAULT_EMBED_MODEL, force);
-} else if (cmd === "search") {
-  const { opts, query } = parseOptions(args.slice(1), 0);
-  if (!query) {
-    console.error("Usage: qmd search [-n num] [--min-score num] [--full] [-csv|-md|-xml] <query>");
+
+  case "add-context": {
+    // qmd add-context <path> <context> OR qmd add-context <context> (uses .)
+    if (cli.args.length === 0) {
+      console.error("Usage: qmd add-context <path> <context>");
+      console.error("       qmd add-context . \"Description of files in current directory\"");
+      process.exit(1);
+    }
+    let pathArg: string;
+    let contextText: string;
+    if (cli.args.length === 1) {
+      // Single arg = context for current directory
+      pathArg = ".";
+      contextText = cli.args[0];
+    } else {
+      pathArg = cli.args[0];
+      contextText = cli.args.slice(1).join(" ");
+    }
+    await addContext(pathArg, contextText);
+    break;
+  }
+
+  case "get": {
+    if (!cli.args[0]) {
+      console.error("Usage: qmd get <filepath>");
+      process.exit(1);
+    }
+    getDocument(cli.args[0]);
+    break;
+  }
+
+  case "status":
+    showStatus();
+    break;
+
+  case "update-all":
+    await updateAllCollections();
+    break;
+
+  case "embed":
+    await vectorIndex(DEFAULT_EMBED_MODEL, cli.values.force || false);
+    break;
+
+  case "search":
+    if (!cli.query) {
+      console.error("Usage: qmd search [options] <query>");
+      process.exit(1);
+    }
+    search(cli.query, cli.opts);
+    break;
+
+  case "vsearch":
+    if (!cli.query) {
+      console.error("Usage: qmd vsearch [options] <query>");
+      process.exit(1);
+    }
+    // Default min-score for vector search is 0.3
+    if (!cli.values["min-score"]) {
+      cli.opts.minScore = 0.3;
+    }
+    await vectorSearch(cli.query, cli.opts);
+    break;
+
+  case "query":
+    if (!cli.query) {
+      console.error("Usage: qmd query [options] <query>");
+      process.exit(1);
+    }
+    await querySearch(cli.query, cli.opts);
+    break;
+
+  case "cleanup": {
+    const db = getDb();
+
+    // 1. Clear ollama_cache
+    const cacheCount = db.prepare(`SELECT COUNT(*) as c FROM ollama_cache`).get() as { c: number };
+    db.exec(`DELETE FROM ollama_cache`);
+    console.log(`${c.green}✓${c.reset} Cleared ${cacheCount.c} cached API responses`);
+
+    // 2. Remove orphaned vectors (no active document with that hash)
+    const orphanedVecs = db.prepare(`
+      SELECT COUNT(*) as c FROM content_vectors cv
+      WHERE NOT EXISTS (
+        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+      )
+    `).get() as { c: number };
+
+    if (orphanedVecs.c > 0) {
+      db.exec(`
+        DELETE FROM vectors_vec WHERE hash_seq IN (
+          SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+          WHERE NOT EXISTS (
+            SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+          )
+        )
+      `);
+      db.exec(`
+        DELETE FROM content_vectors WHERE hash NOT IN (
+          SELECT hash FROM documents WHERE active = 1
+        )
+      `);
+      console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs.c} orphaned embedding chunks`);
+    } else {
+      console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+    }
+
+    // 3. Count inactive documents
+    const inactiveDocs = db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number };
+    if (inactiveDocs.c > 0) {
+      db.exec(`DELETE FROM documents WHERE active = 0`);
+      console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs.c} inactive document records`);
+    }
+
+    // 4. Vacuum to reclaim space
+    db.exec(`VACUUM`);
+    console.log(`${c.green}✓${c.reset} Database vacuumed`);
+
+    db.close();
+    break;
+  }
+
+  default:
+    console.error(`Unknown command: ${cli.command}`);
+    console.error("Run 'qmd --help' for usage.");
     process.exit(1);
-  }
-  search(query, opts);
-} else if (cmd === "vsearch") {
-  const { opts, query } = parseOptions(args.slice(1), 0.3);
-  if (!query) {
-    console.error("Usage: qmd vsearch [-n num] [--min-score num] [--full] [-csv|-md|-xml] <query>");
-    process.exit(1);
-  }
-  await vectorSearch(query, opts);
-} else if (cmd === "query") {
-  const { opts, query } = parseOptions(args.slice(1), 0);
-  if (!query) {
-    console.error("Usage: qmd query [-n num] [--min-score num] [--full] [-csv|-md|-xml] <query>");
-    process.exit(1);
-  }
-  await querySearch(query, opts);
-} else {
-  console.error(`Unknown command: ${cmd}`);
-  console.error("Run 'qmd' without arguments for usage.");
-  process.exit(1);
 }
