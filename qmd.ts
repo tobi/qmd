@@ -1230,25 +1230,37 @@ async function searchVec(db: Database, query: string, model: string, limit: numb
   `);
   const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; body: string; distance: number; pos: number }[];
 
-  // Dedupe: keep best-scoring chunk per document
-  const bestByFile = new Map<string, { filepath: string; body: string; distance: number; pos: number }>();
+  // Aggregate chunks per document: max score + small bonus for additional matches
+  const byFile = new Map<string, { filepath: string; body: string; chunkCount: number; bestPos: number; bestDist: number }>();
   for (const r of rawResults) {
-    const existing = bestByFile.get(r.filepath);
-    if (!existing || r.distance < existing.distance) {
-      bestByFile.set(r.filepath, r);
+    const existing = byFile.get(r.filepath);
+    if (!existing) {
+      byFile.set(r.filepath, { filepath: r.filepath, body: r.body, chunkCount: 1, bestPos: r.pos, bestDist: r.distance });
+    } else {
+      existing.chunkCount++;
+      if (r.distance < existing.bestDist) {
+        existing.bestDist = r.distance;
+        existing.bestPos = r.pos;
+      }
     }
   }
 
-  return Array.from(bestByFile.values())
-    .sort((a, b) => a.distance - b.distance)
-    .slice(0, limit)
-    .map(r => ({
-      file: r.filepath,
-      body: r.body,
-      score: 1 / (1 + r.distance),
-      source: "vec" as const,
-      chunkPos: r.pos,
-    }));
+  // Score = max chunk score + 0.02 bonus per additional chunk (capped at +0.1)
+  return Array.from(byFile.values())
+    .map(r => {
+      const maxScore = 1 / (1 + r.bestDist);
+      const bonusChunks = Math.min(r.chunkCount - 1, 5);
+      const bonus = bonusChunks * 0.02;
+      return {
+        file: r.filepath,
+        body: r.body,
+        score: maxScore + bonus,
+        source: "vec" as const,
+        chunkPos: r.bestPos,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 function normalizeScores(results: SearchResult[]): SearchResult[] {
