@@ -678,11 +678,27 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Calculate total bytes for accurate progress tracking, skip empty files
+  // Truncate documents larger than 64KB
+  const MAX_EMBED_BYTES = 64 * 1024;
+  const truncated: string[] = [];
+
   const itemsWithSize = hashesToEmbed
-    .map(item => ({
-      ...item,
-      bytes: new TextEncoder().encode(item.body).length
-    }))
+    .map(item => {
+      const originalBytes = new TextEncoder().encode(item.body).length;
+      let body = item.body;
+      if (originalBytes > MAX_EMBED_BYTES) {
+        // Truncate to MAX_EMBED_BYTES
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+        body = decoder.decode(encoder.encode(item.body).slice(0, MAX_EMBED_BYTES));
+        truncated.push(item.title);
+      }
+      return {
+        ...item,
+        body,
+        bytes: new TextEncoder().encode(body).length
+      };
+    })
     .filter(item => item.bytes > 0);  // Skip empty documents
 
   if (itemsWithSize.length === 0) {
@@ -698,6 +714,15 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   console.log(`${c.bold}Embedding ${total} documents${c.reset} ${c.dim}(${formatBytes(totalBytes)})${c.reset}`);
   if (skipped > 0) {
     console.log(`${c.dim}Skipped ${skipped} empty documents${c.reset}`);
+  }
+  if (truncated.length > 0) {
+    console.log(`${c.yellow}⚠ Truncated ${truncated.length} large documents to 64KB:${c.reset}`);
+    for (const title of truncated.slice(0, 5)) {
+      console.log(`${c.dim}  - ${title}${c.reset}`);
+    }
+    if (truncated.length > 5) {
+      console.log(`${c.dim}  ... and ${truncated.length - 5} more${c.reset}`);
+    }
   }
   console.log(`${c.dim}Model: ${model}${c.reset}\n`);
 
@@ -729,7 +754,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       errors++;
       bytesProcessed += item.bytes;
       progress.error();
-      console.error(`\n${c.yellow}⚠ Error embedding ${item.hash.slice(0, 8)}...: ${err}${c.reset}`);
+      console.error(`\n${c.yellow}⚠ Error embedding "${item.title}": ${err}${c.reset}`);
     }
 
     const processed = embedded + errors;
@@ -751,11 +776,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   progress.clear();
-  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  const avgThroughput = formatBytes(totalBytes / parseFloat(totalTime));
+  const totalTimeSec = (Date.now() - startTime) / 1000;
+  const avgThroughput = formatBytes(totalBytes / totalTimeSec);
 
   console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${embedded}${c.reset} documents in ${c.bold}${totalTime}s${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${embedded}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
   if (errors > 0) {
     console.log(`${c.yellow}⚠ ${errors} documents failed${c.reset}`);
   }
