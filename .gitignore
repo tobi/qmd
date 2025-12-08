@@ -1,0 +1,9 @@
+node_modules/
+*.sqlite
+.DS_Store
+archive/
+texts/
+.cursor/
+*.md
+!README.md
+!CLAUDE.md

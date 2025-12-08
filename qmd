@@ -1,0 +1,14 @@
+#!/bin/bash
+# qmd - Quick Markdown Search
+# Run with: ./qmd or symlink to PATH
+
+# Resolve symlinks to find actual script location
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+exec bun "$SCRIPT_DIR/qmd.ts" "$@"

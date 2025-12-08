@@ -1,0 +1,47 @@
+{
+  "name": "qmd",
+  "version": "1.0.0",
+  "description": "Quick Markdown Search - Full-text and vector search for markdown files",
+  "type": "module",
+  "bin": {
+    "qmd": "./qmd"
+  },
+  "scripts": {
+    "qmd": "bun qmd.ts",
+    "index": "bun qmd.ts index",
+    "vector": "bun qmd.ts vector",
+    "search": "bun qmd.ts search",
+    "vsearch": "bun qmd.ts vsearch",
+    "rerank": "bun qmd.ts rerank",
+    "link": "bun link"
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.7-alpha.2"
+  },
+  "optionalDependencies": {
+    "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
+    "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
+    "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
+    "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": [
+    "markdown",
+    "search",
+    "fts",
+    "vector",
+    "sqlite",
+    "bm25",
+    "embeddings",
+    "ollama"
+  ],
+  "license": "MIT"
+}
