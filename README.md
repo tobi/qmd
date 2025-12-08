@@ -1,6 +1,54 @@
 # QMD - Quick Markdown Search
 
-A CLI tool for searching markdown knowledge bases using hybrid retrieval: combining BM25 full-text search, vector semantic search, and LLM re-ranking.
+An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via Ollama.
+
+## Quick Start
+
+```sh
+# Install
+bun install
+
+# Index your notes, docs, and meeting transcripts
+cd ~/notes && qmd add .
+cd ~/Documents/meetings && qmd add .
+cd ~/work/docs && qmd add .
+
+# Add context to help with search results
+qmd add-context ~/notes "Personal notes and ideas"
+qmd add-context ~/Documents/meetings "Meeting transcripts and notes"
+qmd add-context ~/work/docs "Work documentation"
+
+# Generate embeddings for semantic search
+qmd embed
+
+# Search across everything
+qmd search "project timeline"           # Fast keyword search
+qmd vsearch "how to deploy"             # Semantic search
+qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
+
+# Get a specific document
+qmd get "meetings/2024-01-15.md"
+
+# Export all matches for an agent
+qmd search "API" --all --files --min-score 0.3
+```
+
+### Using with AI Agents
+
+QMD's `--json` and `--files` output formats are designed for agentic workflows:
+
+```sh
+# Get structured results for an LLM
+qmd search "authentication" --json -n 10
+
+# List all relevant files above a threshold
+qmd query "error handling" --all --files --min-score 0.4
+
+# Retrieve full document content
+qmd get "docs/api-reference.md" --full
+```
 
 ## Architecture
 
@@ -194,6 +242,7 @@ qmd query "user authentication"
 
 ```sh
 -n <num>           # Number of results (default: 5, or 20 for --files/--json)
+--all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --files            # Output: score,filepath,context
@@ -209,19 +258,29 @@ qmd query "user authentication"
 Default output is colorized CLI format (respects `NO_COLOR` env):
 
 ```
- 93%  ~/docs/guide.md:42
-  │ This section covers the **craftsmanship** of building
-  │ quality software with attention to detail.
-  │ See also: engineering principles
+docs/guide.md:42
+Title: Software Craftsmanship
+Context: Work documentation
+Score: 93%
 
- 67%  ~/notes/meeting.md:15
-  │ Discussion about code quality and craftsmanship
-  │ in the development process.
+This section covers the **craftsmanship** of building
+quality software with attention to detail.
+See also: engineering principles
+
+
+notes/meeting.md:15
+Title: Q4 Planning
+Context: Personal notes and ideas
+Score: 67%
+
+Discussion about code quality and craftsmanship
+in the development process.
 ```
 
+- **Path**: Collection-relative, includes parent folder (e.g., `docs/guide.md`)
+- **Title**: Extracted from document (first heading or filename)
+- **Context**: Folder context if configured via `add-context`
 - **Score**: Color-coded (green >70%, yellow >40%, dim otherwise)
-- **Path**: Relative to $HOME (`~/...`)
-- **Line**: Line number where match was found
 - **Snippet**: Context around match with query terms highlighted
 
 ### Examples
