@@ -209,6 +209,7 @@ function getDb(): Database {
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
       filepath TEXT NOT NULL,
+      display_path TEXT NOT NULL DEFAULT '',
       body TEXT NOT NULL,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
@@ -216,6 +217,16 @@ function getDb(): Database {
       FOREIGN KEY (collection_id) REFERENCES collections(id)
     )
   `);
+
+  // Migration: add display_path column if missing
+  const docInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  const hasDisplayPath = docInfo.some(col => col.name === 'display_path');
+  if (!hasDisplayPath) {
+    db.exec(`ALTER TABLE documents ADD COLUMN display_path TEXT NOT NULL DEFAULT ''`);
+  }
+
+  // Unique index on display_path (only for non-empty values)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_display_path ON documents(display_path) WHERE display_path != '' AND active = 1`);
 
   // Content vectors keyed by (hash, seq) for chunked embeddings
   // Migration: check if old schema (no seq column) and recreate
@@ -424,6 +435,40 @@ function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZE): { t
   }
 
   return chunks;
+}
+
+// Compute unique display path for a document
+// Start with filename, add parent directories until unique
+function computeDisplayPath(
+  filepath: string,
+  collectionPath: string,
+  existingPaths: Set<string>
+): string {
+  // Get path relative to collection (include collection dir name)
+  const collectionDir = collectionPath.replace(/\/$/, '');
+  const collectionName = collectionDir.split('/').pop() || '';
+
+  let relativePath: string;
+  if (filepath.startsWith(collectionDir + '/')) {
+    // filepath is under collection: use collection name + relative path
+    relativePath = collectionName + filepath.slice(collectionDir.length);
+  } else {
+    // Fallback: just use the filepath
+    relativePath = filepath;
+  }
+
+  const parts = relativePath.split('/').filter(p => p.length > 0);
+
+  // Start with just the filename, then add parent dirs until unique
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const candidate = parts.slice(i).join('/');
+    if (!existingPaths.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Absolute fallback: use full path (should be unique)
+  return filepath;
 }
 
 // Auto-pull model if not found
@@ -720,6 +765,37 @@ function showStatus(): void {
   db.close();
 }
 
+// Update display_paths for all documents that have empty display_path
+function updateDisplayPaths(db: Database): number {
+  // Get all docs with empty display_path, grouped by collection
+  const emptyDocs = db.prepare(`
+    SELECT d.id, d.filepath, c.pwd
+    FROM documents d
+    JOIN collections c ON d.collection_id = c.id
+    WHERE d.active = 1 AND (d.display_path IS NULL OR d.display_path = '')
+  `).all() as { id: number; filepath: string; pwd: string }[];
+
+  if (emptyDocs.length === 0) return 0;
+
+  // Collect existing display_paths
+  const existingPaths = new Set<string>(
+    (db.prepare(`SELECT display_path FROM documents WHERE active = 1 AND display_path != ''`).all() as { display_path: string }[])
+      .map(r => r.display_path)
+  );
+
+  const updateStmt = db.prepare(`UPDATE documents SET display_path = ? WHERE id = ?`);
+  let updated = 0;
+
+  for (const doc of emptyDocs) {
+    const displayPath = computeDisplayPath(doc.filepath, doc.pwd, existingPaths);
+    updateStmt.run(displayPath, doc.id);
+    existingPaths.add(displayPath);
+    updated++;
+  }
+
+  return updated;
+}
+
 async function updateAllCollections(): Promise<void> {
   const db = getDb();
   cleanupDuplicateCollections(db);
@@ -733,6 +809,12 @@ async function updateAllCollections(): Promise<void> {
     console.log(`${c.dim}No collections found. Run 'qmd add .' to index markdown files.${c.reset}`);
     db.close();
     return;
+  }
+
+  // Update display_paths for any documents missing them (migration)
+  const pathsUpdated = updateDisplayPaths(db);
+  if (pathsUpdated > 0) {
+    console.log(`${c.green}✓${c.reset} Updated ${pathsUpdated} display paths`);
   }
 
   db.close();
@@ -780,11 +862,18 @@ async function addContext(pathArg: string, contextText: string): Promise<void> {
   db.close();
 }
 
-function getDocument(filename: string): void {
+function getDocument(filename: string, fromLine?: number, maxLines?: number): void {
   const db = getDb();
 
-  // Expand ~ to home directory
+  // Parse :linenum suffix from filename (e.g., "file.md:100")
   let filepath = filename;
+  const colonMatch = filepath.match(/:(\d+)$/);
+  if (colonMatch && !fromLine) {
+    fromLine = parseInt(colonMatch[1], 10);
+    filepath = filepath.slice(0, -colonMatch[0].length);
+  }
+
+  // Expand ~ to home directory
   if (filepath.startsWith('~/')) {
     filepath = homedir() + filepath.slice(1);
   }
@@ -803,7 +892,17 @@ function getDocument(filename: string): void {
     process.exit(1);
   }
 
-  console.log(doc.body);
+  let output = doc.body;
+
+  // Apply line filtering if specified
+  if (fromLine !== undefined || maxLines !== undefined) {
+    const lines = output.split('\n');
+    const start = (fromLine || 1) - 1; // Convert to 0-indexed
+    const end = maxLines !== undefined ? start + maxLines : lines.length;
+    output = lines.slice(start, end).join('\n');
+  }
+
+  console.log(output);
   db.close();
 }
 
@@ -881,10 +980,18 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
     return;
   }
 
-  const insertStmt = db.prepare(`INSERT INTO documents (collection_id, name, title, hash, filepath, body, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`);
+  const insertStmt = db.prepare(`INSERT INTO documents (collection_id, name, title, hash, filepath, display_path, body, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`);
   const deactivateStmt = db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND filepath = ? AND active = 1`);
-  const findActiveStmt = db.prepare(`SELECT id, hash, title FROM documents WHERE collection_id = ? AND filepath = ? AND active = 1`);
+  const findActiveStmt = db.prepare(`SELECT id, hash, title, display_path FROM documents WHERE collection_id = ? AND filepath = ? AND active = 1`);
+  const findActiveAnyCollectionStmt = db.prepare(`SELECT id, collection_id, hash, title, display_path FROM documents WHERE filepath = ? AND active = 1`);
   const updateTitleStmt = db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`);
+  const updateDisplayPathStmt = db.prepare(`UPDATE documents SET display_path = ? WHERE id = ?`);
+
+  // Collect all existing display_paths for uniqueness check
+  const existingDisplayPaths = new Set<string>(
+    (db.prepare(`SELECT display_path FROM documents WHERE active = 1 AND display_path != ''`).all() as { display_path: string }[])
+      .map(r => r.display_path)
+  );
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenFiles = new Set<string>();
@@ -898,27 +1005,48 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
     const hash = await hashContent(content);
     const name = relativeFile.replace(/\.md$/, "").split("/").pop() || relativeFile;
     const title = extractTitle(content, relativeFile);
-    const existing = findActiveStmt.get(collectionId, filepath) as { id: number; hash: string; title: string } | null;
+
+    // First check if file exists in THIS collection
+    const existing = findActiveStmt.get(collectionId, filepath) as { id: number; hash: string; title: string; display_path: string } | null;
 
     if (existing) {
       if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating (e.g., extraction logic improved)
+        // Hash unchanged, but check if title needs updating
         if (existing.title !== title) {
           updateTitleStmt.run(title, now, existing.id);
           updated++;
         } else {
           unchanged++;
         }
+        // Update display_path if empty
+        if (!existing.display_path) {
+          const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
+          updateDisplayPathStmt.run(displayPath, existing.id);
+          existingDisplayPaths.add(displayPath);
+        }
       } else {
+        // Content changed - deactivate old, insert new
+        existingDisplayPaths.delete(existing.display_path);
         deactivateStmt.run(collectionId, filepath);
         updated++;
         const stat = await Bun.file(filepath).stat();
-        insertStmt.run(collectionId, name, title, hash, filepath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
+        const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
+        insertStmt.run(collectionId, name, title, hash, filepath, displayPath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
+        existingDisplayPaths.add(displayPath);
       }
     } else {
-      indexed++;
-      const stat = await Bun.file(filepath).stat();
-      insertStmt.run(collectionId, name, title, hash, filepath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
+      // Check if file exists in ANY collection (would violate unique constraint)
+      const existingAnywhere = findActiveAnyCollectionStmt.get(filepath) as { id: number; collection_id: number; hash: string; title: string; display_path: string } | null;
+      if (existingAnywhere) {
+        // File already indexed in another collection - skip it
+        unchanged++;
+      } else {
+        indexed++;
+        const stat = await Bun.file(filepath).stat();
+        const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
+        insertStmt.run(collectionId, name, title, hash, filepath, displayPath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
+        existingDisplayPaths.add(displayPath);
+      }
     }
 
     processed++;
@@ -974,12 +1102,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   // Find unique hashes that need embedding (from active documents)
   // Use MIN(filepath) to get one representative filepath per hash
   const hashesToEmbed = db.prepare(`
-    SELECT d.hash, d.body, MIN(d.filepath) as filepath
+    SELECT d.hash, d.body, MIN(d.filepath) as filepath, MIN(d.display_path) as display_path
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; filepath: string }[];
+  `).all() as { hash: string; body: string; filepath: string; display_path: string }[];
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -998,7 +1126,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (bodyBytes === 0) continue; // Skip empty
 
     const title = extractTitle(item.body, item.filepath);
-    const displayName = shortPath(item.filepath);
+    const displayName = item.display_path || item.filepath;
     const chunks = chunkDocument(item.body, CHUNK_BYTE_SIZE);
 
     if (chunks.length > 1) multiChunkDocs++;
@@ -1145,7 +1273,7 @@ function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: nu
   return { line: lineOffset + bestLine + 1, snippet };
 }
 
-type SearchResult = { file: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
+type SearchResult = { file: string; displayPath: string; title: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
@@ -1195,16 +1323,18 @@ function searchFTS(db: Database, query: string, limit: number = 20): SearchResul
 
   // BM25 weights: name=10, body=1 (title matches ranked higher)
   const stmt = db.prepare(`
-    SELECT d.filepath, d.body, bm25(documents_fts, 10.0, 1.0) as score
+    SELECT d.filepath, d.display_path, d.title, d.body, bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     WHERE documents_fts MATCH ? AND d.active = 1
     ORDER BY score
     LIMIT ?
   `);
-  const results = stmt.all(ftsQuery, limit) as { filepath: string; body: string; score: number }[];
+  const results = stmt.all(ftsQuery, limit) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
   return results.map(r => ({
     file: r.filepath,
+    displayPath: r.display_path,
+    title: r.title,
     body: r.body,
     score: normalizeBM25(r.score),
     source: "fts" as const,
@@ -1221,21 +1351,21 @@ async function searchVec(db: Database, query: string, model: string, limit: numb
   // Join: vectors_vec -> content_vectors -> documents
   // Over-retrieve to handle multiple chunks per document, then dedupe
   const stmt = db.prepare(`
-    SELECT d.filepath, d.body, vec.distance, cv.pos
+    SELECT d.filepath, d.display_path, d.title, d.body, vec.distance, cv.pos
     FROM vectors_vec vec
     JOIN content_vectors cv ON vec.hash_seq = cv.hash || '_' || cv.seq
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     WHERE vec.embedding MATCH ? AND k = ?
     ORDER BY vec.distance
   `);
-  const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; body: string; distance: number; pos: number }[];
+  const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; display_path: string; title: string; body: string; distance: number; pos: number }[];
 
   // Aggregate chunks per document: max score + small bonus for additional matches
-  const byFile = new Map<string, { filepath: string; body: string; chunkCount: number; bestPos: number; bestDist: number }>();
+  const byFile = new Map<string, { filepath: string; displayPath: string; title: string; body: string; chunkCount: number; bestPos: number; bestDist: number }>();
   for (const r of rawResults) {
     const existing = byFile.get(r.filepath);
     if (!existing) {
-      byFile.set(r.filepath, { filepath: r.filepath, body: r.body, chunkCount: 1, bestPos: r.pos, bestDist: r.distance });
+      byFile.set(r.filepath, { filepath: r.filepath, displayPath: r.display_path, title: r.title, body: r.body, chunkCount: 1, bestPos: r.pos, bestDist: r.distance });
     } else {
       existing.chunkCount++;
       if (r.distance < existing.bestDist) {
@@ -1253,6 +1383,8 @@ async function searchVec(db: Database, query: string, model: string, limit: numb
       const bonus = bonusChunks * 0.02;
       return {
         file: r.filepath,
+        displayPath: r.displayPath,
+        title: r.title,
         body: r.body,
         score: maxScore + bonus,
         source: "vec" as const,
@@ -1274,14 +1406,14 @@ function normalizeScores(results: SearchResult[]): SearchResult[] {
 // Reciprocal Rank Fusion: combines multiple ranked lists
 // RRF score = sum(1 / (k + rank)) across all lists where doc appears
 // k=60 is standard, provides good balance between top and lower ranks
-type RankedResult = { file: string; body: string; score: number };
+type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
 
 function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[] = [],  // Weight per result list (default 1.0)
   k: number = 60
 ): RankedResult[] {
-  const scores = new Map<string, { score: number; body: string; bestRank: number }>();
+  const scores = new Map<string, { score: number; displayPath: string; title: string; body: string; bestRank: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const results = resultLists[listIdx];
@@ -1294,7 +1426,7 @@ function reciprocalRankFusion(
         existing.score += rrfScore;
         existing.bestRank = Math.min(existing.bestRank, rank);
       } else {
-        scores.set(doc.file, { score: rrfScore, body: doc.body, bestRank: rank });
+        scores.set(doc.file, { score: rrfScore, displayPath: doc.displayPath, title: doc.title, body: doc.body, bestRank: rank });
       }
     }
   }
@@ -1302,11 +1434,11 @@ function reciprocalRankFusion(
   // Add bonus for best rank: documents that ranked #1-3 in any list get a boost
   // This prevents dilution of exact matches by expansion queries
   return Array.from(scores.entries())
-    .map(([file, { score, body, bestRank }]) => {
+    .map(([file, { score, displayPath, title, body, bestRank }]) => {
       let bonus = 0;
       if (bestRank === 0) bonus = 0.05;  // Ranked #1 somewhere
       else if (bestRank <= 2) bonus = 0.02;  // Ranked top-3 somewhere
-      return { file, body, score: score + bonus };
+      return { file, displayPath, title, body, score: score + bonus };
     })
     .sort((a, b) => b.score - a.score);
 }
@@ -1381,16 +1513,16 @@ function formatScore(score: number): string {
   return `${c.dim}${pct}%${c.reset}`;
 }
 
-// Shorten filepath for display - always relative to $HOME
-function shortPath(filepath: string): string {
+// Shorten directory path for display - relative to $HOME (used for context paths, not documents)
+function shortPath(dirpath: string): string {
   const home = homedir();
-  if (filepath.startsWith(home)) {
-    return '~' + filepath.slice(home.length);
+  if (dirpath.startsWith(home)) {
+    return '~' + dirpath.slice(home.length);
   }
-  return filepath;
+  return dirpath;
 }
 
-function outputResults(results: { file: string; body: string; score: number; context?: string | null; chunkPos?: number }[], query: string, opts: OutputOptions): void {
+function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1402,7 +1534,8 @@ function outputResults(results: { file: string; body: string; score: number; con
     // JSON output for LLM consumption
     const output = filtered.map(row => ({
       score: Math.round(row.score * 100) / 100,
-      file: shortPath(row.file),
+      file: row.displayPath,
+      title: row.title,
       ...(row.context && { context: row.context }),
       ...(opts.full && { body: row.body }),
       ...(!opts.full && { snippet: extractSnippet(row.body, query, 300, row.chunkPos).snippet }),
@@ -1411,55 +1544,68 @@ function outputResults(results: { file: string; body: string; score: number; con
   } else if (opts.format === "files") {
     // Simple score,filepath,context output
     for (const row of filtered) {
-      const path = shortPath(row.file);
       const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-      console.log(`${row.score.toFixed(2)},${path}${ctx}`);
+      console.log(`${row.score.toFixed(2)},${row.displayPath}${ctx}`);
     }
   } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       const { line, snippet, hasMatch } = extractSnippetWithContext(row.body, query, 2, row.chunkPos);
 
-      // Header: score and filename
-      const score = formatScore(row.score);
-      const path = shortPath(row.file);
+      // Line 1: filepath
+      const path = row.displayPath;
       const lineInfo = hasMatch ? `:${line}` : "";
-      console.log(`${c.bold}${score}${c.reset}  ${c.cyan}${path}${c.dim}${lineInfo}${c.reset}`);
+      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}`);
 
-      // Snippet with highlighting
+      // Line 2: Title (if available)
+      if (row.title) {
+        console.log(`${c.bold}Title: ${row.title}${c.reset}`);
+      }
+
+      // Line 3: Context (if available)
+      if (row.context) {
+        console.log(`${c.dim}Context: ${row.context}${c.reset}`);
+      }
+
+      // Line 4: Score
+      const score = formatScore(row.score);
+      console.log(`Score: ${c.bold}${score}${c.reset}`);
+      console.log();
+
+      // Snippet with highlighting (no leading | chars for better word wrap)
       const highlighted = highlightTerms(snippet, query);
-      const indented = highlighted.split('\n').map(l => `  ${c.dim}│${c.reset} ${l}`).join('\n');
-      console.log(indented);
+      console.log(highlighted);
 
-      if (i < filtered.length - 1) console.log();
+      // Double empty line between results
+      if (i < filtered.length - 1) console.log('\n');
     }
   } else if (opts.format === "md") {
     for (const row of filtered) {
-      const path = shortPath(row.file);
+      const heading = row.title || row.displayPath;
       if (opts.full) {
-        console.log(`---\n# ${path}\n\n${row.body}\n`);
+        console.log(`---\n# ${heading}\n\n${row.body}\n`);
       } else {
         const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-        console.log(`---\n# ${path}\n\n${snippet}\n`);
+        console.log(`---\n# ${heading}\n\n${snippet}\n`);
       }
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
-      const path = shortPath(row.file);
+      const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       if (opts.full) {
-        console.log(`<file name="${path}">\n${row.body}\n</file>\n`);
+        console.log(`<file name="${row.displayPath}"${titleAttr}>\n${row.body}\n</file>\n`);
       } else {
         const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-        console.log(`<file name="${path}">\n${snippet}\n</file>\n`);
+        console.log(`<file name="${row.displayPath}"${titleAttr}>\n${snippet}\n</file>\n`);
       }
     }
   } else {
     // CSV format
-    console.log("score,file,line,snippet");
+    console.log("score,file,title,line,snippet");
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
       const content = opts.full ? row.body : snippet;
-      console.log(`${row.score.toFixed(4)},${escapeCSV(shortPath(row.file))},${line},${escapeCSV(content)}`);
+      console.log(`${row.score.toFixed(4)},${escapeCSV(row.displayPath)},${escapeCSV(row.title)},${line},${escapeCSV(content)}`);
     }
   }
 }
@@ -1498,14 +1644,14 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   process.stderr.write(`Searching with ${queries.length} query variations...\n`);
 
   // Collect results from all query variations
-  const allResults = new Map<string, { file: string; body: string; score: number }>();
+  const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
 
   for (const q of queries) {
     const vecResults = await searchVec(db, q, model, 20);
     for (const r of vecResults) {
       const existing = allResults.get(r.file);
       if (!existing || r.score > existing.score) {
-        allResults.set(r.file, { file: r.file, body: r.body, score: r.score });
+        allResults.set(r.file, { file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score });
       }
     }
   }
@@ -1607,14 +1753,14 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     // FTS search - get ranked results
     const ftsResults = searchFTS(db, q, 20);
     if (ftsResults.length > 0) {
-      rankedLists.push(ftsResults.map(r => ({ file: r.file, body: r.body, score: r.score })));
+      rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
     }
 
     // Vector search - get ranked results
     if (hasVectors) {
       const vecResults = await searchVec(db, q, embedModel, 20);
       if (vecResults.length > 0) {
-        rankedLists.push(vecResults.map(r => ({ file: r.file, body: r.body, score: r.score })));
+        rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
       }
     }
   }
@@ -1641,7 +1787,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   // Blend RRF position score with reranker score using position-aware weights
   // Top retrieval results get more protection from reranker disagreement
-  const bodyMap = new Map(candidates.map(c => [c.file, c.body]));
+  const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1])); // 1-indexed rank
 
   const finalResults = reranked.map(r => {
@@ -1660,9 +1806,12 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     }
     const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const candidate = candidateMap.get(r.file);
     return {
       file: r.file,
-      body: bodyMap.get(r.file) || "",
+      displayPath: candidate?.displayPath || "",
+      title: candidate?.title || "",
+      body: candidate?.body || "",
       score: blendedScore,
       context: getContextForFile(db, r.file),
     };
@@ -1693,6 +1842,9 @@ function parseCLI() {
       drop: { type: "boolean" },
       // Embed options
       force: { type: "boolean", short: "f" },
+      // Get options
+      l: { type: "string" },  // max lines
+      from: { type: "string" },  // start line
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -1734,7 +1886,7 @@ function showHelp(): void {
   console.log("Usage:");
   console.log("  qmd add [--drop] [glob]       - Add/update collection from $PWD (default: **/*.md)");
   console.log("  qmd add-context <path> <text> - Add context description for files under path");
-  console.log("  qmd get <file>                - Get document body by filepath");
+  console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update-all                - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
@@ -1810,10 +1962,12 @@ switch (cli.command) {
 
   case "get": {
     if (!cli.args[0]) {
-      console.error("Usage: qmd get <filepath>");
+      console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>]");
       process.exit(1);
     }
-    getDocument(cli.args[0]);
+    const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
+    const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+    getDocument(cli.args[0], fromLine, maxLines);
     break;
   }
 
