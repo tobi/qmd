@@ -6,7 +6,7 @@ A CLI tool for searching markdown knowledge bases using hybrid retrieval: combin
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              QMD Search Pipeline                            │
+│                         QMD Hybrid Search Pipeline                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                               ┌─────────────────┐
@@ -16,31 +16,35 @@ A CLI tool for searching markdown knowledge bases using hybrid retrieval: combin
                         ┌──────────────┴──────────────┐
                         ▼                             ▼
                ┌────────────────┐            ┌────────────────┐
-               │ Query Expansion│            │  Direct Query  │
-               │  (qwen3:0.6b)  │            │    (×2 weight) │
+               │ Query Expansion│            │  Original Query│
+               │  (qwen3:0.6b)  │            │   (×2 weight)  │
                └───────┬────────┘            └───────┬────────┘
                        │                             │
-                       │ 1 alternative query         │
+                       │ 2 alternative queries       │
                        └──────────────┬──────────────┘
                                       │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                 ▼
-           ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-           │   FTS Search   │ │   FTS Search   │ │   FTS Search   │
-           │    (BM25)      │ │    (BM25)      │ │    (BM25)      │
-           └───────┬────────┘ └───────┬────────┘ └───────┬────────┘
-                   │                  │                  │
-           ┌───────┴────────┐ ┌───────┴────────┐ ┌───────┴────────┐
-           │ Vector Search  │ │ Vector Search  │ │ Vector Search  │
-           │(embeddinggemma)│ │(embeddinggemma)│ │(embeddinggemma)│
-           └───────┬────────┘ └───────┬────────┘ └───────┬────────┘
-                   │                  │                  │
-                   └──────────────────┼──────────────────┘
-                                      │
-                                      ▼
+              ┌───────────────────────┼───────────────────────┐
+              ▼                       ▼                       ▼
+     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+     │ Original Query  │     │ Expanded Query 1│     │ Expanded Query 2│
+     └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+              │                       │                       │
+      ┌───────┴───────┐       ┌───────┴───────┐       ┌───────┴───────┐
+      ▼               ▼       ▼               ▼       ▼               ▼
+  ┌───────┐       ┌───────┐ ┌───────┐     ┌───────┐ ┌───────┐     ┌───────┐
+  │ BM25  │       │Vector │ │ BM25  │     │Vector │ │ BM25  │     │Vector │
+  │(FTS5) │       │Search │ │(FTS5) │     │Search │ │(FTS5) │     │Search │
+  └───┬───┘       └───┬───┘ └───┬───┘     └───┬───┘ └───┬───┘     └───┬───┘
+      │               │         │             │         │             │
+      └───────┬───────┘         └──────┬──────┘         └──────┬──────┘
+              │                        │                       │
+              └────────────────────────┼───────────────────────┘
+                                       │
+                                       ▼
                           ┌───────────────────────┐
                           │   RRF Fusion + Bonus  │
-                          │  (Top-rank preserved) │
+                          │  Original query: ×2   │
+                          │  Top-rank bonus: +0.05│
                           │     Top 30 Kept       │
                           └───────────┬───────────┘
                                       │
@@ -54,7 +58,9 @@ A CLI tool for searching markdown knowledge bases using hybrid retrieval: combin
                                       ▼
                           ┌───────────────────────┐
                           │  Position-Aware Blend │
-                          │  (RRF + Reranker)     │
+                          │  Top 1-3:  75% RRF    │
+                          │  Top 4-10: 60% RRF    │
+                          │  Top 11+:  40% RRF    │
                           └───────────────────────┘
 ```
 
@@ -134,20 +140,31 @@ bun install
 
 ```sh
 # Index all .md files in current directory
-qmd index
+qmd add .
 
 # Index with custom glob pattern
-qmd index "**/*.md"
+qmd add "docs/**/*.md"
 
-# Index specific directory
-qmd index "docs/**/*.md"
+# Drop and re-add a collection
+qmd add --drop .
 ```
 
 ### Generate Vector Embeddings
 
 ```sh
-# Embed all indexed documents
+# Embed all indexed documents (chunked into ~6KB pieces)
 qmd embed
+
+# Force re-embed everything
+qmd embed -f
+```
+
+### Add Context
+
+```sh
+# Add context description for files in a path
+qmd add-context . "Project documentation and guides"
+qmd add-context ./meetings "Internal meeting transcripts"
 ```
 
 ### Search Commands
@@ -176,12 +193,14 @@ qmd query "user authentication"
 ### Options
 
 ```sh
--n <num>           # Number of results (default: 5)
+-n <num>           # Number of results (default: 5, or 20 for --files/--json)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
--csv               # CSV output (for piping/scripting)
--md                # Output as markdown
--xml               # Output as XML
+--files            # Output: score,filepath,context
+--json             # JSON output with snippets
+--csv              # CSV output with snippets
+--md               # Markdown output
+--xml              # XML output
 --index <name>     # Use named index
 ```
 
@@ -190,19 +209,19 @@ qmd query "user authentication"
 Default output is colorized CLI format (respects `NO_COLOR` env):
 
 ```
- 93%  docs/guide.md:42
+ 93%  ~/docs/guide.md:42
   │ This section covers the **craftsmanship** of building
   │ quality software with attention to detail.
   │ See also: engineering principles
 
- 67%  notes/meeting.md:15
+ 67%  ~/notes/meeting.md:15
   │ Discussion about code quality and craftsmanship
   │ in the development process.
 ```
 
 - **Score**: Color-coded (green >70%, yellow >40%, dim otherwise)
-- **Path**: Shortened relative to current directory
-- **Line**: Line number where match was found (omitted for vector-only results)
+- **Path**: Relative to $HOME (`~/...`)
+- **Line**: Line number where match was found
 - **Snippet**: Context around match with query terms highlighted
 
 ### Examples
@@ -212,7 +231,10 @@ Default output is colorized CLI format (respects `NO_COLOR` env):
 qmd query -n 10 --min-score 0.3 "API design patterns"
 
 # Output as markdown for LLM context
-qmd search -md --full "error handling"
+qmd search --md --full "error handling"
+
+# JSON output for scripting
+qmd query --json "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
@@ -221,14 +243,17 @@ qmd --index work search "quarterly reports"
 ### Manage Collections
 
 ```sh
-# List all indexed collections
-qmd list
+# Show index status and collections with contexts
+qmd status
 
-# Show database statistics
-qmd stats
+# Re-index all collections
+qmd update-all
 
-# Forget a collection
-qmd forget
+# Get document body by filepath
+qmd get ~/notes/meeting.md
+
+# Clean up cache and orphaned data
+qmd cleanup
 ```
 
 ## Data Storage
@@ -239,10 +264,12 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 
 ```sql
 collections     -- Indexed directories and glob patterns
+path_contexts   -- Context descriptions by path prefix
 documents       -- Markdown content with metadata
 documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding cache (by content hash)
-vectors_vec     -- sqlite-vec vector index
+content_vectors -- Embedding chunks (hash, seq, pos)
+vectors_vec     -- sqlite-vec vector index (hash_seq key)
+ollama_cache    -- Cached API responses
 ```
 
 ## Environment Variables
@@ -259,32 +286,59 @@ vectors_vec     -- sqlite-vec vector index
 ```
 Markdown Files ──► Parse Title ──► Hash Content ──► Store in SQLite
                       │                                    │
-                      └─► FTS5 Index ◄─────────────────────┘
+                      └──────────► FTS5 Index ◄────────────┘
 ```
 
 ### Embedding Flow
 
+Documents are chunked into ~6KB pieces to fit the embedding model's token window:
+
 ```
-Document ──► Format for EmbeddingGemma ──► Ollama API ──► Store Vector
-              "title: X | text: Y"           /api/embed
+Document ──► Chunk (~6KB each) ──► Format each chunk ──► Ollama API ──► Store Vectors
+                │                    "title | text"        /api/embed
+                │
+                └─► Chunks stored with:
+                    - hash: document hash
+                    - seq: chunk sequence (0, 1, 2...)
+                    - pos: character position in original
 ```
 
 ### Query Flow (Hybrid)
 
 ```
-Query ──► Expand (3 variations) ──► FTS + Vector (per variation)
-                                            │
-                                            ▼
-                                   Merge (max score)
-                                            │
-                                            ▼
-                                   Top 25 candidates
-                                            │
-                                            ▼
-                                   LLM Re-rank (0-10)
-                                            │
-                                            ▼
-                                   Final ranked results
+Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
+                │
+      ┌─────────┴─────────┐
+      ▼                   ▼
+   For each query:     FTS (BM25)
+      │                   │
+      ▼                   ▼
+   Vector Search      Ranked List
+      │
+      ▼
+   Ranked List
+      │
+      └─────────┬─────────┘
+                ▼
+         RRF Fusion (k=60)
+         Original query ×2 weight
+         Top-rank bonus: +0.05/#1, +0.02/#2-3
+                │
+                ▼
+         Top 30 candidates
+                │
+                ▼
+         LLM Re-ranking
+         (yes/no + logprob confidence)
+                │
+                ▼
+         Position-Aware Blend
+         Rank 1-3:  75% RRF / 25% reranker
+         Rank 4-10: 60% RRF / 40% reranker
+         Rank 11+:  40% RRF / 60% reranker
+                │
+                ▼
+         Final Results
 ```
 
 ## Model Configuration
