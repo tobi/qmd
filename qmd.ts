@@ -645,13 +645,20 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   db.close();
 }
 
+function renderProgressBar(percent: number, width: number = 30): string {
+  const filled = Math.round((percent / 100) * width);
+  const empty = width - filled;
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+  return bar;
+}
+
 async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
   // If force, clear all vectors
   if (force) {
-    console.log("Force re-indexing: clearing all vectors...");
+    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     db.exec(`DELETE FROM content_vectors`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
   }
@@ -665,56 +672,93 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   `).all() as { hash: string; title: string; body: string }[];
 
   if (hashesToEmbed.length === 0) {
-    console.log("All content hashes already have embeddings.");
+    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     db.close();
     return;
   }
 
-  const total = hashesToEmbed.length;
-  console.log(`Embedding ${total} unique content hashes with ${model}...`);
+  // Calculate total bytes for accurate progress tracking, skip empty files
+  const itemsWithSize = hashesToEmbed
+    .map(item => ({
+      ...item,
+      bytes: new TextEncoder().encode(item.body).length
+    }))
+    .filter(item => item.bytes > 0);  // Skip empty documents
+
+  if (itemsWithSize.length === 0) {
+    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+    db.close();
+    return;
+  }
+
+  const totalBytes = itemsWithSize.reduce((sum, item) => sum + item.bytes, 0);
+  const total = itemsWithSize.length;
+  const skipped = hashesToEmbed.length - total;
+
+  console.log(`${c.bold}Embedding ${total} documents${c.reset} ${c.dim}(${formatBytes(totalBytes)})${c.reset}`);
+  if (skipped > 0) {
+    console.log(`${c.dim}Skipped ${skipped} empty documents${c.reset}`);
+  }
+  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
 
   progress.indeterminate();
-  const firstEmbedding = await getEmbedding(hashesToEmbed[0].body, model, false, hashesToEmbed[0].title);
-  console.log(`Embedding dimensions: ${firstEmbedding.length}`);
+  const firstEmbedding = await getEmbedding(itemsWithSize[0].body, model, false, itemsWithSize[0].title);
   ensureVecTable(db, firstEmbedding.length);
 
-  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash, embedding) VALUES (?, ?)`);
+  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash, embedding) VALUES (?, ?)`);
   const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, model, embedded_at) VALUES (?, ?, ?)`);
 
-  let embedded = 0, errors = 0;
+  let embedded = 0, errors = 0, bytesProcessed = 0;
   const startTime = Date.now();
 
   // Insert first
-  insertVecStmt.run(hashesToEmbed[0].hash, new Float32Array(firstEmbedding));
-  insertContentVectorStmt.run(hashesToEmbed[0].hash, model, now);
+  insertVecStmt.run(itemsWithSize[0].hash, new Float32Array(firstEmbedding));
+  insertContentVectorStmt.run(itemsWithSize[0].hash, model, now);
   embedded++;
-  progress.set((embedded / total) * 100);
-  process.stderr.write(`\rEmbedding: ${embedded}/${total}`);
+  bytesProcessed += itemsWithSize[0].bytes;
 
-  for (let i = 1; i < hashesToEmbed.length; i++) {
-    const item = hashesToEmbed[i];
+  for (let i = 1; i < itemsWithSize.length; i++) {
+    const item = itemsWithSize[i];
     try {
       const embedding = await getEmbedding(item.body, model, false, item.title);
       insertVecStmt.run(item.hash, new Float32Array(embedding));
       insertContentVectorStmt.run(item.hash, model, now);
       embedded++;
+      bytesProcessed += item.bytes;
     } catch (err) {
       errors++;
+      bytesProcessed += item.bytes;
       progress.error();
-      console.error(`\nError embedding hash ${item.hash.slice(0, 8)}...: ${err}`);
+      console.error(`\n${c.yellow}⚠ Error embedding ${item.hash.slice(0, 8)}...: ${err}${c.reset}`);
     }
+
     const processed = embedded + errors;
-    progress.set((processed / total) * 100);
+    const percent = (bytesProcessed / totalBytes) * 100;
+    progress.set(percent);
+
     const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    process.stderr.write(`\rEmbedding: ${embedded}/${total}${errors > 0 ? ` (${errors} errors)` : ""}${eta}        `);
+    const bytesPerSec = bytesProcessed / elapsed;
+    const remainingBytes = totalBytes - bytesProcessed;
+    const etaSec = remainingBytes / bytesPerSec;
+
+    const bar = renderProgressBar(percent);
+    const percentStr = percent.toFixed(0).padStart(3);
+    const throughput = `${formatBytes(bytesPerSec)}/s`;
+    const eta = elapsed > 2 ? formatETA(etaSec) : "...";
+    const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
+
+    process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${embedded}/${total}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
   }
 
   progress.clear();
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`\nDone! Embedded ${embedded} hashes${errors > 0 ? `, ${errors} errors` : ""} in ${totalTime}s.`);
+  const avgThroughput = formatBytes(totalBytes / parseFloat(totalTime));
+
+  console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${embedded}${c.reset} documents in ${c.bold}${totalTime}s${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+  if (errors > 0) {
+    console.log(`${c.yellow}⚠ ${errors} documents failed${c.reset}`);
+  }
   db.close();
 }
 
