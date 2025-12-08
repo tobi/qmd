@@ -438,7 +438,7 @@ function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZE): { t
 }
 
 // Compute unique display path for a document
-// Start with filename, add parent directories until unique
+// Always include at least parent folder + filename, add more parent dirs until unique
 function computeDisplayPath(
   filepath: string,
   collectionPath: string,
@@ -459,8 +459,10 @@ function computeDisplayPath(
 
   const parts = relativePath.split('/').filter(p => p.length > 0);
 
-  // Start with just the filename, then add parent dirs until unique
-  for (let i = parts.length - 1; i >= 0; i--) {
+  // Always include at least parent folder + filename (minimum 2 parts if available)
+  // Then add more parent dirs until unique
+  const minParts = Math.min(2, parts.length);
+  for (let i = parts.length - minParts; i >= 0; i--) {
     const candidate = parts.slice(i).join('/');
     if (!existingPaths.has(candidate)) {
       return candidate;
@@ -879,11 +881,11 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
   }
 
   // Try exact match first
-  let doc = db.prepare(`SELECT body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { body: string } | null;
+  let doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
 
   // Try matching by filename ending (allows partial paths)
   if (!doc) {
-    doc = db.prepare(`SELECT body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { body: string } | null;
+    doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
   }
 
   if (!doc) {
@@ -891,6 +893,9 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     db.close();
     process.exit(1);
   }
+
+  // Get context for this file
+  const context = getContextForFile(db, doc.filepath);
 
   let output = doc.body;
 
@@ -902,6 +907,10 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     output = lines.slice(start, end).join('\n');
   }
 
+  // Output context header if exists
+  if (context) {
+    console.log(`Folder Context: ${context}\n---\n`);
+  }
   console.log(output);
   db.close();
 }
@@ -1449,6 +1458,7 @@ type OutputOptions = {
   full: boolean;
   limit: number;
   minScore: number;
+  all?: boolean;
 };
 
 // Extract snippet with more context lines for CLI display
@@ -1612,7 +1622,9 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
-  const results = searchFTS(db, query, 50);
+  // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
+  const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
+  const results = searchFTS(db, query, fetchLimit);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1644,10 +1656,12 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   process.stderr.write(`Searching with ${queries.length} query variations...\n`);
 
   // Collect results from all query variations
+  // For --all, fetch more results per query
+  const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
 
   for (const q of queries) {
-    const vecResults = await searchVec(db, q, model, 20);
+    const vecResults = await searchVec(db, q, model, perQueryLimit);
     for (const r of vecResults) {
       const existing = allResults.get(r.file);
       if (!existing || r.score > existing.score) {
@@ -1832,6 +1846,7 @@ function parseCLI() {
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
+      all: { type: "boolean" },
       full: { type: "boolean" },
       csv: { type: "boolean" },
       md: { type: "boolean" },
@@ -1864,13 +1879,16 @@ function parseCLI() {
   else if (values.json) format = "json";
 
   // Default limit: 20 for --files/--json, 5 otherwise
+  // --all means return all results (use very large limit)
   const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
+  const isAll = values.all || false;
 
   const opts: OutputOptions = {
     format,
     full: values.full || false,
-    limit: values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit,
+    limit: isAll ? 100000 : (values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit),
     minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
+    all: isAll,
   };
 
   return {
@@ -1900,6 +1918,7 @@ function showHelp(): void {
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
+  console.log("  --all                      - Return all matches (use with --min-score to filter)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  --files                    - Output score,filepath,context (default: 20 results)");
