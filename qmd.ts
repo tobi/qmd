@@ -392,69 +392,133 @@ async function rerank(query: string, documents: { file: string; text: string }[]
 
 function getOrCreateCollection(db: Database, pwd: string, globPattern: string): number {
   const now = new Date().toISOString();
-  const existing = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number } | null;
-  if (existing) return existing.id;
 
-  db.prepare(`INSERT INTO collections (pwd, glob_pattern, created_at) VALUES (?, ?, ?)`).run(pwd, globPattern, now);
-  return (db.prepare(`SELECT last_insert_rowid() as id`).get() as { id: number }).id;
+  // Use INSERT OR IGNORE to handle race conditions, then SELECT
+  db.prepare(`INSERT OR IGNORE INTO collections (pwd, glob_pattern, created_at) VALUES (?, ?, ?)`).run(pwd, globPattern, now);
+  const existing = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number };
+  return existing.id;
 }
 
-function listCollections(): void {
+function cleanupDuplicateCollections(db: Database): void {
+  // Remove duplicate collections keeping the oldest one
+  db.exec(`
+    DELETE FROM collections WHERE id NOT IN (
+      SELECT MIN(id) FROM collections GROUP BY pwd, glob_pattern
+    )
+  `);
+  // Remove bogus "." glob pattern entries (from earlier bug)
+  db.exec(`DELETE FROM collections WHERE glob_pattern = '.'`);
+}
+
+function formatTimeAgo(date: Date): string {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function showStatus(): void {
+  const dbPath = getDbPath();
   const db = getDb();
+
+  // Cleanup any duplicate collections
+  cleanupDuplicateCollections(db);
+
+  // Index size
+  let indexSize = 0;
+  try {
+    const stat = Bun.file(dbPath).size;
+    indexSize = stat;
+  } catch {}
+
+  // Collections info
   const collections = db.prepare(`
     SELECT c.id, c.pwd, c.glob_pattern, c.created_at,
            COUNT(d.id) as doc_count,
-           SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count
+           SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
+           MAX(d.modified_at) as last_modified
     FROM collections c
     LEFT JOIN documents d ON d.collection_id = c.id
     GROUP BY c.id
     ORDER BY c.created_at DESC
-  `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number }[];
+  `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
 
-  if (collections.length === 0) {
-    console.log("No collections found.");
-    db.close();
-    return;
+  // Overall stats
+  const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
+  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+
+  // Most recent update across all collections
+  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+
+  console.log(`${c.bold}QMD Status${c.reset}\n`);
+  console.log(`Index: ${dbPath}`);
+  console.log(`Size:  ${formatBytes(indexSize)}\n`);
+
+  console.log(`${c.bold}Documents${c.reset}`);
+  console.log(`  Total:    ${totalDocs.count} files indexed`);
+  console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  if (needsEmbedding > 0) {
+    console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
+  }
+  if (mostRecent.latest) {
+    const lastUpdate = new Date(mostRecent.latest);
+    console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
-  console.log("Collections:\n");
-  for (const c of collections) {
-    console.log(`  ${c.pwd}`);
-    console.log(`    Pattern: ${c.glob_pattern}`);
-    console.log(`    Documents: ${c.active_count} active (${c.doc_count} total)`);
-    console.log(`    Created: ${c.created_at}\n`);
+  if (collections.length > 0) {
+    console.log(`\n${c.bold}Collections${c.reset}`);
+    for (const col of collections) {
+      const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
+      console.log(`  ${c.cyan}${col.pwd}${c.reset}`);
+      console.log(`    ${col.glob_pattern} → ${col.active_count} docs (updated ${lastMod})`);
+    }
+  } else {
+    console.log(`\n${c.dim}No collections. Run 'qmd add .' to index markdown files.${c.reset}`);
   }
-
-  const hashCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  console.log(`Vectors: ${hashCount.count} unique content hashes embedded`);
 
   db.close();
 }
 
 async function updateAllCollections(): Promise<void> {
   const db = getDb();
+  cleanupDuplicateCollections(db);
   const collections = db.prepare(`SELECT id, pwd, glob_pattern FROM collections`).all() as { id: number; pwd: string; glob_pattern: string }[];
 
   if (collections.length === 0) {
-    console.log("No collections found.");
+    console.log(`${c.dim}No collections found. Run 'qmd add .' to index markdown files.${c.reset}`);
     db.close();
     return;
   }
 
   db.close();
 
-  console.log(`Updating ${collections.length} collection(s)...\n`);
+  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
-  for (const c of collections) {
-    console.log(`\n--- ${c.pwd} (${c.glob_pattern}) ---`);
+  for (let i = 0; i < collections.length; i++) {
+    const col = collections[i];
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.pwd}${c.reset}`);
+    console.log(`${c.dim}    Pattern: ${col.glob_pattern}${c.reset}`);
     // Temporarily set PWD for indexing
     const originalPwd = process.env.PWD;
-    process.env.PWD = c.pwd;
-    await indexFiles(c.glob_pattern);
+    process.env.PWD = col.pwd;
+    await indexFiles(col.glob_pattern);
     process.env.PWD = originalPwd;
+    console.log("");
   }
 
-  console.log("\nAll collections updated.");
+  console.log(`${c.green}✓ All collections updated.${c.reset}`);
 }
 
 async function dropCollection(globPattern: string): Promise<void> {
@@ -575,7 +639,7 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
 
   if (needsEmbedding > 0) {
-    console.log(`\nRun 'qmd vector' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 
   db.close();
@@ -958,7 +1022,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
-    console.error("Vector index not found. Run 'qmd vector' first to create embeddings.");
+    console.error("Vector index not found. Run 'qmd embed' first to create embeddings.");
     db.close();
     return;
   }
@@ -1171,7 +1235,7 @@ const args = parseGlobalOptions(rawArgs);
 if (args.length === 0) {
   console.log("Usage:");
   console.log("  qmd add [--drop] [glob]    - Add/update collection from $PWD (default: **/*.md)");
-  console.log("  qmd collections            - List all collections");
+  console.log("  qmd status                 - Show index status and collections");
   console.log("  qmd update-all             - Re-index all collections");
   console.log("  qmd embed [-f]             - Create vector embeddings for all content");
   console.log("  qmd search <query>         - Full-text search (BM25)");
@@ -1214,8 +1278,8 @@ if (cmd === "add") {
   } else {
     await indexFiles(globPattern);
   }
-} else if (cmd === "collections") {
-  listCollections();
+} else if (cmd === "status") {
+  showStatus();
 } else if (cmd === "update-all") {
   await updateAllCollections();
 } else if (cmd === "embed") {
