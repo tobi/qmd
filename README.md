@@ -7,8 +7,8 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 ## Quick Start
 
 ```sh
-# Install
-bun install
+# Install globally
+bun install -g https://github.com/tobi/qmd
 
 # Index your notes, docs, and meeting transcripts
 cd ~/notes && qmd add .
@@ -48,6 +48,43 @@ qmd query "error handling" --all --files --min-score 0.4
 
 # Retrieve full document content
 qmd get "docs/api-reference.md" --full
+```
+
+### MCP Server
+
+Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
+
+**Tools exposed:**
+- `qmd_search` - Fast BM25 keyword search
+- `qmd_vsearch` - Semantic vector search
+- `qmd_query` - Hybrid search with reranking (best quality)
+- `qmd_get` - Retrieve document content
+- `qmd_status` - Index health and collection info
+
+**Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "qmd": {
+      "command": "qmd",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Claude Code configuration** (`~/.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "qmd": {
+      "command": "qmd",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
 ## Architecture

@@ -16,7 +16,9 @@
     "link": "bun link"
   },
   "dependencies": {
-    "sqlite-vec": "^0.1.7-alpha.2"
+    "@modelcontextprotocol/sdk": "^1.24.3",
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "zod": "^4.1.13"
   },
   "optionalDependencies": {
     "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
