@@ -79,18 +79,27 @@ process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
 // Terminal progress bar using OSC 9;4 escape sequence
+// Only output when stderr is a TTY to avoid polluting logs/pipes
 const progress = {
   set(percent: number) {
-    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    }
   },
   clear() {
-    process.stderr.write(`\x1b]9;4;0\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;0\x07`);
+    }
   },
   indeterminate() {
-    process.stderr.write(`\x1b]9;4;3\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;3\x07`);
+    }
   },
   error() {
-    process.stderr.write(`\x1b]9;4;2\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;2\x07`);
+    }
   },
 };
 
