@@ -7,6 +7,8 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
-!REFACTORING_PLAN.md
+!*PLAN*.md
+!*STRATEGY*.md
 !ARCHITECTURE.md
+!SQL_SAFETY.md
 .beads/
