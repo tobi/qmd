@@ -114,7 +114,7 @@ export function createTestDbWithVectors(dimensions: number = 128): Database {
   const embeddingBytes = new Uint8Array(embedding.buffer);
 
   db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(
-    'hash123:0',
+    'hash123_0',
     embeddingBytes
   );
 
