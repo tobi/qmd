@@ -57,6 +57,22 @@ export function initializeSchema(db: Database): void {
     )
   `);
 
+  // Search history table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS search_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      command TEXT NOT NULL CHECK(command IN ('search', 'vsearch', 'query')),
+      query TEXT NOT NULL,
+      results_count INTEGER NOT NULL,
+      index_name TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_search_history_timestamp ON search_history(timestamp DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_search_history_query ON search_history(query)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_search_history_command ON search_history(command)`);
+
   // Documents table with collection_id and full filepath
   db.exec(`
     CREATE TABLE IF NOT EXISTS documents (

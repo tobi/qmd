@@ -1,11 +1,16 @@
 /**
  * Search history tracking utilities
  * Stores query history (not results) for suggestions and analytics
+ *
+ * Now uses database-backed storage with automatic migration from file-based history.
  */
 
 import { resolve } from 'path';
 import { homedir } from 'os';
 import { existsSync, appendFileSync, readFileSync } from 'fs';
+import type { Database } from 'bun:sqlite';
+import { getDb } from '../database/db.ts';
+import { SearchHistoryRepository } from '../database/repositories/search-history.ts';
 
 /**
  * History entry structure
@@ -158,4 +163,121 @@ export function clearHistory(): void {
   } catch (error) {
     throw new Error(`Failed to clear history: ${error}`);
   }
+}
+
+// ============================================================================
+// Database-backed history (new implementation)
+// ============================================================================
+
+/**
+ * Migrate file-based history to database
+ * @param db - Database instance
+ * @param indexName - Index name for database
+ * @returns Number of entries migrated
+ */
+export function migrateFileHistoryToDatabase(db: Database, indexName: string = 'default'): number {
+  const repo = new SearchHistoryRepository(db);
+
+  // Check if already has history in database
+  if (repo.count() > 0) {
+    return 0; // Already migrated
+  }
+
+  // Read file-based history
+  const fileEntries = readHistoryFromFile();
+  if (fileEntries.length === 0) {
+    return 0;
+  }
+
+  // Convert to database format
+  const dbEntries = fileEntries.map(entry => ({
+    timestamp: entry.timestamp,
+    command: entry.command,
+    query: entry.query,
+    results_count: entry.results_count,
+    index_name: entry.index || indexName, // Use entry.index if available
+  }));
+
+  // Batch insert
+  return repo.insertBatch(dbEntries);
+}
+
+/**
+ * Read history from file (legacy support)
+ * @param limit - Maximum entries
+ * @returns Array of history entries
+ */
+function readHistoryFromFile(limit?: number): HistoryEntry[] {
+  return readHistory(limit);
+}
+
+/**
+ * Log search to database
+ * @param db - Database instance
+ * @param entry - History entry
+ */
+export function logSearchToDatabase(db: Database, entry: HistoryEntry): void {
+  const repo = new SearchHistoryRepository(db);
+  repo.insert({
+    timestamp: entry.timestamp,
+    command: entry.command,
+    query: entry.query,
+    results_count: entry.results_count,
+    index_name: entry.index,
+  });
+}
+
+/**
+ * Read history from database
+ * @param db - Database instance
+ * @param limit - Maximum entries
+ * @returns Array of history entries
+ */
+export function readHistoryFromDatabase(db: Database, limit?: number): HistoryEntry[] {
+  const repo = new SearchHistoryRepository(db);
+  const entries = repo.findRecent(limit || 100);
+
+  return entries.map(e => ({
+    timestamp: e.timestamp,
+    command: e.command,
+    query: e.query,
+    results_count: e.results_count,
+    index: e.index_name,
+  }));
+}
+
+/**
+ * Get unique queries from database
+ * @param db - Database instance
+ * @param limit - Maximum queries
+ * @returns Array of unique queries
+ */
+export function getUniqueQueriesFromDatabase(db: Database, limit?: number): string[] {
+  const repo = new SearchHistoryRepository(db);
+  return repo.getUniqueQueries(limit);
+}
+
+/**
+ * Get history stats from database
+ * @param db - Database instance
+ * @returns Statistics object
+ */
+export function getHistoryStatsFromDatabase(db: Database): {
+  total_searches: number;
+  unique_queries: number;
+  commands: Record<string, number>;
+  indexes: Record<string, number>;
+  popular_queries: Array<{ query: string; count: number }>;
+} {
+  const repo = new SearchHistoryRepository(db);
+  return repo.getStats();
+}
+
+/**
+ * Clear history from database
+ * @param db - Database instance
+ */
+export function clearHistoryFromDatabase(db: Database): void {
+  const repo = new SearchHistoryRepository(db);
+  repo.clear();
 }
