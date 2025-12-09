@@ -6,6 +6,14 @@ import * as sqliteVec from "sqlite-vec";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import type {
+  LogProb,
+  RerankResponse,
+  SearchResult,
+  RankedResult,
+  OutputFormat,
+  OutputOptions
+} from "./src/models/types.ts";
 
 const HOME = Bun.env.HOME || "/tmp";
 const VERSION = "1.0.0";
@@ -574,11 +582,6 @@ function formatRerankPrompt(query: string, title: string, doc: string): string {
 <Document>: ${doc}`;
 }
 
-type LogProb = { token: string; logprob: number };
-type RerankResponse = {
-  response: string;
-  logprobs?: LogProb[];
-};
 
 function parseRerankResponse(data: RerankResponse): number {
   if (!data.logprobs || data.logprobs.length === 0) {
@@ -1322,7 +1325,6 @@ function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: nu
   return { line: lineOffset + bestLine + 1, snippet };
 }
 
-type SearchResult = { file: string; displayPath: string; title: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
@@ -1455,7 +1457,6 @@ function normalizeScores(results: SearchResult[]): SearchResult[] {
 // Reciprocal Rank Fusion: combines multiple ranked lists
 // RRF score = sum(1 / (k + rank)) across all lists where doc appears
 // k=60 is standard, provides good balance between top and lower ranks
-type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
 
 function reciprocalRankFusion(
   resultLists: RankedResult[][],
@@ -1492,14 +1493,6 @@ function reciprocalRankFusion(
     .sort((a, b) => b.score - a.score);
 }
 
-type OutputFormat = "cli" | "csv" | "md" | "xml" | "files" | "json";
-type OutputOptions = {
-  format: OutputFormat;
-  full: boolean;
-  limit: number;
-  minScore: number;
-  all?: boolean;
-};
 
 // Extract snippet with more context lines for CLI display
 function extractSnippetWithContext(body: string, query: string, contextLines = 3, chunkPos?: number): { line: number; snippet: string; hasMatch: boolean } {
