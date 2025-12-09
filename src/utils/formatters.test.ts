@@ -1,8 +1,5 @@
 import { describe, test, expect } from "bun:test";
-
-// Note: These functions will be extracted to formatters.ts
-// For now, testing them from main qmd.ts file
-// TODO: Update imports once formatters.ts is created
+import { formatETA, formatTimeAgo, formatBytes, formatScore } from "./formatters.ts";
 
 /**
  * Test suite for formatting utility functions
@@ -10,12 +7,6 @@ import { describe, test, expect } from "bun:test";
  */
 
 describe("formatETA", () => {
-  // Temporarily inline for testing - will import from formatters.ts
-  const formatETA = (seconds: number): string => {
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  };
 
   test("formats seconds correctly", () => {
     expect(formatETA(0)).toBe("0s");
@@ -39,20 +30,6 @@ describe("formatETA", () => {
 });
 
 describe("formatTimeAgo", () => {
-  const formatTimeAgo = (date: Date): string => {
-    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    if (days < 7) return `${days}d ago`;
-    const weeks = Math.floor(days / 7);
-    if (weeks < 4) return `${weeks}w ago`;
-    const months = Math.floor(days / 30);
-    return `${months}mo ago`;
-  };
 
   test("formats seconds ago", () => {
     const now = Date.now();
@@ -79,21 +56,28 @@ describe("formatTimeAgo", () => {
   });
 });
 
-describe("formatBytes (future implementation)", () => {
-  // TODO: Extract formatBytes from qmd.ts and test it
-  test.todo("formats bytes to human readable", () => {
-    // expect(formatBytes(0)).toBe("0.0 B");
-    // expect(formatBytes(1024)).toBe("1.0 KB");
-    // expect(formatBytes(1048576)).toBe("1.0 MB");
+describe("formatBytes", () => {
+  test("formats bytes to human readable", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1024)).toBe("1.0 KB");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+    expect(formatBytes(1048576)).toBe("1.0 MB");
+    expect(formatBytes(1073741824)).toBe("1.0 GB");
   });
 });
 
-describe("formatScore (future implementation)", () => {
-  // TODO: Extract formatScore from qmd.ts and test it
-  test.todo("formats scores as percentages", () => {
-    // expect(formatScore(1.0)).toBe("100%");
-    // expect(formatScore(0.856)).toBe("86%");
-    // expect(formatScore(0.0)).toBe("0%");
+describe("formatScore", () => {
+  // Note: formatScore returns colored output when TTY is available
+  // For tests, NO_COLOR env var should disable colors
+  test("formats scores as percentages", () => {
+    const result100 = formatScore(1.0);
+    const result86 = formatScore(0.856);
+    const result0 = formatScore(0.0);
+
+    // Check that percentage values are correct (ignoring color codes)
+    expect(result100).toContain("100%");
+    expect(result86).toContain("86%");
+    expect(result0).toContain("  0%");
   });
 });
 
@@ -101,12 +85,6 @@ describe("formatScore (future implementation)", () => {
  * Edge case tests
  */
 describe("Edge Cases", () => {
-  const formatETA = (seconds: number): string => {
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  };
-
   test("handles negative seconds gracefully", () => {
     // Should return "0s" or handle gracefully
     const result = formatETA(-10);
