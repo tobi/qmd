@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const HOME = Bun.env.HOME || "/tmp";
+const VERSION = "1.0.0";
 
 function homedir(): string {
   return HOME;
@@ -2266,6 +2267,7 @@ function parseCLI() {
       // Global options
       index: { type: "string" },
       help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
       // Model options
       "embed-model": { type: "string" },
       "rerank-model": { type: "string" },
@@ -2370,6 +2372,11 @@ function showHelp(): void {
 
 // Main CLI
 const cli = parseCLI();
+
+if (cli.values.version) {
+  console.log(`qmd version ${VERSION}`);
+  process.exit(0);
+}
 
 if (!cli.command || cli.values.help) {
   showHelp();
