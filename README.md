@@ -31,6 +31,12 @@ qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
 
+# Get multiple documents by glob pattern
+qmd multi-get "journals/2025-05*.md"
+
+# Search within a specific collection
+qmd search "API" -c notes
+
 # Export all matches for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
@@ -55,10 +61,11 @@ qmd get "docs/api-reference.md" --full
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search
-- `qmd_vsearch` - Semantic vector search
-- `qmd_query` - Hybrid search with reranking (best quality)
-- `qmd_get` - Retrieve document content
+- `qmd_search` - Fast BM25 keyword search (supports collection filter)
+- `qmd_vsearch` - Semantic vector search (supports collection filter)
+- `qmd_query` - Hybrid search with reranking (supports collection filter)
+- `qmd_get` - Retrieve document content (with fuzzy matching suggestions)
+- `qmd_multi_get` - Retrieve multiple documents by glob pattern or list
 - `qmd_status` - Index health and collection info
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -278,16 +285,24 @@ qmd query "user authentication"
 ### Options
 
 ```sh
+# Search options
 -n <num>           # Number of results (default: 5, or 20 for --files/--json)
+-c, --collection   # Restrict search to a specific collection
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
---files            # Output: score,filepath,context
---json             # JSON output with snippets
---csv              # CSV output with snippets
+--index <name>     # Use named index
+
+# Output formats (for search and multi-get)
+--files            # Output: score,filepath,context (search) or filepath,context (multi-get)
+--json             # JSON output
+--csv              # CSV output
 --md               # Markdown output
 --xml              # XML output
---index <name>     # Use named index
+
+# Multi-get options
+-l <num>           # Maximum lines per file
+--max-bytes <num>  # Skip files larger than N bytes (default: 10KB)
 ```
 
 ### Output Format
@@ -345,8 +360,20 @@ qmd status
 # Re-index all collections
 qmd update-all
 
-# Get document body by filepath
+# Get document body by filepath (with fuzzy matching)
 qmd get ~/notes/meeting.md
+
+# Get multiple documents by glob pattern
+qmd multi-get "journals/2025-05*.md"
+
+# Get multiple documents by comma-separated list
+qmd multi-get "doc1.md, doc2.md, doc3.md"
+
+# Limit multi-get to files under 20KB
+qmd multi-get "docs/*.md" --max-bytes 20480
+
+# Output multi-get as JSON for agent processing
+qmd multi-get "docs/*.md" --json
 
 # Clean up cache and orphaned data
 qmd cleanup

@@ -3,52 +3,54 @@ import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
 import * as sqliteVec from "sqlite-vec";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-
-const HOME = Bun.env.HOME || "/tmp";
-
-function homedir(): string {
-  return HOME;
-}
-
-function resolve(...paths: string[]): string {
-  // Simple path resolution
-  let result = paths[0].startsWith('/') ? '' : Bun.env.PWD || process.cwd();
-  for (const p of paths) {
-    if (p.startsWith('/')) {
-      result = p;
-    } else {
-      result = result + '/' + p;
-    }
-  }
-  // Normalize: remove // and resolve . and ..
-  const parts = result.split('/').filter(Boolean);
-  const normalized: string[] = [];
-  for (const part of parts) {
-    if (part === '..') normalized.pop();
-    else if (part !== '.') normalized.push(part);
-  }
-  return '/' + normalized.join('/');
-}
-
-// On macOS, use Homebrew's SQLite which supports extensions
-if (process.platform === "darwin") {
-  const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  if (Bun.file(homebrewSqlitePath).size > 0) {
-    Database.setCustomSQLite(homebrewSqlitePath);
-  }
-}
-
-const DEFAULT_EMBED_MODEL = "embeddinggemma";
-const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
-const DEFAULT_GLOB = "**/*.md";
-const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
+import {
+  getDb,
+  getDbPath,
+  getPwd,
+  getRealPath,
+  homedir,
+  resolve,
+  setCustomIndexName,
+  searchFTS,
+  searchVec,
+  reciprocalRankFusion,
+  extractSnippet,
+  getContextForFile,
+  getCollectionIdByName,
+  findSimilarFiles,
+  matchFilesByGlob,
+  getHashesNeedingEmbedding,
+  getDocument as storeGetDocument,
+  getMultipleDocuments as storeMultiGetDocuments,
+  getStatus,
+  hashContent,
+  extractTitle,
+  formatDocForEmbedding,
+  formatQueryForEmbedding,
+  chunkDocument,
+  ensureVecTable,
+  clearCache,
+  getCacheKey,
+  getCachedResult,
+  setCachedResult,
+  getIndexHealth,
+  OLLAMA_URL,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_QUERY_MODEL,
+  DEFAULT_RERANK_MODEL,
+  DEFAULT_GLOB,
+  DEFAULT_MULTI_GET_MAX_BYTES,
+} from "./store.js";
+import type { SearchResult, RankedResult } from "./store.js";
+import {
+  formatSearchResults,
+  formatDocuments,
+  escapeXml,
+  escapeCSV,
+  type OutputFormat,
+} from "./formatter.js";
 
 // Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
-const CHUNK_TOKEN_LENGTH = 2000;
 const CHUNK_BYTE_SIZE = 6 * 1024;
 
 // Terminal colors (respects NO_COLOR env)
@@ -63,9 +65,6 @@ const c = {
   magenta: useColor ? "\x1b[35m" : "",
   blue: useColor ? "\x1b[34m" : "",
 };
-
-// Global state for --index option
-let customIndexName: string | null = null;
 
 // Terminal cursor control
 const cursor = {
@@ -100,223 +99,10 @@ function formatETA(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
-function getDbPath(): string {
-  const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
-  const qmdCacheDir = resolve(cacheDir, "qmd");
-  // Ensure cache directory exists
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch {}
-  const dbName = customIndexName || "index";
-  return resolve(qmdCacheDir, `${dbName}.sqlite`);
-}
-
-function getPwd(): string {
-  return process.env.PWD || process.cwd();
-}
-
-// Get canonical realpath, falling back to resolved path if file doesn't exist
-function getRealPath(path: string): string {
-  try {
-    const result = Bun.spawnSync(["realpath", path]);
-    if (result.success) {
-      return result.stdout.toString().trim();
-    }
-  } catch {}
-  return resolve(path);
-}
-
-/*
-Schema:
-
-CREATE TABLE collections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  pwd TEXT NOT NULL,
-  glob_pattern TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(pwd, glob_pattern)
-);
-
-CREATE TABLE documents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  collection_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  title TEXT NOT NULL,
-  hash TEXT NOT NULL,
-  filepath TEXT NOT NULL,
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  modified_at TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  FOREIGN KEY (collection_id) REFERENCES collections(id)
-);
-
-CREATE TABLE content_vectors (
-  hash TEXT NOT NULL,
-  seq INTEGER NOT NULL DEFAULT 0,  -- chunk sequence (0, 1, 2...)
-  pos INTEGER NOT NULL DEFAULT 0,  -- character position in document
-  model TEXT NOT NULL,
-  embedded_at TEXT NOT NULL,
-  PRIMARY KEY (hash, seq)
-);
-
-CREATE VIRTUAL TABLE vectors_vec USING vec0(
-  hash_seq TEXT PRIMARY KEY,  -- "{hash}_{seq}"
-  embedding float[N]
-);
-
-CREATE VIRTUAL TABLE documents_fts USING fts5(...);
-*/
-
-function getDb(): Database {
-  const db = new Database(getDbPath());
-  sqliteVec.load(db);
-  db.exec("PRAGMA journal_mode = WAL");
-
-  // Collections table
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS collections (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pwd TEXT NOT NULL,
-      glob_pattern TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      context TEXT,
-      UNIQUE(pwd, glob_pattern)
-    )
-  `);
-
-  // Path-based context (more flexible than collection-level)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS path_contexts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      path_prefix TEXT NOT NULL UNIQUE,
-      context TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_path_contexts_prefix ON path_contexts(path_prefix)`);
-
-  // Cache table for Ollama API calls (not embeddings)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ollama_cache (
-      hash TEXT PRIMARY KEY,
-      result TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-
-  // Documents table with collection_id and full filepath
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      title TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      filepath TEXT NOT NULL,
-      display_path TEXT NOT NULL DEFAULT '',
-      body TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      modified_at TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      FOREIGN KEY (collection_id) REFERENCES collections(id)
-    )
-  `);
-
-  // Migration: add display_path column if missing
-  const docInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
-  const hasDisplayPath = docInfo.some(col => col.name === 'display_path');
-  if (!hasDisplayPath) {
-    db.exec(`ALTER TABLE documents ADD COLUMN display_path TEXT NOT NULL DEFAULT ''`);
-  }
-
-  // Unique index on display_path (only for non-empty values)
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_display_path ON documents(display_path) WHERE display_path != '' AND active = 1`);
-
-  // Content vectors keyed by (hash, seq) for chunked embeddings
-  // Migration: check if old schema (no seq column) and recreate
-  const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
-  const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
-  if (cvInfo.length > 0 && !hasSeqColumn) {
-    // Old schema without chunking - drop and recreate (embeddings need regenerating anyway)
-    db.exec(`DROP TABLE IF EXISTS content_vectors`);
-    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  }
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS content_vectors (
-      hash TEXT NOT NULL,
-      seq INTEGER NOT NULL DEFAULT 0,
-      pos INTEGER NOT NULL DEFAULT 0,
-      model TEXT NOT NULL,
-      embedded_at TEXT NOT NULL,
-      PRIMARY KEY (hash, seq)
-    )
-  `);
-
-  // FTS on documents
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      name, body,
-      content='documents',
-      content_rowid='id',
-      tokenize='porter unicode61'
-    )
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body) VALUES (new.id, new.name, new.body);
-    END
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-      INSERT INTO documents_fts(documents_fts, rowid, name, body) VALUES('delete', old.id, old.name, old.body);
-    END
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-      INSERT INTO documents_fts(documents_fts, rowid, name, body) VALUES('delete', old.id, old.name, old.body);
-      INSERT INTO documents_fts(rowid, name, body) VALUES (new.id, new.name, new.body);
-    END
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection_id, active)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_filepath ON documents(filepath, active)`);
-  // Ensure only one active document per filepath
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_filepath_active ON documents(filepath) WHERE active = 1`);
-
-  return db;
-}
-
-function ensureVecTable(db: Database, dimensions: number): void {
-  const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
-  if (tableInfo) {
-    // Check for correct dimensions and hash_seq key (not old 'hash' key)
-    const match = tableInfo.sql.match(/float\[(\d+)\]/);
-    const hasHashSeq = tableInfo.sql.includes('hash_seq');
-    if (match && parseInt(match[1]) === dimensions && hasHashSeq) return;
-    db.exec("DROP TABLE IF EXISTS vectors_vec");
-  }
-  // Use hash_seq as composite key: "{hash}_{seq}" (e.g., "abc123_0", "abc123_1")
-  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}])`);
-}
-
-function getHashesNeedingEmbedding(db: Database): number {
-  // Check for hashes missing the first chunk (seq=0)
-  const result = db.prepare(`
-    SELECT COUNT(DISTINCT d.hash) as count
-    FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
-  return result.count;
-}
 
 // Check index health and print warnings/tips
 function checkIndexHealth(db: Database): void {
-  const needsEmbedding = getHashesNeedingEmbedding(db);
-  const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
+  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db);
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -329,142 +115,9 @@ function checkIndexHealth(db: Database): void {
   }
 
   // Check if most recent document update is older than 2 weeks
-  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
-  if (mostRecent?.latest) {
-    const lastUpdate = new Date(mostRecent.latest);
-    const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
-    if (lastUpdate < twoWeeksAgo) {
-      const daysAgo = Math.floor((Date.now() - lastUpdate.getTime()) / (24 * 60 * 60 * 1000));
-      process.stderr.write(`${c.dim}Tip: Index last updated ${daysAgo} days ago. Run 'qmd update-all' to refresh.${c.reset}\n`);
-    }
+  if (daysStale !== null && daysStale >= 14) {
+    process.stderr.write(`${c.dim}Tip: Index last updated ${daysStale} days ago. Run 'qmd update-all' to refresh.${c.reset}\n`);
   }
-}
-
-async function hashContent(content: string): Promise<string> {
-  const hash = new Bun.CryptoHasher("sha256");
-  hash.update(content);
-  return hash.digest("hex");
-}
-
-// Cache helpers for Ollama API calls (not embeddings)
-function getCacheKey(url: string, body: object): string {
-  const hash = new Bun.CryptoHasher("sha256");
-  hash.update(url);
-  hash.update(JSON.stringify(body));
-  return hash.digest("hex");
-}
-
-function getCachedResult(db: Database, cacheKey: string): string | null {
-  const row = db.prepare(`SELECT result FROM ollama_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
-  return row?.result || null;
-}
-
-function setCachedResult(db: Database, cacheKey: string, result: string): void {
-  const now = new Date().toISOString();
-  db.prepare(`INSERT OR REPLACE INTO ollama_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
-
-  // 1 in 100 chance to truncate to most recent 1000 entries
-  if (Math.random() < 0.01) {
-    db.exec(`DELETE FROM ollama_cache WHERE hash NOT IN (SELECT hash FROM ollama_cache ORDER BY created_at DESC LIMIT 1000)`);
-  }
-}
-
-function clearCache(db: Database): void {
-  db.exec(`DELETE FROM ollama_cache`);
-}
-
-// Extract title from first markdown headline, or use filename as fallback
-function extractTitle(content: string, filename: string): string {
-  const match = content.match(/^##?\s+(.+)$/m);
-  if (match) {
-    const title = match[1].trim();
-    // Skip generic "📝 Notes" heading, find next ## instead
-    if (title === "📝 Notes" || title === "Notes") {
-      const nextMatch = content.match(/^##\s+(.+)$/m);
-      if (nextMatch) return nextMatch[1].trim();
-    }
-    return title;
-  }
-  return filename.replace(/\.md$/, "").split("/").pop() || filename;
-}
-
-// Format text for EmbeddingGemma
-function formatQueryForEmbedding(query: string): string {
-  return `task: search result | query: ${query}`;
-}
-
-function formatDocForEmbedding(text: string, title?: string): string {
-  return `title: ${title || "none"} | text: ${text}`;
-}
-
-// Chunk document into ~6KB pieces, breaking at word boundaries
-function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZE): { text: string; pos: number }[] {
-  const encoder = new TextEncoder();
-  const totalBytes = encoder.encode(content).length;
-
-  // Single chunk if small enough
-  if (totalBytes <= maxBytes) {
-    return [{ text: content, pos: 0 }];
-  }
-
-  const chunks: { text: string; pos: number }[] = [];
-  let charPos = 0;
-
-  while (charPos < content.length) {
-    // Find chunk boundary at ~maxBytes
-    let endPos = charPos;
-    let byteCount = 0;
-
-    // Advance character by character, counting bytes
-    while (endPos < content.length && byteCount < maxBytes) {
-      const charBytes = encoder.encode(content[endPos]).length;
-      if (byteCount + charBytes > maxBytes) break;
-      byteCount += charBytes;
-      endPos++;
-    }
-
-    // Back up to word boundary (paragraph, newline, or space)
-    if (endPos < content.length && endPos > charPos) {
-      const slice = content.slice(charPos, endPos);
-      // Prefer paragraph break, then sentence end, then newline, then space
-      const paragraphBreak = slice.lastIndexOf('\n\n');
-      const sentenceEnd = Math.max(
-        slice.lastIndexOf('. '),
-        slice.lastIndexOf('.\n'),
-        slice.lastIndexOf('? '),
-        slice.lastIndexOf('?\n'),
-        slice.lastIndexOf('! '),
-        slice.lastIndexOf('!\n')
-      );
-      const lineBreak = slice.lastIndexOf('\n');
-      const spaceBreak = slice.lastIndexOf(' ');
-
-      let breakPoint = -1;
-      if (paragraphBreak > slice.length * 0.5) {
-        breakPoint = paragraphBreak + 2; // Include the double newline
-      } else if (sentenceEnd > slice.length * 0.5) {
-        breakPoint = sentenceEnd + 2; // Include period and space
-      } else if (lineBreak > slice.length * 0.3) {
-        breakPoint = lineBreak + 1;
-      } else if (spaceBreak > slice.length * 0.3) {
-        breakPoint = spaceBreak + 1;
-      }
-
-      if (breakPoint > 0) {
-        endPos = charPos + breakPoint;
-      }
-    }
-
-    // Ensure we make progress (at least one character)
-    if (endPos <= charPos) {
-      endPos = charPos + 1;
-    }
-
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
-    charPos = endPos;
-  }
-
-  return chunks;
 }
 
 // Compute unique display path for a document
@@ -910,16 +563,34 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     filepath = homedir() + filepath.slice(1);
   }
 
-  // Try exact match first
+  // Try exact match on filepath first
   let doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
+
+  // Try exact match on display_path
+  if (!doc) {
+    doc = db.prepare(`SELECT filepath, body FROM documents WHERE display_path = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
+  }
 
   // Try matching by filename ending (allows partial paths)
   if (!doc) {
     doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
   }
 
+  // Try matching by display_path ending
   if (!doc) {
+    doc = db.prepare(`SELECT filepath, body FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
+  }
+
+  if (!doc) {
+    // Suggest similar files using Levenshtein distance
+    const similar = findSimilarFiles(db, filepath, 5, 5);
     console.error(`Document not found: ${filename}`);
+    if (similar.length > 0) {
+      console.error(`\nDid you mean one of these?`);
+      for (const s of similar) {
+        console.error(`  ${s}`);
+      }
+    }
     db.close();
     process.exit(1);
   }
@@ -943,6 +614,171 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
   }
   console.log(output);
   db.close();
+}
+
+// Multi-get: fetch multiple documents by glob pattern or comma-separated list
+function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli"): void {
+  const db = getDb();
+
+  // Check if it's a comma-separated list or a glob pattern
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+
+  let files: { filepath: string; displayPath: string; bodyLength: number }[];
+
+  if (isCommaSeparated) {
+    // Comma-separated list of files
+    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
+    files = [];
+    for (const name of names) {
+      // Try exact match on display_path first
+      let doc = db.prepare(`SELECT filepath, display_path, LENGTH(body) as body_length FROM documents WHERE display_path = ? AND active = 1`).get(name) as { filepath: string; display_path: string; body_length: number } | null;
+      // Try suffix match
+      if (!doc) {
+        doc = db.prepare(`SELECT filepath, display_path, LENGTH(body) as body_length FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${name}`) as { filepath: string; display_path: string; body_length: number } | null;
+      }
+      if (doc) {
+        files.push({ filepath: doc.filepath, displayPath: doc.display_path, bodyLength: doc.body_length });
+      } else {
+        // Suggest similar files
+        const similar = findSimilarFiles(db, name, 5, 3);
+        console.error(`File not found: ${name}`);
+        if (similar.length > 0) {
+          console.error(`  Did you mean: ${similar.join(', ')}`);
+        }
+      }
+    }
+  } else {
+    // Glob pattern on display_path
+    files = matchFilesByGlob(db, pattern);
+    if (files.length === 0) {
+      console.error(`No files matched pattern: ${pattern}`);
+      db.close();
+      process.exit(1);
+    }
+  }
+
+  // Collect results for structured output
+  const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
+
+  for (const file of files) {
+    const context = getContextForFile(db, file.filepath);
+
+    // Check size limit
+    if (file.bodyLength > maxBytes) {
+      results.push({
+        file: file.filepath,
+        displayPath: file.displayPath,
+        title: file.displayPath.split('/').pop() || file.displayPath,
+        body: "",
+        context,
+        skipped: true,
+        skipReason: `File too large (${Math.round(file.bodyLength / 1024)}KB > ${Math.round(maxBytes / 1024)}KB). Use 'qmd get ${file.displayPath}' to retrieve.`,
+      });
+      continue;
+    }
+
+    const doc = db.prepare(`SELECT body, title FROM documents WHERE filepath = ? AND active = 1`).get(file.filepath) as { body: string; title: string } | null;
+    if (!doc) continue;
+
+    let body = doc.body;
+
+    // Apply line limit if specified
+    if (maxLines !== undefined) {
+      const lines = body.split('\n');
+      body = lines.slice(0, maxLines).join('\n');
+      if (lines.length > maxLines) {
+        body += `\n\n[... truncated ${lines.length - maxLines} more lines]`;
+      }
+    }
+
+    results.push({
+      file: file.filepath,
+      displayPath: file.displayPath,
+      title: doc.title || file.displayPath.split('/').pop() || file.displayPath,
+      body,
+      context,
+      skipped: false,
+    });
+  }
+
+  db.close();
+
+  // Output based on format
+  if (format === "json") {
+    const output = results.map(r => ({
+      file: r.displayPath,
+      title: r.title,
+      ...(r.context && { context: r.context }),
+      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
+    }));
+    console.log(JSON.stringify(output, null, 2));
+  } else if (format === "csv") {
+    const escapeField = (val: string | null): string => {
+      if (val === null || val === undefined) return "";
+      const str = String(val);
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+    console.log("file,title,context,skipped,body");
+    for (const r of results) {
+      console.log([r.displayPath, r.title, r.context || "", r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+    }
+  } else if (format === "files") {
+    for (const r of results) {
+      const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
+      const status = r.skipped ? "[SKIPPED]" : "";
+      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
+    }
+  } else if (format === "md") {
+    for (const r of results) {
+      console.log(`## ${r.displayPath}\n`);
+      if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
+      if (r.context) console.log(`**Context:** ${r.context}\n`);
+      if (r.skipped) {
+        console.log(`> ${r.skipReason}\n`);
+      } else {
+        console.log("```");
+        console.log(r.body);
+        console.log("```\n");
+      }
+    }
+  } else if (format === "xml") {
+    console.log('<?xml version="1.0" encoding="UTF-8"?>');
+    console.log("<documents>");
+    for (const r of results) {
+      console.log("  <document>");
+      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
+      console.log(`    <title>${escapeXml(r.title)}</title>`);
+      if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
+      if (r.skipped) {
+        console.log(`    <skipped>true</skipped>`);
+        console.log(`    <reason>${escapeXml(r.skipReason || "")}</reason>`);
+      } else {
+        console.log(`    <body>${escapeXml(r.body)}</body>`);
+      }
+      console.log("  </document>");
+    }
+    console.log("</documents>");
+  } else {
+    // CLI format (default)
+    for (const r of results) {
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`File: ${r.displayPath}`);
+      console.log(`${'='.repeat(60)}\n`);
+
+      if (r.skipped) {
+        console.log(`[SKIPPED: ${r.skipReason}]`);
+        continue;
+      }
+
+      if (r.context) {
+        console.log(`Folder Context: ${r.context}\n---\n`);
+      }
+      console.log(r.body);
+    }
+  }
 }
 
 // Get context for a filepath (finds most specific matching path prefix)
@@ -1266,54 +1102,6 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   db.close();
 }
 
-function escapeCSV(value: string): string {
-  if (value.includes('"') || value.includes(',') || value.includes('\n')) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
-
-function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): { line: number; snippet: string } {
-  // If chunkPos provided, calculate line offset and focus search there
-  let lineOffset = 0;
-  let searchBody = body;
-  if (chunkPos && chunkPos > 0) {
-    // Count lines before chunkPos to get line offset
-    const beforeChunk = body.slice(0, chunkPos);
-    lineOffset = beforeChunk.split('\n').length - 1;
-    // Focus search on the chunk area (with some context before)
-    const contextStart = Math.max(0, chunkPos - 200);
-    searchBody = body.slice(contextStart);
-    if (contextStart > 0) {
-      lineOffset = body.slice(0, contextStart).split('\n').length - 1;
-    }
-  }
-
-  const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-  let bestLine = 0, bestScore = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const lineLower = lines[i].toLowerCase();
-    let score = 0;
-    for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestLine = i;
-    }
-  }
-
-  const startLine = Math.max(0, bestLine - 1);
-  const endLine = Math.min(lines.length, bestLine + 2);
-  let snippet = lines.slice(startLine, endLine).join('\n');
-  if (snippet.length > maxLen) snippet = snippet.substring(0, maxLen - 3) + "...";
-  return { line: lineOffset + bestLine + 1, snippet };
-}
-
-type SearchResult = { file: string; displayPath: string; title: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
-
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
   // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
@@ -1356,20 +1144,35 @@ function normalizeBM25(score: number): number {
   return 1 / (1 + Math.exp(-(absScore - 5) / 3));
 }
 
-function searchFTS(db: Database, query: string, limit: number = 20): SearchResult[] {
+// Get collection ID by name (matches pwd suffix)
+function getCollectionIdByName(db: Database, name: string): number | null {
+  const result = db.prepare(`SELECT id FROM collections WHERE pwd LIKE ? ORDER BY LENGTH(pwd) DESC LIMIT 1`).get(`%${name}`) as { id: number } | null;
+  return result?.id || null;
+}
+
+function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
   // BM25 weights: name=10, body=1 (title matches ranked higher)
-  const stmt = db.prepare(`
+  let sql = `
     SELECT d.filepath, d.display_path, d.title, d.body, bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     WHERE documents_fts MATCH ? AND d.active = 1
-    ORDER BY score
-    LIMIT ?
-  `);
-  const results = stmt.all(ftsQuery, limit) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
+  `;
+  const params: (string | number)[] = [ftsQuery];
+
+  if (collectionId !== undefined) {
+    sql += ` AND d.collection_id = ?`;
+    params.push(collectionId);
+  }
+
+  sql += ` ORDER BY score LIMIT ?`;
+  params.push(limit);
+
+  const stmt = db.prepare(sql);
+  const results = stmt.all(...params) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
   return results.map(r => ({
     file: r.filepath,
     displayPath: r.display_path,
@@ -1380,7 +1183,7 @@ function searchFTS(db: Database, query: string, limit: number = 20): SearchResul
   }));
 }
 
-async function searchVec(db: Database, query: string, model: string, limit: number = 20): Promise<SearchResult[]> {
+async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -1389,14 +1192,19 @@ async function searchVec(db: Database, query: string, model: string, limit: numb
 
   // Join: vectors_vec -> content_vectors -> documents
   // Over-retrieve to handle multiple chunks per document, then dedupe
-  const stmt = db.prepare(`
+  let sql = `
     SELECT d.filepath, d.display_path, d.title, d.body, vec.distance, cv.pos
     FROM vectors_vec vec
     JOIN content_vectors cv ON vec.hash_seq = cv.hash || '_' || cv.seq
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     WHERE vec.embedding MATCH ? AND k = ?
-    ORDER BY vec.distance
-  `);
+  `;
+  if (collectionId !== undefined) {
+    sql += ` AND d.collection_id = ${collectionId}`;
+  }
+  sql += ` ORDER BY vec.distance`;
+
+  const stmt = db.prepare(sql);
   const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; display_path: string; title: string; body: string; distance: number; pos: number }[];
 
   // Aggregate chunks per document: max score + small bonus for additional matches
@@ -1445,7 +1253,7 @@ function normalizeScores(results: SearchResult[]): SearchResult[] {
 // Reciprocal Rank Fusion: combines multiple ranked lists
 // RRF score = sum(1 / (k + rank)) across all lists where doc appears
 // k=60 is standard, provides good balance between top and lower ranks
-type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
+export type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
 
 function reciprocalRankFusion(
   resultLists: RankedResult[][],
@@ -1482,13 +1290,13 @@ function reciprocalRankFusion(
     .sort((a, b) => b.score - a.score);
 }
 
-type OutputFormat = "cli" | "csv" | "md" | "xml" | "files" | "json";
 type OutputOptions = {
   format: OutputFormat;
   full: boolean;
   limit: number;
   minScore: number;
   all?: boolean;
+  collection?: string;  // Filter by collection name (pwd suffix match)
 };
 
 // Extract snippet with more context lines for CLI display
@@ -1652,9 +1460,21 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
+
+  // Resolve collection filter if specified
+  let collectionId: number | undefined;
+  if (opts.collection) {
+    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
+    if (collectionId === undefined) {
+      console.error(`Collection not found: ${opts.collection}`);
+      db.close();
+      process.exit(1);
+    }
+  }
+
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit);
+  const results = searchFTS(db, query, fetchLimit, collectionId);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1673,6 +1493,17 @@ function search(query: string, opts: OutputOptions): void {
 
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
+
+  // Resolve collection filter if specified
+  let collectionId: number | undefined;
+  if (opts.collection) {
+    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
+    if (collectionId === undefined) {
+      console.error(`Collection not found: ${opts.collection}`);
+      db.close();
+      process.exit(1);
+    }
+  }
 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
@@ -1694,7 +1525,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
 
   for (const q of queries) {
-    const vecResults = await searchVec(db, q, model, perQueryLimit);
+    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionId);
     for (const r of vecResults) {
       const existing = allResults.get(r.file);
       if (!existing || r.score > existing.score) {
@@ -1788,6 +1619,17 @@ Output exactly 2 variations, one per line, no numbering or bullets:`;
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
+  // Resolve collection filter if specified
+  let collectionId: number | undefined;
+  if (opts.collection) {
+    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
+    if (collectionId === undefined) {
+      console.error(`Collection not found: ${opts.collection}`);
+      db.close();
+      process.exit(1);
+    }
+  }
+
   // Check index health and warn about issues
   checkIndexHealth(db);
 
@@ -1801,14 +1643,14 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   for (const q of queries) {
     // FTS search - get ranked results
-    const ftsResults = searchFTS(db, q, 20);
+    const ftsResults = searchFTS(db, q, 20, collectionId);
     if (ftsResults.length > 0) {
       rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
     }
 
     // Vector search - get ranked results
     if (hasVectors) {
-      const vecResults = await searchVec(db, q, embedModel, 20);
+      const vecResults = await searchVec(db, q, embedModel, 20, collectionId);
       if (vecResults.length > 0) {
         rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
       }
@@ -1871,393 +1713,6 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   outputResults(finalResults, query, opts);
 }
 
-// =============================================================================
-// MCP Server Implementation
-// =============================================================================
-
-// Convert search results to CSV format for MCP responses
-function toMcpCsv(results: { file: string; title: string; score: number; context: string | null; snippet: string }[]): string {
-  const escapeField = (val: string | null | number): string => {
-    if (val === null || val === undefined) return "";
-    const str = String(val);
-    if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
-  const header = "file,title,score,context,snippet";
-  const rows = results.map(r =>
-    [r.file, r.title, r.score, r.context || "", r.snippet].map(escapeField).join(",")
-  );
-  return [header, ...rows].join("\n");
-}
-
-async function startMcpServer(): Promise<void> {
-  const server = new McpServer({
-    name: "qmd",
-    version: "1.0.0",
-  });
-
-  // Register the query prompt - describes ideal usage
-  server.registerPrompt(
-    "query",
-    {
-      title: "QMD Query Guide",
-      description: "How to effectively search your knowledge base with QMD",
-    },
-    () => ({
-      messages: [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text: `# QMD - Quick Markdown Search
-
-QMD is your on-device search engine for markdown knowledge bases. Use it to find information across your notes, documents, and meeting transcripts.
-
-## Available Tools
-
-### 1. qmd_search (Fast keyword search)
-Best for: Finding documents with specific keywords or phrases.
-- Uses BM25 full-text search
-- Fast, no LLM required
-- Good for exact matches
-
-### 2. qmd_vsearch (Semantic search)
-Best for: Finding conceptually related content even without exact keyword matches.
-- Uses vector embeddings
-- Understands meaning and context
-- Good for "how do I..." or conceptual queries
-
-### 3. qmd_query (Hybrid search - highest quality)
-Best for: Important searches where you want the best results.
-- Combines keyword + semantic search
-- Expands your query with variations
-- Re-ranks results with LLM
-- Slower but most accurate
-
-### 4. qmd_get (Retrieve document)
-Best for: Getting the full content of a document you found.
-- Use the file path from search results
-- Supports line ranges: \`file.md:100\` or \`--from 50 -l 20\`
-
-## Search Strategy
-
-1. **Start with qmd_search** for quick keyword lookups
-2. **Use qmd_vsearch** when keywords aren't working or for conceptual queries
-3. **Use qmd_query** for important searches or when you need high confidence
-4. **Use qmd_get** to retrieve full documents after finding them
-
-## Tips
-
-- Use \`--min-score 0.5\` to filter low-relevance results
-- Use \`--all --files\` to get a complete list of matches
-- Check the "Context" field - it describes what kind of content the file contains
-- File paths are relative to their collection (e.g., \`pages/meeting.md\`)`,
-          },
-        },
-      ],
-    })
-  );
-
-  // Tool: search (BM25 full-text)
-  server.registerTool(
-    "qmd_search",
-    {
-      title: "Search (BM25)",
-      description: "Fast keyword-based full-text search using BM25. Best for finding documents with specific words or phrases.",
-      inputSchema: {
-        query: z.string().describe("Search query - keywords or phrases to find"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-      },
-    },
-    async ({ query, limit, minScore }) => {
-      const db = getDb();
-      const results = searchFTS(db, query, limit || 10);
-      const filtered = results
-        .filter(r => r.score >= (minScore || 0))
-        .map(r => ({
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: getContextForFile(db, r.file),
-          snippet: extractSnippet(r.body, query, 300, r.chunkPos).snippet,
-        }));
-      db.close();
-
-      return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: toMcpCsv(filtered),
-          },
-        ],
-      };
-    }
-  );
-
-  // Tool: vsearch (Vector semantic search)
-  server.registerTool(
-    "qmd_vsearch",
-    {
-      title: "Vector Search (Semantic)",
-      description: "Semantic similarity search using vector embeddings. Finds conceptually related content even without exact keyword matches. Requires embeddings (run 'qmd embed' first).",
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
-      },
-    },
-    async ({ query, limit, minScore }) => {
-      const db = getDb();
-
-      const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-      if (!tableExists) {
-        db.close();
-        return {
-          content: [{ type: "text", text: "Error: Vector index not found. Run 'qmd embed' first to create embeddings." }],
-        };
-      }
-
-      // Expand query
-      const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
-
-      // Collect results
-      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
-      for (const q of queries) {
-        const vecResults = await searchVec(db, q, DEFAULT_EMBED_MODEL, limit || 10);
-        for (const r of vecResults) {
-          const existing = allResults.get(r.file);
-          if (!existing || r.score > existing.score) {
-            allResults.set(r.file, { file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score });
-          }
-        }
-      }
-
-      const filtered = Array.from(allResults.values())
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit || 10)
-        .filter(r => r.score >= (minScore || 0.3))
-        .map(r => ({
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: getContextForFile(db, r.file),
-          snippet: extractSnippet(r.body, query, 300).snippet,
-        }));
-
-      db.close();
-
-      return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: toMcpCsv(filtered),
-          },
-        ],
-      };
-    }
-  );
-
-  // Tool: query (Hybrid with reranking)
-  server.registerTool(
-    "qmd_query",
-    {
-      title: "Hybrid Query (Best Quality)",
-      description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-      },
-    },
-    async ({ query, limit, minScore }) => {
-      const db = getDb();
-
-      // Expand query
-      const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
-
-      // Collect ranked lists
-      const rankedLists: RankedResult[][] = [];
-      const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-
-      for (const q of queries) {
-        const ftsResults = searchFTS(db, q, 20);
-        if (ftsResults.length > 0) {
-          rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
-        }
-        if (hasVectors) {
-          const vecResults = await searchVec(db, q, DEFAULT_EMBED_MODEL, 20);
-          if (vecResults.length > 0) {
-            rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
-          }
-        }
-      }
-
-      // RRF fusion
-      const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-      const fused = reciprocalRankFusion(rankedLists, weights);
-      const candidates = fused.slice(0, 30);
-
-      // Rerank
-      const reranked = await rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL,
-        db
-      );
-
-      // Blend scores
-      const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-      const finalResults = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        let rrfWeight: number;
-        if (rrfRank <= 3) rrfWeight = 0.75;
-        else if (rrfRank <= 10) rrfWeight = 0.60;
-        else rrfWeight = 0.40;
-        const rrfScore = 1 / rrfRank;
-        const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-        const candidate = candidateMap.get(r.file);
-        return {
-          file: candidate?.displayPath || "",
-          title: candidate?.title || "",
-          score: Math.round(blendedScore * 100) / 100,
-          context: getContextForFile(db, r.file),
-          snippet: extractSnippet(candidate?.body || "", query, 300).snippet,
-        };
-      }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
-
-      db.close();
-
-      return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: toMcpCsv(finalResults),
-          },
-        ],
-      };
-    }
-  );
-
-  // Tool: get (Retrieve document)
-  server.registerTool(
-    "qmd_get",
-    {
-      title: "Get Document",
-      description: "Retrieve the full content of a document by its file path. Use paths from search results.",
-      inputSchema: {
-        file: z.string().describe("File path from search results (e.g., 'pages/meeting.md' or 'pages/meeting.md:100' to start at line 100)"),
-        fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
-        maxLines: z.number().optional().describe("Maximum number of lines to return"),
-      },
-    },
-    async ({ file, fromLine, maxLines }) => {
-      const db = getDb();
-
-      let filepath = file;
-      const colonMatch = filepath.match(/:(\d+)$/);
-      if (colonMatch && !fromLine) {
-        fromLine = parseInt(colonMatch[1], 10);
-        filepath = filepath.slice(0, -colonMatch[0].length);
-      }
-
-      if (filepath.startsWith("~/")) {
-        filepath = homedir() + filepath.slice(1);
-      }
-
-      let doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
-      if (!doc) {
-        doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
-      }
-
-      if (!doc) {
-        db.close();
-        return {
-          content: [{ type: "text", text: `Error: Document not found: ${file}` }],
-        };
-      }
-
-      const context = getContextForFile(db, doc.filepath);
-      let output = doc.body;
-
-      if (fromLine !== undefined || maxLines !== undefined) {
-        const lines = output.split("\n");
-        const start = (fromLine || 1) - 1;
-        const end = maxLines !== undefined ? start + maxLines : lines.length;
-        output = lines.slice(start, end).join("\n");
-      }
-
-      db.close();
-
-      let result = "";
-      if (context) {
-        result += `Folder Context: ${context}\n---\n\n`;
-      }
-      result += output;
-
-      return {
-        content: [{ type: "text", text: result }],
-      };
-    }
-  );
-
-  // Tool: status (Index status)
-  server.registerTool(
-    "qmd_status",
-    {
-      title: "Index Status",
-      description: "Show the status of the QMD index: collections, document counts, and health information.",
-      inputSchema: {},
-    },
-    async () => {
-      const db = getDb();
-
-      const collections = db.prepare(`
-        SELECT c.id, c.pwd, c.glob_pattern, c.created_at,
-               COUNT(d.id) as active_count,
-               MAX(d.modified_at) as last_doc_update
-        FROM collections c
-        LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
-        GROUP BY c.id
-        ORDER BY last_doc_update DESC
-      `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; active_count: number; last_doc_update: string | null }[];
-
-      const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
-      const needsEmbedding = getHashesNeedingEmbedding(db);
-      const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-
-      const status = {
-        totalDocuments: totalDocs,
-        needsEmbedding,
-        hasVectorIndex: hasVectors,
-        collections: collections.map(col => ({
-          path: col.pwd,
-          pattern: col.glob_pattern,
-          documents: col.active_count,
-          lastUpdated: col.last_doc_update || col.created_at,
-        })),
-      };
-
-      db.close();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
-      };
-    }
-  );
-
-  // Connect via stdio
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
-
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -2276,6 +1731,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
+      collection: { type: "string", short: "c" },  // Filter by collection
       // Add options
       drop: { type: "boolean" },
       // Embed options
@@ -2283,14 +1739,15 @@ function parseCLI() {
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
+      "max-bytes": { type: "string" },  // max bytes for multi-get
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
   });
 
-  // Set global index name
+  // Set global index name in store
   if (values.index) {
-    customIndexName = values.index;
+    setCustomIndexName(values.index);
   }
 
   // Determine output format
@@ -2312,6 +1769,7 @@ function parseCLI() {
     limit: isAll ? 100000 : (values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit),
     minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
     all: isAll,
+    collection: values.collection as string | undefined,
   };
 
   return {
@@ -2328,6 +1786,7 @@ function showHelp(): void {
   console.log("  qmd add [--drop] [glob]       - Add/update collection from $PWD (default: **/*.md)");
   console.log("  qmd add-context <path> <text> - Add context description for files under path");
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
+  console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update-all                - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
@@ -2350,6 +1809,12 @@ function showHelp(): void {
   console.log("  --csv                      - CSV output with snippets");
   console.log("  --md                       - Markdown output");
   console.log("  --xml                      - XML output");
+  console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("");
+  console.log("Multi-get options:");
+  console.log("  -l <num>                   - Maximum lines per file");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
+  console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
   console.log("Environment:");
   console.log("  OLLAMA_URL                 - Ollama server URL (default: http://localhost:11434)");
@@ -2361,7 +1826,8 @@ function showHelp(): void {
   console.log(`Index: ${getDbPath()}`);
 }
 
-// Main CLI
+// Main CLI - only run if this is the main module
+if (import.meta.main) {
 const cli = parseCLI();
 
 if (!cli.command || cli.values.help) {
@@ -2414,6 +1880,18 @@ switch (cli.command) {
     break;
   }
 
+  case "multi-get": {
+    if (!cli.args[0]) {
+      console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
+      console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
+      process.exit(1);
+    }
+    const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+    const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
+    multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+    break;
+  }
+
   case "status":
     showStatus();
     break;
@@ -2454,9 +1932,11 @@ switch (cli.command) {
     await querySearch(cli.query, cli.opts);
     break;
 
-  case "mcp":
+  case "mcp": {
+    const { startMcpServer } = await import("./mcp.js");
     await startMcpServer();
     break;
+  }
 
   case "cleanup": {
     const db = getDb();
@@ -2513,3 +1993,4 @@ switch (cli.command) {
     console.error("Run 'qmd --help' for usage.");
     process.exit(1);
 }
+} // end if (import.meta.main)

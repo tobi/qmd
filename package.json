@@ -7,13 +7,15 @@
     "qmd": "./qmd"
   },
   "scripts": {
+    "test": "bun test",
     "qmd": "bun qmd.ts",
     "index": "bun qmd.ts index",
     "vector": "bun qmd.ts vector",
     "search": "bun qmd.ts search",
     "vsearch": "bun qmd.ts vsearch",
     "rerank": "bun qmd.ts rerank",
-    "link": "bun link"
+    "link": "bun link",
+    "inspector": "npx @modelcontextprotocol/inspector bun qmd.ts mcp"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",

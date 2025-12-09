@@ -12,6 +12,26 @@ qmd embed              # Generate vector embeddings (requires Ollama)
 qmd search <query>     # BM25 full-text search
 qmd vsearch <query>    # Vector similarity search
 qmd query <query>      # Hybrid search with reranking (best quality)
+qmd get <file>         # Get document content (fuzzy matches if not found)
+qmd multi-get <pattern> # Get multiple docs by glob or comma-separated list
+```
+
+## Options
+
+```sh
+# Search & retrieval
+-c, --collection <name>  # Restrict search to a collection (matches pwd suffix)
+-n <num>                 # Number of results
+--all                    # Return all matches
+--min-score <num>        # Minimum score threshold
+--full                   # Show full document content
+
+# Multi-get specific
+-l <num>                 # Maximum lines per file
+--max-bytes <num>        # Skip files larger than this (default 10KB)
+
+# Output formats (search and multi-get)
+--json, --csv, --md, --xml, --files
 ```
 
 ## Development
