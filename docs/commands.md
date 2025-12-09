@@ -112,20 +112,38 @@ qmd add [pattern] [--index <name>]
 # Index all markdown files
 qmd add .
 
-# Index specific directory
-qmd add docs/
+# Index specific directory (ALWAYS QUOTE GLOBS!)
+qmd add "docs/**/*.md"
 
-# Custom pattern
+# Custom pattern (QUOTE IT!)
 qmd add "src/**/*.md"
 
 # Named index
 qmd add . --index work
 ```
 
+**⚠️ Important: Quote Glob Patterns**
+
+Always quote glob patterns to prevent shell expansion:
+
+```bash
+# ✓ Correct
+qmd add "**/*.md"
+qmd add "docs/**/*.md"
+
+# ✗ Wrong (shell expands before qmd sees it)
+qmd add **/*.md        # Error: Unexpected argument
+qmd add docs/**/*.md   # Error: Unexpected argument
+```
+
+**What Happens Without Quotes:**
+When you run `qmd add **/*.md`, your shell expands it to `qmd add file1.md file2.md file3.md`, causing an error.
+
 **Behavior:**
 - Creates or updates collection for (pwd, pattern)
 - Detects new, updated, removed files
 - Shows statistics: indexed, updated, unchanged, removed
+- Warns if pattern looks like a file instead of glob
 
 ---
 
