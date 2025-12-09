@@ -4,6 +4,7 @@ import type { OutputOptions } from '../models/types.ts';
 import { getDbPath } from '../utils/paths.ts';
 import { getDb } from '../database/index.ts';
 import { fullTextSearch } from '../services/search.ts';
+import { logSearch } from '../utils/history.ts';
 
 export default class SearchCommand extends Command {
   static description = 'Full-text search using BM25';
@@ -88,6 +89,15 @@ export default class SearchCommand extends Command {
       // Search using service
       const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
       const results = await fullTextSearch(db, args.query, fetchLimit);
+
+      // Log search to history
+      logSearch({
+        timestamp: new Date().toISOString(),
+        command: 'search',
+        query: args.query,
+        results_count: results.length,
+        index: flags.index,
+      });
 
       if (results.length === 0) {
         this.log('No results found.');

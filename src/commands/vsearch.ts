@@ -4,6 +4,7 @@ import type { OutputOptions } from '../models/types.ts';
 import { getDbPath } from '../utils/paths.ts';
 import { getDb } from '../database/index.ts';
 import { vectorSearch } from '../services/search.ts';
+import { logSearch } from '../utils/history.ts';
 import { DEFAULT_EMBED_MODEL } from '../config/constants.ts';
 
 export default class VSearchCommand extends Command {
@@ -84,6 +85,15 @@ export default class VSearchCommand extends Command {
       // Vector search using service
       const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
       const results = await vectorSearch(db, args.query, embedModel, fetchLimit);
+
+      // Log search to history
+      logSearch({
+        timestamp: new Date().toISOString(),
+        command: 'vsearch',
+        query: args.query,
+        results_count: results.length,
+        index: flags.index,
+      });
 
       if (results.length === 0) {
         this.log('No results found.');

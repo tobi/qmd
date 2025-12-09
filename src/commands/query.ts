@@ -4,6 +4,7 @@ import { getDbPath } from '../utils/paths.ts';
 import { getDb } from '../database/index.ts';
 import { hybridSearch } from '../services/search.ts';
 import { DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL } from '../config/constants.ts';
+import { logSearch } from '../utils/history.ts';
 
 export default class QueryCommand extends Command {
   static description = 'Hybrid search with RRF fusion and reranking (best quality)';
@@ -64,6 +65,15 @@ export default class QueryCommand extends Command {
 
       // Filter by min score
       const filtered = results.filter(r => r.score >= minScore).slice(0, flags.n);
+
+      // Log search to history
+      logSearch({
+        timestamp: new Date().toISOString(),
+        command: 'query',
+        query: args.query,
+        results_count: filtered.length,
+        index: flags.index,
+      });
 
       if (filtered.length === 0) {
         this.log('No results found.');
