@@ -4,15 +4,54 @@
 
 import { resolve } from 'path';
 import { homedir } from 'os';
+import { existsSync } from 'fs';
+
+/**
+ * Find .qmd/ directory by walking up from current directory
+ * @param startDir - Starting directory (defaults to PWD)
+ * @returns Path to .qmd/ directory or null if not found
+ */
+export function findQmdDir(startDir?: string): string | null {
+  let dir = startDir || getPwd();
+  const root = resolve('/');
+
+  // Walk up directory tree
+  while (dir !== root) {
+    const qmdDir = resolve(dir, '.qmd');
+    if (existsSync(qmdDir)) {
+      return qmdDir;
+    }
+    const parent = resolve(dir, '..');
+    if (parent === dir) break; // Safety check for root
+    dir = parent;
+  }
+
+  return null;
+}
 
 /**
  * Get the database path for a given index name
+ * Priority: 1) .qmd/ directory, 2) QMD_CACHE_DIR env var, 3) XDG_CACHE_HOME/qmd/
  * @param indexName - Name of the index (default: "index")
  * @returns Full path to the SQLite database file
  */
 export function getDbPath(indexName: string = "index"): string {
-  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
-  const qmdCacheDir = resolve(cacheDir, "qmd");
+  let qmdCacheDir: string;
+
+  // Priority 1: Check for .qmd/ directory in current project
+  const projectQmdDir = findQmdDir();
+  if (projectQmdDir) {
+    qmdCacheDir = projectQmdDir;
+  }
+  // Priority 2: Check QMD_CACHE_DIR environment variable
+  else if (process.env.QMD_CACHE_DIR) {
+    qmdCacheDir = resolve(process.env.QMD_CACHE_DIR);
+  }
+  // Priority 3: Use XDG_CACHE_HOME or ~/.cache/qmd (default)
+  else {
+    const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+    qmdCacheDir = resolve(cacheDir, "qmd");
+  }
 
   // Ensure cache directory exists
   try {

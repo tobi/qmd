@@ -30,6 +30,27 @@ bun link               # Install globally as 'qmd'
 - Reciprocal Rank Fusion (RRF) for combining results
 - Project-local indexes via `.qmd/` directory (like `.git/`)
 
+## Index Location Priority
+
+QMD searches for indexes in this order:
+1. **`.qmd/` directory** - Walks up from current directory (project-local)
+2. **`QMD_CACHE_DIR`** - Environment variable for custom location
+3. **`~/.cache/qmd/`** - Global default (respects `XDG_CACHE_HOME`)
+
+Example workflows:
+```sh
+# Project-local index (recommended)
+qmd init                    # Creates .qmd/ directory
+qmd add .                   # Uses .qmd/default.sqlite
+
+# Custom location via environment variable
+export QMD_CACHE_DIR=/custom/path
+qmd add .                   # Uses /custom/path/default.sqlite
+
+# Global index (no .qmd/ in tree)
+qmd add ~/Documents/notes   # Uses ~/.cache/qmd/default.sqlite
+```
+
 ## Important: Do NOT run automatically
 
 - Never run `qmd add`, `qmd init`, or `qmd embed` automatically

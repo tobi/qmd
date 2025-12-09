@@ -80,9 +80,7 @@ cache/
         this.log('');
         this.log('Indexing markdown files...');
 
-        // Note: We need to use the .qmd/ path for the database
-        // This will require updating getDbPath to check for .qmd/ first
-        // For now, we'll use the global index
+        // getDb will now automatically use the .qmd/ directory we just created
         const db = getDb('default');
 
         try {
