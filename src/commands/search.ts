@@ -1,8 +1,9 @@
 import { Command, Flags, Args } from '@oclif/core';
-import { Database } from 'bun:sqlite';
-import { resolve } from 'path';
 import { existsSync } from 'fs';
-import type { SearchResult, OutputOptions } from '../models/types.ts';
+import type { OutputOptions } from '../models/types.ts';
+import { getDbPath } from '../utils/paths.ts';
+import { getDb } from '../database/index.ts';
+import { fullTextSearch } from '../services/search.ts';
 
 export default class SearchCommand extends Command {
   static description = 'Full-text search using BM25';
@@ -59,14 +60,13 @@ export default class SearchCommand extends Command {
   async run(): Promise<void> {
     const { args, flags } = await this.parse(SearchCommand);
 
-    const cacheDir = process.env.XDG_CACHE_HOME || resolve(process.env.HOME || '~', '.cache');
-    const dbPath = resolve(cacheDir, 'qmd', `${flags.index}.sqlite`);
+    const dbPath = getDbPath(flags.index);
 
     if (!existsSync(dbPath)) {
       this.error(`No index found at: ${dbPath}\nRun: qmd add <files> to create an index`);
     }
 
-    const db = new Database(dbPath, { readonly: true });
+    const db = getDb(flags.index);
 
     try {
       // Determine output format
@@ -85,84 +85,21 @@ export default class SearchCommand extends Command {
         all: flags.all,
       };
 
-      // Search
+      // Search using service
       const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-      const results = this.searchFTS(db, args.query, fetchLimit);
+      const results = await fullTextSearch(db, args.query, fetchLimit);
 
-      // Add context
-      const resultsWithContext = results.map(r => ({
-        ...r,
-        context: this.getContextForFile(db, r.file),
-      }));
-
-      if (resultsWithContext.length === 0) {
+      if (results.length === 0) {
         this.log('No results found.');
         return;
       }
 
       // Output
-      this.outputResults(resultsWithContext, args.query, opts);
+      this.outputResults(results, args.query, opts);
 
     } finally {
       db.close();
     }
-  }
-
-  private searchFTS(db: Database, query: string, limit: number = 20): SearchResult[] {
-    const ftsQuery = this.buildFTS5Query(query);
-    if (!ftsQuery) return [];
-
-    // BM25 weights: title=10, body=1
-    const stmt = db.prepare(`
-      SELECT d.filepath, d.display_path, d.title, d.body, bm25(documents_fts, 10.0, 1.0) as score
-      FROM documents_fts f
-      JOIN documents d ON d.id = f.rowid
-      WHERE documents_fts MATCH ? AND d.active = 1
-      ORDER BY score
-      LIMIT ?
-    `);
-
-    const results = stmt.all(ftsQuery, limit) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
-
-    return results.map(r => ({
-      file: r.filepath,
-      displayPath: r.display_path,
-      title: r.title,
-      body: r.body,
-      score: this.normalizeBM25(r.score),
-      source: 'fts' as const,
-    }));
-  }
-
-  private buildFTS5Query(input: string): string | null {
-    const trimmed = input.trim();
-    if (!trimmed) return null;
-
-    // If already has FTS5 operators, use as-is
-    if (/[*"{}]/.test(trimmed) || /\b(AND|OR|NOT)\b/.test(trimmed)) {
-      return trimmed;
-    }
-
-    // Simple quote escape
-    const escaped = trimmed.replace(/"/g, '""');
-    return `"${escaped}"`;
-  }
-
-  private normalizeBM25(rawScore: number): number {
-    // Normalize BM25 score (negative) to 0-1 range
-    const normalized = 1 / (1 + Math.abs(rawScore) / 10);
-    return Math.round(normalized * 1000) / 1000;
-  }
-
-  private getContextForFile(db: Database, filepath: string): string | null {
-    const stmt = db.prepare(`
-      SELECT context_text FROM path_contexts
-      WHERE ? LIKE path_prefix || '%'
-      ORDER BY LENGTH(path_prefix) DESC
-      LIMIT 1
-    `);
-    const result = stmt.get(filepath) as { context_text: string } | undefined;
-    return result?.context_text || null;
   }
 
   private outputResults(results: any[], query: string, opts: OutputOptions): void {
