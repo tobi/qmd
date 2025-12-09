@@ -7,4 +7,6 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
+!REFACTORING_PLAN.md
+!ARCHITECTURE.md
 .beads/
