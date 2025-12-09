@@ -5,6 +5,7 @@ import { getPwd, getDbPath } from '../utils/paths.ts';
 import { getDb } from '../database/index.ts';
 import { OLLAMA_URL } from '../config/constants.ts';
 import { getHashesNeedingEmbedding } from '../database/db.ts';
+import { runAllIntegrityChecks, autoFixIssues } from '../database/integrity.ts';
 
 interface CheckResult {
   status: 'success' | 'warning' | 'error';
@@ -52,6 +53,7 @@ export default class DoctorCommand extends Command {
     await this.checkDependencies(flags);
     await this.checkServices(flags);
     await this.checkIndexHealth(flags);
+    await this.checkDataIntegrity(flags);
 
     // Output results
     if (flags.json) {
@@ -298,6 +300,66 @@ export default class DoctorCommand extends Command {
     }
 
     this.addCategory('Index Health', results);
+  }
+
+  private async checkDataIntegrity(flags: any): Promise<void> {
+    const results: CheckResult[] = [];
+    const dbPath = getDbPath(flags.index);
+
+    if (!existsSync(dbPath)) {
+      results.push({
+        status: 'warning',
+        message: 'No index to check',
+      });
+      this.addCategory('Data Integrity', results);
+      return;
+    }
+
+    try {
+      const db = getDb(flags.index);
+
+      // Run all integrity checks
+      const issues = runAllIntegrityChecks(db);
+
+      if (issues.length === 0) {
+        results.push({
+          status: 'success',
+          message: 'All data integrity checks passed',
+        });
+      } else {
+        // Add each issue as a result
+        for (const issue of issues) {
+          const status = issue.severity === 'error' ? 'error' : issue.severity === 'warning' ? 'warning' : 'success';
+          results.push({
+            status,
+            message: issue.message,
+            details: issue.details,
+            fix: issue.fixable ? (flags.fix ? 'Fixing...' : 'Auto-fixable with --fix flag') : issue.type === 'stale_documents' ? "Run 'qmd cleanup --older-than=90d'" : undefined,
+          });
+        }
+
+        // Auto-fix if requested
+        if (flags.fix) {
+          const fixed = autoFixIssues(db, issues);
+          if (fixed > 0) {
+            results.push({
+              status: 'success',
+              message: `Auto-fixed ${fixed} issue(s)`,
+            });
+          }
+        }
+      }
+
+      db.close();
+    } catch (error) {
+      results.push({
+        status: 'error',
+        message: 'Failed to check data integrity',
+        details: [`Error: ${error}`],
+      });
+    }
+
+    this.addCategory('Data Integrity', results);
   }
 
   private addCategory(name: string, results: CheckResult[]): void {
