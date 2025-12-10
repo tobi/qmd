@@ -6,6 +6,7 @@ import * as sqliteVec from "sqlite-vec";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { realpathSync } from "fs";
 
 const HOME = Bun.env.HOME || "/tmp";
 
@@ -116,10 +117,7 @@ function getPwd(): string {
 // Get canonical realpath, falling back to resolved path if file doesn't exist
 function getRealPath(path: string): string {
   try {
-    const result = Bun.spawnSync(["realpath", path]);
-    if (result.success) {
-      return result.stdout.toString().trim();
-    }
+    return realpathSync(path);
   } catch {}
   return resolve(path);
 }
