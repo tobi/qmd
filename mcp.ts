@@ -4,6 +4,8 @@
  *
  * Exposes QMD search and document retrieval as MCP tools and resources.
  * Documents are accessible via qmd:// URIs.
+ *
+ * Follows MCP spec 2025-06-18 for proper response types.
  */
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -19,7 +21,62 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { RankedResult } from "./store.js";
-import { searchResultsToMcpCsv } from "./formatter.js";
+
+// =============================================================================
+// Types for structured content
+// =============================================================================
+
+type SearchResultItem = {
+  file: string;
+  title: string;
+  score: number;
+  context: string | null;
+  snippet: string;
+};
+
+type StatusResult = {
+  totalDocuments: number;
+  needsEmbedding: number;
+  hasVectorIndex: boolean;
+  collections: {
+    id: number;
+    path: string;
+    pattern: string;
+    documents: number;
+    lastUpdated: string;
+  }[];
+};
+
+// =============================================================================
+// Helper functions
+// =============================================================================
+
+/**
+ * Encode a path for use in qmd:// URIs.
+ * Encodes special characters but preserves forward slashes for readability.
+ */
+function encodeQmdPath(path: string): string {
+  // Encode each path segment separately to preserve slashes
+  return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+/**
+ * Format search results as human-readable text summary
+ */
+function formatSearchSummary(results: SearchResultItem[], query: string): string {
+  if (results.length === 0) {
+    return `No results found for "${query}"`;
+  }
+  const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
+  for (const r of results) {
+    lines.push(`${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
+  }
+  return lines.join('\n');
+}
+
+// =============================================================================
+// MCP Server
+// =============================================================================
 
 export async function startMcpServer(): Promise<void> {
   // Open database once at startup - keep it open for the lifetime of the server
@@ -30,11 +87,13 @@ export async function startMcpServer(): Promise<void> {
     version: "1.0.0",
   });
 
-  // Register resource template for qmd:// URIs
-  // This allows clients to list and read documents via the MCP resources API
+  // ---------------------------------------------------------------------------
+  // Resource: qmd://{path}
+  // ---------------------------------------------------------------------------
+
   server.registerResource(
     "document",
-    new ResourceTemplate("qmd://{path}", {
+    new ResourceTemplate("qmd://{+path}", {
       list: async () => {
         // List all indexed documents
         const docs = store.db.prepare(`
@@ -47,8 +106,9 @@ export async function startMcpServer(): Promise<void> {
 
         return {
           resources: docs.map(doc => ({
-            uri: `qmd://${encodeURIComponent(doc.display_path)}`,
-            name: doc.title || doc.display_path,
+            uri: `qmd://${encodeQmdPath(doc.display_path)}`,
+            name: doc.display_path,
+            title: doc.title || doc.display_path,
             mimeType: "text/markdown",
           })),
         };
@@ -64,11 +124,11 @@ export async function startMcpServer(): Promise<void> {
       const decodedPath = decodeURIComponent(path);
 
       // Find document by display_path
-      let doc = store.db.prepare(`SELECT filepath, display_path, body FROM documents WHERE display_path = ? AND active = 1`).get(decodedPath) as { filepath: string; display_path: string; body: string } | null;
+      let doc = store.db.prepare(`SELECT filepath, display_path, title, body FROM documents WHERE display_path = ? AND active = 1`).get(decodedPath) as { filepath: string; display_path: string; title: string; body: string } | null;
 
       // Try suffix match if exact match fails
       if (!doc) {
-        doc = store.db.prepare(`SELECT filepath, display_path, body FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${decodedPath}`) as { filepath: string; display_path: string; body: string } | null;
+        doc = store.db.prepare(`SELECT filepath, display_path, title, body FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${decodedPath}`) as { filepath: string; display_path: string; title: string; body: string } | null;
       }
 
       if (!doc) {
@@ -85,6 +145,8 @@ export async function startMcpServer(): Promise<void> {
       return {
         contents: [{
           uri: uri.href,
+          name: doc.display_path,
+          title: doc.title || doc.display_path,
           mimeType: "text/markdown",
           text,
         }],
@@ -92,7 +154,10 @@ export async function startMcpServer(): Promise<void> {
     }
   );
 
-  // Register the query prompt - describes ideal usage
+  // ---------------------------------------------------------------------------
+  // Prompt: query guide
+  // ---------------------------------------------------------------------------
+
   server.registerPrompt(
     "query",
     {
@@ -111,21 +176,21 @@ QMD is your on-device search engine for markdown knowledge bases. Use it to find
 
 ## Available Tools
 
-### 1. qmd_search (Fast keyword search)
+### 1. search (Fast keyword search)
 Best for: Finding documents with specific keywords or phrases.
 - Uses BM25 full-text search
 - Fast, no LLM required
 - Good for exact matches
 - Use \`collection\` parameter to filter to a specific collection
 
-### 2. qmd_vsearch (Semantic search)
+### 2. vsearch (Semantic search)
 Best for: Finding conceptually related content even without exact keyword matches.
 - Uses vector embeddings
 - Understands meaning and context
 - Good for "how do I..." or conceptual queries
 - Use \`collection\` parameter to filter to a specific collection
 
-### 3. qmd_query (Hybrid search - highest quality)
+### 3. query (Hybrid search - highest quality)
 Best for: Important searches where you want the best results.
 - Combines keyword + semantic search
 - Expands your query with variations
@@ -133,19 +198,19 @@ Best for: Important searches where you want the best results.
 - Slower but most accurate
 - Use \`collection\` parameter to filter to a specific collection
 
-### 4. qmd_get (Retrieve document)
+### 4. get (Retrieve document)
 Best for: Getting the full content of a single document you found.
 - Use the file path from search results
 - Supports line ranges: \`file.md:100\` or fromLine/maxLines parameters
 - Suggests similar files if not found
 
-### 5. qmd_multi_get (Retrieve multiple documents)
+### 5. multi_get (Retrieve multiple documents)
 Best for: Getting content from multiple files at once.
 - Use glob patterns: \`journals/2025-05*.md\`
 - Or comma-separated: \`file1.md, file2.md\`
-- Skips files over maxBytes (default 10KB) - use qmd_get for large files
+- Skips files over maxBytes (default 10KB) - use get for large files
 
-### 6. qmd_status (Index info)
+### 6. status (Index info)
 Shows collection info, document counts, and embedding status.
 
 ## Resources
@@ -156,11 +221,11 @@ You can also access documents directly via the \`qmd://\` URI scheme:
 
 ## Search Strategy
 
-1. **Start with qmd_search** for quick keyword lookups
-2. **Use qmd_vsearch** when keywords aren't working or for conceptual queries
-3. **Use qmd_query** for important searches or when you need high confidence
-4. **Use qmd_get** to retrieve a single full document
-5. **Use qmd_multi_get** to batch retrieve multiple related files
+1. **Start with search** for quick keyword lookups
+2. **Use vsearch** when keywords aren't working or for conceptual queries
+3. **Use query** for important searches or when you need high confidence
+4. **Use get** to retrieve a single full document
+5. **Use multi_get** to batch retrieve multiple related files
 
 ## Tips
 
@@ -175,9 +240,12 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     })
   );
 
-  // Tool: search (BM25 full-text)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_search (BM25 full-text)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_search",
+    "search",
     {
       title: "Search (BM25)",
       description: "Fast keyword-based full-text search using BM25. Best for finding documents with specific words or phrases.",
@@ -194,12 +262,15 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       if (collection) {
         collectionId = store.getCollectionIdByName(collection) ?? undefined;
         if (collectionId === undefined) {
-          return { content: [{ type: "text", text: `Error: Collection not found: ${collection}` }] };
+          return {
+            content: [{ type: "text", text: `Collection not found: ${collection}` }],
+            isError: true,
+          };
         }
       }
 
       const results = store.searchFTS(query, limit || 10, collectionId);
-      const filtered = results
+      const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => ({
           file: r.displayPath,
@@ -210,20 +281,18 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         }));
 
       return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: searchResultsToMcpCsv(filtered),
-          },
-        ],
+        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        structuredContent: { results: filtered },
       };
     }
   );
 
-  // Tool: vsearch (Vector semantic search)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_vsearch (Vector semantic search)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_vsearch",
+    "vsearch",
     {
       title: "Vector Search (Semantic)",
       description: "Semantic similarity search using vector embeddings. Finds conceptually related content even without exact keyword matches. Requires embeddings (run 'qmd embed' first).",
@@ -240,14 +309,18 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       if (collection) {
         collectionId = store.getCollectionIdByName(collection) ?? undefined;
         if (collectionId === undefined) {
-          return { content: [{ type: "text", text: `Error: Collection not found: ${collection}` }] };
+          return {
+            content: [{ type: "text", text: `Collection not found: ${collection}` }],
+            isError: true,
+          };
         }
       }
 
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
         return {
-          content: [{ type: "text", text: "Error: Vector index not found. Run 'qmd embed' first to create embeddings." }],
+          content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
+          isError: true,
         };
       }
 
@@ -266,7 +339,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         }
       }
 
-      const filtered = Array.from(allResults.values())
+      const filtered: SearchResultItem[] = Array.from(allResults.values())
         .sort((a, b) => b.score - a.score)
         .slice(0, limit || 10)
         .filter(r => r.score >= (minScore || 0.3))
@@ -279,20 +352,18 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         }));
 
       return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: searchResultsToMcpCsv(filtered),
-          },
-        ],
+        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        structuredContent: { results: filtered },
       };
     }
   );
 
-  // Tool: query (Hybrid with reranking)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_query (Hybrid with reranking)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_query",
+    "query",
     {
       title: "Hybrid Query (Best Quality)",
       description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
@@ -309,7 +380,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       if (collection) {
         collectionId = store.getCollectionIdByName(collection) ?? undefined;
         if (collectionId === undefined) {
-          return { content: [{ type: "text", text: `Error: Collection not found: ${collection}` }] };
+          return {
+            content: [{ type: "text", text: `Collection not found: ${collection}` }],
+            isError: true,
+          };
         }
       }
 
@@ -349,7 +423,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
       const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-      const finalResults = reranked.map(r => {
+      const filtered: SearchResultItem[] = reranked.map(r => {
         const rrfRank = rrfRankMap.get(r.file) || candidates.length;
         let rrfWeight: number;
         if (rrfRank <= 3) rrfWeight = 0.75;
@@ -368,20 +442,18 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
 
       return {
-        content: [
-          {
-            type: "text",
-            mimeType: "text/csv",
-            text: searchResultsToMcpCsv(finalResults),
-          },
-        ],
+        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        structuredContent: { results: filtered },
       };
     }
   );
 
-  // Tool: get (Retrieve document)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_get (Retrieve document)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_get",
+    "get",
     {
       title: "Get Document",
       description: "Retrieve the full content of a document by its file path. Use paths from search results. Suggests similar files if not found.",
@@ -395,11 +467,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const result = store.getDocument(file, fromLine, maxLines);
 
       if ("error" in result) {
-        let msg = `Error: Document not found: ${file}`;
+        let msg = `Document not found: ${file}`;
         if (result.similarFiles.length > 0) {
           msg += `\n\nDid you mean one of these?\n${result.similarFiles.map(s => `  - ${s}`).join('\n')}`;
         }
-        return { content: [{ type: "text", text: msg }] };
+        return {
+          content: [{ type: "text", text: msg }],
+          isError: true,
+        };
       }
 
       let text = result.body;
@@ -411,7 +486,9 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         content: [{
           type: "resource",
           resource: {
-            uri: `qmd://${result.displayPath}`,
+            uri: `qmd://${encodeQmdPath(result.displayPath)}`,
+            name: result.displayPath,
+            title: result.title,
             mimeType: "text/markdown",
             text,
           },
@@ -420,9 +497,12 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     }
   );
 
-  // Tool: multi-get (Retrieve multiple documents)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_multi_get (Retrieve multiple documents)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_multi_get",
+    "multi_get",
     {
       title: "Multi-Get Documents",
       description: "Retrieve multiple documents by glob pattern (e.g., 'journals/2025-05*.md') or comma-separated list. Skips files larger than maxBytes.",
@@ -436,10 +516,13 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const { files, errors } = store.getMultipleDocuments(pattern, maxLines, maxBytes || DEFAULT_MULTI_GET_MAX_BYTES);
 
       if (files.length === 0 && errors.length === 0) {
-        return { content: [{ type: "text", text: `No files matched pattern: ${pattern}` }] };
+        return {
+          content: [{ type: "text", text: `No files matched pattern: ${pattern}` }],
+          isError: true,
+        };
       }
 
-      const content: ({ type: "text"; text: string } | { type: "resource"; resource: { uri: string; mimeType: string; text: string } })[] = [];
+      const content: ({ type: "text"; text: string } | { type: "resource"; resource: { uri: string; name: string; title?: string; mimeType: string; text: string } })[] = [];
 
       if (errors.length > 0) {
         content.push({ type: "text", text: `Errors:\n${errors.join('\n')}` });
@@ -462,7 +545,9 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         content.push({
           type: "resource",
           resource: {
-            uri: `qmd://${file.displayPath}`,
+            uri: `qmd://${encodeQmdPath(file.displayPath)}`,
+            name: file.displayPath,
+            title: file.title,
             mimeType: "text/markdown",
             text,
           },
@@ -473,24 +558,43 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     }
   );
 
-  // Tool: status (Index status)
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_status (Index status)
+  // ---------------------------------------------------------------------------
+
   server.registerTool(
-    "qmd_status",
+    "status",
     {
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
       inputSchema: {},
     },
     async () => {
-      const status = store.getStatus();
+      const status: StatusResult = store.getStatus();
+
+      const summary = [
+        `QMD Index Status:`,
+        `  Total documents: ${status.totalDocuments}`,
+        `  Needs embedding: ${status.needsEmbedding}`,
+        `  Vector index: ${status.hasVectorIndex ? 'yes' : 'no'}`,
+        `  Collections: ${status.collections.length}`,
+      ];
+
+      for (const col of status.collections) {
+        summary.push(`    - ${col.path} (${col.documents} docs)`);
+      }
 
       return {
-        content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: status,
       };
     }
   );
 
+  // ---------------------------------------------------------------------------
   // Connect via stdio
+  // ---------------------------------------------------------------------------
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

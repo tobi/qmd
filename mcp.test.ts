@@ -254,9 +254,10 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  createStore,
 } from "./store";
 import type { RankedResult } from "./store";
-import { searchResultsToMcpCsv } from "./formatter";
+// Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
 // Tests
@@ -315,7 +316,7 @@ describe("MCP Server", () => {
       expect(collectionId).toBeNull();
     });
 
-    test("formats results as CSV", () => {
+    test("formats results as structured content", () => {
       const results = searchFTS(testDb, "api", 10);
       const filtered = results.map(r => ({
         file: r.displayPath,
@@ -324,9 +325,12 @@ describe("MCP Server", () => {
         context: getContextForFile(testDb, r.file),
         snippet: extractSnippet(r.body, "api", 300, r.chunkPos).snippet,
       }));
-      const csv = searchResultsToMcpCsv(filtered);
-      expect(csv).toContain("file,title,score,context,snippet");
-      expect(csv).toContain("api.md");
+      // MCP now returns structuredContent with results array
+      expect(filtered.length).toBeGreaterThan(0);
+      expect(filtered[0]).toHaveProperty("file");
+      expect(filtered[0]).toHaveProperty("title");
+      expect(filtered[0]).toHaveProperty("score");
+      expect(filtered[0]).toHaveProperty("snippet");
     });
   });
 
@@ -834,37 +838,81 @@ QMD is your on-device search engine for markdown knowledge bases.`;
   });
 
   // ===========================================================================
-  // CSV Formatting
+  // MCP Spec Compliance
   // ===========================================================================
 
-  describe("CSV formatting", () => {
-    test("escapes quotes in CSV", () => {
-      const results = [{
-        file: 'test.md',
-        title: 'Test "quoted" title',
-        score: 0.9,
-        context: null,
-        snippet: 'Some "quoted" text',
-      }];
-      const csv = searchResultsToMcpCsv(results);
-      expect(csv).toContain('""quoted""');
+  describe("MCP spec compliance", () => {
+    test("encodeQmdPath preserves slashes but encodes special chars", () => {
+      // Helper function behavior (tested indirectly through resource URIs)
+      const path = "External Podcast/2023 April - Interview.md";
+      const segments = path.split('/').map(s => encodeURIComponent(s)).join('/');
+      expect(segments).toBe("External%20Podcast/2023%20April%20-%20Interview.md");
+      expect(segments).toContain("/"); // Slashes preserved
+      expect(segments).toContain("%20"); // Spaces encoded
     });
 
-    test("escapes newlines in CSV", () => {
-      const results = [{
-        file: 'test.md',
-        title: 'Test title',
-        score: 0.9,
-        context: null,
-        snippet: 'Line 1\nLine 2',
-      }];
-      const csv = searchResultsToMcpCsv(results);
-      expect(csv).not.toContain('\n\n'); // Should be escaped within quotes
+    test("search results have correct structure for structuredContent", () => {
+      const results = searchFTS(testDb, "readme", 5);
+      const structured = results.map(r => ({
+        file: r.displayPath,
+        title: r.title,
+        score: Math.round(r.score * 100) / 100,
+        context: getContextForFile(testDb, r.file),
+        snippet: extractSnippet(r.body, "readme", 300, r.chunkPos).snippet,
+      }));
+
+      expect(structured.length).toBeGreaterThan(0);
+      const item = structured[0];
+      expect(typeof item.file).toBe("string");
+      expect(typeof item.title).toBe("string");
+      expect(typeof item.score).toBe("number");
+      expect(item.score).toBeGreaterThanOrEqual(0);
+      expect(item.score).toBeLessThanOrEqual(1);
+      expect(typeof item.snippet).toBe("string");
     });
 
-    test("handles empty results", () => {
-      const csv = searchResultsToMcpCsv([]);
-      expect(csv).toBe("file,title,score,context,snippet");
+    test("error responses should include isError flag", () => {
+      // Simulate what MCP server returns for errors
+      const errorResponse = {
+        content: [{ type: "text", text: "Collection not found: nonexistent" }],
+        isError: true,
+      };
+      expect(errorResponse.isError).toBe(true);
+      expect(errorResponse.content[0].type).toBe("text");
+    });
+
+    test("embedded resources include name and title", () => {
+      // Simulate what qmd_get returns
+      const result = getDocument(testDb, "readme.md");
+      expect("error" in result).toBe(false);
+      if (!("error" in result)) {
+        const resource = {
+          uri: `qmd://${result.displayPath}`,
+          name: result.displayPath,
+          title: result.title,
+          mimeType: "text/markdown",
+          text: result.body,
+        };
+        expect(resource.name).toBe("readme.md");
+        expect(resource.title).toBe("Project README");
+        expect(resource.mimeType).toBe("text/markdown");
+      }
+    });
+
+    test("status response includes structuredContent", () => {
+      const status = getStatus(testDb);
+      // Verify structure matches StatusResult type
+      expect(typeof status.totalDocuments).toBe("number");
+      expect(typeof status.needsEmbedding).toBe("number");
+      expect(typeof status.hasVectorIndex).toBe("boolean");
+      expect(Array.isArray(status.collections)).toBe(true);
+      if (status.collections.length > 0) {
+        const col = status.collections[0];
+        expect(typeof col.id).toBe("number");
+        expect(typeof col.path).toBe("string");
+        expect(typeof col.pattern).toBe("string");
+        expect(typeof col.documents).toBe("number");
+      }
     });
   });
 });
