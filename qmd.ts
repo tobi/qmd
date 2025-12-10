@@ -115,9 +115,9 @@ function getPwd(): string {
 }
 
 // Get canonical realpath, falling back to resolved path if file doesn't exist
-function getRealPath(path: string): string {
+function getRealPath(path: string) {
   try {
-    return realpathSync(path);
+    return realpathSync(path).toString();
   } catch {}
   return resolve(path);
 }
