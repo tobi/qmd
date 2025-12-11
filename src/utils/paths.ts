@@ -4,7 +4,7 @@
 
 import { resolve } from 'path';
 import { homedir } from 'os';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 
 /**
  * Find .qmd/ directory by walking up from current directory
@@ -76,12 +76,10 @@ export function getPwd(): string {
  */
 export function getRealPath(path: string): string {
   try {
-    const result = Bun.spawnSync(["realpath", path]);
-    if (result.success) {
-      return result.stdout.toString().trim();
-    }
-  } catch {}
-  return resolve(path);
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 /**
