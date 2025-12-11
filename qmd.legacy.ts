@@ -6,8 +6,17 @@ import * as sqliteVec from "sqlite-vec";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import type {
+  LogProb,
+  RerankResponse,
+  SearchResult,
+  RankedResult,
+  OutputFormat,
+  OutputOptions
+} from "./src/models/types.ts";
 
 const HOME = Bun.env.HOME || "/tmp";
+const VERSION = "1.0.0";
 
 function homedir(): string {
   return HOME;
@@ -41,8 +50,8 @@ if (process.platform === "darwin") {
   }
 }
 
-const DEFAULT_EMBED_MODEL = "embeddinggemma";
-const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
+const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL || "nomic-embed-text";
+const DEFAULT_RERANK_MODEL = process.env.QMD_RERANK_MODEL || "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
 const DEFAULT_GLOB = "**/*.md";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
@@ -78,18 +87,27 @@ process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
 // Terminal progress bar using OSC 9;4 escape sequence
+// Only output when stderr is a TTY to avoid polluting logs/pipes
 const progress = {
   set(percent: number) {
-    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    }
   },
   clear() {
-    process.stderr.write(`\x1b]9;4;0\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;0\x07`);
+    }
   },
   indeterminate() {
-    process.stderr.write(`\x1b]9;4;3\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;3\x07`);
+    }
   },
   error() {
-    process.stderr.write(`\x1b]9;4;2\x07`);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\x1b]9;4;2\x07`);
+    }
   },
 };
 
@@ -564,11 +582,6 @@ function formatRerankPrompt(query: string, title: string, doc: string): string {
 <Document>: ${doc}`;
 }
 
-type LogProb = { token: string; logprob: number };
-type RerankResponse = {
-  response: string;
-  logprobs?: LogProb[];
-};
 
 function parseRerankResponse(data: RerankResponse): number {
   if (!data.logprobs || data.logprobs.length === 0) {
@@ -1312,7 +1325,6 @@ function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: nu
   return { line: lineOffset + bestLine + 1, snippet };
 }
 
-type SearchResult = { file: string; displayPath: string; title: string; body: string; score: number; source: "fts" | "vec"; chunkPos?: number };
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
@@ -1445,7 +1457,6 @@ function normalizeScores(results: SearchResult[]): SearchResult[] {
 // Reciprocal Rank Fusion: combines multiple ranked lists
 // RRF score = sum(1 / (k + rank)) across all lists where doc appears
 // k=60 is standard, provides good balance between top and lower ranks
-type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
 
 function reciprocalRankFusion(
   resultLists: RankedResult[][],
@@ -1482,14 +1493,6 @@ function reciprocalRankFusion(
     .sort((a, b) => b.score - a.score);
 }
 
-type OutputFormat = "cli" | "csv" | "md" | "xml" | "files" | "json";
-type OutputOptions = {
-  format: OutputFormat;
-  full: boolean;
-  limit: number;
-  minScore: number;
-  all?: boolean;
-};
 
 // Extract snippet with more context lines for CLI display
 function extractSnippetWithContext(body: string, query: string, contextLines = 3, chunkPos?: number): { line: number; snippet: string; hasMatch: boolean } {
@@ -2266,6 +2269,10 @@ function parseCLI() {
       // Global options
       index: { type: "string" },
       help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
+      // Model options
+      "embed-model": { type: "string" },
+      "rerank-model": { type: "string" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2339,6 +2346,8 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  --embed-model <model>      - Override embedding model (default: nomic-embed-text)");
+  console.log("  --rerank-model <model>     - Override reranking model");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2353,8 +2362,10 @@ function showHelp(): void {
   console.log("");
   console.log("Environment:");
   console.log("  OLLAMA_URL                 - Ollama server URL (default: http://localhost:11434)");
+  console.log("  QMD_EMBED_MODEL            - Default embedding model (default: nomic-embed-text)");
+  console.log("  QMD_RERANK_MODEL           - Default reranking model");
   console.log("");
-  console.log("Models:");
+  console.log("Models (current):");
   console.log(`  Embedding: ${DEFAULT_EMBED_MODEL}`);
   console.log(`  Reranking: ${DEFAULT_RERANK_MODEL}`);
   console.log("");
@@ -2363,6 +2374,11 @@ function showHelp(): void {
 
 // Main CLI
 const cli = parseCLI();
+
+if (cli.values.version) {
+  console.log(`qmd version ${VERSION}`);
+  process.exit(0);
+}
 
 if (!cli.command || cli.values.help) {
   showHelp();
@@ -2422,9 +2438,11 @@ switch (cli.command) {
     await updateAllCollections();
     break;
 
-  case "embed":
-    await vectorIndex(DEFAULT_EMBED_MODEL, cli.values.force || false);
+  case "embed": {
+    const embedModel = cli.values["embed-model"] || DEFAULT_EMBED_MODEL;
+    await vectorIndex(embedModel as string, cli.values.force || false);
     break;
+  }
 
   case "search":
     if (!cli.query) {
@@ -2434,7 +2452,7 @@ switch (cli.command) {
     search(cli.query, cli.opts);
     break;
 
-  case "vsearch":
+  case "vsearch": {
     if (!cli.query) {
       console.error("Usage: qmd vsearch [options] <query>");
       process.exit(1);
@@ -2443,16 +2461,21 @@ switch (cli.command) {
     if (!cli.values["min-score"]) {
       cli.opts.minScore = 0.3;
     }
-    await vectorSearch(cli.query, cli.opts);
+    const embedModel = cli.values["embed-model"] || DEFAULT_EMBED_MODEL;
+    await vectorSearch(cli.query, cli.opts, embedModel as string);
     break;
+  }
 
-  case "query":
+  case "query": {
     if (!cli.query) {
       console.error("Usage: qmd query [options] <query>");
       process.exit(1);
     }
-    await querySearch(cli.query, cli.opts);
+    const embedModel = cli.values["embed-model"] || DEFAULT_EMBED_MODEL;
+    const rerankModel = cli.values["rerank-model"] || DEFAULT_RERANK_MODEL;
+    await querySearch(cli.query, cli.opts, embedModel as string, rerankModel as string);
     break;
+  }
 
   case "mcp":
     await startMcpServer();

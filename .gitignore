@@ -4,6 +4,16 @@ node_modules/
 archive/
 texts/
 .cursor/
+research/
 *.md
-!README.md
+!docs/dev/README.md
 !CLAUDE.md
+!BUILD.md
+!*PLAN*.md
+!*STRATEGY*.md
+!*SUMMARY*.md
+!docs/dev/ARCHITECTURE.md
+!SQL_SAFETY.md
+!docs/**/*.md
+.beads/
+builds/

@@ -1,483 +1,308 @@
-# QMD - Quick Markdown Search
+# QMD Documentation
 
-An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+Complete documentation for QMD (Quick Markdown Search) features and commands.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via Ollama.
+## Table of Contents
 
-## Quick Start
-
-```sh
-# Install globally
-bun install -g https://github.com/tobi/qmd
-
-# Index your notes, docs, and meeting transcripts
-cd ~/notes && qmd add .
-cd ~/Documents/meetings && qmd add .
-cd ~/work/docs && qmd add .
-
-# Add context to help with search results
-qmd add-context ~/notes "Personal notes and ideas"
-qmd add-context ~/Documents/meetings "Meeting transcripts and notes"
-qmd add-context ~/work/docs "Work documentation"
-
-# Generate embeddings for semantic search
-qmd embed
-
-# Search across everything
-qmd search "project timeline"           # Fast keyword search
-qmd vsearch "how to deploy"             # Semantic search
-qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
-
-# Get a specific document
-qmd get "meetings/2024-01-15.md"
-
-# Export all matches for an agent
-qmd search "API" --all --files --min-score 0.3
-```
-
-### Using with AI Agents
-
-QMD's `--json` and `--files` output formats are designed for agentic workflows:
-
-```sh
-# Get structured results for an LLM
-qmd search "authentication" --json -n 10
-
-# List all relevant files above a threshold
-qmd query "error handling" --all --files --min-score 0.4
-
-# Retrieve full document content
-qmd get "docs/api-reference.md" --full
-```
-
-### MCP Server
-
-Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
-
-**Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search
-- `qmd_vsearch` - Semantic vector search
-- `qmd_query` - Hybrid search with reranking (best quality)
-- `qmd_get` - Retrieve document content
-- `qmd_status` - Index health and collection info
-
-**Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-**Claude Code configuration** (`~/.claude/settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         QMD Hybrid Search Pipeline                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-                              ┌─────────────────┐
-                              │   User Query    │
-                              └────────┬────────┘
-                                       │
-                        ┌──────────────┴──────────────┐
-                        ▼                             ▼
-               ┌────────────────┐            ┌────────────────┐
-               │ Query Expansion│            │  Original Query│
-               │  (qwen3:0.6b)  │            │   (×2 weight)  │
-               └───────┬────────┘            └───────┬────────┘
-                       │                             │
-                       │ 2 alternative queries       │
-                       └──────────────┬──────────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-     │ Original Query  │     │ Expanded Query 1│     │ Expanded Query 2│
-     └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-              │                       │                       │
-      ┌───────┴───────┐       ┌───────┴───────┐       ┌───────┴───────┐
-      ▼               ▼       ▼               ▼       ▼               ▼
-  ┌───────┐       ┌───────┐ ┌───────┐     ┌───────┐ ┌───────┐     ┌───────┐
-  │ BM25  │       │Vector │ │ BM25  │     │Vector │ │ BM25  │     │Vector │
-  │(FTS5) │       │Search │ │(FTS5) │     │Search │ │(FTS5) │     │Search │
-  └───┬───┘       └───┬───┘ └───┬───┘     └───┬───┘ └───┬───┘     └───┬───┘
-      │               │         │             │         │             │
-      └───────┬───────┘         └──────┬──────┘         └──────┬──────┘
-              │                        │                       │
-              └────────────────────────┼───────────────────────┘
-                                       │
-                                       ▼
-                          ┌───────────────────────┐
-                          │   RRF Fusion + Bonus  │
-                          │  Original query: ×2   │
-                          │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
-                          └───────────┬───────────┘
-                                      │
-                                      ▼
-                          ┌───────────────────────┐
-                          │    LLM Re-ranking     │
-                          │  (qwen3-reranker)     │
-                          │  Yes/No + logprobs    │
-                          └───────────┬───────────┘
-                                      │
-                                      ▼
-                          ┌───────────────────────┐
-                          │  Position-Aware Blend │
-                          │  Top 1-3:  75% RRF    │
-                          │  Top 4-10: 60% RRF    │
-                          │  Top 11+:  40% RRF    │
-                          └───────────────────────┘
-```
-
-## Score Normalization & Fusion
-
-### Search Backends
-
-| Backend | Raw Score | Conversion | Range |
-|---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
-| **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
-
-### Fusion Strategy
-
-The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware blending:
-
-1. **Query Expansion**: Original query (×2 for weighting) + 1 LLM variation
-2. **Parallel Retrieval**: Each query searches both FTS and vector indexes
-3. **RRF Fusion**: Combine all result lists using `score = Σ(1/(k+rank+1))` where k=60
-4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
-5. **Top-K Selection**: Take top 30 candidates for reranking
-6. **Re-ranking**: LLM scores each document (yes/no with logprobs confidence)
-7. **Position-Aware Blending**:
-   - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
-   - RRF rank 4-10: 60% retrieval, 40% reranker
-   - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
-
-**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that score #1 for the original query. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
-
-### Score Interpretation
-
-| Score | Meaning |
-|-------|---------|
-| 0.8 - 1.0 | Highly relevant |
-| 0.5 - 0.8 | Moderately relevant |
-| 0.2 - 0.5 | Somewhat relevant |
-| 0.0 - 0.2 | Low relevance |
-
-## Requirements
-
-### System Requirements
-
-- **Bun** >= 1.0.0
-- **macOS**: Homebrew SQLite (for extension support)
-  ```sh
-  brew install sqlite
-  ```
-- **Ollama** running locally (default: `http://localhost:11434`)
-
-### Ollama Models
-
-QMD uses three models (auto-pulled if missing):
-
-| Model | Purpose | Size |
-|-------|---------|------|
-| `embeddinggemma` | Vector embeddings | ~1.6GB |
-| `ExpedientFalcon/qwen3-reranker:0.6b-q8_0` | Re-ranking (trained) | ~640MB |
-| `qwen3:0.6b` | Query expansion | ~400MB |
-
-```sh
-# Pre-pull models (optional)
-ollama pull embeddinggemma
-ollama pull ExpedientFalcon/qwen3-reranker:0.6b-q8_0
-ollama pull qwen3:0.6b
-```
+- [Installation](#installation) - How to install QMD
+- [Configuration](#configuration) - Unified config system (CLI > Env > File > Defaults)
+- [Getting Started](docs/user/getting-started.md) - Quick start guide
+- [Commands](docs/user/commands.md) - Complete command reference
+- [Project Setup](docs/user/project-setup.md) - Setting up project-local indexes
+- [Index Management](docs/user/index-management.md) - Managing collections and indexes
+- [Architecture](docs/user/architecture.md) - Index location priority and design
 
 ## Installation
 
-```sh
+### Prerequisites
+
+QMD requires [Bun](https://bun.sh) runtime:
+
+```bash
+# Install Bun (if not already installed)
+curl -fsSL https://bun.sh/install | bash
+```
+
+### Install QMD
+
+#### Option 1: Install Globally from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/ddebowczyk/qmd.git
+cd qmd
+
+# Install dependencies
 bun install
+
+# Link globally (creates 'qmd' command)
+bun link
+
+# Verify installation
+qmd doctor
 ```
 
-## Usage
+#### Option 2: Run from Source
 
-### Index Markdown Files
+```bash
+# Clone and install dependencies
+git clone https://github.com/ddebowczyk/qmd.git
+cd qmd
+bun install
 
-```sh
-# Index all .md files in current directory
+# Run directly
+bun qmd.ts init
+bun qmd.ts add .
+bun qmd.ts search "query"
+```
+
+### Optional: Ollama for Embeddings
+
+For vector search (`qmd embed`, `qmd vsearch`, `qmd query`), install [Ollama](https://ollama.ai):
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Pull required models
+ollama pull nomic-embed-text    # For embeddings
+ollama pull qwen3-reranker      # For reranking (hybrid search)
+```
+
+### Verify Installation
+
+```bash
+# Check system health
+qmd doctor
+
+# Initialize a project
+qmd init
+
+# Run your first search
 qmd add .
-
-# Index with custom glob pattern
-qmd add "docs/**/*.md"
-
-# Drop and re-add a collection
-qmd add --drop .
+qmd search "markdown"
 ```
 
-### Generate Vector Embeddings
+## Quick Reference
 
-```sh
-# Embed all indexed documents (chunked into ~6KB pieces)
-qmd embed
+### Essential Commands
 
-# Force re-embed everything
-qmd embed -f
+```bash
+# Initialize project
+qmd init                    # Create .qmd/ directory
+qmd init --with-index       # Init + index files
+qmd doctor                  # Check system health
+
+# Indexing
+qmd add .                   # Index current directory
+qmd update                  # Re-index all collections
+qmd update <id>             # Re-index specific collection
+qmd embed                   # Generate embeddings
+
+# Searching
+qmd search "query"          # Full-text search (BM25)
+qmd vsearch "query"         # Vector similarity search
+qmd query "query"           # Hybrid search (best quality)
+
+# Information
+qmd status                  # Show collections and stats
+qmd get <path>              # Get document by path
 ```
 
-### Add Context
+## Configuration
 
-```sh
-# Add context description for files in a path
-qmd add-context . "Project documentation and guides"
-qmd add-context ./meetings "Internal meeting transcripts"
+QMD uses a unified configuration system with clear precedence:
+
+**Priority:** CLI flags > Environment variables > Config file > Defaults
+
+### Config File (`.qmd/config.json`)
+
+Create a config file for project-specific settings:
+
+```bash
+# Create with defaults
+qmd init --config
+
+# Or create manually
+cat > .qmd/config.json <<'EOF'
+{
+  "embedModel": "nomic-embed-text",
+  "rerankModel": "qwen3-reranker:0.6b-q8_0",
+  "defaultGlob": "**/*.md",
+  "excludeDirs": ["node_modules", ".git", "dist", "build", ".cache"],
+  "ollamaUrl": "http://localhost:11434"
+}
+EOF
 ```
 
-### Search Commands
+**Commit this file** to share settings with your team.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Search Modes                              │
-├──────────┬───────────────────────────────────────────────────────┤
-│ search   │ BM25 full-text search only                           │
-│ vsearch  │ Vector semantic search only                          │
-│ query    │ Hybrid: FTS + Vector + Query Expansion + Re-ranking  │
-└──────────┴───────────────────────────────────────────────────────┘
-```
+### Environment Variables
 
-```sh
-# Full-text search (fast, keyword-based)
-qmd search "authentication flow"
+Quick overrides for machine-specific settings:
 
-# Vector search (semantic similarity)
-qmd vsearch "how to login"
+```bash
+# Model configuration
+export QMD_EMBED_MODEL=custom-model
+export QMD_RERANK_MODEL=custom-reranker
+export OLLAMA_URL=http://remote:11434
 
-# Hybrid search with re-ranking (best quality)
-qmd query "user authentication"
+# Infrastructure
+export QMD_CACHE_DIR=/custom/cache  # Cache location override
+
+# Standard
+export NO_COLOR=1  # Disable terminal colors
 ```
 
-### Options
+### CLI Flags
 
-```sh
--n <num>           # Number of results (default: 5, or 20 for --files/--json)
---all              # Return all matches (use with --min-score to filter)
---min-score <num>  # Minimum score threshold (default: 0)
---full             # Show full document content
---files            # Output: score,filepath,context
---json             # JSON output with snippets
---csv              # CSV output with snippets
---md               # Markdown output
---xml              # XML output
---index <name>     # Use named index
+Override any setting at runtime:
+
+```bash
+qmd embed --embed-model custom-model
+qmd vsearch "query" --embed-model nomic-embed-text
+qmd query "query" --rerank-model qwen3-reranker
 ```
 
-### Output Format
+### Example: Team Configuration
 
-Default output is colorized CLI format (respects `NO_COLOR` env):
+```bash
+# 1. Create project config (commit to git)
+qmd init --config
 
-```
-docs/guide.md:42
-Title: Software Craftsmanship
-Context: Work documentation
-Score: 93%
+# 2. Team members clone repo (config is shared)
+git clone your-repo
+cd your-repo
 
-This section covers the **craftsmanship** of building
-quality software with attention to detail.
-See also: engineering principles
+# 3. Override locally if needed
+export QMD_EMBED_MODEL=faster-model  # Personal preference
+export OLLAMA_URL=http://localhost:11434  # Local Ollama
 
-
-notes/meeting.md:15
-Title: Q4 Planning
-Context: Personal notes and ideas
-Score: 67%
-
-Discussion about code quality and craftsmanship
-in the development process.
+# 4. Or override per-command
+qmd embed --embed-model production-model
 ```
 
-- **Path**: Collection-relative, includes parent folder (e.g., `docs/guide.md`)
-- **Title**: Extracted from document (first heading or filename)
-- **Context**: Folder context if configured via `add-context`
-- **Score**: Color-coded (green >70%, yellow >40%, dim otherwise)
-- **Snippet**: Context around match with query terms highlighted
+## Core Concepts
 
-### Examples
+### Project-Local Indexes
 
-```sh
-# Get 10 results with minimum score 0.3
-qmd query -n 10 --min-score 0.3 "API design patterns"
+QMD uses a `.qmd/` directory (like `.git/`) for project-local indexes:
 
-# Output as markdown for LLM context
-qmd search --md --full "error handling"
-
-# JSON output for scripting
-qmd query --json "quarterly reports"
-
-# Use separate index for different knowledge base
-qmd --index work search "quarterly reports"
+```
+myproject/
+├── .qmd/
+│   ├── default.sqlite      # Index database
+│   ├── .gitignore          # Ignores *.sqlite files
+│   └── config.json         # Optional config
+├── docs/
+│   └── readme.md
+└── src/
+    └── index.ts
 ```
 
-### Manage Collections
+### Index Location Priority
 
-```sh
-# Show index status and collections with contexts
+QMD searches for indexes in this order:
+
+1. **`.qmd/` directory** - Project-local (walks up tree)
+2. **`QMD_CACHE_DIR`** - Environment variable override
+3. **`~/.cache/qmd/`** - Global default
+
+### Collections
+
+A collection is a set of indexed files from one directory with one glob pattern:
+
+```bash
+qmd add .                   # Creates collection: (pwd, **/*.md)
+qmd add "docs/**/*.md"      # Creates collection: (pwd, docs/**/*.md)
+```
+
+## Features
+
+### ✅ Project Initialization (`qmd init`)
+- Zero-config setup for project-local indexes
+- Automatic `.gitignore` generation
+- Optional configuration file
+- Immediate indexing with `--with-index`
+
+### ✅ Health Diagnostics (`qmd doctor`)
+- Check project configuration
+- Validate dependencies (Bun, sqlite-vec)
+- Test services (Ollama)
+- Examine index health
+- Auto-fix capability
+
+### ✅ Smart Index Location
+- Auto-detects `.qmd/` directory
+- Works from subdirectories
+- Environment variable support
+- Global fallback
+
+### ✅ Collection Updates (`qmd update`)
+- Re-index all collections
+- Update specific collection by ID
+- No need to cd into directories
+- Detailed statistics
+
+### ✅ CI/CD Integration
+- GitHub Actions workflow
+- Multi-platform testing
+- Code coverage with Codecov
+- Type checking and build verification
+
+## Examples
+
+### Single Project Workflow
+
+```bash
+# Setup
+cd myproject
+qmd init --with-index
+
+# Work in subdirectories
+cd docs
+qmd search "architecture"   # Finds .qmd/ in parent
+
+# Update after changes
+git pull
+qmd update                  # Refresh index
+```
+
+### Multi-Project Workflow
+
+```bash
+# Index multiple projects
+cd ~/work/project1 && qmd add .
+cd ~/work/project2 && qmd add .
+cd ~/work/project3 && qmd add .
+
+# View all
 qmd status
 
-# Re-index all collections
-qmd update-all
-
-# Get document body by filepath
-qmd get ~/notes/meeting.md
-
-# Clean up cache and orphaned data
-qmd cleanup
+# Update all at once
+qmd update
 ```
 
-## Data Storage
+### Environment Variable Override
 
-Index stored in: `~/.cache/qmd/index.sqlite`
+```bash
+# Custom cache location
+export QMD_CACHE_DIR=/mnt/ssd/qmd-indexes
+qmd add .                   # Uses custom location
 
-### Schema
-
-```sql
-collections     -- Indexed directories and glob patterns
-path_contexts   -- Context descriptions by path prefix
-documents       -- Markdown content with metadata
-documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos)
-vectors_vec     -- sqlite-vec vector index (hash_seq key)
-ollama_cache    -- Cached API responses
+# Or with direnv (.envrc)
+echo 'export QMD_CACHE_DIR=.qmd' >> .envrc
+direnv allow
 ```
 
-## Environment Variables
+## Next Steps
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
-| `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+- Read [Getting Started](docs/user/getting-started.md) for detailed setup
+- See [Commands](docs/user/commands.md) for complete command reference
+- Check [Project Setup](docs/user/project-setup.md) for best practices
 
-## How It Works
+## Support
 
-### Indexing Flow
-
-```
-Markdown Files ──► Parse Title ──► Hash Content ──► Store in SQLite
-                      │                                    │
-                      └──────────► FTS5 Index ◄────────────┘
-```
-
-### Embedding Flow
-
-Documents are chunked into ~6KB pieces to fit the embedding model's token window:
-
-```
-Document ──► Chunk (~6KB each) ──► Format each chunk ──► Ollama API ──► Store Vectors
-                │                    "title | text"        /api/embed
-                │
-                └─► Chunks stored with:
-                    - hash: document hash
-                    - seq: chunk sequence (0, 1, 2...)
-                    - pos: character position in original
-```
-
-### Query Flow (Hybrid)
-
-```
-Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
-                │
-      ┌─────────┴─────────┐
-      ▼                   ▼
-   For each query:     FTS (BM25)
-      │                   │
-      ▼                   ▼
-   Vector Search      Ranked List
-      │
-      ▼
-   Ranked List
-      │
-      └─────────┬─────────┘
-                ▼
-         RRF Fusion (k=60)
-         Original query ×2 weight
-         Top-rank bonus: +0.05/#1, +0.02/#2-3
-                │
-                ▼
-         Top 30 candidates
-                │
-                ▼
-         LLM Re-ranking
-         (yes/no + logprob confidence)
-                │
-                ▼
-         Position-Aware Blend
-         Rank 1-3:  75% RRF / 25% reranker
-         Rank 4-10: 60% RRF / 40% reranker
-         Rank 11+:  40% RRF / 60% reranker
-                │
-                ▼
-         Final Results
-```
-
-## Model Configuration
-
-Models are configured as constants in `qmd.ts`:
-
-```typescript
-const DEFAULT_EMBED_MODEL = "embeddinggemma";
-const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
-```
-
-### EmbeddingGemma Prompt Format
-
-```
-// For queries
-"task: search result | query: {query}"
-
-// For documents
-"title: {title} | text: {content}"
-```
-
-### Qwen3-Reranker
-
-A dedicated reranker model trained on relevance classification:
-
-```
-System: Judge whether the Document meets the requirements based on the Query
-        and the Instruct provided. Note that the answer can only be "yes" or "no".
-
-User: <Instruct>: Given a search query, determine if the document is relevant...
-      <Query>: {query}
-      <Document>: {doc}
-```
-
-- Uses `logprobs: true` to extract token probabilities
-- Outputs yes/no with confidence score (0.0 - 1.0)
-- `num_predict: 1` - Only need the yes/no token
-
-### Qwen3 (Query Expansion)
-
-- `num_predict: 150` - For generating query variations
-
-## License
-
-MIT
+- GitHub Issues: https://github.com/ddebowczyk/qmd/issues
+- Architecture: See [ARCHITECTURE.md](docs/dev/ARCHITECTURE.md)
+- Claude Guide: See [CLAUDE.md](CLAUDE.md)

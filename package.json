@@ -13,10 +13,24 @@
     "search": "bun qmd.ts search",
     "vsearch": "bun qmd.ts vsearch",
     "rerank": "bun qmd.ts rerank",
-    "link": "bun link"
+    "link": "bun link",
+    "build": "bun build bin/run --compile --outfile builds/qmd",
+    "build:bundle": "bun build bin/run --target bun --outdir builds",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "test:coverage": "bun test --coverage",
+    "test:unit": "bun test src/**/*.test.ts",
+    "test:integration": "bun test tests/integration/**/*.test.ts",
+    "test:utils": "bun test src/utils/**/*.test.ts",
+    "test:database": "bun test src/database/**/*.test.ts",
+    "test:services": "bun test src/services/**/*.test.ts",
+    "test:commands": "bun test src/commands/**/*.test.ts",
+    "test:bail": "bun test --bail",
+    "test:verbose": "bun test --verbose"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
+    "@oclif/core": "^4.8.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "zod": "^4.1.13"
   },
@@ -34,6 +48,13 @@
   },
   "engines": {
     "bun": ">=1.0.0"
+  },
+  "oclif": {
+    "bin": "qmd",
+    "dirname": "qmd",
+    "commands": "./src/commands",
+    "topicSeparator": " ",
+    "topics": {}
   },
   "keywords": [
     "markdown",
