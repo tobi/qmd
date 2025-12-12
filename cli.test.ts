@@ -560,3 +560,58 @@ describe("CLI ls Command", () => {
     expect(stderr).toContain("Collection not found");
   });
 });
+
+describe("CLI Collection Commands", () => {
+  let localDbPath: string;
+
+  beforeEach(async () => {
+    // Use a fresh database for this test suite
+    localDbPath = getFreshDbPath();
+    // Index some files first to create a collection
+    await runQmd(["add", "."], { dbPath: localDbPath });
+  });
+
+  test("lists collections", async () => {
+    const { stdout, exitCode } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collections");
+    expect(stdout).toContain("fixtures");
+    expect(stdout).toContain("Path:");
+    expect(stdout).toContain("Pattern:");
+    expect(stdout).toContain("Files:");
+  });
+
+  test("removes a collection", async () => {
+    // First verify the collection exists
+    const { stdout: listBefore } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(listBefore).toContain("fixtures");
+
+    // Remove it
+    const { stdout, exitCode } = await runQmd(["collection", "remove", "fixtures"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Removed collection 'fixtures'");
+    expect(stdout).toContain("Deleted");
+
+    // Verify it's gone
+    const { stdout: listAfter } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(listAfter).not.toContain("fixtures");
+  });
+
+  test("handles removing non-existent collection", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "remove", "nonexistent"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection not found");
+  });
+
+  test("handles missing remove argument", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "remove"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Usage:");
+  });
+
+  test("handles unknown subcommand", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "invalid"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Unknown subcommand");
+  });
+});

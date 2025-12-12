@@ -1229,6 +1229,137 @@ function listFiles(pathArg?: string): void {
   closeDb();
 }
 
+// Collection management commands
+function collectionList(): void {
+  const db = getDb();
+
+  const collections = db.prepare(`
+    SELECT
+      c.id,
+      c.name,
+      c.pwd,
+      c.glob_pattern,
+      c.created_at,
+      c.updated_at,
+      COUNT(d.id) as file_count
+    FROM collections c
+    LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
+    GROUP BY c.id
+    ORDER BY c.name
+  `).all() as {
+    id: number;
+    name: string;
+    pwd: string;
+    glob_pattern: string;
+    created_at: string;
+    updated_at: string;
+    file_count: number;
+  }[];
+
+  if (collections.length === 0) {
+    console.log("No collections found. Run 'qmd add .' to create one.");
+    closeDb();
+    return;
+  }
+
+  console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
+
+  for (const coll of collections) {
+    const updatedAt = new Date(coll.updated_at);
+    const timeAgo = formatTimeAgo(updatedAt);
+
+    console.log(`${c.cyan}${coll.name}${c.reset}`);
+    console.log(`  ${c.dim}Path:${c.reset}     ${coll.pwd}`);
+    console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
+    console.log(`  ${c.dim}Files:${c.reset}    ${coll.file_count}`);
+    console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
+    console.log();
+  }
+
+  closeDb();
+}
+
+async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+  const db = getDb();
+
+  // If name not provided, generate from pwd basename
+  if (!name) {
+    const parts = pwd.split('/').filter(Boolean);
+    name = parts[parts.length - 1] || 'root';
+  }
+
+  // Check if collection with this name already exists
+  const existing = getCollectionByName(db, name);
+  if (existing) {
+    console.error(`${c.yellow}Collection '${name}' already exists.${c.reset}`);
+    console.error(`Use a different name with --name <name>`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // Check if a collection with this pwd+glob already exists
+  const existingPwdGlob = db.prepare(`
+    SELECT id, name FROM collections WHERE pwd = ? AND glob_pattern = ?
+  `).get(pwd, globPattern) as { id: number; name: string } | null;
+
+  if (existingPwdGlob) {
+    console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
+    console.error(`  Name: ${existingPwdGlob.name}`);
+    console.error(`  Path: ${pwd}`);
+    console.error(`  Pattern: ${globPattern}`);
+    console.error(`\nUse 'qmd add ${globPattern}' to update it, or remove it first with 'qmd collection remove ${existingPwdGlob.name}'`);
+    closeDb();
+    process.exit(1);
+  }
+
+  closeDb();
+
+  // Create the collection and index files
+  console.log(`Creating collection '${name}'...`);
+  await indexFiles(globPattern);
+  console.log(`${c.green}✓${c.reset} Collection '${name}' created successfully`);
+}
+
+function collectionRemove(name: string): void {
+  const db = getDb();
+
+  const coll = getCollectionByName(db, name);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // Get file count
+  const fileCount = db.prepare(`
+    SELECT COUNT(*) as count FROM documents WHERE collection_id = ? AND active = 1
+  `).get(coll.id) as { count: number };
+
+  // Delete documents
+  db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(coll.id);
+
+  // Delete contexts
+  db.prepare(`DELETE FROM path_contexts WHERE collection_id = ?`).run(coll.id);
+
+  // Delete collection
+  db.prepare(`DELETE FROM collections WHERE id = ?`).run(coll.id);
+
+  // Clean up orphaned content hashes
+  const cleanupResult = db.prepare(`
+    DELETE FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).run();
+
+  console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
+  console.log(`  Deleted ${fileCount.count} documents`);
+  if (cleanupResult.changes > 0) {
+    console.log(`  Cleaned up ${cleanupResult.changes} orphaned content hashes`);
+  }
+
+  closeDb();
+}
+
 async function dropCollection(globPattern: string): Promise<void> {
   const db = getDb();
   const pwd = getPwd();
@@ -2137,6 +2268,9 @@ function parseCLI() {
       collection: { type: "string", short: "c" },  // Filter by collection
       // Add options
       drop: { type: "boolean" },
+      // Collection options
+      name: { type: "string" },  // collection name
+      mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
       // Get options
@@ -2193,6 +2327,9 @@ function showHelp(): void {
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
+  console.log("  qmd collection list           - List all collections with details");
+  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create collection explicitly");
+  console.log("  qmd collection remove <name>  - Remove a collection by name");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update                    - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
@@ -2371,6 +2508,43 @@ switch (cli.command) {
 
   case "ls": {
     listFiles(cli.args[0]);
+    break;
+  }
+
+  case "collection": {
+    const subcommand = cli.args[0];
+    switch (subcommand) {
+      case "list": {
+        collectionList();
+        break;
+      }
+
+      case "add": {
+        const pwd = cli.args[1] || getPwd();
+        const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
+        const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+        const name = cli.values.name as string | undefined;
+
+        await collectionAdd(resolvedPwd, globPattern, name);
+        break;
+      }
+
+      case "remove":
+      case "rm": {
+        if (!cli.args[1]) {
+          console.error("Usage: qmd collection remove <name>");
+          console.error("  Use 'qmd collection list' to see available collections");
+          process.exit(1);
+        }
+        collectionRemove(cli.args[1]);
+        break;
+      }
+
+      default:
+        console.error(`Unknown subcommand: ${subcommand}`);
+        console.error("Available: list, add, remove");
+        process.exit(1);
+    }
     break;
   }
 
