@@ -1076,6 +1076,48 @@ export function getCollectionByName(db: Database, name: string): { id: number; n
   return result;
 }
 
+export function listCollections(db: Database): { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; updated_at: string; doc_count: number; active_count: number; last_modified: string | null }[] {
+  const collections = db.prepare(`
+    SELECT c.id, c.name, c.pwd, c.glob_pattern, c.created_at, c.updated_at,
+           COUNT(d.id) as doc_count,
+           SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
+           MAX(d.modified_at) as last_modified
+    FROM collections c
+    LEFT JOIN documents d ON d.collection_id = c.id
+    GROUP BY c.id
+    ORDER BY c.name
+  `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; updated_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
+  return collections;
+}
+
+export function removeCollection(db: Database, collectionId: number): { deletedDocs: number; cleanedHashes: number } {
+  // Delete documents
+  const docResult = db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(collectionId);
+
+  // Delete contexts
+  db.prepare(`DELETE FROM path_contexts WHERE collection_id = ?`).run(collectionId);
+
+  // Delete collection
+  db.prepare(`DELETE FROM collections WHERE id = ?`).run(collectionId);
+
+  // Clean up orphaned content hashes
+  const cleanupResult = db.prepare(`
+    DELETE FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).run();
+
+  return {
+    deletedDocs: docResult.changes,
+    cleanedHashes: cleanupResult.changes
+  };
+}
+
+export function renameCollection(db: Database, collectionId: number, newName: string): void {
+  const now = new Date().toISOString();
+  db.prepare(`UPDATE collections SET name = ?, updated_at = ? WHERE id = ?`)
+    .run(newName, now, collectionId);
+}
+
 // =============================================================================
 // FTS Search
 // =============================================================================

@@ -20,6 +20,9 @@ import {
   getContextForPath,
   getCollectionIdByName,
   getCollectionByName,
+  listCollections,
+  removeCollection,
+  renameCollection,
   findSimilarFiles,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
@@ -1250,29 +1253,7 @@ function listFiles(pathArg?: string): void {
 // Collection management commands
 function collectionList(): void {
   const db = getDb();
-
-  const collections = db.prepare(`
-    SELECT
-      c.id,
-      c.name,
-      c.pwd,
-      c.glob_pattern,
-      c.created_at,
-      c.updated_at,
-      COUNT(d.id) as file_count
-    FROM collections c
-    LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
-    GROUP BY c.id
-    ORDER BY c.name
-  `).all() as {
-    id: number;
-    name: string;
-    pwd: string;
-    glob_pattern: string;
-    created_at: string;
-    updated_at: string;
-    file_count: number;
-  }[];
+  const collections = listCollections(db);
 
   if (collections.length === 0) {
     console.log("No collections found. Run 'qmd add .' to create one.");
@@ -1289,7 +1270,7 @@ function collectionList(): void {
     console.log(`${c.cyan}${coll.name}${c.reset}`);
     console.log(`  ${c.dim}Path:${c.reset}     ${coll.pwd}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
-    console.log(`  ${c.dim}Files:${c.reset}    ${coll.file_count}`);
+    console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
     console.log();
   }
@@ -1349,30 +1330,12 @@ function collectionRemove(name: string): void {
     process.exit(1);
   }
 
-  // Get file count
-  const fileCount = db.prepare(`
-    SELECT COUNT(*) as count FROM documents WHERE collection_id = ? AND active = 1
-  `).get(coll.id) as { count: number };
-
-  // Delete documents
-  db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(coll.id);
-
-  // Delete contexts
-  db.prepare(`DELETE FROM path_contexts WHERE collection_id = ?`).run(coll.id);
-
-  // Delete collection
-  db.prepare(`DELETE FROM collections WHERE id = ?`).run(coll.id);
-
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
+  const result = removeCollection(db, coll.id);
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
-  console.log(`  Deleted ${fileCount.count} documents`);
-  if (cleanupResult.changes > 0) {
-    console.log(`  Cleaned up ${cleanupResult.changes} orphaned content hashes`);
+  console.log(`  Deleted ${result.deletedDocs} documents`);
+  if (result.cleanedHashes > 0) {
+    console.log(`  Cleaned up ${result.cleanedHashes} orphaned content hashes`);
   }
 
   closeDb();
@@ -1399,9 +1362,7 @@ function collectionRename(oldName: string, newName: string): void {
     process.exit(1);
   }
 
-  // Update the collection name
-  db.prepare(`UPDATE collections SET name = ?, updated_at = ? WHERE id = ?`)
-    .run(newName, new Date().toISOString(), coll.id);
+  renameCollection(db, coll.id, newName);
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
