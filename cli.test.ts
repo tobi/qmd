@@ -151,7 +151,7 @@ describe("CLI Help", () => {
     const { stdout, exitCode } = await runQmd(["--help"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Usage:");
-    expect(stdout).toContain("qmd add");
+    expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
   });
 
@@ -164,34 +164,36 @@ describe("CLI Help", () => {
 
 describe("CLI Add Command", () => {
   test("adds files from current directory", async () => {
-    const { stdout, exitCode } = await runQmd(["add", "."]);
+    const { stdout, exitCode } = await runQmd(["collection", "add", "."]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collection:");
     expect(stdout).toContain("Indexed:");
   });
 
   test("adds files with custom glob pattern", async () => {
-    const { stdout, exitCode } = await runQmd(["add", "notes/*.md"]);
+    const { stdout, exitCode } = await runQmd(["collection", "add", ".", "--mask", "notes/*.md"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collection:");
     // Should find meeting.md and ideas.md in notes/
     expect(stdout).toContain("notes/*.md");
   });
 
-  test("adds files with --drop flag recreates collection", async () => {
+  test("can recreate collection with remove and add", async () => {
     // First add
-    await runQmd(["add", "."]);
-    // Then drop and re-add
-    const { stdout, exitCode } = await runQmd(["add", "--drop", "."]);
+    await runQmd(["collection", "add", "."]);
+    // Remove it
+    await runQmd(["collection", "remove", "fixtures"]);
+    // Re-add
+    const { stdout, exitCode } = await runQmd(["collection", "add", "."]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("Dropped collection:");
+    expect(stdout).toContain("Collection 'fixtures' created successfully");
   });
 });
 
 describe("CLI Status Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("shows index status", async () => {
@@ -205,7 +207,7 @@ describe("CLI Status Command", () => {
 describe("CLI Search Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("searches for documents with BM25", async () => {
@@ -242,7 +244,7 @@ describe("CLI Search Command", () => {
 describe("CLI Get Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("retrieves document content by path", async () => {
@@ -267,7 +269,7 @@ describe("CLI Get Command", () => {
 describe("CLI Multi-Get Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("retrieves multiple documents by pattern", async () => {
@@ -296,7 +298,7 @@ describe("CLI Update Command", () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
     // Ensure we have indexed files
-    await runQmd(["add", "."], { dbPath: localDbPath });
+    await runQmd(["collection", "add", "."], { dbPath: localDbPath });
   });
 
   test("updates all collections", async () => {
@@ -309,7 +311,7 @@ describe("CLI Update Command", () => {
 describe("CLI Add-Context Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("adds context to a path", async () => {
@@ -332,7 +334,7 @@ describe("CLI Add-Context Command", () => {
 describe("CLI Cleanup Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("cleans up orphaned entries", async () => {
@@ -352,7 +354,7 @@ describe("CLI Error Handling", () => {
   test("uses INDEX_PATH environment variable", async () => {
     // Verify the test DB path is being used by creating a separate index
     const customDbPath = join(testDir, "custom.sqlite");
-    const { exitCode } = await runQmd(["add", "."], {
+    const { exitCode } = await runQmd(["collection", "add", "."], {
       env: { INDEX_PATH: customDbPath },
     });
     expect(exitCode).toBe(0);
@@ -365,7 +367,7 @@ describe("CLI Error Handling", () => {
 
 describe("CLI Output Formats", () => {
   beforeEach(async () => {
-    await runQmd(["add", "."]);
+    await runQmd(["collection", "add", "."]);
   });
 
   test("search with --json flag outputs JSON", async () => {
@@ -399,8 +401,8 @@ describe("CLI Search with Collection Filter", () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
     // Create multiple collections
-    await runQmd(["add", "notes/*.md"], { dbPath: localDbPath });
-    await runQmd(["add", "docs/*.md"], { dbPath: localDbPath });
+    await runQmd(["collection", "add", ".", "--mask", "notes/*.md"], { dbPath: localDbPath });
+    await runQmd(["collection", "add", ".", "--mask", "docs/*.md"], { dbPath: localDbPath });
   });
 
   test("filters search by collection name", async () => {
@@ -423,7 +425,7 @@ describe("CLI Context Management", () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
     // Index some files first
-    await runQmd(["add", "."], { dbPath: localDbPath });
+    await runQmd(["collection", "add", "."], { dbPath: localDbPath });
   });
 
   test("add global context with /", async () => {
@@ -522,7 +524,7 @@ describe("CLI ls Command", () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
     // Index some files first
-    await runQmd(["add", "."], { dbPath: localDbPath });
+    await runQmd(["collection", "add", "."], { dbPath: localDbPath });
   });
 
   test("lists all collections", async () => {
@@ -568,7 +570,7 @@ describe("CLI Collection Commands", () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
     // Index some files first to create a collection
-    await runQmd(["add", "."], { dbPath: localDbPath });
+    await runQmd(["collection", "add", "."], { dbPath: localDbPath });
   });
 
   test("lists collections", async () => {

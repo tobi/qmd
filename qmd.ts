@@ -2266,8 +2266,6 @@ function parseCLI() {
       files: { type: "boolean" },
       json: { type: "boolean" },
       collection: { type: "string", short: "c" },  // Filter by collection
-      // Add options
-      drop: { type: "boolean" },
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2320,16 +2318,15 @@ function parseCLI() {
 
 function showHelp(): void {
   console.log("Usage:");
-  console.log("  qmd add [--drop] [glob]       - Add/update collection from $PWD (default: **/*.md)");
+  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create/index collection");
+  console.log("  qmd collection list           - List all collections with details");
+  console.log("  qmd collection remove <name>  - Remove a collection by name");
+  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
   console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
   console.log("  qmd context list              - List all contexts");
   console.log("  qmd context rm <path>         - Remove context");
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
-  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
-  console.log("  qmd collection list           - List all collections with details");
-  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create collection explicitly");
-  console.log("  qmd collection remove <name>  - Remove a collection by name");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update                    - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
@@ -2379,17 +2376,6 @@ if (!cli.command || cli.values.help) {
 }
 
 switch (cli.command) {
-  case "add": {
-    const globArg = cli.args[0];
-    // Treat "." as "use default glob in current directory"
-    const globPattern = (!globArg || globArg === ".") ? DEFAULT_GLOB : globArg;
-    if (cli.values.drop) {
-      await dropCollection(globPattern);
-    }
-    await indexFiles(globPattern);
-    break;
-  }
-
   case "context": {
     const subcommand = cli.args[0];
     if (!subcommand) {
