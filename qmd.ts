@@ -1582,14 +1582,15 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Find unique hashes that need embedding (from active documents)
-  // Use MIN(filepath) to get one representative filepath per hash
+  // Join with content table to get document body
   const hashesToEmbed = db.prepare(`
-    SELECT d.hash, d.body, MIN(d.filepath) as filepath, MIN(d.display_path) as display_path
+    SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
+    JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; filepath: string; display_path: string }[];
+  `).all() as { hash: string; body: string; path: string }[];
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -1607,8 +1608,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const bodyBytes = encoder.encode(item.body).length;
     if (bodyBytes === 0) continue; // Skip empty
 
-    const title = extractTitle(item.body, item.filepath);
-    const displayName = item.display_path || item.filepath;
+    const title = extractTitle(item.body, item.path);
+    const displayName = item.path;
     const chunks = chunkDocument(item.body, CHUNK_BYTE_SIZE);
 
     if (chunks.length > 1) multiChunkDocs++;
