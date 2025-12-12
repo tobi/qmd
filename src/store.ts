@@ -602,6 +602,8 @@ export type Store = {
   getContextForPath: (collectionId: number, path: string) => string | null;
   getCollectionIdByName: (name: string) => number | null;
   getCollectionByName: (name: string) => { id: number; name: string; pwd: string; glob_pattern: string } | null;
+  getCollectionsWithoutContext: () => { id: number; name: string; pwd: string; doc_count: number }[];
+  getTopLevelPathsWithoutContext: (collectionId: number) => string[];
 
   // Virtual paths
   parseVirtualPath: typeof parseVirtualPath;
@@ -1420,6 +1422,72 @@ export function listPathContexts(db: Database): { collection_name: string; path_
  */
 export function getAllCollections(db: Database): { id: number; name: string }[] {
   return db.prepare(`SELECT id, name FROM collections`).all() as { id: number; name: string }[];
+}
+
+/**
+ * Check which collections don't have any context defined.
+ * Returns collections that have no context entries at all (not even root context).
+ */
+export function getCollectionsWithoutContext(db: Database): { id: number; name: string; pwd: string; doc_count: number }[] {
+  const collections = db.prepare(`
+    SELECT c.id, c.name, c.pwd, COUNT(d.id) as doc_count
+    FROM collections c
+    LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
+    WHERE NOT EXISTS (
+      SELECT 1 FROM path_contexts pc WHERE pc.collection_id = c.id
+    )
+    GROUP BY c.id
+    ORDER BY c.name
+  `).all() as { id: number; name: string; pwd: string; doc_count: number }[];
+  return collections;
+}
+
+/**
+ * Get top-level directories in a collection that don't have context.
+ * Useful for suggesting where context might be needed.
+ */
+export function getTopLevelPathsWithoutContext(db: Database, collectionId: number): string[] {
+  // Get all paths in the collection
+  const paths = db.prepare(`
+    SELECT DISTINCT path FROM documents
+    WHERE collection_id = ? AND active = 1
+  `).all(collectionId) as { path: string }[];
+
+  // Get existing contexts for this collection
+  const contexts = db.prepare(`
+    SELECT path_prefix FROM path_contexts WHERE collection_id = ?
+  `).all(collectionId) as { path_prefix: string }[];
+
+  const contextPrefixes = new Set(contexts.map(c => c.path_prefix));
+
+  // Extract top-level directories (first path component)
+  const topLevelDirs = new Set<string>();
+  for (const { path } of paths) {
+    const parts = path.split('/').filter(Boolean);
+    if (parts.length > 1) {
+      topLevelDirs.add(parts[0]);
+    }
+  }
+
+  // Filter out directories that already have context (exact or parent)
+  const missing: string[] = [];
+  for (const dir of topLevelDirs) {
+    let hasContext = false;
+
+    // Check if this dir or any parent has context
+    for (const prefix of contextPrefixes) {
+      if (prefix === '' || prefix === dir || dir.startsWith(prefix + '/')) {
+        hasContext = true;
+        break;
+      }
+    }
+
+    if (!hasContext) {
+      missing.push(dir);
+    }
+  }
+
+  return missing.sort();
 }
 
 // =============================================================================

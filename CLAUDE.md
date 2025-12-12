@@ -18,7 +18,7 @@ qmd context rm <path>             # Remove context
 qmd get <file>                    # Get document content (fuzzy matches if not found)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
-qmd update                        # Re-index all collections
+qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (requires Ollama)
 qmd search <query>                # BM25 full-text search
 qmd vsearch <query>               # Vector similarity search

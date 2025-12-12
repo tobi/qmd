@@ -2439,12 +2439,13 @@ switch (cli.command) {
   case "context": {
     const subcommand = cli.args[0];
     if (!subcommand) {
-      console.error("Usage: qmd context <add|list|rm>");
+      console.error("Usage: qmd context <add|list|check|rm>");
       console.error("");
       console.error("Commands:");
       console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
       console.error("  qmd context add / \"text\"       - Add global context to all collections");
       console.error("  qmd context list                - List all contexts");
+      console.error("  qmd context check               - Check for missing contexts");
       console.error("  qmd context rm <path>           - Remove context");
       process.exit(1);
     }
@@ -2488,6 +2489,11 @@ switch (cli.command) {
         break;
       }
 
+      case "check": {
+        contextCheck();
+        break;
+      }
+
       case "rm":
       case "remove": {
         if (cli.args.length < 2) {
@@ -2503,7 +2509,7 @@ switch (cli.command) {
 
       default:
         console.error(`Unknown subcommand: ${subcommand}`);
-        console.error("Available: add, list, rm");
+        console.error("Available: add, list, check, rm");
         process.exit(1);
     }
     break;
