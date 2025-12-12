@@ -575,18 +575,13 @@ function detectCollectionFromPath(db: Database, fsPath: string): { collectionId:
 
 async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
   const db = getDb();
-  const now = new Date().toISOString();
 
   // Handle "/" as global/root context (applies to all collections)
   if (pathArg === '/') {
     // Find all collections and add context to each
-    const collections = db.prepare(`SELECT id, name FROM collections`).all() as { id: number; name: string }[];
+    const collections = getAllCollections(db);
     for (const coll of collections) {
-      db.prepare(`
-        INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
-        VALUES (?, '', ?, ?)
-        ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
-      `).run(coll.id, contextText, now);
+      insertContext(db, coll.id, \'\', contextText);
     }
     console.log(`${c.green}✓${c.reset} Added global context to ${collections.length} collection(s)`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
@@ -618,11 +613,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
       process.exit(1);
     }
 
-    db.prepare(`
-      INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
-    `).run(coll.id, parsed.path, contextText, now);
+    insertContext(db, coll.id, parsed.path, contextText);
 
     console.log(`${c.green}✓${c.reset} Added context for: qmd://${parsed.collectionName}/${parsed.path || ''}`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
@@ -638,11 +629,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     process.exit(1);
   }
 
-  db.prepare(`
-    INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
-  `).run(detected.collectionId, detected.relativePath, contextText, now);
+  insertContext(db, detected.collectionId, detected.relativePath, contextText);
 
   const displayPath = detected.relativePath ? `qmd://${detected.collectionName}/${detected.relativePath}` : `qmd://${detected.collectionName}/`;
   console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
@@ -653,12 +640,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
 function contextList(): void {
   const db = getDb();
 
-  const contexts = db.prepare(`
-    SELECT c.name as collection_name, pc.path_prefix, pc.context
-    FROM path_contexts pc
-    JOIN collections c ON c.id = pc.collection_id
-    ORDER BY c.name, LENGTH(pc.path_prefix) DESC, pc.path_prefix
-  `).all() as { collection_name: string; path_prefix: string; context: string }[];
+  const contexts = listPathContexts(db);
 
   if (contexts.length === 0) {
     console.log(`${c.dim}No contexts configured. Use 'qmd context add' to add one.${c.reset}`);
@@ -689,8 +671,8 @@ function contextRemove(pathArg: string): void {
 
   if (pathArg === '/') {
     // Remove all root contexts
-    const result = db.prepare(`DELETE FROM path_contexts WHERE path_prefix = ''`).run();
-    console.log(`${c.green}✓${c.reset} Removed ${result.changes} global context(s)`);
+    const changes = deleteGlobalContexts(db);
+    console.log(`${c.green}✓${c.reset} Removed ${changes} global context(s)`);
     closeDb();
     return;
   }
@@ -709,12 +691,9 @@ function contextRemove(pathArg: string): void {
       process.exit(1);
     }
 
-    const result = db.prepare(`
-      DELETE FROM path_contexts
-      WHERE collection_id = ? AND path_prefix = ?
-    `).run(coll.id, parsed.path);
+    const changes = deleteContext(db, coll.id, parsed.path);
 
-    if (result.changes === 0) {
+    if (changes === 0) {
       console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
       process.exit(1);
     }
@@ -740,12 +719,9 @@ function contextRemove(pathArg: string): void {
     process.exit(1);
   }
 
-  const result = db.prepare(`
-    DELETE FROM path_contexts
-    WHERE collection_id = ? AND path_prefix = ?
-  `).run(detected.collectionId, detected.relativePath);
+  const changes = deleteContext(db, detected.collectionId, detected.relativePath);
 
-  if (result.changes === 0) {
+  if (changes === 0) {
     console.error(`${c.yellow}No context found for: qmd://${detected.collectionName}/${detected.relativePath}${c.reset}`);
     process.exit(1);
   }
