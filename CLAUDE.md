@@ -92,7 +92,7 @@ qmd context rm /  # Remove global context
 ## Development
 
 ```sh
-bun qmd.ts <command>   # Run from source
+bun src/qmd.ts <command>   # Run from source
 bun link               # Install globally as 'qmd'
 ```
 
@@ -113,4 +113,4 @@ bun link               # Install globally as 'qmd'
 ## Do NOT compile
 
 - Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
-- The `qmd` file is a shell script that runs `bun qmd.ts` - do not replace it
+- The `qmd` file is a shell script that runs `bun src/qmd.ts` - do not replace it

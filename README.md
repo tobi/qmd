@@ -466,7 +466,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured as constants in `qmd.ts`:
+Models are configured as constants in `src/qmd.ts`:
 
 ```typescript
 const DEFAULT_EMBED_MODEL = "embeddinggemma";

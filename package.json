@@ -8,14 +8,14 @@
   },
   "scripts": {
     "test": "bun test",
-    "qmd": "bun qmd.ts",
-    "index": "bun qmd.ts index",
-    "vector": "bun qmd.ts vector",
-    "search": "bun qmd.ts search",
-    "vsearch": "bun qmd.ts vsearch",
-    "rerank": "bun qmd.ts rerank",
+    "qmd": "bun src/qmd.ts",
+    "index": "bun src/qmd.ts index",
+    "vector": "bun src/qmd.ts vector",
+    "search": "bun src/qmd.ts search",
+    "vsearch": "bun src/qmd.ts vsearch",
+    "rerank": "bun src/qmd.ts rerank",
     "link": "bun link",
-    "inspector": "npx @modelcontextprotocol/inspector bun qmd.ts mcp"
+    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",

@@ -11,4 +11,4 @@ while [ -L "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-exec bun "$SCRIPT_DIR/qmd.ts" "$@"
+exec bun "$SCRIPT_DIR/src/qmd.ts" "$@"
