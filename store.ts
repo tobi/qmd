@@ -636,6 +636,7 @@ export type Store = {
   insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionId: number, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
+  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionId: number, path: string) => void;
   getActiveDocumentPaths: (collectionId: number) => string[];
 
@@ -721,6 +722,7 @@ export function createStore(dbPath?: string): Store {
     insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionId, path, title, hash, createdAt, modifiedAt),
     findActiveDocument: (collectionId: number, path: string) => findActiveDocument(db, collectionId, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
+    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
     deactivateDocument: (collectionId: number, path: string) => deactivateDocument(db, collectionId, path),
     getActiveDocumentPaths: (collectionId: number) => getActiveDocumentPaths(db, collectionId),
 
