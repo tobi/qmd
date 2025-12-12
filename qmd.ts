@@ -52,6 +52,7 @@ import {
   insertDocument,
   findActiveDocument,
   updateDocumentTitle,
+  updateDocument,
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
@@ -581,7 +582,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     // Find all collections and add context to each
     const collections = getAllCollections(db);
     for (const coll of collections) {
-      insertContext(db, coll.id, \'\', contextText);
+      insertContext(db, coll.id, '', contextText);
     }
     console.log(`${c.green}✓${c.reset} Added global context to ${collections.length} collection(s)`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
@@ -1403,12 +1404,10 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
       } else {
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
-        deactivateDocument(db, collectionId, path);
-        updated++;
         const stat = await Bun.file(filepath).stat();
-        insertDocument(db, collectionId, path, title, hash,
-          stat ? new Date(stat.birthtime).toISOString() : now,
+        updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
+        updated++;
       }
     } else {
       // New document - insert content and document
