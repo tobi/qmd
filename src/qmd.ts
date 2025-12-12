@@ -468,26 +468,44 @@ function showStatus(): void {
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
-  // Get context counts per collection
-  const contextCounts = db.prepare(`
-    SELECT collection_id, COUNT(*) as count
-    FROM path_contexts
-    GROUP BY collection_id
-  `).all() as { collection_id: number; count: number }[];
-  const contextCountMap = new Map(contextCounts.map(c => [c.collection_id, c.count]));
+  // Get all contexts grouped by collection
+  const allContexts = listPathContexts(db);
+  const contextsByCollection = new Map<number, { path_prefix: string; context: string }[]>();
+
+  for (const ctx of allContexts) {
+    // Find collection by name
+    const collection = collections.find(col => col.name === ctx.collection_name);
+    if (collection) {
+      if (!contextsByCollection.has(collection.id)) {
+        contextsByCollection.set(collection.id, []);
+      }
+      contextsByCollection.get(collection.id)!.push({
+        path_prefix: ctx.path_prefix,
+        context: ctx.context
+      });
+    }
+  }
 
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
       const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
-      const contextCount = contextCountMap.get(col.id) || 0;
+      const contexts = contextsByCollection.get(col.id) || [];
 
       console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(qmd://${col.name}/)${c.reset}`);
       console.log(`    ${c.dim}Path:${c.reset}     ${col.pwd}`);
       console.log(`    ${c.dim}Pattern:${c.reset}  ${col.glob_pattern}`);
       console.log(`    ${c.dim}Files:${c.reset}    ${col.active_count} (updated ${lastMod})`);
-      if (contextCount > 0) {
-        console.log(`    ${c.dim}Contexts:${c.reset} ${contextCount}`);
+
+      if (contexts.length > 0) {
+        console.log(`    ${c.dim}Contexts:${c.reset} ${contexts.length}`);
+        for (const ctx of contexts) {
+          const pathDisplay = ctx.path_prefix === '' ? '/' : `/${ctx.path_prefix}`;
+          const contextPreview = ctx.context.length > 60
+            ? ctx.context.substring(0, 57) + '...'
+            : ctx.context;
+          console.log(`      ${c.dim}${pathDisplay}:${c.reset} ${contextPreview}`);
+        }
       }
     }
 
@@ -781,6 +799,64 @@ function contextRemove(pathArg: string): void {
   }
 
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
+  closeDb();
+}
+
+function contextCheck(): void {
+  const db = getDb();
+
+  // Get collections without any context
+  const collectionsWithoutContext = getCollectionsWithoutContext(db);
+
+  // Get all collections to check for missing path contexts
+  const allCollections = listCollections(db);
+
+  if (collectionsWithoutContext.length === 0 && allCollections.length > 0) {
+    // Check if all collections have contexts
+    console.log(`\n${c.green}✓${c.reset} ${c.bold}All collections have context configured${c.reset}\n`);
+  }
+
+  if (collectionsWithoutContext.length > 0) {
+    console.log(`\n${c.yellow}Collections without any context:${c.reset}\n`);
+
+    for (const coll of collectionsWithoutContext) {
+      console.log(`${c.cyan}${coll.name}${c.reset}`);
+      console.log(`  ${c.dim}Path: ${coll.pwd}${c.reset}`);
+      console.log(`  ${c.dim}Documents: ${coll.doc_count}${c.reset}`);
+      console.log(`  ${c.dim}Suggestion: qmd context add qmd://${coll.name}/ "Description of ${coll.name}"${c.reset}\n`);
+    }
+  }
+
+  // Check for top-level paths without context within collections that DO have context
+  const collectionsWithContext = allCollections.filter(c =>
+    !collectionsWithoutContext.some(cwc => cwc.id === c.id)
+  );
+
+  let hasPathSuggestions = false;
+
+  for (const coll of collectionsWithContext) {
+    const missingPaths = getTopLevelPathsWithoutContext(db, coll.id);
+
+    if (missingPaths.length > 0) {
+      if (!hasPathSuggestions) {
+        console.log(`${c.yellow}Top-level directories without context:${c.reset}\n`);
+        hasPathSuggestions = true;
+      }
+
+      console.log(`${c.cyan}${coll.name}${c.reset}`);
+      for (const path of missingPaths) {
+        console.log(`  ${path}`);
+        console.log(`    ${c.dim}Suggestion: qmd context add qmd://${coll.name}/${path} "Description of ${path}"${c.reset}`);
+      }
+      console.log('');
+    }
+  }
+
+  if (collectionsWithoutContext.length === 0 && !hasPathSuggestions) {
+    console.log(`${c.dim}All collections and major paths have context configured.${c.reset}`);
+    console.log(`${c.dim}Use 'qmd context list' to see all configured contexts.${c.reset}\n`);
+  }
+
   closeDb();
 }
 
@@ -2252,6 +2328,8 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      // Update options
+      pull: { type: "boolean" },  // git pull before update
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2310,7 +2388,7 @@ function showHelp(): void {
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
-  console.log("  qmd update                    - Re-index all collections");
+  console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
@@ -2532,7 +2610,7 @@ switch (cli.command) {
     break;
 
   case "update":
-    await updateCollections();
+    await updateCollections(cli.values.pull || false);
     break;
 
   case "embed":
