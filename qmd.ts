@@ -1334,7 +1334,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Create the collection and index files
   console.log(`Creating collection '${name}'...`);
-  await indexFiles(globPattern);
+  await indexFiles(pwd, globPattern, name);
   console.log(`${c.green}✓${c.reset} Collection '${name}' created successfully`);
 }
 
@@ -1378,6 +1378,37 @@ function collectionRemove(name: string): void {
   closeDb();
 }
 
+function collectionRename(oldName: string, newName: string): void {
+  const db = getDb();
+
+  // Check if old collection exists
+  const coll = getCollectionByName(db, oldName);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // Check if new name already exists
+  const existing = getCollectionByName(db, newName);
+  if (existing) {
+    console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
+    console.error(`Choose a different name or remove the existing collection first.`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // Update the collection name
+  db.prepare(`UPDATE collections SET name = ?, updated_at = ? WHERE id = ?`)
+    .run(newName, new Date().toISOString(), coll.id);
+
+  console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
+  console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
+
+  closeDb();
+}
+
 async function dropCollection(globPattern: string): Promise<void> {
   const db = getDb();
   const pwd = getPwd();
@@ -1401,9 +1432,9 @@ async function dropCollection(globPattern: string): Promise<void> {
   // Don't close db - indexFiles will use it and close at the end
 }
 
-async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name?: string): Promise<void> {
   const db = getDb();
-  const pwd = getPwd();
+  const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
@@ -1411,13 +1442,13 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   clearCache(db);
 
   // Get or create collection for this (pwd, glob)
-  const collectionId = getOrCreateCollection(db, pwd, globPattern);
-  console.log(`Collection: ${pwd} (${globPattern})`);
+  const collectionId = getOrCreateCollection(db, resolvedPwd, globPattern, name);
+  console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
   const glob = new Glob(globPattern);
   const files: string[] = [];
-  for await (const file of glob.scan({ cwd: pwd, onlyFiles: true, followSymlinks: true })) {
+  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
     // Skip node_modules, hidden folders (.*), and other common excludes
     const parts = file.split("/");
     const shouldSkip = parts.some(part =>
@@ -1450,7 +1481,7 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   const startTime = Date.now();
 
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(pwd, relativeFile));
+    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     const path = relativeFile; // Use relative path as-is
     seenPaths.add(path);
 
@@ -2339,6 +2370,7 @@ function showHelp(): void {
   console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create/index collection");
   console.log("  qmd collection list           - List all collections with details");
   console.log("  qmd collection remove <name>  - Remove a collection by name");
+  console.log("  qmd collection rename <old> <new>  - Rename a collection");
   console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
   console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
   console.log("  qmd context list              - List all contexts");
@@ -2544,9 +2576,20 @@ switch (cli.command) {
         break;
       }
 
+      case "rename":
+      case "mv": {
+        if (!cli.args[1] || !cli.args[2]) {
+          console.error("Usage: qmd collection rename <old-name> <new-name>");
+          console.error("  Use 'qmd collection list' to see available collections");
+          process.exit(1);
+        }
+        collectionRename(cli.args[1], cli.args[2]);
+        break;
+      }
+
       default:
         console.error(`Unknown subcommand: ${subcommand}`);
-        console.error("Available: list, add, remove");
+        console.error("Available: list, add, remove, rename");
         process.exit(1);
     }
     break;

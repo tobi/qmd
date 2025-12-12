@@ -616,4 +616,60 @@ describe("CLI Collection Commands", () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain("Unknown subcommand");
   });
+
+  test("renames a collection", async () => {
+    // First verify the collection exists
+    const { stdout: listBefore } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(listBefore).toMatch(/^fixtures$/m); // Collection name on its own line
+
+    // Rename it
+    const { stdout, exitCode } = await runQmd(["collection", "rename", "fixtures", "my-fixtures"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Renamed collection 'fixtures' to 'my-fixtures'");
+    expect(stdout).toContain("qmd://fixtures/");
+    expect(stdout).toContain("qmd://my-fixtures/");
+
+    // Verify the new name exists and old name is gone
+    const { stdout: listAfter } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(listAfter).toMatch(/^my-fixtures$/m); // Collection name on its own line
+    expect(listAfter).not.toMatch(/^fixtures$/m); // Old name should not appear as collection name
+  });
+
+  test("handles renaming non-existent collection", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "rename", "nonexistent", "newname"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection not found");
+  });
+
+  test("handles renaming to existing collection name", async () => {
+    // Create a second collection in a temp directory
+    const tempDir = await mkdtemp(join(tmpdir(), "qmd-second-"));
+    await writeFile(join(tempDir, "test.md"), "# Test");
+    const addResult = await runQmd(["collection", "add", tempDir, "--name", "second"], { dbPath: localDbPath });
+
+    if (addResult.exitCode !== 0) {
+      console.error("Failed to add second collection:", addResult.stderr);
+    }
+    expect(addResult.exitCode).toBe(0);
+
+    // Verify both collections exist
+    const { stdout: listBoth } = await runQmd(["collection", "list"], { dbPath: localDbPath });
+    expect(listBoth).toMatch(/^fixtures$/m);
+    expect(listBoth).toMatch(/^second$/m);
+
+    // Try to rename fixtures to second (which already exists)
+    const { stderr, exitCode } = await runQmd(["collection", "rename", "fixtures", "second"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection name already exists");
+  });
+
+  test("handles missing rename arguments", async () => {
+    const { stderr: stderr1, exitCode: exitCode1 } = await runQmd(["collection", "rename"], { dbPath: localDbPath });
+    expect(exitCode1).toBe(1);
+    expect(stderr1).toContain("Usage:");
+
+    const { stderr: stderr2, exitCode: exitCode2 } = await runQmd(["collection", "rename", "fixtures"], { dbPath: localDbPath });
+    expect(exitCode2).toBe(1);
+    expect(stderr2).toContain("Usage:");
+  });
 });

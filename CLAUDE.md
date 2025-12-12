@@ -10,6 +10,7 @@ Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 qmd collection add . --name <n>   # Create/index collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
+qmd collection rename <old> <new> # Rename a collection
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
@@ -35,6 +36,9 @@ qmd collection add ~/Documents/notes --name mynotes --mask '**/*.md'
 
 # Remove a collection
 qmd collection remove mynotes
+
+# Rename a collection
+qmd collection rename mynotes my-notes
 
 # List all files in a collection
 qmd ls mynotes
