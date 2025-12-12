@@ -533,11 +533,7 @@ async function updateCollections(): Promise<void> {
     const col = collections[i];
     console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.pwd}${c.reset}`);
     console.log(`${c.dim}    Pattern: ${col.glob_pattern}${c.reset}`);
-    // Temporarily set PWD for indexing
-    const originalPwd = process.env.PWD;
-    process.env.PWD = col.pwd;
-    await indexFiles(col.glob_pattern);
-    process.env.PWD = originalPwd;
+    await indexFiles(col.pwd, col.glob_pattern);
     console.log("");
   }
 

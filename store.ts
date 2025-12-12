@@ -1119,18 +1119,6 @@ export function getActiveDocumentPaths(db: Database, collectionId: number): stri
   return rows.map(r => r.path);
 }
 
-/**
- * Clean up orphaned content hashes (content not referenced by any active document).
- * Returns the number of orphaned hashes deleted.
- */
-export function cleanupOrphanedContent(db: Database): number {
-  const result = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-  return result.changes;
-}
-
 // Re-export from llm.ts for backwards compatibility
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
