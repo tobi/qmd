@@ -1102,6 +1102,21 @@ export function updateDocumentTitle(
 }
 
 /**
+ * Update an existing document's hash, title, and modified_at timestamp.
+ * Used when content changes but the file path stays the same.
+ */
+export function updateDocument(
+  db: Database,
+  documentId: number,
+  title: string,
+  hash: string,
+  modifiedAt: string
+): void {
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
+    .run(title, hash, modifiedAt, documentId);
+}
+
+/**
  * Deactivate a document (mark as inactive but don't delete).
  */
 export function deactivateDocument(db: Database, collectionId: number, path: string): void {
