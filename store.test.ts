@@ -142,43 +142,57 @@ async function cleanupTestDb(store: Store): Promise<void> {
 }
 
 // Helper to insert a test document directly into the database
-function insertTestDocument(
+async function insertTestDocument(
   db: Database,
   collectionId: number,
   opts: {
     name?: string;
     title?: string;
     hash?: string;
-    filepath?: string;
     displayPath?: string;
     body?: string;
     active?: number;
   }
-): number {
+): Promise<number> {
   const now = new Date().toISOString();
   const name = opts.name || "test-doc";
   const title = opts.title || "Test Document";
-  const hash = opts.hash || `hash-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const filepath = opts.filepath || `/test/path/${name}.md`;
-  const displayPath = opts.displayPath || `test/${name}.md`;
+  const path = opts.displayPath || `test/${name}.md`;
   const body = opts.body || "# Test Document\n\nThis is test content.";
   const active = opts.active ?? 1;
 
+  // Generate hash from body if not provided
+  const hash = opts.hash || await hashContent(body);
+
+  // Insert content (with OR IGNORE for deduplication)
+  db.prepare(`
+    INSERT OR IGNORE INTO content (hash, doc, created_at)
+    VALUES (?, ?, ?)
+  `).run(hash, body, now);
+
+  // Insert document
   const result = db.prepare(`
-    INSERT INTO documents (collection_id, name, title, hash, filepath, display_path, body, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(collectionId, name, title, hash, filepath, displayPath, body, now, now, active);
+    INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(collectionId, path, title, hash, now, now, active);
 
   return Number(result.lastInsertRowid);
 }
 
 // Helper to create a test collection
-function createTestCollection(db: Database, pwd: string = "/test/collection", glob: string = "**/*.md"): number {
+function createTestCollection(
+  db: Database,
+  options: { pwd?: string; glob?: string; name?: string } = {}
+): number {
+  const pwd = options.pwd || "/test/collection";
+  const glob = options.glob || "**/*.md";
+  const name = options.name || pwd.split('/').filter(Boolean).pop() || 'test';
   const now = new Date().toISOString();
+
   const result = db.prepare(`
-    INSERT INTO collections (pwd, glob_pattern, created_at)
-    VALUES (?, ?, ?)
-  `).run(pwd, glob, now);
+    INSERT INTO collections (name, pwd, glob_pattern, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(name, pwd, glob, now, now);
   return Number(result.lastInsertRowid);
 }
 
@@ -522,7 +536,7 @@ describe("Path Context", () => {
 describe("Collections", () => {
   test("getCollectionIdByName finds collection by path suffix", async () => {
     const store = await createTestStore();
-    const collectionId = createTestCollection(store.db, "/home/user/projects/myapp", "**/*.md");
+    const collectionId = createTestCollection(store.db, { pwd: "/home/user/projects/myapp", glob: "**/*.md" });
 
     const found = store.getCollectionIdByName("myapp");
     expect(found).toBe(collectionId);
@@ -624,8 +638,8 @@ describe("FTS Search", () => {
 
   test("searchFTS filters by collectionId", async () => {
     const store = await createTestStore();
-    const collection1 = createTestCollection(store.db, "/path/one", "**/*.md");
-    const collection2 = createTestCollection(store.db, "/path/two", "**/*.md");
+    const collection1 = createTestCollection(store.db, { pwd: "/path/one", glob: "**/*.md" });
+    const collection2 = createTestCollection(store.db, { pwd: "/path/two", glob: "**/*.md" });
 
     insertTestDocument(store.db, collection1, {
       name: "doc1",
@@ -1272,7 +1286,7 @@ describe("Index Status", () => {
 
   test("getStatus reports collection info", async () => {
     const store = await createTestStore();
-    const collectionId = createTestCollection(store.db, "/test/path", "**/*.md");
+    const collectionId = createTestCollection(store.db, { pwd: "/test/path", glob: "**/*.md" });
     insertTestDocument(store.db, collectionId, { name: "doc1" });
 
     const status = store.getStatus();
@@ -1439,7 +1453,7 @@ describe("Vector Table", () => {
 describe("Integration", () => {
   test("full document lifecycle: create, search, retrieve", async () => {
     const store = await createTestStore();
-    const collectionId = createTestCollection(store.db, "/test/notes", "**/*.md");
+    const collectionId = createTestCollection(store.db, { pwd: "/test/notes", glob: "**/*.md" });
 
     // Add context
     addPathContext(store.db, "/test/notes", "Personal notes");
@@ -1491,8 +1505,8 @@ describe("Integration", () => {
     const store1 = await createTestStore();
     const store2 = await createTestStore();
 
-    const col1 = createTestCollection(store1.db, "/store1", "**/*.md");
-    const col2 = createTestCollection(store2.db, "/store2", "**/*.md");
+    const col1 = createTestCollection(store1.db, { pwd: "/store1", glob: "**/*.md" });
+    const col2 = createTestCollection(store2.db, { pwd: "/store2", glob: "**/*.md" });
 
     insertTestDocument(store1.db, col1, {
       name: "doc1",
@@ -1802,6 +1816,183 @@ describe("Edge Cases", () => {
     // All should be searchable
     const results = store.searchFTS("searchterm", 20);
     expect(results).toHaveLength(10);
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
+// Content-Addressable Storage Tests
+// =============================================================================
+
+describe("Content-Addressable Storage", () => {
+  test("same content gets same hash from multiple collections", async () => {
+    const store = await createTestStore();
+
+    // Create two collections
+    const collection1 = createTestCollection(store.db, { pwd: "/path/collection1" });
+    const collection2 = createTestCollection(store.db, { pwd: "/path/collection2" });
+
+    // Add same content to both collections
+    const content = "# Same Content\n\nThis is the same content in two places.";
+    const hash1 = await hashContent(content);
+
+    const doc1 = await insertTestDocument(store.db, collection1, {
+      name: "doc1",
+      body: content,
+      displayPath: "doc1.md",
+    });
+
+    const doc2 = await insertTestDocument(store.db, collection2, {
+      name: "doc2",
+      body: content,
+      displayPath: "doc2.md",
+    });
+
+    // Both should have the same hash
+    const hash1Db = store.db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(doc1) as { hash: string };
+    const hash2Db = store.db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(doc2) as { hash: string };
+
+    expect(hash1Db.hash).toBe(hash2Db.hash);
+    expect(hash1Db.hash).toBe(hash1);
+
+    // There should only be one entry in the content table
+    const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content WHERE hash = ?`).get(hash1) as { count: number };
+    expect(contentCount.count).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("removing one collection preserves content used by another", async () => {
+    const store = await createTestStore();
+
+    // Create two collections
+    const collection1 = createTestCollection(store.db, { pwd: "/path/collection1" });
+    const collection2 = createTestCollection(store.db, { pwd: "/path/collection2" });
+
+    // Add same content to both collections
+    const sharedContent = "# Shared Content\n\nThis is shared.";
+    const sharedHash = await hashContent(sharedContent);
+
+    await insertTestDocument(store.db, collection1, {
+      name: "shared1",
+      body: sharedContent,
+      displayPath: "shared1.md",
+    });
+
+    await insertTestDocument(store.db, collection2, {
+      name: "shared2",
+      body: sharedContent,
+      displayPath: "shared2.md",
+    });
+
+    // Add unique content to collection1
+    const uniqueContent = "# Unique Content\n\nThis is unique to collection1.";
+    const uniqueHash = await hashContent(uniqueContent);
+
+    await insertTestDocument(store.db, collection1, {
+      name: "unique",
+      body: uniqueContent,
+      displayPath: "unique.md",
+    });
+
+    // Verify both hashes exist in content table
+    const sharedExists1 = store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(sharedHash);
+    const uniqueExists1 = store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(uniqueHash);
+    expect(sharedExists1).toBeTruthy();
+    expect(uniqueExists1).toBeTruthy();
+
+    // Remove collection1 (this should NOT remove shared content)
+    store.db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(collection1);
+    store.db.prepare(`DELETE FROM collections WHERE id = ?`).run(collection1);
+
+    // Clean up orphaned content (mimics what the CLI does)
+    store.db.prepare(`
+      DELETE FROM content
+      WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    `).run();
+
+    // Shared content should still exist (used by collection2)
+    const sharedExists2 = store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(sharedHash);
+    expect(sharedExists2).toBeTruthy();
+
+    // Unique content should be removed (only used by collection1)
+    const uniqueExists2 = store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(uniqueHash);
+    expect(uniqueExists2).toBeFalsy();
+
+    await cleanupTestDb(store);
+  });
+
+  test("deduplicates content across many collections", async () => {
+    const store = await createTestStore();
+
+    const sharedContent = "# Common Header\n\nThis appears everywhere.";
+    const sharedHash = await hashContent(sharedContent);
+
+    // Create 5 collections with the same content
+    const collectionIds = [];
+    for (let i = 0; i < 5; i++) {
+      const collId = createTestCollection(store.db, { pwd: `/path/collection${i}` });
+      collectionIds.push(collId);
+
+      await insertTestDocument(store.db, collId, {
+        name: `doc${i}`,
+        body: sharedContent,
+        displayPath: `doc${i}.md`,
+      });
+    }
+
+    // Should have 5 documents
+    const docCount = store.db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
+    expect(docCount.count).toBe(5);
+
+    // But only 1 content entry
+    const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content WHERE hash = ?`).get(sharedHash) as { count: number };
+    expect(contentCount.count).toBe(1);
+
+    // All documents should point to the same hash
+    const hashes = store.db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
+    expect(hashes).toHaveLength(1);
+    expect(hashes[0].hash).toBe(sharedHash);
+
+    await cleanupTestDb(store);
+  });
+
+  test("different content gets different hashes", async () => {
+    const store = await createTestStore();
+    const collectionId = createTestCollection(store.db);
+
+    const content1 = "# Content One";
+    const content2 = "# Content Two";
+    const hash1 = await hashContent(content1);
+    const hash2 = await hashContent(content2);
+
+    // Hashes should be different
+    expect(hash1).not.toBe(hash2);
+
+    const doc1 = await insertTestDocument(store.db, collectionId, {
+      name: "doc1",
+      body: content1,
+      displayPath: "doc1.md",
+    });
+
+    const doc2 = await insertTestDocument(store.db, collectionId, {
+      name: "doc2",
+      body: content2,
+      displayPath: "doc2.md",
+    });
+
+    // Both hashes should exist in content table
+    const hash1Db = store.db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(doc1) as { hash: string };
+    const hash2Db = store.db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(doc2) as { hash: string };
+
+    expect(hash1Db.hash).toBe(hash1);
+    expect(hash2Db.hash).toBe(hash2);
+    expect(hash1Db.hash).not.toBe(hash2Db.hash);
+
+    // Should have 2 entries in content table
+    const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content`).get() as { count: number };
+    expect(contentCount.count).toBe(2);
 
     await cleanupTestDb(store);
   });
