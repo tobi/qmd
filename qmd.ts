@@ -26,6 +26,9 @@ import {
   findSimilarFiles,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
+  getHashesForEmbedding,
+  clearAllEmbeddings,
+  insertEmbedding,
   getDocument as storeGetDocument,
   getMultipleDocuments as storeMultiGetDocuments,
   getStatus,
@@ -45,6 +48,23 @@ import {
   isVirtualPath,
   resolveVirtualPath,
   toVirtualPath,
+  insertContent,
+  insertDocument,
+  findActiveDocument,
+  updateDocumentTitle,
+  deactivateDocument,
+  getActiveDocumentPaths,
+  cleanupOrphanedContent,
+  deleteOllamaCache,
+  deleteInactiveDocuments,
+  cleanupOrphanedVectors,
+  cleanupDuplicateCollections,
+  vacuumDatabase,
+  insertContext,
+  deleteContext,
+  deleteGlobalContexts,
+  listPathContexts,
+  getAllCollections,
   OLLAMA_URL,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -379,16 +399,6 @@ function getOrCreateCollection(db: Database, pwd: string, globPattern: string, n
   }
 }
 
-function cleanupDuplicateCollections(db: Database): void {
-  // Remove duplicate collections keeping the oldest one
-  db.exec(`
-    DELETE FROM collections WHERE id NOT IN (
-      SELECT MIN(id) FROM collections GROUP BY pwd, glob_pattern
-    )
-  `);
-  // Remove bogus "." glob pattern entries (from earlier bug)
-  db.exec(`DELETE FROM collections WHERE glob_pattern = '.'`);
-}
 
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -501,37 +511,6 @@ function showStatus(): void {
   closeDb();
 }
 
-// Update display_paths for all documents that have empty display_path
-function updateDisplayPaths(db: Database): number {
-  // Get all docs with empty display_path, grouped by collection
-  const emptyDocs = db.prepare(`
-    SELECT d.id, d.filepath, c.pwd
-    FROM documents d
-    JOIN collections c ON d.collection_id = c.id
-    WHERE d.active = 1 AND (d.display_path IS NULL OR d.display_path = '')
-  `).all() as { id: number; filepath: string; pwd: string }[];
-
-  if (emptyDocs.length === 0) return 0;
-
-  // Collect existing display_paths
-  const existingPaths = new Set<string>(
-    (db.prepare(`SELECT display_path FROM documents WHERE active = 1 AND display_path != ''`).all() as { display_path: string }[])
-      .map(r => r.display_path)
-  );
-
-  const updateStmt = db.prepare(`UPDATE documents SET display_path = ? WHERE id = ?`);
-  let updated = 0;
-
-  for (const doc of emptyDocs) {
-    const displayPath = computeDisplayPath(doc.filepath, doc.pwd, existingPaths);
-    updateStmt.run(displayPath, doc.id);
-    existingPaths.add(displayPath);
-    updated++;
-  }
-
-  return updated;
-}
-
 async function updateCollections(): Promise<void> {
   const db = getDb();
   cleanupDuplicateCollections(db);
@@ -545,12 +524,6 @@ async function updateCollections(): Promise<void> {
     console.log(`${c.dim}No collections found. Run 'qmd add .' to index markdown files.${c.reset}`);
     closeDb();
     return;
-  }
-
-  // Update display_paths for any documents missing them (migration)
-  const pathsUpdated = updateDisplayPaths(db);
-  if (pathsUpdated > 0) {
-    console.log(`${c.green}✓${c.reset} Updated ${pathsUpdated} display paths`);
   }
 
   // Don't close db here - indexFiles will reuse it and close at the end
@@ -1430,13 +1403,6 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
     return;
   }
 
-  // Prepared statements for new schema
-  const insertContentStmt = db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`);
-  const insertDocStmt = db.prepare(`INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)`);
-  const deactivateStmt = db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ? AND active = 1`);
-  const findActiveStmt = db.prepare(`SELECT id, hash, title FROM documents WHERE collection_id = ? AND path = ? AND active = 1`);
-  const updateTitleStmt = db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`);
-
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
   const startTime = Date.now();
@@ -1451,33 +1417,33 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists in this collection with this path
-    const existing = findActiveStmt.get(collectionId, path) as { id: number; hash: string; title: string } | null;
+    const existing = findActiveDocument(db, collectionId, path);
 
     if (existing) {
       if (existing.hash === hash) {
         // Hash unchanged, but check if title needs updating
         if (existing.title !== title) {
-          updateTitleStmt.run(title, now, existing.id);
+          updateDocumentTitle(db, existing.id, title, now);
           updated++;
         } else {
           unchanged++;
         }
       } else {
         // Content changed - insert new content hash and update document
-        insertContentStmt.run(hash, content, now);
-        deactivateStmt.run(collectionId, path);
+        insertContent(db, hash, content, now);
+        deactivateDocument(db, collectionId, path);
         updated++;
         const stat = await Bun.file(filepath).stat();
-        insertDocStmt.run(collectionId, path, title, hash,
+        insertDocument(db, collectionId, path, title, hash,
           stat ? new Date(stat.birthtime).toISOString() : now,
           stat ? new Date(stat.mtime).toISOString() : now);
       }
     } else {
       // New document - insert content and document
       indexed++;
-      insertContentStmt.run(hash, content, now);
+      insertContent(db, hash, content, now);
       const stat = await Bun.file(filepath).stat();
-      insertDocStmt.run(collectionId, path, title, hash,
+      insertDocument(db, collectionId, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
@@ -1492,21 +1458,17 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
   }
 
   // Deactivate documents in this collection that no longer exist
-  const allActive = db.prepare(`SELECT path FROM documents WHERE collection_id = ? AND active = 1`).all(collectionId) as { path: string }[];
+  const allActive = getActiveDocumentPaths(db, collectionId);
   let removed = 0;
-  for (const row of allActive) {
-    if (!seenPaths.has(row.path)) {
-      deactivateStmt.run(collectionId, row.path);
+  for (const path of allActive) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionId, path);
       removed++;
     }
   }
 
   // Clean up orphaned content hashes (content not referenced by any document)
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-  const orphanedContent = cleanupResult.changes;
+  const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -1538,20 +1500,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   // If force, clear all vectors
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-    db.exec(`DELETE FROM content_vectors`);
-    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    clearAllEmbeddings(db);
   }
 
   // Find unique hashes that need embedding (from active documents)
-  // Join with content table to get document body
-  const hashesToEmbed = db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-    GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  const hashesToEmbed = getHashesForEmbedding(db);
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -1612,16 +1565,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const firstEmbedding = await getEmbedding(allChunks[0].text, model, false, allChunks[0].title);
   ensureVecTable(db, firstEmbedding.length);
 
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
-
   let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
   const startTime = Date.now();
 
   // Insert first chunk
-  const firstHashSeq = `${allChunks[0].hash}_${allChunks[0].seq}`;
-  insertVecStmt.run(firstHashSeq, new Float32Array(firstEmbedding));
-  insertContentVectorStmt.run(allChunks[0].hash, allChunks[0].seq, allChunks[0].pos, model, now);
+  insertEmbedding(db, allChunks[0].hash, allChunks[0].seq, allChunks[0].pos, new Float32Array(firstEmbedding), model, now);
   chunksEmbedded++;
   bytesProcessed += allChunks[0].bytes;
 
@@ -1629,9 +1577,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const chunk = allChunks[i];
     try {
       const embedding = await getEmbedding(chunk.text, model, false, chunk.title);
-      const hashSeq = `${chunk.hash}_${chunk.seq}`;
-      insertVecStmt.run(hashSeq, new Float32Array(embedding));
-      insertContentVectorStmt.run(chunk.hash, chunk.seq, chunk.pos, model, now);
+      insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding), model, now);
       chunksEmbedded++;
       bytesProcessed += chunk.bytes;
     } catch (err) {
@@ -2607,46 +2553,25 @@ switch (cli.command) {
     const db = getDb();
 
     // 1. Clear ollama_cache
-    const cacheCount = db.prepare(`SELECT COUNT(*) as c FROM ollama_cache`).get() as { c: number };
-    db.exec(`DELETE FROM ollama_cache`);
-    console.log(`${c.green}✓${c.reset} Cleared ${cacheCount.c} cached API responses`);
+    const cacheCount = deleteOllamaCache(db);
+    console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
 
-    // 2. Remove orphaned vectors (no active document with that hash)
-    const orphanedVecs = db.prepare(`
-      SELECT COUNT(*) as c FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
-    `).get() as { c: number };
-
-    if (orphanedVecs.c > 0) {
-      db.exec(`
-        DELETE FROM vectors_vec WHERE hash_seq IN (
-          SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-          WHERE NOT EXISTS (
-            SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-          )
-        )
-      `);
-      db.exec(`
-        DELETE FROM content_vectors WHERE hash NOT IN (
-          SELECT hash FROM documents WHERE active = 1
-        )
-      `);
-      console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs.c} orphaned embedding chunks`);
+    // 2. Remove orphaned vectors
+    const orphanedVecs = cleanupOrphanedVectors(db);
+    if (orphanedVecs > 0) {
+      console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
     } else {
       console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
     }
 
-    // 3. Count inactive documents
-    const inactiveDocs = db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number };
-    if (inactiveDocs.c > 0) {
-      db.exec(`DELETE FROM documents WHERE active = 0`);
-      console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs.c} inactive document records`);
+    // 3. Remove inactive documents
+    const inactiveDocs = deleteInactiveDocuments(db);
+    if (inactiveDocs > 0) {
+      console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
     }
 
     // 4. Vacuum to reclaim space
-    db.exec(`VACUUM`);
+    vacuumDatabase(db);
     console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
     closeDb();

@@ -589,6 +589,14 @@ export type Store = {
   setCachedResult: (cacheKey: string, result: string) => void;
   clearCache: () => void;
 
+  // Cleanup and maintenance
+  deleteOllamaCache: () => number;
+  deleteInactiveDocuments: () => number;
+  cleanupOrphanedContent: () => number;
+  cleanupOrphanedVectors: () => number;
+  cleanupDuplicateCollections: () => number;
+  vacuumDatabase: () => void;
+
   // Context
   getContextForFile: (filepath: string) => string | null;
   getContextForPath: (collectionId: number, path: string) => string | null;
@@ -622,6 +630,19 @@ export type Store = {
   // Fuzzy matching
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
   matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
+
+  // Document indexing operations
+  insertContent: (hash: string, content: string, createdAt: string) => void;
+  insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  findActiveDocument: (collectionId: number, path: string) => { id: number; hash: string; title: string } | null;
+  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
+  deactivateDocument: (collectionId: number, path: string) => void;
+  getActiveDocumentPaths: (collectionId: number) => string[];
+
+  // Vector/embedding operations
+  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  clearAllEmbeddings: () => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
 };
 
 /**
@@ -652,6 +673,14 @@ export function createStore(dbPath?: string): Store {
     getCachedResult: (cacheKey: string) => getCachedResult(db, cacheKey),
     setCachedResult: (cacheKey: string, result: string) => setCachedResult(db, cacheKey, result),
     clearCache: () => clearCache(db),
+
+    // Cleanup and maintenance
+    deleteOllamaCache: () => deleteOllamaCache(db),
+    deleteInactiveDocuments: () => deleteInactiveDocuments(db),
+    cleanupOrphanedContent: () => cleanupOrphanedContent(db),
+    cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
+    cleanupDuplicateCollections: () => cleanupDuplicateCollections(db),
+    vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
     getContextForFile: (filepath: string) => getContextForFile(db, filepath),
@@ -686,6 +715,19 @@ export function createStore(dbPath?: string): Store {
     // Fuzzy matching
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
     matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
+
+    // Document indexing operations
+    insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
+    insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionId, path, title, hash, createdAt, modifiedAt),
+    findActiveDocument: (collectionId: number, path: string) => findActiveDocument(db, collectionId, path),
+    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
+    deactivateDocument: (collectionId: number, path: string) => deactivateDocument(db, collectionId, path),
+    getActiveDocumentPaths: (collectionId: number) => getActiveDocumentPaths(db, collectionId),
+
+    // Vector/embedding operations
+    getHashesForEmbedding: () => getHashesForEmbedding(db),
+    clearAllEmbeddings: () => clearAllEmbeddings(db),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
   };
 }
 
@@ -868,6 +910,117 @@ export function clearCache(db: Database): void {
 }
 
 // =============================================================================
+// Cleanup and maintenance operations
+// =============================================================================
+
+/**
+ * Delete cached Ollama API responses.
+ * Returns the number of cached responses deleted.
+ */
+export function deleteOllamaCache(db: Database): number {
+  const result = db.prepare(`DELETE FROM ollama_cache`).run();
+  return result.changes;
+}
+
+/**
+ * Remove inactive document records (active = 0).
+ * Returns the number of inactive documents deleted.
+ */
+export function deleteInactiveDocuments(db: Database): number {
+  const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
+  return result.changes;
+}
+
+/**
+ * Remove orphaned content hashes that are not referenced by any active document.
+ * Returns the number of orphaned content hashes deleted.
+ */
+export function cleanupOrphanedContent(db: Database): number {
+  const result = db.prepare(`
+    DELETE FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).run();
+  return result.changes;
+}
+
+/**
+ * Remove orphaned vector embeddings that are not referenced by any active document.
+ * Returns the number of orphaned embedding chunks deleted.
+ */
+export function cleanupOrphanedVectors(db: Database): number {
+  // Check if vectors_vec table exists
+  const tableExists = db.prepare(`
+    SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
+  `).get();
+
+  if (!tableExists) {
+    return 0;
+  }
+
+  // Count orphaned vectors first
+  const countResult = db.prepare(`
+    SELECT COUNT(*) as c FROM content_vectors cv
+    WHERE NOT EXISTS (
+      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+    )
+  `).get() as { c: number };
+
+  if (countResult.c === 0) {
+    return 0;
+  }
+
+  // Delete from vectors_vec first
+  db.exec(`
+    DELETE FROM vectors_vec WHERE hash_seq IN (
+      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+      WHERE NOT EXISTS (
+        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+      )
+    )
+  `);
+
+  // Delete from content_vectors
+  db.exec(`
+    DELETE FROM content_vectors WHERE hash NOT IN (
+      SELECT hash FROM documents WHERE active = 1
+    )
+  `);
+
+  return countResult.c;
+}
+
+/**
+ * Remove duplicate collections, keeping the oldest one per (pwd, glob_pattern).
+ * Also removes bogus "." glob pattern entries.
+ * Returns the number of duplicate collections removed.
+ */
+export function cleanupDuplicateCollections(db: Database): number {
+  // Count duplicates before removal
+  const beforeCount = (db.prepare(`SELECT COUNT(*) as c FROM collections`).get() as { c: number }).c;
+
+  // Remove duplicates keeping the oldest one
+  db.exec(`
+    DELETE FROM collections WHERE id NOT IN (
+      SELECT MIN(id) FROM collections GROUP BY pwd, glob_pattern
+    )
+  `);
+
+  // Remove bogus "." glob pattern entries (from earlier bug)
+  db.exec(`DELETE FROM collections WHERE glob_pattern = '.'`);
+
+  const afterCount = (db.prepare(`SELECT COUNT(*) as c FROM collections`).get() as { c: number }).c;
+  return beforeCount - afterCount;
+}
+
+/**
+ * Run VACUUM to reclaim unused space in the database.
+ * This operation rebuilds the database file to eliminate fragmentation.
+ */
+export function vacuumDatabase(db: Database): void {
+  db.exec(`VACUUM`);
+}
+
+// =============================================================================
 // Document helpers
 // =============================================================================
 
@@ -888,6 +1041,94 @@ export function extractTitle(content: string, filename: string): string {
     return title;
   }
   return filename.replace(/\.md$/, "").split("/").pop() || filename;
+}
+
+// =============================================================================
+// Document indexing operations
+// =============================================================================
+
+/**
+ * Insert content into the content table (content-addressable storage).
+ * Uses INSERT OR IGNORE so duplicate hashes are skipped.
+ */
+export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
+  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+    .run(hash, content, createdAt);
+}
+
+/**
+ * Insert a new document into the documents table.
+ */
+export function insertDocument(
+  db: Database,
+  collectionId: number,
+  path: string,
+  title: string,
+  hash: string,
+  createdAt: string,
+  modifiedAt: string
+): void {
+  db.prepare(`
+    INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+  `).run(collectionId, path, title, hash, createdAt, modifiedAt);
+}
+
+/**
+ * Find an active document by collection ID and path.
+ */
+export function findActiveDocument(
+  db: Database,
+  collectionId: number,
+  path: string
+): { id: number; hash: string; title: string } | null {
+  return db.prepare(`
+    SELECT id, hash, title FROM documents
+    WHERE collection_id = ? AND path = ? AND active = 1
+  `).get(collectionId, path) as { id: number; hash: string; title: string } | null;
+}
+
+/**
+ * Update the title and modified_at timestamp for a document.
+ */
+export function updateDocumentTitle(
+  db: Database,
+  documentId: number,
+  title: string,
+  modifiedAt: string
+): void {
+  db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
+    .run(title, modifiedAt, documentId);
+}
+
+/**
+ * Deactivate a document (mark as inactive but don't delete).
+ */
+export function deactivateDocument(db: Database, collectionId: number, path: string): void {
+  db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ? AND active = 1`)
+    .run(collectionId, path);
+}
+
+/**
+ * Get all active document paths for a collection.
+ */
+export function getActiveDocumentPaths(db: Database, collectionId: number): string[] {
+  const rows = db.prepare(`
+    SELECT path FROM documents WHERE collection_id = ? AND active = 1
+  `).all(collectionId) as { path: string }[];
+  return rows.map(r => r.path);
+}
+
+/**
+ * Clean up orphaned content hashes (content not referenced by any active document).
+ * Returns the number of orphaned hashes deleted.
+ */
+export function cleanupOrphanedContent(db: Database): number {
+  const result = db.prepare(`
+    DELETE FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).run();
+  return result.changes;
 }
 
 // Re-export from llm.ts for backwards compatibility
@@ -1119,6 +1360,64 @@ export function renameCollection(db: Database, collectionId: number, newName: st
 }
 
 // =============================================================================
+// Context Management Operations
+// =============================================================================
+
+/**
+ * Insert or update a context for a specific collection and path prefix.
+ */
+export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
+  `).run(collectionId, pathPrefix, context, now);
+}
+
+/**
+ * Delete a context for a specific collection and path prefix.
+ * Returns the number of contexts deleted.
+ */
+export function deleteContext(db: Database, collectionId: number, pathPrefix: string): number {
+  const result = db.prepare(`
+    DELETE FROM path_contexts
+    WHERE collection_id = ? AND path_prefix = ?
+  `).run(collectionId, pathPrefix);
+  return result.changes;
+}
+
+/**
+ * Delete all global contexts (contexts with empty path_prefix).
+ * Returns the number of contexts deleted.
+ */
+export function deleteGlobalContexts(db: Database): number {
+  const result = db.prepare(`DELETE FROM path_contexts WHERE path_prefix = ''`).run();
+  return result.changes;
+}
+
+/**
+ * List all contexts, grouped by collection.
+ * Returns contexts ordered by collection name, then by path prefix length (longest first).
+ */
+export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
+  const contexts = db.prepare(`
+    SELECT c.name as collection_name, pc.path_prefix, pc.context
+    FROM path_contexts pc
+    JOIN collections c ON c.id = pc.collection_id
+    ORDER BY c.name, LENGTH(pc.path_prefix) DESC, pc.path_prefix
+  `).all() as { collection_name: string; path_prefix: string; context: string }[];
+  return contexts;
+}
+
+/**
+ * Get all collections (id and name).
+ */
+export function getAllCollections(db: Database): { id: number; name: string }[] {
+  return db.prepare(`SELECT id, name FROM collections`).all() as { id: number; name: string }[];
+}
+
+// =============================================================================
 // FTS Search
 // =============================================================================
 
@@ -1242,6 +1541,51 @@ async function getEmbedding(text: string, model: string, isQuery: boolean): Prom
   const ollama = getDefaultOllama();
   const result = await ollama.embed(text, { model, isQuery });
   return result?.embedding || null;
+}
+
+/**
+ * Get all unique content hashes that need embeddings (from active documents).
+ * Returns hash, document body, and a sample path for display purposes.
+ */
+export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+  return db.prepare(`
+    SELECT d.hash, c.doc as body, MIN(d.path) as path
+    FROM documents d
+    JOIN content c ON d.hash = c.hash
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    WHERE d.active = 1 AND v.hash IS NULL
+    GROUP BY d.hash
+  `).all() as { hash: string; body: string; path: string }[];
+}
+
+/**
+ * Clear all embeddings from the database (force re-index).
+ * Deletes all rows from content_vectors and drops the vectors_vec table.
+ */
+export function clearAllEmbeddings(db: Database): void {
+  db.exec(`DELETE FROM content_vectors`);
+  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+}
+
+/**
+ * Insert a single embedding into both content_vectors and vectors_vec tables.
+ * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
+ */
+export function insertEmbedding(
+  db: Database,
+  hash: string,
+  seq: number,
+  pos: number,
+  embedding: Float32Array,
+  model: string,
+  embeddedAt: string
+): void {
+  const hashSeq = `${hash}_${seq}`;
+  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+
+  insertVecStmt.run(hashSeq, embedding);
+  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
 }
 
 // =============================================================================
