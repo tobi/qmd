@@ -1125,6 +1125,110 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   }
 }
 
+// List files in virtual file tree
+function listFiles(pathArg?: string): void {
+  const db = getDb();
+
+  if (!pathArg) {
+    // No argument - list all collections
+    const collections = db.prepare(`
+      SELECT name, COUNT(d.id) as file_count
+      FROM collections c
+      LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
+      GROUP BY c.id, c.name
+      ORDER BY c.name
+    `).all() as { name: string; file_count: number }[];
+
+    if (collections.length === 0) {
+      console.log("No collections found. Run 'qmd add .' to index files.");
+      closeDb();
+      return;
+    }
+
+    console.log(`${c.bold}Collections:${c.reset}\n`);
+    for (const coll of collections) {
+      console.log(`${c.cyan}qmd://${coll.name}/${c.reset} (${coll.file_count} files)`);
+    }
+    closeDb();
+    return;
+  }
+
+  // Parse the path argument
+  let collectionName: string;
+  let pathPrefix: string | null = null;
+
+  if (pathArg.startsWith('qmd://')) {
+    // Virtual path format: qmd://collection/path
+    const parsed = parseVirtualPath(pathArg);
+    if (!parsed) {
+      console.error(`Invalid virtual path: ${pathArg}`);
+      closeDb();
+      process.exit(1);
+    }
+    collectionName = parsed.collectionName;
+    pathPrefix = parsed.path;
+  } else {
+    // Just collection name or collection/path
+    const parts = pathArg.split('/');
+    collectionName = parts[0];
+    if (parts.length > 1) {
+      pathPrefix = parts.slice(1).join('/');
+    }
+  }
+
+  // Get the collection
+  const coll = getCollectionByName(db, collectionName);
+  if (!coll) {
+    console.error(`Collection not found: ${collectionName}`);
+    console.error(`Run 'qmd ls' to see available collections.`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // List files in the collection (optionally filtered by path prefix)
+  let query: string;
+  let params: any[];
+
+  if (pathPrefix) {
+    // List files under a specific path
+    query = `
+      SELECT d.path
+      FROM documents d
+      WHERE d.collection_id = ? AND d.path LIKE ? AND d.active = 1
+      ORDER BY d.path
+    `;
+    params = [coll.id, `${pathPrefix}%`];
+  } else {
+    // List all files in the collection
+    query = `
+      SELECT d.path
+      FROM documents d
+      WHERE d.collection_id = ? AND d.active = 1
+      ORDER BY d.path
+    `;
+    params = [coll.id];
+  }
+
+  const files = db.prepare(query).all(...params) as { path: string }[];
+
+  if (files.length === 0) {
+    if (pathPrefix) {
+      console.log(`No files found under qmd://${collectionName}/${pathPrefix}`);
+    } else {
+      console.log(`No files found in collection: ${collectionName}`);
+    }
+    closeDb();
+    return;
+  }
+
+  // Output virtual paths
+  for (const file of files) {
+    console.log(buildVirtualPath(collectionName, file.path));
+  }
+
+  closeDb();
+}
+
 async function dropCollection(globPattern: string): Promise<void> {
   const db = getDb();
   const pwd = getPwd();
@@ -2088,6 +2192,7 @@ function showHelp(): void {
   console.log("  qmd context rm <path>         - Remove context");
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
+  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update                    - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
@@ -2261,6 +2366,11 @@ switch (cli.command) {
     const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
     const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
     multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+    break;
+  }
+
+  case "ls": {
+    listFiles(cli.args[0]);
     break;
   }
 

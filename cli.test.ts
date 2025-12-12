@@ -514,3 +514,49 @@ describe("CLI Context Management", () => {
     expect(stderr || stdout).toContain("not found");
   });
 });
+
+describe("CLI ls Command", () => {
+  let localDbPath: string;
+
+  beforeEach(async () => {
+    // Use a fresh database for this test suite
+    localDbPath = getFreshDbPath();
+    // Index some files first
+    await runQmd(["add", "."], { dbPath: localDbPath });
+  });
+
+  test("lists all collections", async () => {
+    const { stdout, exitCode } = await runQmd(["ls"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collections:");
+    expect(stdout).toContain("qmd://fixtures/");
+  });
+
+  test("lists files in a collection", async () => {
+    const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/README.md");
+    expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
+  });
+
+  test("lists files with path prefix", async () => {
+    const { stdout, exitCode } = await runQmd(["ls", "fixtures/notes"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
+    expect(stdout).toContain("qmd://fixtures/notes/ideas.md");
+    // Should not include files outside the prefix
+    expect(stdout).not.toContain("qmd://fixtures/README.md");
+  });
+
+  test("lists files with virtual path", async () => {
+    const { stdout, exitCode } = await runQmd(["ls", "qmd://fixtures/docs"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("handles non-existent collection", async () => {
+    const { stderr, exitCode } = await runQmd(["ls", "nonexistent"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection not found");
+  });
+});
