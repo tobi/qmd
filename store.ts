@@ -380,21 +380,26 @@ function migrateToContentAddressable(db: Database): void {
 
     // Migrate collections: generate names from pwd basename
     console.log("Migrating collections...");
+    // First insert with pwd as temporary name
     db.exec(`
       INSERT INTO collections (id, name, pwd, glob_pattern, created_at, updated_at)
       SELECT
         id,
-        CASE
-          WHEN INSTR(RTRIM(pwd, '/'), '/') > 0
-          THEN SUBSTR(RTRIM(pwd, '/'), INSTR(RTRIM(pwd, '/'), '/') + 1)
-          ELSE RTRIM(pwd, '/')
-        END as name,
+        pwd as name,
         pwd,
         glob_pattern,
         created_at,
         created_at as updated_at
       FROM collections_old
     `);
+
+    // Then update names to basenames using application logic
+    const collections = db.prepare(`SELECT id, pwd FROM collections`).all() as { id: number; pwd: string }[];
+    for (const coll of collections) {
+      const parts = coll.pwd.split('/').filter(Boolean);
+      const name = parts[parts.length - 1] || 'root';
+      db.prepare(`UPDATE collections SET name = ? WHERE id = ?`).run(name, coll.id);
+    }
 
     // Handle duplicate collection names by appending collection_id
     const duplicates = db.prepare(`
