@@ -421,15 +421,15 @@ function showStatus(): void {
 
   // Collections info
   const collections = db.prepare(`
-    SELECT c.id, c.pwd, c.glob_pattern, c.created_at,
+    SELECT c.id, c.name, c.pwd, c.glob_pattern, c.created_at,
            COUNT(d.id) as doc_count,
            SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
            MAX(d.modified_at) as last_modified
     FROM collections c
     LEFT JOIN documents d ON d.collection_id = c.id
     GROUP BY c.id
-    ORDER BY c.created_at DESC
-  `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
+    ORDER BY c.name
+  `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
 
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
@@ -454,27 +454,45 @@ function showStatus(): void {
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
-  // Get all path contexts
-  const pathContexts = db.prepare(`SELECT path_prefix, context FROM path_contexts ORDER BY path_prefix`).all() as { path_prefix: string; context: string }[];
+  // Get context counts per collection
+  const contextCounts = db.prepare(`
+    SELECT collection_id, COUNT(*) as count
+    FROM path_contexts
+    GROUP BY collection_id
+  `).all() as { collection_id: number; count: number }[];
+  const contextCountMap = new Map(contextCounts.map(c => [c.collection_id, c.count]));
 
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
       const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
-      console.log(`  ${c.cyan}${col.pwd}${c.reset}`);
-      console.log(`    ${col.glob_pattern} → ${col.active_count} docs (updated ${lastMod})`);
+      const contextCount = contextCountMap.get(col.id) || 0;
 
-      // Show contexts that match this collection's path
-      const matchingContexts = pathContexts.filter(ctx =>
-        ctx.path_prefix.startsWith(col.pwd) || col.pwd.startsWith(ctx.path_prefix)
-      );
-      for (const ctx of matchingContexts) {
-        const displayPath = shortPath(ctx.path_prefix);
-        console.log(`    ${c.dim}context: ${displayPath} → "${ctx.context}"${c.reset}`);
+      console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(qmd://${col.name}/)${c.reset}`);
+      console.log(`    ${c.dim}Path:${c.reset}     ${col.pwd}`);
+      console.log(`    ${c.dim}Pattern:${c.reset}  ${col.glob_pattern}`);
+      console.log(`    ${c.dim}Files:${c.reset}    ${col.active_count} (updated ${lastMod})`);
+      if (contextCount > 0) {
+        console.log(`    ${c.dim}Contexts:${c.reset} ${contextCount}`);
       }
     }
+
+    // Show examples of virtual paths
+    console.log(`\n${c.bold}Examples${c.reset}`);
+    console.log(`  ${c.dim}# List files in a collection${c.reset}`);
+    if (collections.length > 0) {
+      console.log(`  qmd ls ${collections[0].name}`);
+    }
+    console.log(`  ${c.dim}# Get a document${c.reset}`);
+    if (collections.length > 0) {
+      console.log(`  qmd get qmd://${collections[0].name}/path/to/file.md`);
+    }
+    console.log(`  ${c.dim}# Search within a collection${c.reset}`);
+    if (collections.length > 0) {
+      console.log(`  qmd search "query" -c ${collections[0].name}`);
+    }
   } else {
-    console.log(`\n${c.dim}No collections. Run 'qmd add .' to index markdown files.${c.reset}`);
+    console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
   closeDb();
