@@ -415,3 +415,102 @@ describe("CLI Search with Collection Filter", () => {
     expect(stdout.toLowerCase()).toContain("meeting");
   });
 });
+
+describe("CLI Context Management", () => {
+  let localDbPath: string;
+
+  beforeEach(async () => {
+    // Use a fresh database for this test suite
+    localDbPath = getFreshDbPath();
+    // Index some files first
+    await runQmd(["add", "."], { dbPath: localDbPath });
+  });
+
+  test("add global context with /", async () => {
+    const { stdout, exitCode } = await runQmd([
+      "context",
+      "add",
+      "/",
+      "Global system context",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Added global context");
+    expect(stdout).toContain("Global system context");
+  });
+
+  test("list contexts", async () => {
+    // Add a global context first
+    await runQmd([
+      "context",
+      "add",
+      "/",
+      "Test context",
+    ], { dbPath: localDbPath });
+
+    const { stdout, exitCode } = await runQmd([
+      "context",
+      "list",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Configured Contexts");
+    expect(stdout).toContain("Test context");
+  });
+
+  test("add context to virtual path", async () => {
+    // Collection name should be "fixtures" (basename of the fixtures directory)
+    const { stdout, exitCode } = await runQmd([
+      "context",
+      "add",
+      "qmd://fixtures/notes",
+      "Context for notes subdirectory",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Added context for: qmd://fixtures/notes");
+  });
+
+  test("remove global context", async () => {
+    // Add a global context first
+    await runQmd([
+      "context",
+      "add",
+      "/",
+      "Global context to remove",
+    ], { dbPath: localDbPath });
+
+    const { stdout, exitCode } = await runQmd([
+      "context",
+      "rm",
+      "/",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Removed");
+  });
+
+  test("remove virtual path context", async () => {
+    // Add a context first
+    await runQmd([
+      "context",
+      "add",
+      "qmd://fixtures/notes",
+      "Context to remove",
+    ], { dbPath: localDbPath });
+
+    const { stdout, exitCode } = await runQmd([
+      "context",
+      "rm",
+      "qmd://fixtures/notes",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Removed context for: qmd://fixtures/notes");
+  });
+
+  test("fails to remove non-existent context", async () => {
+    const { stdout, stderr, exitCode } = await runQmd([
+      "context",
+      "rm",
+      "qmd://nonexistent/path",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr || stdout).toContain("not found");
+  });
+});

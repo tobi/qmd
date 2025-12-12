@@ -17,7 +17,9 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
+  getContextForPath,
   getCollectionIdByName,
+  getCollectionByName,
   findSimilarFiles,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
@@ -35,6 +37,11 @@ import {
   getCachedResult,
   setCachedResult,
   getIndexHealth,
+  parseVirtualPath,
+  buildVirtualPath,
+  isVirtualPath,
+  resolveVirtualPath,
+  toVirtualPath,
   OLLAMA_URL,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -338,13 +345,35 @@ async function rerank(query: string, documents: { file: string; text: string }[]
   return results.sort((a, b) => b.score - a.score);
 }
 
-function getOrCreateCollection(db: Database, pwd: string, globPattern: string): number {
+function getOrCreateCollection(db: Database, pwd: string, globPattern: string, name?: string): number {
   const now = new Date().toISOString();
 
-  // Use INSERT OR IGNORE to handle race conditions, then SELECT
-  db.prepare(`INSERT OR IGNORE INTO collections (pwd, glob_pattern, created_at) VALUES (?, ?, ?)`).run(pwd, globPattern, now);
-  const existing = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number };
-  return existing.id;
+  // Generate collection name from pwd basename if not provided
+  if (!name) {
+    const parts = pwd.split('/').filter(Boolean);
+    name = parts[parts.length - 1] || 'root';
+  }
+
+  // Check if collection with this pwd+glob already exists
+  const existing = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number } | null;
+  if (existing) return existing.id;
+
+  // Try to insert with generated name
+  try {
+    const result = db.prepare(`INSERT INTO collections (name, pwd, glob_pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`).run(name, pwd, globPattern, now, now);
+    return result.lastInsertRowid as number;
+  } catch (e) {
+    // Name collision - append a unique suffix
+    const allCollections = db.prepare(`SELECT name FROM collections WHERE name LIKE ?`).all(`${name}%`) as { name: string }[];
+    let suffix = 2;
+    let uniqueName = `${name}-${suffix}`;
+    while (allCollections.some(c => c.name === uniqueName)) {
+      suffix++;
+      uniqueName = `${name}-${suffix}`;
+    }
+    const result = db.prepare(`INSERT INTO collections (name, pwd, glob_pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`).run(uniqueName, pwd, globPattern, now, now);
+    return result.lastInsertRowid as number;
+  }
 }
 
 function cleanupDuplicateCollections(db: Database): void {
@@ -521,29 +550,217 @@ async function updateCollections(): Promise<void> {
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
 }
 
-async function addContext(pathArg: string, contextText: string): Promise<void> {
+/**
+ * Detect which collection (if any) contains the given filesystem path.
+ * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
+ */
+function detectCollectionFromPath(db: Database, fsPath: string): { collectionId: number; collectionName: string; relativePath: string } | null {
+  const realPath = getRealPath(fsPath);
+
+  // Find collections that this path is under
+  const collections = db.prepare(`
+    SELECT id, name, pwd
+    FROM collections
+    WHERE ? LIKE pwd || '/%' OR ? = pwd
+    ORDER BY LENGTH(pwd) DESC
+    LIMIT 1
+  `).get(realPath, realPath) as { id: number; name: string; pwd: string } | null;
+
+  if (!collections) return null;
+
+  // Calculate relative path
+  let relativePath = realPath;
+  if (relativePath.startsWith(collections.pwd + '/')) {
+    relativePath = relativePath.slice(collections.pwd.length + 1);
+  } else if (relativePath === collections.pwd) {
+    relativePath = '';
+  }
+
+  return {
+    collectionId: collections.id,
+    collectionName: collections.name,
+    relativePath
+  };
+}
+
+async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
-  // Resolve path - could be relative, absolute, or use ~
-  let pathPrefix = pathArg;
-  if (pathPrefix === '.' || pathPrefix === './') {
-    pathPrefix = getPwd();
-  } else if (pathPrefix.startsWith('~/')) {
-    pathPrefix = homedir() + pathPrefix.slice(1);
-  } else if (!pathPrefix.startsWith('/')) {
-    pathPrefix = resolve(getPwd(), pathPrefix);
+  // Handle "/" as global/root context (applies to all collections)
+  if (pathArg === '/') {
+    // Find all collections and add context to each
+    const collections = db.prepare(`SELECT id, name FROM collections`).all() as { id: number; name: string }[];
+    for (const coll of collections) {
+      db.prepare(`
+        INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
+        VALUES (?, '', ?, ?)
+        ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
+      `).run(coll.id, contextText, now);
+    }
+    console.log(`${c.green}✓${c.reset} Added global context to ${collections.length} collection(s)`);
+    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+    closeDb();
+    return;
   }
 
-  // Get realpath and normalize: remove trailing slash
-  pathPrefix = getRealPath(pathPrefix).replace(/\/$/, '');
+  // Resolve path - defaults to current directory if not provided
+  let fsPath = pathArg || '.';
+  if (fsPath === '.' || fsPath === './') {
+    fsPath = getPwd();
+  } else if (fsPath.startsWith('~/')) {
+    fsPath = homedir() + fsPath.slice(1);
+  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('qmd://')) {
+    fsPath = resolve(getPwd(), fsPath);
+  }
 
-  // Insert or update
-  db.prepare(`INSERT INTO path_contexts (path_prefix, context, created_at) VALUES (?, ?, ?)
-              ON CONFLICT(path_prefix) DO UPDATE SET context = excluded.context`).run(pathPrefix, contextText, now);
+  // Handle virtual paths (qmd://collection/path)
+  if (isVirtualPath(fsPath)) {
+    const parsed = parseVirtualPath(fsPath);
+    if (!parsed) {
+      console.error(`${c.yellow}Invalid virtual path: ${fsPath}${c.reset}`);
+      process.exit(1);
+    }
 
-  console.log(`${c.green}✓${c.reset} Added context for: ${shortPath(pathPrefix)}`);
+    const coll = getCollectionByName(db, parsed.collectionName);
+    if (!coll) {
+      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
+      process.exit(1);
+    }
+
+    db.prepare(`
+      INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
+    `).run(coll.id, parsed.path, contextText, now);
+
+    console.log(`${c.green}✓${c.reset} Added context for: qmd://${parsed.collectionName}/${parsed.path || ''}`);
+    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  // Detect collection from filesystem path
+  const detected = detectCollectionFromPath(db, fsPath);
+  if (!detected) {
+    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
+    console.error(`${c.dim}Run 'qmd status' to see indexed collections${c.reset}`);
+    process.exit(1);
+  }
+
+  db.prepare(`
+    INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
+  `).run(detected.collectionId, detected.relativePath, contextText, now);
+
+  const displayPath = detected.relativePath ? `qmd://${detected.collectionName}/${detected.relativePath}` : `qmd://${detected.collectionName}/`;
+  console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
   console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+  closeDb();
+}
+
+function contextList(): void {
+  const db = getDb();
+
+  const contexts = db.prepare(`
+    SELECT c.name as collection_name, pc.path_prefix, pc.context
+    FROM path_contexts pc
+    JOIN collections c ON c.id = pc.collection_id
+    ORDER BY c.name, LENGTH(pc.path_prefix) DESC, pc.path_prefix
+  `).all() as { collection_name: string; path_prefix: string; context: string }[];
+
+  if (contexts.length === 0) {
+    console.log(`${c.dim}No contexts configured. Use 'qmd context add' to add one.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  console.log(`\n${c.bold}Configured Contexts${c.reset}\n`);
+
+  let lastCollection = '';
+  for (const ctx of contexts) {
+    if (ctx.collection_name !== lastCollection) {
+      console.log(`${c.cyan}${ctx.collection_name}${c.reset}`);
+      lastCollection = ctx.collection_name;
+    }
+
+    const path = ctx.path_prefix || '/';
+    const displayPath = ctx.path_prefix ? `  ${path}` : '  / (root)';
+    console.log(`${displayPath}`);
+    console.log(`    ${c.dim}${ctx.context}${c.reset}`);
+  }
+
+  closeDb();
+}
+
+function contextRemove(pathArg: string): void {
+  const db = getDb();
+
+  if (pathArg === '/') {
+    // Remove all root contexts
+    const result = db.prepare(`DELETE FROM path_contexts WHERE path_prefix = ''`).run();
+    console.log(`${c.green}✓${c.reset} Removed ${result.changes} global context(s)`);
+    closeDb();
+    return;
+  }
+
+  // Handle virtual paths
+  if (isVirtualPath(pathArg)) {
+    const parsed = parseVirtualPath(pathArg);
+    if (!parsed) {
+      console.error(`${c.yellow}Invalid virtual path: ${pathArg}${c.reset}`);
+      process.exit(1);
+    }
+
+    const coll = getCollectionByName(db, parsed.collectionName);
+    if (!coll) {
+      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
+      process.exit(1);
+    }
+
+    const result = db.prepare(`
+      DELETE FROM path_contexts
+      WHERE collection_id = ? AND path_prefix = ?
+    `).run(coll.id, parsed.path);
+
+    if (result.changes === 0) {
+      console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
+      process.exit(1);
+    }
+
+    console.log(`${c.green}✓${c.reset} Removed context for: ${pathArg}`);
+    closeDb();
+    return;
+  }
+
+  // Handle filesystem paths
+  let fsPath = pathArg;
+  if (fsPath === '.' || fsPath === './') {
+    fsPath = getPwd();
+  } else if (fsPath.startsWith('~/')) {
+    fsPath = homedir() + fsPath.slice(1);
+  } else if (!fsPath.startsWith('/')) {
+    fsPath = resolve(getPwd(), fsPath);
+  }
+
+  const detected = detectCollectionFromPath(db, fsPath);
+  if (!detected) {
+    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
+    process.exit(1);
+  }
+
+  const result = db.prepare(`
+    DELETE FROM path_contexts
+    WHERE collection_id = ? AND path_prefix = ?
+  `).run(detected.collectionId, detected.relativePath);
+
+  if (result.changes === 0) {
+    console.error(`${c.yellow}No context found for: qmd://${detected.collectionName}/${detected.relativePath}${c.reset}`);
+    process.exit(1);
+  }
+
+  console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
   closeDb();
 }
 
@@ -551,52 +768,102 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
   const db = getDb();
 
   // Parse :linenum suffix from filename (e.g., "file.md:100")
-  let filepath = filename;
-  const colonMatch = filepath.match(/:(\d+)$/);
+  let inputPath = filename;
+  const colonMatch = inputPath.match(/:(\d+)$/);
   if (colonMatch && !fromLine) {
     fromLine = parseInt(colonMatch[1], 10);
-    filepath = filepath.slice(0, -colonMatch[0].length);
+    inputPath = inputPath.slice(0, -colonMatch[0].length);
   }
 
-  // Expand ~ to home directory
-  if (filepath.startsWith('~/')) {
-    filepath = homedir() + filepath.slice(1);
-  }
+  let doc: { collectionId: number; collectionName: string; path: string; body: string } | null = null;
+  let virtualPath: string;
 
-  // Try exact match on filepath first
-  let doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
-
-  // Try exact match on display_path
-  if (!doc) {
-    doc = db.prepare(`SELECT filepath, body FROM documents WHERE display_path = ? AND active = 1`).get(filepath) as { filepath: string; body: string } | null;
-  }
-
-  // Try matching by filename ending (allows partial paths)
-  if (!doc) {
-    doc = db.prepare(`SELECT filepath, body FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
-  }
-
-  // Try matching by display_path ending
-  if (!doc) {
-    doc = db.prepare(`SELECT filepath, body FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as { filepath: string; body: string } | null;
-  }
-
-  if (!doc) {
-    // Suggest similar files using Levenshtein distance
-    const similar = findSimilarFiles(db, filepath, 5, 5);
-    console.error(`Document not found: ${filename}`);
-    if (similar.length > 0) {
-      console.error(`\nDid you mean one of these?`);
-      for (const s of similar) {
-        console.error(`  ${s}`);
-      }
+  // Handle virtual paths (qmd://collection/path)
+  if (isVirtualPath(inputPath)) {
+    const parsed = parseVirtualPath(inputPath);
+    if (!parsed) {
+      console.error(`Invalid virtual path: ${inputPath}`);
+      closeDb();
+      process.exit(1);
     }
+
+    // Try exact match on collection + path
+    doc = db.prepare(`
+      SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+      FROM documents d
+      JOIN collections c ON c.id = d.collection_id
+      JOIN content ON content.hash = d.hash
+      WHERE c.name = ? AND d.path = ? AND d.active = 1
+    `).get(parsed.collectionName, parsed.path) as typeof doc;
+
+    if (!doc) {
+      // Try fuzzy match by path ending
+      doc = db.prepare(`
+        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        FROM documents d
+        JOIN collections c ON c.id = d.collection_id
+        JOIN content ON content.hash = d.hash
+        WHERE c.name = ? AND d.path LIKE ? AND d.active = 1
+        LIMIT 1
+      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
+    }
+
+    virtualPath = inputPath;
+  } else {
+    // Handle filesystem paths
+    let fsPath = inputPath;
+
+    // Expand ~ to home directory
+    if (fsPath.startsWith('~/')) {
+      fsPath = homedir() + fsPath.slice(1);
+    } else if (!fsPath.startsWith('/')) {
+      // Relative path - resolve from current directory
+      fsPath = resolve(getPwd(), fsPath);
+    }
+    fsPath = getRealPath(fsPath);
+
+    // Try to detect which collection contains this path
+    const detected = detectCollectionFromPath(db, fsPath);
+
+    if (detected) {
+      // Found collection - query by collection_id + relative path
+      doc = db.prepare(`
+        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        FROM documents d
+        JOIN collections c ON c.id = d.collection_id
+        JOIN content ON content.hash = d.hash
+        WHERE c.id = ? AND d.path = ? AND d.active = 1
+      `).get(detected.collectionId, detected.relativePath) as typeof doc;
+    }
+
+    // Fuzzy match by filename (last component of path)
+    if (!doc) {
+      const filename = inputPath.split('/').pop() || inputPath;
+      doc = db.prepare(`
+        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        FROM documents d
+        JOIN collections c ON c.id = d.collection_id
+        JOIN content ON content.hash = d.hash
+        WHERE d.path LIKE ? AND d.active = 1
+        LIMIT 1
+      `).get(`%${filename}`) as typeof doc;
+    }
+
+    if (doc) {
+      virtualPath = buildVirtualPath(doc.collectionName, doc.path);
+    } else {
+      virtualPath = inputPath;
+    }
+  }
+
+  if (!doc) {
+    console.error(`Document not found: ${filename}`);
     closeDb();
     process.exit(1);
   }
 
   // Get context for this file
-  const context = getContextForFile(db, doc.filepath);
+  const context = getContextForPath(db, doc.collectionId, doc.path);
 
   let output = doc.body;
 
@@ -623,33 +890,83 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   // Check if it's a comma-separated list or a glob pattern
   const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
 
-  let files: { filepath: string; displayPath: string; bodyLength: number }[];
+  let files: { filepath: string; displayPath: string; bodyLength: number; collectionId?: number; path?: string }[];
 
   if (isCommaSeparated) {
-    // Comma-separated list of files
+    // Comma-separated list of files (can be virtual paths or relative paths)
     const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
     files = [];
     for (const name of names) {
-      // Try exact match on display_path first
-      let doc = db.prepare(`SELECT filepath, display_path, LENGTH(body) as body_length FROM documents WHERE display_path = ? AND active = 1`).get(name) as { filepath: string; display_path: string; body_length: number } | null;
-      // Try suffix match
-      if (!doc) {
-        doc = db.prepare(`SELECT filepath, display_path, LENGTH(body) as body_length FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${name}`) as { filepath: string; display_path: string; body_length: number } | null;
-      }
-      if (doc) {
-        files.push({ filepath: doc.filepath, displayPath: doc.display_path, bodyLength: doc.body_length });
-      } else {
-        // Suggest similar files
-        const similar = findSimilarFiles(db, name, 5, 3);
-        console.error(`File not found: ${name}`);
-        if (similar.length > 0) {
-          console.error(`  Did you mean: ${similar.join(', ')}`);
+      let doc: { virtual_path: string; body_length: number; collection_id: number; path: string } | null = null;
+
+      // Handle virtual paths
+      if (isVirtualPath(name)) {
+        const parsed = parseVirtualPath(name);
+        if (parsed) {
+          // Try exact match on collection + path
+          doc = db.prepare(`
+            SELECT
+              'qmd://' || c.name || '/' || d.path as virtual_path,
+              LENGTH(content.doc) as body_length,
+              d.collection_id,
+              d.path
+            FROM documents d
+            JOIN collections c ON c.id = d.collection_id
+            JOIN content ON content.hash = d.hash
+            WHERE c.name = ? AND d.path = ? AND d.active = 1
+          `).get(parsed.collectionName, parsed.path) as typeof doc;
         }
+      } else {
+        // Try exact match on path
+        doc = db.prepare(`
+          SELECT
+            'qmd://' || c.name || '/' || d.path as virtual_path,
+            LENGTH(content.doc) as body_length,
+            d.collection_id,
+            d.path
+          FROM documents d
+          JOIN collections c ON c.id = d.collection_id
+          JOIN content ON content.hash = d.hash
+          WHERE d.path = ? AND d.active = 1
+          LIMIT 1
+        `).get(name) as typeof doc;
+
+        // Try suffix match
+        if (!doc) {
+          doc = db.prepare(`
+            SELECT
+              'qmd://' || c.name || '/' || d.path as virtual_path,
+              LENGTH(content.doc) as body_length,
+              d.collection_id,
+              d.path
+            FROM documents d
+            JOIN collections c ON c.id = d.collection_id
+            JOIN content ON content.hash = d.hash
+            WHERE d.path LIKE ? AND d.active = 1
+            LIMIT 1
+          `).get(`%${name}`) as typeof doc;
+        }
+      }
+
+      if (doc) {
+        files.push({
+          filepath: doc.virtual_path,
+          displayPath: doc.virtual_path,
+          bodyLength: doc.body_length,
+          collectionId: doc.collection_id,
+          path: doc.path
+        });
+      } else {
+        console.error(`File not found: ${name}`);
       }
     }
   } else {
-    // Glob pattern on display_path
-    files = matchFilesByGlob(db, pattern);
+    // Glob pattern - matchFilesByGlob now returns virtual paths
+    files = matchFilesByGlob(db, pattern).map(f => ({
+      ...f,
+      collectionId: undefined,  // Will be fetched later if needed
+      path: undefined
+    }));
     if (files.length === 0) {
       console.error(`No files matched pattern: ${pattern}`);
       closeDb();
@@ -661,7 +978,23 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
 
   for (const file of files) {
-    const context = getContextForFile(db, file.filepath);
+    // Parse virtual path to get collection info if not already available
+    let collectionId = file.collectionId;
+    let path = file.path;
+
+    if (!collectionId || !path) {
+      const parsed = parseVirtualPath(file.displayPath);
+      if (parsed) {
+        const coll = getCollectionByName(db, parsed.collectionName);
+        if (coll) {
+          collectionId = coll.id;
+          path = parsed.path;
+        }
+      }
+    }
+
+    // Get context using collection-scoped function
+    const context = collectionId && path ? getContextForPath(db, collectionId, path) : null;
 
     // Check size limit
     if (file.bodyLength > maxBytes) {
@@ -677,7 +1010,18 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       continue;
     }
 
-    const doc = db.prepare(`SELECT body, title FROM documents WHERE filepath = ? AND active = 1`).get(file.filepath) as { body: string; title: string } | null;
+    // Fetch document content - use virtual path to query
+    const parsed = parseVirtualPath(file.displayPath);
+    if (!parsed) continue;
+
+    const doc = db.prepare(`
+      SELECT content.doc as body, d.title
+      FROM documents d
+      JOIN collections c ON c.id = d.collection_id
+      JOIN content ON content.hash = d.hash
+      WHERE c.name = ? AND d.path = ? AND d.active = 1
+    `).get(parsed.collectionName, parsed.path) as { body: string; title: string } | null;
+
     if (!doc) continue;
 
     let body = doc.body;
@@ -781,18 +1125,6 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   }
 }
 
-// Get context for a filepath (finds most specific matching path prefix)
-function getContextForFile(db: Database, filepath: string): string | null {
-  // Find all matching prefixes and return the longest (most specific) one
-  const result = db.prepare(`
-    SELECT context FROM path_contexts
-    WHERE ? LIKE path_prefix || '%'
-    ORDER BY LENGTH(path_prefix) DESC
-    LIMIT 1
-  `).get(filepath) as { context: string } | null;
-  return result?.context || null;
-}
-
 async function dropCollection(globPattern: string): Promise<void> {
   const db = getDb();
   const pwd = getPwd();
@@ -853,34 +1185,28 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
     return;
   }
 
-  const insertStmt = db.prepare(`INSERT INTO documents (collection_id, name, title, hash, filepath, display_path, body, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`);
-  const deactivateStmt = db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND filepath = ? AND active = 1`);
-  const findActiveStmt = db.prepare(`SELECT id, hash, title, display_path FROM documents WHERE collection_id = ? AND filepath = ? AND active = 1`);
-  const findActiveAnyCollectionStmt = db.prepare(`SELECT id, collection_id, hash, title, display_path FROM documents WHERE filepath = ? AND active = 1`);
+  // Prepared statements for new schema
+  const insertContentStmt = db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`);
+  const insertDocStmt = db.prepare(`INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)`);
+  const deactivateStmt = db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ? AND active = 1`);
+  const findActiveStmt = db.prepare(`SELECT id, hash, title FROM documents WHERE collection_id = ? AND path = ? AND active = 1`);
   const updateTitleStmt = db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`);
-  const updateDisplayPathStmt = db.prepare(`UPDATE documents SET display_path = ? WHERE id = ?`);
-
-  // Collect all existing display_paths for uniqueness check
-  const existingDisplayPaths = new Set<string>(
-    (db.prepare(`SELECT display_path FROM documents WHERE active = 1 AND display_path != ''`).all() as { display_path: string }[])
-      .map(r => r.display_path)
-  );
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
-  const seenFiles = new Set<string>();
+  const seenPaths = new Set<string>();
   const startTime = Date.now();
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(pwd, relativeFile));
-    seenFiles.add(filepath);
+    const path = relativeFile; // Use relative path as-is
+    seenPaths.add(path);
 
     const content = await Bun.file(filepath).text();
     const hash = await hashContent(content);
-    const name = relativeFile.replace(/\.md$/, "").split("/").pop() || relativeFile;
     const title = extractTitle(content, relativeFile);
 
-    // First check if file exists in THIS collection
-    const existing = findActiveStmt.get(collectionId, filepath) as { id: number; hash: string; title: string; display_path: string } | null;
+    // Check if document exists in this collection with this path
+    const existing = findActiveStmt.get(collectionId, path) as { id: number; hash: string; title: string } | null;
 
     if (existing) {
       if (existing.hash === hash) {
@@ -891,35 +1217,24 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
         } else {
           unchanged++;
         }
-        // Update display_path if empty
-        if (!existing.display_path) {
-          const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
-          updateDisplayPathStmt.run(displayPath, existing.id);
-          existingDisplayPaths.add(displayPath);
-        }
       } else {
-        // Content changed - deactivate old, insert new
-        existingDisplayPaths.delete(existing.display_path);
-        deactivateStmt.run(collectionId, filepath);
+        // Content changed - insert new content hash and update document
+        insertContentStmt.run(hash, content, now);
+        deactivateStmt.run(collectionId, path);
         updated++;
         const stat = await Bun.file(filepath).stat();
-        const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
-        insertStmt.run(collectionId, name, title, hash, filepath, displayPath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
-        existingDisplayPaths.add(displayPath);
+        insertDocStmt.run(collectionId, path, title, hash,
+          stat ? new Date(stat.birthtime).toISOString() : now,
+          stat ? new Date(stat.mtime).toISOString() : now);
       }
     } else {
-      // Check if file exists in ANY collection (would violate unique constraint)
-      const existingAnywhere = findActiveAnyCollectionStmt.get(filepath) as { id: number; collection_id: number; hash: string; title: string; display_path: string } | null;
-      if (existingAnywhere) {
-        // File already indexed in another collection - skip it
-        unchanged++;
-      } else {
-        indexed++;
-        const stat = await Bun.file(filepath).stat();
-        const displayPath = computeDisplayPath(filepath, pwd, existingDisplayPaths);
-        insertStmt.run(collectionId, name, title, hash, filepath, displayPath, content, stat ? new Date(stat.birthtime).toISOString() : now, stat ? new Date(stat.mtime).toISOString() : now);
-        existingDisplayPaths.add(displayPath);
-      }
+      // New document - insert content and document
+      indexed++;
+      insertContentStmt.run(hash, content, now);
+      const stat = await Bun.file(filepath).stat();
+      insertDocStmt.run(collectionId, path, title, hash,
+        stat ? new Date(stat.birthtime).toISOString() : now,
+        stat ? new Date(stat.mtime).toISOString() : now);
     }
 
     processed++;
@@ -932,20 +1247,30 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   }
 
   // Deactivate documents in this collection that no longer exist
-  const allActive = db.prepare(`SELECT filepath FROM documents WHERE collection_id = ? AND active = 1`).all(collectionId) as { filepath: string }[];
+  const allActive = db.prepare(`SELECT path FROM documents WHERE collection_id = ? AND active = 1`).all(collectionId) as { path: string }[];
   let removed = 0;
   for (const row of allActive) {
-    if (!seenFiles.has(row.filepath)) {
-      deactivateStmt.run(collectionId, row.filepath);
+    if (!seenPaths.has(row.path)) {
+      deactivateStmt.run(collectionId, row.path);
       removed++;
     }
   }
+
+  // Clean up orphaned content hashes (content not referenced by any document)
+  const cleanupResult = db.prepare(`
+    DELETE FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).run();
+  const orphanedContent = cleanupResult.changes;
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  if (orphanedContent > 0) {
+    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
 
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
@@ -1154,40 +1479,10 @@ function getCollectionIdByName(db: Database, name: string): number | null {
   return result?.id || null;
 }
 
-function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
-  if (!ftsQuery) return [];
+// searchFTS and searchVec are now imported from store.ts with updated schema
 
-  // BM25 weights: name=10, body=1 (title matches ranked higher)
-  let sql = `
-    SELECT d.filepath, d.display_path, d.title, d.body, bm25(documents_fts, 10.0, 1.0) as score
-    FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
-    WHERE documents_fts MATCH ? AND d.active = 1
-  `;
-  const params: (string | number)[] = [ftsQuery];
-
-  if (collectionId !== undefined) {
-    sql += ` AND d.collection_id = ?`;
-    params.push(collectionId);
-  }
-
-  sql += ` ORDER BY score LIMIT ?`;
-  params.push(limit);
-
-  const stmt = db.prepare(sql);
-  const results = stmt.all(...params) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
-  return results.map(r => ({
-    file: r.filepath,
-    displayPath: r.display_path,
-    title: r.title,
-    body: r.body,
-    score: normalizeBM25(r.score),
-    source: "fts" as const,
-  }));
-}
-
-async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+// Removed duplicate searchFTS and searchVec functions - using store.ts versions instead
+async function REMOVED_searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -1788,7 +2083,9 @@ function parseCLI() {
 function showHelp(): void {
   console.log("Usage:");
   console.log("  qmd add [--drop] [glob]       - Add/update collection from $PWD (default: **/*.md)");
-  console.log("  qmd add-context <path> <text> - Add context description for files under path");
+  console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
+  console.log("  qmd context list              - List all contexts");
+  console.log("  qmd context rm <path>         - Remove context");
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
@@ -1851,24 +2148,96 @@ switch (cli.command) {
     break;
   }
 
-  case "add-context": {
-    // qmd add-context <path> <context> OR qmd add-context <context> (uses .)
-    if (cli.args.length === 0) {
-      console.error("Usage: qmd add-context <path> <context>");
-      console.error("       qmd add-context . \"Description of files in current directory\"");
+  case "context": {
+    const subcommand = cli.args[0];
+    if (!subcommand) {
+      console.error("Usage: qmd context <add|list|rm>");
+      console.error("");
+      console.error("Commands:");
+      console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
+      console.error("  qmd context add / \"text\"       - Add global context to all collections");
+      console.error("  qmd context list                - List all contexts");
+      console.error("  qmd context rm <path>           - Remove context");
       process.exit(1);
     }
-    let pathArg: string;
+
+    switch (subcommand) {
+      case "add": {
+        if (cli.args.length < 2) {
+          console.error("Usage: qmd context add [path] \"text\"");
+          console.error("Examples:");
+          console.error("  qmd context add \"Context for current directory\"");
+          console.error("  qmd context add . \"Context for current directory\"");
+          console.error("  qmd context add /subfolder \"Context for subfolder\"");
+          console.error("  qmd context add / \"Global context for all collections\"");
+          console.error("  qmd context add qmd://journals/2024 \"Context for 2024 journals\"");
+          process.exit(1);
+        }
+
+        let pathArg: string | undefined;
+        let contextText: string;
+
+        // Check if first arg looks like a path or if it's the context text
+        const firstArg = cli.args[1];
+        const secondArg = cli.args[2];
+
+        if (secondArg) {
+          // Two args: path + context
+          pathArg = firstArg;
+          contextText = cli.args.slice(2).join(" ");
+        } else {
+          // One arg: context only (use current directory)
+          pathArg = undefined;
+          contextText = firstArg;
+        }
+
+        await contextAdd(pathArg, contextText);
+        break;
+      }
+
+      case "list": {
+        contextList();
+        break;
+      }
+
+      case "rm":
+      case "remove": {
+        if (cli.args.length < 2) {
+          console.error("Usage: qmd context rm <path>");
+          console.error("Examples:");
+          console.error("  qmd context rm /");
+          console.error("  qmd context rm qmd://journals/2024");
+          process.exit(1);
+        }
+        contextRemove(cli.args[1]);
+        break;
+      }
+
+      default:
+        console.error(`Unknown subcommand: ${subcommand}`);
+        console.error("Available: add, list, rm");
+        process.exit(1);
+    }
+    break;
+  }
+
+  // Legacy alias for backwards compatibility
+  case "add-context": {
+    console.error(`${c.yellow}Note: 'qmd add-context' is deprecated. Use 'qmd context add' instead.${c.reset}`);
+    if (cli.args.length === 0) {
+      console.error("Usage: qmd context add [path] \"text\"");
+      process.exit(1);
+    }
+    let pathArg: string | undefined;
     let contextText: string;
     if (cli.args.length === 1) {
-      // Single arg = context for current directory
-      pathArg = ".";
+      pathArg = undefined;
       contextText = cli.args[0];
     } else {
       pathArg = cli.args[0];
       contextText = cli.args.slice(1).join(" ");
     }
-    await addContext(pathArg, contextText);
+    await contextAdd(pathArg, contextText);
     break;
   }
 

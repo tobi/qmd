@@ -91,6 +91,72 @@ export function getRealPath(path: string): string {
 }
 
 // =============================================================================
+// Virtual Path Utilities (qmd://)
+// =============================================================================
+
+export type VirtualPath = {
+  collectionName: string;
+  path: string;  // relative path within collection
+};
+
+/**
+ * Parse a virtual path like "qmd://collection-name/path/to/file.md"
+ * into its components.
+ */
+export function parseVirtualPath(virtualPath: string): VirtualPath | null {
+  const match = virtualPath.match(/^qmd:\/\/([^\/]+)\/(.+)$/);
+  if (!match) return null;
+  return {
+    collectionName: match[1],
+    path: match[2],
+  };
+}
+
+/**
+ * Build a virtual path from collection name and relative path.
+ */
+export function buildVirtualPath(collectionName: string, path: string): string {
+  return `qmd://${collectionName}/${path}`;
+}
+
+/**
+ * Check if a path is a virtual path (starts with qmd://).
+ */
+export function isVirtualPath(path: string): boolean {
+  return path.startsWith('qmd://');
+}
+
+/**
+ * Resolve a virtual path to absolute filesystem path.
+ */
+export function resolveVirtualPath(db: Database, virtualPath: string): string | null {
+  const parsed = parseVirtualPath(virtualPath);
+  if (!parsed) return null;
+
+  const coll = getCollectionByName(db, parsed.collectionName);
+  if (!coll) return null;
+
+  return resolve(coll.pwd, parsed.path);
+}
+
+/**
+ * Convert an absolute filesystem path to a virtual path.
+ * Returns null if the file is not in any indexed collection.
+ */
+export function toVirtualPath(db: Database, absolutePath: string): string | null {
+  const doc = db.prepare(`
+    SELECT c.name, d.path
+    FROM documents d
+    JOIN collections c ON c.id = d.collection_id
+    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
+    LIMIT 1
+  `).get(absolutePath) as { name: string; path: string } | null;
+
+  if (!doc) return null;
+  return buildVirtualPath(doc.name, doc.path);
+}
+
+// =============================================================================
 // Database initialization
 // =============================================================================
 
@@ -107,29 +173,74 @@ if (process.platform === "darwin") {
 function initializeDatabase(db: Database): void {
   sqliteVec.load(db);
   db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
 
-  // Collections table
+  // Check if we need to migrate from old schema
+  const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as { name: string }[];
+  const tableNames = tables.map(t => t.name);
+  const needsMigration = tableNames.includes('documents') && !tableNames.includes('content');
+
+  if (needsMigration) {
+    migrateToContentAddressable(db);
+    return; // Migration will call initializeDatabase again
+  }
+
+  // Content-addressable storage - the source of truth for document content
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS content (
+      hash TEXT PRIMARY KEY,
+      doc TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+
+  // Collections table with name field
   db.exec(`
     CREATE TABLE IF NOT EXISTS collections (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
       pwd TEXT NOT NULL,
       glob_pattern TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      context TEXT,
+      updated_at TEXT NOT NULL,
       UNIQUE(pwd, glob_pattern)
     )
   `);
 
-  // Path-based context
+  // Documents table - file system layer mapping virtual paths to content hashes
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      collection_id INTEGER NOT NULL,
+      path TEXT NOT NULL,
+      title TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      modified_at TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+      UNIQUE(collection_id, path)
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection_id, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+
+  // Path-based context (collection-scoped, hierarchical)
   db.exec(`
     CREATE TABLE IF NOT EXISTS path_contexts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      path_prefix TEXT NOT NULL UNIQUE,
+      collection_id INTEGER NOT NULL,
+      path_prefix TEXT NOT NULL,
       context TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+      UNIQUE(collection_id, path_prefix)
     )
   `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_path_contexts_prefix ON path_contexts(path_prefix)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collection_id, path_prefix)`);
 
   // Cache table for Ollama API calls
   db.exec(`
@@ -139,33 +250,6 @@ function initializeDatabase(db: Database): void {
       created_at TEXT NOT NULL
     )
   `);
-
-  // Documents table
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      title TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      filepath TEXT NOT NULL,
-      display_path TEXT NOT NULL DEFAULT '',
-      body TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      modified_at TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      FOREIGN KEY (collection_id) REFERENCES collections(id)
-    )
-  `);
-
-  // Migration: add display_path column if missing
-  const docInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
-  const hasDisplayPath = docInfo.some(col => col.name === 'display_path');
-  if (!hasDisplayPath) {
-    db.exec(`ALTER TABLE documents ADD COLUMN display_path TEXT NOT NULL DEFAULT ''`);
-  }
-
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_display_path ON documents(display_path) WHERE display_path != '' AND active = 1`);
 
   // Content vectors
   const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
@@ -185,39 +269,287 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // FTS
+  // FTS - index path and content (joined from content table)
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      name, body,
-      content='documents',
-      content_rowid='id',
+      path, body,
       tokenize='porter unicode61'
     )
   `);
 
+  // Triggers to keep FTS in sync
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body) VALUES (new.id, new.name, new.body);
+      INSERT INTO documents_fts(rowid, path, body)
+      SELECT new.id, new.path, c.doc
+      FROM content c
+      WHERE c.hash = new.hash;
     END
   `);
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-      INSERT INTO documents_fts(documents_fts, rowid, name, body) VALUES('delete', old.id, old.name, old.body);
+      DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-      INSERT INTO documents_fts(documents_fts, rowid, name, body) VALUES('delete', old.id, old.name, old.body);
-      INSERT INTO documents_fts(rowid, name, body) VALUES (new.id, new.name, new.body);
+      UPDATE documents_fts
+      SET path = new.path,
+          body = (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE rowid = new.id;
     END
   `);
+}
 
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection_id, active)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_filepath ON documents(filepath, active)`);
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_filepath_active ON documents(filepath) WHERE active = 1`);
+function migrateToContentAddressable(db: Database): void {
+  console.log("Migrating database to content-addressable schema...");
+
+  // Start transaction
+  db.exec("BEGIN TRANSACTION");
+
+  try {
+    // Rename old tables
+    db.exec("ALTER TABLE documents RENAME TO documents_old");
+    db.exec("ALTER TABLE collections RENAME TO collections_old");
+    db.exec("ALTER TABLE path_contexts RENAME TO path_contexts_old");
+    db.exec("DROP TABLE IF EXISTS documents_fts");
+    db.exec("DROP TRIGGER IF EXISTS documents_ai");
+    db.exec("DROP TRIGGER IF EXISTS documents_ad");
+    db.exec("DROP TRIGGER IF EXISTS documents_au");
+
+    // Create new schema
+    db.exec(`
+      CREATE TABLE content (
+        hash TEXT PRIMARY KEY,
+        doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE collections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        pwd TEXT NOT NULL,
+        glob_pattern TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(pwd, glob_pattern)
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection_id INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        title TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        modified_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+        UNIQUE(collection_id, path)
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE path_contexts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection_id INTEGER NOT NULL,
+        path_prefix TEXT NOT NULL,
+        context TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+        UNIQUE(collection_id, path_prefix)
+      )
+    `);
+
+    // Migrate data: Extract unique content hashes
+    console.log("Migrating content...");
+    db.exec(`
+      INSERT INTO content (hash, doc, created_at)
+      SELECT hash, body, MIN(created_at) as created_at
+      FROM documents_old
+      WHERE active = 1
+      GROUP BY hash
+    `);
+
+    // Migrate collections: generate names from pwd basename
+    console.log("Migrating collections...");
+    db.exec(`
+      INSERT INTO collections (id, name, pwd, glob_pattern, created_at, updated_at)
+      SELECT
+        id,
+        CASE
+          WHEN INSTR(RTRIM(pwd, '/'), '/') > 0
+          THEN SUBSTR(RTRIM(pwd, '/'), INSTR(RTRIM(pwd, '/'), '/') + 1)
+          ELSE RTRIM(pwd, '/')
+        END as name,
+        pwd,
+        glob_pattern,
+        created_at,
+        created_at as updated_at
+      FROM collections_old
+    `);
+
+    // Handle duplicate collection names by appending collection_id
+    const duplicates = db.prepare(`
+      SELECT name, COUNT(*) as cnt
+      FROM collections
+      GROUP BY name
+      HAVING cnt > 1
+    `).all() as { name: string; cnt: number }[];
+
+    for (const dup of duplicates) {
+      const rows = db.prepare(`SELECT id FROM collections WHERE name = ? ORDER BY id`).all(dup.name) as { id: number }[];
+      for (let i = 1; i < rows.length; i++) {
+        db.prepare(`UPDATE collections SET name = ? WHERE id = ?`).run(`${dup.name}-${rows[i].id}`, rows[i].id);
+      }
+    }
+
+    // Migrate documents: convert filepath to relative path within collection
+    console.log("Migrating documents...");
+    const oldDocs = db.prepare(`
+      SELECT d.id, d.collection_id, d.filepath, d.title, d.hash, d.created_at, d.modified_at, c.pwd
+      FROM documents_old d
+      JOIN collections c ON c.id = d.collection_id
+      WHERE d.active = 1
+    `).all() as Array<{
+      id: number;
+      collection_id: number;
+      filepath: string;
+      title: string;
+      hash: string;
+      created_at: string;
+      modified_at: string;
+      pwd: string;
+    }>;
+
+    const insertDoc = db.prepare(`
+      INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active)
+      VALUES (?, ?, ?, ?, ?, ?, 1)
+    `);
+
+    for (const doc of oldDocs) {
+      // Convert absolute filepath to relative path within collection
+      let path = doc.filepath;
+      if (path.startsWith(doc.pwd + '/')) {
+        path = path.slice(doc.pwd.length + 1);
+      } else if (path.startsWith(doc.pwd)) {
+        path = path.slice(doc.pwd.length);
+      }
+      // Remove leading slash if present
+      path = path.replace(/^\/+/, '');
+
+      try {
+        insertDoc.run(doc.collection_id, path, doc.title, doc.hash, doc.created_at, doc.modified_at);
+      } catch (e) {
+        console.warn(`Skipping duplicate path: ${path} in collection ${doc.collection_id}`);
+      }
+    }
+
+    // Migrate path_contexts: associate with collections based on path prefix
+    console.log("Migrating path contexts...");
+    const oldContexts = db.prepare(`SELECT * FROM path_contexts_old`).all() as Array<{
+      path_prefix: string;
+      context: string;
+      created_at: string;
+    }>;
+
+    const insertContext = db.prepare(`
+      INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    const allCollections = db.prepare(`SELECT id, pwd FROM collections`).all() as Array<{ id: number; pwd: string }>;
+
+    for (const ctx of oldContexts) {
+      // Find collection(s) that match this path prefix
+      for (const coll of allCollections) {
+        if (ctx.path_prefix.startsWith(coll.pwd)) {
+          // Convert absolute path_prefix to relative within collection
+          let relPath = ctx.path_prefix;
+          if (relPath.startsWith(coll.pwd + '/')) {
+            relPath = relPath.slice(coll.pwd.length + 1);
+          } else if (relPath.startsWith(coll.pwd)) {
+            relPath = relPath.slice(coll.pwd.length);
+          }
+          relPath = relPath.replace(/^\/+/, '');
+
+          try {
+            insertContext.run(coll.id, relPath, ctx.context, ctx.created_at);
+          } catch (e) {
+            // Ignore duplicates
+          }
+        }
+      }
+    }
+
+    // Drop old tables
+    db.exec("DROP TABLE documents_old");
+    db.exec("DROP TABLE collections_old");
+    db.exec("DROP TABLE path_contexts_old");
+
+    // Recreate FTS and triggers
+    db.exec(`
+      CREATE VIRTUAL TABLE documents_fts USING fts5(
+        path, body,
+        tokenize='porter unicode61'
+      )
+    `);
+
+    db.exec(`
+      CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+        INSERT INTO documents_fts(rowid, path, body)
+        SELECT new.id, new.path, c.doc
+        FROM content c
+        WHERE c.hash = new.hash;
+      END
+    `);
+
+    db.exec(`
+      CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+        DELETE FROM documents_fts WHERE rowid = old.id;
+      END
+    `);
+
+    db.exec(`
+      CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+        UPDATE documents_fts
+        SET path = new.path,
+            body = (SELECT doc FROM content WHERE hash = new.hash)
+        WHERE rowid = new.id;
+      END
+    `);
+
+    // Populate FTS from migrated data
+    console.log("Rebuilding full-text search index...");
+    db.exec(`
+      INSERT INTO documents_fts(rowid, path, body)
+      SELECT d.id, d.path, c.doc
+      FROM documents d
+      JOIN content c ON c.hash = d.hash
+      WHERE d.active = 1
+    `);
+
+    // Create indexes
+    db.exec(`CREATE INDEX idx_documents_collection ON documents(collection_id, active)`);
+    db.exec(`CREATE INDEX idx_documents_hash ON documents(hash)`);
+    db.exec(`CREATE INDEX idx_documents_path ON documents(path, active)`);
+    db.exec(`CREATE INDEX idx_path_contexts_collection ON path_contexts(collection_id, path_prefix)`);
+
+    db.exec("COMMIT");
+    console.log("Migration complete!");
+
+  } catch (e) {
+    db.exec("ROLLBACK");
+    console.error("Migration failed:", e);
+    throw e;
+  }
 }
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
@@ -254,7 +586,16 @@ export type Store = {
 
   // Context
   getContextForFile: (filepath: string) => string | null;
+  getContextForPath: (collectionId: number, path: string) => string | null;
   getCollectionIdByName: (name: string) => number | null;
+  getCollectionByName: (name: string) => { id: number; name: string; pwd: string; glob_pattern: string } | null;
+
+  // Virtual paths
+  parseVirtualPath: typeof parseVirtualPath;
+  buildVirtualPath: typeof buildVirtualPath;
+  isVirtualPath: typeof isVirtualPath;
+  resolveVirtualPath: (virtualPath: string) => string | null;
+  toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
@@ -309,7 +650,16 @@ export function createStore(dbPath?: string): Store {
 
     // Context
     getContextForFile: (filepath: string) => getContextForFile(db, filepath),
+    getContextForPath: (collectionId: number, path: string) => getContextForPath(db, collectionId, path),
     getCollectionIdByName: (name: string) => getCollectionIdByName(db, name),
+    getCollectionByName: (name: string) => getCollectionByName(db, name),
+
+    // Virtual paths
+    parseVirtualPath,
+    buildVirtualPath,
+    isVirtualPath,
+    resolveVirtualPath: (virtualPath: string) => resolveVirtualPath(db, virtualPath),
+    toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
@@ -632,36 +982,93 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
 }
 
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
-  const allFiles = db.prepare(`SELECT filepath, display_path, LENGTH(body) as body_length FROM documents WHERE active = 1`).all() as { filepath: string; display_path: string; body_length: number }[];
+  const allFiles = db.prepare(`
+    SELECT
+      'qmd://' || c.name || '/' || d.path as virtual_path,
+      LENGTH(content.doc) as body_length,
+      d.collection_id,
+      d.path
+    FROM documents d
+    JOIN collections c ON c.id = d.collection_id
+    JOIN content ON content.hash = d.hash
+    WHERE d.active = 1
+  `).all() as { virtual_path: string; body_length: number; collection_id: number; path: string }[];
+
   const glob = new Glob(pattern);
   return allFiles
-    .filter(f => glob.match(f.display_path))
-    .map(f => ({ filepath: f.filepath, displayPath: f.display_path, bodyLength: f.body_length }));
+    .filter(f => glob.match(f.virtual_path) || glob.match(f.path))
+    .map(f => ({
+      filepath: f.virtual_path,  // Use virtual path as filepath
+      displayPath: f.virtual_path,
+      bodyLength: f.body_length
+    }));
 }
 
 // =============================================================================
 // Context
 // =============================================================================
 
-export function getContextForFile(db: Database, filepath: string): string | null {
+/**
+ * Get context for a file path using hierarchical inheritance.
+ * Contexts are collection-scoped and inherit from parent directories.
+ * For example, context at "/talks" applies to "/talks/2024/keynote.md".
+ *
+ * @param db Database instance
+ * @param collectionId Collection ID
+ * @param path Relative path within the collection
+ * @returns Context string or null if no context is defined
+ */
+export function getContextForPath(db: Database, collectionId: number, path: string): string | null {
+  // Find the most specific (longest) matching path prefix for this collection
   const result = db.prepare(`
     SELECT context FROM path_contexts
-    WHERE ? LIKE path_prefix || '%'
+    WHERE collection_id = ?
+      AND (? LIKE path_prefix || '/%' OR ? = path_prefix OR path_prefix = '')
     ORDER BY LENGTH(path_prefix) DESC
     LIMIT 1
-  `).get(filepath) as { context: string } | null;
+  `).get(collectionId, path, path) as { context: string } | null;
   return result?.context || null;
 }
 
+/**
+ * Legacy function for backward compatibility - resolves filepath to collection+path first
+ */
+export function getContextForFile(db: Database, filepath: string): string | null {
+  // Try to find the document to get its collection_id and path
+  const doc = db.prepare(`
+    SELECT d.collection_id, d.path
+    FROM documents d
+    JOIN collections c ON c.id = d.collection_id
+    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
+    LIMIT 1
+  `).get(filepath) as { collection_id: number; path: string } | null;
+
+  if (!doc) return null;
+  return getContextForPath(db, doc.collection_id, doc.path);
+}
+
+/**
+ * Get collection ID by its name (exact match).
+ */
 export function getCollectionIdByName(db: Database, name: string): number | null {
-  // Search both pwd and glob_pattern columns for the name
   const result = db.prepare(`
     SELECT id FROM collections
-    WHERE pwd LIKE ? OR glob_pattern LIKE ?
-    ORDER BY LENGTH(pwd) DESC
+    WHERE name = ?
     LIMIT 1
-  `).get(`%${name}%`, `%${name}%`) as { id: number } | null;
+  `).get(name) as { id: number } | null;
   return result?.id || null;
+}
+
+/**
+ * Get collection by name.
+ */
+export function getCollectionByName(db: Database, name: string): { id: number; name: string; pwd: string; glob_pattern: string } | null {
+  const result = db.prepare(`
+    SELECT id, name, pwd, glob_pattern FROM collections
+    WHERE name = ?
+    LIMIT 1
+  `).get(name) as { id: number; name: string; pwd: string; glob_pattern: string } | null;
+  return result;
 }
 
 // =============================================================================
@@ -686,9 +1093,16 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   if (!ftsQuery) return [];
 
   let sql = `
-    SELECT d.filepath, d.display_path, d.title, d.body, bm25(documents_fts, 10.0, 1.0) as score
+    SELECT
+      'qmd://' || c.name || '/' || d.path as filepath,
+      'qmd://' || c.name || '/' || d.path as display_path,
+      d.title,
+      content.doc as body,
+      bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
+    JOIN collections c ON c.id = d.collection_id
+    JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1
   `;
   const params: (string | number)[] = [ftsQuery];
@@ -727,10 +1141,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   // sqlite-vec requires "k = ?" for KNN queries
   let sql = `
-    SELECT v.hash_seq, v.distance, d.filepath, d.display_path, d.title, d.body, cv.pos
+    SELECT
+      v.hash_seq,
+      v.distance,
+      'qmd://' || c.name || '/' || d.path as filepath,
+      'qmd://' || c.name || '/' || d.path as display_path,
+      d.title,
+      content.doc as body,
+      cv.pos
     FROM vectors_vec v
     JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN collections c ON c.id = d.collection_id
+    JOIN content ON content.hash = d.hash
     WHERE v.embedding MATCH ? AND k = ?
   `;
 
