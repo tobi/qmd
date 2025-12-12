@@ -66,6 +66,8 @@ import {
   deleteGlobalContexts,
   listPathContexts,
   getAllCollections,
+  getCollectionsWithoutContext,
+  getTopLevelPathsWithoutContext,
   OLLAMA_URL,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,

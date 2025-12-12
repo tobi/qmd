@@ -14,6 +14,7 @@ qmd collection rename <old> <new> # Rename a collection
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
+qmd context check                 # Check for collections/paths missing context
 qmd context rm <path>             # Remove context
 qmd get <file>                    # Get document content (fuzzy matches if not found)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
@@ -65,6 +66,9 @@ qmd context add qmd://journals/2024 "Journal entries from 2024"
 
 # List all contexts
 qmd context list
+
+# Check for collections or paths without context
+qmd context check
 
 # Remove context
 qmd context rm qmd://journals/2024
