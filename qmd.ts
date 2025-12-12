@@ -5,6 +5,7 @@ import { parseArgs } from "util";
 import * as sqliteVec from "sqlite-vec";
 import {
   getDb,
+  closeDb,
   getDbPath,
   getPwd,
   getRealPath,
@@ -116,7 +117,7 @@ function checkIndexHealth(db: Database): void {
 
   // Check if most recent document update is older than 2 weeks
   if (daysStale !== null && daysStale >= 14) {
-    process.stderr.write(`${c.dim}Tip: Index last updated ${daysStale} days ago. Run 'qmd update-all' to refresh.${c.reset}\n`);
+    process.stderr.write(`${c.dim}Tip: Index last updated ${daysStale} days ago. Run 'qmd update' to refresh.${c.reset}\n`);
   }
 }
 
@@ -447,7 +448,7 @@ function showStatus(): void {
     console.log(`\n${c.dim}No collections. Run 'qmd add .' to index markdown files.${c.reset}`);
   }
 
-  db.close();
+  closeDb();
 }
 
 // Update display_paths for all documents that have empty display_path
@@ -481,7 +482,7 @@ function updateDisplayPaths(db: Database): number {
   return updated;
 }
 
-async function updateAllCollections(): Promise<void> {
+async function updateCollections(): Promise<void> {
   const db = getDb();
   cleanupDuplicateCollections(db);
 
@@ -492,7 +493,7 @@ async function updateAllCollections(): Promise<void> {
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd add .' to index markdown files.${c.reset}`);
-    db.close();
+    closeDb();
     return;
   }
 
@@ -502,8 +503,7 @@ async function updateAllCollections(): Promise<void> {
     console.log(`${c.green}✓${c.reset} Updated ${pathsUpdated} display paths`);
   }
 
-  db.close();
-
+  // Don't close db here - indexFiles will reuse it and close at the end
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
@@ -544,7 +544,7 @@ async function addContext(pathArg: string, contextText: string): Promise<void> {
 
   console.log(`${c.green}✓${c.reset} Added context for: ${shortPath(pathPrefix)}`);
   console.log(`${c.dim}Context: ${contextText}${c.reset}`);
-  db.close();
+  closeDb();
 }
 
 function getDocument(filename: string, fromLine?: number, maxLines?: number): void {
@@ -591,7 +591,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
         console.error(`  ${s}`);
       }
     }
-    db.close();
+    closeDb();
     process.exit(1);
   }
 
@@ -613,7 +613,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     console.log(`Folder Context: ${context}\n---\n`);
   }
   console.log(output);
-  db.close();
+  closeDb();
 }
 
 // Multi-get: fetch multiple documents by glob pattern or comma-separated list
@@ -652,7 +652,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     files = matchFilesByGlob(db, pattern);
     if (files.length === 0) {
       console.error(`No files matched pattern: ${pattern}`);
-      db.close();
+      closeDb();
       process.exit(1);
     }
   }
@@ -701,7 +701,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     });
   }
 
-  db.close();
+  closeDb();
 
   // Output based on format
   if (format === "json") {
@@ -800,8 +800,7 @@ async function dropCollection(globPattern: string): Promise<void> {
   const collection = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number } | null;
 
   if (!collection) {
-    console.log(`No collection found for ${pwd} with pattern ${globPattern}`);
-    db.close();
+    // No collection to drop - this is fine, we'll create one during indexing
     return;
   }
 
@@ -814,8 +813,7 @@ async function dropCollection(globPattern: string): Promise<void> {
   console.log(`Dropped collection: ${pwd} (${globPattern})`);
   console.log(`Removed ${deleted.changes} documents`);
   console.log(`(Vectors kept for potential reuse)`);
-
-  db.close();
+  // Don't close db - indexFiles will use it and close at the end
 }
 
 async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
@@ -851,7 +849,7 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
   if (total === 0) {
     progress.clear();
     console.log("No files found matching pattern.");
-    db.close();
+    closeDb();
     return;
   }
 
@@ -953,7 +951,7 @@ async function indexFiles(globPattern: string = DEFAULT_GLOB): Promise<void> {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 
-  db.close();
+  closeDb();
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
@@ -986,7 +984,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
-    db.close();
+    closeDb();
     return;
   }
 
@@ -1021,7 +1019,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   if (allChunks.length === 0) {
     console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-    db.close();
+    closeDb();
     return;
   }
 
@@ -1099,7 +1097,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (errors > 0) {
     console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
   }
-  db.close();
+  closeDb();
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -1144,9 +1142,15 @@ function normalizeBM25(score: number): number {
   return 1 / (1 + Math.exp(-(absScore - 5) / 3));
 }
 
-// Get collection ID by name (matches pwd suffix)
+// Get collection ID by name (matches pwd or glob_pattern suffix)
 function getCollectionIdByName(db: Database, name: string): number | null {
-  const result = db.prepare(`SELECT id FROM collections WHERE pwd LIKE ? ORDER BY LENGTH(pwd) DESC LIMIT 1`).get(`%${name}`) as { id: number } | null;
+  // Search both pwd and glob_pattern columns for the name
+  const result = db.prepare(`
+    SELECT id FROM collections
+    WHERE pwd LIKE ? OR glob_pattern LIKE ?
+    ORDER BY LENGTH(pwd) DESC
+    LIMIT 1
+  `).get(`%${name}%`, `%${name}%`) as { id: number } | null;
   return result?.id || null;
 }
 
@@ -1467,7 +1471,7 @@ function search(query: string, opts: OutputOptions): void {
     collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
     if (collectionId === undefined) {
       console.error(`Collection not found: ${opts.collection}`);
-      db.close();
+      closeDb();
       process.exit(1);
     }
   }
@@ -1482,7 +1486,7 @@ function search(query: string, opts: OutputOptions): void {
     context: getContextForFile(db, r.file),
   }));
 
-  db.close();
+  closeDb();
 
   if (resultsWithContext.length === 0) {
     console.log("No results found.");
@@ -1500,7 +1504,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
     if (collectionId === undefined) {
       console.error(`Collection not found: ${opts.collection}`);
-      db.close();
+      closeDb();
       process.exit(1);
     }
   }
@@ -1508,7 +1512,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
     console.error("Vector index not found. Run 'qmd embed' first to create embeddings.");
-    db.close();
+    closeDb();
     return;
   }
 
@@ -1540,7 +1544,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     .slice(0, opts.limit)
     .map(r => ({ ...r, context: getContextForFile(db, r.file) }));
 
-  db.close();
+  closeDb();
 
   if (results.length === 0) {
     console.log("No results found.");
@@ -1625,7 +1629,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
     if (collectionId === undefined) {
       console.error(`Collection not found: ${opts.collection}`);
-      db.close();
+      closeDb();
       process.exit(1);
     }
   }
@@ -1665,7 +1669,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   if (candidates.length === 0) {
     console.log("No results found.");
-    db.close();
+    closeDb();
     return;
   }
 
@@ -1709,7 +1713,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     };
   }).sort((a, b) => b.score - a.score);
 
-  db.close();
+  closeDb();
   outputResults(finalResults, query, opts);
 }
 
@@ -1788,7 +1792,7 @@ function showHelp(): void {
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
-  console.log("  qmd update-all                - Re-index all collections");
+  console.log("  qmd update                    - Re-index all collections");
   console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
@@ -1842,9 +1846,8 @@ switch (cli.command) {
     const globPattern = (!globArg || globArg === ".") ? DEFAULT_GLOB : globArg;
     if (cli.values.drop) {
       await dropCollection(globPattern);
-    } else {
-      await indexFiles(globPattern);
     }
+    await indexFiles(globPattern);
     break;
   }
 
@@ -1896,8 +1899,8 @@ switch (cli.command) {
     showStatus();
     break;
 
-  case "update-all":
-    await updateAllCollections();
+  case "update":
+    await updateCollections();
     break;
 
   case "embed":
@@ -1984,7 +1987,7 @@ switch (cli.command) {
     db.exec(`VACUUM`);
     console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
-    db.close();
+    closeDb();
     break;
   }
 

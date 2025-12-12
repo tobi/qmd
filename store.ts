@@ -66,6 +66,10 @@ export function resolve(...paths: string[]): string {
 }
 
 export function getDefaultDbPath(indexName: string = "index"): string {
+  // Allow override via INDEX_PATH for testing
+  if (Bun.env.INDEX_PATH) {
+    return Bun.env.INDEX_PATH;
+  }
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
   try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch {}
@@ -357,6 +361,14 @@ export function getDb(): Database {
   return _legacyDb;
 }
 
+/** @deprecated Use store.db.close() instead. Closes the legacy db and resets singleton. */
+export function closeDb(): void {
+  if (_legacyDb) {
+    _legacyDb.close();
+    _legacyDb = null;
+  }
+}
+
 /** @deprecated Use store.ensureVecTable() instead */
 export function ensureVecTable(db: Database, dimensions: number): void {
   ensureVecTableInternal(db, dimensions);
@@ -642,7 +654,13 @@ export function getContextForFile(db: Database, filepath: string): string | null
 }
 
 export function getCollectionIdByName(db: Database, name: string): number | null {
-  const result = db.prepare(`SELECT id FROM collections WHERE pwd LIKE ? ORDER BY LENGTH(pwd) DESC LIMIT 1`).get(`%${name}`) as { id: number } | null;
+  // Search both pwd and glob_pattern columns for the name
+  const result = db.prepare(`
+    SELECT id FROM collections
+    WHERE pwd LIKE ? OR glob_pattern LIKE ?
+    ORDER BY LENGTH(pwd) DESC
+    LIMIT 1
+  `).get(`%${name}%`, `%${name}%`) as { id: number } | null;
   return result?.id || null;
 }
 
