@@ -430,17 +430,17 @@ function showStatus(): void {
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
-  // Get all contexts grouped by collection
-  const allContexts = listPathContexts(db);
+  // Get all contexts grouped by collection (from YAML)
+  const allContexts = listAllContexts();
   const contextsByCollection = new Map<string, { path_prefix: string; context: string }[]>();
 
   for (const ctx of allContexts) {
     // Group contexts by collection name
-    if (!contextsByCollection.has(ctx.collection_name)) {
-      contextsByCollection.set(ctx.collection_name, []);
+    if (!contextsByCollection.has(ctx.collection)) {
+      contextsByCollection.set(ctx.collection, []);
     }
-    contextsByCollection.get(ctx.collection_name)!.push({
-      path_prefix: ctx.path_prefix,
+    contextsByCollection.get(ctx.collection)!.push({
+      path_prefix: ctx.path,
       context: ctx.context
     });
   }

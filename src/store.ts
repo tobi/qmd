@@ -1071,63 +1071,82 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const collections = collectionsListCollections();
   const config = collectionsLoadConfig();
 
-  // Find which collection this absolute path belongs to
-  for (const coll of collections) {
-    // Skip collections with missing paths
-    if (!coll || !coll.path) continue;
+  // Parse virtual path format: qmd://collection/path
+  let collectionName: string;
+  let relativePath: string;
 
-    if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
-      // Extract relative path
-      const relativePath = filepath.startsWith(coll.path + '/')
-        ? filepath.slice(coll.path.length + 1)
-        : '';
+  if (filepath.startsWith('qmd://')) {
+    // Virtual path: qmd://collection/path
+    const parts = filepath.slice(6).split('/'); // Remove 'qmd://'
+    collectionName = parts[0];
+    relativePath = parts.slice(1).join('/');
+  } else {
+    // Filesystem path: find which collection this absolute path belongs to
+    let found = false;
+    for (const coll of collections) {
+      // Skip collections with missing paths
+      if (!coll || !coll.path) continue;
 
-      // Verify this document exists in the database
-      const doc = db.prepare(`
-        SELECT d.path
-        FROM documents d
-        WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        LIMIT 1
-      `).get(coll.name, relativePath) as { path: string } | null;
-
-      if (doc) {
-        // Collect ALL matching contexts (global + all path prefixes)
-        const contexts: string[] = [];
-
-        // Add global context if present
-        if (config.global_context) {
-          contexts.push(config.global_context);
-        }
-
-        // Add all matching path contexts (from most general to most specific)
-        if (coll.context) {
-          const normalizedPath = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
-
-          // Collect all matching prefixes
-          const matchingContexts: { prefix: string; context: string }[] = [];
-          for (const [prefix, context] of Object.entries(coll.context)) {
-            const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
-            if (normalizedPath.startsWith(normalizedPrefix)) {
-              matchingContexts.push({ prefix: normalizedPrefix, context });
-            }
-          }
-
-          // Sort by prefix length (shortest/most general first)
-          matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
-
-          // Add all matching contexts
-          for (const match of matchingContexts) {
-            contexts.push(match.context);
-          }
-        }
-
-        // Join all contexts with double newline
-        return contexts.length > 0 ? contexts.join('\n\n') : null;
+      if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
+        collectionName = coll.name;
+        // Extract relative path
+        relativePath = filepath.startsWith(coll.path + '/')
+          ? filepath.slice(coll.path.length + 1)
+          : '';
+        found = true;
+        break;
       }
+    }
+
+    if (!found) return null;
+  }
+
+  // Get the collection from config
+  const coll = getCollection(collectionName);
+  if (!coll) return null;
+
+  // Verify this document exists in the database
+  const doc = db.prepare(`
+    SELECT d.path
+    FROM documents d
+    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    LIMIT 1
+  `).get(collectionName, relativePath) as { path: string } | null;
+
+  if (!doc) return null;
+
+  // Collect ALL matching contexts (global + all path prefixes)
+  const contexts: string[] = [];
+
+  // Add global context if present
+  if (config.global_context) {
+    contexts.push(config.global_context);
+  }
+
+  // Add all matching path contexts (from most general to most specific)
+  if (coll.context) {
+    const normalizedPath = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
+
+    // Collect all matching prefixes
+    const matchingContexts: { prefix: string; context: string }[] = [];
+    for (const [prefix, context] of Object.entries(coll.context)) {
+      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
+      if (normalizedPath.startsWith(normalizedPrefix)) {
+        matchingContexts.push({ prefix: normalizedPrefix, context });
+      }
+    }
+
+    // Sort by prefix length (shortest/most general first)
+    matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
+
+    // Add all matching contexts
+    for (const match of matchingContexts) {
+      contexts.push(match.context);
     }
   }
 
-  return null;
+  // Join all contexts with double newline
+  return contexts.length > 0 ? contexts.join('\n\n') : null;
 }
 
 /**
@@ -1408,6 +1427,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.path as display_path,
       d.title,
       content.doc as body,
+      d.hash,
       bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
@@ -1427,22 +1447,25 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY score LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; score: number }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; score: number }[];
 
   const maxScore = rows.length > 0 ? Math.max(...rows.map(r => Math.abs(r.score))) : 1;
-  return rows.map(row => ({
-    filepath: row.filepath,
-    displayPath: row.display_path,
-    title: row.title,
-    hash: "",  // Not available in FTS query
-    collectionName: row.filepath.split('//')[1]?.split('/')[0] || "",  // Extract from virtual path
-    modifiedAt: "",  // Not available in FTS query
-    bodyLength: row.body.length,
-    body: row.body,
-    context: null,  // Not loaded in FTS
-    score: Math.abs(row.score) / maxScore,
-    source: "fts" as const,
-  }));
+  return rows.map(row => {
+    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+    return {
+      filepath: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      hash: row.hash,
+      collectionName,
+      modifiedAt: "",  // Not available in FTS query
+      bodyLength: row.body.length,
+      body: row.body,
+      context: getContextForFile(db, row.filepath),
+      score: Math.abs(row.score) / maxScore,
+      source: "fts" as const,
+    };
+  });
 }
 
 // =============================================================================
@@ -1465,6 +1488,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       d.path as display_path,
       d.title,
       content.doc as body,
+      cv.hash,
       cv.pos
     FROM vectors_vec v
     JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
@@ -1482,7 +1506,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   sql += ` ORDER BY v.distance`;
 
-  const rows = db.prepare(sql).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; pos: number }[];
+  const rows = db.prepare(sql).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
 
   const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
   for (const row of rows) {
@@ -1495,20 +1519,23 @@ export async function searchVec(db: Database, query: string, model: string, limi
   return Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
-    .map(({ row }) => ({
-      filepath: row.filepath,
-      displayPath: row.display_path,
-      title: row.title,
-      hash: "",  // Not available in vec query
-      collectionName: row.filepath.split('//')[1]?.split('/')[0] || "",  // Extract from virtual path
-      modifiedAt: "",  // Not available in vec query
-      bodyLength: row.body.length,
-      body: row.body,
-      context: null,  // Not loaded in vec
-      score: 1 / (1 + row.distance),
-      source: "vec" as const,
-      chunkPos: row.pos,
-    }));
+    .map(({ row }) => {
+      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      return {
+        filepath: row.filepath,
+        displayPath: row.display_path,
+        title: row.title,
+        hash: row.hash,
+        collectionName,
+        modifiedAt: "",  // Not available in vec query
+        bodyLength: row.body.length,
+        body: row.body,
+        context: getContextForFile(db, row.filepath),
+        score: 1 / (1 + row.distance),
+        source: "vec" as const,
+        chunkPos: row.pos,
+      };
+    });
 }
 
 // =============================================================================
