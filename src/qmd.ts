@@ -689,7 +689,10 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
 
     insertContext(db, coll.id, parsed.path, contextText);
 
-    console.log(`${c.green}✓${c.reset} Added context for: qmd://${parsed.collectionName}/${parsed.path || ''}`);
+    const displayPath = parsed.path
+      ? `qmd://${parsed.collectionName}/${parsed.path}`
+      : `qmd://${parsed.collectionName}/ (collection root)`;
+    console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
     closeDb();
     return;
@@ -2456,11 +2459,15 @@ switch (cli.command) {
       case "add": {
         if (cli.args.length < 2) {
           console.error("Usage: qmd context add [path] \"text\"");
+          console.error("");
           console.error("Examples:");
           console.error("  qmd context add \"Context for current directory\"");
           console.error("  qmd context add . \"Context for current directory\"");
           console.error("  qmd context add /subfolder \"Context for subfolder\"");
           console.error("  qmd context add / \"Global context for all collections\"");
+          console.error("");
+          console.error("  Using virtual paths:");
+          console.error("  qmd context add qmd://journals/ \"Context for entire journals collection\"");
           console.error("  qmd context add qmd://journals/2024 \"Context for 2024 journals\"");
           process.exit(1);
         }

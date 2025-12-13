@@ -102,13 +102,16 @@ export type VirtualPath = {
 /**
  * Parse a virtual path like "qmd://collection-name/path/to/file.md"
  * into its components.
+ * Also supports collection root: "qmd://collection-name/" or "qmd://collection-name"
  */
 export function parseVirtualPath(virtualPath: string): VirtualPath | null {
-  const match = virtualPath.match(/^qmd:\/\/([^\/]+)\/(.+)$/);
+  // Match: qmd://collection-name[/optional-path]
+  // Allows: qmd://name, qmd://name/, qmd://name/path
+  const match = virtualPath.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
   if (!match) return null;
   return {
     collectionName: match[1],
-    path: match[2],
+    path: match[2] || '',  // Empty string for collection root
   };
 }
 

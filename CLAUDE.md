@@ -62,6 +62,7 @@ qmd context add /subfolder "Description for subfolder"
 qmd context add / "Always include this context"
 
 # Add context using virtual paths
+qmd context add qmd://journals/ "Context for entire journals collection"
 qmd context add qmd://journals/2024 "Journal entries from 2024"
 
 # List all contexts
