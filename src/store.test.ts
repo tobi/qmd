@@ -709,7 +709,7 @@ describe("FTS Search", () => {
     // Both documents contain "fox" in the body now, so we should get 2 results
     expect(results.length).toBe(2);
     // Title/name match should rank higher due to BM25 weights
-    expect(results[0].displayPath).toBe(`qmd://${collectionName}/test/title.md`);
+    expect(results[0].displayPath).toBe("test/title.md");
 
     await cleanupTestDb(store);
   });
