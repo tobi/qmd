@@ -1248,7 +1248,7 @@ function listFiles(pathArg?: string): void {
 
     console.log(`${c.bold}Collections:${c.reset}\n`);
     for (const coll of collections) {
-      console.log(`${c.cyan}qmd://${coll.name}/${c.reset} (${coll.file_count} files)`);
+      console.log(`  ${c.dim}qmd://${c.reset}${c.cyan}${coll.name}/${c.reset}  ${c.dim}(${coll.file_count} files)${c.reset}`);
     }
     closeDb();
     return;
@@ -1286,15 +1286,16 @@ function listFiles(pathArg?: string): void {
     process.exit(1);
   }
 
-  // List files in the collection (optionally filtered by path prefix)
+  // List files in the collection with size and modification time
   let query: string;
   let params: any[];
 
   if (pathPrefix) {
     // List files under a specific path
     query = `
-      SELECT d.path
+      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
+      JOIN content ct ON d.hash = ct.hash
       WHERE d.collection_id = ? AND d.path LIKE ? AND d.active = 1
       ORDER BY d.path
     `;
@@ -1302,15 +1303,16 @@ function listFiles(pathArg?: string): void {
   } else {
     // List all files in the collection
     query = `
-      SELECT d.path
+      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
+      JOIN content ct ON d.hash = ct.hash
       WHERE d.collection_id = ? AND d.active = 1
       ORDER BY d.path
     `;
     params = [coll.id];
   }
 
-  const files = db.prepare(query).all(...params) as { path: string }[];
+  const files = db.prepare(query).all(...params) as { path: string; title: string; modified_at: string; size: number }[];
 
   if (files.length === 0) {
     if (pathPrefix) {
@@ -1322,12 +1324,40 @@ function listFiles(pathArg?: string): void {
     return;
   }
 
-  // Output virtual paths
+  // Calculate max widths for alignment
+  const maxSize = Math.max(...files.map(f => formatBytes(f.size).length));
+
+  // Output in ls -l style
   for (const file of files) {
-    console.log(buildVirtualPath(collectionName, file.path));
+    const sizeStr = formatBytes(file.size).padStart(maxSize);
+    const date = new Date(file.modified_at);
+    const timeStr = formatLsTime(date);
+
+    // Dim the qmd:// prefix, highlight the filename
+    console.log(`${sizeStr}  ${timeStr}  ${c.dim}qmd://${collectionName}/${c.reset}${c.cyan}${file.path}${c.reset}`);
   }
 
   closeDb();
+}
+
+// Format date/time like ls -l
+function formatLsTime(date: Date): string {
+  const now = new Date();
+  const sixMonthsAgo = new Date(now.getTime() - 6 * 30 * 24 * 60 * 60 * 1000);
+
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[date.getMonth()];
+  const day = date.getDate().toString().padStart(2, ' ');
+
+  // If file is older than 6 months, show year instead of time
+  if (date < sixMonthsAgo) {
+    const year = date.getFullYear();
+    return `${month} ${day}  ${year}`;
+  } else {
+    const hours = date.getHours().toString().padStart(2, '0');
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    return `${month} ${day} ${hours}:${minutes}`;
+  }
 }
 
 // Collection management commands
