@@ -66,8 +66,9 @@ function getConfigFilePath(): string {
  * Ensure config directory exists
  */
 function ensureConfigDir(): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+  const configDir = getConfigDir();
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true });
   }
 }
 
@@ -80,12 +81,13 @@ function ensureConfigDir(): void {
  * Returns empty config if file doesn't exist
  */
 export function loadConfig(): CollectionConfig {
-  if (!existsSync(CONFIG_PATH)) {
+  const configPath = getConfigFilePath();
+  if (!existsSync(configPath)) {
     return { collections: {} };
   }
 
   try {
-    const content = readFileSync(CONFIG_PATH, "utf-8");
+    const content = readFileSync(configPath, "utf-8");
     const config = YAML.parse(content) as CollectionConfig;
 
     // Ensure collections object exists
@@ -95,7 +97,7 @@ export function loadConfig(): CollectionConfig {
 
     return config;
   } catch (error) {
-    throw new Error(`Failed to parse ${CONFIG_PATH}: ${error}`);
+    throw new Error(`Failed to parse ${configPath}: ${error}`);
   }
 }
 
@@ -104,15 +106,16 @@ export function loadConfig(): CollectionConfig {
  */
 export function saveConfig(config: CollectionConfig): void {
   ensureConfigDir();
+  const configPath = getConfigFilePath();
 
   try {
     const yaml = YAML.stringify(config, {
       indent: 2,
       lineWidth: 0,  // Don't wrap lines
     });
-    writeFileSync(CONFIG_PATH, yaml, "utf-8");
+    writeFileSync(configPath, yaml, "utf-8");
   } catch (error) {
-    throw new Error(`Failed to write ${CONFIG_PATH}: ${error}`);
+    throw new Error(`Failed to write ${configPath}: ${error}`);
   }
 }
 
@@ -356,14 +359,14 @@ export function findContextForPath(
  * Get the config file path (useful for error messages)
  */
 export function getConfigPath(): string {
-  return CONFIG_PATH;
+  return getConfigFilePath();
 }
 
 /**
  * Check if config file exists
  */
 export function configExists(): boolean {
-  return existsSync(CONFIG_PATH);
+  return existsSync(getConfigFilePath());
 }
 
 /**
