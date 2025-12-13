@@ -18,8 +18,6 @@ import {
   extractSnippet,
   getContextForFile,
   getContextForPath,
-  getCollectionIdByName,
-  getCollectionByName,
   listCollections,
   removeCollection,
   renameCollection,
@@ -61,11 +59,6 @@ import {
   cleanupOrphanedVectors,
   cleanupDuplicateCollections,
   vacuumDatabase,
-  insertContext,
-  deleteContext,
-  deleteGlobalContexts,
-  listPathContexts,
-  getAllCollections,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   OLLAMA_URL,
@@ -83,7 +76,14 @@ import {
   escapeCSV,
   type OutputFormat,
 } from "./formatter.js";
-import { getCollection as getCollectionFromYaml } from "./collections.js";
+import {
+  getCollection as getCollectionFromYaml,
+  listCollections as yamlListCollections,
+  addContext as yamlAddContext,
+  removeContext as yamlRemoveContext,
+  setGlobalContext,
+  listAllContexts,
+} from "./collections.js";
 
 // Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
 const CHUNK_BYTE_SIZE = 6 * 1024;
@@ -557,31 +557,34 @@ async function updateCollections(): Promise<void> {
  * Detect which collection (if any) contains the given filesystem path.
  * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
  */
-function detectCollectionFromPath(db: Database, fsPath: string): { collectionId: number; collectionName: string; relativePath: string } | null {
+function detectCollectionFromPath(db: Database, fsPath: string): { collectionName: string; relativePath: string } | null {
   const realPath = getRealPath(fsPath);
 
-  // Find collections that this path is under
-  const collections = db.prepare(`
-    SELECT id, name, pwd
-    FROM collections
-    WHERE ? LIKE pwd || '/%' OR ? = pwd
-    ORDER BY LENGTH(pwd) DESC
-    LIMIT 1
-  `).get(realPath, realPath) as { id: number; name: string; pwd: string } | null;
+  // Find collections that this path is under from YAML
+  const allCollections = yamlListCollections();
 
-  if (!collections) return null;
+  // Find longest matching path
+  let bestMatch: { name: string; path: string } | null = null;
+  for (const coll of allCollections) {
+    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
+      if (!bestMatch || coll.path.length > bestMatch.path.length) {
+        bestMatch = { name: coll.name, path: coll.path };
+      }
+    }
+  }
+
+  if (!bestMatch) return null;
 
   // Calculate relative path
   let relativePath = realPath;
-  if (relativePath.startsWith(collections.pwd + '/')) {
-    relativePath = relativePath.slice(collections.pwd.length + 1);
-  } else if (relativePath === collections.pwd) {
+  if (relativePath.startsWith(bestMatch.path + '/')) {
+    relativePath = relativePath.slice(bestMatch.path.length + 1);
+  } else if (relativePath === bestMatch.path) {
     relativePath = '';
   }
 
   return {
-    collectionId: collections.id,
-    collectionName: collections.name,
+    collectionName: bestMatch.name,
     relativePath
   };
 }
@@ -589,14 +592,10 @@ function detectCollectionFromPath(db: Database, fsPath: string): { collectionId:
 async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
   const db = getDb();
 
-  // Handle "/" as global/root context (applies to all collections)
+  // Handle "/" as global context (applies to all collections)
   if (pathArg === '/') {
-    // Find all collections and add context to each
-    const collections = getAllCollections(db);
-    for (const coll of collections) {
-      insertContext(db, coll.id, '', contextText);
-    }
-    console.log(`${c.green}✓${c.reset} Added global context to ${collections.length} collection(s)`);
+    setGlobalContext(contextText);
+    console.log(`${c.green}✓${c.reset} Set global context`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
     closeDb();
     return;
@@ -620,13 +619,13 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
       process.exit(1);
     }
 
-    const coll = getCollectionByName(db, parsed.collectionName);
+    const coll = getCollectionFromYaml(parsed.collectionName);
     if (!coll) {
       console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
       process.exit(1);
     }
 
-    insertContext(db, coll.id, parsed.path, contextText);
+    yamlAddContext(parsed.collectionName, parsed.path, contextText);
 
     const displayPath = parsed.path
       ? `qmd://${parsed.collectionName}/${parsed.path}`
@@ -645,7 +644,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     process.exit(1);
   }
 
-  insertContext(db, detected.collectionId, detected.relativePath, contextText);
+  yamlAddContext(detected.collectionName, detected.relativePath, contextText);
 
   const displayPath = detected.relativePath ? `qmd://${detected.collectionName}/${detected.relativePath}` : `qmd://${detected.collectionName}/`;
   console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
@@ -656,9 +655,9 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
 function contextList(): void {
   const db = getDb();
 
-  const contexts = listPathContexts(db);
+  const allContexts = listAllContexts();
 
-  if (contexts.length === 0) {
+  if (allContexts.length === 0) {
     console.log(`${c.dim}No contexts configured. Use 'qmd context add' to add one.${c.reset}`);
     closeDb();
     return;
@@ -667,14 +666,13 @@ function contextList(): void {
   console.log(`\n${c.bold}Configured Contexts${c.reset}\n`);
 
   let lastCollection = '';
-  for (const ctx of contexts) {
-    if (ctx.collection_name !== lastCollection) {
-      console.log(`${c.cyan}${ctx.collection_name}${c.reset}`);
-      lastCollection = ctx.collection_name;
+  for (const ctx of allContexts) {
+    if (ctx.collection !== lastCollection) {
+      console.log(`${c.cyan}${ctx.collection}${c.reset}`);
+      lastCollection = ctx.collection;
     }
 
-    const path = ctx.path_prefix || '/';
-    const displayPath = ctx.path_prefix ? `  ${path}` : '  / (root)';
+    const displayPath = ctx.path ? `  ${ctx.path}` : '  / (root)';
     console.log(`${displayPath}`);
     console.log(`    ${c.dim}${ctx.context}${c.reset}`);
   }
@@ -683,13 +681,10 @@ function contextList(): void {
 }
 
 function contextRemove(pathArg: string): void {
-  const db = getDb();
-
   if (pathArg === '/') {
-    // Remove all root contexts
-    const changes = deleteGlobalContexts(db);
-    console.log(`${c.green}✓${c.reset} Removed ${changes} global context(s)`);
-    closeDb();
+    // Remove global context
+    setGlobalContext(undefined);
+    console.log(`${c.green}✓${c.reset} Removed global context`);
     return;
   }
 
@@ -701,21 +696,20 @@ function contextRemove(pathArg: string): void {
       process.exit(1);
     }
 
-    const coll = getCollectionByName(db, parsed.collectionName);
+    const coll = getCollectionFromYaml(parsed.collectionName);
     if (!coll) {
       console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
       process.exit(1);
     }
 
-    const changes = deleteContext(db, coll.name, parsed.path);
+    const success = yamlRemoveContext(coll.name, parsed.path);
 
-    if (changes === 0) {
+    if (!success) {
       console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
       process.exit(1);
     }
 
     console.log(`${c.green}✓${c.reset} Removed context for: ${pathArg}`);
-    closeDb();
     return;
   }
 
@@ -729,21 +723,23 @@ function contextRemove(pathArg: string): void {
     fsPath = resolve(getPwd(), fsPath);
   }
 
+  const db = getDb();
   const detected = detectCollectionFromPath(db, fsPath);
+  closeDb();
+
   if (!detected) {
     console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
     process.exit(1);
   }
 
-  const changes = deleteContext(db, detected.collectionName, detected.relativePath);
+  const success = yamlRemoveContext(detected.collectionName, detected.relativePath);
 
-  if (changes === 0) {
+  if (!success) {
     console.error(`${c.yellow}No context found for: qmd://${detected.collectionName}/${detected.relativePath}${c.reset}`);
     process.exit(1);
   }
 
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
-  closeDb();
 }
 
 function contextCheck(): void {
@@ -815,7 +811,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     inputPath = inputPath.slice(0, -colonMatch[0].length);
   }
 
-  let doc: { collectionId: number; collectionName: string; path: string; body: string } | null = null;
+  let doc: { collectionName: string; path: string; body: string } | null = null;
   let virtualPath: string;
 
   // Handle virtual paths (qmd://collection/path)
@@ -829,21 +825,19 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
 
     // Try exact match on collection + path
     doc = db.prepare(`
-      SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+      SELECT d.collection as collectionName, d.path, content.doc as body
       FROM documents d
-      JOIN collections c ON c.id = d.collection_id
       JOIN content ON content.hash = d.hash
-      WHERE c.name = ? AND d.path = ? AND d.active = 1
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
     `).get(parsed.collectionName, parsed.path) as typeof doc;
 
     if (!doc) {
       // Try fuzzy match by path ending
       doc = db.prepare(`
-        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        SELECT d.collection as collectionName, d.path, content.doc as body
         FROM documents d
-        JOIN collections c ON c.id = d.collection_id
         JOIN content ON content.hash = d.hash
-        WHERE c.name = ? AND d.path LIKE ? AND d.active = 1
+        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
         LIMIT 1
       `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
     }
@@ -866,23 +860,21 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
     const detected = detectCollectionFromPath(db, fsPath);
 
     if (detected) {
-      // Found collection - query by collection_id + relative path
+      // Found collection - query by collection name + relative path
       doc = db.prepare(`
-        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        SELECT d.collection as collectionName, d.path, content.doc as body
         FROM documents d
-        JOIN collections c ON c.id = d.collection_id
         JOIN content ON content.hash = d.hash
-        WHERE c.id = ? AND d.path = ? AND d.active = 1
-      `).get(detected.collectionId, detected.relativePath) as typeof doc;
+        WHERE d.collection = ? AND d.path = ? AND d.active = 1
+      `).get(detected.collectionName, detected.relativePath) as typeof doc;
     }
 
     // Fuzzy match by filename (last component of path)
     if (!doc) {
       const filename = inputPath.split('/').pop() || inputPath;
       doc = db.prepare(`
-        SELECT c.id as collectionId, c.name as collectionName, d.path, content.doc as body
+        SELECT d.collection as collectionName, d.path, content.doc as body
         FROM documents d
-        JOIN collections c ON c.id = d.collection_id
         JOIN content ON content.hash = d.hash
         WHERE d.path LIKE ? AND d.active = 1
         LIMIT 1
@@ -903,7 +895,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
   }
 
   // Get context for this file
-  const context = getContextForPath(db, doc.collectionId, doc.path);
+  const context = getContextForPath(db, doc.collectionName, doc.path);
 
   let output = doc.body;
 
@@ -930,14 +922,14 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   // Check if it's a comma-separated list or a glob pattern
   const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
 
-  let files: { filepath: string; displayPath: string; bodyLength: number; collectionId?: number; path?: string }[];
+  let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
   if (isCommaSeparated) {
     // Comma-separated list of files (can be virtual paths or relative paths)
     const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
     files = [];
     for (const name of names) {
-      let doc: { virtual_path: string; body_length: number; collection_id: number; path: string } | null = null;
+      let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
 
       // Handle virtual paths
       if (isVirtualPath(name)) {
@@ -946,26 +938,24 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
           // Try exact match on collection + path
           doc = db.prepare(`
             SELECT
-              'qmd://' || c.name || '/' || d.path as virtual_path,
+              'qmd://' || d.collection || '/' || d.path as virtual_path,
               LENGTH(content.doc) as body_length,
-              d.collection_id,
+              d.collection,
               d.path
             FROM documents d
-            JOIN collections c ON c.id = d.collection_id
             JOIN content ON content.hash = d.hash
-            WHERE c.name = ? AND d.path = ? AND d.active = 1
+            WHERE d.collection = ? AND d.path = ? AND d.active = 1
           `).get(parsed.collectionName, parsed.path) as typeof doc;
         }
       } else {
         // Try exact match on path
         doc = db.prepare(`
           SELECT
-            'qmd://' || c.name || '/' || d.path as virtual_path,
+            'qmd://' || d.collection || '/' || d.path as virtual_path,
             LENGTH(content.doc) as body_length,
-            d.collection_id,
+            d.collection,
             d.path
           FROM documents d
-          JOIN collections c ON c.id = d.collection_id
           JOIN content ON content.hash = d.hash
           WHERE d.path = ? AND d.active = 1
           LIMIT 1
@@ -975,12 +965,11 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
         if (!doc) {
           doc = db.prepare(`
             SELECT
-              'qmd://' || c.name || '/' || d.path as virtual_path,
+              'qmd://' || d.collection || '/' || d.path as virtual_path,
               LENGTH(content.doc) as body_length,
-              d.collection_id,
+              d.collection,
               d.path
             FROM documents d
-            JOIN collections c ON c.id = d.collection_id
             JOIN content ON content.hash = d.hash
             WHERE d.path LIKE ? AND d.active = 1
             LIMIT 1
@@ -993,7 +982,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
           filepath: doc.virtual_path,
           displayPath: doc.virtual_path,
           bodyLength: doc.body_length,
-          collectionId: doc.collection_id,
+          collection: doc.collection,
           path: doc.path
         });
       } else {
@@ -1004,7 +993,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     // Glob pattern - matchFilesByGlob now returns virtual paths
     files = matchFilesByGlob(db, pattern).map(f => ({
       ...f,
-      collectionId: undefined,  // Will be fetched later if needed
+      collection: undefined,  // Will be fetched later if needed
       path: undefined
     }));
     if (files.length === 0) {
@@ -1019,22 +1008,19 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 
   for (const file of files) {
     // Parse virtual path to get collection info if not already available
-    let collectionId = file.collectionId;
+    let collection = file.collection;
     let path = file.path;
 
-    if (!collectionId || !path) {
+    if (!collection || !path) {
       const parsed = parseVirtualPath(file.displayPath);
       if (parsed) {
-        const coll = getCollectionByName(db, parsed.collectionName);
-        if (coll) {
-          collectionId = coll.id;
-          path = parsed.path;
-        }
+        collection = parsed.collectionName;
+        path = parsed.path;
       }
     }
 
     // Get context using collection-scoped function
-    const context = collectionId && path ? getContextForPath(db, collectionId, path) : null;
+    const context = collection && path ? getContextForPath(db, collection, path) : null;
 
     // Check size limit
     if (file.bodyLength > maxBytes) {
@@ -1057,9 +1043,8 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     const doc = db.prepare(`
       SELECT content.doc as body, d.title
       FROM documents d
-      JOIN collections c ON c.id = d.collection_id
       JOIN content ON content.hash = d.hash
-      WHERE c.name = ? AND d.path = ? AND d.active = 1
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
     `).get(parsed.collectionName, parsed.path) as { body: string; title: string } | null;
 
     if (!doc) continue;
@@ -1171,19 +1156,27 @@ function listFiles(pathArg?: string): void {
 
   if (!pathArg) {
     // No argument - list all collections
-    const collections = db.prepare(`
-      SELECT name, COUNT(d.id) as file_count
-      FROM collections c
-      LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
-      GROUP BY c.id, c.name
-      ORDER BY c.name
-    `).all() as { name: string; file_count: number }[];
+    const yamlCollections = yamlListCollections();
 
-    if (collections.length === 0) {
+    if (yamlCollections.length === 0) {
       console.log("No collections found. Run 'qmd add .' to index files.");
       closeDb();
       return;
     }
+
+    // Get file counts from database for each collection
+    const collections = yamlCollections.map(coll => {
+      const stats = db.prepare(`
+        SELECT COUNT(*) as file_count
+        FROM documents d
+        WHERE d.collection = ? AND d.active = 1
+      `).get(coll.name) as { file_count: number } | null;
+
+      return {
+        name: coll.name,
+        file_count: stats?.file_count || 0
+      };
+    });
 
     console.log(`${c.bold}Collections:${c.reset}\n`);
     for (const coll of collections) {
@@ -1217,7 +1210,7 @@ function listFiles(pathArg?: string): void {
   }
 
   // Get the collection
-  const coll = getCollectionByName(db, collectionName);
+  const coll = getCollectionFromYaml(collectionName);
   if (!coll) {
     console.error(`Collection not found: ${collectionName}`);
     console.error(`Run 'qmd ls' to see available collections.`);
@@ -1235,20 +1228,20 @@ function listFiles(pathArg?: string): void {
       SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection_id = ? AND d.path LIKE ? AND d.active = 1
+      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
       ORDER BY d.path
     `;
-    params = [coll.id, `${pathPrefix}%`];
+    params = [coll.name, `${pathPrefix}%`];
   } else {
     // List all files in the collection
     query = `
       SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection_id = ? AND d.active = 1
+      WHERE d.collection = ? AND d.active = 1
       ORDER BY d.path
     `;
-    params = [coll.id];
+    params = [coll.name];
   }
 
   const files = db.prepare(query).all(...params) as { path: string; title: string; modified_at: string; size: number }[];
@@ -1328,39 +1321,36 @@ function collectionList(): void {
 }
 
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
-  const db = getDb();
-
   // If name not provided, generate from pwd basename
   if (!name) {
     const parts = pwd.split('/').filter(Boolean);
     name = parts[parts.length - 1] || 'root';
   }
 
-  // Check if collection with this name already exists
-  const existing = getCollectionByName(db, name);
+  // Check if collection with this name already exists in YAML
+  const existing = getCollectionFromYaml(name);
   if (existing) {
     console.error(`${c.yellow}Collection '${name}' already exists.${c.reset}`);
     console.error(`Use a different name with --name <name>`);
-    closeDb();
     process.exit(1);
   }
 
-  // Check if a collection with this pwd+glob already exists
-  const existingPwdGlob = db.prepare(`
-    SELECT id, name FROM collections WHERE pwd = ? AND glob_pattern = ?
-  `).get(pwd, globPattern) as { id: number; name: string } | null;
+  // Check if a collection with this pwd+glob already exists in YAML
+  const allCollections = yamlListCollections();
+  const existingPwdGlob = allCollections.find(c => c.path === pwd && c.pattern === globPattern);
 
   if (existingPwdGlob) {
     console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
     console.error(`  Name: ${existingPwdGlob.name}`);
     console.error(`  Path: ${pwd}`);
     console.error(`  Pattern: ${globPattern}`);
-    console.error(`\nUse 'qmd add ${globPattern}' to update it, or remove it first with 'qmd collection remove ${existingPwdGlob.name}'`);
-    closeDb();
+    console.error(`\nUse 'qmd update' to re-index it, or remove it first with 'qmd collection remove ${existingPwdGlob.name}'`);
     process.exit(1);
   }
 
-  closeDb();
+  // Add to YAML config
+  const { addCollection } = await import("./collections.js");
+  addCollection(name, pwd, globPattern);
 
   // Create the collection and index files
   console.log(`Creating collection '${name}'...`);
@@ -1369,77 +1359,48 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 }
 
 function collectionRemove(name: string): void {
-  const db = getDb();
-
-  const coll = getCollectionByName(db, name);
+  // Check if collection exists in YAML
+  const coll = getCollectionFromYaml(name);
   if (!coll) {
     console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
-    closeDb();
     process.exit(1);
   }
 
+  const db = getDb();
   const result = removeCollection(db, name);
+  closeDb();
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
   console.log(`  Deleted ${result.deletedDocs} documents`);
   if (result.cleanedHashes > 0) {
     console.log(`  Cleaned up ${result.cleanedHashes} orphaned content hashes`);
   }
-
-  closeDb();
 }
 
 function collectionRename(oldName: string, newName: string): void {
-  const db = getDb();
-
-  // Check if old collection exists
-  const coll = getCollectionByName(db, oldName);
+  // Check if old collection exists in YAML
+  const coll = getCollectionFromYaml(oldName);
   if (!coll) {
     console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
-    closeDb();
     process.exit(1);
   }
 
-  // Check if new name already exists
-  const existing = getCollectionByName(db, newName);
+  // Check if new name already exists in YAML
+  const existing = getCollectionFromYaml(newName);
   if (existing) {
     console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
     console.error(`Choose a different name or remove the existing collection first.`);
-    closeDb();
     process.exit(1);
   }
 
+  const db = getDb();
   renameCollection(db, oldName, newName);
+  closeDb();
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
-
-  closeDb();
-}
-
-async function dropCollection(globPattern: string): Promise<void> {
-  const db = getDb();
-  const pwd = getPwd();
-
-  const collection = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number } | null;
-
-  if (!collection) {
-    // No collection to drop - this is fine, we'll create one during indexing
-    return;
-  }
-
-  // Delete documents in this collection
-  const deleted = db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(collection.id);
-
-  // Delete the collection
-  db.prepare(`DELETE FROM collections WHERE id = ?`).run(collection.id);
-
-  console.log(`Dropped collection: ${pwd} (${globPattern})`);
-  console.log(`Removed ${deleted.changes} documents`);
-  console.log(`(Vectors kept for potential reuse)`);
-  // Don't close db - indexFiles will use it and close at the end
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string): Promise<void> {
@@ -1736,80 +1697,6 @@ function normalizeBM25(score: number): number {
   return 1 / (1 + Math.exp(-(absScore - 5) / 3));
 }
 
-// Get collection ID by name (matches pwd or glob_pattern suffix)
-function getCollectionIdByName(db: Database, name: string): number | null {
-  // Search both pwd and glob_pattern columns for the name
-  const result = db.prepare(`
-    SELECT id FROM collections
-    WHERE pwd LIKE ? OR glob_pattern LIKE ?
-    ORDER BY LENGTH(pwd) DESC
-    LIMIT 1
-  `).get(`%${name}%`, `%${name}%`) as { id: number } | null;
-  return result?.id || null;
-}
-
-// searchFTS and searchVec are now imported from store.ts with updated schema
-
-// Removed duplicate searchFTS and searchVec functions - using store.ts versions instead
-async function REMOVED_searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) return [];
-
-  const queryEmbedding = await getEmbedding(query, model, true);
-  const queryVec = new Float32Array(queryEmbedding);
-
-  // Join: vectors_vec -> content_vectors -> documents
-  // Over-retrieve to handle multiple chunks per document, then dedupe
-  let sql = `
-    SELECT d.filepath, d.display_path, d.title, d.body, vec.distance, cv.pos
-    FROM vectors_vec vec
-    JOIN content_vectors cv ON vec.hash_seq = cv.hash || '_' || cv.seq
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    WHERE vec.embedding MATCH ? AND k = ?
-  `;
-  if (collectionId !== undefined) {
-    sql += ` AND d.collection_id = ${collectionId}`;
-  }
-  sql += ` ORDER BY vec.distance`;
-
-  const stmt = db.prepare(sql);
-  const rawResults = stmt.all(queryVec, limit * 3) as { filepath: string; display_path: string; title: string; body: string; distance: number; pos: number }[];
-
-  // Aggregate chunks per document: max score + small bonus for additional matches
-  const byFile = new Map<string, { filepath: string; displayPath: string; title: string; body: string; chunkCount: number; bestPos: number; bestDist: number }>();
-  for (const r of rawResults) {
-    const existing = byFile.get(r.filepath);
-    if (!existing) {
-      byFile.set(r.filepath, { filepath: r.filepath, displayPath: r.display_path, title: r.title, body: r.body, chunkCount: 1, bestPos: r.pos, bestDist: r.distance });
-    } else {
-      existing.chunkCount++;
-      if (r.distance < existing.bestDist) {
-        existing.bestDist = r.distance;
-        existing.bestPos = r.pos;
-      }
-    }
-  }
-
-  // Score = max chunk score + 0.02 bonus per additional chunk (capped at +0.1)
-  return Array.from(byFile.values())
-    .map(r => {
-      const maxScore = 1 / (1 + r.bestDist);
-      const bonusChunks = Math.min(r.chunkCount - 1, 5);
-      const bonus = bonusChunks * 0.02;
-      return {
-        file: r.filepath,
-        displayPath: r.displayPath,
-        title: r.title,
-        body: r.body,
-        score: maxScore + bonus,
-        source: "vec" as const,
-        chunkPos: r.bestPos,
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-}
-
 function normalizeScores(results: SearchResult[]): SearchResult[] {
   if (results.length === 0) return results;
   const maxScore = Math.max(...results.map(r => r.score));
@@ -2029,20 +1916,22 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
-  // Resolve collection filter if specified
-  let collectionId: number | undefined;
+  // Validate collection filter if specified
+  let collectionName: string | undefined;
   if (opts.collection) {
-    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
-    if (collectionId === undefined) {
+    const coll = getCollectionFromYaml(opts.collection);
+    if (!coll) {
       console.error(`Collection not found: ${opts.collection}`);
       closeDb();
       process.exit(1);
     }
+    collectionName = opts.collection;
   }
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionId);
+  // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+  const results = searchFTS(db, query, fetchLimit, collectionName as any);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2062,15 +1951,16 @@ function search(query: string, opts: OutputOptions): void {
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
 
-  // Resolve collection filter if specified
-  let collectionId: number | undefined;
+  // Validate collection filter if specified
+  let collectionName: string | undefined;
   if (opts.collection) {
-    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
-    if (collectionId === undefined) {
+    const coll = getCollectionFromYaml(opts.collection);
+    if (!coll) {
       console.error(`Collection not found: ${opts.collection}`);
       closeDb();
       process.exit(1);
     }
+    collectionName = opts.collection;
   }
 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
@@ -2093,7 +1983,8 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
 
   for (const q of queries) {
-    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionId);
+    // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.file);
       if (!existing || r.score > existing.score) {
@@ -2187,15 +2078,16 @@ Output exactly 2 variations, one per line, no numbering or bullets:`;
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
-  // Resolve collection filter if specified
-  let collectionId: number | undefined;
+  // Validate collection filter if specified
+  let collectionName: string | undefined;
   if (opts.collection) {
-    collectionId = getCollectionIdByName(db, opts.collection) ?? undefined;
-    if (collectionId === undefined) {
+    const coll = getCollectionFromYaml(opts.collection);
+    if (!coll) {
       console.error(`Collection not found: ${opts.collection}`);
       closeDb();
       process.exit(1);
     }
+    collectionName = opts.collection;
   }
 
   // Check index health and warn about issues
@@ -2211,14 +2103,16 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   for (const q of queries) {
     // FTS search - get ranked results
-    const ftsResults = searchFTS(db, q, 20, collectionId);
+    // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+    const ftsResults = searchFTS(db, q, 20, collectionName as any);
     if (ftsResults.length > 0) {
       rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
     }
 
     // Vector search - get ranked results
     if (hasVectors) {
-      const vecResults = await searchVec(db, q, embedModel, 20, collectionId);
+      // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+      const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
       if (vecResults.length > 0) {
         rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
       }
