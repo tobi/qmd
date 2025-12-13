@@ -278,21 +278,26 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // FTS - index path and content (joined from content table)
+  // FTS - index filepath (collection/path), title, and content
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      path, body,
+      filepath, title, body,
       tokenize='porter unicode61'
     )
   `);
 
   // Triggers to keep FTS in sync
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, path, body)
-      SELECT new.id, new.path, c.doc
-      FROM content c
-      WHERE c.hash = new.hash;
+    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+    WHEN new.active = 1
+    BEGIN
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
     END
   `);
 
@@ -303,11 +308,19 @@ function initializeDatabase(db: Database): void {
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-      UPDATE documents_fts
-      SET path = new.path,
-          body = (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE rowid = new.id;
+    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    BEGIN
+      -- Delete from FTS if no longer active
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+      -- Update FTS if still/newly active
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
     END
   `);
 }
@@ -508,20 +521,25 @@ function migrateToContentAddressable(db: Database): void {
     db.exec("DROP TABLE collections_old");
     db.exec("DROP TABLE path_contexts_old");
 
-    // Recreate FTS and triggers
+    // Recreate FTS and triggers (matching migrated schema)
     db.exec(`
       CREATE VIRTUAL TABLE documents_fts USING fts5(
-        path, body,
+        filepath, title, body,
         tokenize='porter unicode61'
       )
     `);
 
     db.exec(`
-      CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
-        INSERT INTO documents_fts(rowid, path, body)
-        SELECT new.id, new.path, c.doc
-        FROM content c
-        WHERE c.hash = new.hash;
+      CREATE TRIGGER documents_ai AFTER INSERT ON documents
+      WHEN new.active = 1
+      BEGIN
+        INSERT INTO documents_fts(rowid, filepath, title, body)
+        SELECT
+          new.id,
+          new.collection || '/' || new.path,
+          new.title,
+          (SELECT doc FROM content WHERE hash = new.hash)
+        WHERE new.active = 1;
       END
     `);
 
@@ -532,19 +550,27 @@ function migrateToContentAddressable(db: Database): void {
     `);
 
     db.exec(`
-      CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
-        UPDATE documents_fts
-        SET path = new.path,
-            body = (SELECT doc FROM content WHERE hash = new.hash)
-        WHERE rowid = new.id;
+      CREATE TRIGGER documents_au AFTER UPDATE ON documents
+      BEGIN
+        -- Delete from FTS if no longer active
+        DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+        -- Update FTS if still/newly active
+        INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+        SELECT
+          new.id,
+          new.collection || '/' || new.path,
+          new.title,
+          (SELECT doc FROM content WHERE hash = new.hash)
+        WHERE new.active = 1;
       END
     `);
 
     // Populate FTS from migrated data
     console.log("Rebuilding full-text search index...");
     db.exec(`
-      INSERT INTO documents_fts(rowid, path, body)
-      SELECT d.id, d.path, c.doc
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT d.id, d.collection || '/' || d.path, d.title, c.doc
       FROM documents d
       JOIN content c ON c.hash = d.hash
       WHERE d.active = 1
@@ -554,7 +580,6 @@ function migrateToContentAddressable(db: Database): void {
     db.exec(`CREATE INDEX idx_documents_collection ON documents(collection, active)`);
     db.exec(`CREATE INDEX idx_documents_hash ON documents(hash)`);
     db.exec(`CREATE INDEX idx_documents_path ON documents(path, active)`);
-    db.exec(`CREATE INDEX idx_path_contexts_collection ON path_contexts(collection_id, path_prefix)`);
 
     db.exec("COMMIT");
     console.log("Migration complete!");
@@ -846,7 +871,7 @@ export type MultiGetResult = {
 };
 
 export type CollectionInfo = {
-  id: number;
+  name: string;
   path: string;
   pattern: string;
   documents: number;
@@ -1595,12 +1620,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const params: (string | number)[] = [ftsQuery];
 
   if (collectionId !== undefined) {
-    // Convert collectionId to collection name for filtering
-    const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-    if (coll) {
-      sql += ` AND d.collection = ?`;
-      params.push(coll.name);
-    }
+    // Note: collectionId is a legacy parameter that should be phased out
+    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
+    // This code path is likely unused as collection filtering should be done at CLI level.
+    sql += ` AND d.collection = ?`;
+    params.push(String(collectionId));
   }
 
   sql += ` ORDER BY score LIMIT ?`;
@@ -2212,15 +2236,34 @@ export type MultiGetFile = {
 // =============================================================================
 
 export function getStatus(db: Database): IndexStatus {
-  const collections = db.prepare(`
-    SELECT c.id, c.pwd, c.glob_pattern, c.created_at,
-           COUNT(d.id) as active_count,
-           MAX(d.modified_at) as last_doc_update
-    FROM collections c
-    LEFT JOIN documents d ON d.collection = c.name AND d.active = 1
-    GROUP BY c.id
-    ORDER BY last_doc_update DESC
-  `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; active_count: number; last_doc_update: string | null }[];
+  // Load collections from YAML
+  const yamlCollections = collectionsListCollections();
+
+  // Get document counts and last update times for each collection
+  const collections = yamlCollections.map(col => {
+    const stats = db.prepare(`
+      SELECT
+        COUNT(*) as active_count,
+        MAX(modified_at) as last_doc_update
+      FROM documents
+      WHERE collection = ? AND active = 1
+    `).get(col.name) as { active_count: number; last_doc_update: string | null };
+
+    return {
+      name: col.name,
+      path: col.path,
+      pattern: col.pattern,
+      documents: stats.active_count,
+      lastUpdated: stats.last_doc_update || new Date().toISOString(),
+    };
+  });
+
+  // Sort by last update time (most recent first)
+  collections.sort((a, b) => {
+    if (!a.lastUpdated) return 1;
+    if (!b.lastUpdated) return -1;
+    return new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime();
+  });
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -2230,13 +2273,7 @@ export function getStatus(db: Database): IndexStatus {
     totalDocuments: totalDocs,
     needsEmbedding,
     hasVectorIndex: hasVectors,
-    collections: collections.map(col => ({
-      id: col.id,
-      path: col.pwd,
-      pattern: col.glob_pattern,
-      documents: col.active_count,
-      lastUpdated: col.last_doc_update || col.created_at,
-    })),
+    collections,
   };
 }
 
