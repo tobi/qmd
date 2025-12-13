@@ -83,6 +83,7 @@ import {
   escapeCSV,
   type OutputFormat,
 } from "./formatter.js";
+import { getCollection as getCollectionFromYaml } from "./collections.js";
 
 // Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
 const CHUNK_BYTE_SIZE = 6 * 1024;
@@ -528,10 +529,10 @@ async function updateCollections(pullFirst: boolean = false): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = db.prepare(`SELECT id, pwd, glob_pattern FROM collections`).all() as { id: number; pwd: string; glob_pattern: string }[];
+  const collections = listCollections(db);
 
   if (collections.length === 0) {
-    console.log(`${c.dim}No collections found. Run 'qmd add .' to index markdown files.${c.reset}`);
+    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
     closeDb();
     return;
   }
@@ -541,10 +542,43 @@ async function updateCollections(pullFirst: boolean = false): Promise<void> {
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.pwd}${c.reset}`);
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset}`);
+    console.log(`${c.dim}    Path: ${col.pwd}${c.reset}`);
     console.log(`${c.dim}    Pattern: ${col.glob_pattern}${c.reset}`);
 
-    // Check if this is a git repository
+    // Execute custom update command if specified in YAML
+    const yamlCol = getCollectionFromYaml(col.name);
+    if (yamlCol?.update) {
+      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      try {
+        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
+          cwd: col.pwd,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+
+        const output = await new Response(proc.stdout).text();
+        const errorOutput = await new Response(proc.stderr).text();
+        const exitCode = await proc.exited;
+
+        if (output.trim()) {
+          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
+        }
+        if (errorOutput.trim()) {
+          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+        }
+
+        if (exitCode !== 0) {
+          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
+          process.exit(exitCode);
+        }
+      } catch (err) {
+        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
+        process.exit(1);
+      }
+    }
+
+    // Check if this is a git repository (for legacy support)
     const gitDir = `${col.pwd}/.git`;
     let isGitRepo = false;
 
@@ -559,8 +593,8 @@ async function updateCollections(pullFirst: boolean = false): Promise<void> {
     if (isGitRepo) {
       console.log(`${c.dim}    Git repository detected${c.reset}`);
 
-      // Execute git pull if requested
-      if (pullFirst) {
+      // Execute git pull if requested via --pull flag
+      if (pullFirst && !yamlCol?.update) {
         console.log(`${c.dim}    Running git pull...${c.reset}`);
         try {
           const result = await $`cd ${col.pwd} && git pull`.quiet();

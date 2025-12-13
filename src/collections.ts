@@ -28,6 +28,7 @@ export interface Collection {
   path: string;           // Absolute path to index
   pattern: string;        // Glob pattern (e.g., "**/*.md")
   context?: ContextMap;   // Optional context definitions
+  update?: string;        // Optional bash command to run during qmd update
 }
 
 /**
@@ -49,8 +50,17 @@ export interface NamedCollection extends Collection {
 // Configuration paths
 // ============================================================================
 
-const CONFIG_DIR = join(homedir(), ".config", "qmd");
-const CONFIG_PATH = join(CONFIG_DIR, "index.yml");
+function getConfigDir(): string {
+  // Allow override via QMD_CONFIG_DIR for testing
+  if (process.env.QMD_CONFIG_DIR) {
+    return process.env.QMD_CONFIG_DIR;
+  }
+  return join(homedir(), ".config", "qmd");
+}
+
+function getConfigFilePath(): string {
+  return join(getConfigDir(), "index.yml");
+}
 
 /**
  * Ensure config directory exists
