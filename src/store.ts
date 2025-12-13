@@ -1947,8 +1947,17 @@ export function findDocument(db: Database, filename: string, options: { includeB
   if (!doc && !filepath.startsWith('qmd://')) {
     const collections = collectionsListCollections();
     for (const coll of collections) {
-      const absPath = `${coll.path}/${filepath}`;
-      const relativePath = absPath.startsWith(coll.path + '/') ? absPath.slice(coll.path.length + 1) : null;
+      let relativePath: string | null = null;
+
+      // If filepath is absolute and starts with collection path, extract relative part
+      if (filepath.startsWith(coll.path + '/')) {
+        relativePath = filepath.slice(coll.path.length + 1);
+      }
+      // Otherwise treat filepath as relative to collection
+      else if (!filepath.startsWith('/')) {
+        relativePath = filepath;
+      }
+
       if (relativePath) {
         doc = db.prepare(`
           SELECT ${selectCols}
