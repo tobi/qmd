@@ -522,7 +522,7 @@ function showStatus(): void {
   closeDb();
 }
 
-async function updateCollections(pullFirst: boolean = false): Promise<void> {
+async function updateCollections(): Promise<void> {
   const db = getDb();
   cleanupDuplicateCollections(db);
 
@@ -575,58 +575,6 @@ async function updateCollections(pullFirst: boolean = false): Promise<void> {
       } catch (err) {
         console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
         process.exit(1);
-      }
-    }
-
-    // Check if this is a git repository (for legacy support)
-    const gitDir = `${col.pwd}/.git`;
-    let isGitRepo = false;
-
-    try {
-      const stat = await Bun.file(gitDir).exists();
-      isGitRepo = stat;
-    } catch {
-      // Not a git repo or can't access
-      isGitRepo = false;
-    }
-
-    if (isGitRepo) {
-      console.log(`${c.dim}    Git repository detected${c.reset}`);
-
-      // Execute git pull if requested via --pull flag
-      if (pullFirst && !yamlCol?.update) {
-        console.log(`${c.dim}    Running git pull...${c.reset}`);
-        try {
-          const result = await $`cd ${col.pwd} && git pull`.quiet();
-          if (result.exitCode === 0) {
-            const output = result.stdout.toString().trim();
-            if (output) {
-              // Show output but dimmed
-              console.log(`${c.dim}    ${output.split('\n').join('\n    ')}${c.reset}`);
-            }
-          } else {
-            const stderr = result.stderr.toString().trim();
-            console.log(`${c.yellow}    Warning: git pull failed: ${stderr}${c.reset}`);
-          }
-        } catch (err) {
-          console.log(`${c.yellow}    Warning: git pull failed: ${err}${c.reset}`);
-        }
-      }
-
-      // Show git status
-      try {
-        const statusResult = await $`cd ${col.pwd} && git status --short`.quiet();
-        if (statusResult.exitCode === 0) {
-          const statusOutput = statusResult.stdout.toString().trim();
-          if (statusOutput) {
-            console.log(`${c.dim}    Git status:${c.reset}`);
-            console.log(`${c.dim}    ${statusOutput.split('\n').join('\n    ')}${c.reset}`);
-          } else {
-            console.log(`${c.dim}    Git status: clean${c.reset}`);
-          }
-        }
-      } catch (err) {
-        // Silently ignore git status errors
       }
     }
 
@@ -2678,7 +2626,7 @@ switch (cli.command) {
     break;
 
   case "update":
-    await updateCollections(cli.values.pull || false);
+    await updateCollections();
     break;
 
   case "embed":
