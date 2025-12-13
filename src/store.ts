@@ -32,6 +32,7 @@ import {
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
   setGlobalContext,
+  loadConfig as collectionsLoadConfig,
   type NamedCollection,
 } from "./collections";
 
