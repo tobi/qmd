@@ -156,6 +156,15 @@ afterAll(async () => {
   }
 });
 
+// Reset YAML config before each test to ensure isolation
+beforeEach(async () => {
+  // Reset to empty collections config
+  await writeFile(
+    join(testConfigDir, "index.yml"),
+    "collections: {}\n"
+  );
+});
+
 describe("CLI Help", () => {
   test("shows help with --help flag", async () => {
     const { stdout, exitCode } = await runQmd(["--help"]);
@@ -181,7 +190,10 @@ describe("CLI Add Command", () => {
   });
 
   test("adds files with custom glob pattern", async () => {
-    const { stdout, exitCode } = await runQmd(["collection", "add", ".", "--mask", "notes/*.md"]);
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", ".", "--mask", "notes/*.md"]);
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collection:");
     // Should find meeting.md and ideas.md in notes/

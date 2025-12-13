@@ -1405,7 +1405,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   let sql = `
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
-      'qmd://' || d.collection || '/' || d.path as display_path,
+      d.path as display_path,
       d.title,
       content.doc as body,
       bm25(documents_fts, 10.0, 1.0) as score
@@ -1462,7 +1462,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       v.hash_seq,
       v.distance,
       'qmd://' || d.collection || '/' || d.path as filepath,
-      'qmd://' || d.collection || '/' || d.path as display_path,
+      d.path as display_path,
       d.title,
       content.doc as body,
       cv.pos
@@ -1474,11 +1474,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
 
   if (collectionId !== undefined) {
-    // Convert collectionId to collection name for filtering
-    const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-    if (coll) {
-      sql += ` AND d.collection = '${coll.name}'`;
-    }
+    // Note: collectionId is a legacy parameter that should be phased out
+    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
+    sql += ` AND d.collection = ?`;
+    sql = sql.replace('?', String(collectionId)); // Hacky but maintains compatibility
   }
 
   sql += ` ORDER BY v.distance`;
