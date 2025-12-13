@@ -463,27 +463,24 @@ function showStatus(): void {
 
   // Get all contexts grouped by collection
   const allContexts = listPathContexts(db);
-  const contextsByCollection = new Map<number, { path_prefix: string; context: string }[]>();
+  const contextsByCollection = new Map<string, { path_prefix: string; context: string }[]>();
 
   for (const ctx of allContexts) {
-    // Find collection by name
-    const collection = collections.find(col => col.name === ctx.collection_name);
-    if (collection) {
-      if (!contextsByCollection.has(collection.id)) {
-        contextsByCollection.set(collection.id, []);
-      }
-      contextsByCollection.get(collection.id)!.push({
-        path_prefix: ctx.path_prefix,
-        context: ctx.context
-      });
+    // Group contexts by collection name
+    if (!contextsByCollection.has(ctx.collection_name)) {
+      contextsByCollection.set(ctx.collection_name, []);
     }
+    contextsByCollection.get(ctx.collection_name)!.push({
+      path_prefix: ctx.path_prefix,
+      context: ctx.context
+    });
   }
 
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
       const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
-      const contexts = contextsByCollection.get(col.id) || [];
+      const contexts = contextsByCollection.get(col.name) || [];
 
       console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(qmd://${col.name}/)${c.reset}`);
       console.log(`    ${c.dim}Path:${c.reset}     ${col.pwd}`);
