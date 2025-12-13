@@ -1936,7 +1936,7 @@ function search(query: string, opts: OutputOptions): void {
   // Add context to results
   const resultsWithContext = results.map(r => ({
     ...r,
-    context: getContextForFile(db, r.file),
+    context: getContextForFile(db, r.filepath),
   }));
 
   closeDb();
@@ -1986,9 +1986,9 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
-      const existing = allResults.get(r.file);
+      const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
-        allResults.set(r.file, { file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score });
+        allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score });
       }
     }
   }
@@ -2106,7 +2106,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
     const ftsResults = searchFTS(db, q, 20, collectionName as any);
     if (ftsResults.length > 0) {
-      rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
+      rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
     }
 
     // Vector search - get ranked results
@@ -2114,7 +2114,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
       const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
       if (vecResults.length > 0) {
-        rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
+        rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
     }
   }
