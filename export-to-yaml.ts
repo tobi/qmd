@@ -87,7 +87,9 @@ for (const ctx of contexts) {
     collection.context = {};
   }
 
-  collection.context[ctx.path_prefix] = ctx.context;
+  // Use "/" for empty path prefix (cleaner YAML)
+  const pathKey = ctx.path_prefix === "" ? "/" : ctx.path_prefix;
+  collection.context[pathKey] = ctx.context;
 
   // Truncate long contexts for display
   const displayContext = ctx.context.length > 50
