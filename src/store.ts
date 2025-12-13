@@ -1020,8 +1020,43 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * @returns Context string or null if no context is defined
  */
 export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
-  const context = collectionsFindContextForPath(collectionName, path);
-  return context || null;
+  const config = collectionsLoadConfig();
+  const coll = getCollection(collectionName);
+
+  if (!coll) return null;
+
+  // Collect ALL matching contexts (global + all path prefixes)
+  const contexts: string[] = [];
+
+  // Add global context if present
+  if (config.global_context) {
+    contexts.push(config.global_context);
+  }
+
+  // Add all matching path contexts (from most general to most specific)
+  if (coll.context) {
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+
+    // Collect all matching prefixes
+    const matchingContexts: { prefix: string; context: string }[] = [];
+    for (const [prefix, context] of Object.entries(coll.context)) {
+      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
+      if (normalizedPath.startsWith(normalizedPrefix)) {
+        matchingContexts.push({ prefix: normalizedPrefix, context });
+      }
+    }
+
+    // Sort by prefix length (shortest/most general first)
+    matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
+
+    // Add all matching contexts
+    for (const match of matchingContexts) {
+      contexts.push(match.context);
+    }
+  }
+
+  // Join all contexts with double newline
+  return contexts.length > 0 ? contexts.join('\n\n') : null;
 }
 
 /**
@@ -1030,6 +1065,7 @@ export function getContextForPath(db: Database, collectionName: string, path: st
 export function getContextForFile(db: Database, filepath: string): string | null {
   // Get all collections from YAML config
   const collections = collectionsListCollections();
+  const config = collectionsLoadConfig();
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
@@ -1048,9 +1084,38 @@ export function getContextForFile(db: Database, filepath: string): string | null
       `).get(coll.name, relativePath) as { path: string } | null;
 
       if (doc) {
-        // Use collections.ts to find context
-        const context = collectionsFindContextForPath(coll.name, relativePath);
-        return context || null;
+        // Collect ALL matching contexts (global + all path prefixes)
+        const contexts: string[] = [];
+
+        // Add global context if present
+        if (config.global_context) {
+          contexts.push(config.global_context);
+        }
+
+        // Add all matching path contexts (from most general to most specific)
+        if (coll.context) {
+          const normalizedPath = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
+
+          // Collect all matching prefixes
+          const matchingContexts: { prefix: string; context: string }[] = [];
+          for (const [prefix, context] of Object.entries(coll.context)) {
+            const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
+            if (normalizedPath.startsWith(normalizedPrefix)) {
+              matchingContexts.push({ prefix: normalizedPrefix, context });
+            }
+          }
+
+          // Sort by prefix length (shortest/most general first)
+          matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
+
+          // Add all matching contexts
+          for (const match of matchingContexts) {
+            contexts.push(match.context);
+          }
+        }
+
+        // Join all contexts with double newline
+        return contexts.length > 0 ? contexts.join('\n\n') : null;
       }
     }
   }

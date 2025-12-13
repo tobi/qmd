@@ -191,7 +191,19 @@ async function insertTestDocument(
   const now = new Date().toISOString();
   const name = opts.name || "test-doc";
   const title = opts.title || "Test Document";
-  const path = opts.displayPath || `test/${name}.md`;
+
+  // Use displayPath if provided, otherwise filepath's basename, otherwise default
+  let path: string;
+  if (opts.displayPath) {
+    path = opts.displayPath;
+  } else if (opts.filepath) {
+    // Extract relative path from filepath by removing collection path
+    // For tests, assume filepath is either relative or we want the whole path as the document path
+    path = opts.filepath.startsWith('/') ? opts.filepath : opts.filepath;
+  } else {
+    path = `test/${name}.md`;
+  }
+
   const body = opts.body || "# Test Document\n\nThis is test content.";
   const active = opts.active ?? 1;
 
@@ -919,11 +931,10 @@ describe("Document Retrieval", () => {
 
     test("findDocument includes context from path_contexts", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
-      await addPathContext(collectionName, "/path/docs", "Documentation");
+      const collectionName = await createTestCollection({ pwd: "/path" });
+      await addPathContext(collectionName, "docs", "Documentation");
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
-        filepath: "/path/docs/mydoc.md",
         displayPath: "docs/mydoc.md",
       });
 
@@ -940,10 +951,10 @@ describe("Document Retrieval", () => {
   describe("getDocumentBody", () => {
     test("getDocumentBody returns full body", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
+      const collectionName = await createTestCollection({ pwd: "/path" });
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
-        filepath: "/path/mydoc.md",
+        displayPath: "mydoc.md",
         body: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5",
       });
 
@@ -955,10 +966,10 @@ describe("Document Retrieval", () => {
 
     test("getDocumentBody supports line range", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
+      const collectionName = await createTestCollection({ pwd: "/path" });
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
-        filepath: "/path/mydoc.md",
+        displayPath: "mydoc.md",
         body: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5",
       });
 
@@ -1089,10 +1100,10 @@ describe("Document Retrieval", () => {
   describe("Legacy getDocument", () => {
     test("getDocument returns document with body", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
+      const collectionName = await createTestCollection({ pwd: "/path" });
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
-        filepath: "/path/mydoc.md",
+        displayPath: "mydoc.md",
         body: "Document body",
       });
 
@@ -1107,10 +1118,9 @@ describe("Document Retrieval", () => {
 
     test("getDocument supports line range from :line suffix", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
+      const collectionName = await createTestCollection({ pwd: "/path" });
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
-        filepath: "/path/mydoc.md",
         displayPath: "mydoc.md",
         body: "Line 1\nLine 2\nLine 3\nLine 4",
       });
