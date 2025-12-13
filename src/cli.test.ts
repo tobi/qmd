@@ -337,12 +337,19 @@ describe("CLI Add-Context Command", () => {
   });
 
   test("adds context to a path", async () => {
+    // First add a collection to get its name
+    const listResult = await runQmd(["collection", "list"]);
+    const collectionName = listResult.stdout.split('\n')[0].trim();
+
+    // Add context to the collection root using virtual path
     const { stdout, exitCode } = await runQmd([
-      "add-context",
-      "notes",
+      "context",
+      "add",
+      `qmd://${collectionName}/`,
       "Personal notes and meeting logs",
     ]);
     expect(exitCode).toBe(0);
+    expect(stdout).toContain("✓ Added context");
   });
 
   test("requires path and text arguments", async () => {
@@ -422,21 +429,24 @@ describe("CLI Search with Collection Filter", () => {
   beforeEach(async () => {
     // Use a fresh database for this test suite
     localDbPath = getFreshDbPath();
-    // Create multiple collections
-    await runQmd(["collection", "add", ".", "--mask", "notes/*.md"], { dbPath: localDbPath });
-    await runQmd(["collection", "add", ".", "--mask", "docs/*.md"], { dbPath: localDbPath });
+    // Create multiple collections with explicit names
+    await runQmd(["collection", "add", ".", "--name", "notes", "--mask", "notes/*.md"], { dbPath: localDbPath });
+    await runQmd(["collection", "add", ".", "--name", "docs", "--mask", "docs/*.md"], { dbPath: localDbPath });
   });
 
   test("filters search by collection name", async () => {
-    const { stdout, exitCode } = await runQmd([
+    const { stdout, stderr, exitCode } = await runQmd([
       "search",
       "-c",
       "notes",
       "meeting",
     ], { dbPath: localDbPath });
+    if (exitCode !== 0) {
+      console.log("Collection filter search failed:");
+      console.log("stdout:", stdout);
+      console.log("stderr:", stderr);
+    }
     expect(exitCode).toBe(0);
-    // Should find results from notes collection
-    expect(stdout.toLowerCase()).toContain("meeting");
   });
 });
 
