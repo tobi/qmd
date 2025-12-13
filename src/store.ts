@@ -21,6 +21,19 @@ import {
   formatDocForEmbedding,
   type RerankDocument,
 } from "./llm";
+import {
+  findContextForPath as collectionsFindContextForPath,
+  addContext as collectionsAddContext,
+  removeContext as collectionsRemoveContext,
+  listAllContexts as collectionsListAllContexts,
+  getCollection,
+  listCollections as collectionsListCollections,
+  addCollection as collectionsAddCollection,
+  removeCollection as collectionsRemoveCollection,
+  renameCollection as collectionsRenameCollection,
+  setGlobalContext,
+  type NamedCollection,
+} from "./collections";
 
 // =============================================================================
 // Configuration
@@ -147,16 +160,32 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  * Returns null if the file is not in any indexed collection.
  */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
-  const doc = db.prepare(`
-    SELECT d.collection as name, d.path
-    FROM documents d
-    JOIN collections c ON c.name = d.collection
-    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
-    LIMIT 1
-  `).get(absolutePath) as { name: string; path: string } | null;
+  // Get all collections from YAML config
+  const collections = collectionsListCollections();
 
-  if (!doc) return null;
-  return buildVirtualPath(doc.name, doc.path);
+  // Find which collection this absolute path belongs to
+  for (const coll of collections) {
+    if (absolutePath.startsWith(coll.path + '/') || absolutePath === coll.path) {
+      // Extract relative path
+      const relativePath = absolutePath.startsWith(coll.path + '/')
+        ? absolutePath.slice(coll.path.length + 1)
+        : '';
+
+      // Verify this document exists in the database
+      const doc = db.prepare(`
+        SELECT d.path
+        FROM documents d
+        WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        LIMIT 1
+      `).get(coll.name, relativePath) as { path: string } | null;
+
+      if (doc) {
+        return buildVirtualPath(coll.name, relativePath);
+      }
+    }
+  }
+
+  return null;
 }
 
 // =============================================================================
@@ -602,9 +631,8 @@ export type Store = {
   // Context
   getContextForFile: (filepath: string) => string | null;
   getContextForPath: (collectionName: string, path: string) => string | null;
-  getCollectionIdByName: (name: string) => number | null;
-  getCollectionByName: (name: string) => { id: number; name: string; pwd: string; glob_pattern: string } | null;
-  getCollectionsWithoutContext: () => { id: number; name: string; pwd: string; doc_count: number }[];
+  getCollectionByName: (name: string) => { name: string; pwd: string; glob_pattern: string } | null;
+  getCollectionsWithoutContext: () => { name: string; pwd: string; doc_count: number }[];
   getTopLevelPathsWithoutContext: (collectionName: string) => string[];
 
   // Virtual paths
@@ -690,7 +718,6 @@ export function createStore(dbPath?: string): Store {
     // Context
     getContextForFile: (filepath: string) => getContextForFile(db, filepath),
     getContextForPath: (collectionName: string, path: string) => getContextForPath(db, collectionName, path),
-    getCollectionIdByName: (name: string) => getCollectionIdByName(db, name),
     getCollectionByName: (name: string) => getCollectionByName(db, name),
     getCollectionsWithoutContext: () => getCollectionsWithoutContext(db),
     getTopLevelPathsWithoutContext: (collectionName: string) => getTopLevelPathsWithoutContext(db, collectionName),
@@ -1272,97 +1299,103 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * Contexts are collection-scoped and inherit from parent directories.
  * For example, context at "/talks" applies to "/talks/2024/keynote.md".
  *
- * @param db Database instance
+ * @param db Database instance (unused - kept for compatibility)
  * @param collectionName Collection name
  * @param path Relative path within the collection
  * @returns Context string or null if no context is defined
  */
 export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
-  // First get the collection_id from the collection name
-  const coll = db.prepare(`SELECT id FROM collections WHERE name = ?`).get(collectionName) as { id: number } | null;
-  if (!coll) return null;
-
-  // Find the most specific (longest) matching path prefix for this collection
-  const result = db.prepare(`
-    SELECT context FROM path_contexts
-    WHERE collection_id = ?
-      AND (? LIKE path_prefix || '/%' OR ? = path_prefix OR path_prefix = '')
-    ORDER BY LENGTH(path_prefix) DESC
-    LIMIT 1
-  `).get(coll.id, path, path) as { context: string } | null;
-  return result?.context || null;
+  const context = collectionsFindContextForPath(collectionName, path);
+  return context || null;
 }
 
 /**
  * Legacy function for backward compatibility - resolves filepath to collection+path first
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
-  // Try to find the document to get its collection name and path
-  const doc = db.prepare(`
-    SELECT d.collection, d.path
-    FROM documents d
-    JOIN collections c ON c.name = d.collection
-    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
-    LIMIT 1
-  `).get(filepath) as { collection: string; path: string } | null;
+  // Get all collections from YAML config
+  const collections = collectionsListCollections();
 
-  if (!doc) return null;
-  return getContextForPath(db, doc.collection, doc.path);
+  // Find which collection this absolute path belongs to
+  for (const coll of collections) {
+    if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
+      // Extract relative path
+      const relativePath = filepath.startsWith(coll.path + '/')
+        ? filepath.slice(coll.path.length + 1)
+        : '';
+
+      // Verify this document exists in the database
+      const doc = db.prepare(`
+        SELECT d.path
+        FROM documents d
+        WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        LIMIT 1
+      `).get(coll.name, relativePath) as { path: string } | null;
+
+      if (doc) {
+        // Use collections.ts to find context
+        const context = collectionsFindContextForPath(coll.name, relativePath);
+        return context || null;
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
- * Get collection ID by its name (exact match).
+ * Get collection by name from YAML config.
+ * Returns collection metadata from ~/.config/qmd/index.yml
  */
-export function getCollectionIdByName(db: Database, name: string): number | null {
-  const result = db.prepare(`
-    SELECT id FROM collections
-    WHERE name = ?
-    LIMIT 1
-  `).get(name) as { id: number } | null;
-  return result?.id || null;
+export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
+  const collection = getCollection(name);
+  if (!collection) return null;
+
+  return {
+    name: collection.name,
+    pwd: collection.path,
+    glob_pattern: collection.pattern,
+  };
 }
 
 /**
- * Get collection by name.
+ * List all collections with document counts from database.
+ * Merges YAML config with database statistics.
  */
-export function getCollectionByName(db: Database, name: string): { id: number; name: string; pwd: string; glob_pattern: string } | null {
-  const result = db.prepare(`
-    SELECT id, name, pwd, glob_pattern FROM collections
-    WHERE name = ?
-    LIMIT 1
-  `).get(name) as { id: number; name: string; pwd: string; glob_pattern: string } | null;
+export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
+  const collections = collectionsListCollections();
+
+  // Get document counts from database for each collection
+  const result = collections.map(coll => {
+    const stats = db.prepare(`
+      SELECT
+        COUNT(d.id) as doc_count,
+        SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
+        MAX(d.modified_at) as last_modified
+      FROM documents d
+      WHERE d.collection = ?
+    `).get(coll.name) as { doc_count: number; active_count: number; last_modified: string | null } | null;
+
+    return {
+      name: coll.name,
+      pwd: coll.path,
+      glob_pattern: coll.pattern,
+      doc_count: stats?.doc_count || 0,
+      active_count: stats?.active_count || 0,
+      last_modified: stats?.last_modified || null,
+    };
+  });
+
   return result;
 }
 
-export function listCollections(db: Database): { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; updated_at: string; doc_count: number; active_count: number; last_modified: string | null }[] {
-  const collections = db.prepare(`
-    SELECT c.id, c.name, c.pwd, c.glob_pattern, c.created_at, c.updated_at,
-           COUNT(d.id) as doc_count,
-           SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
-           MAX(d.modified_at) as last_modified
-    FROM collections c
-    LEFT JOIN documents d ON d.collection = c.name
-    GROUP BY c.id
-    ORDER BY c.name
-  `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; updated_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
-  return collections;
-}
-
-export function removeCollection(db: Database, collectionId: number): { deletedDocs: number; cleanedHashes: number } {
-  // Get collection name first
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) {
-    return { deletedDocs: 0, cleanedHashes: 0 };
-  }
-
-  // Delete documents
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(coll.name);
-
-  // Delete contexts
-  db.prepare(`DELETE FROM path_contexts WHERE collection_id = ?`).run(collectionId);
-
-  // Delete collection
-  db.prepare(`DELETE FROM collections WHERE id = ?`).run(collectionId);
+/**
+ * Remove a collection and clean up its documents.
+ * Uses collections.ts to remove from YAML config and cleans up database.
+ */
+export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
+  // Delete documents from database
+  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
   // Clean up orphaned content hashes
   const cleanupResult = db.prepare(`
@@ -1370,26 +1403,26 @@ export function removeCollection(db: Database, collectionId: number): { deletedD
     WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
   `).run();
 
+  // Remove from YAML config (returns true if found and removed)
+  collectionsRemoveCollection(collectionName);
+
   return {
     deletedDocs: docResult.changes,
     cleanedHashes: cleanupResult.changes
   };
 }
 
-export function renameCollection(db: Database, collectionId: number, newName: string): void {
-  // Get old collection name first
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) return;
-
-  const now = new Date().toISOString();
-
-  // Update all documents with the new collection name
+/**
+ * Rename a collection.
+ * Updates both YAML config and database documents table.
+ */
+export function renameCollection(db: Database, oldName: string, newName: string): void {
+  // Update all documents with the new collection name in database
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
-    .run(newName, coll.name);
+    .run(newName, oldName);
 
-  // Update collection name
-  db.prepare(`UPDATE collections SET name = ?, updated_at = ? WHERE id = ?`)
-    .run(newName, now, collectionId);
+  // Rename in YAML config
+  collectionsRenameCollection(oldName, newName);
 }
 
 // =============================================================================
@@ -1400,12 +1433,14 @@ export function renameCollection(db: Database, collectionId: number, newName: st
  * Insert or update a context for a specific collection and path prefix.
  */
 export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
-  const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO path_contexts (collection_id, path_prefix, context, created_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(collection_id, path_prefix) DO UPDATE SET context = excluded.context
-  `).run(collectionId, pathPrefix, context, now);
+  // Get collection name from ID
+  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+  if (!coll) {
+    throw new Error(`Collection with id ${collectionId} not found`);
+  }
+
+  // Use collections.ts to add context
+  collectionsAddContext(coll.name, pathPrefix, context);
 }
 
 /**
@@ -1413,11 +1448,15 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
  * Returns the number of contexts deleted.
  */
 export function deleteContext(db: Database, collectionId: number, pathPrefix: string): number {
-  const result = db.prepare(`
-    DELETE FROM path_contexts
-    WHERE collection_id = ? AND path_prefix = ?
-  `).run(collectionId, pathPrefix);
-  return result.changes;
+  // Get collection name from ID
+  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+  if (!coll) {
+    return 0;
+  }
+
+  // Use collections.ts to remove context
+  const success = collectionsRemoveContext(coll.name, pathPrefix);
+  return success ? 1 : 0;
 }
 
 /**
@@ -1425,8 +1464,22 @@ export function deleteContext(db: Database, collectionId: number, pathPrefix: st
  * Returns the number of contexts deleted.
  */
 export function deleteGlobalContexts(db: Database): number {
-  const result = db.prepare(`DELETE FROM path_contexts WHERE path_prefix = ''`).run();
-  return result.changes;
+  let deletedCount = 0;
+
+  // Remove global context
+  setGlobalContext(undefined);
+  deletedCount++;
+
+  // Remove root context (empty string) from all collections
+  const collections = collectionsListCollections();
+  for (const coll of collections) {
+    const success = collectionsRemoveContext(coll.name, '');
+    if (success) {
+      deletedCount++;
+    }
+  }
+
+  return deletedCount;
 }
 
 /**
@@ -1434,38 +1487,65 @@ export function deleteGlobalContexts(db: Database): number {
  * Returns contexts ordered by collection name, then by path prefix length (longest first).
  */
 export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const contexts = db.prepare(`
-    SELECT c.name as collection_name, pc.path_prefix, pc.context
-    FROM path_contexts pc
-    JOIN collections c ON c.id = pc.collection_id
-    ORDER BY c.name, LENGTH(pc.path_prefix) DESC, pc.path_prefix
-  `).all() as { collection_name: string; path_prefix: string; context: string }[];
-  return contexts;
+  const allContexts = collectionsListAllContexts();
+
+  // Convert to expected format and sort
+  return allContexts.map(ctx => ({
+    collection_name: ctx.collection,
+    path_prefix: ctx.path,
+    context: ctx.context,
+  })).sort((a, b) => {
+    // Sort by collection name first
+    if (a.collection_name !== b.collection_name) {
+      return a.collection_name.localeCompare(b.collection_name);
+    }
+    // Then by path prefix length (longest first)
+    if (a.path_prefix.length !== b.path_prefix.length) {
+      return b.path_prefix.length - a.path_prefix.length;
+    }
+    // Then alphabetically
+    return a.path_prefix.localeCompare(b.path_prefix);
+  });
 }
 
 /**
- * Get all collections (id and name).
+ * Get all collections (name only - from YAML config).
  */
-export function getAllCollections(db: Database): { id: number; name: string }[] {
-  return db.prepare(`SELECT id, name FROM collections`).all() as { id: number; name: string }[];
+export function getAllCollections(db: Database): { name: string }[] {
+  const collections = collectionsListCollections();
+  return collections.map(c => ({ name: c.name }));
 }
 
 /**
  * Check which collections don't have any context defined.
  * Returns collections that have no context entries at all (not even root context).
  */
-export function getCollectionsWithoutContext(db: Database): { id: number; name: string; pwd: string; doc_count: number }[] {
-  const collections = db.prepare(`
-    SELECT c.id, c.name, c.pwd, COUNT(d.id) as doc_count
-    FROM collections c
-    LEFT JOIN documents d ON d.collection = c.name AND d.active = 1
-    WHERE NOT EXISTS (
-      SELECT 1 FROM path_contexts pc WHERE pc.collection_id = c.id
-    )
-    GROUP BY c.id
-    ORDER BY c.name
-  `).all() as { id: number; name: string; pwd: string; doc_count: number }[];
-  return collections;
+export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
+  // Get all collections from YAML config
+  const yamlCollections = collectionsListCollections();
+
+  // Filter to those without context
+  const collectionsWithoutContext: { name: string; pwd: string; doc_count: number }[] = [];
+
+  for (const coll of yamlCollections) {
+    // Check if collection has any context
+    if (!coll.context || Object.keys(coll.context).length === 0) {
+      // Get doc count from database
+      const stats = db.prepare(`
+        SELECT COUNT(d.id) as doc_count
+        FROM documents d
+        WHERE d.collection = ? AND d.active = 1
+      `).get(coll.name) as { doc_count: number } | null;
+
+      collectionsWithoutContext.push({
+        name: coll.name,
+        pwd: coll.path,
+        doc_count: stats?.doc_count || 0,
+      });
+    }
+  }
+
+  return collectionsWithoutContext.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
@@ -1473,22 +1553,22 @@ export function getCollectionsWithoutContext(db: Database): { id: number; name: 
  * Useful for suggesting where context might be needed.
  */
 export function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
-  // First get the collection_id from the collection name
-  const coll = db.prepare(`SELECT id FROM collections WHERE name = ?`).get(collectionName) as { id: number } | null;
-  if (!coll) return [];
-
-  // Get all paths in the collection
+  // Get all paths in the collection from database
   const paths = db.prepare(`
     SELECT DISTINCT path FROM documents
     WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
 
-  // Get existing contexts for this collection
-  const contexts = db.prepare(`
-    SELECT path_prefix FROM path_contexts WHERE collection_id = ?
-  `).all(coll.id) as { path_prefix: string }[];
+  // Get existing contexts for this collection from YAML
+  const yamlColl = getCollection(collectionName);
+  if (!yamlColl) return [];
 
-  const contextPrefixes = new Set(contexts.map(c => c.path_prefix));
+  const contextPrefixes = new Set<string>();
+  if (yamlColl.context) {
+    for (const prefix of Object.keys(yamlColl.context)) {
+      contextPrefixes.add(prefix);
+    }
+  }
 
   // Extract top-level directories (first path component)
   const topLevelDirs = new Set<string>();

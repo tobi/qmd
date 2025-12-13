@@ -442,7 +442,7 @@ function showStatus(): void {
            SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
            MAX(d.modified_at) as last_modified
     FROM collections c
-    LEFT JOIN documents d ON d.collection_id = c.id
+    LEFT JOIN documents d ON d.collection = c.name
     GROUP BY c.id
     ORDER BY c.name
   `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
