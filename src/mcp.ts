@@ -97,18 +97,18 @@ export async function startMcpServer(): Promise<void> {
       list: async () => {
         // List all indexed documents
         const docs = store.db.prepare(`
-          SELECT display_path, title
+          SELECT path, title, collection
           FROM documents
           WHERE active = 1
           ORDER BY modified_at DESC
           LIMIT 1000
-        `).all() as { display_path: string; title: string }[];
+        `).all() as { path: string; title: string; collection: string }[];
 
         return {
           resources: docs.map(doc => ({
-            uri: `qmd://${encodeQmdPath(doc.display_path)}`,
-            name: doc.display_path,
-            title: doc.title || doc.display_path,
+            uri: `qmd://${doc.collection}/${encodeQmdPath(doc.path)}`,
+            name: `${doc.collection}/${doc.path}`,
+            title: doc.title || doc.path,
             mimeType: "text/markdown",
           })),
         };
@@ -123,30 +123,49 @@ export async function startMcpServer(): Promise<void> {
       // Decode URL-encoded path (MCP clients send encoded URIs)
       const decodedPath = decodeURIComponent(path);
 
-      // Find document by display_path
-      let doc = store.db.prepare(`SELECT filepath, display_path, title, body FROM documents WHERE display_path = ? AND active = 1`).get(decodedPath) as { filepath: string; display_path: string; title: string; body: string } | null;
+      // Parse virtual path: collection/relative/path
+      const parts = decodedPath.split('/');
+      const collection = parts[0];
+      const relativePath = parts.slice(1).join('/');
+
+      // Find document by collection and path, join with content table
+      let doc = store.db.prepare(`
+        SELECT d.collection, d.path, d.title, c.doc as body
+        FROM documents d
+        JOIN content c ON c.hash = d.hash
+        WHERE d.collection = ? AND d.path = ? AND d.active = 1
+      `).get(collection, relativePath) as { collection: string; path: string; title: string; body: string } | null;
 
       // Try suffix match if exact match fails
       if (!doc) {
-        doc = store.db.prepare(`SELECT filepath, display_path, title, body FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${decodedPath}`) as { filepath: string; display_path: string; title: string; body: string } | null;
+        doc = store.db.prepare(`
+          SELECT d.collection, d.path, d.title, c.doc as body
+          FROM documents d
+          JOIN content c ON c.hash = d.hash
+          WHERE d.path LIKE ? AND d.active = 1
+          LIMIT 1
+        `).get(`%${relativePath}`) as { collection: string; path: string; title: string; body: string } | null;
       }
 
       if (!doc) {
         return { contents: [{ uri: uri.href, text: `Document not found: ${decodedPath}` }] };
       }
 
-      const context = store.getContextForFile(doc.filepath);
+      // Construct virtual path for context lookup
+      const virtualPath = `qmd://${doc.collection}/${doc.path}`;
+      const context = store.getContextForFile(virtualPath);
 
       let text = doc.body;
       if (context) {
         text = `<!-- Context: ${context} -->\n\n` + text;
       }
 
+      const displayName = `${doc.collection}/${doc.path}`;
       return {
         contents: [{
           uri: uri.href,
-          name: doc.display_path,
-          title: doc.title || doc.display_path,
+          name: displayName,
+          title: doc.title || doc.path,
           mimeType: "text/markdown",
           text,
         }],

@@ -458,7 +458,7 @@ describe("CLI Context Management", () => {
       "Global system context",
     ], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("✓ Added global context");
+    expect(stdout).toContain("✓ Set global context");
     expect(stdout).toContain("Global system context");
   });
 

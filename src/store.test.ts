@@ -678,8 +678,8 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("fox", 10);
     expect(results.length).toBeGreaterThan(0);
-    // displayPath now uses virtual path format
-    expect(results[0].displayPath).toBe(`qmd://${collectionName}/test/doc1.md`);
+    expect(results[0].displayPath).toBe("test/doc1.md");
+    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
     expect(results[0].source).toBe("fts");
 
     await cleanupTestDb(store);
@@ -800,7 +800,8 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("findme", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`qmd://${collectionName}/test/active.md`);
+    expect(results[0].displayPath).toBe("test/active.md");
+    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/active.md`);
 
     await cleanupTestDb(store);
   });
