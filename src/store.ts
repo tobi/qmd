@@ -148,9 +148,9 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
   const doc = db.prepare(`
-    SELECT c.name, d.path
+    SELECT d.collection as name, d.path
     FROM documents d
-    JOIN collections c ON c.id = d.collection_id
+    JOIN collections c ON c.name = d.collection
     WHERE c.pwd || '/' || d.path = ? AND d.active = 1
     LIMIT 1
   `).get(absolutePath) as { name: string; path: string } | null;
@@ -214,20 +214,19 @@ function initializeDatabase(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection_id INTEGER NOT NULL,
+      collection TEXT NOT NULL,
       path TEXT NOT NULL,
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
-      FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
-      UNIQUE(collection_id, path)
+      UNIQUE(collection, path)
     )
   `);
 
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection_id, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
@@ -346,16 +345,15 @@ function migrateToContentAddressable(db: Database): void {
     db.exec(`
       CREATE TABLE documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        collection_id INTEGER NOT NULL,
+        collection TEXT NOT NULL,
         path TEXT NOT NULL,
         title TEXT NOT NULL,
         hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
         modified_at TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
-        FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
         FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
-        UNIQUE(collection_id, path)
+        UNIQUE(collection, path)
       )
     `);
 
@@ -422,7 +420,7 @@ function migrateToContentAddressable(db: Database): void {
     // Migrate documents: convert filepath to relative path within collection
     console.log("Migrating documents...");
     const oldDocs = db.prepare(`
-      SELECT d.id, d.collection_id, d.filepath, d.title, d.hash, d.created_at, d.modified_at, c.pwd
+      SELECT d.id, d.collection_id, d.filepath, d.title, d.hash, d.created_at, d.modified_at, c.pwd, c.name
       FROM documents_old d
       JOIN collections c ON c.id = d.collection_id
       WHERE d.active = 1
@@ -435,10 +433,11 @@ function migrateToContentAddressable(db: Database): void {
       created_at: string;
       modified_at: string;
       pwd: string;
+      name: string;
     }>;
 
     const insertDoc = db.prepare(`
-      INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active)
+      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
       VALUES (?, ?, ?, ?, ?, ?, 1)
     `);
 
@@ -454,9 +453,9 @@ function migrateToContentAddressable(db: Database): void {
       path = path.replace(/^\/+/, '');
 
       try {
-        insertDoc.run(doc.collection_id, path, doc.title, doc.hash, doc.created_at, doc.modified_at);
+        insertDoc.run(doc.name, path, doc.title, doc.hash, doc.created_at, doc.modified_at);
       } catch (e) {
-        console.warn(`Skipping duplicate path: ${path} in collection ${doc.collection_id}`);
+        console.warn(`Skipping duplicate path: ${path} in collection ${doc.name}`);
       }
     }
 
@@ -545,7 +544,7 @@ function migrateToContentAddressable(db: Database): void {
     `);
 
     // Create indexes
-    db.exec(`CREATE INDEX idx_documents_collection ON documents(collection_id, active)`);
+    db.exec(`CREATE INDEX idx_documents_collection ON documents(collection, active)`);
     db.exec(`CREATE INDEX idx_documents_hash ON documents(hash)`);
     db.exec(`CREATE INDEX idx_documents_path ON documents(path, active)`);
     db.exec(`CREATE INDEX idx_path_contexts_collection ON path_contexts(collection_id, path_prefix)`);
@@ -602,11 +601,11 @@ export type Store = {
 
   // Context
   getContextForFile: (filepath: string) => string | null;
-  getContextForPath: (collectionId: number, path: string) => string | null;
+  getContextForPath: (collectionName: string, path: string) => string | null;
   getCollectionIdByName: (name: string) => number | null;
   getCollectionByName: (name: string) => { id: number; name: string; pwd: string; glob_pattern: string } | null;
   getCollectionsWithoutContext: () => { id: number; name: string; pwd: string; doc_count: number }[];
-  getTopLevelPathsWithoutContext: (collectionId: number) => string[];
+  getTopLevelPathsWithoutContext: (collectionName: string) => string[];
 
   // Virtual paths
   parseVirtualPath: typeof parseVirtualPath;
@@ -638,12 +637,12 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionId: number, path: string) => { id: number; hash: string; title: string } | null;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionId: number, path: string) => void;
-  getActiveDocumentPaths: (collectionId: number) => string[];
+  deactivateDocument: (collectionName: string, path: string) => void;
+  getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
@@ -690,9 +689,11 @@ export function createStore(dbPath?: string): Store {
 
     // Context
     getContextForFile: (filepath: string) => getContextForFile(db, filepath),
-    getContextForPath: (collectionId: number, path: string) => getContextForPath(db, collectionId, path),
+    getContextForPath: (collectionName: string, path: string) => getContextForPath(db, collectionName, path),
     getCollectionIdByName: (name: string) => getCollectionIdByName(db, name),
     getCollectionByName: (name: string) => getCollectionByName(db, name),
+    getCollectionsWithoutContext: () => getCollectionsWithoutContext(db),
+    getTopLevelPathsWithoutContext: (collectionName: string) => getTopLevelPathsWithoutContext(db, collectionName),
 
     // Virtual paths
     parseVirtualPath,
@@ -724,12 +725,12 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionId: number, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionId, path, title, hash, createdAt, modifiedAt),
-    findActiveDocument: (collectionId: number, path: string) => findActiveDocument(db, collectionId, path),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
-    deactivateDocument: (collectionId: number, path: string) => deactivateDocument(db, collectionId, path),
-    getActiveDocumentPaths: (collectionId: number) => getActiveDocumentPaths(db, collectionId),
+    deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
+    getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
@@ -792,7 +793,7 @@ export type DocumentResult = {
   title: string;              // Document title (from first heading or filename)
   context: string | null;     // Folder context description if configured
   hash: string;               // Content hash for caching/change detection
-  collectionId: number;       // Parent collection ID
+  collectionName: string;     // Parent collection name
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
   body?: string;              // Document body (optional, load with getDocumentBody)
@@ -1068,7 +1069,7 @@ export function insertContent(db: Database, hash: string, content: string, creat
  */
 export function insertDocument(
   db: Database,
-  collectionId: number,
+  collectionName: string,
   path: string,
   title: string,
   hash: string,
@@ -1076,23 +1077,23 @@ export function insertDocument(
   modifiedAt: string
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection_id, path, title, hash, created_at, modified_at, active)
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(collectionId, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
 }
 
 /**
- * Find an active document by collection ID and path.
+ * Find an active document by collection name and path.
  */
 export function findActiveDocument(
   db: Database,
-  collectionId: number,
+  collectionName: string,
   path: string
 ): { id: number; hash: string; title: string } | null {
   return db.prepare(`
     SELECT id, hash, title FROM documents
-    WHERE collection_id = ? AND path = ? AND active = 1
-  `).get(collectionId, path) as { id: number; hash: string; title: string } | null;
+    WHERE collection = ? AND path = ? AND active = 1
+  `).get(collectionName, path) as { id: number; hash: string; title: string } | null;
 }
 
 /**
@@ -1126,18 +1127,18 @@ export function updateDocument(
 /**
  * Deactivate a document (mark as inactive but don't delete).
  */
-export function deactivateDocument(db: Database, collectionId: number, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ? AND active = 1`)
-    .run(collectionId, path);
+export function deactivateDocument(db: Database, collectionName: string, path: string): void {
+  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
+    .run(collectionName, path);
 }
 
 /**
  * Get all active document paths for a collection.
  */
-export function getActiveDocumentPaths(db: Database, collectionId: number): string[] {
+export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
   const rows = db.prepare(`
-    SELECT path FROM documents WHERE collection_id = ? AND active = 1
-  `).all(collectionId) as { path: string }[];
+    SELECT path FROM documents WHERE collection = ? AND active = 1
+  `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
 }
 
@@ -1227,7 +1228,11 @@ function levenshtein(a: string, b: string): number {
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
-  const allFiles = db.prepare(`SELECT display_path FROM documents WHERE active = 1`).all() as { display_path: string }[];
+  const allFiles = db.prepare(`
+    SELECT 'qmd://' || d.collection || '/' || d.path as display_path
+    FROM documents d
+    WHERE d.active = 1
+  `).all() as { display_path: string }[];
   const queryLower = query.toLowerCase();
   const scored = allFiles
     .map(f => ({ path: f.display_path, dist: levenshtein(f.display_path.toLowerCase(), queryLower) }))
@@ -1240,15 +1245,13 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
   const allFiles = db.prepare(`
     SELECT
-      'qmd://' || c.name || '/' || d.path as virtual_path,
+      'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
-      d.collection_id,
       d.path
     FROM documents d
-    JOIN collections c ON c.id = d.collection_id
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; collection_id: number; path: string }[];
+  `).all() as { virtual_path: string; body_length: number; path: string }[];
 
   const glob = new Glob(pattern);
   return allFiles
@@ -1270,11 +1273,15 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * For example, context at "/talks" applies to "/talks/2024/keynote.md".
  *
  * @param db Database instance
- * @param collectionId Collection ID
+ * @param collectionName Collection name
  * @param path Relative path within the collection
  * @returns Context string or null if no context is defined
  */
-export function getContextForPath(db: Database, collectionId: number, path: string): string | null {
+export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
+  // First get the collection_id from the collection name
+  const coll = db.prepare(`SELECT id FROM collections WHERE name = ?`).get(collectionName) as { id: number } | null;
+  if (!coll) return null;
+
   // Find the most specific (longest) matching path prefix for this collection
   const result = db.prepare(`
     SELECT context FROM path_contexts
@@ -1282,7 +1289,7 @@ export function getContextForPath(db: Database, collectionId: number, path: stri
       AND (? LIKE path_prefix || '/%' OR ? = path_prefix OR path_prefix = '')
     ORDER BY LENGTH(path_prefix) DESC
     LIMIT 1
-  `).get(collectionId, path, path) as { context: string } | null;
+  `).get(coll.id, path, path) as { context: string } | null;
   return result?.context || null;
 }
 
@@ -1290,17 +1297,17 @@ export function getContextForPath(db: Database, collectionId: number, path: stri
  * Legacy function for backward compatibility - resolves filepath to collection+path first
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
-  // Try to find the document to get its collection_id and path
+  // Try to find the document to get its collection name and path
   const doc = db.prepare(`
-    SELECT d.collection_id, d.path
+    SELECT d.collection, d.path
     FROM documents d
-    JOIN collections c ON c.id = d.collection_id
+    JOIN collections c ON c.name = d.collection
     WHERE c.pwd || '/' || d.path = ? AND d.active = 1
     LIMIT 1
-  `).get(filepath) as { collection_id: number; path: string } | null;
+  `).get(filepath) as { collection: string; path: string } | null;
 
   if (!doc) return null;
-  return getContextForPath(db, doc.collection_id, doc.path);
+  return getContextForPath(db, doc.collection, doc.path);
 }
 
 /**
@@ -1334,7 +1341,7 @@ export function listCollections(db: Database): { id: number; name: string; pwd: 
            SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
            MAX(d.modified_at) as last_modified
     FROM collections c
-    LEFT JOIN documents d ON d.collection_id = c.id
+    LEFT JOIN documents d ON d.collection = c.name
     GROUP BY c.id
     ORDER BY c.name
   `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; updated_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
@@ -1342,8 +1349,14 @@ export function listCollections(db: Database): { id: number; name: string; pwd: 
 }
 
 export function removeCollection(db: Database, collectionId: number): { deletedDocs: number; cleanedHashes: number } {
+  // Get collection name first
+  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+  if (!coll) {
+    return { deletedDocs: 0, cleanedHashes: 0 };
+  }
+
   // Delete documents
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection_id = ?`).run(collectionId);
+  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(coll.name);
 
   // Delete contexts
   db.prepare(`DELETE FROM path_contexts WHERE collection_id = ?`).run(collectionId);
@@ -1364,7 +1377,17 @@ export function removeCollection(db: Database, collectionId: number): { deletedD
 }
 
 export function renameCollection(db: Database, collectionId: number, newName: string): void {
+  // Get old collection name first
+  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+  if (!coll) return;
+
   const now = new Date().toISOString();
+
+  // Update all documents with the new collection name
+  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
+    .run(newName, coll.name);
+
+  // Update collection name
   db.prepare(`UPDATE collections SET name = ?, updated_at = ? WHERE id = ?`)
     .run(newName, now, collectionId);
 }
@@ -1435,7 +1458,7 @@ export function getCollectionsWithoutContext(db: Database): { id: number; name: 
   const collections = db.prepare(`
     SELECT c.id, c.name, c.pwd, COUNT(d.id) as doc_count
     FROM collections c
-    LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
+    LEFT JOIN documents d ON d.collection = c.name AND d.active = 1
     WHERE NOT EXISTS (
       SELECT 1 FROM path_contexts pc WHERE pc.collection_id = c.id
     )
@@ -1449,17 +1472,21 @@ export function getCollectionsWithoutContext(db: Database): { id: number; name: 
  * Get top-level directories in a collection that don't have context.
  * Useful for suggesting where context might be needed.
  */
-export function getTopLevelPathsWithoutContext(db: Database, collectionId: number): string[] {
+export function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
+  // First get the collection_id from the collection name
+  const coll = db.prepare(`SELECT id FROM collections WHERE name = ?`).get(collectionName) as { id: number } | null;
+  if (!coll) return [];
+
   // Get all paths in the collection
   const paths = db.prepare(`
     SELECT DISTINCT path FROM documents
-    WHERE collection_id = ? AND active = 1
-  `).all(collectionId) as { path: string }[];
+    WHERE collection = ? AND active = 1
+  `).all(collectionName) as { path: string }[];
 
   // Get existing contexts for this collection
   const contexts = db.prepare(`
     SELECT path_prefix FROM path_contexts WHERE collection_id = ?
-  `).all(collectionId) as { path_prefix: string }[];
+  `).all(coll.id) as { path_prefix: string }[];
 
   const contextPrefixes = new Set(contexts.map(c => c.path_prefix));
 
@@ -1516,22 +1543,25 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 
   let sql = `
     SELECT
-      'qmd://' || c.name || '/' || d.path as filepath,
-      'qmd://' || c.name || '/' || d.path as display_path,
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      'qmd://' || d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
-    JOIN collections c ON c.id = d.collection_id
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1
   `;
   const params: (string | number)[] = [ftsQuery];
 
   if (collectionId !== undefined) {
-    sql += ` AND d.collection_id = ?`;
-    params.push(collectionId);
+    // Convert collectionId to collection name for filtering
+    const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+    if (coll) {
+      sql += ` AND d.collection = ?`;
+      params.push(coll.name);
+    }
   }
 
   sql += ` ORDER BY score LIMIT ?`;
@@ -1541,10 +1571,15 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 
   const maxScore = rows.length > 0 ? Math.max(...rows.map(r => Math.abs(r.score))) : 1;
   return rows.map(row => ({
-    file: row.filepath,
+    filepath: row.filepath,
     displayPath: row.display_path,
     title: row.title,
+    hash: "",  // Not available in FTS query
+    collectionName: row.filepath.split('//')[1]?.split('/')[0] || "",  // Extract from virtual path
+    modifiedAt: "",  // Not available in FTS query
+    bodyLength: row.body.length,
     body: row.body,
+    context: null,  // Not loaded in FTS
     score: Math.abs(row.score) / maxScore,
     source: "fts" as const,
   }));
@@ -1566,21 +1601,24 @@ export async function searchVec(db: Database, query: string, model: string, limi
     SELECT
       v.hash_seq,
       v.distance,
-      'qmd://' || c.name || '/' || d.path as filepath,
-      'qmd://' || c.name || '/' || d.path as display_path,
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      'qmd://' || d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       cv.pos
     FROM vectors_vec v
     JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN collections c ON c.id = d.collection_id
     JOIN content ON content.hash = d.hash
     WHERE v.embedding MATCH ? AND k = ?
   `;
 
   if (collectionId !== undefined) {
-    sql += ` AND d.collection_id = ${collectionId}`;
+    // Convert collectionId to collection name for filtering
+    const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+    if (coll) {
+      sql += ` AND d.collection = '${coll.name}'`;
+    }
   }
 
   sql += ` ORDER BY v.distance`;
@@ -1599,10 +1637,15 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
     .map(({ row }) => ({
-      file: row.filepath,
+      filepath: row.filepath,
       displayPath: row.display_path,
       title: row.title,
+      hash: "",  // Not available in vec query
+      collectionName: row.filepath.split('//')[1]?.split('/')[0] || "",  // Extract from virtual path
+      modifiedAt: "",  // Not available in vec query
+      bodyLength: row.body.length,
       body: row.body,
+      context: null,  // Not loaded in vec
       score: 1 / (1 + row.distance),
       source: "vec" as const,
       chunkPos: row.pos,
@@ -1782,7 +1825,7 @@ type DbDocRow = {
   display_path: string;
   title: string;
   hash: string;
-  collection_id: number;
+  collection: string;
   modified_at: string;
   body_length: number;
   body?: string;
@@ -1803,20 +1846,48 @@ export function findDocument(db: Database, filename: string, options: { includeB
     filepath = homedir() + filepath.slice(1);
   }
 
-  const selectCols = options.includeBody
-    ? `filepath, display_path, title, hash, collection_id, modified_at, LENGTH(body) as body_length, body`
-    : `filepath, display_path, title, hash, collection_id, modified_at, LENGTH(body) as body_length`;
+  const bodyCol = options.includeBody ? `, content.doc as body` : ``;
 
-  // Try various match strategies
-  let doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as DbDocRow | null;
+  // Build computed columns for filepath and display_path
+  const selectCols = `
+    c.pwd || '/' || d.path as filepath,
+    'qmd://' || d.collection || '/' || d.path as display_path,
+    d.title,
+    d.hash,
+    d.collection,
+    d.modified_at,
+    LENGTH(content.doc) as body_length
+    ${bodyCol}
+  `;
+
+  // Try various match strategies - always join content for body_length
+  let doc = db.prepare(`
+    SELECT ${selectCols}
+    FROM documents d
+    JOIN collections c ON c.name = d.collection
+    JOIN content ON content.hash = d.hash
+    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
+  `).get(filepath) as DbDocRow | null;
+
   if (!doc) {
-    doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE display_path = ? AND active = 1`).get(filepath) as DbDocRow | null;
+    doc = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN collections c ON c.name = d.collection
+      JOIN content ON content.hash = d.hash
+      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
+    `).get(filepath) as DbDocRow | null;
   }
+
   if (!doc) {
-    doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE filepath LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as DbDocRow | null;
-  }
-  if (!doc) {
-    doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${filepath}`) as DbDocRow | null;
+    doc = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN collections c ON c.name = d.collection
+      JOIN content ON content.hash = d.hash
+      WHERE (c.pwd || '/' || d.path LIKE ? OR 'qmd://' || d.collection || '/' || d.path LIKE ?) AND d.active = 1
+      LIMIT 1
+    `).get(`%${filepath}`, `%${filepath}`) as DbDocRow | null;
   }
 
   if (!doc) {
@@ -1832,7 +1903,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     title: doc.title,
     context,
     hash: doc.hash,
-    collectionId: doc.collection_id,
+    collectionName: doc.collection,
     modifiedAt: doc.modified_at,
     bodyLength: doc.body_length,
     ...(options.includeBody && doc.body !== undefined && { body: doc.body }),
@@ -1845,7 +1916,13 @@ export function findDocument(db: Database, filename: string, options: { includeB
  */
 export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
   const filepath = 'filepath' in doc ? doc.filepath : doc.filepath;
-  const row = db.prepare(`SELECT body FROM documents WHERE filepath = ? AND active = 1`).get(filepath) as { body: string } | null;
+  const row = db.prepare(`
+    SELECT content.doc as body
+    FROM documents d
+    JOIN collections c ON c.name = d.collection
+    JOIN content ON content.hash = d.hash
+    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
+  `).get(filepath) as { body: string } | null;
   if (!row) return null;
 
   let body = row.body;
@@ -1900,9 +1977,17 @@ export function findDocuments(
   const errors: string[] = [];
   const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
 
-  const selectCols = options.includeBody
-    ? `filepath, display_path, title, hash, collection_id, modified_at, LENGTH(body) as body_length, body`
-    : `filepath, display_path, title, hash, collection_id, modified_at, LENGTH(body) as body_length`;
+  const bodyCol = options.includeBody ? `, content.doc as body` : ``;
+  const selectCols = `
+    c.pwd || '/' || d.path as filepath,
+    'qmd://' || d.collection || '/' || d.path as display_path,
+    d.title,
+    d.hash,
+    d.collection,
+    d.modified_at,
+    LENGTH(content.doc) as body_length
+    ${bodyCol}
+  `;
 
   let fileRows: DbDocRow[];
 
@@ -1910,9 +1995,22 @@ export function findDocuments(
     const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
     fileRows = [];
     for (const name of names) {
-      let doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE display_path = ? AND active = 1`).get(name) as DbDocRow | null;
+      let doc = db.prepare(`
+        SELECT ${selectCols}
+        FROM documents d
+        JOIN collections c ON c.name = d.collection
+        JOIN content ON content.hash = d.hash
+        WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
+      `).get(name) as DbDocRow | null;
       if (!doc) {
-        doc = db.prepare(`SELECT ${selectCols} FROM documents WHERE display_path LIKE ? AND active = 1 LIMIT 1`).get(`%${name}`) as DbDocRow | null;
+        doc = db.prepare(`
+          SELECT ${selectCols}
+          FROM documents d
+          JOIN collections c ON c.name = d.collection
+          JOIN content ON content.hash = d.hash
+          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+          LIMIT 1
+        `).get(`%${name}`) as DbDocRow | null;
       }
       if (doc) {
         fileRows.push(doc);
@@ -1932,9 +2030,15 @@ export function findDocuments(
       errors.push(`No files matched pattern: ${pattern}`);
       return { docs: [], errors };
     }
-    const filepaths = matched.map(m => m.filepath);
-    const placeholders = filepaths.map(() => '?').join(',');
-    fileRows = db.prepare(`SELECT ${selectCols} FROM documents WHERE filepath IN (${placeholders}) AND active = 1`).all(...filepaths) as DbDocRow[];
+    const virtualPaths = matched.map(m => m.filepath);
+    const placeholders = virtualPaths.map(() => '?').join(',');
+    fileRows = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN collections c ON c.name = d.collection
+      JOIN content ON content.hash = d.hash
+      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
+    `).all(...virtualPaths) as DbDocRow[];
   }
 
   const results: MultiGetResult[] = [];
@@ -1958,7 +2062,7 @@ export function findDocuments(
         title: row.title || row.display_path.split('/').pop() || row.display_path,
         context,
         hash: row.hash,
-        collectionId: row.collection_id,
+        collectionName: row.collection,
         modifiedAt: row.modified_at,
         bodyLength: row.body_length,
         ...(options.includeBody && row.body !== undefined && { body: row.body }),
@@ -2039,7 +2143,7 @@ export function getStatus(db: Database): IndexStatus {
            COUNT(d.id) as active_count,
            MAX(d.modified_at) as last_doc_update
     FROM collections c
-    LEFT JOIN documents d ON d.collection_id = c.id AND d.active = 1
+    LEFT JOIN documents d ON d.collection = c.name AND d.active = 1
     GROUP BY c.id
     ORDER BY last_doc_update DESC
   `).all() as { id: number; pwd: string; glob_pattern: string; created_at: string; active_count: number; last_doc_update: string | null }[];
