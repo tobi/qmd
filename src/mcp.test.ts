@@ -77,48 +77,40 @@ function initTestDatabase(db: Database): void {
   sqliteVec.load(db);
   db.exec("PRAGMA journal_mode = WAL");
 
+  // Content-addressable storage - the source of truth for document content
   db.exec(`
-    CREATE TABLE IF NOT EXISTS collections (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pwd TEXT NOT NULL,
-      glob_pattern TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      context TEXT,
-      UNIQUE(pwd, glob_pattern)
-    )
-  `);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS path_contexts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      path_prefix TEXT NOT NULL UNIQUE,
-      context TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS content (
+      hash TEXT PRIMARY KEY,
+      doc TEXT NOT NULL,
       created_at TEXT NOT NULL
     )
   `);
+
+  // Documents table - file system layer mapping virtual paths to content hashes
+  // Collections are now managed in YAML config
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      collection TEXT NOT NULL,
+      path TEXT NOT NULL,
+      title TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      modified_at TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+      UNIQUE(collection, path)
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS ollama_cache (
       hash TEXT PRIMARY KEY,
       result TEXT NOT NULL,
       created_at TEXT NOT NULL
-    )
-  `);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      title TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      filepath TEXT NOT NULL,
-      display_path TEXT NOT NULL DEFAULT '',
-      body TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      modified_at TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      FOREIGN KEY (collection_id) REFERENCES collections(id)
     )
   `);
 
@@ -144,7 +136,10 @@ function initTestDatabase(db: Database): void {
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body) VALUES (new.id, new.name, new.body);
+      INSERT INTO documents_fts(rowid, name, body)
+      SELECT new.id, new.path, content.doc
+      FROM content
+      WHERE content.hash = new.hash;
     END
   `);
 
@@ -155,70 +150,55 @@ function initTestDatabase(db: Database): void {
 function seedTestData(db: Database): void {
   const now = new Date().toISOString();
 
-  // Create a collection
-  db.prepare(`INSERT INTO collections (pwd, glob_pattern, created_at, context) VALUES (?, ?, ?, ?)`).run(
-    "/test/docs",
-    "**/*.md",
-    now,
-    "Test documentation collection"
-  );
-
-  // Add path context
-  db.prepare(`INSERT INTO path_contexts (path_prefix, context, created_at) VALUES (?, ?, ?)`).run(
-    "/test/docs/meetings",
-    "Meeting notes and transcripts",
-    now
-  );
+  // Note: Collections are now managed in YAML config, not in database
+  // For tests, we'll use a collection name "docs"
 
   // Add test documents
   const docs = [
     {
-      name: "readme.md",
+      path: "readme.md",
       title: "Project README",
       hash: "hash1",
-      filepath: "/test/docs/readme.md",
-      display_path: "readme.md",
       body: "# Project README\n\nThis is the main readme file for the project.\n\nIt contains important information about setup and usage.",
     },
     {
-      name: "api.md",
+      path: "api.md",
       title: "API Documentation",
       hash: "hash2",
-      filepath: "/test/docs/api.md",
-      display_path: "api.md",
       body: "# API Documentation\n\nThis document describes the REST API endpoints.\n\n## Authentication\n\nUse Bearer tokens for auth.",
     },
     {
-      name: "meeting-2024-01.md",
+      path: "meetings/meeting-2024-01.md",
       title: "January Meeting Notes",
       hash: "hash3",
-      filepath: "/test/docs/meetings/meeting-2024-01.md",
-      display_path: "meetings/meeting-2024-01.md",
       body: "# January Meeting Notes\n\nDiscussed Q1 goals and roadmap.\n\n## Action Items\n\n- Review budget\n- Hire new team members",
     },
     {
-      name: "meeting-2024-02.md",
+      path: "meetings/meeting-2024-02.md",
       title: "February Meeting Notes",
       hash: "hash4",
-      filepath: "/test/docs/meetings/meeting-2024-02.md",
-      display_path: "meetings/meeting-2024-02.md",
       body: "# February Meeting Notes\n\nFollowed up on Q1 progress.\n\n## Updates\n\n- Budget approved\n- Two candidates interviewed",
     },
     {
-      name: "large-file.md",
+      path: "large-file.md",
       title: "Large Document",
       hash: "hash5",
-      filepath: "/test/docs/large-file.md",
-      display_path: "large-file.md",
       body: "# Large Document\n\n" + "Lorem ipsum ".repeat(2000), // ~24KB
     },
   ];
 
   for (const doc of docs) {
+    // Insert content first
     db.prepare(`
-      INSERT INTO documents (collection_id, name, title, hash, filepath, display_path, body, created_at, modified_at, active)
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(doc.name, doc.title, doc.hash, doc.filepath, doc.display_path, doc.body, now, now);
+      INSERT OR IGNORE INTO content (hash, doc, created_at)
+      VALUES (?, ?, ?)
+    `).run(doc.hash, doc.body, now);
+
+    // Then insert document metadata
+    db.prepare(`
+      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
+      VALUES ('docs', ?, ?, ?, ?, ?, 1)
+    `).run(doc.path, doc.title, doc.hash, now, now);
   }
 
   // Add embeddings for vector search
@@ -246,7 +226,6 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
-  getCollectionIdByName,
   getDocument,
   getMultipleDocuments,
   getStatus,
@@ -304,17 +283,7 @@ describe("MCP Server", () => {
       expect(results.length).toBe(1);
     });
 
-    test("filters by collection", () => {
-      const collectionId = getCollectionIdByName(testDb, "docs");
-      expect(collectionId).toBe(1);
-      const results = searchFTS(testDb, "meeting", 10, collectionId!);
-      expect(results.length).toBeGreaterThan(0);
-    });
-
-    test("returns null for non-existent collection", () => {
-      const collectionId = getCollectionIdByName(testDb, "nonexistent");
-      expect(collectionId).toBeNull();
-    });
+    // Note: Collection filtering tests removed - collections are now managed in YAML, not DB
 
     test("formats results as structured content", () => {
       const results = searchFTS(testDb, "api", 10);
@@ -717,19 +686,21 @@ describe("MCP Server", () => {
     test("handles URL-encoded paths with spaces", () => {
       // Add a document with spaces in the path
       const now = new Date().toISOString();
+      const body = "# Podcast Episode\n\nInterview content here.";
+      const hash = "hash_spaces";
+      const path = "External Podcast/2023 April - Interview.md";
+
+      // Insert content first
       testDb.prepare(`
-        INSERT INTO documents (collection_id, name, title, hash, filepath, display_path, body, created_at, modified_at, active)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-      `).run(
-        "podcast with spaces.md",
-        "Podcast Episode",
-        "hash_spaces",
-        "/test/docs/External Podcast/2023 April - Interview.md",
-        "External Podcast/2023 April - Interview.md",
-        "# Podcast Episode\n\nInterview content here.",
-        now,
-        now
-      );
+        INSERT OR IGNORE INTO content (hash, doc, created_at)
+        VALUES (?, ?, ?)
+      `).run(hash, body, now);
+
+      // Then insert document metadata
+      testDb.prepare(`
+        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
+        VALUES ('docs', ?, ?, ?, ?, ?, 1)
+      `).run(path, "Podcast Episode", hash, now, now);
 
       // Simulate URL-encoded path from MCP client
       const encodedPath = "External%20Podcast%2F2023%20April%20-%20Interview.md";
@@ -738,9 +709,10 @@ describe("MCP Server", () => {
       expect(decodedPath).toBe("External Podcast/2023 April - Interview.md");
 
       const doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(decodedPath) as { filepath: string; display_path: string; body: string } | null;
 
       expect(doc).not.toBeNull();
@@ -908,7 +880,7 @@ QMD is your on-device search engine for markdown knowledge bases.`;
       expect(Array.isArray(status.collections)).toBe(true);
       if (status.collections.length > 0) {
         const col = status.collections[0];
-        expect(typeof col.id).toBe("number");
+        expect(typeof col.name).toBe("string"); // Collections now use names, not IDs
         expect(typeof col.path).toBe("string");
         expect(typeof col.pattern).toBe("string");
         expect(typeof col.documents).toBe("number");

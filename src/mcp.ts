@@ -276,19 +276,9 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Resolve collection filter
-      let collectionId: number | undefined;
-      if (collection) {
-        collectionId = store.getCollectionIdByName(collection) ?? undefined;
-        if (collectionId === undefined) {
-          return {
-            content: [{ type: "text", text: `Collection not found: ${collection}` }],
-            isError: true,
-          };
-        }
-      }
-
-      const results = store.searchFTS(query, limit || 10, collectionId);
+      // Note: Collection filtering is now done post-search since collections are managed in YAML
+      const results = store.searchFTS(query, limit || 10)
+        .filter(r => !collection || r.collectionName === collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => ({
@@ -323,18 +313,6 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Resolve collection filter
-      let collectionId: number | undefined;
-      if (collection) {
-        collectionId = store.getCollectionIdByName(collection) ?? undefined;
-        if (collectionId === undefined) {
-          return {
-            content: [{ type: "text", text: `Collection not found: ${collection}` }],
-            isError: true,
-          };
-        }
-      }
-
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
         return {
@@ -346,10 +324,11 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       // Expand query
       const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
 
-      // Collect results
+      // Collect results (filter by collection after search)
       const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
       for (const q of queries) {
-        const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10, collectionId);
+        const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10)
+          .then(results => results.filter(r => !collection || r.collectionName === collection));
         for (const r of vecResults) {
           const existing = allResults.get(r.file);
           if (!existing || r.score > existing.score) {
@@ -394,32 +373,22 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Resolve collection filter
-      let collectionId: number | undefined;
-      if (collection) {
-        collectionId = store.getCollectionIdByName(collection) ?? undefined;
-        if (collectionId === undefined) {
-          return {
-            content: [{ type: "text", text: `Collection not found: ${collection}` }],
-            isError: true,
-          };
-        }
-      }
-
       // Expand query
       const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
 
-      // Collect ranked lists
+      // Collect ranked lists (filter by collection after search)
       const rankedLists: RankedResult[][] = [];
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       for (const q of queries) {
-        const ftsResults = store.searchFTS(q, 20, collectionId);
+        const ftsResults = store.searchFTS(q, 20)
+          .filter(r => !collection || r.collectionName === collection);
         if (ftsResults.length > 0) {
           rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
         }
         if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20, collectionId);
+          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
+            .then(results => results.filter(r => !collection || r.collectionName === collection));
           if (vecResults.length > 0) {
             rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
           }

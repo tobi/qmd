@@ -1554,8 +1554,8 @@ describe("Integration", () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
 
-    // Add context
-    await addPathContext(collectionName, "/test/notes", "Personal notes");
+    // Add context - use "/" for collection root
+    await addPathContext(collectionName, "/", "Personal notes");
 
     // Insert documents
     await insertTestDocument(store.db, collectionName, {
@@ -1624,10 +1624,12 @@ describe("Integration", () => {
     const results2 = store2.searchFTS("different", 10);
 
     expect(results1).toHaveLength(1);
-    expect(results1[0].displayPath).toBe("qmd://store1/store1/doc.md");
+    expect(results1[0].displayPath).toBe("store1/doc.md");
+    expect(results1[0].filepath).toBe("qmd://store1/store1/doc.md");
 
     expect(results2).toHaveLength(1);
-    expect(results2[0].displayPath).toBe("qmd://store2/store2/doc.md");
+    expect(results2[0].displayPath).toBe("store2/doc.md");
+    expect(results2[0].filepath).toBe("qmd://store2/store2/doc.md");
 
     // Cross-check: store1 shouldn't find store2's content
     const cross1 = store1.searchFTS("different", 10);
@@ -1753,7 +1755,8 @@ describe("Ollama Integration (Mocked)", () => {
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`qmd://${collectionName}/doc1.md`);
+    expect(results[0].displayPath).toBe("doc1.md");
+    expect(results[0].filepath).toBe(`qmd://${collectionName}/doc1.md`);
     expect(results[0].source).toBe("vec");
 
     await cleanupTestDb(store);

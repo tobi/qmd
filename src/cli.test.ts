@@ -339,7 +339,9 @@ describe("CLI Add-Context Command", () => {
   test("adds context to a path", async () => {
     // First add a collection to get its name
     const listResult = await runQmd(["collection", "list"]);
-    const collectionName = listResult.stdout.split('\n')[0].trim();
+    // Parse collection name - it's on the 3rd line (after header and blank line)
+    const lines = listResult.stdout.split('\n').filter(l => l.trim());
+    const collectionName = lines[1]; // "fixtures" is on line 2
 
     // Add context to the collection root using virtual path
     const { stdout, exitCode } = await runQmd([

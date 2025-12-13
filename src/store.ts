@@ -972,13 +972,13 @@ function levenshtein(a: string, b: string): number {
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
-    SELECT 'qmd://' || d.collection || '/' || d.path as display_path
+    SELECT d.path
     FROM documents d
     WHERE d.active = 1
-  `).all() as { display_path: string }[];
+  `).all() as { path: string }[];
   const queryLower = query.toLowerCase();
   const scored = allFiles
-    .map(f => ({ path: f.display_path, dist: levenshtein(f.display_path.toLowerCase(), queryLower) }))
+    .map(f => ({ path: f.path, dist: levenshtein(f.path.toLowerCase(), queryLower) }))
     .filter(f => f.dist <= maxDistance)
     .sort((a, b) => a.dist - b.dist)
     .slice(0, limit);
@@ -990,18 +990,19 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     SELECT
       'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
-      d.path
+      d.path,
+      d.collection
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string }[];
+  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
 
   const glob = new Glob(pattern);
   return allFiles
     .filter(f => glob.match(f.virtual_path) || glob.match(f.path))
     .map(f => ({
-      filepath: f.virtual_path,  // Use virtual path as filepath
-      displayPath: f.virtual_path,
+      filepath: f.virtual_path,  // Virtual path for precise lookup
+      displayPath: f.path,        // Relative path for display
       bodyLength: f.body_length
     }));
 }
@@ -1734,14 +1735,14 @@ export function findDocument(db: Database, filename: string, options: { includeB
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
 
-  // Build computed columns for display_path
-  // Note: filepath is computed from YAML collections after query
+  // Build computed columns
+  // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || d.path as virtual_path,
+    d.path as display_path,
     d.title,
     d.hash,
     d.collection,
-    d.path,
     d.modified_at,
     LENGTH(content.doc) as body_length
     ${bodyCol}
@@ -1798,13 +1799,12 @@ export function findDocument(db: Database, filename: string, options: { includeB
     return { error: "not_found", query: filename, similarFiles: similar };
   }
 
-  // Compute absolute filepath from collection (in YAML) and relative path
-  const coll = getCollection(doc.collection);
-  const absoluteFilepath = coll ? `${coll.path}/${doc.path}` : doc.path;
-  const context = getContextForFile(db, absoluteFilepath);
+  // Get context using virtual path
+  const virtualPath = doc.virtual_path || `qmd://${doc.collection}/${doc.display_path}`;
+  const context = getContextForFile(db, virtualPath);
 
   return {
-    filepath: absoluteFilepath,
+    filepath: virtualPath,
     displayPath: doc.display_path,
     title: doc.title,
     context,
