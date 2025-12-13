@@ -20,6 +20,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
     "sqlite-vec": "^0.1.7-alpha.2",
+    "yaml": "^2.8.2",
     "zod": "^4.1.13"
   },
   "optionalDependencies": {
