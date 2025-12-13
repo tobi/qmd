@@ -435,17 +435,8 @@ function showStatus(): void {
     indexSize = stat;
   } catch {}
 
-  // Collections info
-  const collections = db.prepare(`
-    SELECT c.id, c.name, c.pwd, c.glob_pattern, c.created_at,
-           COUNT(d.id) as doc_count,
-           SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
-           MAX(d.modified_at) as last_modified
-    FROM collections c
-    LEFT JOIN documents d ON d.collection = c.name
-    GROUP BY c.id
-    ORDER BY c.name
-  `).all() as { id: number; name: string; pwd: string; glob_pattern: string; created_at: string; doc_count: number; active_count: number; last_modified: string | null }[];
+  // Collections info (from YAML + database stats)
+  const collections = listCollections(db);
 
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
@@ -768,7 +759,7 @@ function contextRemove(pathArg: string): void {
       process.exit(1);
     }
 
-    const changes = deleteContext(db, coll.id, parsed.path);
+    const changes = deleteContext(db, coll.name, parsed.path);
 
     if (changes === 0) {
       console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
@@ -796,7 +787,7 @@ function contextRemove(pathArg: string): void {
     process.exit(1);
   }
 
-  const changes = deleteContext(db, detected.collectionId, detected.relativePath);
+  const changes = deleteContext(db, detected.collectionName, detected.relativePath);
 
   if (changes === 0) {
     console.error(`${c.yellow}No context found for: qmd://${detected.collectionName}/${detected.relativePath}${c.reset}`);

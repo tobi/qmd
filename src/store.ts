@@ -217,6 +217,10 @@ function initializeDatabase(db: Database): void {
     return; // Migration will call initializeDatabase again
   }
 
+  // Drop legacy tables that are now managed in YAML
+  db.exec(`DROP TABLE IF EXISTS path_contexts`);
+  db.exec(`DROP TABLE IF EXISTS collections`);
+
   // Content-addressable storage - the source of truth for document content
   db.exec(`
     CREATE TABLE IF NOT EXISTS content (
@@ -226,20 +230,8 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Collections table with name field
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS collections (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      pwd TEXT NOT NULL,
-      glob_pattern TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      UNIQUE(pwd, glob_pattern)
-    )
-  `);
-
   // Documents table - file system layer mapping virtual paths to content hashes
+  // Collections are now managed in ~/.config/qmd/index.yml
   db.exec(`
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,20 +250,6 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
-
-  // Path-based context (collection-scoped, hierarchical)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS path_contexts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection_id INTEGER NOT NULL,
-      path_prefix TEXT NOT NULL,
-      context TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
-      UNIQUE(collection_id, path_prefix)
-    )
-  `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collection_id, path_prefix)`);
 
   // Cache table for Ollama API calls
   db.exec(`
@@ -1026,25 +1004,12 @@ export function cleanupOrphanedVectors(db: Database): number {
 
 /**
  * Remove duplicate collections, keeping the oldest one per (pwd, glob_pattern).
- * Also removes bogus "." glob pattern entries.
- * Returns the number of duplicate collections removed.
+ * NOTE: This function is deprecated since collections are now managed in YAML.
+ * Kept for backwards compatibility but returns 0.
  */
 export function cleanupDuplicateCollections(db: Database): number {
-  // Count duplicates before removal
-  const beforeCount = (db.prepare(`SELECT COUNT(*) as c FROM collections`).get() as { c: number }).c;
-
-  // Remove duplicates keeping the oldest one
-  db.exec(`
-    DELETE FROM collections WHERE id NOT IN (
-      SELECT MIN(id) FROM collections GROUP BY pwd, glob_pattern
-    )
-  `);
-
-  // Remove bogus "." glob pattern entries (from earlier bug)
-  db.exec(`DELETE FROM collections WHERE glob_pattern = '.'`);
-
-  const afterCount = (db.prepare(`SELECT COUNT(*) as c FROM collections`).get() as { c: number }).c;
-  return beforeCount - afterCount;
+  // Collections are now managed in YAML, no cleanup needed
+  return 0;
 }
 
 /**
@@ -1447,15 +1412,9 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
  * Delete a context for a specific collection and path prefix.
  * Returns the number of contexts deleted.
  */
-export function deleteContext(db: Database, collectionId: number, pathPrefix: string): number {
-  // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) {
-    return 0;
-  }
-
+export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
   // Use collections.ts to remove context
-  const success = collectionsRemoveContext(coll.name, pathPrefix);
+  const success = collectionsRemoveContext(collectionName, pathPrefix);
   return success ? 1 : 0;
 }
 
@@ -1901,11 +1860,11 @@ export function reciprocalRankFusion(
 // =============================================================================
 
 type DbDocRow = {
-  filepath: string;
   display_path: string;
   title: string;
   hash: string;
   collection: string;
+  path: string;
   modified_at: string;
   body_length: number;
   body?: string;
@@ -1928,46 +1887,54 @@ export function findDocument(db: Database, filename: string, options: { includeB
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
 
-  // Build computed columns for filepath and display_path
+  // Build computed columns for display_path
+  // Note: filepath is computed from YAML collections after query
   const selectCols = `
-    c.pwd || '/' || d.path as filepath,
     'qmd://' || d.collection || '/' || d.path as display_path,
     d.title,
     d.hash,
     d.collection,
+    d.path,
     d.modified_at,
     LENGTH(content.doc) as body_length
     ${bodyCol}
   `;
 
-  // Try various match strategies - always join content for body_length
+  // Try to match by virtual path first
   let doc = db.prepare(`
     SELECT ${selectCols}
     FROM documents d
-    JOIN collections c ON c.name = d.collection
     JOIN content ON content.hash = d.hash
-    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
+    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
   `).get(filepath) as DbDocRow | null;
 
+  // Try fuzzy match by virtual path
   if (!doc) {
     doc = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
-      JOIN collections c ON c.name = d.collection
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-    `).get(filepath) as DbDocRow | null;
+      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      LIMIT 1
+    `).get(`%${filepath}`) as DbDocRow | null;
   }
 
-  if (!doc) {
-    doc = db.prepare(`
-      SELECT ${selectCols}
-      FROM documents d
-      JOIN collections c ON c.name = d.collection
-      JOIN content ON content.hash = d.hash
-      WHERE (c.pwd || '/' || d.path LIKE ? OR 'qmd://' || d.collection || '/' || d.path LIKE ?) AND d.active = 1
-      LIMIT 1
-    `).get(`%${filepath}`, `%${filepath}`) as DbDocRow | null;
+  // Try to match by absolute path (requires looking up collection paths from YAML)
+  if (!doc && !filepath.startsWith('qmd://')) {
+    const collections = collectionsListCollections();
+    for (const coll of collections) {
+      const absPath = `${coll.path}/${filepath}`;
+      const relativePath = absPath.startsWith(coll.path + '/') ? absPath.slice(coll.path.length + 1) : null;
+      if (relativePath) {
+        doc = db.prepare(`
+          SELECT ${selectCols}
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        `).get(coll.name, relativePath) as DbDocRow | null;
+        if (doc) break;
+      }
+    }
   }
 
   if (!doc) {
@@ -1975,10 +1942,13 @@ export function findDocument(db: Database, filename: string, options: { includeB
     return { error: "not_found", query: filename, similarFiles: similar };
   }
 
-  const context = getContextForFile(db, doc.filepath);
+  // Compute absolute filepath from collection (in YAML) and relative path
+  const coll = getCollection(doc.collection);
+  const absoluteFilepath = coll ? `${coll.path}/${doc.path}` : doc.path;
+  const context = getContextForFile(db, absoluteFilepath);
 
   return {
-    filepath: doc.filepath,
+    filepath: absoluteFilepath,
     displayPath: doc.display_path,
     title: doc.title,
     context,
@@ -1996,13 +1966,37 @@ export function findDocument(db: Database, filename: string, options: { includeB
  */
 export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
   const filepath = 'filepath' in doc ? doc.filepath : doc.filepath;
-  const row = db.prepare(`
-    SELECT content.doc as body
-    FROM documents d
-    JOIN collections c ON c.name = d.collection
-    JOIN content ON content.hash = d.hash
-    WHERE c.pwd || '/' || d.path = ? AND d.active = 1
-  `).get(filepath) as { body: string } | null;
+
+  // Try to resolve document by filepath (absolute or virtual)
+  let row: { body: string } | null = null;
+
+  // Try virtual path first
+  if (filepath.startsWith('qmd://')) {
+    row = db.prepare(`
+      SELECT content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
+    `).get(filepath) as { body: string } | null;
+  }
+
+  // Try absolute path by looking up in YAML collections
+  if (!row) {
+    const collections = collectionsListCollections();
+    for (const coll of collections) {
+      if (filepath.startsWith(coll.path + '/')) {
+        const relativePath = filepath.slice(coll.path.length + 1);
+        row = db.prepare(`
+          SELECT content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        `).get(coll.name, relativePath) as { body: string } | null;
+        if (row) break;
+      }
+    }
+  }
+
   if (!row) return null;
 
   let body = row.body;
@@ -2059,11 +2053,11 @@ export function findDocuments(
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
-    c.pwd || '/' || d.path as filepath,
     'qmd://' || d.collection || '/' || d.path as display_path,
     d.title,
     d.hash,
     d.collection,
+    d.path,
     d.modified_at,
     LENGTH(content.doc) as body_length
     ${bodyCol}
@@ -2078,7 +2072,6 @@ export function findDocuments(
       let doc = db.prepare(`
         SELECT ${selectCols}
         FROM documents d
-        JOIN collections c ON c.name = d.collection
         JOIN content ON content.hash = d.hash
         WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
       `).get(name) as DbDocRow | null;
@@ -2086,7 +2079,6 @@ export function findDocuments(
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
-          JOIN collections c ON c.name = d.collection
           JOIN content ON content.hash = d.hash
           WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
           LIMIT 1
@@ -2115,7 +2107,6 @@ export function findDocuments(
     fileRows = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
-      JOIN collections c ON c.name = d.collection
       JOIN content ON content.hash = d.hash
       WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
     `).all(...virtualPaths) as DbDocRow[];
@@ -2124,11 +2115,14 @@ export function findDocuments(
   const results: MultiGetResult[] = [];
 
   for (const row of fileRows) {
-    const context = getContextForFile(db, row.filepath);
+    // Compute absolute filepath from collection
+    const coll = getCollection(row.collection);
+    const absoluteFilepath = coll ? `${coll.path}/${row.path}` : row.path;
+    const context = getContextForFile(db, absoluteFilepath);
 
     if (row.body_length > maxBytes) {
       results.push({
-        doc: { filepath: row.filepath, displayPath: row.display_path },
+        doc: { filepath: absoluteFilepath, displayPath: row.display_path },
         skipped: true,
         skipReason: `File too large (${Math.round(row.body_length / 1024)}KB > ${Math.round(maxBytes / 1024)}KB)`,
       });
@@ -2137,7 +2131,7 @@ export function findDocuments(
 
     results.push({
       doc: {
-        filepath: row.filepath,
+        filepath: absoluteFilepath,
         displayPath: row.display_path,
         title: row.title || row.display_path.split('/').pop() || row.display_path,
         context,
