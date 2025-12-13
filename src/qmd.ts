@@ -1440,7 +1440,7 @@ function collectionRemove(name: string): void {
     process.exit(1);
   }
 
-  const result = removeCollection(db, coll.id);
+  const result = removeCollection(db, name);
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
   console.log(`  Deleted ${result.deletedDocs} documents`);
@@ -1472,7 +1472,7 @@ function collectionRename(oldName: string, newName: string): void {
     process.exit(1);
   }
 
-  renameCollection(db, coll.id, newName);
+  renameCollection(db, oldName, newName);
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
