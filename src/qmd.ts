@@ -490,7 +490,8 @@ function showStatus(): void {
       if (contexts.length > 0) {
         console.log(`    ${c.dim}Contexts:${c.reset} ${contexts.length}`);
         for (const ctx of contexts) {
-          const pathDisplay = ctx.path_prefix === '' ? '/' : `/${ctx.path_prefix}`;
+          // Handle both empty string and '/' as root context
+          const pathDisplay = (ctx.path_prefix === '' || ctx.path_prefix === '/') ? '/' : `/${ctx.path_prefix}`;
           const contextPreview = ctx.context.length > 60
             ? ctx.context.substring(0, 57) + '...'
             : ctx.context;
