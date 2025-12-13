@@ -570,7 +570,7 @@ describe("MCP Server", () => {
   describe("qmd:// resource", () => {
     test("lists all documents", () => {
       const docs = testDb.prepare(`
-        SELECT display_path, title
+        SELECT path as display_path, title
         FROM documents
         WHERE active = 1
         ORDER BY modified_at DESC
@@ -584,9 +584,10 @@ describe("MCP Server", () => {
     test("reads document by display_path", () => {
       const path = "readme.md";
       const doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
       expect(doc).not.toBeNull();
@@ -599,9 +600,10 @@ describe("MCP Server", () => {
       const decodedPath = decodeURIComponent(encodedPath);
 
       const doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(decodedPath) as { filepath: string; display_path: string; body: string } | null;
 
       expect(doc).not.toBeNull();
@@ -611,16 +613,18 @@ describe("MCP Server", () => {
     test("reads document by suffix match", () => {
       const path = "meeting-2024-01.md"; // without meetings/ prefix
       let doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
       if (!doc) {
         doc = testDb.prepare(`
-          SELECT filepath, display_path, body
-          FROM documents
-          WHERE display_path LIKE ? AND active = 1
+          SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.path LIKE ? AND d.active = 1
           LIMIT 1
         `).get(`%${path}`) as { filepath: string; display_path: string; body: string } | null;
       }
@@ -632,9 +636,10 @@ describe("MCP Server", () => {
     test("returns not found for missing document", () => {
       const path = "nonexistent.md";
       const doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
       expect(doc).toBeNull();
@@ -643,9 +648,10 @@ describe("MCP Server", () => {
     test("includes context in document body", () => {
       const path = "meetings/meeting-2024-01.md";
       const doc = testDb.prepare(`
-        SELECT filepath, display_path, body
-        FROM documents
-        WHERE display_path = ? AND active = 1
+        SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.path as display_path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
       expect(doc).not.toBeNull();
