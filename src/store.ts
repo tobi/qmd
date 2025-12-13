@@ -1063,12 +1063,18 @@ export function getContextForPath(db: Database, collectionName: string, path: st
  * Legacy function for backward compatibility - resolves filepath to collection+path first
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
+  // Handle undefined or null filepath
+  if (!filepath) return null;
+
   // Get all collections from YAML config
   const collections = collectionsListCollections();
   const config = collectionsLoadConfig();
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
+    // Skip collections with missing paths
+    if (!coll || !coll.path) continue;
+
     if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
       // Extract relative path
       const relativePath = filepath.startsWith(coll.path + '/')
