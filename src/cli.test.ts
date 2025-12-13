@@ -13,6 +13,7 @@ import { join } from "path";
 // Test fixtures directory and database path
 let testDir: string;
 let testDbPath: string;
+let testConfigDir: string;
 let fixturesDir: string;
 let testCounter = 0; // Unique counter for each test run
 
@@ -32,6 +33,7 @@ async function runQmd(
     env: {
       ...process.env,
       INDEX_PATH: dbPath,
+      QMD_CONFIG_DIR: testConfigDir, // Use test config directory
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
       ...options.env,
     },
@@ -57,11 +59,19 @@ beforeAll(async () => {
   // Create temp directory structure
   testDir = await mkdtemp(join(tmpdir(), "qmd-test-"));
   testDbPath = join(testDir, "test.sqlite");
+  testConfigDir = join(testDir, "config");
   fixturesDir = join(testDir, "fixtures");
 
+  await mkdir(testConfigDir, { recursive: true });
   await mkdir(fixturesDir, { recursive: true });
   await mkdir(join(fixturesDir, "notes"), { recursive: true });
   await mkdir(join(fixturesDir, "docs"), { recursive: true });
+
+  // Create empty YAML config for tests
+  await writeFile(
+    join(testConfigDir, "index.yml"),
+    "collections: {}\n"
+  );
 
   // Create test markdown files
   await writeFile(
