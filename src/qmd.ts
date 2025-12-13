@@ -372,38 +372,6 @@ async function rerank(query: string, documents: { file: string; text: string }[]
   return results.sort((a, b) => b.score - a.score);
 }
 
-function getOrCreateCollection(db: Database, pwd: string, globPattern: string, name?: string): number {
-  const now = new Date().toISOString();
-
-  // Generate collection name from pwd basename if not provided
-  if (!name) {
-    const parts = pwd.split('/').filter(Boolean);
-    name = parts[parts.length - 1] || 'root';
-  }
-
-  // Check if collection with this pwd+glob already exists
-  const existing = db.prepare(`SELECT id FROM collections WHERE pwd = ? AND glob_pattern = ?`).get(pwd, globPattern) as { id: number } | null;
-  if (existing) return existing.id;
-
-  // Try to insert with generated name
-  try {
-    const result = db.prepare(`INSERT INTO collections (name, pwd, glob_pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`).run(name, pwd, globPattern, now, now);
-    return result.lastInsertRowid as number;
-  } catch (e) {
-    // Name collision - append a unique suffix
-    const allCollections = db.prepare(`SELECT name FROM collections WHERE name LIKE ?`).all(`${name}%`) as { name: string }[];
-    let suffix = 2;
-    let uniqueName = `${name}-${suffix}`;
-    while (allCollections.some(c => c.name === uniqueName)) {
-      suffix++;
-      uniqueName = `${name}-${suffix}`;
-    }
-    const result = db.prepare(`INSERT INTO collections (name, pwd, glob_pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`).run(uniqueName, pwd, globPattern, now, now);
-    return result.lastInsertRowid as number;
-  }
-}
-
-
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -578,7 +546,7 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern);
+    await indexFiles(col.pwd, col.glob_pattern, col.name);
     console.log("");
   }
 
@@ -1474,7 +1442,7 @@ async function dropCollection(globPattern: string): Promise<void> {
   // Don't close db - indexFiles will use it and close at the end
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name?: string): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1483,8 +1451,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
   // Clear Ollama cache on index
   clearCache(db);
 
-  // Get or create collection for this (pwd, glob)
-  const collectionId = getOrCreateCollection(db, resolvedPwd, globPattern, name);
+  // Collection name must be provided (from YAML)
+  if (!collectionName) {
+    throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
+  }
+
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
@@ -1525,7 +1496,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists in this collection with this path
-    const existing = findActiveDocument(db, collectionId, path);
+    const existing = findActiveDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1549,7 +1520,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
       indexed++;
       insertContent(db, hash, content, now);
       const stat = await Bun.file(filepath).stat();
-      insertDocument(db, collectionId, path, title, hash,
+      insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
@@ -1564,11 +1535,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, name
   }
 
   // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionId);
+  const allActive = getActiveDocumentPaths(db, collectionName);
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionId, path);
+      deactivateDocument(db, collectionName, path);
       removed++;
     }
   }
