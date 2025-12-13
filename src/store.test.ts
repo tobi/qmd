@@ -601,7 +601,7 @@ describe("Path Context", () => {
     await cleanupTestDb(store);
   });
 
-  test("getContextForFile returns most specific context", async () => {
+  test("getContextForFile returns all matching contexts", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection({ pwd: "/test/collection", glob: "**/*.md" });
     await addPathContext(collectionName, "/", "General test files");
@@ -622,9 +622,10 @@ describe("Path Context", () => {
       displayPath: "docs/api/reference.md",
     });
 
+    // Context now returns ALL matching contexts joined with \n\n
     expect(store.getContextForFile("/test/collection/readme.md")).toBe("General test files");
-    expect(store.getContextForFile("/test/collection/docs/guide.md")).toBe("Documentation files");
-    expect(store.getContextForFile("/test/collection/docs/api/reference.md")).toBe("API documentation");
+    expect(store.getContextForFile("/test/collection/docs/guide.md")).toBe("General test files\n\nDocumentation files");
+    expect(store.getContextForFile("/test/collection/docs/api/reference.md")).toBe("General test files\n\nDocumentation files\n\nAPI documentation");
 
     await cleanupTestDb(store);
   });
