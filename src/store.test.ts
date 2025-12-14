@@ -827,7 +827,8 @@ describe("Document Retrieval", () => {
       expect("error" in result).toBe(false);
       if (!("error" in result)) {
         expect(result.title).toBe("My Document");
-        expect(result.displayPath).toBe(`qmd://${collectionName}/mydoc.md`);
+        expect(result.displayPath).toBe("mydoc.md");
+        expect(result.filepath).toBe(`qmd://${collectionName}/mydoc.md`);
         expect(result.body).toBeUndefined(); // body not included by default
       }
 
@@ -917,8 +918,8 @@ describe("Document Retrieval", () => {
 
     test("findDocument expands ~ to home directory", async () => {
       const store = await createTestStore();
-      const collectionName = await createTestCollection();
       const home = homedir();
+      const collectionName = await createTestCollection({ pwd: home, name: "home" });
       await insertTestDocument(store.db, collectionName, {
         name: "mydoc",
         filepath: `${home}/docs/mydoc.md`,
@@ -944,6 +945,41 @@ describe("Document Retrieval", () => {
       expect("error" in result).toBe(false);
       if (!("error" in result)) {
         expect(result.context).toBe("Documentation");
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocument includes hierarchical contexts (global + collection + path)", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({ pwd: "/archive", name: "archive" });
+
+      // Add global context
+      await addGlobalContext("Global context for all documents");
+
+      // Add collection root context
+      await addPathContext(collectionName, "/", "Archive collection context");
+
+      // Add path-specific contexts at different levels
+      await addPathContext(collectionName, "/podcasts", "Podcast episodes");
+      await addPathContext(collectionName, "/podcasts/external", "External podcast interviews");
+
+      // Insert document in nested path
+      await insertTestDocument(store.db, collectionName, {
+        name: "interview",
+        displayPath: "podcasts/external/2024-jan-interview.md",
+      });
+
+      const result = store.findDocument("/archive/podcasts/external/2024-jan-interview.md");
+      expect("error" in result).toBe(false);
+      if (!("error" in result)) {
+        // Should have all contexts joined with double newlines
+        expect(result.context).toBe(
+          "Global context for all documents\n\n" +
+          "Archive collection context\n\n" +
+          "Podcast episodes\n\n" +
+          "External podcast interviews"
+        );
       }
 
       await cleanupTestDb(store);

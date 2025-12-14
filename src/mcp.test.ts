@@ -11,6 +11,11 @@ import * as sqliteVec from "sqlite-vec";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { setDefaultOllama, Ollama } from "./llm";
+import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import YAML from "yaml";
+import type { CollectionConfig } from "./collections";
 
 // =============================================================================
 // Mock Ollama
@@ -28,12 +33,13 @@ const mockOllamaResponses: Record<string, (body: unknown) => Response> = {
     });
   },
   "/api/generate": (body: unknown) => {
-    const reqBody = body as { prompt?: string };
+    const reqBody = body as { prompt?: string; logprobs?: boolean };
     if (reqBody.prompt?.includes("Judge") || reqBody.prompt?.includes("Document")) {
+      // Return format matching Ollama API
       return new Response(JSON.stringify({
         response: "yes",
         done: true,
-        logprobs: { tokens: ["yes"], token_logprobs: [-0.1] },
+        logprobs: reqBody.logprobs ? { tokens: ["yes"], token_logprobs: [-0.1] } : undefined
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     } else {
       return new Response(JSON.stringify({
@@ -72,6 +78,7 @@ function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
 
 let testDb: Database;
 let testDbPath: string;
+let testConfigDir: string;
 
 function initTestDatabase(db: Database): void {
   sqliteVec.load(db);
@@ -243,9 +250,28 @@ import type { RankedResult } from "./store";
 // =============================================================================
 
 describe("MCP Server", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     globalThis.fetch = mockFetch as typeof fetch;
     setDefaultOllama(new Ollama({ baseUrl: OLLAMA_URL }));
+
+    // Set up test config directory
+    const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testConfigDir = await mkdtemp(configPrefix);
+    process.env.QMD_CONFIG_DIR = testConfigDir;
+
+    // Create YAML config with test collection
+    const testConfig: CollectionConfig = {
+      collections: {
+        docs: {
+          path: "/test/docs",
+          pattern: "**/*.md",
+          context: {
+            "/meetings": "Meeting notes and transcripts"
+          }
+        }
+      }
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
     testDb = new Database(testDbPath);
@@ -253,13 +279,24 @@ describe("MCP Server", () => {
     seedTestData(testDb);
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     globalThis.fetch = originalFetch;
     setDefaultOllama(null);
     testDb.close();
     try {
       require("fs").unlinkSync(testDbPath);
     } catch {}
+
+    // Clean up test config directory
+    try {
+      const files = await readdir(testConfigDir);
+      for (const file of files) {
+        await unlink(join(testConfigDir, file));
+      }
+      await rmdir(testConfigDir);
+    } catch {}
+
+    delete process.env.QMD_CONFIG_DIR;
   });
 
   // ===========================================================================
@@ -377,10 +414,10 @@ describe("MCP Server", () => {
         const ftsResults = searchFTS(testDb, q, 20);
         if (ftsResults.length > 0) {
           rankedLists.push(ftsResults.map(r => ({
-            file: r.file,
+            file: r.filepath,
             displayPath: r.displayPath,
             title: r.title,
-            body: r.body,
+            body: r.body || "",
             score: r.score,
           })));
         }

@@ -1909,11 +1909,11 @@ export function findDocuments(
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || d.path as virtual_path,
+    d.path as display_path,
     d.title,
     d.hash,
     d.collection,
-    d.path,
     d.modified_at,
     LENGTH(content.doc) as body_length
     ${bodyCol}
@@ -1971,14 +1971,13 @@ export function findDocuments(
   const results: MultiGetResult[] = [];
 
   for (const row of fileRows) {
-    // Compute absolute filepath from collection
-    const coll = getCollection(row.collection);
-    const absoluteFilepath = coll ? `${coll.path}/${row.path}` : row.path;
-    const context = getContextForFile(db, absoluteFilepath);
+    // Get context using virtual path
+    const virtualPath = row.virtual_path || `qmd://${row.collection}/${row.display_path}`;
+    const context = getContextForFile(db, virtualPath);
 
     if (row.body_length > maxBytes) {
       results.push({
-        doc: { filepath: absoluteFilepath, displayPath: row.display_path },
+        doc: { filepath: virtualPath, displayPath: row.display_path },
         skipped: true,
         skipReason: `File too large (${Math.round(row.body_length / 1024)}KB > ${Math.round(maxBytes / 1024)}KB)`,
       });
@@ -1987,7 +1986,7 @@ export function findDocuments(
 
     results.push({
       doc: {
-        filepath: absoluteFilepath,
+        filepath: virtualPath,
         displayPath: row.display_path,
         title: row.title || row.display_path.split('/').pop() || row.display_path,
         context,

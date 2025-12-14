@@ -1012,7 +1012,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     let path = file.path;
 
     if (!collection || !path) {
-      const parsed = parseVirtualPath(file.displayPath);
+      const parsed = parseVirtualPath(file.filepath);
       if (parsed) {
         collection = parsed.collectionName;
         path = parsed.path;
@@ -1036,16 +1036,15 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       continue;
     }
 
-    // Fetch document content - use virtual path to query
-    const parsed = parseVirtualPath(file.displayPath);
-    if (!parsed) continue;
+    // Fetch document content using collection and path
+    if (!collection || !path) continue;
 
     const doc = db.prepare(`
       SELECT content.doc as body, d.title
       FROM documents d
       JOIN content ON content.hash = d.hash
       WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(parsed.collectionName, parsed.path) as { body: string; title: string } | null;
+    `).get(collection, path) as { body: string; title: string } | null;
 
     if (!doc) continue;
 

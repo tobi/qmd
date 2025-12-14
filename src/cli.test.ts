@@ -289,13 +289,21 @@ describe("CLI Get Command", () => {
 });
 
 describe("CLI Multi-Get Command", () => {
+  let localDbPath: string;
+
   beforeEach(async () => {
+    // Use fresh database for each test
+    localDbPath = getFreshDbPath();
     // Ensure we have indexed files
-    await runQmd(["collection", "add", "."]);
+    const addResult = await runQmd(["collection", "add", ".", "--name", "fixtures"], { dbPath: localDbPath });
+    if (addResult.exitCode !== 0) {
+      throw new Error(`Failed to add collection: ${addResult.stderr}`);
+    }
   });
 
   test("retrieves multiple documents by pattern", async () => {
-    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md"]);
+    // Test glob pattern matching
+    const { stdout, stderr, exitCode } = await runQmd(["multi-get", "notes/*.md"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     // Should contain content from both notes files
     expect(stdout).toContain("Meeting");
@@ -306,7 +314,7 @@ describe("CLI Multi-Get Command", () => {
     const { stdout, exitCode } = await runQmd([
       "multi-get",
       "README.md,notes/meeting.md",
-    ]);
+    ], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Project");
     expect(stdout).toContain("Team Meeting");
