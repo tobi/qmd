@@ -27,6 +27,7 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
+  handelize,
   OLLAMA_URL,
   type Store,
   type DocumentResult,
@@ -357,6 +358,97 @@ describe("Path Utilities", () => {
 });
 
 // =============================================================================
+// Handelize Tests - path normalization for token-friendly filenames
+// =============================================================================
+
+describe("handelize", () => {
+  test("converts to lowercase", () => {
+    expect(handelize("README.md")).toBe("readme.md");
+    expect(handelize("MyFile.MD")).toBe("myfile.md");
+  });
+
+  test("preserves folder structure", () => {
+    expect(handelize("a/b/c/d.md")).toBe("a/b/c/d.md");
+    expect(handelize("docs/api/README.md")).toBe("docs/api/readme.md");
+  });
+
+  test("replaces non-word characters with dash", () => {
+    expect(handelize("hello world.md")).toBe("hello-world.md");
+    expect(handelize("file (1).md")).toBe("file-1.md");
+    expect(handelize("foo@bar#baz.md")).toBe("foo-bar-baz.md");
+  });
+
+  test("collapses multiple special chars into single dash", () => {
+    expect(handelize("hello   world.md")).toBe("hello-world.md");
+    expect(handelize("foo---bar.md")).toBe("foo-bar.md");
+    expect(handelize("a  -  b.md")).toBe("a-b.md");
+  });
+
+  test("removes leading and trailing dashes from segments", () => {
+    expect(handelize("-hello-.md")).toBe("hello.md");
+    expect(handelize("--test--.md")).toBe("test.md");
+    expect(handelize("a/-b-/c.md")).toBe("a/b/c.md");
+  });
+
+  test("converts triple underscore to folder separator", () => {
+    expect(handelize("foo___bar.md")).toBe("foo/bar.md");
+    expect(handelize("notes___2025___january.md")).toBe("notes/2025/january.md");
+    expect(handelize("a/b___c/d.md")).toBe("a/b/c/d.md");
+  });
+
+  test("handles complex real-world meeting notes", () => {
+    // Example: "Money Movement Licensing Review - 2025／11／19 10:25 EST - Notes by Gemini.md"
+    const complexName = "Money Movement Licensing Review - 2025／11／19 10:25 EST - Notes by Gemini.md";
+    const result = handelize(complexName);
+    expect(result).toBe("money-movement-licensing-review-2025-11-19-10-25-est-notes-by-gemini.md");
+    expect(result).not.toContain(" ");
+    expect(result).not.toContain("／");
+    expect(result).not.toContain(":");
+  });
+
+  test("handles unicode characters", () => {
+    // Pure unicode with no alphanumerics throws error
+    expect(() => handelize("日本語.md")).toThrow("no valid filename content");
+    // Mixed unicode/ascii preserves the ascii parts
+    expect(handelize("café-notes.md")).toBe("caf-notes.md");
+    expect(handelize("naïve.md")).toBe("na-ve.md");
+    expect(handelize("日本語-notes.md")).toBe("notes.md");
+  });
+
+  test("handles dates and times in filenames", () => {
+    expect(handelize("meeting-2025-01-15.md")).toBe("meeting-2025-01-15.md");
+    expect(handelize("notes 2025/01/15.md")).toBe("notes-2025/01/15.md");
+    expect(handelize("call_10:30_AM.md")).toBe("call-10-30-am.md");
+  });
+
+  test("handles special project naming patterns", () => {
+    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("project-abc-v2-0.md");
+    expect(handelize("[WIP] Feature Request.md")).toBe("wip-feature-request.md");
+    expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
+  });
+
+  test("filters out empty segments", () => {
+    expect(handelize("a//b/c.md")).toBe("a/b/c.md");
+    expect(handelize("/a/b/")).toBe("a/b");
+    expect(handelize("///test///")).toBe("test");
+  });
+
+  test("throws error for invalid inputs", () => {
+    expect(() => handelize("")).toThrow("path cannot be empty");
+    expect(() => handelize("   ")).toThrow("path cannot be empty");
+    expect(() => handelize(".md")).toThrow("no valid filename content");
+    expect(() => handelize("...")).toThrow("no valid filename content");
+    expect(() => handelize("___")).toThrow("no valid filename content");
+  });
+
+  test("handles minimal valid inputs", () => {
+    expect(handelize("a")).toBe("a");
+    expect(handelize("1")).toBe("1");
+    expect(handelize("a.md")).toBe("a.md");
+  });
+});
+
+// =============================================================================
 // Store Creation Tests
 // =============================================================================
 
@@ -678,7 +770,7 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("fox", 10);
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0].displayPath).toBe("test/doc1.md");
+    expect(results[0].displayPath).toBe(`${collectionName}/test/doc1.md`);
     expect(results[0].filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
     expect(results[0].source).toBe("fts");
 
@@ -709,7 +801,7 @@ describe("FTS Search", () => {
     // Both documents contain "fox" in the body now, so we should get 2 results
     expect(results.length).toBe(2);
     // Title/name match should rank higher due to BM25 weights
-    expect(results[0].displayPath).toBe("test/title.md");
+    expect(results[0].displayPath).toBe(`${collectionName}/test/title.md`);
 
     await cleanupTestDb(store);
   });
@@ -800,7 +892,7 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("findme", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe("test/active.md");
+    expect(results[0].displayPath).toBe(`${collectionName}/test/active.md`);
     expect(results[0].filepath).toBe(`qmd://${collectionName}/test/active.md`);
 
     await cleanupTestDb(store);
@@ -827,7 +919,7 @@ describe("Document Retrieval", () => {
       expect("error" in result).toBe(false);
       if (!("error" in result)) {
         expect(result.title).toBe("My Document");
-        expect(result.displayPath).toBe("mydoc.md");
+        expect(result.displayPath).toBe(`${collectionName}/mydoc.md`);
         expect(result.filepath).toBe(`qmd://${collectionName}/mydoc.md`);
         expect(result.body).toBeUndefined(); // body not included by default
       }
@@ -1646,13 +1738,13 @@ describe("Integration", () => {
     await insertTestDocument(store1.db, col1, {
       name: "doc1",
       body: "unique content for store1",
-      displayPath: "store1/doc.md",
+      displayPath: "doc.md",
     });
 
     await insertTestDocument(store2.db, col2, {
       name: "doc2",
       body: "different content for store2",
-      displayPath: "store2/doc.md",
+      displayPath: "doc.md",
     });
 
     // Each store should only see its own documents
@@ -1661,11 +1753,11 @@ describe("Integration", () => {
 
     expect(results1).toHaveLength(1);
     expect(results1[0].displayPath).toBe("store1/doc.md");
-    expect(results1[0].filepath).toBe("qmd://store1/store1/doc.md");
+    expect(results1[0].filepath).toBe("qmd://store1/doc.md");
 
     expect(results2).toHaveLength(1);
     expect(results2[0].displayPath).toBe("store2/doc.md");
-    expect(results2[0].filepath).toBe("qmd://store2/store2/doc.md");
+    expect(results2[0].filepath).toBe("qmd://store2/doc.md");
 
     // Cross-check: store1 shouldn't find store2's content
     const cross1 = store1.searchFTS("different", 10);
@@ -1791,7 +1883,7 @@ describe("Ollama Integration (Mocked)", () => {
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe("doc1.md");
+    expect(results[0].displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0].filepath).toBe(`qmd://${collectionName}/doc1.md`);
     expect(results[0].source).toBe("vec");
 

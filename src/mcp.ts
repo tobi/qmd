@@ -27,6 +27,7 @@ import type { RankedResult } from "./store.js";
 // =============================================================================
 
 type SearchResultItem = {
+  docid: string;  // Short docid (#abc123) for quick reference
   file: string;
   title: string;
   score: number;
@@ -69,9 +70,18 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   }
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
   for (const r of results) {
-    lines.push(`${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
+    lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Add line numbers to text content.
+ * Each line becomes: "{lineNum}: {content}"
+ */
+function addLineNumbers(text: string, startLine: number = 1): string {
+  const lines = text.split('\n');
+  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
 
 // =============================================================================
@@ -88,35 +98,16 @@ export async function startMcpServer(): Promise<void> {
   });
 
   // ---------------------------------------------------------------------------
-  // Resource: qmd://{path}
+  // Resource: qmd://{path} - read-only access to documents by path
+  // Note: No list() - documents are discovered via search tools
   // ---------------------------------------------------------------------------
 
   server.registerResource(
     "document",
-    new ResourceTemplate("qmd://{+path}", {
-      list: async () => {
-        // List all indexed documents
-        const docs = store.db.prepare(`
-          SELECT path, title, collection
-          FROM documents
-          WHERE active = 1
-          ORDER BY modified_at DESC
-          LIMIT 1000
-        `).all() as { path: string; title: string; collection: string }[];
-
-        return {
-          resources: docs.map(doc => ({
-            uri: `qmd://${doc.collection}/${encodeQmdPath(doc.path)}`,
-            name: `${doc.collection}/${doc.path}`,
-            title: doc.title || doc.path,
-            mimeType: "text/markdown",
-          })),
-        };
-      },
-    }),
+    new ResourceTemplate("qmd://{+path}", {}),
     {
       title: "QMD Document",
-      description: "A markdown document from your QMD knowledge base",
+      description: "A markdown document from your QMD knowledge base. Use search tools to discover documents.",
       mimeType: "text/markdown",
     },
     async (uri, { path }) => {
@@ -155,7 +146,7 @@ export async function startMcpServer(): Promise<void> {
       const virtualPath = `qmd://${doc.collection}/${doc.path}`;
       const context = store.getContextForFile(virtualPath);
 
-      let text = doc.body;
+      let text = addLineNumbers(doc.body);  // Default to line numbers
       if (context) {
         text = `<!-- Context: ${context} -->\n\n` + text;
       }
@@ -281,13 +272,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         .filter(r => !collection || r.collectionName === collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
-        .map(r => ({
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: store.getContextForFile(r.file),
-          snippet: extractSnippet(r.body, query, 300, r.chunkPos).snippet,
-        }));
+        .map(r => {
+          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: store.getContextForFile(r.filepath),
+            snippet: addLineNumbers(snippet, line),  // Default to line numbers
+          };
+        });
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
@@ -325,14 +320,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
 
       // Collect results (filter by collection after search)
-      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
+      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; docid: string }>();
       for (const q of queries) {
         const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10)
           .then(results => results.filter(r => !collection || r.collectionName === collection));
         for (const r of vecResults) {
-          const existing = allResults.get(r.file);
+          const existing = allResults.get(r.filepath);
           if (!existing || r.score > existing.score) {
-            allResults.set(r.file, { file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score });
+            allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, docid: r.docid });
           }
         }
       }
@@ -341,13 +336,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         .sort((a, b) => b.score - a.score)
         .slice(0, limit || 10)
         .filter(r => r.score >= (minScore || 0.3))
-        .map(r => ({
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: store.getContextForFile(r.file),
-          snippet: extractSnippet(r.body, query, 300).snippet,
-        }));
+        .map(r => {
+          const { line, snippet } = extractSnippet(r.body || "", query, 300);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: store.getContextForFile(r.file),
+            snippet: addLineNumbers(snippet, line),  // Default to line numbers
+          };
+        });
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
@@ -378,19 +377,22 @@ You can also access documents directly via the \`qmd://\` URI scheme:
 
       // Collect ranked lists (filter by collection after search)
       const rankedLists: RankedResult[][] = [];
+      const docidMap = new Map<string, string>(); // filepath -> docid
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       for (const q of queries) {
         const ftsResults = store.searchFTS(q, 20)
           .filter(r => !collection || r.collectionName === collection);
         if (ftsResults.length > 0) {
-          rankedLists.push(ftsResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
+          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
         if (hasVectors) {
           const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
             .then(results => results.filter(r => !collection || r.collectionName === collection));
           if (vecResults.length > 0) {
-            rankedLists.push(vecResults.map(r => ({ file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score })));
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         }
       }
@@ -420,12 +422,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         const rrfScore = 1 / rrfRank;
         const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
         const candidate = candidateMap.get(r.file);
+        const { line, snippet } = extractSnippet(candidate?.body || "", query, 300);
         return {
+          docid: `#${docidMap.get(r.file) || ""}`,
           file: candidate?.displayPath || "",
           title: candidate?.title || "",
           score: Math.round(blendedScore * 100) / 100,
           context: store.getContextForFile(r.file),
-          snippet: extractSnippet(candidate?.body || "", query, 300).snippet,
+          snippet: addLineNumbers(snippet, line),  // Default to line numbers
         };
       }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
 
@@ -444,14 +448,15 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     "get",
     {
       title: "Get Document",
-      description: "Retrieve the full content of a document by its file path. Use paths from search results. Suggests similar files if not found.",
+      description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
       inputSchema: {
-        file: z.string().describe("File path from search results (e.g., 'pages/meeting.md' or 'pages/meeting.md:100' to start at line 100)"),
+        file: z.string().describe("File path or docid from search results (e.g., 'pages/meeting.md', '#abc123', or 'pages/meeting.md:100' to start at line 100)"),
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
         maxLines: z.number().optional().describe("Maximum number of lines to return"),
+        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
       },
     },
-    async ({ file, fromLine, maxLines }) => {
+    async ({ file, fromLine, maxLines, lineNumbers }) => {
       const result = store.getDocument(file, fromLine, maxLines);
 
       if ("error" in result) {
@@ -466,6 +471,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       }
 
       let text = result.body;
+      if (lineNumbers) {
+        const startLine = fromLine || 1;
+        text = addLineNumbers(text, startLine);
+      }
       if (result.context) {
         text = `<!-- Context: ${result.context} -->\n\n` + text;
       }
@@ -498,9 +507,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
         maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
+        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
       },
     },
-    async ({ pattern, maxLines, maxBytes }) => {
+    async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
       const { files, errors } = store.getMultipleDocuments(pattern, maxLines, maxBytes || DEFAULT_MULTI_GET_MAX_BYTES);
 
       if (files.length === 0 && errors.length === 0) {
@@ -526,6 +536,9 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         }
 
         let text = file.body;
+        if (lineNumbers) {
+          text = addLineNumbers(text);
+        }
         if (file.context) {
           text = `<!-- Context: ${file.context} -->\n\n` + text;
         }

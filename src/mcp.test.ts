@@ -307,7 +307,7 @@ describe("MCP Server", () => {
     test("returns results for matching query", () => {
       const results = searchFTS(testDb, "readme", 10);
       expect(results.length).toBeGreaterThan(0);
-      expect(results[0].displayPath).toBe("readme.md");
+      expect(results[0].displayPath).toBe("docs/readme.md");
     });
 
     test("returns empty for non-matching query", () => {
@@ -449,7 +449,7 @@ describe("MCP Server", () => {
       const result = getDocument(testDb, "readme.md");
       expect("error" in result).toBe(false);
       if (!("error" in result)) {
-        expect(result.displayPath).toBe("readme.md");
+        expect(result.displayPath).toBe("docs/readme.md");
         expect(result.body).toContain("Project README");
       }
     });
@@ -527,8 +527,8 @@ describe("MCP Server", () => {
       const { files, errors } = getMultipleDocuments(testDb, "meetings/*.md");
       expect(errors.length).toBe(0);
       expect(files.length).toBe(2);
-      expect(files.some(f => f.displayPath === "meetings/meeting-2024-01.md")).toBe(true);
-      expect(files.some(f => f.displayPath === "meetings/meeting-2024-02.md")).toBe(true);
+      expect(files.some(f => f.displayPath === "docs/meetings/meeting-2024-01.md")).toBe(true);
+      expect(files.some(f => f.displayPath === "docs/meetings/meeting-2024-02.md")).toBe(true);
     });
 
     test("retrieves documents by comma-separated list", () => {
@@ -546,7 +546,7 @@ describe("MCP Server", () => {
 
     test("skips files larger than maxBytes", () => {
       const { files } = getMultipleDocuments(testDb, "*.md", undefined, 1000); // 1KB limit
-      const largeFile = files.find(f => f.displayPath === "large-file.md");
+      const largeFile = files.find(f => f.displayPath === "docs/large-file.md");
       expect(largeFile).toBeDefined();
       expect(largeFile?.skipped).toBe(true);
       if (largeFile?.skipped) {
@@ -908,7 +908,7 @@ QMD is your on-device search engine for markdown knowledge bases.`;
           mimeType: "text/markdown",
           text: result.body,
         };
-        expect(resource.name).toBe("readme.md");
+        expect(resource.name).toBe("docs/readme.md");
         expect(resource.title).toBe("Project README");
         expect(resource.mimeType).toBe("text/markdown");
       }

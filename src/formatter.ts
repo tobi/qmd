@@ -21,7 +21,30 @@ export type FormatOptions = {
   full?: boolean;       // Show full document content instead of snippet
   query?: string;       // Query for snippet extraction and highlighting
   useColor?: boolean;   // Enable terminal colors (default: false for non-CLI)
+  lineNumbers?: boolean;// Add line numbers to output
 };
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * Add line numbers to text content.
+ * Each line becomes: "{lineNum}: {content}"
+ * @param text The text to add line numbers to
+ * @param startLine Optional starting line number (default: 1)
+ */
+export function addLineNumbers(text: string, startLine: number = 1): string {
+  const lines = text.split('\n');
+  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
+}
+
+/**
+ * Extract short docid from a full hash (first 6 characters).
+ */
+export function getDocid(hash: string): string {
+  return hash.slice(0, 6);
+}
 
 // =============================================================================
 // Escape Helpers
@@ -56,14 +79,27 @@ export function searchResultsToJson(
   results: SearchResult[],
   opts: FormatOptions = {}
 ): string {
-  const output = results.map(row => ({
-    score: Math.round(row.score * 100) / 100,
-    file: row.displayPath,
-    title: row.title,
-    ...(row.context && { context: row.context }),
-    ...(opts.full && { body: row.body }),
-    ...(!opts.full && opts.query && { snippet: extractSnippet(row.body, opts.query, 300, row.chunkPos).snippet }),
-  }));
+  const query = opts.query || "";
+  const output = results.map(row => {
+    const bodyStr = row.body || "";
+    let body = opts.full ? bodyStr : undefined;
+    let snippet = !opts.full ? extractSnippet(bodyStr, query, 300, row.chunkPos).snippet : undefined;
+
+    if (opts.lineNumbers) {
+      if (body) body = addLineNumbers(body);
+      if (snippet) snippet = addLineNumbers(snippet);
+    }
+
+    return {
+      docid: `#${row.docid}`,
+      score: Math.round(row.score * 100) / 100,
+      file: row.displayPath,
+      title: row.title,
+      ...(row.context && { context: row.context }),
+      ...(body && { body }),
+      ...(snippet && { snippet }),
+    };
+  });
   return JSON.stringify(output, null, 2);
 }
 
@@ -75,11 +111,16 @@ export function searchResultsToCsv(
   opts: FormatOptions = {}
 ): string {
   const query = opts.query || "";
-  const header = "score,file,title,context,line,snippet";
+  const header = "docid,score,file,title,context,line,snippet";
   const rows = results.map(row => {
-    const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-    const content = opts.full ? row.body : snippet;
+    const bodyStr = row.body || "";
+    const { line, snippet } = extractSnippet(bodyStr, query, 500, row.chunkPos);
+    let content = opts.full ? bodyStr : snippet;
+    if (opts.lineNumbers && content) {
+      content = addLineNumbers(content);
+    }
     return [
+      `#${row.docid}`,
       row.score.toFixed(4),
       escapeCSV(row.displayPath),
       escapeCSV(row.title),
@@ -92,12 +133,12 @@ export function searchResultsToCsv(
 }
 
 /**
- * Format search results as simple files list (score,filepath,context)
+ * Format search results as simple files list (docid,score,filepath,context)
  */
 export function searchResultsToFiles(results: SearchResult[]): string {
   return results.map(row => {
     const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-    return `${row.score.toFixed(2)},${row.displayPath}${ctx}`;
+    return `#${row.docid},${row.score.toFixed(2)},${row.displayPath}${ctx}`;
   }).join("\n");
 }
 
@@ -111,12 +152,17 @@ export function searchResultsToMarkdown(
   const query = opts.query || "";
   return results.map(row => {
     const heading = row.title || row.displayPath;
+    const bodyStr = row.body || "";
+    let content: string;
     if (opts.full) {
-      return `---\n# ${heading}\n\n${row.body}\n`;
+      content = bodyStr;
     } else {
-      const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-      return `---\n# ${heading}\n\n${snippet}\n`;
+      content = extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
     }
+    if (opts.lineNumbers) {
+      content = addLineNumbers(content);
+    }
+    return `---\n# ${heading}\n\n**docid:** \`#${row.docid}\`\n\n${content}\n`;
   }).join("\n");
 }
 
@@ -130,8 +176,12 @@ export function searchResultsToXml(
   const query = opts.query || "";
   const items = results.map(row => {
     const titleAttr = row.title ? ` title="${escapeXml(row.title)}"` : "";
-    const content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
-    return `<file name="${escapeXml(row.displayPath)}"${titleAttr}>\n${escapeXml(content)}\n</file>`;
+    const bodyStr = row.body || "";
+    let content = opts.full ? bodyStr : extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
+    if (opts.lineNumbers) {
+      content = addLineNumbers(content);
+    }
+    return `<file docid="#${row.docid}" name="${escapeXml(row.displayPath)}"${titleAttr}>\n${escapeXml(content)}\n</file>`;
   });
   return items.join("\n\n");
 }
@@ -140,11 +190,11 @@ export function searchResultsToXml(
  * Format search results for MCP (simpler CSV format with pre-extracted snippets)
  */
 export function searchResultsToMcpCsv(
-  results: { file: string; title: string; score: number; context: string | null; snippet: string }[]
+  results: { docid: string; file: string; title: string; score: number; context: string | null; snippet: string }[]
 ): string {
-  const header = "file,title,score,context,snippet";
+  const header = "docid,file,title,score,context,snippet";
   const rows = results.map(r =>
-    [r.file, r.title, r.score, r.context || "", r.snippet].map(escapeCSV).join(",")
+    [`#${r.docid}`, r.file, r.title, r.score, r.context || "", r.snippet].map(escapeCSV).join(",")
   );
   return [header, ...rows].join("\n");
 }

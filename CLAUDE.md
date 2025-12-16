@@ -16,7 +16,7 @@ qmd context add [path] "text"     # Add context for path (defaults to current di
 qmd context list                  # List all contexts
 qmd context check                 # Check for collections/paths missing context
 qmd context rm <path>             # Remove context
-qmd get <file>                    # Get document content (fuzzy matches if not found)
+qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
@@ -76,6 +76,24 @@ qmd context rm qmd://journals/2024
 qmd context rm /  # Remove global context
 ```
 
+## Document IDs (docid)
+
+Each document has a unique short ID (docid) - the first 6 characters of its content hash.
+Docids are shown in search results as `#abc123` and can be used with `get` and `multi-get`:
+
+```sh
+# Search returns docid in results
+qmd search "query" --json
+# Output: [{"docid": "#abc123", "score": 0.85, "file": "docs/readme.md", ...}]
+
+# Get document by docid
+qmd get "#abc123"
+qmd get abc123              # Leading # is optional
+
+# Docids also work in multi-get comma-separated lists
+qmd multi-get "#abc123, #def456"
+```
+
 ## Options
 
 ```sh
@@ -85,6 +103,7 @@ qmd context rm /  # Remove global context
 --all                    # Return all matches
 --min-score <num>        # Minimum score threshold
 --full                   # Show full document content
+--line-numbers           # Add line numbers to output
 
 # Multi-get specific
 -l <num>                 # Maximum lines per file

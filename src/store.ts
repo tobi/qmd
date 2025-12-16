@@ -388,9 +388,10 @@ export type Store = {
   getDocument: (filename: string, fromLine?: number, maxLines?: number) => (DocumentResult & { body: string }) | DocumentNotFound;
   getMultipleDocuments: (pattern: string, maxLines?: number, maxBytes?: number) => { files: MultiGetFile[]; errors: string[] };
 
-  // Fuzzy matching
+  // Fuzzy matching and docid lookup
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
   matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
+  findDocumentByDocid: (docid: string) => { filepath: string; hash: string } | null;
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
@@ -475,9 +476,10 @@ export function createStore(dbPath?: string): Store {
     getDocument: (filename: string, fromLine?: number, maxLines?: number) => getDocument(db, filename, fromLine, maxLines),
     getMultipleDocuments: (pattern: string, maxLines?: number, maxBytes?: number) => getMultipleDocuments(db, pattern, maxLines, maxBytes),
 
-    // Fuzzy matching
+    // Fuzzy matching and docid lookup
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
     matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
+    findDocumentByDocid: (docid: string) => findDocumentByDocid(db, docid),
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
@@ -549,11 +551,78 @@ export type DocumentResult = {
   title: string;              // Document title (from first heading or filename)
   context: string | null;     // Folder context description if configured
   hash: string;               // Content hash for caching/change detection
+  docid: string;              // Short docid (first 6 chars of hash) for quick reference
   collectionName: string;     // Parent collection name
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
   body?: string;              // Document body (optional, load with getDocumentBody)
 };
+
+/**
+ * Extract short docid from a full hash (first 6 characters).
+ */
+export function getDocid(hash: string): string {
+  return hash.slice(0, 6);
+}
+
+/**
+ * Handelize a filename to be more token-friendly.
+ * - Convert triple underscore `___` to `/` (folder separator)
+ * - Convert to lowercase
+ * - Replace sequences of non-word chars (except /) with single dash
+ * - Remove leading/trailing dashes from path segments
+ * - Preserve folder structure (a/b/c/d.md stays structured)
+ * - Preserve file extension
+ */
+export function handelize(path: string): string {
+  if (!path || path.trim() === '') {
+    throw new Error('handelize: path cannot be empty');
+  }
+
+  // Check for paths that are just extensions or only dots/special chars
+  // A valid path must have at least one alphanumeric character before processing
+  const segments = path.split('/').filter(Boolean);
+  const lastSegment = segments[segments.length - 1] || '';
+  const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
+  const hasValidContent = /[a-zA-Z0-9]/.test(filenameWithoutExt);
+  if (!hasValidContent) {
+    throw new Error(`handelize: path "${path}" has no valid filename content`);
+  }
+
+  const result = path
+    .replace(/___/g, '/')       // Triple underscore becomes folder separator
+    .toLowerCase()
+    .split('/')
+    .map((segment, idx, arr) => {
+      const isLastSegment = idx === arr.length - 1;
+
+      if (isLastSegment) {
+        // For the filename (last segment), preserve the extension
+        const extMatch = segment.match(/(\.[a-z0-9]+)$/i);
+        const ext = extMatch ? extMatch[1] : '';
+        const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
+
+        const cleanedName = nameWithoutExt
+          .replace(/[\W_]+/g, '-')  // Replace non-word chars with dash
+          .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
+
+        return cleanedName + ext;
+      } else {
+        // For directories, just clean normally
+        return segment
+          .replace(/[\W_]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+      }
+    })
+    .filter(Boolean)
+    .join('/');
+
+  if (!result) {
+    throw new Error(`handelize: path "${path}" resulted in empty string after processing`);
+  }
+
+  return result;
+}
 
 /**
  * Search result extends DocumentResult with score and source info
@@ -968,6 +1037,28 @@ function levenshtein(a: string, b: string): number {
     }
   }
   return dp[m][n];
+}
+
+/**
+ * Find a document by its short docid (first 6 characters of hash).
+ * Returns the document's virtual path if found, null otherwise.
+ * If multiple documents match the same short hash (collision), returns the first one.
+ */
+export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
+  // Normalize: remove leading # if present
+  const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
+
+  if (shortHash.length < 1) return null;
+
+  // Look up documents where hash starts with the short hash
+  const doc = db.prepare(`
+    SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.hash
+    FROM documents d
+    WHERE d.hash LIKE ? AND d.active = 1
+    LIMIT 1
+  `).get(`${shortHash}%`) as { filepath: string; hash: string } | null;
+
+  return doc;
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
@@ -1425,7 +1516,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   let sql = `
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
-      d.path as display_path,
+      d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       d.hash,
@@ -1458,6 +1549,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       displayPath: row.display_path,
       title: row.title,
       hash: row.hash,
+      docid: getDocid(row.hash),
       collectionName,
       modifiedAt: "",  // Not available in FTS query
       bodyLength: row.body.length,
@@ -1486,7 +1578,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       v.hash_seq,
       v.distance,
       'qmd://' || d.collection || '/' || d.path as filepath,
-      d.path as display_path,
+      d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       cv.hash,
@@ -1527,6 +1619,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         displayPath: row.display_path,
         title: row.title,
         hash: row.hash,
+        docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
         bodyLength: row.body.length,
@@ -1719,14 +1812,30 @@ type DbDocRow = {
 };
 
 /**
- * Find a document by filename/path (with fuzzy matching)
- * Returns document metadata without body by default
+ * Find a document by filename/path, docid (#hash), or with fuzzy matching.
+ * Returns document metadata without body by default.
+ *
+ * Supports:
+ * - Virtual paths: qmd://collection/path/to/file.md
+ * - Absolute paths: /path/to/file.md
+ * - Relative paths: path/to/file.md
+ * - Short docid: #abc123 (first 6 chars of hash)
  */
 export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
     filepath = filepath.slice(0, -colonMatch[0].length);
+  }
+
+  // Check if this is a docid lookup (#hash or just 6-char hex)
+  if (filepath.startsWith('#') || /^[a-f0-9]{6}$/i.test(filepath)) {
+    const docidMatch = findDocumentByDocid(db, filepath);
+    if (docidMatch) {
+      filepath = docidMatch.filepath;
+    } else {
+      return { error: "not_found", query: filename, similarFiles: [] };
+    }
   }
 
   if (filepath.startsWith('~/')) {
@@ -1739,7 +1848,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
   // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
     'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.path as display_path,
+    d.collection || '/' || d.path as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -1809,6 +1918,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     title: doc.title,
     context,
     hash: doc.hash,
+    docid: getDocid(doc.hash),
     collectionName: doc.collection,
     modifiedAt: doc.modified_at,
     bodyLength: doc.body_length,
@@ -1910,7 +2020,7 @@ export function findDocuments(
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
     'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.path as display_path,
+    d.collection || '/' || d.path as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -1991,6 +2101,7 @@ export function findDocuments(
         title: row.title || row.display_path.split('/').pop() || row.display_path,
         context,
         hash: row.hash,
+        docid: getDocid(row.hash),
         collectionName: row.collection,
         modifiedAt: row.modified_at,
         bodyLength: row.body_length,

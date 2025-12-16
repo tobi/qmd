@@ -579,7 +579,8 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("qmd://fixtures/README.md");
+    // handelize converts to lowercase
+    expect(stdout).toContain("qmd://fixtures/readme.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
@@ -588,8 +589,8 @@ describe("CLI ls Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
     expect(stdout).toContain("qmd://fixtures/notes/ideas.md");
-    // Should not include files outside the prefix
-    expect(stdout).not.toContain("qmd://fixtures/README.md");
+    // Should not include files outside the prefix (handelize converts to lowercase)
+    expect(stdout).not.toContain("qmd://fixtures/readme.md");
   });
 
   test("lists files with virtual path", async () => {

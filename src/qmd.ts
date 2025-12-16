@@ -61,6 +61,7 @@ import {
   vacuumDatabase,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
+  handelize,
   OLLAMA_URL,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -1448,7 +1449,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = relativeFile; // Use relative path as-is
+    const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
     const content = await Bun.file(filepath).text();
@@ -1751,6 +1752,7 @@ type OutputOptions = {
   minScore: number;
   all?: boolean;
   collection?: string;  // Filter by collection name (pwd suffix match)
+  lineNumbers?: boolean; // Add line numbers to output
 };
 
 // Extract snippet with more context lines for CLI display
@@ -1824,7 +1826,13 @@ function shortPath(dirpath: string): string {
   return dirpath;
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number }[], query: string, opts: OutputOptions): void {
+// Add line numbers to text content
+function addLineNumbers(text: string, startLine: number = 1): string {
+  const lines = text.split('\n');
+  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
+}
+
+function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1834,30 +1842,43 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 
   if (opts.format === "json") {
     // JSON output for LLM consumption
-    const output = filtered.map(row => ({
-      score: Math.round(row.score * 100) / 100,
-      file: row.displayPath,
-      title: row.title,
-      ...(row.context && { context: row.context }),
-      ...(opts.full && { body: row.body }),
-      ...(!opts.full && { snippet: extractSnippet(row.body, query, 300, row.chunkPos).snippet }),
-    }));
+    const output = filtered.map(row => {
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+      let body = opts.full ? row.body : undefined;
+      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      if (opts.lineNumbers) {
+        if (body) body = addLineNumbers(body);
+        if (snippet) snippet = addLineNumbers(snippet);
+      }
+      return {
+        ...(docid && { docid: `#${docid}` }),
+        score: Math.round(row.score * 100) / 100,
+        file: row.displayPath,
+        title: row.title,
+        ...(row.context && { context: row.context }),
+        ...(body && { body }),
+        ...(snippet && { snippet }),
+      };
+    });
     console.log(JSON.stringify(output, null, 2));
   } else if (opts.format === "files") {
-    // Simple score,filepath,context output
+    // Simple docid,score,filepath,context output
     for (const row of filtered) {
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-      console.log(`${row.score.toFixed(2)},${row.displayPath}${ctx}`);
+      console.log(`#${docid},${row.score.toFixed(2)},${row.displayPath}${ctx}`);
     }
   } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       const { line, snippet, hasMatch } = extractSnippetWithContext(row.body, query, 2, row.chunkPos);
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
-      // Line 1: filepath
+      // Line 1: filepath with docid
       const path = row.displayPath;
       const lineInfo = hasMatch ? `:${line}` : "";
-      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}`);
+      const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
+      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
 
       // Line 2: Title (if available)
       if (row.title) {
@@ -1875,7 +1896,8 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       console.log();
 
       // Snippet with highlighting (no leading | chars for better word wrap)
-      const highlighted = highlightTerms(snippet, query);
+      let displaySnippet = opts.lineNumbers ? addLineNumbers(snippet, line) : snippet;
+      const highlighted = highlightTerms(displaySnippet, query);
       console.log(highlighted);
 
       // Double empty line between results
@@ -1884,30 +1906,35 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   } else if (opts.format === "md") {
     for (const row of filtered) {
       const heading = row.title || row.displayPath;
-      if (opts.full) {
-        console.log(`---\n# ${heading}\n\n${row.body}\n`);
-      } else {
-        const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-        console.log(`---\n# ${heading}\n\n${snippet}\n`);
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content);
       }
+      const docidLine = docid ? `\n**docid:** \`#${docid}\`\n` : "";
+      console.log(`---\n# ${heading}${docidLine}\n${content}\n`);
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
-      if (opts.full) {
-        console.log(`<file name="${row.displayPath}"${titleAttr}>\n${row.body}\n</file>\n`);
-      } else {
-        const { snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-        console.log(`<file name="${row.displayPath}"${titleAttr}>\n${snippet}\n</file>\n`);
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content);
       }
+      console.log(`<file docid="#${docid}" name="${row.displayPath}"${titleAttr}>\n${content}\n</file>\n`);
     }
   } else {
     // CSV format
-    console.log("score,file,title,line,snippet");
+    console.log("docid,score,file,title,line,snippet");
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-      const content = opts.full ? row.body : snippet;
-      console.log(`${row.score.toFixed(4)},${escapeCSV(row.displayPath)},${escapeCSV(row.title)},${line},${escapeCSV(content)}`);
+      let content = opts.full ? row.body : snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content, line);
+      }
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
+      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(row.displayPath)},${escapeCSV(row.title)},${line},${escapeCSV(content)}`);
     }
   }
 }
@@ -2204,6 +2231,7 @@ function parseCLI() {
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
+      "line-numbers": { type: "boolean" },  // add line numbers to output
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2234,6 +2262,7 @@ function parseCLI() {
     minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
     all: isAll,
     collection: values.collection as string | undefined,
+    lineNumbers: values["line-numbers"] || false,
   };
 
   return {
@@ -2274,7 +2303,8 @@ function showHelp(): void {
   console.log("  --all                      - Return all matches (use with --min-score to filter)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  --files                    - Output score,filepath,context (default: 20 results)");
+  console.log("  --line-numbers             - Add line numbers to output");
+  console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
   console.log("  --json                     - JSON output with snippets (default: 20 results)");
   console.log("  --csv                      - CSV output with snippets");
   console.log("  --md                       - Markdown output");
