@@ -801,7 +801,7 @@ function contextCheck(): void {
   closeDb();
 }
 
-function getDocument(filename: string, fromLine?: number, maxLines?: number): void {
+function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
   const db = getDb();
 
   // Parse :linenum suffix from filename (e.g., "file.md:100")
@@ -899,13 +899,19 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number): vo
   const context = getContextForPath(db, doc.collectionName, doc.path);
 
   let output = doc.body;
+  const startLine = fromLine || 1;
 
   // Apply line filtering if specified
   if (fromLine !== undefined || maxLines !== undefined) {
     const lines = output.split('\n');
-    const start = (fromLine || 1) - 1; // Convert to 0-indexed
+    const start = startLine - 1; // Convert to 0-indexed
     const end = maxLines !== undefined ? start + maxLines : lines.length;
     output = lines.slice(start, end).join('\n');
+  }
+
+  // Add line numbers if requested
+  if (lineNumbers) {
+    output = addLineNumbers(output, startLine);
   }
 
   // Output context header if exists
@@ -2441,12 +2447,12 @@ switch (cli.command) {
 
   case "get": {
     if (!cli.args[0]) {
-      console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>]");
+      console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
       process.exit(1);
     }
     const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
     const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-    getDocument(cli.args[0], fromLine, maxLines);
+    getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
     break;
   }
 
