@@ -825,9 +825,7 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
-  test.skip("searchFTS filters by collectionId - SKIPPED due to bug in store.ts", async () => {
-    // This test is skipped because searchFTS tries to query a non-existent collections table
-    // when collectionId is provided. This is a bug in store.ts that needs to be fixed separately.
+  test("searchFTS filters by collection name", async () => {
     const store = await createTestStore();
     const collection1 = await createTestCollection({ pwd: "/path/one", glob: "**/*.md", name: "one" });
     const collection2 = await createTestCollection({ pwd: "/path/two", glob: "**/*.md", name: "two" });
@@ -835,22 +833,22 @@ describe("FTS Search", () => {
     await insertTestDocument(store.db, collection1, {
       name: "doc1",
       body: "searchable content",
-      displayPath: "one/doc1.md",
+      displayPath: "doc1.md",
     });
 
     await insertTestDocument(store.db, collection2, {
       name: "doc2",
       body: "searchable content",
-      displayPath: "two/doc2.md",
+      displayPath: "doc2.md",
     });
 
     const allResults = store.searchFTS("searchable", 10);
     expect(allResults).toHaveLength(2);
 
-    // This would fail with "no such table: collections" error
-    // const filtered = store.searchFTS("searchable", 10, collection1);
-    // expect(filtered).toHaveLength(1);
-    // expect(filtered[0].displayPath).toBe(`qmd://one/one/doc1.md`);
+    // Filter by collection name (collectionId is now treated as collection name string)
+    const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].displayPath).toBe(`${collection1}/doc1.md`);
 
     await cleanupTestDb(store);
   });
@@ -1481,22 +1479,19 @@ describe("Reciprocal Rank Fusion", () => {
 // =============================================================================
 
 describe("Index Status", () => {
-  test.skip("getStatus returns correct structure - SKIPPED due to bug in store.ts", async () => {
-    // This test is skipped because getStatus tries to query a non-existent collections table
-    // This is a bug in store.ts that needs to be fixed separately.
+  test("getStatus returns correct structure", async () => {
     const store = await createTestStore();
-    // const status = store.getStatus();
-    // expect(status).toHaveProperty("totalDocuments");
-    // expect(status).toHaveProperty("needsEmbedding");
-    // expect(status).toHaveProperty("hasVectorIndex");
-    // expect(status).toHaveProperty("collections");
-    // expect(Array.isArray(status.collections)).toBe(true);
+    const status = store.getStatus();
+    expect(status).toHaveProperty("totalDocuments");
+    expect(status).toHaveProperty("needsEmbedding");
+    expect(status).toHaveProperty("hasVectorIndex");
+    expect(status).toHaveProperty("collections");
+    expect(Array.isArray(status.collections)).toBe(true);
 
     await cleanupTestDb(store);
   });
 
-  test.skip("getStatus counts documents correctly - SKIPPED due to bug in store.ts", async () => {
-    // This test is skipped because getStatus tries to query a non-existent collections table
+  test("getStatus counts documents correctly", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
 
@@ -1504,23 +1499,24 @@ describe("Index Status", () => {
     await insertTestDocument(store.db, collectionName, { name: "doc2", active: 1 });
     await insertTestDocument(store.db, collectionName, { name: "doc3", active: 0 }); // inactive
 
-    // const status = store.getStatus();
-    // expect(status.totalDocuments).toBe(2); // Only active docs
+    const status = store.getStatus();
+    expect(status.totalDocuments).toBe(2); // Only active docs
 
     await cleanupTestDb(store);
   });
 
-  test.skip("getStatus reports collection info - SKIPPED due to bug in store.ts", async () => {
-    // This test is skipped because getStatus tries to query a non-existent collections table
+  test("getStatus reports collection info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection({ pwd: "/test/path", glob: "**/*.md" });
     await insertTestDocument(store.db, collectionName, { name: "doc1" });
 
-    // const status = store.getStatus();
-    // expect(status.collections).toHaveLength(1);
-    // expect(status.collections[0].path).toBe("/test/path");
-    // expect(status.collections[0].pattern).toBe("**/*.md");
-    // expect(status.collections[0].documents).toBe(1);
+    const status = store.getStatus();
+    expect(status.collections.length).toBeGreaterThanOrEqual(1);
+    const col = status.collections.find(c => c.name === collectionName);
+    expect(col).toBeDefined();
+    expect(col?.path).toBe("/test/path");
+    expect(col?.pattern).toBe("**/*.md");
+    expect(col?.documents).toBe(1);
 
     await cleanupTestDb(store);
   });
