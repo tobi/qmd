@@ -486,7 +486,7 @@ Output exactly ${numVariations} variations, one per line, no numbering or bullet
         },
         hyde: {
           type: "string" as const,
-          description: "A hypothetical document snippet that would perfectly answer this query (50-100 words)"
+          description: "Write a short passage (50-100 words) that directly answers the query as if from a relevant document"
         }
       },
       required: ["vectorQuery", "hyde"] as const
@@ -499,13 +499,13 @@ Output exactly ${numVariations} variations, one per line, no numbering or bullet
 Given a query, generate:
 1. lexicalQuery: Alternative keywords using synonyms (for BM25 keyword search)
 2. vectorQuery: Semantically rephrased query (for vector/embedding search)
-3. hyde: A hypothetical document excerpt that would answer the query (50-100 words)
+3. hyde: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
 
 Keep proper nouns exactly as written. Be concise.`
       : `You expand search queries for semantic search.
 Given a query, generate:
 1. vectorQuery: Semantically rephrased query capturing the full intent
-2. hyde: A hypothetical document excerpt that would answer the query (50-100 words)
+2. hyde: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
 
 Keep proper nouns exactly as written. Be concise. Set lexicalQuery to empty string.`;
 
