@@ -114,14 +114,50 @@ export type VirtualPath = {
 };
 
 /**
+ * Normalize explicit virtual path formats to standard qmd:// format.
+ * Only handles paths that are already explicitly virtual:
+ * - qmd://collection/path.md (already normalized)
+ * - qmd:////collection/path.md (extra slashes - normalize)
+ * - //collection/path.md (missing qmd: prefix - add it)
+ *
+ * Does NOT handle:
+ * - collection/path.md (bare paths - could be filesystem relative)
+ * - :linenum suffix (should be parsed separately before calling this)
+ */
+export function normalizeVirtualPath(input: string): string {
+  let path = input.trim();
+
+  // Handle qmd:// with extra slashes: qmd:////collection/path -> qmd://collection/path
+  if (path.startsWith('qmd:')) {
+    // Remove qmd: prefix and normalize slashes
+    path = path.slice(4);
+    // Remove leading slashes and re-add exactly two
+    path = path.replace(/^\/+/, '');
+    return `qmd://${path}`;
+  }
+
+  // Handle //collection/path (missing qmd: prefix)
+  if (path.startsWith('//')) {
+    path = path.replace(/^\/+/, '');
+    return `qmd://${path}`;
+  }
+
+  // Return as-is for other cases (filesystem paths, docids, bare collection/path, etc.)
+  return path;
+}
+
+/**
  * Parse a virtual path like "qmd://collection-name/path/to/file.md"
  * into its components.
  * Also supports collection root: "qmd://collection-name/" or "qmd://collection-name"
  */
 export function parseVirtualPath(virtualPath: string): VirtualPath | null {
+  // Normalize the path first
+  const normalized = normalizeVirtualPath(virtualPath);
+
   // Match: qmd://collection-name[/optional-path]
   // Allows: qmd://name, qmd://name/, qmd://name/path
-  const match = virtualPath.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
+  const match = normalized.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
   if (!match) return null;
   return {
     collectionName: match[1],
@@ -137,10 +173,24 @@ export function buildVirtualPath(collectionName: string, path: string): string {
 }
 
 /**
- * Check if a path is a virtual path (starts with qmd://).
+ * Check if a path is explicitly a virtual path.
+ * Only recognizes explicit virtual path formats:
+ * - qmd://collection/path.md
+ * - //collection/path.md
+ *
+ * Does NOT consider bare collection/path.md as virtual - that should be
+ * handled separately by checking if the first component is a collection name.
  */
 export function isVirtualPath(path: string): boolean {
-  return path.startsWith('qmd://');
+  const trimmed = path.trim();
+
+  // Explicit qmd:// prefix (with any number of slashes)
+  if (trimmed.startsWith('qmd:')) return true;
+
+  // //collection/path format (missing qmd: prefix)
+  if (trimmed.startsWith('//')) return true;
+
+  return false;
 }
 
 /**

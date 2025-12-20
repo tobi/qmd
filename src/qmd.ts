@@ -453,7 +453,6 @@ function showStatus(): void {
       const contexts = contextsByCollection.get(col.name) || [];
 
       console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(qmd://${col.name}/)${c.reset}`);
-      console.log(`    ${c.dim}Path:${c.reset}     ${col.pwd}`);
       console.log(`    ${c.dim}Pattern:${c.reset}  ${col.glob_pattern}`);
       console.log(`    ${c.dim}Files:${c.reset}    ${col.active_count} (updated ${lastMod})`);
 
@@ -511,9 +510,7 @@ async function updateCollections(): Promise<void> {
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset}`);
-    console.log(`${c.dim}    Path: ${col.pwd}${c.reset}`);
-    console.log(`${c.dim}    Pattern: ${col.glob_pattern}${c.reset}`);
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
@@ -761,9 +758,7 @@ function contextCheck(): void {
     console.log(`\n${c.yellow}Collections without any context:${c.reset}\n`);
 
     for (const coll of collectionsWithoutContext) {
-      console.log(`${c.cyan}${coll.name}${c.reset}`);
-      console.log(`  ${c.dim}Path: ${coll.pwd}${c.reset}`);
-      console.log(`  ${c.dim}Documents: ${coll.doc_count}${c.reset}`);
+      console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(${coll.doc_count} documents)${c.reset}`);
       console.log(`  ${c.dim}Suggestion: qmd context add qmd://${coll.name}/ "Description of ${coll.name}"${c.reset}\n`);
     }
   }
@@ -845,47 +840,90 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
 
     virtualPath = inputPath;
   } else {
-    // Handle filesystem paths
-    let fsPath = inputPath;
+    // Try to interpret as collection/path format first (before filesystem path)
+    // If path is relative (no / or ~ prefix), check if first component is a collection name
+    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
+      const parts = inputPath.split('/');
+      if (parts.length >= 2) {
+        const possibleCollection = parts[0];
+        const possiblePath = parts.slice(1).join('/');
 
-    // Expand ~ to home directory
-    if (fsPath.startsWith('~/')) {
-      fsPath = homedir() + fsPath.slice(1);
-    } else if (!fsPath.startsWith('/')) {
-      // Relative path - resolve from current directory
-      fsPath = resolve(getPwd(), fsPath);
+        // Check if this collection exists
+        const collExists = db.prepare(`
+          SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
+        `).get(possibleCollection);
+
+        if (collExists) {
+          // Try exact match on collection + path
+          doc = db.prepare(`
+            SELECT d.collection as collectionName, d.path, content.doc as body
+            FROM documents d
+            JOIN content ON content.hash = d.hash
+            WHERE d.collection = ? AND d.path = ? AND d.active = 1
+          `).get(possibleCollection, possiblePath) as typeof doc;
+
+          if (!doc) {
+            // Try fuzzy match by path ending
+            doc = db.prepare(`
+              SELECT d.collection as collectionName, d.path, content.doc as body
+              FROM documents d
+              JOIN content ON content.hash = d.hash
+              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+              LIMIT 1
+            `).get(possibleCollection, `%${possiblePath}`) as typeof doc;
+          }
+
+          if (doc) {
+            virtualPath = buildVirtualPath(doc.collectionName, doc.path);
+            // Skip the filesystem path handling below
+          }
+        }
+      }
     }
-    fsPath = getRealPath(fsPath);
 
-    // Try to detect which collection contains this path
-    const detected = detectCollectionFromPath(db, fsPath);
-
-    if (detected) {
-      // Found collection - query by collection name + relative path
-      doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE d.collection = ? AND d.path = ? AND d.active = 1
-      `).get(detected.collectionName, detected.relativePath) as typeof doc;
-    }
-
-    // Fuzzy match by filename (last component of path)
+    // If not found as collection/path, handle as filesystem paths
     if (!doc) {
-      const filename = inputPath.split('/').pop() || inputPath;
-      doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE d.path LIKE ? AND d.active = 1
-        LIMIT 1
-      `).get(`%${filename}`) as typeof doc;
-    }
+      let fsPath = inputPath;
 
-    if (doc) {
-      virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-    } else {
-      virtualPath = inputPath;
+      // Expand ~ to home directory
+      if (fsPath.startsWith('~/')) {
+        fsPath = homedir() + fsPath.slice(1);
+      } else if (!fsPath.startsWith('/')) {
+        // Relative path - resolve from current directory
+        fsPath = resolve(getPwd(), fsPath);
+      }
+      fsPath = getRealPath(fsPath);
+
+      // Try to detect which collection contains this path
+      const detected = detectCollectionFromPath(db, fsPath);
+
+      if (detected) {
+        // Found collection - query by collection name + relative path
+        doc = db.prepare(`
+          SELECT d.collection as collectionName, d.path, content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        `).get(detected.collectionName, detected.relativePath) as typeof doc;
+      }
+
+      // Fuzzy match by filename (last component of path)
+      if (!doc) {
+        const filename = inputPath.split('/').pop() || inputPath;
+        doc = db.prepare(`
+          SELECT d.collection as collectionName, d.path, content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.path LIKE ? AND d.active = 1
+          LIMIT 1
+        `).get(`%${filename}`) as typeof doc;
+      }
+
+      if (doc) {
+        virtualPath = buildVirtualPath(doc.collectionName, doc.path);
+      } else {
+        virtualPath = inputPath;
+      }
     }
   }
 
@@ -1315,8 +1353,7 @@ function collectionList(): void {
     const updatedAt = new Date(coll.updated_at);
     const timeAgo = formatTimeAgo(updatedAt);
 
-    console.log(`${c.cyan}${coll.name}${c.reset}`);
-    console.log(`  ${c.dim}Path:${c.reset}     ${coll.pwd}`);
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
@@ -1347,8 +1384,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   if (existingPwdGlob) {
     console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
-    console.error(`  Name: ${existingPwdGlob.name}`);
-    console.error(`  Path: ${pwd}`);
+    console.error(`  Name: ${existingPwdGlob.name} (qmd://${existingPwdGlob.name}/)`);
     console.error(`  Pattern: ${globPattern}`);
     console.error(`\nUse 'qmd update' to re-index it, or remove it first with 'qmd collection remove ${existingPwdGlob.name}'`);
     process.exit(1);
@@ -1846,6 +1882,9 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     return;
   }
 
+  // Helper to create qmd:// URI from displayPath
+  const toQmdPath = (displayPath: string) => `qmd://${displayPath}`;
+
   if (opts.format === "json") {
     // JSON output for LLM consumption
     const output = filtered.map(row => {
@@ -1859,7 +1898,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       return {
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
-        file: row.displayPath,
+        file: toQmdPath(row.displayPath),
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),
@@ -1872,7 +1911,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     for (const row of filtered) {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-      console.log(`#${docid},${row.score.toFixed(2)},${row.displayPath}${ctx}`);
+      console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
@@ -1881,7 +1920,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const path = row.displayPath;
+      const path = toQmdPath(row.displayPath);
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
       console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
@@ -1917,22 +1956,24 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      const docidLine = docid ? `\n**docid:** \`#${docid}\`\n` : "";
-      console.log(`---\n# ${heading}${docidLine}\n${content}\n`);
+      const docidLine = docid ? `**docid:** \`#${docid}\`\n` : "";
+      const contextLine = row.context ? `**context:** ${row.context}\n` : "";
+      console.log(`---\n# ${heading}\n${docidLine}${contextLine}\n${content}\n`);
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
+      const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      console.log(`<file docid="#${docid}" name="${row.displayPath}"${titleAttr}>\n${content}\n</file>\n`);
+      console.log(`<file docid="#${docid}" name="${toQmdPath(row.displayPath)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
     }
   } else {
     // CSV format
-    console.log("docid,score,file,title,line,snippet");
+    console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
       let content = opts.full ? row.body : snippet;
@@ -1940,7 +1981,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         content = addLineNumbers(content, line);
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(row.displayPath)},${escapeCSV(row.title)},${line},${escapeCSV(content)}`);
+      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title)},${escapeCSV(row.context || "")},${line},${escapeCSV(content)}`);
     }
   }
 }
@@ -2012,7 +2053,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   // Collect results from all query variations
   // For --all, fetch more results per query
   const perQueryLimit = opts.all ? 500 : 20;
-  const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number }>();
+  const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
   for (const q of queries) {
     // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
@@ -2020,7 +2061,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
-        allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score });
+        allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
       }
     }
   }
@@ -2133,11 +2174,15 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   const rankedLists: RankedResult[][] = [];
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
+  // Map to store hash by filepath for final results
+  const hashMap = new Map<string, string>();
+
   for (const q of queries) {
     // FTS search - get ranked results
     // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
     const ftsResults = searchFTS(db, q, 20, collectionName as any);
     if (ftsResults.length > 0) {
+      for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
       rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
     }
 
@@ -2146,6 +2191,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
       const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
       if (vecResults.length > 0) {
+        for (const r of vecResults) hashMap.set(r.filepath, r.hash);
         rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
     }
@@ -2200,6 +2246,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       body: candidate?.body || "",
       score: blendedScore,
       context: getContextForFile(db, r.file),
+      hash: hashMap.get(r.file) || "",
     };
   }).sort((a, b) => b.score - a.score);
 

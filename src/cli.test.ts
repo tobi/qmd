@@ -24,16 +24,17 @@ const qmdScript = join(qmdDir, "qmd.ts");
 // Helper to run qmd command with test database
 async function runQmd(
   args: string[],
-  options: { cwd?: string; env?: Record<string, string>; dbPath?: string } = {}
+  options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
+  const configDir = options.configDir || testConfigDir;
   const proc = Bun.spawn(["bun", qmdScript, ...args], {
     cwd: workingDir,
     env: {
       ...process.env,
       INDEX_PATH: dbPath,
-      QMD_CONFIG_DIR: testConfigDir, // Use test config directory
+      QMD_CONFIG_DIR: configDir, // Use test config directory
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
       ...options.env,
     },
@@ -52,6 +53,16 @@ async function runQmd(
 function getFreshDbPath(): string {
   testCounter++;
   return join(testDir, `test-${testCounter}.sqlite`);
+}
+
+// Create an isolated test environment (db + config dir)
+async function createIsolatedTestEnv(prefix: string): Promise<{ dbPath: string; configDir: string }> {
+  testCounter++;
+  const dbPath = join(testDir, `${prefix}-${testCounter}.sqlite`);
+  const configDir = join(testDir, `${prefix}-config-${testCounter}`);
+  await mkdir(configDir, { recursive: true });
+  await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+  return { dbPath, configDir };
 }
 
 // Setup test fixtures
@@ -145,6 +156,27 @@ Retrieve a specific document.
 
 ### POST /index
 Index new documents.
+`
+  );
+
+  // Create test files for path normalization tests
+  await writeFile(
+    join(fixturesDir, "test1.md"),
+    `# Test Document 1
+
+This is the first test document.
+
+It has multiple lines for testing line numbers.
+Line 6 is here.
+Line 7 is here.
+`
+  );
+
+  await writeFile(
+    join(fixturesDir, "test2.md"),
+    `# Test Document 2
+
+This is the second test document.
 `
   );
 });
@@ -339,31 +371,38 @@ describe("CLI Update Command", () => {
 });
 
 describe("CLI Add-Context Command", () => {
-  beforeEach(async () => {
-    // Ensure we have indexed files
-    await runQmd(["collection", "add", "."]);
+  let localDbPath: string;
+  let localConfigDir: string;
+  const collName = "fixtures";
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("context-cmd");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    // Add collection with known name
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", collName],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    if (exitCode !== 0) console.error("collection add failed:", stderr);
+    expect(exitCode).toBe(0);
   });
 
   test("adds context to a path", async () => {
-    // First add a collection to get its name
-    const listResult = await runQmd(["collection", "list"]);
-    // Parse collection name - it's on the 3rd line (after header and blank line)
-    const lines = listResult.stdout.split('\n').filter(l => l.trim());
-    const collectionName = lines[1]; // "fixtures" is on line 2
-
     // Add context to the collection root using virtual path
     const { stdout, exitCode } = await runQmd([
       "context",
       "add",
-      `qmd://${collectionName}/`,
+      `qmd://${collName}/`,
       "Personal notes and meeting logs",
-    ]);
+    ], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("✓ Added context");
   });
 
   test("requires path and text arguments", async () => {
-    const { stderr, exitCode } = await runQmd(["add-context"]);
+    const { stderr, exitCode } = await runQmd(["add-context"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(1);
     // Error message goes to stderr
     expect(stderr).toContain("Usage:");
@@ -621,7 +660,7 @@ describe("CLI Collection Commands", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collections");
     expect(stdout).toContain("fixtures");
-    expect(stdout).toContain("Path:");
+    expect(stdout).toContain("qmd://fixtures/");
     expect(stdout).toContain("Pattern:");
     expect(stdout).toContain("Files:");
   });
@@ -663,7 +702,7 @@ describe("CLI Collection Commands", () => {
   test("renames a collection", async () => {
     // First verify the collection exists
     const { stdout: listBefore } = await runQmd(["collection", "list"], { dbPath: localDbPath });
-    expect(listBefore).toMatch(/^fixtures$/m); // Collection name on its own line
+    expect(listBefore).toContain("qmd://fixtures/");
 
     // Rename it
     const { stdout, exitCode } = await runQmd(["collection", "rename", "fixtures", "my-fixtures"], { dbPath: localDbPath });
@@ -674,8 +713,8 @@ describe("CLI Collection Commands", () => {
 
     // Verify the new name exists and old name is gone
     const { stdout: listAfter } = await runQmd(["collection", "list"], { dbPath: localDbPath });
-    expect(listAfter).toMatch(/^my-fixtures$/m); // Collection name on its own line
-    expect(listAfter).not.toMatch(/^fixtures$/m); // Old name should not appear as collection name
+    expect(listAfter).toContain("qmd://my-fixtures/");
+    expect(listAfter).not.toContain("qmd://fixtures/"); // Old collection should not appear
   });
 
   test("handles renaming non-existent collection", async () => {
@@ -697,8 +736,8 @@ describe("CLI Collection Commands", () => {
 
     // Verify both collections exist
     const { stdout: listBoth } = await runQmd(["collection", "list"], { dbPath: localDbPath });
-    expect(listBoth).toMatch(/^fixtures$/m);
-    expect(listBoth).toMatch(/^second$/m);
+    expect(listBoth).toContain("qmd://fixtures/");
+    expect(listBoth).toContain("qmd://second/");
 
     // Try to rename fixtures to second (which already exists)
     const { stderr, exitCode } = await runQmd(["collection", "rename", "fixtures", "second"], { dbPath: localDbPath });
@@ -714,5 +753,211 @@ describe("CLI Collection Commands", () => {
     const { stderr: stderr2, exitCode: exitCode2 } = await runQmd(["collection", "rename", "fixtures"], { dbPath: localDbPath });
     expect(exitCode2).toBe(1);
     expect(stderr2).toContain("Usage:");
+  });
+});
+
+// =============================================================================
+// Output Format Tests - qmd:// URIs, context, and docid
+// =============================================================================
+
+describe("search output formats", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  const collName = "fixtures";
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("output-format");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    // Add collection
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", collName],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    if (exitCode !== 0) console.error("collection add failed:", stderr);
+    expect(exitCode).toBe(0);
+
+    // Add context
+    await runQmd(["context", "add", `qmd://${collName}/`, "Test fixtures for QMD"], { dbPath: localDbPath, configDir: localConfigDir });
+  });
+
+  test("search --json includes qmd:// path, docid, and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+
+    const result = results[0];
+    expect(result.file).toMatch(new RegExp(`^qmd://${collName}/`));
+    expect(result.docid).toMatch(/^#[a-f0-9]{6}$/);
+    expect(result.context).toBe("Test fixtures for QMD");
+    // Ensure no full filesystem paths
+    expect(result.file).not.toMatch(/^\/Users\//);
+    expect(result.file).not.toMatch(/^\/home\//);
+  });
+
+  test("search --files includes qmd:// path, docid, and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--files", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    // Format: #docid,score,qmd://collection/path,"context"
+    expect(stdout).toMatch(new RegExp(`^#[a-f0-9]{6},[\\d.]+,qmd://${collName}/`, "m"));
+    expect(stdout).toContain("Test fixtures for QMD");
+    // Ensure no full filesystem paths
+    expect(stdout).not.toMatch(/\/Users\//);
+    expect(stdout).not.toMatch(/\/home\//);
+  });
+
+  test("search --csv includes qmd:// path, docid, and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--csv", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    // Header should include context
+    expect(stdout).toMatch(/^docid,score,file,title,context,line,snippet$/m);
+    // Data rows should have qmd:// paths and context
+    expect(stdout).toMatch(new RegExp(`#[a-f0-9]{6},[\\d.]+,qmd://${collName}/`));
+    expect(stdout).toContain("Test fixtures for QMD");
+    // Ensure no full filesystem paths
+    expect(stdout).not.toMatch(/\/Users\//);
+    expect(stdout).not.toMatch(/\/home\//);
+  });
+
+  test("search --md includes docid and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
+    expect(stdout).toContain("**context:** Test fixtures for QMD");
+  });
+
+  test("search --xml includes qmd:// path, docid, and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--xml", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    expect(stdout).toMatch(new RegExp(`<file docid="#[a-f0-9]{6}" name="qmd://${collName}/`));
+    expect(stdout).toContain('context="Test fixtures for QMD"');
+    // Ensure no full filesystem paths
+    expect(stdout).not.toMatch(/\/Users\//);
+    expect(stdout).not.toMatch(/\/home\//);
+  });
+
+  test("search default CLI format includes qmd:// path, docid, and context", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    // First line should have qmd:// path and docid
+    expect(stdout).toMatch(new RegExp(`^qmd://${collName}/.*#[a-f0-9]{6}`, "m"));
+    expect(stdout).toContain("Context: Test fixtures for QMD");
+    // Ensure no full filesystem paths
+    expect(stdout).not.toMatch(/\/Users\//);
+    expect(stdout).not.toMatch(/\/home\//);
+  });
+});
+
+// =============================================================================
+// Get Command Path Normalization Tests
+// =============================================================================
+
+describe("get command path normalization", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  const collName = "fixtures";
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("get-paths");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", collName],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    if (exitCode !== 0) console.error("collection add failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("get with qmd://collection/path format", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Test Document 1");
+  });
+
+  test("get with collection/path format (no scheme)", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Test Document 1");
+  });
+
+  test("get with //collection/path format", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `//${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Test Document 1");
+  });
+
+  test("get with qmd:////collection/path format (extra slashes)", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `qmd:////${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Test Document 1");
+  });
+
+  test("get with path:line format", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:3`, "-l", "2"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // Should start from line 3, not line 1
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+  });
+
+  test("get with qmd://path:line format", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md:3`, "-l", "2"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // Should start from line 3, not line 1
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+  });
+});
+
+// =============================================================================
+// Status and Collection List - No Full Paths
+// =============================================================================
+
+describe("status and collection list hide filesystem paths", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  const collName = "fixtures";
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("status-paths");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", collName],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    if (exitCode !== 0) console.error("collection add failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("status does not show full filesystem paths", async () => {
+    const { stdout, exitCode } = await runQmd(["status"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    // Should show qmd:// URIs
+    expect(stdout).toContain(`qmd://${collName}/`);
+    // Should NOT show full filesystem paths (except for the index location which is ok)
+    const lines = stdout.split('\n').filter(l => !l.includes('Index:'));
+    const pathLines = lines.filter(l => l.includes('/Users/') || l.includes('/home/') || l.includes('/tmp/'));
+    expect(pathLines.length).toBe(0);
+  });
+
+  test("collection list does not show full filesystem paths", async () => {
+    const { stdout, exitCode } = await runQmd(["collection", "list"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+
+    // Should show qmd:// URIs
+    expect(stdout).toContain(`qmd://${collName}/`);
+    // Should NOT show Path: lines with filesystem paths
+    expect(stdout).not.toMatch(/Path:\s+\//);
   });
 });

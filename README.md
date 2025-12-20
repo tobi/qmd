@@ -10,15 +10,15 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking�
 # Install globally
 bun install -g https://github.com/tobi/qmd
 
-# Index your notes, docs, and meeting transcripts
-cd ~/notes && qmd add .
-cd ~/Documents/meetings && qmd add .
-cd ~/work/docs && qmd add .
+# Create collections for your notes, docs, and meeting transcripts
+qmd collection add ~/notes --name notes
+qmd collection add ~/Documents/meetings --name meetings
+qmd collection add ~/work/docs --name docs
 
 # Add context to help with search results
-qmd add-context ~/notes "Personal notes and ideas"
-qmd add-context ~/Documents/meetings "Meeting transcripts and notes"
-qmd add-context ~/work/docs "Work documentation"
+qmd context add qmd://notes "Personal notes and ideas"
+qmd context add qmd://meetings "Meeting transcripts and notes"
+qmd context add qmd://docs "Work documentation"
 
 # Generate embeddings for semantic search
 qmd embed
@@ -30,6 +30,9 @@ qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
+
+# Get a document by docid (shown in search results)
+qmd get "#abc123"
 
 # Get multiple documents by glob pattern
 qmd multi-get "journals/2025-05*.md"
@@ -64,8 +67,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
 - `qmd_vsearch` - Semantic vector search (supports collection filter)
 - `qmd_query` - Hybrid search with reranking (supports collection filter)
-- `qmd_get` - Retrieve document content (with fuzzy matching suggestions)
-- `qmd_multi_get` - Retrieve multiple documents by glob pattern or list
+- `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
+- `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -228,17 +231,27 @@ bun install
 
 ## Usage
 
-### Index Markdown Files
+### Collection Management
 
 ```sh
-# Index all .md files in current directory
-qmd add .
+# Create a collection from current directory
+qmd collection add . --name myproject
 
-# Index with custom glob pattern
-qmd add "docs/**/*.md"
+# Create a collection with explicit path and custom glob mask
+qmd collection add ~/Documents/notes --name notes --mask "**/*.md"
 
-# Drop and re-add a collection
-qmd add --drop .
+# List all collections
+qmd collection list
+
+# Remove a collection
+qmd collection remove myproject
+
+# Rename a collection
+qmd collection rename myproject my-project
+
+# List files in a collection
+qmd ls notes
+qmd ls notes/subfolder
 ```
 
 ### Generate Vector Embeddings
@@ -251,12 +264,27 @@ qmd embed
 qmd embed -f
 ```
 
-### Add Context
+### Context Management
+
+Context adds descriptive metadata to collections and paths, helping search understand your content.
 
 ```sh
-# Add context description for files in a path
-qmd add-context . "Project documentation and guides"
-qmd add-context ./meetings "Internal meeting transcripts"
+# Add context to a collection (using qmd:// virtual paths)
+qmd context add qmd://notes "Personal notes and ideas"
+qmd context add qmd://docs/api "API documentation"
+
+# Add context from within a collection directory
+cd ~/notes && qmd context add "Personal notes and ideas"
+cd ~/notes/work && qmd context add "Work-related notes"
+
+# Add global context (applies to all collections)
+qmd context add / "Knowledge base for my projects"
+
+# List all contexts
+qmd context list
+
+# Remove context
+qmd context rm qmd://notes/old
 ```
 
 ### Search Commands
@@ -291,14 +319,20 @@ qmd query "user authentication"
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
+--line-numbers     # Add line numbers to output
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
---files            # Output: score,filepath,context (search) or filepath,context (multi-get)
---json             # JSON output
+--files            # Output: docid,score,filepath,context
+--json             # JSON output with snippets
 --csv              # CSV output
 --md               # Markdown output
 --xml              # XML output
+
+# Get options
+qmd get <file>[:line]  # Get document, optionally starting at line
+-l <num>               # Maximum lines to return
+--from <num>           # Start from line number
 
 # Multi-get options
 -l <num>           # Maximum lines per file
@@ -310,7 +344,7 @@ qmd query "user authentication"
 Default output is colorized CLI format (respects `NO_COLOR` env):
 
 ```
-docs/guide.md:42
+docs/guide.md:42 #a1b2c3
 Title: Software Craftsmanship
 Context: Work documentation
 Score: 93%
@@ -320,7 +354,7 @@ quality software with attention to detail.
 See also: engineering principles
 
 
-notes/meeting.md:15
+notes/meeting.md:15 #d4e5f6
 Title: Q4 Planning
 Context: Personal notes and ideas
 Score: 67%
@@ -329,9 +363,10 @@ Discussion about code quality and craftsmanship
 in the development process.
 ```
 
-- **Path**: Collection-relative, includes parent folder (e.g., `docs/guide.md`)
+- **Path**: Collection-relative path (e.g., `docs/guide.md`)
+- **Docid**: Short hash identifier (e.g., `#a1b2c3`) - use with `qmd get #a1b2c3`
 - **Title**: Extracted from document (first heading or filename)
-- **Context**: Folder context if configured via `add-context`
+- **Context**: Path context if configured via `qmd context add`
 - **Score**: Color-coded (green >70%, yellow >40%, dim otherwise)
 - **Snippet**: Context around match with query terms highlighted
 
@@ -351,23 +386,32 @@ qmd query --json "quarterly reports"
 qmd --index work search "quarterly reports"
 ```
 
-### Manage Collections
+### Index Maintenance
 
 ```sh
 # Show index status and collections with contexts
 qmd status
 
 # Re-index all collections
-qmd update-all
+qmd update
 
-# Get document body by filepath (with fuzzy matching)
-qmd get ~/notes/meeting.md
+# Re-index with git pull first (for remote repos)
+qmd update --pull
+
+# Get document by filepath (with fuzzy matching suggestions)
+qmd get notes/meeting.md
+
+# Get document by docid (from search results)
+qmd get "#abc123"
+
+# Get document starting at line 50, max 100 lines
+qmd get notes/meeting.md:50 -l 100
 
 # Get multiple documents by glob pattern
 qmd multi-get "journals/2025-05*.md"
 
-# Get multiple documents by comma-separated list
-qmd multi-get "doc1.md, doc2.md, doc3.md"
+# Get multiple documents by comma-separated list (supports docids)
+qmd multi-get "doc1.md, doc2.md, #abc123"
 
 # Limit multi-get to files under 20KB
 qmd multi-get "docs/*.md" --max-bytes 20480
@@ -386,9 +430,9 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 ### Schema
 
 ```sql
-collections     -- Indexed directories and glob patterns
-path_contexts   -- Context descriptions by path prefix
-documents       -- Markdown content with metadata
+collections     -- Indexed directories with name and glob patterns
+path_contexts   -- Context descriptions by virtual path (qmd://...)
+documents       -- Markdown content with metadata and docid (6-char hash)
 documents_fts   -- FTS5 full-text index
 content_vectors -- Embedding chunks (hash, seq, pos)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
@@ -407,9 +451,16 @@ ollama_cache    -- Cached API responses
 ### Indexing Flow
 
 ```
-Markdown Files ──► Parse Title ──► Hash Content ──► Store in SQLite
-                      │                                    │
-                      └──────────► FTS5 Index ◄────────────┘
+Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title ──► Hash Content
+    │                                                   │              │
+    │                                                   │              ▼
+    │                                                   │         Generate docid
+    │                                                   │         (6-char hash)
+    │                                                   │              │
+    └──────────────────────────────────────────────────►└──► Store in SQLite
+                                                                       │
+                                                                       ▼
+                                                                  FTS5 Index
 ```
 
 ### Embedding Flow
