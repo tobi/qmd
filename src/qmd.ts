@@ -2164,8 +2164,16 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     };
   }).sort((a, b) => b.score - a.score);
 
+  // Deduplicate by file (safety net - shouldn't happen but prevents duplicate output)
+  const seenFiles = new Set<string>();
+  const dedupedResults = finalResults.filter(r => {
+    if (seenFiles.has(r.file)) return false;
+    seenFiles.add(r.file);
+    return true;
+  });
+
   closeDb();
-  outputResults(finalResults, query, opts);
+  outputResults(dedupedResults, query, opts);
 }
 
 // Parse CLI arguments using util.parseArgs
