@@ -190,11 +190,16 @@ export type LlamaCppConfig = {
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
+  /** Inactivity timeout in ms before unloading models (default: 2 minutes, 0 to disable) */
+  inactivityTimeoutMs?: number;
 };
 
 /**
  * LLM implementation using node-llama-cpp
  */
+// Default inactivity timeout: 2 minutes
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
+
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -211,11 +216,88 @@ export class LlamaCpp implements LLM {
 
   private initPromise: Promise<void> | null = null;
 
+  // Inactivity timer for auto-unloading models
+  private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+  private inactivityTimeoutMs: number;
+
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
+    this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+  }
+
+  /**
+   * Reset the inactivity timer. Called after each model operation.
+   * When timer fires, models are unloaded to free memory.
+   */
+  private touchActivity(): void {
+    // Clear existing timer
+    if (this.inactivityTimer) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
+
+    // Only set timer if we have loaded models and timeout is enabled
+    if (this.inactivityTimeoutMs > 0 && this.hasLoadedModels()) {
+      this.inactivityTimer = setTimeout(() => {
+        this.unloadModels().catch(err => {
+          console.error("Error unloading models:", err);
+        });
+      }, this.inactivityTimeoutMs);
+      // Don't keep process alive just for this timer
+      this.inactivityTimer.unref();
+    }
+  }
+
+  /**
+   * Check if any models are currently loaded
+   */
+  private hasLoadedModels(): boolean {
+    return !!(this.embedModel || this.generateModel || this.rerankModel);
+  }
+
+  /**
+   * Unload all models but keep the instance alive for future use.
+   * Models will be reloaded lazily on next operation.
+   */
+  async unloadModels(): Promise<void> {
+    // Clear timer
+    if (this.inactivityTimer) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
+
+    // Dispose contexts first
+    if (this.embedContext) {
+      await this.embedContext.dispose();
+      this.embedContext = null;
+    }
+    if (this.generateContext) {
+      await this.generateContext.dispose();
+      this.generateContext = null;
+    }
+    if (this.rerankContext) {
+      await this.rerankContext.dispose();
+      this.rerankContext = null;
+    }
+
+    // Dispose models
+    if (this.embedModel) {
+      await this.embedModel.dispose();
+      this.embedModel = null;
+    }
+    if (this.generateModel) {
+      await this.generateModel.dispose();
+      this.generateModel = null;
+    }
+    if (this.rerankModel) {
+      await this.rerankModel.dispose();
+      this.rerankModel = null;
+    }
+
+    // Note: We keep llama instance alive - it's lightweight
   }
 
   /**
@@ -256,6 +338,7 @@ export class LlamaCpp implements LLM {
       this.embedModel = await llama.loadModel({ modelPath });
       this.embedContext = await this.embedModel.createEmbeddingContext();
     }
+    this.touchActivity();
     return this.embedContext;
   }
 
@@ -270,6 +353,7 @@ export class LlamaCpp implements LLM {
       // Create context with 4 sequences for parallel generation support
       this.generateContext = await this.generateModel.createContext({ sequences: 4 });
     }
+    this.touchActivity();
     return this.generateContext;
   }
 
@@ -283,6 +367,7 @@ export class LlamaCpp implements LLM {
       this.rerankModel = await llama.loadModel({ modelPath });
       this.rerankContext = await this.rerankModel.createRankingContext();
     }
+    this.touchActivity();
     return this.rerankContext;
   }
 
@@ -599,6 +684,12 @@ Generate the structured expansion:`;
   }
 
   async dispose(): Promise<void> {
+    // Clear inactivity timer
+    if (this.inactivityTimer) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
+
     // Dispose contexts
     if (this.embedContext) {
       await this.embedContext.dispose();
