@@ -3,7 +3,7 @@
  *
  * Run with: bun test store.test.ts
  *
- * Ollama is mocked - tests will fail if any real Ollama calls are made.
+ * LLM operations use LlamaCpp with local GGUF models (node-llama-cpp).
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
@@ -24,6 +24,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   chunkDocument,
+  chunkDocumentByTokens,
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
@@ -31,7 +32,6 @@ import {
   normalizeVirtualPath,
   isVirtualPath,
   parseVirtualPath,
-  OLLAMA_URL,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -40,91 +40,11 @@ import {
 import type { CollectionConfig } from "./collections.js";
 
 // =============================================================================
-// Ollama Mocking
+// LlamaCpp Setup
 // =============================================================================
 
-// Track original fetch
-const originalFetch = globalThis.fetch;
-
-// Mock responses for different Ollama endpoints
-const mockOllamaResponses: Record<string, (body: unknown) => Response> = {
-  "/api/embed": (body: unknown) => {
-    // Return mock embeddings (768 dimensions)
-    const embedding = Array(768).fill(0).map(() => Math.random());
-    return new Response(JSON.stringify({ embeddings: [embedding] }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  },
-  "/api/generate": (body: unknown) => {
-    const reqBody = body as { prompt?: string };
-    // Check if this is a rerank request or query expansion
-    if (reqBody.prompt?.includes("yes") || reqBody.prompt?.includes("no") || reqBody.prompt?.includes("Judge")) {
-      // Rerank response
-      return new Response(JSON.stringify({
-        response: "yes",
-        logprobs: [{ token: "yes", logprob: -0.1 }],
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    } else {
-      // Query expansion response
-      return new Response(JSON.stringify({
-        response: "expanded query variation 1\nexpanded query variation 2",
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-  },
-  "/api/show": () => {
-    // Model exists
-    return new Response(JSON.stringify({ modelfile: "exists" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  },
-};
-
-// Install mock fetch that intercepts Ollama calls
-function installOllamaMock(): void {
-  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-
-    // Check if this is an Ollama URL
-    if (url.startsWith(OLLAMA_URL)) {
-      const path = url.replace(OLLAMA_URL, "");
-      const mockHandler = mockOllamaResponses[path];
-
-      if (mockHandler) {
-        const body = init?.body ? JSON.parse(init.body as string) : {};
-        return mockHandler(body);
-      }
-
-      // Unknown Ollama endpoint - fail the test
-      throw new Error(`TEST ERROR: Unmocked Ollama endpoint called: ${path}`);
-    }
-
-    // Non-Ollama URLs fail (we shouldn't be making other network calls in tests)
-    throw new Error(`TEST ERROR: Unexpected network call to: ${url}`);
-  };
-}
-
-// Restore original fetch
-function restoreOllamaMock(): void {
-  globalThis.fetch = originalFetch;
-}
-
-// Install mock before all tests
-beforeAll(() => {
-  installOllamaMock();
-});
-
-// Restore after all tests
-afterAll(() => {
-  restoreOllamaMock();
-});
+// Note: LlamaCpp uses node-llama-cpp for local GGUF model inference.
+// No HTTP mocking needed - tests use real LlamaCpp calls for integration tests.
 
 // =============================================================================
 // Test Utilities
@@ -483,7 +403,7 @@ describe("Store Creation", () => {
     expect(tableNames).toContain("documents");
     expect(tableNames).toContain("documents_fts");
     expect(tableNames).toContain("content_vectors");
-    expect(tableNames).toContain("ollama_cache");
+    expect(tableNames).toContain("llm_cache");
     // Note: path_contexts table removed in favor of YAML-based context storage
 
     await cleanupTestDb(store);
@@ -580,7 +500,7 @@ describe("Embedding Formatting", () => {
 describe("Document Chunking", () => {
   test("chunkDocument returns single chunk for small documents", () => {
     const content = "Small document content";
-    const chunks = chunkDocument(content, 1000);
+    const chunks = chunkDocument(content, 1000, 0);
     expect(chunks).toHaveLength(1);
     expect(chunks[0].text).toBe(content);
     expect(chunks[0].pos).toBe(0);
@@ -588,7 +508,7 @@ describe("Document Chunking", () => {
 
   test("chunkDocument splits large documents", () => {
     const content = "A".repeat(10000);
-    const chunks = chunkDocument(content, 1000);
+    const chunks = chunkDocument(content, 1000, 0);
     expect(chunks.length).toBeGreaterThan(1);
 
     // All chunks should have correct positions
@@ -600,9 +520,26 @@ describe("Document Chunking", () => {
     }
   });
 
+  test("chunkDocument with overlap creates overlapping chunks", () => {
+    const content = "A".repeat(3000);
+    const chunks = chunkDocument(content, 1000, 150);  // 15% overlap
+    expect(chunks.length).toBeGreaterThan(1);
+
+    // With overlap, positions should be closer together than without
+    // Each new chunk starts 150 chars before where the previous one ended
+    for (let i = 1; i < chunks.length; i++) {
+      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
+      const currentStart = chunks[i].pos;
+      // Current chunk should start before the previous chunk ended (overlap)
+      expect(currentStart).toBeLessThan(prevEnd);
+      // But should still make forward progress
+      expect(currentStart).toBeGreaterThan(chunks[i - 1].pos);
+    }
+  });
+
   test("chunkDocument prefers paragraph breaks", () => {
     const content = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.".repeat(50);
-    const chunks = chunkDocument(content, 500);
+    const chunks = chunkDocument(content, 500, 0);
 
     // Chunks should end at paragraph breaks when possible
     for (const chunk of chunks.slice(0, -1)) {
@@ -617,12 +554,81 @@ describe("Document Chunking", () => {
 
   test("chunkDocument handles UTF-8 characters correctly", () => {
     const content = "こんにちは世界".repeat(500); // Japanese text
-    const chunks = chunkDocument(content, 1000);
+    const chunks = chunkDocument(content, 1000, 0);
 
     // Should not split in the middle of a multi-byte character
     for (const chunk of chunks) {
       expect(() => new TextEncoder().encode(chunk.text)).not.toThrow();
     }
+  });
+
+  test("chunkDocument with default params uses 800-token chunks", () => {
+    // Default is CHUNK_SIZE_CHARS (3200 chars) with CHUNK_OVERLAP_CHARS (480 chars)
+    const content = "Word ".repeat(2000);  // ~10000 chars
+    const chunks = chunkDocument(content);
+    expect(chunks.length).toBeGreaterThan(1);
+    // Each chunk should be around 3200 chars (except last)
+    expect(chunks[0].text.length).toBeGreaterThan(2500);
+    expect(chunks[0].text.length).toBeLessThanOrEqual(3200);
+  });
+});
+
+describe("Token-based Chunking", () => {
+  test("chunkDocumentByTokens returns single chunk for small documents", async () => {
+    const content = "This is a small document.";
+    const chunks = await chunkDocumentByTokens(content, 800, 120);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].text).toBe(content);
+    expect(chunks[0].pos).toBe(0);
+    expect(chunks[0].tokens).toBeGreaterThan(0);
+    expect(chunks[0].tokens).toBeLessThan(800);
+  });
+
+  test("chunkDocumentByTokens splits large documents", async () => {
+    // Create a document that's definitely more than 800 tokens
+    const content = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+    const chunks = await chunkDocumentByTokens(content, 800, 120);
+
+    expect(chunks.length).toBeGreaterThan(1);
+
+    // Each chunk should have ~800 tokens or less
+    for (const chunk of chunks) {
+      expect(chunk.tokens).toBeLessThanOrEqual(850);  // Allow slight overage
+      expect(chunk.tokens).toBeGreaterThan(0);
+    }
+
+    // Chunks should have correct positions
+    for (let i = 0; i < chunks.length; i++) {
+      expect(chunks[i].pos).toBeGreaterThanOrEqual(0);
+      if (i > 0) {
+        expect(chunks[i].pos).toBeGreaterThan(chunks[i - 1].pos);
+      }
+    }
+  });
+
+  test("chunkDocumentByTokens creates overlapping chunks", async () => {
+    const content = "Word ".repeat(500);  // ~500 tokens
+    const chunks = await chunkDocumentByTokens(content, 200, 30);  // 15% overlap
+
+    expect(chunks.length).toBeGreaterThan(1);
+
+    // With overlap, consecutive chunks should have overlapping positions
+    for (let i = 1; i < chunks.length; i++) {
+      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
+      const currentStart = chunks[i].pos;
+      // Current chunk should start before the previous chunk ended (overlap)
+      expect(currentStart).toBeLessThan(prevEnd);
+    }
+  });
+
+  test("chunkDocumentByTokens returns actual token counts", async () => {
+    const content = "Hello world, this is a test.";
+    const chunks = await chunkDocumentByTokens(content);
+
+    expect(chunks).toHaveLength(1);
+    // The token count should be reasonable (not 0, not equal to char count)
+    expect(chunks[0].tokens).toBeGreaterThan(0);
+    expect(chunks[0].tokens).toBeLessThan(content.length);  // Tokens < chars for English
   });
 });
 
@@ -1842,10 +1848,10 @@ describe("Legacy Compatibility", () => {
 });
 
 // =============================================================================
-// Ollama Integration Tests (using mocked Ollama)
+// LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
-describe("Ollama Integration (Mocked)", () => {
+describe("LlamaCpp Integration", () => {
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -1895,7 +1901,7 @@ describe("Ollama Integration (Mocked)", () => {
     const queries = await store.expandQuery("test query");
     expect(queries).toContain("test query");
     expect(queries[0]).toBe("test query");
-    // Mock returns 2 variations
+    // LlamaCpp returns original + variations
     expect(queries.length).toBeGreaterThanOrEqual(1);
 
     await cleanupTestDb(store);
@@ -1924,7 +1930,7 @@ describe("Ollama Integration (Mocked)", () => {
 
     const results = await store.rerank("topic", docs);
     expect(results).toHaveLength(2);
-    // Mock returns "yes" with high confidence
+    // LlamaCpp reranker returns relevance scores
     expect(results[0].score).toBeGreaterThan(0);
 
     await cleanupTestDb(store);

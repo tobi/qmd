@@ -1,9 +1,33 @@
 /**
- * llm.ts - LLM abstraction layer for QMD
+ * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
  *
- * Provides a clean interface for LLM operations with an Ollama implementation.
- * All raw fetch calls to LLM APIs should go through this module.
+ * Provides embeddings, text generation, and reranking using local GGUF models.
  */
+
+import { getLlama, resolveModelFile, type Llama, type LlamaModel, type LlamaEmbeddingContext, type LlamaContext, type LlamaChatSession } from "node-llama-cpp";
+import { homedir } from "os";
+import { join } from "path";
+import { existsSync, mkdirSync } from "fs";
+
+// =============================================================================
+// Embedding Formatting Functions
+// =============================================================================
+
+/**
+ * Format a query for embedding.
+ * Uses nomic-style task prefix format for embeddinggemma.
+ */
+export function formatQueryForEmbedding(query: string): string {
+  return `task: search result | query: ${query}`;
+}
+
+/**
+ * Format a document for embedding.
+ * Uses nomic-style format with title and text fields.
+ */
+export function formatDocForEmbedding(text: string, title?: string): string {
+  return `title: ${title || "none"} | text: ${text}`;
+}
 
 // =============================================================================
 // Types
@@ -40,11 +64,8 @@ export type GenerateResult = {
  */
 export type RerankDocumentResult = {
   file: string;
-  relevant: boolean;
-  confidence: number;
   score: number;
-  rawToken: string;
-  logprob: number;
+  index: number;
 };
 
 /**
@@ -61,15 +82,14 @@ export type RerankResult = {
 export type ModelInfo = {
   name: string;
   exists: boolean;
-  size?: number;
-  modifiedAt?: string;
+  path?: string;
 };
 
 /**
  * Options for embedding
  */
 export type EmbedOptions = {
-  model: string;
+  model?: string;
   isQuery?: boolean;
   title?: string;
 };
@@ -78,20 +98,25 @@ export type EmbedOptions = {
  * Options for text generation
  */
 export type GenerateOptions = {
-  model: string;
+  model?: string;
   maxTokens?: number;
   temperature?: number;
-  logprobs?: boolean;
-  raw?: boolean;
-  stop?: string[];
 };
 
 /**
  * Options for reranking
  */
 export type RerankOptions = {
-  model: string;
-  batchSize?: number;
+  model?: string;
+};
+
+/**
+ * Structured query expansion result
+ */
+export type ExpandedQuery = {
+  lexicalQuery: string | null;  // Alternative query for BM25/keyword search
+  vectorQuery: string;          // Alternative query for semantic search
+  hyde: string;                 // Hypothetical document that would answer the query
 };
 
 /**
@@ -104,6 +129,19 @@ export type RerankDocument = {
 };
 
 // =============================================================================
+// Model Configuration
+// =============================================================================
+
+// HuggingFace model URIs for node-llama-cpp
+// Format: hf:<user>/<repo>/<file>
+const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+
+// Local model cache directory
+const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
+
+// =============================================================================
 // LLM Interface
 // =============================================================================
 
@@ -114,266 +152,297 @@ export interface LLM {
   /**
    * Get embeddings for text
    */
-  embed(text: string, options: EmbedOptions): Promise<EmbeddingResult | null>;
+  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
    * Generate text completion
    */
-  generate(prompt: string, options: GenerateOptions): Promise<GenerateResult | null>;
+  generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
 
   /**
-   * Check if a model exists
+   * Check if a model exists/is available
    */
   modelExists(model: string): Promise<ModelInfo>;
 
   /**
-   * Pull a model (download if not available)
-   */
-  pullModel(model: string, onProgress?: (progress: number) => void): Promise<boolean>;
-
-  // ==========================================================================
-  // High-level abstractions
-  // ==========================================================================
-
-  /**
    * Expand a search query into multiple variations
    */
-  expandQuery(query: string, model: string, numVariations?: number): Promise<string[]>;
+  expandQuery(query: string, numVariations?: number): Promise<string[]>;
 
   /**
    * Rerank documents by relevance to a query
-   * Returns list of documents with relevance scores and boolean judgments
+   * Returns list of documents with relevance scores (higher = more relevant)
    */
-  rerank(query: string, documents: RerankDocument[], options: RerankOptions): Promise<RerankResult>;
+  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
 
   /**
-   * Quick relevance check - returns just boolean judgments with logprobs
-   * More efficient than full rerank when you just need yes/no
+   * Dispose of resources
    */
-  rerankerLogprobsCheck(query: string, documents: RerankDocument[], options: RerankOptions): Promise<RerankDocumentResult[]>;
+  dispose(): Promise<void>;
 }
 
 // =============================================================================
-// Ollama Implementation
+// node-llama-cpp Implementation
 // =============================================================================
 
-export type OllamaConfig = {
-  baseUrl?: string;
-  defaultEmbedModel?: string;
-  defaultGenerateModel?: string;
-  defaultRerankModel?: string;
+export type LlamaCppConfig = {
+  embedModel?: string;
+  generateModel?: string;
+  rerankModel?: string;
+  modelCacheDir?: string;
 };
 
-const DEFAULT_OLLAMA_URL = "http://localhost:11434";
-const DEFAULT_EMBED_MODEL = "embeddinggemma";
-const DEFAULT_GENERATE_MODEL = "qwen3:0.6b";
-const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-
 /**
- * Format text for embedding query
+ * LLM implementation using node-llama-cpp
  */
-export function formatQueryForEmbedding(query: string): string {
-  return `task: search result | query: ${query}`;
-}
+export class LlamaCpp implements LLM {
+  private llama: Llama | null = null;
+  private embedModel: LlamaModel | null = null;
+  private embedContext: LlamaEmbeddingContext | null = null;
+  private generateModel: LlamaModel | null = null;
+  private generateContext: LlamaContext | null = null;
+  private rerankModel: LlamaModel | null = null;
+  private rerankContext: Awaited<ReturnType<LlamaModel["createRankingContext"]>> | null = null;
 
-/**
- * Format text for embedding document
- */
-export function formatDocForEmbedding(text: string, title?: string): string {
-  return `title: ${title || "none"} | text: ${text}`;
-}
+  private embedModelUri: string;
+  private generateModelUri: string;
+  private rerankModelUri: string;
+  private modelCacheDir: string;
 
-/**
- * Ollama LLM implementation
- */
-export class Ollama implements LLM {
-  private baseUrl: string;
-  private defaultEmbedModel: string;
-  private defaultGenerateModel: string;
-  private defaultRerankModel: string;
+  private initPromise: Promise<void> | null = null;
 
-  constructor(config: OllamaConfig = {}) {
-    this.baseUrl = config.baseUrl || process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL;
-    this.defaultEmbedModel = config.defaultEmbedModel || DEFAULT_EMBED_MODEL;
-    this.defaultGenerateModel = config.defaultGenerateModel || DEFAULT_GENERATE_MODEL;
-    this.defaultRerankModel = config.defaultRerankModel || DEFAULT_RERANK_MODEL;
+  constructor(config: LlamaCppConfig = {}) {
+    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
+    this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
+    this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
+    this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
   }
 
   /**
-   * Get the base URL for this Ollama instance
+   * Ensure model cache directory exists
    */
-  getBaseUrl(): string {
-    return this.baseUrl;
+  private ensureModelCacheDir(): void {
+    if (!existsSync(this.modelCacheDir)) {
+      mkdirSync(this.modelCacheDir, { recursive: true });
+    }
+  }
+
+  /**
+   * Initialize the llama instance (lazy)
+   */
+  private async ensureLlama(): Promise<Llama> {
+    if (!this.llama) {
+      this.llama = await getLlama({ logLevel: "error" });
+    }
+    return this.llama;
+  }
+
+  /**
+   * Resolve a model URI to a local path, downloading if needed
+   */
+  private async resolveModel(modelUri: string): Promise<string> {
+    this.ensureModelCacheDir();
+    // resolveModelFile handles HF URIs and downloads to the cache dir
+    return await resolveModelFile(modelUri, this.modelCacheDir);
+  }
+
+  /**
+   * Load embedding model and context (lazy)
+   */
+  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
+    if (!this.embedContext) {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.embedModelUri);
+      this.embedModel = await llama.loadModel({ modelPath });
+      this.embedContext = await this.embedModel.createEmbeddingContext();
+    }
+    return this.embedContext;
+  }
+
+  /**
+   * Load generation model and context (lazy)
+   */
+  private async ensureGenerateContext(): Promise<LlamaContext> {
+    if (!this.generateContext) {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.generateModelUri);
+      this.generateModel = await llama.loadModel({ modelPath });
+      // Create context with 4 sequences for parallel generation support
+      this.generateContext = await this.generateModel.createContext({ sequences: 4 });
+    }
+    return this.generateContext;
+  }
+
+  /**
+   * Load rerank model and context (lazy)
+   */
+  private async ensureRerankContext(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> {
+    if (!this.rerankContext) {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.rerankModelUri);
+      this.rerankModel = await llama.loadModel({ modelPath });
+      this.rerankContext = await this.rerankModel.createRankingContext();
+    }
+    return this.rerankContext;
+  }
+
+  // ==========================================================================
+  // Tokenization
+  // ==========================================================================
+
+  /**
+   * Tokenize text using the embedding model's tokenizer
+   * Returns array of token IDs
+   */
+  async tokenize(text: string): Promise<number[]> {
+    await this.ensureEmbedContext();  // Ensure model is loaded
+    if (!this.embedModel) {
+      throw new Error("Embed model not loaded");
+    }
+    return this.embedModel.tokenize(text);
+  }
+
+  /**
+   * Count tokens in text using the embedding model's tokenizer
+   */
+  async countTokens(text: string): Promise<number> {
+    const tokens = await this.tokenize(text);
+    return tokens.length;
+  }
+
+  /**
+   * Detokenize token IDs back to text
+   */
+  async detokenize(tokens: number[]): Promise<string> {
+    await this.ensureEmbedContext();
+    if (!this.embedModel) {
+      throw new Error("Embed model not loaded");
+    }
+    return this.embedModel.detokenize(tokens);
   }
 
   // ==========================================================================
   // Core API methods
   // ==========================================================================
 
-  async embed(text: string, options: EmbedOptions): Promise<EmbeddingResult | null> {
-    const model = options.model || this.defaultEmbedModel;
-    const formatted = options.isQuery
-      ? formatQueryForEmbedding(text)
-      : formatDocForEmbedding(text, options.title);
-
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     try {
-      const response = await fetch(`${this.baseUrl}/api/embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, input: formatted }),
-      });
-
-      if (!response.ok) {
-        return null;
-      }
-
-      const data = await response.json() as { embeddings?: number[][] };
-      if (!data.embeddings?.[0]) {
-        return null;
-      }
+      const context = await this.ensureEmbedContext();
+      const embedding = await context.getEmbeddingFor(text);
 
       return {
-        embedding: data.embeddings[0],
-        model,
+        embedding: Array.from(embedding.vector),
+        model: this.embedModelUri,
       };
-    } catch {
+    } catch (error) {
+      console.error("Embedding error:", error);
       return null;
     }
   }
 
-  async generate(prompt: string, options: GenerateOptions): Promise<GenerateResult | null> {
-    const model = options.model || this.defaultGenerateModel;
+  /**
+   * Batch embed multiple texts efficiently
+   * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
+   */
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
 
-    const requestBody: Record<string, unknown> = {
-      model,
-      prompt,
-      stream: false,
-      options: {
-        num_predict: options.maxTokens ?? 150,
-        temperature: options.temperature ?? 0,
-      },
+    try {
+      const context = await this.ensureEmbedContext();
+
+      // node-llama-cpp handles batching internally when we make parallel requests
+      const embeddings = await Promise.all(
+        texts.map(async (text) => {
+          try {
+            const embedding = await context.getEmbeddingFor(text);
+            return {
+              embedding: Array.from(embedding.vector),
+              model: this.embedModelUri,
+            };
+          } catch (err) {
+            console.error("Embedding error for text:", err);
+            return null;
+          }
+        })
+      );
+
+      return embeddings;
+    } catch (error) {
+      console.error("Batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    try {
+      const context = await this.ensureGenerateContext();
+      const { LlamaChatSession } = await import("node-llama-cpp");
+      const session = new LlamaChatSession({
+        contextSequence: context.getSequence(),
+      });
+
+      const maxTokens = options.maxTokens ?? 150;
+      const temperature = options.temperature ?? 0;
+
+      let result = "";
+      try {
+        await session.prompt(prompt, {
+          maxTokens,
+          temperature,
+          onTextChunk: (text) => {
+            result += text;
+          },
+        });
+      } finally {
+        // Dispose session to release the sequence
+        await session.dispose();
+      }
+
+      return {
+        text: result,
+        model: this.generateModelUri,
+        done: true,
+      };
+    } catch (error) {
+      console.error("Generation error:", error);
+      return null;
+    }
+  }
+
+  async modelExists(modelUri: string): Promise<ModelInfo> {
+    // For HuggingFace URIs, we assume they exist
+    // For local paths, check if file exists
+    if (modelUri.startsWith("hf:")) {
+      return { name: modelUri, exists: true };
+    }
+
+    const exists = existsSync(modelUri);
+    return {
+      name: modelUri,
+      exists,
+      path: exists ? modelUri : undefined,
     };
-
-    if (options.logprobs) {
-      requestBody.logprobs = true;
-    }
-
-    if (options.raw) {
-      requestBody.raw = true;
-    }
-
-    if (options.stop) {
-      (requestBody.options as Record<string, unknown>).stop = options.stop;
-    }
-
-    try {
-      const response = await fetch(`${this.baseUrl}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
-
-      if (!response.ok) {
-        return null;
-      }
-
-      const data = await response.json() as {
-        response?: string;
-        done?: boolean;
-        logprobs?: { tokens?: string[]; token_logprobs?: number[] };
-      };
-
-      // Parse logprobs if present
-      let logprobs: TokenLogProb[] | undefined;
-      if (data.logprobs?.tokens && data.logprobs?.token_logprobs) {
-        logprobs = data.logprobs.tokens.map((token, i) => ({
-          token,
-          logprob: data.logprobs!.token_logprobs![i],
-        }));
-      }
-
-      return {
-        text: data.response || "",
-        model,
-        logprobs,
-        done: data.done ?? true,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  async modelExists(model: string): Promise<ModelInfo> {
-    try {
-      const response = await fetch(`${this.baseUrl}/api/show`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: model }),
-      });
-
-      if (!response.ok) {
-        return { name: model, exists: false };
-      }
-
-      const data = await response.json() as {
-        size?: number;
-        modified_at?: string;
-      };
-
-      return {
-        name: model,
-        exists: true,
-        size: data.size,
-        modifiedAt: data.modified_at,
-      };
-    } catch {
-      return { name: model, exists: false };
-    }
-  }
-
-  async pullModel(model: string, onProgress?: (progress: number) => void): Promise<boolean> {
-    try {
-      const response = await fetch(`${this.baseUrl}/api/pull`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: model, stream: false }),
-      });
-
-      if (!response.ok) {
-        return false;
-      }
-
-      // For non-streaming, we just wait for completion
-      await response.json();
-      onProgress?.(100);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   // ==========================================================================
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, model?: string, numVariations: number = 2): Promise<string[]> {
-    const useModel = model || this.defaultGenerateModel;
-
+  async expandQuery(query: string, numVariations: number = 2): Promise<string[]> {
     const prompt = `You are a search query expander. Given a search query, generate ${numVariations} alternative queries that would help find relevant documents.
 
 Rules:
-- Use synonyms and related terminology (e.g., "craft" → "craftsmanship", "quality", "excellence")
-- Rephrase to capture different angles (e.g., "engineering culture" → "technical excellence", "developer practices")
-- Keep proper nouns and named concepts exactly as written (e.g., "Build a Business", "Stripe", "Shopify")
+- Use synonyms and related terminology
+- Rephrase to capture different angles
+- Keep proper nouns exactly as written
 - Each variation should be 3-8 words, natural search terms
-- Do NOT just append words like "search" or "find" or "documents"
+- Do NOT append words like "search" or "find"
 
 Query: "${query}"
 
 Output exactly ${numVariations} variations, one per line, no numbering or bullets:`;
 
     const result = await this.generate(prompt, {
-      model: useModel,
       maxTokens: 150,
       temperature: 0,
     });
@@ -392,148 +461,226 @@ Output exactly ${numVariations} variations, one per line, no numbering or bullet
     return [query, ...lines.slice(0, numVariations)];
   }
 
+  /**
+   * Expand query using structured output with JSON schema grammar.
+   * Returns different query types optimized for different retrieval methods.
+   *
+   * @param query - Original search query
+   * @param includeLexical - Whether to include lexical query (false for vector-only search)
+   */
+  async expandQueryStructured(query: string, includeLexical: boolean = true): Promise<ExpandedQuery> {
+    const llama = await this.ensureLlama();
+    const context = await this.ensureGenerateContext();
+
+    // Define JSON schema for structured output
+    const schema = {
+      type: "object" as const,
+      properties: {
+        lexicalQuery: {
+          type: "string" as const,
+          description: "Alternative keyword-based query using synonyms (3-6 words)"
+        },
+        vectorQuery: {
+          type: "string" as const,
+          description: "Semantically rephrased query capturing the intent (5-10 words)"
+        },
+        hyde: {
+          type: "string" as const,
+          description: "A hypothetical document snippet that would perfectly answer this query (50-100 words)"
+        }
+      },
+      required: ["vectorQuery", "hyde"] as const
+    };
+
+    const grammar = await llama.createGrammarForJsonSchema(schema);
+
+    const systemPrompt = includeLexical
+      ? `You expand search queries into structured alternatives for a hybrid search system.
+Given a query, generate:
+1. lexicalQuery: Alternative keywords using synonyms (for BM25 keyword search)
+2. vectorQuery: Semantically rephrased query (for vector/embedding search)
+3. hyde: A hypothetical document excerpt that would answer the query (50-100 words)
+
+Keep proper nouns exactly as written. Be concise.`
+      : `You expand search queries for semantic search.
+Given a query, generate:
+1. vectorQuery: Semantically rephrased query capturing the full intent
+2. hyde: A hypothetical document excerpt that would answer the query (50-100 words)
+
+Keep proper nouns exactly as written. Be concise. Set lexicalQuery to empty string.`;
+
+    const prompt = `Query: "${query}"
+
+Generate the structured expansion:`;
+
+    const { LlamaChatSession } = await import("node-llama-cpp");
+    const session = new LlamaChatSession({
+      contextSequence: context.getSequence(),
+      systemPrompt,
+    });
+
+    try {
+      const result = await session.prompt(prompt, {
+        grammar,
+        maxTokens: 300,
+        temperature: 0,
+      });
+
+      const parsed = grammar.parse(result) as {
+        lexicalQuery?: string;
+        vectorQuery: string;
+        hyde: string;
+      };
+
+      return {
+        lexicalQuery: includeLexical && parsed.lexicalQuery ? parsed.lexicalQuery : null,
+        vectorQuery: parsed.vectorQuery || query,
+        hyde: parsed.hyde || "",
+      };
+    } catch (error) {
+      console.error("Structured query expansion failed:", error);
+      // Fallback to original query
+      return {
+        lexicalQuery: includeLexical ? query : null,
+        vectorQuery: query,
+        hyde: "",
+      };
+    } finally {
+      await session.dispose();
+    }
+  }
+
   async rerank(
     query: string,
     documents: RerankDocument[],
-    options: RerankOptions
+    options: RerankOptions = {}
   ): Promise<RerankResult> {
-    const results = await this.rerankerLogprobsCheck(query, documents, options);
+    try {
+      const context = await this.ensureRerankContext();
 
-    return {
-      results: results.sort((a, b) => b.score - a.score),
-      model: options.model || this.defaultRerankModel,
-    };
-  }
+      // Build a map from document text to original indices (for lookup after sorting)
+      const textToDoc = new Map<string, { file: string; index: number }>();
+      documents.forEach((doc, index) => {
+        textToDoc.set(doc.text, { file: doc.file, index });
+      });
 
-  async rerankerLogprobsCheck(
-    query: string,
-    documents: RerankDocument[],
-    options: RerankOptions
-  ): Promise<RerankDocumentResult[]> {
-    const model = options.model || this.defaultRerankModel;
-    const batchSize = options.batchSize || 5;
+      // Extract just the text for ranking
+      const texts = documents.map((doc) => doc.text);
 
-    const results: RerankDocumentResult[] = [];
+      // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
+      const ranked = await context.rankAndSort(query, texts);
 
-    // Process in batches
-    for (let i = 0; i < documents.length; i += batchSize) {
-      const batch = documents.slice(i, i + batchSize);
-      const batchResults = await Promise.all(
-        batch.map((doc) => this.rerankSingle(query, doc, model))
-      );
-      results.push(...batchResults);
-    }
+      // Map back to our result format using the text-to-doc map
+      const results: RerankDocumentResult[] = ranked.map((item) => {
+        const docInfo = textToDoc.get(item.document)!;
+        return {
+          file: docInfo.file,
+          score: item.score,
+          index: docInfo.index,
+        };
+      });
 
-    return results;
-  }
-
-  /**
-   * Rerank a single document - internal helper
-   */
-  private async rerankSingle(
-    query: string,
-    doc: RerankDocument,
-    model: string
-  ): Promise<RerankDocumentResult> {
-    const systemPrompt = `Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".`;
-
-    const instruct = `Given a search query, determine if the following document is relevant to the query. Consider both direct matches and related concepts.`;
-
-    const docTitle = doc.title || doc.file.split("/").pop()?.replace(/\.md$/, "") || doc.file;
-    const docPreview = doc.text.length > 4000 ? doc.text.substring(0, 4000) + "..." : doc.text;
-
-    // Qwen3-reranker prompt format with empty think tags
-    const prompt = `<|im_start|>system
-${systemPrompt}<|im_end|>
-<|im_start|>user
-<Instruct>: ${instruct}
-<Query>: ${query}
-<Document Title>: ${docTitle}
-<Document>: ${docPreview}<|im_end|>
-<|im_start|>assistant
-<think>
-
-</think>
-
-`;
-
-    const result = await this.generate(prompt, {
-      model,
-      maxTokens: 1,
-      temperature: 0,
-      logprobs: true,
-      raw: true,
-    });
-
-    if (!result) {
       return {
-        file: doc.file,
-        relevant: false,
-        confidence: 0,
-        score: 0,
-        rawToken: "",
-        logprob: 0,
+        results,
+        model: this.rerankModelUri,
+      };
+    } catch (error) {
+      console.error("Rerank error:", error);
+      // Return documents in original order with zero scores on error
+      return {
+        results: documents.map((doc, index) => ({
+          file: doc.file,
+          score: 0,
+          index,
+        })),
+        model: this.rerankModelUri,
       };
     }
-
-    return this.parseRerankResponse(doc.file, result);
   }
 
-  /**
-   * Parse rerank response into structured result
-   */
-  private parseRerankResponse(file: string, result: GenerateResult): RerankDocumentResult {
-    const token = result.text.toLowerCase().trim();
-    const logprob = result.logprobs?.[0]?.logprob ?? 0;
-    const confidence = Math.exp(logprob);
-
-    let relevant: boolean;
-    let score: number;
-
-    if (token.startsWith("yes")) {
-      relevant = true;
-      // Score: 0.5 base + up to 0.5 from confidence
-      score = 0.5 + 0.5 * confidence;
-    } else if (token.startsWith("no")) {
-      relevant = false;
-      // Score: up to 0.5 based on uncertainty (1 - confidence)
-      score = 0.5 * (1 - confidence);
-    } else {
-      // Unknown token - neutral score
-      relevant = false;
-      score = 0.3;
+  async dispose(): Promise<void> {
+    // Dispose contexts
+    if (this.embedContext) {
+      await this.embedContext.dispose();
+      this.embedContext = null;
+    }
+    if (this.generateContext) {
+      await this.generateContext.dispose();
+      this.generateContext = null;
+    }
+    if (this.rerankContext) {
+      await this.rerankContext.dispose();
+      this.rerankContext = null;
     }
 
-    return {
-      file,
-      relevant,
-      confidence,
-      score,
-      rawToken: result.logprobs?.[0]?.token ?? token,
-      logprob,
-    };
+    // Dispose models
+    if (this.embedModel) {
+      await this.embedModel.dispose();
+      this.embedModel = null;
+    }
+    if (this.generateModel) {
+      await this.generateModel.dispose();
+      this.generateModel = null;
+    }
+    if (this.rerankModel) {
+      await this.rerankModel.dispose();
+      this.rerankModel = null;
+    }
+
+    // Dispose llama
+    if (this.llama) {
+      await this.llama.dispose();
+      this.llama = null;
+    }
   }
 }
 
 // =============================================================================
-// Singleton for default Ollama instance
+// Singleton for default LlamaCpp instance
 // =============================================================================
 
-let defaultOllama: Ollama | null = null;
+let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default Ollama instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed)
  */
-export function getDefaultOllama(): Ollama {
-  if (!defaultOllama) {
-    defaultOllama = new Ollama();
+export function getDefaultLlamaCpp(): LlamaCpp {
+  if (!defaultLlamaCpp) {
+    defaultLlamaCpp = new LlamaCpp();
   }
-  return defaultOllama;
+  return defaultLlamaCpp;
 }
 
 /**
- * Set a custom default Ollama instance (useful for testing)
+ * Set a custom default LlamaCpp instance (useful for testing)
  */
-export function setDefaultOllama(ollama: Ollama | null): void {
-  defaultOllama = ollama;
+export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+  defaultLlamaCpp = llm;
+}
+
+/**
+ * Dispose the default LlamaCpp instance if it exists.
+ * Call this before process exit to prevent NAPI crashes.
+ */
+export async function disposeDefaultLlamaCpp(): Promise<void> {
+  if (defaultLlamaCpp) {
+    await defaultLlamaCpp.dispose();
+    defaultLlamaCpp = null;
+  }
+}
+
+// =============================================================================
+// Legacy exports for backwards compatibility
+// =============================================================================
+
+// Keep Ollama as an alias for now during transition
+export { LlamaCpp as Ollama };
+export type { LlamaCppConfig as OllamaConfig };
+
+export function getDefaultOllama(): LlamaCpp {
+  return getDefaultLlamaCpp();
+}
+
+export function setDefaultOllama(llm: LlamaCpp | null): void {
+  setDefaultLlamaCpp(llm);
 }

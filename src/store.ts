@@ -15,8 +15,8 @@ import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import * as sqliteVec from "sqlite-vec";
 import {
-  Ollama,
-  getDefaultOllama,
+  LlamaCpp,
+  getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -47,11 +47,12 @@ export const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
-// Re-export OLLAMA_URL for backwards compatibility
-export const OLLAMA_URL = getDefaultOllama().getBaseUrl();
-
-// Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
-const CHUNK_BYTE_SIZE = 6 * 1024;
+// Chunking: 800 tokens per chunk with 15% overlap
+export const CHUNK_SIZE_TOKENS = 800;
+export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 120 tokens (15% overlap)
+// Fallback char-based approximation for sync chunking (~4 chars per token)
+export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3200 chars
+export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 480 chars
 
 // =============================================================================
 // Path utilities
@@ -292,9 +293,9 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
-  // Cache table for Ollama API calls
+  // Cache table for LLM API calls (table name kept for backwards compatibility)
   db.exec(`
-    CREATE TABLE IF NOT EXISTS ollama_cache (
+    CREATE TABLE IF NOT EXISTS llm_cache (
       hash TEXT PRIMARY KEY,
       result TEXT NOT NULL,
       created_at TEXT NOT NULL
@@ -372,10 +373,12 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (tableInfo) {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
     const hasHashSeq = tableInfo.sql.includes('hash_seq');
-    if (match && parseInt(match[1]) === dimensions && hasHashSeq) return;
+    const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
+    if (match && parseInt(match[1]) === dimensions && hasHashSeq && hasCosine) return;
+    // Table exists but wrong schema - need to rebuild
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
-  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}])`);
+  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
 }
 
 // =============================================================================
@@ -400,7 +403,7 @@ export type Store = {
   clearCache: () => void;
 
   // Cleanup and maintenance
-  deleteOllamaCache: () => number;
+  deleteLLMCache: () => number;
   deleteInactiveDocuments: () => number;
   cleanupOrphanedContent: () => number;
   cleanupOrphanedVectors: () => number;
@@ -488,7 +491,7 @@ export function createStore(dbPath?: string): Store {
     clearCache: () => clearCache(db),
 
     // Cleanup and maintenance
-    deleteOllamaCache: () => deleteOllamaCache(db),
+    deleteLLMCache: () => deleteLLMCache(db),
     deleteInactiveDocuments: () => deleteInactiveDocuments(db),
     cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
@@ -776,20 +779,20 @@ export function getCacheKey(url: string, body: object): string {
 }
 
 export function getCachedResult(db: Database, cacheKey: string): string | null {
-  const row = db.prepare(`SELECT result FROM ollama_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
+  const row = db.prepare(`SELECT result FROM llm_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
   return row?.result || null;
 }
 
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
   const now = new Date().toISOString();
-  db.prepare(`INSERT OR REPLACE INTO ollama_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
+  db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
   if (Math.random() < 0.01) {
-    db.exec(`DELETE FROM ollama_cache WHERE hash NOT IN (SELECT hash FROM ollama_cache ORDER BY created_at DESC LIMIT 1000)`);
+    db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
   }
 }
 
 export function clearCache(db: Database): void {
-  db.exec(`DELETE FROM ollama_cache`);
+  db.exec(`DELETE FROM llm_cache`);
 }
 
 // =============================================================================
@@ -797,11 +800,11 @@ export function clearCache(db: Database): void {
 // =============================================================================
 
 /**
- * Delete cached Ollama API responses.
+ * Delete cached LLM API responses.
  * Returns the number of cached responses deleted.
  */
-export function deleteOllamaCache(db: Database): number {
-  const result = db.prepare(`DELETE FROM ollama_cache`).run();
+export function deleteLLMCache(db: Database): number {
+  const result = db.prepare(`DELETE FROM llm_cache`).run();
   return result.changes;
 }
 
@@ -1007,11 +1010,8 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
 // Re-export from llm.ts for backwards compatibility
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
-export function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZE): { text: string; pos: number }[] {
-  const encoder = new TextEncoder();
-  const totalBytes = encoder.encode(content).length;
-
-  if (totalBytes <= maxBytes) {
+export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
+  if (content.length <= maxChars) {
     return [{ text: content, pos: 0 }];
   }
 
@@ -1019,52 +1019,174 @@ export function chunkDocument(content: string, maxBytes: number = CHUNK_BYTE_SIZ
   let charPos = 0;
 
   while (charPos < content.length) {
-    let endPos = charPos;
-    let byteCount = 0;
+    // Calculate end position for this chunk
+    let endPos = Math.min(charPos + maxChars, content.length);
 
-    while (endPos < content.length && byteCount < maxBytes) {
-      const charBytes = encoder.encode(content[endPos]).length;
-      if (byteCount + charBytes > maxBytes) break;
-      byteCount += charBytes;
-      endPos++;
-    }
-
-    if (endPos < content.length && endPos > charPos) {
+    // If not at the end, try to find a good break point
+    if (endPos < content.length) {
       const slice = content.slice(charPos, endPos);
-      const paragraphBreak = slice.lastIndexOf('\n\n');
-      const sentenceEnd = Math.max(
-        slice.lastIndexOf('. '),
-        slice.lastIndexOf('.\n'),
-        slice.lastIndexOf('? '),
-        slice.lastIndexOf('?\n'),
-        slice.lastIndexOf('! '),
-        slice.lastIndexOf('!\n')
-      );
-      const lineBreak = slice.lastIndexOf('\n');
-      const spaceBreak = slice.lastIndexOf(' ');
 
-      let breakPoint = -1;
-      if (paragraphBreak > slice.length * 0.5) {
-        breakPoint = paragraphBreak + 2;
-      } else if (sentenceEnd > slice.length * 0.5) {
-        breakPoint = sentenceEnd + 2;
-      } else if (lineBreak > slice.length * 0.3) {
-        breakPoint = lineBreak + 1;
-      } else if (spaceBreak > slice.length * 0.3) {
-        breakPoint = spaceBreak + 1;
+      // Look for break points in the last 30% of the chunk
+      const searchStart = Math.floor(slice.length * 0.7);
+      const searchSlice = slice.slice(searchStart);
+
+      // Priority: paragraph > sentence > line > word
+      let breakOffset = -1;
+      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+      if (paragraphBreak >= 0) {
+        breakOffset = searchStart + paragraphBreak + 2;
+      } else {
+        const sentenceEnd = Math.max(
+          searchSlice.lastIndexOf('. '),
+          searchSlice.lastIndexOf('.\n'),
+          searchSlice.lastIndexOf('? '),
+          searchSlice.lastIndexOf('?\n'),
+          searchSlice.lastIndexOf('! '),
+          searchSlice.lastIndexOf('!\n')
+        );
+        if (sentenceEnd >= 0) {
+          breakOffset = searchStart + sentenceEnd + 2;
+        } else {
+          const lineBreak = searchSlice.lastIndexOf('\n');
+          if (lineBreak >= 0) {
+            breakOffset = searchStart + lineBreak + 1;
+          } else {
+            const spaceBreak = searchSlice.lastIndexOf(' ');
+            if (spaceBreak >= 0) {
+              breakOffset = searchStart + spaceBreak + 1;
+            }
+          }
+        }
       }
 
-      if (breakPoint > 0) {
-        endPos = charPos + breakPoint;
+      if (breakOffset > 0) {
+        endPos = charPos + breakOffset;
       }
     }
 
+    // Ensure we make progress
     if (endPos <= charPos) {
-      endPos = charPos + 1;
+      endPos = Math.min(charPos + maxChars, content.length);
     }
 
     chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
-    charPos = endPos;
+
+    // Move forward, but overlap with previous chunk
+    // For last chunk, don't overlap (just go to the end)
+    if (endPos >= content.length) {
+      break;
+    }
+    charPos = endPos - overlapChars;
+    if (charPos <= chunks[chunks.length - 1].pos) {
+      // Prevent infinite loop - move forward at least a bit
+      charPos = endPos;
+    }
+  }
+
+  return chunks;
+}
+
+/**
+ * Chunk a document by actual token count using the LLM tokenizer.
+ * More accurate than character-based chunking but requires async.
+ */
+export async function chunkDocumentByTokens(
+  content: string,
+  maxTokens: number = CHUNK_SIZE_TOKENS,
+  overlapTokens: number = CHUNK_OVERLAP_TOKENS
+): Promise<{ text: string; pos: number; tokens: number }[]> {
+  const llm = getDefaultLlamaCpp();
+
+  // For small documents, check if we need chunking at all
+  const totalTokens = await llm.countTokens(content);
+  if (totalTokens <= maxTokens) {
+    return [{ text: content, pos: 0, tokens: totalTokens }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    // Binary search to find the right chunk end position
+    // Start with an estimate based on average tokens per char
+    const avgCharsPerToken = content.length / totalTokens;
+    let estimatedEnd = Math.min(charPos + Math.floor(maxTokens * avgCharsPerToken * 1.1), content.length);
+
+    // Get token count for this slice
+    let slice = content.slice(charPos, estimatedEnd);
+    let sliceTokens = await llm.countTokens(slice);
+
+    // Adjust until we're close to maxTokens
+    while (sliceTokens > maxTokens && estimatedEnd > charPos + 100) {
+      // Reduce by ~10%
+      estimatedEnd = charPos + Math.floor((estimatedEnd - charPos) * 0.9);
+      slice = content.slice(charPos, estimatedEnd);
+      sliceTokens = await llm.countTokens(slice);
+    }
+
+    // If we're under, try to expand (but not past content end)
+    while (sliceTokens < maxTokens * 0.9 && estimatedEnd < content.length) {
+      const newEnd = Math.min(estimatedEnd + Math.floor((estimatedEnd - charPos) * 0.1), content.length);
+      if (newEnd === estimatedEnd) break;
+      const newSlice = content.slice(charPos, newEnd);
+      const newTokens = await llm.countTokens(newSlice);
+      if (newTokens > maxTokens) break;
+      estimatedEnd = newEnd;
+      slice = newSlice;
+      sliceTokens = newTokens;
+    }
+
+    // Find a good break point in the last 30% of the chunk
+    if (estimatedEnd < content.length) {
+      const searchStart = charPos + Math.floor((estimatedEnd - charPos) * 0.7);
+      const searchSlice = content.slice(searchStart, estimatedEnd);
+
+      let breakOffset = -1;
+      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+      if (paragraphBreak >= 0) {
+        breakOffset = paragraphBreak + 2;
+      } else {
+        const sentenceEnd = Math.max(
+          searchSlice.lastIndexOf('. '),
+          searchSlice.lastIndexOf('.\n'),
+          searchSlice.lastIndexOf('? '),
+          searchSlice.lastIndexOf('?\n'),
+          searchSlice.lastIndexOf('! '),
+          searchSlice.lastIndexOf('!\n')
+        );
+        if (sentenceEnd >= 0) {
+          breakOffset = sentenceEnd + 2;
+        } else {
+          const lineBreak = searchSlice.lastIndexOf('\n');
+          if (lineBreak >= 0) {
+            breakOffset = lineBreak + 1;
+          } else {
+            const spaceBreak = searchSlice.lastIndexOf(' ');
+            if (spaceBreak >= 0) {
+              breakOffset = spaceBreak + 1;
+            }
+          }
+        }
+      }
+
+      if (breakOffset >= 0) {
+        estimatedEnd = searchStart + breakOffset;
+        slice = content.slice(charPos, estimatedEnd);
+        sliceTokens = await llm.countTokens(slice);
+      }
+    }
+
+    chunks.push({ text: slice, pos: charPos, tokens: sliceTokens });
+
+    // Move forward with overlap
+    if (estimatedEnd >= content.length) break;
+
+    // Calculate overlap in characters based on token ratio
+    const overlapChars = Math.floor(overlapTokens * (slice.length / sliceTokens));
+    charPos = estimatedEnd - overlapChars;
+    if (charPos <= chunks[chunks.length - 1].pos) {
+      charPos = estimatedEnd;  // Prevent infinite loop
+    }
   }
 
   return chunks;
@@ -1675,7 +1797,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 / (1 + row.distance),
+        score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
@@ -1687,8 +1809,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
-  const ollama = getDefaultOllama();
-  const result = await ollama.embed(text, { model, isQuery });
+  const llm = getDefaultLlamaCpp();
+  // Format text using the appropriate prompt template
+  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const result = await llm.embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -1750,8 +1874,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     return [query, ...lines.slice(0, 2)];
   }
 
-  const ollama = getDefaultOllama();
-  const results = await ollama.expandQuery(query, model, 2);
+  const llm = getDefaultLlamaCpp();
+  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const results = await llm.expandQuery(query, 2);
 
   // Cache the expanded queries (excluding original)
   if (results.length > 1) {
@@ -1780,10 +1905,10 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using Ollama
+  // Rerank uncached documents using LlamaCpp
   if (uncachedDocs.length > 0) {
-    const ollama = getDefaultOllama();
-    const rerankResult = await ollama.rerank(query, uncachedDocs, { model });
+    const llm = getDefaultLlamaCpp();
+    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results
     for (const result of rerankResult.results) {

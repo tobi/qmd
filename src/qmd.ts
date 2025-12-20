@@ -35,6 +35,7 @@ import {
   formatDocForEmbedding,
   formatQueryForEmbedding,
   chunkDocument,
+  chunkDocumentByTokens,
   ensureVecTable,
   clearCache,
   getCacheKey,
@@ -54,7 +55,7 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
-  deleteOllamaCache,
+  deleteLLMCache,
   deleteInactiveDocuments,
   cleanupOrphanedVectors,
   cleanupDuplicateCollections,
@@ -62,13 +63,13 @@ import {
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
-  OLLAMA_URL,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type ExpandedQuery } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -85,9 +86,6 @@ import {
   setGlobalContext,
   listAllContexts,
 } from "./collections.js";
-
-// Chunking: ~2000 tokens per chunk, ~3 bytes/token = 6KB
-const CHUNK_BYTE_SIZE = 6 * 1024;
 
 // Terminal colors (respects NO_COLOR env)
 const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
@@ -192,185 +190,26 @@ function computeDisplayPath(
   return filepath;
 }
 
-// Auto-pull model if not found
-async function ensureModelAvailable(model: string): Promise<void> {
-  try {
-    const response = await fetch(`${OLLAMA_URL}/api/show`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: model }),
-    });
-    if (response.ok) return;
-  } catch {
-    // Continue to pull attempt
-  }
+// Rerank documents using node-llama-cpp cross-encoder model
+async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database): Promise<{ file: string; score: number }[]> {
+  if (documents.length === 0) return [];
 
-  console.log(`Model ${model} not found. Pulling...`);
-  progress.indeterminate();
-
-  const pullResponse = await fetch(`${OLLAMA_URL}/api/pull`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: model, stream: false }),
-  });
-
-  if (!pullResponse.ok) {
-    progress.error();
-    throw new Error(`Failed to pull model ${model}: ${pullResponse.status} - ${await pullResponse.text()}`);
-  }
-
-  progress.clear();
-  console.log(`Model ${model} pulled successfully.`);
-}
-
-async function getEmbedding(text: string, model: string, isQuery: boolean = false, title?: string, retried: boolean = false): Promise<number[]> {
-  const input = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text, title);
-
-  const response = await fetch(`${OLLAMA_URL}/api/embed`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, input }),
-  });
-  if (!response.ok) {
-    const errorText = await response.text();
-    if (!retried && (errorText.includes("not found") || errorText.includes("does not exist"))) {
-      await ensureModelAvailable(model);
-      return getEmbedding(text, model, isQuery, title, true);
-    }
-    throw new Error(`Ollama API error: ${response.status} - ${errorText}`);
-  }
-  const data = await response.json() as { embeddings: number[][] };
-  return data.embeddings[0];
-}
-
-// Qwen3-Reranker prompt format (trained for yes/no relevance classification)
-const RERANK_SYSTEM = `Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".`;
-
-function formatRerankPrompt(query: string, title: string, doc: string): string {
-  return `<Instruct>: Determine if this document from a Shopify knowledge base is relevant to the search query. The query may reference specific Shopify programs, competitions, features, or named concepts (e.g., "Build a Business" competition, "Shop Pay", "Polaris"). Match documents that discuss the queried topic, even if phrasing differs.
-<Query>: ${query}
-<Document Title>: ${title}
-<Document>: ${doc}`;
-}
-
-type LogProb = { token: string; logprob: number };
-type RerankResponse = {
-  response: string;
-  logprobs?: LogProb[];
-};
-
-function parseRerankResponse(data: RerankResponse): number {
-  if (!data.logprobs || data.logprobs.length === 0) {
-    throw new Error("Reranker response missing logprobs");
-  }
-
-  const firstToken = data.logprobs[0];
-  const token = firstToken.token.toLowerCase().trim();
-  const confidence = Math.exp(firstToken.logprob);
-
-  if (token === "yes") {
-    return confidence;
-  }
-  if (token === "no") {
-    return (1 - confidence) * 0.3;
-  }
-
-  throw new Error(`Unexpected reranker token: "${token}"`);
-}
-
-async function rerankSingle(prompt: string, model: string, db?: Database, retried: boolean = false): Promise<number> {
-  // Use generate with raw template for qwen3-reranker format
-  // Include empty <think> tags as per HuggingFace reference implementation
-  const fullPrompt = `<|im_start|>system
-${RERANK_SYSTEM}<|im_end|>
-<|im_start|>user
-${prompt}<|im_end|>
-<|im_start|>assistant
-<think>
-
-</think>
-
-`;
-
-  const requestBody = {
-    model,
-    prompt: fullPrompt,
-    raw: true,
-    stream: false,
-    logprobs: true,
-    options: { num_predict: 1 },
-  };
-
-  // Check cache
-  const cacheKey = db ? getCacheKey(`${OLLAMA_URL}/api/generate`, requestBody) : "";
-  if (db) {
-    const cached = getCachedResult(db, cacheKey);
-    if (cached) {
-      const data = JSON.parse(cached) as RerankResponse;
-      return parseRerankResponse(data);
-    }
-  }
-
-  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    if (!retried && (errorText.includes("not found") || errorText.includes("does not exist"))) {
-      await ensureModelAvailable(model);
-      return rerankSingle(prompt, model, db, true);
-    }
-    throw new Error(`Ollama API error: ${response.status} - ${errorText}`);
-  }
-
-  const data = await response.json() as RerankResponse;
-
-  // Cache the result
-  if (db) {
-    setCachedResult(db, cacheKey, JSON.stringify(data));
-  }
-
-  return parseRerankResponse(data);
-}
-
-async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db?: Database): Promise<{ file: string; score: number }[]> {
-  const results: { file: string; score: number }[] = [];
   const total = documents.length;
-  const PARALLEL = 5;
-
-  process.stderr.write(`Reranking ${total} documents with ${model} (parallel: ${PARALLEL})...\n`);
+  process.stderr.write(`Reranking ${total} documents...\n`);
   progress.indeterminate();
 
-  // Process in parallel batches
-  for (let i = 0; i < documents.length; i += PARALLEL) {
-    const batch = documents.slice(i, i + PARALLEL);
-    const batchResults = await Promise.all(
-      batch.map(async (doc) => {
-        try {
-          // Extract title from filename for reranker context
-          const title = doc.file.split('/').pop()?.replace(/\.md$/, '') || doc.file;
-          const prompt = formatRerankPrompt(query, title, doc.text.slice(0, 4000));
-          const score = await rerankSingle(prompt, model, db);
-          return { file: doc.file, score };
-        } catch (err) {
-          return { file: doc.file, score: 0 };
-        }
-      })
-    );
-    results.push(...batchResults);
+  const llm = getDefaultLlamaCpp();
+  const rerankDocs: RerankDocument[] = documents.map((doc) => ({
+    file: doc.file,
+    text: doc.text.slice(0, 4000), // Truncate to context limit
+  }));
 
-    const processed = Math.min(i + PARALLEL, total);
-    progress.set((processed / total) * 100);
-    process.stderr.write(`\rReranking: ${processed}/${total}`);
-  }
+  const result = await llm.rerank(query, rerankDocs);
 
   progress.clear();
   process.stderr.write("\n");
 
-  return results.sort((a, b) => b.score - a.score);
+  return result.results.map((r) => ({ file: r.file, score: r.score }));
 }
 
 function formatTimeAgo(date: Date): string {
@@ -1593,10 +1432,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Prepare documents with chunks
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; bytes: number; displayName: string };
+  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number; displayName: string };
   const allChunks: ChunkItem[] = [];
   let multiChunkDocs = 0;
 
+  // Chunk all documents using actual token counts
+  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
   for (const item of hashesToEmbed) {
     const encoder = new TextEncoder();
     const bodyBytes = encoder.encode(item.body).length;
@@ -1604,7 +1445,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
-    const chunks = chunkDocument(item.body, CHUNK_BYTE_SIZE);
+    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
 
     if (chunks.length > 1) multiChunkDocs++;
 
@@ -1615,6 +1456,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         text: chunks[seq].text,
         seq,
         pos: chunks[seq].pos,
+        tokens: chunks[seq].tokens,
         bytes: encoder.encode(chunks[seq].text).length,
         displayName,
       });
@@ -1642,29 +1484,64 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   // Get embedding dimensions from first chunk
   progress.indeterminate();
-  const firstEmbedding = await getEmbedding(allChunks[0].text, model, false, allChunks[0].title);
-  ensureVecTable(db, firstEmbedding.length);
+  const llm = getDefaultLlamaCpp();
+  const firstText = formatDocForEmbedding(allChunks[0].text, allChunks[0].title);
+  const firstResult = await llm.embed(firstText);
+  if (!firstResult) {
+    throw new Error("Failed to get embedding dimensions from first chunk");
+  }
+  ensureVecTable(db, firstResult.embedding.length);
 
   let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
   const startTime = Date.now();
 
-  // Insert first chunk
-  insertEmbedding(db, allChunks[0].hash, allChunks[0].seq, allChunks[0].pos, new Float32Array(firstEmbedding), model, now);
-  chunksEmbedded++;
-  bytesProcessed += allChunks[0].bytes;
+  // Batch embedding for better throughput
+  // Process in batches of 32 to balance memory usage and efficiency
+  const BATCH_SIZE = 32;
 
-  for (let i = 1; i < allChunks.length; i++) {
-    const chunk = allChunks[i];
+  for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
+    const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+    const batch = allChunks.slice(batchStart, batchEnd);
+
+    // Format texts for embedding
+    const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
     try {
-      const embedding = await getEmbedding(chunk.text, model, false, chunk.title);
-      insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding), model, now);
-      chunksEmbedded++;
-      bytesProcessed += chunk.bytes;
+      // Batch embed all texts at once
+      const embeddings = await llm.embedBatch(texts);
+
+      // Insert each embedding
+      for (let i = 0; i < batch.length; i++) {
+        const chunk = batch[i];
+        const embedding = embeddings[i];
+
+        if (embedding) {
+          insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+          chunksEmbedded++;
+        } else {
+          errors++;
+          console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
+        }
+        bytesProcessed += chunk.bytes;
+      }
     } catch (err) {
-      errors++;
-      bytesProcessed += chunk.bytes;
-      progress.error();
-      console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${err}${c.reset}`);
+      // If batch fails, try individual embeddings as fallback
+      for (const chunk of batch) {
+        try {
+          const text = formatDocForEmbedding(chunk.text, chunk.title);
+          const result = await llm.embed(text);
+          if (result) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+        } catch (innerErr) {
+          errors++;
+          console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
+        }
+        bytesProcessed += chunk.bytes;
+      }
     }
 
     const percent = (bytesProcessed / totalBytes) * 100;
@@ -2046,17 +1923,25 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // Expand query to multiple variations (with caching)
-  const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
-  process.stderr.write(`Searching with ${queries.length} query variations...\n`);
+  // Expand query using structured output (no lexical for vector-only search)
+  const expanded = await expandQueryStructured(query, false);
+
+  // Build list of queries for vector search: original, vectorQuery, and hyde
+  const vectorQueries: string[] = [query];
+  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
+    vectorQueries.push(expanded.vectorQuery);
+  }
+  if (expanded.hyde && expanded.hyde.length > 20) {
+    vectorQueries.push(expanded.hyde);
+  }
+
+  process.stderr.write(`${c.dim}Searching ${vectorQueries.length} vector queries...${c.reset}\n`);
 
   // Collect results from all query variations
-  // For --all, fetch more results per query
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  for (const q of queries) {
-    // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+  for (const q of vectorQueries) {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -2081,71 +1966,51 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   outputResults(results, query, { ...opts, limit: results.length }); // Already limited
 }
 
-async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db?: Database): Promise<string[]> {
-  process.stderr.write("Generating query variations...\n");
+// Expand query using structured output with JSON schema grammar
+async function expandQueryStructured(query: string, includeLexical: boolean = true): Promise<ExpandedQuery> {
+  process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
 
-  const prompt = `You are a search query expander. Given a search query, generate 2 alternative queries that would help find relevant documents.
+  const llm = getDefaultLlamaCpp();
+  const expanded = await llm.expandQueryStructured(query, includeLexical);
 
-Rules:
-- Use synonyms and related terminology (e.g., "craft" → "craftsmanship", "quality", "excellence")
-- Rephrase to capture different angles (e.g., "engineering culture" → "technical excellence", "developer practices")
-- Keep proper nouns and named concepts exactly as written (e.g., "Build a Business", "Stripe", "Shopify")
-- Each variation should be 3-8 words, natural search terms
-- Do NOT just append words like "search" or "find" or "documents"
+  // Log the expansion as a tree, starting with original query
+  const lines: string[] = [];
+  const bothLabel = includeLexical ? ' · (lexical+vector)' : ' · (vector)';
+  lines.push(`${c.dim}├─ ${query}${bothLabel}${c.reset}`);
 
-Query: "${query}"
-
-Output exactly 2 variations, one per line, no numbering or bullets:`;
-
-  const requestBody = {
-    model,
-    prompt,
-    stream: false,
-    think: false,
-    options: { num_predict: 150 },
-  };
-
-  // Check cache
-  const cacheDb = db || getDb();
-  const cacheKey = getCacheKey(`${OLLAMA_URL}/api/generate`, requestBody);
-  const cached = getCachedResult(cacheDb, cacheKey);
-
-  let responseText: string;
-  if (cached) {
-    responseText = cached;
-  } else {
-    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      if (errorText.includes("not found") || errorText.includes("does not exist")) {
-        await ensureModelAvailable(model);
-        if (!db) cacheDb.close();
-        return expandQuery(query, model, db);
-      }
-      if (!db) cacheDb.close();
-      return [query];
-    }
-
-    const data = await response.json() as { response: string };
-    responseText = data.response;
-    setCachedResult(cacheDb, cacheKey, responseText);
+  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
+    lines.push(`${c.dim}├─ ${expanded.lexicalQuery} · (lexical)${c.reset}`);
+  }
+  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
+    lines.push(`${c.dim}├─ ${expanded.vectorQuery} · (vector)${c.reset}`);
+  }
+  if (expanded.hyde && expanded.hyde.length > 20) {
+    // Truncate hyde to first ~60 chars for display
+    const hydePreview = expanded.hyde.length > 60
+      ? expanded.hyde.substring(0, 60).replace(/\n/g, ' ') + '...'
+      : expanded.hyde.replace(/\n/g, ' ');
+    lines.push(`${c.dim}├─ ${hydePreview} · (vector)${c.reset}`);
   }
 
-  if (!db) cacheDb.close();
+  // Fix last item to use └─ instead of ├─
+  if (lines.length > 0) {
+    lines[lines.length - 1] = lines[lines.length - 1].replace('├─', '└─');
+  }
 
-  const lines = responseText.trim().split('\n')
-    .map(l => l.replace(/^[\d\.\-\*\"\s]+/, '').replace(/["\s]+$/, '').trim())
-    .filter(l => l.length > 2 && l.length < 100 && !l.startsWith('<') && !l.toLowerCase().includes('variation'))
-    .slice(0, 2);
+  for (const line of lines) {
+    process.stderr.write(line + '\n');
+  }
 
-  const allQueries = [query, ...lines];
-  process.stderr.write(`${c.dim}Queries: ${allQueries.join(' | ')}${c.reset}\n`);
-  return allQueries;
+  return expanded;
+}
+
+// Legacy wrapper for backward compatibility
+async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database): Promise<string[]> {
+  const expanded = await expandQueryStructured(query, true);
+  const queries = [query];
+  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) queries.push(expanded.lexicalQuery);
+  if (expanded.vectorQuery && expanded.vectorQuery !== query) queries.push(expanded.vectorQuery);
+  return queries;
 }
 
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2166,9 +2031,24 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // Expand query to multiple variations (with caching)
-  const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, db);
-  process.stderr.write(`Searching with ${queries.length} query variations...\n`);
+  // Expand query using structured output
+  const expanded = await expandQueryStructured(query, true);
+
+  // Build query lists for each retrieval type
+  const ftsQueries: string[] = [query];
+  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
+    ftsQueries.push(expanded.lexicalQuery);
+  }
+
+  const vectorQueries: string[] = [query];
+  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
+    vectorQueries.push(expanded.vectorQuery);
+  }
+  if (expanded.hyde && expanded.hyde.length > 20) {
+    vectorQueries.push(expanded.hyde);
+  }
+
+  process.stderr.write(`${c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${c.reset}\n`);
 
   // Collect ranked result lists for RRF fusion
   const rankedLists: RankedResult[][] = [];
@@ -2177,18 +2057,18 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Map to store hash by filepath for final results
   const hashMap = new Map<string, string>();
 
-  for (const q of queries) {
-    // FTS search - get ranked results
-    // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+  // FTS searches with lexical queries
+  for (const q of ftsQueries) {
     const ftsResults = searchFTS(db, q, 20, collectionName as any);
     if (ftsResults.length > 0) {
       for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
       rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
     }
+  }
 
-    // Vector search - get ranked results
-    if (hasVectors) {
-      // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
+  // Vector searches with semantic queries + hyde
+  if (hasVectors) {
+    for (const q of vectorQueries) {
       const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
       if (vecResults.length > 0) {
         for (const r of vecResults) hashMap.set(r.filepath, r.hash);
@@ -2209,10 +2089,39 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     return;
   }
 
-  // Rerank with the original query (with caching)
+  // Rerank chunks, not full documents
+  // For each candidate, extract the most relevant chunk to rerank
+  const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestChunkIdx: number }>();
+
+  for (const c of candidates) {
+    const chunks = chunkDocument(c.body);
+    if (chunks.length === 1) {
+      // Small document - use entire body
+      chunksToRerank.push({ file: c.file, text: chunks[0].text, chunkIdx: 0 });
+      docChunkMap.set(c.file, { chunks, bestChunkIdx: 0 });
+    } else {
+      // Find the chunk that best matches the query terms (simple keyword heuristic)
+      const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+      let bestIdx = 0;
+      let bestScore = 0;
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkLower = chunks[i].text.toLowerCase();
+        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      chunksToRerank.push({ file: c.file, text: chunks[bestIdx].text, chunkIdx: bestIdx });
+      docChunkMap.set(c.file, { chunks, bestChunkIdx: bestIdx });
+    }
+  }
+
+  // Rerank the focused chunks (with caching)
   const reranked = await rerank(
     query,
-    candidates.map(c => ({ file: c.file, text: c.body })),
+    chunksToRerank.map(c => ({ file: c.file, text: c.text })),
     rerankModel,
     db
   );
@@ -2239,11 +2148,16 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
     const candidate = candidateMap.get(r.file);
+    // Use the best chunk's text for the body (better for snippets)
+    const chunkInfo = docChunkMap.get(r.file);
+    const chunkBody = chunkInfo ? chunkInfo.chunks[chunkInfo.bestChunkIdx].text : candidate?.body || "";
+    const chunkPos = chunkInfo ? chunkInfo.chunks[chunkInfo.bestChunkIdx].pos : 0;
     return {
       file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: candidate?.body || "",
+      body: chunkBody,
+      chunkPos,
       score: blendedScore,
       context: getContextForFile(db, r.file),
       hash: hashMap.get(r.file) || "",
@@ -2341,7 +2255,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (chunks ~6KB each)");
+  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query>           - Vector similarity search");
@@ -2369,12 +2283,10 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
-  console.log("Environment:");
-  console.log("  OLLAMA_URL                 - Ollama server URL (default: http://localhost:11434)");
-  console.log("");
-  console.log("Models:");
-  console.log(`  Embedding: ${DEFAULT_EMBED_MODEL}`);
-  console.log(`  Reranking: ${DEFAULT_RERANK_MODEL}`);
+  console.log("Models (auto-downloaded from HuggingFace):");
+  console.log("  Embedding: embeddinggemma-300M-Q8_0");
+  console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
+  console.log("  Generation: Qwen3-0.6B-Q8_0");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2617,8 +2529,8 @@ switch (cli.command) {
   case "cleanup": {
     const db = getDb();
 
-    // 1. Clear ollama_cache
-    const cacheCount = deleteOllamaCache(db);
+    // 1. Clear llm_cache
+    const cacheCount = deleteLLMCache(db);
     console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
 
     // 2. Remove orphaned vectors
@@ -2648,4 +2560,8 @@ switch (cli.command) {
     console.error("Run 'qmd --help' for usage.");
     process.exit(1);
 }
+
+// Cleanup LlamaCpp instance to prevent NAPI crash on exit
+await disposeDefaultLlamaCpp();
+
 } // end if (import.meta.main)

@@ -20,7 +20,7 @@ qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
-qmd embed                         # Generate vector embeddings (requires Ollama)
+qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
 qmd search <query>                # BM25 full-text search
 qmd vsearch <query>               # Vector similarity search
 qmd query <query>                 # Hybrid search with reranking (best quality)
@@ -124,8 +124,9 @@ bun link               # Install globally as 'qmd'
 
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- Ollama for embeddings (embeddinggemma) and reranking (qwen3-reranker)
+- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
+- Token-based chunking: 800 tokens/chunk with 15% overlap
 
 ## Important: Do NOT run automatically
 

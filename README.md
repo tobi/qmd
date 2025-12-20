@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via Ollama.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
 ## Quick Start
 
@@ -112,7 +112,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
                         ▼                             ▼
                ┌────────────────┐            ┌────────────────┐
                │ Query Expansion│            │  Original Query│
-               │  (qwen3:0.6b)  │            │   (×2 weight)  │
+               │   (Qwen3-0.6B) │            │   (×2 weight)  │
                └───────┬────────┘            └───────┬────────┘
                        │                             │
                        │ 2 alternative queries       │
@@ -204,24 +204,18 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   ```sh
   brew install sqlite
   ```
-- **Ollama** running locally (default: `http://localhost:11434`)
 
-### Ollama Models
+### GGUF Models (via node-llama-cpp)
 
-QMD uses three models (auto-pulled if missing):
+QMD uses three local GGUF models (auto-downloaded on first use):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma` | Vector embeddings | ~1.6GB |
-| `ExpedientFalcon/qwen3-reranker:0.6b-q8_0` | Re-ranking (trained) | ~640MB |
-| `qwen3:0.6b` | Query expansion | ~400MB |
+| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
+| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
+| `Qwen3-0.6B-Q8_0` | Query expansion | ~640MB |
 
-```sh
-# Pre-pull models (optional)
-ollama pull embeddinggemma
-ollama pull ExpedientFalcon/qwen3-reranker:0.6b-q8_0
-ollama pull qwen3:0.6b
-```
+Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ## Installation
 
@@ -257,7 +251,7 @@ qmd ls notes/subfolder
 ### Generate Vector Embeddings
 
 ```sh
-# Embed all indexed documents (chunked into ~6KB pieces)
+# Embed all indexed documents (800 tokens/chunk, 15% overlap)
 qmd embed
 
 # Force re-embed everything
@@ -434,16 +428,15 @@ collections     -- Indexed directories with name and glob patterns
 path_contexts   -- Context descriptions by virtual path (qmd://...)
 documents       -- Markdown content with metadata and docid (6-char hash)
 documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos)
+content_vectors -- Embedding chunks (hash, seq, pos, 800 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
-ollama_cache    -- Cached API responses
+llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 
 ## How It Works
@@ -465,11 +458,11 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 
 ### Embedding Flow
 
-Documents are chunked into ~6KB pieces to fit the embedding model's token window:
+Documents are chunked into 800-token pieces with 15% overlap:
 
 ```
-Document ──► Chunk (~6KB each) ──► Format each chunk ──► Ollama API ──► Store Vectors
-                │                    "title | text"        /api/embed
+Document ──► Chunk (800 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
+                │                    "title | text"        embedBatch()
                 │
                 └─► Chunks stored with:
                     - hash: document hash
@@ -517,12 +510,12 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured as constants in `src/qmd.ts`:
+Models are configured in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "embeddinggemma";
-const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
+const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 ```
 
 ### EmbeddingGemma Prompt Format
@@ -537,24 +530,11 @@ const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
 
 ### Qwen3-Reranker
 
-A dedicated reranker model trained on relevance classification:
-
-```
-System: Judge whether the Document meets the requirements based on the Query
-        and the Instruct provided. Note that the answer can only be "yes" or "no".
-
-User: <Instruct>: Given a search query, determine if the document is relevant...
-      <Query>: {query}
-      <Document>: {doc}
-```
-
-- Uses `logprobs: true` to extract token probabilities
-- Outputs yes/no with confidence score (0.0 - 1.0)
-- `num_predict: 1` - Only need the yes/no token
+Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
 
 ### Qwen3 (Query Expansion)
 
-- `num_predict: 150` - For generating query variations
+Used for generating query variations via `LlamaChatSession`.
 
 ## License
 
