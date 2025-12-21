@@ -258,12 +258,31 @@ describe("Path Utilities", () => {
     expect(resolve("/foo/bar/../../baz")).toBe("/baz");
   });
 
-  test("getDefaultDbPath returns expected path structure", () => {
-    const defaultPath = getDefaultDbPath();
-    expect(defaultPath).toContain(".cache/qmd/index.sqlite");
+  test("getDefaultDbPath throws in test mode without INDEX_PATH", () => {
+    // In test mode, getDefaultDbPath should throw to prevent accidental writes to global index
+    // This is intentional safety behavior
+    const originalIndexPath = process.env.INDEX_PATH;
+    delete process.env.INDEX_PATH;
 
-    const customPath = getDefaultDbPath("custom");
-    expect(customPath).toContain(".cache/qmd/custom.sqlite");
+    expect(() => getDefaultDbPath()).toThrow("Database path not set");
+
+    // Restore
+    if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
+  });
+
+  test("getDefaultDbPath uses INDEX_PATH when set", () => {
+    const originalIndexPath = process.env.INDEX_PATH;
+    process.env.INDEX_PATH = "/tmp/test-index.sqlite";
+
+    expect(getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
+    expect(getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
+
+    // Restore
+    if (originalIndexPath) {
+      process.env.INDEX_PATH = originalIndexPath;
+    } else {
+      delete process.env.INDEX_PATH;
+    }
   });
 
   test("getPwd returns current working directory", () => {
@@ -376,12 +395,15 @@ describe("handelize", () => {
 // =============================================================================
 
 describe("Store Creation", () => {
-  test("createStore creates a new store with default path", () => {
-    const store = createStore();
-    expect(store).toBeDefined();
-    expect(store.db).toBeDefined();
-    expect(store.dbPath).toContain(".cache/qmd/index.sqlite");
-    store.close();
+  test("createStore throws without explicit path in test mode", () => {
+    // In test mode, createStore without path should throw to prevent accidental writes
+    const originalIndexPath = process.env.INDEX_PATH;
+    delete process.env.INDEX_PATH;
+
+    expect(() => createStore()).toThrow("Database path not set");
+
+    // Restore
+    if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
   });
 
   test("createStore creates a new store with custom path", async () => {

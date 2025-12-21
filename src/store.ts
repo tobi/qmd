@@ -80,11 +80,27 @@ export function resolve(...paths: string[]): string {
   return '/' + normalized.join('/');
 }
 
+// Flag to indicate production mode (set by qmd.ts at startup)
+let _productionMode = false;
+
+export function enableProductionMode(): void {
+  _productionMode = true;
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
-  // Allow override via INDEX_PATH for testing
+  // Always allow override via INDEX_PATH (for testing)
   if (Bun.env.INDEX_PATH) {
     return Bun.env.INDEX_PATH;
   }
+
+  // In non-production mode (tests), require explicit path
+  if (!_productionMode) {
+    throw new Error(
+      "Database path not set. Tests must set INDEX_PATH env var or use createStore() with explicit path. " +
+      "This prevents tests from accidentally writing to the global index."
+    );
+  }
+
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
   try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch {}

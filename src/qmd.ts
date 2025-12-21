@@ -12,6 +12,7 @@ import {
   homedir,
   resolve,
   setCustomIndexName,
+  enableProductionMode,
   searchFTS,
   searchVec,
   reciprocalRankFusion,
@@ -86,6 +87,10 @@ import {
   setGlobalContext,
   listAllContexts,
 } from "./collections.js";
+
+// Enable production mode - allows using default database path
+// Tests must set INDEX_PATH or use createStore() with explicit path
+enableProductionMode();
 
 // Terminal colors (respects NO_COLOR env)
 const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
