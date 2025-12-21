@@ -704,19 +704,38 @@ Generate the structured expansion:`;
       this.inactivityTimer = null;
     }
 
-    // Don't explicitly dispose llama resources - it causes Metal backend
-    // assertion failures during process cleanup. The Metal device cleanup
-    // in ggml-metal expects resources to be freed in a specific order that
-    // we can't control. Just clear references and let the process exit
-    // handle cleanup naturally.
-    // See: https://github.com/ggml-org/llama.cpp/pull/17869
-    this.embedContext = null;
-    this.generateContext = null;
-    this.rerankContext = null;
-    this.embedModel = null;
-    this.generateModel = null;
-    this.rerankModel = null;
-    this.llama = null;
+    // Dispose in order: contexts -> models -> llama
+    // Contexts depend on models, models depend on llama
+    if (this.embedContext) {
+      await this.embedContext.dispose();
+      this.embedContext = null;
+    }
+    if (this.generateContext) {
+      await this.generateContext.dispose();
+      this.generateContext = null;
+    }
+    if (this.rerankContext) {
+      await this.rerankContext.dispose();
+      this.rerankContext = null;
+    }
+
+    if (this.embedModel) {
+      await this.embedModel.dispose();
+      this.embedModel = null;
+    }
+    if (this.generateModel) {
+      await this.generateModel.dispose();
+      this.generateModel = null;
+    }
+    if (this.rerankModel) {
+      await this.rerankModel.dispose();
+      this.rerankModel = null;
+    }
+
+    if (this.llama) {
+      await this.llama.dispose();
+      this.llama = null;
+    }
   }
 }
 

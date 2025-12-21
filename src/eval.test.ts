@@ -34,7 +34,7 @@ import {
   DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -201,8 +201,8 @@ describe("Vector Search", () => {
     hasEmbeddings = true;
   }, 120000); // 2 minute timeout for embedding generation
 
-  // Note: Don't call disposeDefaultLlamaCpp() here - it causes Metal backend
-  // assertion failures during process exit. Let the process exit handle cleanup.
+  // Note: Don't dispose here - Hybrid tests also use llama.
+  // Dispose happens in the global afterAll.
 
   test("easy queries: ≥60% Hit@3 (vector should match keywords too)", async () => {
     if (!hasEmbeddings) return; // Skip if embedding failed
@@ -392,6 +392,8 @@ describe("Hybrid Search (RRF)", () => {
 // Cleanup
 // =============================================================================
 
-afterAll(() => {
+afterAll(async () => {
+  // Dispose llama before process exit to properly free Metal resources
+  await disposeDefaultLlamaCpp();
   rmSync(tempDir, { recursive: true, force: true });
 });
