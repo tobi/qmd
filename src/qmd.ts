@@ -2089,50 +2089,80 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     return;
   }
 
-  // Rerank chunks, not full documents
-  // For each candidate, extract the most relevant chunk to rerank
+  // Rerank multiple chunks per document, then aggregate scores
+  // This improves ranking for long documents where keyword-matched chunk isn't always best
+  const MAX_CHUNKS_PER_DOC = 3;
   const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestChunkIdx: number }>();
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; selectedIndices: number[] }>();
 
   for (const c of candidates) {
     const chunks = chunkDocument(c.body);
-    if (chunks.length === 1) {
-      // Small document - use entire body
-      chunksToRerank.push({ file: c.file, text: chunks[0].text, chunkIdx: 0 });
-      docChunkMap.set(c.file, { chunks, bestChunkIdx: 0 });
-    } else {
-      // Find the chunk that best matches the query terms (simple keyword heuristic)
-      const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-      let bestIdx = 0;
-      let bestScore = 0;
+    if (chunks.length <= MAX_CHUNKS_PER_DOC) {
+      // Small document - rerank all chunks
       for (let i = 0; i < chunks.length; i++) {
-        const chunkLower = chunks[i].text.toLowerCase();
-        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-        if (score > bestScore) {
-          bestScore = score;
-          bestIdx = i;
-        }
+        chunksToRerank.push({ file: c.file, text: chunks[i].text, chunkIdx: i });
       }
-      chunksToRerank.push({ file: c.file, text: chunks[bestIdx].text, chunkIdx: bestIdx });
-      docChunkMap.set(c.file, { chunks, bestChunkIdx: bestIdx });
+      docChunkMap.set(c.file, { chunks, selectedIndices: chunks.map((_, i) => i) });
+    } else {
+      // Score all chunks by keyword match, select top MAX_CHUNKS_PER_DOC
+      const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+      const scored = chunks.map((chunk, idx) => {
+        const chunkLower = chunk.text.toLowerCase();
+        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+        return { idx, score };
+      });
+      scored.sort((a, b) => b.score - a.score);
+      const selectedIndices = scored.slice(0, MAX_CHUNKS_PER_DOC).map(s => s.idx);
+
+      for (const idx of selectedIndices) {
+        chunksToRerank.push({ file: c.file, text: chunks[idx].text, chunkIdx: idx });
+      }
+      docChunkMap.set(c.file, { chunks, selectedIndices });
     }
   }
 
-  // Rerank the focused chunks (with caching)
+  // Rerank all selected chunks (with caching)
+  // Use file:chunkIdx as unique identifier for reranker
   const reranked = await rerank(
     query,
-    chunksToRerank.map(c => ({ file: c.file, text: c.text })),
+    chunksToRerank.map(c => ({ file: `${c.file}:${c.chunkIdx}`, text: c.text })),
     rerankModel,
     db
   );
 
-  // Blend RRF position score with reranker score using position-aware weights
+  // Aggregate chunk scores back to document level using top-2 average
+  // (or max if only 1 chunk) - this balances best chunk with consistency
+  const docScores = new Map<string, { scores: number[]; bestChunkIdx: number }>();
+  for (const r of reranked) {
+    const [file, chunkIdxStr] = r.file.split(/:(\d+)$/);
+    const chunkIdx = parseInt(chunkIdxStr || "0");
+    const existing = docScores.get(file);
+    if (existing) {
+      existing.scores.push(r.score);
+      if (r.score > (existing.scores[0] || 0)) {
+        existing.bestChunkIdx = chunkIdx;
+      }
+    } else {
+      docScores.set(file, { scores: [r.score], bestChunkIdx: chunkIdx });
+    }
+  }
+
+  // Compute aggregated score: top-2 average (rewards consistency across chunks)
+  const aggregatedScores = new Map<string, { score: number; bestChunkIdx: number }>();
+  for (const [file, { scores, bestChunkIdx }] of docScores) {
+    scores.sort((a, b) => b - a);
+    const topScores = scores.slice(0, 2);
+    const avgScore = topScores.reduce((a, b) => a + b, 0) / topScores.length;
+    aggregatedScores.set(file, { score: avgScore, bestChunkIdx });
+  }
+
+  // Blend RRF position score with aggregated reranker score using position-aware weights
   // Top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1])); // 1-indexed rank
 
-  const finalResults = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || 30;
+  const finalResults = Array.from(aggregatedScores.entries()).map(([file, { score: rerankScore, bestChunkIdx }]) => {
+    const rrfRank = rrfRankMap.get(file) || 30;
     // Position-aware blending: top retrieval results preserved more
     // Rank 1-3: 75% RRF, 25% reranker (trust retrieval for exact matches)
     // Rank 4-10: 60% RRF, 40% reranker
@@ -2146,21 +2176,21 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       rrfWeight = 0.40;
     }
     const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-    const candidate = candidateMap.get(r.file);
-    // Use the best chunk's text for the body (better for snippets)
-    const chunkInfo = docChunkMap.get(r.file);
-    const chunkBody = chunkInfo ? chunkInfo.chunks[chunkInfo.bestChunkIdx].text : candidate?.body || "";
-    const chunkPos = chunkInfo ? chunkInfo.chunks[chunkInfo.bestChunkIdx].pos : 0;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
+    const candidate = candidateMap.get(file);
+    // Use the best-scoring chunk's text for the body (better for snippets)
+    const chunkInfo = docChunkMap.get(file);
+    const chunkBody = chunkInfo ? chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0].text : candidate?.body || "";
+    const chunkPos = chunkInfo ? chunkInfo.chunks[bestChunkIdx]?.pos || 0 : 0;
     return {
-      file: r.file,
+      file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
       body: chunkBody,
       chunkPos,
       score: blendedScore,
-      context: getContextForFile(db, r.file),
-      hash: hashMap.get(r.file) || "",
+      context: getContextForFile(db, file),
+      hash: hashMap.get(file) || "",
     };
   }).sort((a, b) => b.score - a.score);
 
