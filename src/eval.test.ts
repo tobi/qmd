@@ -34,7 +34,7 @@ import {
   DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
+import { getDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -192,9 +192,8 @@ describe("Vector Search", () => {
     hasEmbeddings = true;
   }, 120000); // 2 minute timeout for embedding generation
 
-  afterAll(async () => {
-    await disposeDefaultLlamaCpp();
-  });
+  // Note: Don't call disposeDefaultLlamaCpp() here - it causes Metal backend
+  // assertion failures during process exit. Let the process exit handle cleanup.
 
   test("easy queries: ≥60% Hit@3 (vector should match keywords too)", async () => {
     if (!hasEmbeddings) return; // Skip if embedding failed

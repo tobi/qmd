@@ -220,6 +220,9 @@ export class LlamaCpp implements LLM {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private inactivityTimeoutMs: number;
 
+  // Track disposal state to prevent double-dispose
+  private disposed = false;
+
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
@@ -263,6 +266,11 @@ export class LlamaCpp implements LLM {
    * Models will be reloaded lazily on next operation.
    */
   async unloadModels(): Promise<void> {
+    // Don't unload if already disposed
+    if (this.disposed) {
+      return;
+    }
+
     // Clear timer
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
@@ -684,45 +692,31 @@ Generate the structured expansion:`;
   }
 
   async dispose(): Promise<void> {
+    // Prevent double-dispose
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+
     // Clear inactivity timer
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
 
-    // Dispose contexts
-    if (this.embedContext) {
-      await this.embedContext.dispose();
-      this.embedContext = null;
-    }
-    if (this.generateContext) {
-      await this.generateContext.dispose();
-      this.generateContext = null;
-    }
-    if (this.rerankContext) {
-      await this.rerankContext.dispose();
-      this.rerankContext = null;
-    }
-
-    // Dispose models
-    if (this.embedModel) {
-      await this.embedModel.dispose();
-      this.embedModel = null;
-    }
-    if (this.generateModel) {
-      await this.generateModel.dispose();
-      this.generateModel = null;
-    }
-    if (this.rerankModel) {
-      await this.rerankModel.dispose();
-      this.rerankModel = null;
-    }
-
-    // Dispose llama
-    if (this.llama) {
-      await this.llama.dispose();
-      this.llama = null;
-    }
+    // Don't explicitly dispose llama resources - it causes Metal backend
+    // assertion failures during process cleanup. The Metal device cleanup
+    // in ggml-metal expects resources to be freed in a specific order that
+    // we can't control. Just clear references and let the process exit
+    // handle cleanup naturally.
+    // See: https://github.com/ggml-org/llama.cpp/pull/17869
+    this.embedContext = null;
+    this.generateContext = null;
+    this.rerankContext = null;
+    this.embedModel = null;
+    this.generateModel = null;
+    this.rerankModel = null;
+    this.llama = null;
   }
 }
 
