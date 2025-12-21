@@ -21,20 +21,18 @@ const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-"));
 process.env.INDEX_PATH = join(tempDir, "eval.sqlite");
 
 import {
-  getDb,
-  closeDb,
+  createStore,
   searchFTS,
   searchVec,
   insertDocument,
   insertContent,
-  ensureVecTable,
   insertEmbedding,
   chunkDocumentByTokens,
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "./llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -100,10 +98,12 @@ function calcHitRate(
 // =============================================================================
 
 describe("BM25 Search (FTS)", () => {
+  let store: ReturnType<typeof createStore>;
   let db: Database;
 
   beforeAll(() => {
-    db = getDb();
+    store = createStore();
+    db = store.db;
 
     // Load and index eval documents
     const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
@@ -121,7 +121,7 @@ describe("BM25 Search (FTS)", () => {
   });
 
   afterAll(() => {
-    closeDb();
+    store.close();
   });
 
   test("easy queries: ≥80% Hit@3", () => {
@@ -153,11 +153,13 @@ describe("BM25 Search (FTS)", () => {
 // =============================================================================
 
 describe("Vector Search", () => {
+  let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasEmbeddings = false;
 
   beforeAll(async () => {
-    db = getDb();
+    store = createStore();
+    db = store.db;
 
     // Check if embeddings already exist (from previous test run)
     const vecTable = db.prepare(
@@ -174,7 +176,7 @@ describe("Vector Search", () => {
 
     // Generate embeddings for test documents
     const llm = getDefaultLlamaCpp();
-    ensureVecTable(db, 768); // embeddinggemma uses 768 dimensions
+    store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
 
     const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
@@ -185,9 +187,10 @@ describe("Vector Search", () => {
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
 
       // Chunk and embed
-      const chunks = await chunkDocumentByTokens(content, llm);
+      const chunks = await chunkDocumentByTokens(content);
       for (let seq = 0; seq < chunks.length; seq++) {
         const chunk = chunks[seq];
+        if (!chunk) continue;
         const formatted = formatDocForEmbedding(chunk.text, title);
         const result = await llm.embed(formatted, { model: DEFAULT_EMBED_MODEL, isQuery: false });
         if (result?.embedding) {
@@ -200,6 +203,10 @@ describe("Vector Search", () => {
     }
     hasEmbeddings = true;
   }, 120000); // 2 minute timeout for embedding generation
+
+  afterAll(() => {
+    store.close();
+  });
 
   // Note: Don't dispose here - Hybrid tests also use llama.
   // Dispose happens in the global afterAll.
@@ -258,11 +265,13 @@ describe("Vector Search", () => {
 // =============================================================================
 
 describe("Hybrid Search (RRF)", () => {
+  let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasVectors = false;
 
   beforeAll(() => {
-    db = getDb();
+    store = createStore();
+    db = store.db;
     // Check if vectors exist
     const vecTable = db.prepare(
       `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -271,6 +280,10 @@ describe("Hybrid Search (RRF)", () => {
       const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
       hasVectors = count.cnt > 0;
     }
+  });
+
+  afterAll(() => {
+    store.close();
   });
 
   // Helper: run hybrid search with RRF fusion
@@ -392,6 +405,8 @@ describe("Hybrid Search (RRF)", () => {
 // Cleanup
 // =============================================================================
 
-afterAll(() => {
+afterAll(async () => {
+  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
+  await disposeDefaultLlamaCpp();
   rmSync(tempDir, { recursive: true, force: true });
 });

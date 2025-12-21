@@ -402,7 +402,7 @@ describe("CLI Add-Context Command", () => {
   });
 
   test("requires path and text arguments", async () => {
-    const { stderr, exitCode } = await runQmd(["add-context"], { dbPath: localDbPath, configDir: localConfigDir });
+    const { stderr, exitCode } = await runQmd(["context", "add"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(1);
     // Error message goes to stderr
     expect(stderr).toContain("Usage:");

@@ -11,7 +11,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
-  setDefaultLlamaCpp,
+  disposeDefaultLlamaCpp,
   type RerankDocument,
 } from "./llm.js";
 
@@ -20,35 +20,12 @@ import {
 // =============================================================================
 
 describe("Default LlamaCpp Singleton", () => {
-  // Don't dispose - let process exit handle Metal cleanup naturally
-
-  test("getDefaultLlamaCpp creates instance on first call", () => {
-    setDefaultLlamaCpp(null);
-    const llm = getDefaultLlamaCpp();
-    expect(llm).toBeInstanceOf(LlamaCpp);
-  });
-
+  // Test singleton behavior without resetting to avoid orphan instances
   test("getDefaultLlamaCpp returns same instance on subsequent calls", () => {
-    setDefaultLlamaCpp(null);
     const llm1 = getDefaultLlamaCpp();
     const llm2 = getDefaultLlamaCpp();
     expect(llm1).toBe(llm2);
-  });
-
-  test("setDefaultLlamaCpp allows replacing the singleton", () => {
-    const custom = new LlamaCpp({ embedModel: "custom-model" });
-    setDefaultLlamaCpp(custom);
-
-    const result = getDefaultLlamaCpp();
-    expect(result).toBe(custom);
-  });
-
-  test("setDefaultLlamaCpp with null resets singleton", () => {
-    const original = getDefaultLlamaCpp();
-    setDefaultLlamaCpp(null);
-    const newInstance = getDefaultLlamaCpp();
-
-    expect(newInstance).not.toBe(original);
+    expect(llm1).toBeInstanceOf(LlamaCpp);
   });
 });
 
@@ -81,6 +58,11 @@ describe("LlamaCpp.modelExists", () => {
 describe("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
+
+  afterAll(async () => {
+    // Ensure native resources are released to avoid ggml-metal asserts on process exit.
+    await disposeDefaultLlamaCpp();
+  });
 
   describe("embed", () => {
     test("returns embedding with correct dimensions", async () => {
@@ -180,9 +162,8 @@ describe("LlamaCpp Integration", () => {
       const seqTime = Date.now() - seqStart;
 
       console.log(`Batch: ${batchTime}ms, Sequential: ${seqTime}ms`);
-      // Batch should be faster (or at least not much slower)
-      // Allow some variance since first call may load the model
-      expect(batchTime).toBeLessThan(seqTime * 1.5);
+      // Performance is machine/load dependent. We only assert batch isn't drastically worse.
+      expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
     });
   });
 

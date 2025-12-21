@@ -4,14 +4,10 @@ import { Glob, $ } from "bun";
 import { parseArgs } from "util";
 import * as sqliteVec from "sqlite-vec";
 import {
-  getDb,
-  closeDb,
-  getDbPath,
   getPwd,
   getRealPath,
   homedir,
   resolve,
-  setCustomIndexName,
   enableProductionMode,
   searchFTS,
   searchVec,
@@ -28,8 +24,6 @@ import {
   getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
-  getDocument as storeGetDocument,
-  getMultipleDocuments as storeMultiGetDocuments,
   getStatus,
   hashContent,
   extractTitle,
@@ -37,7 +31,6 @@ import {
   formatQueryForEmbedding,
   chunkDocument,
   chunkDocumentByTokens,
-  ensureVecTable,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -59,7 +52,6 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   cleanupOrphanedVectors,
-  cleanupDuplicateCollections,
   vacuumDatabase,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
@@ -69,6 +61,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  createStore,
+  getDefaultDbPath,
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type ExpandedQuery } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
@@ -91,6 +85,46 @@ import {
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
 enableProductionMode();
+
+// =============================================================================
+// Store/DB lifecycle (no legacy singletons in store.ts)
+// =============================================================================
+
+let store: ReturnType<typeof createStore> | null = null;
+let storeDbPathOverride: string | undefined;
+
+function getStore(): ReturnType<typeof createStore> {
+  if (!store) {
+    store = createStore(storeDbPathOverride);
+  }
+  return store;
+}
+
+function getDb(): Database {
+  return getStore().db;
+}
+
+function closeDb(): void {
+  if (store) {
+    store.close();
+    store = null;
+  }
+}
+
+function getDbPath(): string {
+  return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
+}
+
+function setIndexName(name: string | null): void {
+  storeDbPathOverride = name ? getDefaultDbPath(name) : undefined;
+  // Reset open handle so next use opens the new index
+  closeDb();
+}
+
+function ensureVecTable(_db: Database, dimensions: number): void {
+  // Store owns the DB; ignore `_db` and ensure vec table on the active store
+  getStore().ensureVecTable(dimensions);
+}
 
 // Terminal colors (respects NO_COLOR env)
 const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
@@ -239,8 +273,8 @@ function showStatus(): void {
   const dbPath = getDbPath();
   const db = getDb();
 
-  // Cleanup any duplicate collections
-  cleanupDuplicateCollections(db);
+  // Collections are defined in YAML; no duplicate cleanup needed.
+  // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Index size
   let indexSize = 0;
@@ -336,7 +370,7 @@ function showStatus(): void {
 
 async function updateCollections(): Promise<void> {
   const db = getDb();
-  cleanupDuplicateCollections(db);
+  // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Clear Ollama cache on update
   clearCache(db);
@@ -1679,47 +1713,6 @@ type OutputOptions = {
   lineNumbers?: boolean; // Add line numbers to output
 };
 
-// Extract snippet with more context lines for CLI display
-function extractSnippetWithContext(body: string, query: string, contextLines = 3, chunkPos?: number): { line: number; snippet: string; hasMatch: boolean } {
-  // If chunkPos provided, focus search on that area
-  let lineOffset = 0;
-  let searchBody = body;
-  if (chunkPos && chunkPos > 0) {
-    const contextStart = Math.max(0, chunkPos - 200);
-    searchBody = body.slice(contextStart);
-    if (contextStart > 0) {
-      lineOffset = body.slice(0, contextStart).split('\n').length - 1;
-    }
-  }
-
-  const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-  let bestLine = 0, bestScore = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const lineLower = lines[i].toLowerCase();
-    let score = 0;
-    for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestLine = i;
-    }
-  }
-
-  // No query match found - return beginning of chunk area or file
-  if (bestScore <= 0) {
-    const preview = lines.slice(0, contextLines * 2).join('\n').trim();
-    return { line: lineOffset + 1, snippet: preview, hasMatch: false };
-  }
-
-  const startLine = Math.max(0, bestLine - contextLines);
-  const endLine = Math.min(lines.length, bestLine + contextLines + 1);
-  const snippet = lines.slice(startLine, endLine).join('\n').trim();
-  return { line: lineOffset + bestLine + 1, snippet, hasMatch: true };
-}
-
 // Highlight query terms in text (skip short words < 3 chars)
 function highlightTerms(text: string, query: string): string {
   if (!useColor) return text;
@@ -1798,11 +1791,14 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
-      const { line, snippet, hasMatch } = extractSnippetWithContext(row.body, query, 2, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
       const path = toQmdPath(row.displayPath);
+      // Only show :line if we actually found a term match in the snippet body (exclude header line).
+      const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
+      const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
       console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
@@ -1822,7 +1818,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       console.log(`Score: ${c.bold}${score}${c.reset}`);
       console.log();
 
-      // Snippet with highlighting (no leading | chars for better word wrap)
+      // Snippet with highlighting (diff-style header included)
       let displaySnippet = opts.lineNumbers ? addLineNumbers(snippet, line) : snippet;
       const highlighted = highlightTerms(displaySnippet, query);
       console.log(highlighted);
@@ -2009,7 +2005,6 @@ async function expandQueryStructured(query: string, includeLexical: boolean = tr
   return expanded;
 }
 
-// Legacy wrapper for backward compatibility
 async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database): Promise<string[]> {
   const expanded = await expandQueryStructured(query, true);
   const queries = [query];
@@ -2041,15 +2036,25 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
-  // Strong signal = top result has high normalized score (> 0.7)
-  const hasStrongSignal = initialFts.length > 0 && initialFts[0].score > 0.7;
+  // Strong signal = top result is strong AND clearly separated from runner-up.
+  // This avoids skipping expansion when BM25 has lots of mediocre matches.
+  const topScore = initialFts[0]?.score ?? 0;
+  const secondScore = initialFts[1]?.score ?? 0;
+  const hasStrongSignal = initialFts.length > 0 && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
 
   let ftsQueries: string[] = [query];
   let vectorQueries: string[] = [query];
 
   if (hasStrongSignal) {
     // Strong BM25 signal - skip expensive LLM expansion
-    process.stderr.write(`${c.dim}Strong BM25 signal (${initialFts[0].score.toFixed(2)}) - skipping expansion${c.reset}\n`);
+    process.stderr.write(`${c.dim}Strong BM25 signal (${topScore.toFixed(2)}) - skipping expansion${c.reset}\n`);
+    // Still log the "expansion tree" in the same style as vsearch for consistency.
+    {
+      const lines: string[] = [];
+      lines.push(`${c.dim}├─ ${query} · (lexical+vector)${c.reset}`);
+      lines[lines.length - 1] = lines[lines.length - 1].replace('├─', '└─');
+      for (const line of lines) process.stderr.write(line + '\n');
+    }
   } else {
     // Weak signal - expand query for better recall
     const expanded = await expandQueryStructured(query, true);
@@ -2102,7 +2107,9 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Give 2x weight to original query results (first 2 lists: FTS + vector)
   const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
-  const candidates = fused.slice(0, 30); // Over-retrieve for reranking
+  // Hard cap reranking for latency/cost. We rerank per-document (best chunk only).
+  const RERANK_DOC_LIMIT = 40;
+  const candidates = fused.slice(0, RERANK_DOC_LIMIT);
 
   if (candidates.length === 0) {
     console.log("No results found.");
@@ -2112,69 +2119,44 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   // Rerank multiple chunks per document, then aggregate scores
   // This improves ranking for long documents where keyword-matched chunk isn't always best
-  const MAX_CHUNKS_PER_DOC = 3;
+  // We only rerank ONE chunk per document (best chunk by a simple keyword heuristic),
+  // so we never rerank more than RERANK_DOC_LIMIT items.
   const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; selectedIndices: number[] }>();
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
+  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   for (const c of candidates) {
     const chunks = chunkDocument(c.body);
-    if (chunks.length <= MAX_CHUNKS_PER_DOC) {
-      // Small document - rerank all chunks
-      for (let i = 0; i < chunks.length; i++) {
-        chunksToRerank.push({ file: c.file, text: chunks[i].text, chunkIdx: i });
-      }
-      docChunkMap.set(c.file, { chunks, selectedIndices: chunks.map((_, i) => i) });
-    } else {
-      // Score all chunks by keyword match, select top MAX_CHUNKS_PER_DOC
-      const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-      const scored = chunks.map((chunk, idx) => {
-        const chunkLower = chunk.text.toLowerCase();
-        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-        return { idx, score };
-      });
-      scored.sort((a, b) => b.score - a.score);
-      const selectedIndices = scored.slice(0, MAX_CHUNKS_PER_DOC).map(s => s.idx);
+    if (chunks.length === 0) continue;
 
-      for (const idx of selectedIndices) {
-        chunksToRerank.push({ file: c.file, text: chunks[idx].text, chunkIdx: idx });
+    // Choose best chunk by keyword matches; fall back to first chunk.
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkLower = chunks[i]!.text.toLowerCase();
+      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
       }
-      docChunkMap.set(c.file, { chunks, selectedIndices });
     }
+
+    chunksToRerank.push({ file: c.file, text: chunks[bestIdx]!.text, chunkIdx: bestIdx });
+    docChunkMap.set(c.file, { chunks, bestIdx });
   }
 
-  // Rerank all selected chunks (with caching)
-  // Use file:chunkIdx as unique identifier for reranker
+  // Rerank selected chunks (with caching). One chunk per doc -> one rerank item per doc.
   const reranked = await rerank(
     query,
-    chunksToRerank.map(c => ({ file: `${c.file}:${c.chunkIdx}`, text: c.text })),
+    chunksToRerank.map(c => ({ file: c.file, text: c.text })),
     rerankModel,
     db
   );
 
-  // Aggregate chunk scores back to document level using top-2 average
-  // (or max if only 1 chunk) - this balances best chunk with consistency
-  const docScores = new Map<string, { scores: number[]; bestChunkIdx: number }>();
-  for (const r of reranked) {
-    const [file, chunkIdxStr] = r.file.split(/:(\d+)$/);
-    const chunkIdx = parseInt(chunkIdxStr || "0");
-    const existing = docScores.get(file);
-    if (existing) {
-      existing.scores.push(r.score);
-      if (r.score > (existing.scores[0] || 0)) {
-        existing.bestChunkIdx = chunkIdx;
-      }
-    } else {
-      docScores.set(file, { scores: [r.score], bestChunkIdx: chunkIdx });
-    }
-  }
-
-  // Compute aggregated score: top-2 average (rewards consistency across chunks)
   const aggregatedScores = new Map<string, { score: number; bestChunkIdx: number }>();
-  for (const [file, { scores, bestChunkIdx }] of docScores) {
-    scores.sort((a, b) => b - a);
-    const topScores = scores.slice(0, 2);
-    const avgScore = topScores.reduce((a, b) => a + b, 0) / topScores.length;
-    aggregatedScores.set(file, { score: avgScore, bestChunkIdx });
+  for (const r of reranked) {
+    const chunkInfo = docChunkMap.get(r.file);
+    aggregatedScores.set(r.file, { score: r.score, bestChunkIdx: chunkInfo?.bestIdx ?? 0 });
   }
 
   // Blend RRF position score with aggregated reranker score using position-aware weights
@@ -2201,8 +2183,8 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     const candidate = candidateMap.get(file);
     // Use the best-scoring chunk's text for the body (better for snippets)
     const chunkInfo = docChunkMap.get(file);
-    const chunkBody = chunkInfo ? chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0].text : candidate?.body || "";
-    const chunkPos = chunkInfo ? chunkInfo.chunks[bestChunkIdx]?.pos || 0 : 0;
+    const chunkBody = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0]!.text) : candidate?.body || "";
+    const chunkPos = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.pos || 0) : 0;
     return {
       file,
       displayPath: candidate?.displayPath || "",
@@ -2263,9 +2245,9 @@ function parseCLI() {
     strict: false, // Allow unknown options to pass through
   });
 
-  // Set global index name in store
+  // Select index name (default: "index")
   if (values.index) {
-    setCustomIndexName(values.index);
+    setIndexName(values.index);
   }
 
   // Determine output format
@@ -2440,26 +2422,6 @@ switch (cli.command) {
         console.error("Available: add, list, check, rm");
         process.exit(1);
     }
-    break;
-  }
-
-  // Legacy alias for backwards compatibility
-  case "add-context": {
-    console.error(`${c.yellow}Note: 'qmd add-context' is deprecated. Use 'qmd context add' instead.${c.reset}`);
-    if (cli.args.length === 0) {
-      console.error("Usage: qmd context add [path] \"text\"");
-      process.exit(1);
-    }
-    let pathArg: string | undefined;
-    let contextText: string;
-    if (cli.args.length === 1) {
-      pathArg = undefined;
-      contextText = cli.args[0];
-    } else {
-      pathArg = cli.args[0];
-      contextText = cli.args.slice(1).join(" ");
-    }
-    await contextAdd(pathArg, contextText);
     break;
   }
 

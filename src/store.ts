@@ -63,7 +63,10 @@ export function homedir(): string {
 }
 
 export function resolve(...paths: string[]): string {
-  let result = paths[0].startsWith('/') ? '' : Bun.env.PWD || process.cwd();
+  if (paths.length === 0) {
+    throw new Error("resolve: at least one path segment is required");
+  }
+  let result = paths[0]!.startsWith('/') ? '' : Bun.env.PWD || process.cwd();
   for (const p of paths) {
     if (p.startsWith('/')) {
       result = p;
@@ -175,10 +178,10 @@ export function parseVirtualPath(virtualPath: string): VirtualPath | null {
   // Match: qmd://collection-name[/optional-path]
   // Allows: qmd://name, qmd://name/, qmd://name/path
   const match = normalized.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
-  if (!match) return null;
+  if (!match?.[1]) return null;
   return {
     collectionName: match[1],
-    path: match[2] || '',  // Empty string for collection root
+    path: match[2] ?? '',  // Empty string for collection root
   };
 }
 
@@ -309,7 +312,7 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
-  // Cache table for LLM API calls (table name kept for backwards compatibility)
+  // Cache table for LLM API calls
   db.exec(`
     CREATE TABLE IF NOT EXISTS llm_cache (
       hash TEXT PRIMARY KEY,
@@ -390,7 +393,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
     const hasHashSeq = tableInfo.sql.includes('hash_seq');
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
-    if (match && parseInt(match[1]) === dimensions && hasHashSeq && hasCosine) return;
+    const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
+    if (existingDims === dimensions && hasHashSeq && hasCosine) return;
     // Table exists but wrong schema - need to rebuild
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
@@ -423,7 +427,6 @@ export type Store = {
   deleteInactiveDocuments: () => number;
   cleanupOrphanedContent: () => number;
   cleanupOrphanedVectors: () => number;
-  cleanupDuplicateCollections: () => number;
   vacuumDatabase: () => void;
 
   // Context
@@ -452,10 +455,6 @@ export type Store = {
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
   findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
-
-  // Legacy compatibility
-  getDocument: (filename: string, fromLine?: number, maxLines?: number) => (DocumentResult & { body: string }) | DocumentNotFound;
-  getMultipleDocuments: (pattern: string, maxLines?: number, maxBytes?: number) => { files: MultiGetFile[]; errors: string[] };
 
   // Fuzzy matching and docid lookup
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
@@ -511,7 +510,6 @@ export function createStore(dbPath?: string): Store {
     deleteInactiveDocuments: () => deleteInactiveDocuments(db),
     cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
-    cleanupDuplicateCollections: () => cleanupDuplicateCollections(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
@@ -541,10 +539,6 @@ export function createStore(dbPath?: string): Store {
     getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => getDocumentBody(db, doc, fromLine, maxLines),
     findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => findDocuments(db, pattern, options),
 
-    // Legacy compatibility
-    getDocument: (filename: string, fromLine?: number, maxLines?: number) => getDocument(db, filename, fromLine, maxLines),
-    getMultipleDocuments: (pattern: string, maxLines?: number, maxBytes?: number) => getMultipleDocuments(db, pattern, maxLines, maxBytes),
-
     // Fuzzy matching and docid lookup
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
     matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
@@ -564,46 +558,6 @@ export function createStore(dbPath?: string): Store {
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
   };
-}
-
-// =============================================================================
-// Legacy compatibility - will be removed
-// =============================================================================
-
-let _legacyDb: Database | null = null;
-let _legacyDbPath: string | null = null;
-
-/** @deprecated Use createStore() instead */
-export function setCustomIndexName(name: string | null): void {
-  _legacyDbPath = name ? getDefaultDbPath(name) : null;
-  _legacyDb = null; // Reset so next getDb() creates new connection
-}
-
-/** @deprecated Use createStore() instead */
-export function getDbPath(): string {
-  return _legacyDbPath || getDefaultDbPath();
-}
-
-/** @deprecated Use createStore() instead */
-export function getDb(): Database {
-  if (!_legacyDb) {
-    _legacyDb = new Database(getDbPath());
-    initializeDatabase(_legacyDb);
-  }
-  return _legacyDb;
-}
-
-/** @deprecated Use store.db.close() instead. Closes the legacy db and resets singleton. */
-export function closeDb(): void {
-  if (_legacyDb) {
-    _legacyDb.close();
-    _legacyDb = null;
-  }
-}
-
-/** @deprecated Use store.ensureVecTable() instead */
-export function ensureVecTable(db: Database, dimensions: number): void {
-  ensureVecTableInternal(db, dimensions);
 }
 
 // =============================================================================
@@ -892,16 +846,6 @@ export function cleanupOrphanedVectors(db: Database): number {
 }
 
 /**
- * Remove duplicate collections, keeping the oldest one per (pwd, glob_pattern).
- * NOTE: This function is deprecated since collections are now managed in YAML.
- * Kept for backwards compatibility but returns 0.
- */
-export function cleanupDuplicateCollections(db: Database): number {
-  // Collections are now managed in YAML, no cleanup needed
-  return 0;
-}
-
-/**
  * Run VACUUM to reclaim unused space in the database.
  * This operation rebuilds the database file to eliminate fragmentation.
  */
@@ -922,10 +866,10 @@ export async function hashContent(content: string): Promise<string> {
 export function extractTitle(content: string, filename: string): string {
   const match = content.match(/^##?\s+(.+)$/m);
   if (match) {
-    const title = match[1].trim();
+    const title = (match[1] ?? "").trim();
     if (title === "📝 Notes" || title === "Notes") {
       const nextMatch = content.match(/^##\s+(.+)$/m);
-      if (nextMatch) return nextMatch[1].trim();
+      if (nextMatch?.[1]) return nextMatch[1].trim();
     }
     return title;
   }
@@ -1023,7 +967,6 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
-// Re-export from llm.ts for backwards compatibility
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
 export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
@@ -1093,7 +1036,8 @@ export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHA
       break;
     }
     charPos = endPos - overlapChars;
-    if (charPos <= chunks[chunks.length - 1].pos) {
+    const lastChunkPos = chunks.at(-1)!.pos;
+    if (charPos <= lastChunkPos) {
       // Prevent infinite loop - move forward at least a bit
       charPos = endPos;
     }
@@ -1200,7 +1144,8 @@ export async function chunkDocumentByTokens(
     // Calculate overlap in characters based on token ratio
     const overlapChars = Math.floor(overlapTokens * (slice.length / sliceTokens));
     charPos = estimatedEnd - overlapChars;
-    if (charPos <= chunks[chunks.length - 1].pos) {
+    const lastChunkPos = chunks.at(-1)!.pos;
+    if (charPos <= lastChunkPos) {
       charPos = estimatedEnd;  // Prevent infinite loop
     }
   }
@@ -1216,15 +1161,20 @@ function levenshtein(a: string, b: string): number {
   const m = a.length, n = b.length;
   if (m === 0) return n;
   if (n === 0) return m;
-  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) => [i]);
-  for (let j = 1; j <= n; j++) dp[0][j] = j;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i]![0] = i;
+  for (let j = 0; j <= n; j++) dp[0]![j] = j;
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      dp[i]![j] = Math.min(
+        dp[i - 1]![j]! + 1,
+        dp[i]![j - 1]! + 1,
+        dp[i - 1]![j - 1]! + cost
+      );
     }
   }
-  return dp[m][n];
+  return dp[m]![n]!;
 }
 
 /**
@@ -1341,7 +1291,8 @@ export function getContextForPath(db: Database, collectionName: string, path: st
 }
 
 /**
- * Legacy function for backward compatibility - resolves filepath to collection+path first
+ * Get context for a file path (virtual or filesystem).
+ * Resolves the collection and relative path using the YAML collections config.
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
   // Handle undefined or null filepath
@@ -1352,17 +1303,15 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const config = collectionsLoadConfig();
 
   // Parse virtual path format: qmd://collection/path
-  let collectionName: string;
-  let relativePath: string;
+  let collectionName: string | null = null;
+  let relativePath: string | null = null;
 
-  if (filepath.startsWith('qmd://')) {
-    // Virtual path: qmd://collection/path
-    const parts = filepath.slice(6).split('/'); // Remove 'qmd://'
-    collectionName = parts[0];
-    relativePath = parts.slice(1).join('/');
+  const parsedVirtual = filepath.startsWith('qmd://') ? parseVirtualPath(filepath) : null;
+  if (parsedVirtual) {
+    collectionName = parsedVirtual.collectionName;
+    relativePath = parsedVirtual.path;
   } else {
     // Filesystem path: find which collection this absolute path belongs to
-    let found = false;
     for (const coll of collections) {
       // Skip collections with missing paths
       if (!coll || !coll.path) continue;
@@ -1373,12 +1322,11 @@ export function getContextForFile(db: Database, filepath: string): string | null
         relativePath = filepath.startsWith(coll.path + '/')
           ? filepath.slice(coll.path.length + 1)
           : '';
-        found = true;
         break;
       }
     }
 
-    if (!found) return null;
+    if (!collectionName || relativePath === null) return null;
   }
 
   // Get the collection from config
@@ -1655,7 +1603,8 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
   for (const { path } of paths) {
     const parts = path.split('/').filter(Boolean);
     if (parts.length > 1) {
-      topLevelDirs.add(parts[0]);
+      const dir = parts[0];
+      if (dir) topLevelDirs.add(dir);
     }
   }
 
@@ -1708,7 +1657,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as score
+      bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
@@ -1724,14 +1673,16 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(String(collectionId));
   }
 
-  sql += ` ORDER BY score LIMIT ?`;
+  // bm25 lower is better; sort ascending.
+  sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; score: number }[];
-
-  const maxScore = rows.length > 0 ? Math.max(...rows.map(r => Math.abs(r.score))) : 1;
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+    // Convert bm25 (lower is better) into a stable (0..1] score where higher is better.
+    // Avoid per-query normalization so "strong signal" heuristics can work.
+    const score = 1 / (1 + Math.max(0, row.bm25_score));
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -1743,7 +1694,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
-      score: Math.abs(row.score) / maxScore,
+      score,
       source: "fts" as const,
     };
   });
@@ -1953,10 +1904,12 @@ export function reciprocalRankFusion(
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
+    if (!list) continue;
     const weight = weights[listIdx] ?? 1.0;
 
     for (let rank = 0; rank < list.length; rank++) {
       const result = list[rank];
+      if (!result) continue;
       const rrfContribution = weight / (k + rank + 1);
       const existing = scores.get(result.file);
 
@@ -1992,6 +1945,7 @@ export function reciprocalRankFusion(
 // =============================================================================
 
 type DbDocRow = {
+  virtual_path: string;
   display_path: string;
   title: string;
   hash: string;
@@ -2122,7 +2076,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
  * Optionally slice by line range
  */
 export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
-  const filepath = 'filepath' in doc ? doc.filepath : doc.filepath;
+  const filepath = doc.filepath;
 
   // Try to resolve document by filepath (absolute or virtual)
   let row: { body: string } | null = null;
@@ -2165,34 +2119,6 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   }
 
   return body;
-}
-
-/**
- * Legacy function for backwards compatibility
- * Combines findDocument + getDocumentBody with line slicing
- */
-export function getDocument(db: Database, filename: string, fromLine?: number, maxLines?: number): (DocumentResult & { body: string }) | DocumentNotFound {
-  // Parse :line suffix
-  let parsedFromLine = fromLine;
-  let filepath = filename;
-  const colonMatch = filepath.match(/:(\d+)$/);
-  if (colonMatch && !parsedFromLine) {
-    parsedFromLine = parseInt(colonMatch[1], 10);
-    filepath = filepath.slice(0, -colonMatch[0].length);
-  }
-
-  const result = findDocument(db, filepath, { includeBody: true });
-  if ("error" in result) return result;
-
-  let body = result.body || "";
-  if (parsedFromLine !== undefined || maxLines !== undefined) {
-    const lines = body.split('\n');
-    const start = (parsedFromLine || 1) - 1;
-    const end = maxLines !== undefined ? start + maxLines : lines.length;
-    body = lines.slice(start, end).join('\n');
-  }
-
-  return { ...result, body };
 }
 
 /**
@@ -2305,65 +2231,6 @@ export function findDocuments(
   return { docs: results, errors };
 }
 
-/**
- * Legacy function for backwards compatibility
- */
-export function getMultipleDocuments(db: Database, pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES): { files: MultiGetFile[]; errors: string[] } {
-  const { docs, errors } = findDocuments(db, pattern, { includeBody: true, maxBytes });
-
-  const files: MultiGetFile[] = docs.map(result => {
-    if (result.skipped) {
-      return {
-        filepath: result.doc.filepath,
-        displayPath: result.doc.displayPath,
-        title: "",
-        body: "",
-        context: null,
-        skipped: true as const,
-        skipReason: result.skipReason,
-      };
-    }
-
-    let body = result.doc.body || "";
-    if (maxLines !== undefined) {
-      const lines = body.split('\n');
-      body = lines.slice(0, maxLines).join('\n');
-      if (lines.length > maxLines) {
-        body += `\n\n[... truncated ${lines.length - maxLines} more lines]`;
-      }
-    }
-
-    return {
-      filepath: result.doc.filepath,
-      displayPath: result.doc.displayPath,
-      title: result.doc.title,
-      body,
-      context: result.doc.context,
-      skipped: false as const,
-    };
-  });
-
-  return { files, errors };
-}
-
-// Keep the old MultiGetFile type for backwards compatibility
-export type MultiGetFile = {
-  filepath: string;
-  displayPath: string;
-  title: string;
-  body: string;
-  context: string | null;
-  skipped: false;
-} | {
-  filepath: string;
-  displayPath: string;
-  title: string;
-  body: string;
-  context: string | null;
-  skipped: true;
-  skipReason: string;
-};
-
 // =============================================================================
 // Status
 // =============================================================================
@@ -2441,7 +2308,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
-    const lineLower = lines[i].toLowerCase();
+    const lineLower = (lines[i] ?? "").toLowerCase();
     let score = 0;
     for (const term of queryTerms) {
       if (lineLower.includes(term)) score++;
@@ -2456,6 +2323,13 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   const end = Math.min(lines.length, bestLine + 3);
   const snippetLines = lines.slice(start, end);
   let snippetText = snippetLines.join('\n');
+
+  // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
+  // fall back to a full-document snippet so we always show something useful.
+  if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
+    return extractSnippet(body, query, maxLen, undefined);
+  }
+
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
 
   const absoluteStart = lineOffset + start + 1; // 1-indexed

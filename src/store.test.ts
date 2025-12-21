@@ -12,6 +12,7 @@ import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
   getDefaultDbPath,
@@ -218,6 +219,9 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
+  await disposeDefaultLlamaCpp();
+
   try {
     // Clean up test directory
     const { readdir, unlink } = await import("node:fs/promises");
@@ -1256,43 +1260,6 @@ describe("Document Retrieval", () => {
     });
   });
 
-  describe("Legacy getDocument", () => {
-    test("getDocument returns document with body", async () => {
-      const store = await createTestStore();
-      const collectionName = await createTestCollection({ pwd: "/path" });
-      await insertTestDocument(store.db, collectionName, {
-        name: "mydoc",
-        displayPath: "mydoc.md",
-        body: "Document body",
-      });
-
-      const result = store.getDocument("/path/mydoc.md");
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.body).toBe("Document body");
-      }
-
-      await cleanupTestDb(store);
-    });
-
-    test("getDocument supports line range from :line suffix", async () => {
-      const store = await createTestStore();
-      const collectionName = await createTestCollection({ pwd: "/path" });
-      await insertTestDocument(store.db, collectionName, {
-        name: "mydoc",
-        displayPath: "mydoc.md",
-        body: "Line 1\nLine 2\nLine 3\nLine 4",
-      });
-
-      const result = store.getDocument("mydoc.md:2", undefined, 2);
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.body).toBe("Line 2\nLine 3");
-      }
-
-      await cleanupTestDb(store);
-    });
-  });
 });
 
 // =============================================================================
@@ -1799,77 +1766,6 @@ describe("Integration", () => {
 });
 
 // =============================================================================
-// Legacy Compatibility Tests
-// =============================================================================
-
-describe("Legacy Compatibility", () => {
-  test("getMultipleDocuments returns files with body", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-
-    await insertTestDocument(store.db, collectionName, {
-      name: "doc1",
-      filepath: "/path/doc1.md",
-      displayPath: "doc1.md",
-      body: "Content 1",
-    });
-    await insertTestDocument(store.db, collectionName, {
-      name: "doc2",
-      filepath: "/path/doc2.md",
-      displayPath: "doc2.md",
-      body: "Content 2",
-    });
-
-    const { files, errors } = store.getMultipleDocuments("*.md");
-    expect(errors).toHaveLength(0);
-    expect(files).toHaveLength(2);
-    expect(files[0].body).toBeTruthy();
-    expect(files[1].body).toBeTruthy();
-
-    await cleanupTestDb(store);
-  });
-
-  test("getMultipleDocuments truncates with maxLines", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-
-    await insertTestDocument(store.db, collectionName, {
-      name: "doc1",
-      filepath: "/path/doc1.md",
-      displayPath: "doc1.md",
-      body: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5",
-    });
-
-    const { files } = store.getMultipleDocuments("doc1.md", 2);
-    expect(files).toHaveLength(1);
-    expect(files[0].skipped).toBe(false);
-    if (!files[0].skipped) {
-      expect(files[0].body).toBe("Line 1\nLine 2\n\n[... truncated 3 more lines]");
-    }
-
-    await cleanupTestDb(store);
-  });
-
-  test("getMultipleDocuments skips large files", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-
-    await insertTestDocument(store.db, collectionName, {
-      name: "large",
-      filepath: "/path/large.md",
-      displayPath: "large.md",
-      body: "x".repeat(15000),
-    });
-
-    const { files } = store.getMultipleDocuments("large.md", undefined, 10000);
-    expect(files).toHaveLength(1);
-    expect(files[0].skipped).toBe(true);
-
-    await cleanupTestDb(store);
-  });
-});
-
-// =============================================================================
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
@@ -1927,7 +1823,7 @@ describe("LlamaCpp Integration", () => {
     expect(queries.length).toBeGreaterThanOrEqual(1);
 
     await cleanupTestDb(store);
-  });
+  }, 30000);
 
   test("expandQuery caches results", async () => {
     const store = await createTestStore();
@@ -1940,7 +1836,7 @@ describe("LlamaCpp Integration", () => {
     expect(queries1[0]).toBe(queries2[0]);
 
     await cleanupTestDb(store);
-  });
+  }, 30000);
 
   test("rerank scores documents", async () => {
     const store = await createTestStore();

@@ -6,54 +6,28 @@
 
 # Global context applied to all collections
 # Use this for universal search instructions or patterns
-global_context: "If you see relevant [[WikiWord]] you can do a search for WikiWord to get more context on the matter"
+global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
 # Collection definitions
 collections:
   # Meeting notes
   Meetings:
-    path: /Users/tobi/Documents/Meetings
+    path: ~/Documents/Meetings
     pattern: "**/*.md"
     context:
       "/": "Meeting notes and summaries"
 
-  # Archived content from Shopify
-  archive:
-    path: /Users/tobi/src/github.com/Shopify/archive/obsidian/archive
-    pattern: "**/*.md"
-    context:
-      # Context can be defined at any path level
-      "/Board of Directors": "Public communications with the Shopify BOD"
-      "/Context/": "Shopify Internal Podcasts, almost all of them hosted by Tobi"
-      "/Summit/": "Tobi's major internal Shopify Summit Keynotes"
-      "/": "Shopify archive - historical documents and communications"
-
   # Daily journal entries
   journals:
-    path: /Users/tobi/src/github.com/tobi/Brain/journals
+    path: ~/Documents/Notes
     pattern: "**/*.md"
     context:
-      "/2024": "Daily notes from 2024"
-      "/2025": "Daily notes from 2025"
-      "/": "Logseq - daily notes. Unstructured text in logseq bullet point format"
+      "/journal/2024": "Daily notes from 2024"
+      "/journal/2025": "Daily notes from 2025"
+      "/": "Notes vault"
 
-  # Knowledge base pages
-  pages:
-    path: /Users/tobi/src/github.com/tobi/Brain/pages
-    pattern: "**/*.md"
-    context:
-      "/": "Logseq knowledge base - structured notes and reference material"
-
-  # Technical RFCs
-  rfcs:
-    path: /Users/tobi/src/github.com/Shopify/codex/rfcs
-    pattern: "**/*.md"
-    context:
-      "/": "Request for Comments - technical design documents"
-
-  # Thematic collections
-  themes:
-    path: /Users/tobi/src/github.com/Shopify/codex/themes
+  codex:
+    path: ~/Documents/Codex
     pattern: "**/*.md"
     context:
       "/": "Thematic collections of important concepts and discussions"

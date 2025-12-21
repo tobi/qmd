@@ -457,7 +457,16 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ file, fromLine, maxLines, lineNumbers }) => {
-      const result = store.getDocument(file, fromLine, maxLines);
+      // Support :line suffix in `file` (e.g. "foo.md:120") when fromLine isn't provided
+      let parsedFromLine = fromLine;
+      let lookup = file;
+      const colonMatch = lookup.match(/:(\d+)$/);
+      if (colonMatch && parsedFromLine === undefined) {
+        parsedFromLine = parseInt(colonMatch[1], 10);
+        lookup = lookup.slice(0, -colonMatch[0].length);
+      }
+
+      const result = store.findDocument(lookup, { includeBody: false });
 
       if ("error" in result) {
         let msg = `Document not found: ${file}`;
@@ -470,9 +479,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         };
       }
 
-      let text = result.body;
+      const body = store.getDocumentBody(result, parsedFromLine, maxLines) ?? "";
+      let text = body;
       if (lineNumbers) {
-        const startLine = fromLine || 1;
+        const startLine = parsedFromLine || 1;
         text = addLineNumbers(text, startLine);
       }
       if (result.context) {
@@ -511,9 +521,9 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      const { files, errors } = store.getMultipleDocuments(pattern, maxLines, maxBytes || DEFAULT_MULTI_GET_MAX_BYTES);
+      const { docs, errors } = store.findDocuments(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
-      if (files.length === 0 && errors.length === 0) {
+      if (docs.length === 0 && errors.length === 0) {
         return {
           content: [{ type: "text", text: `No files matched pattern: ${pattern}` }],
           isError: true,
@@ -526,29 +536,36 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         content.push({ type: "text", text: `Errors:\n${errors.join('\n')}` });
       }
 
-      for (const file of files) {
-        if (file.skipped) {
+      for (const result of docs) {
+        if (result.skipped) {
           content.push({
             type: "text",
-            text: `[SKIPPED: ${file.displayPath} - ${file.skipReason}. Use 'qmd_get' with file="${file.displayPath}" to retrieve.]`,
+            text: `[SKIPPED: ${result.doc.displayPath} - ${result.skipReason}. Use 'qmd_get' with file="${result.doc.displayPath}" to retrieve.]`,
           });
           continue;
         }
 
-        let text = file.body;
+        let text = result.doc.body || "";
+        if (maxLines !== undefined) {
+          const lines = text.split("\n");
+          text = lines.slice(0, maxLines).join("\n");
+          if (lines.length > maxLines) {
+            text += `\n\n[... truncated ${lines.length - maxLines} more lines]`;
+          }
+        }
         if (lineNumbers) {
           text = addLineNumbers(text);
         }
-        if (file.context) {
-          text = `<!-- Context: ${file.context} -->\n\n` + text;
+        if (result.doc.context) {
+          text = `<!-- Context: ${result.doc.context} -->\n\n` + text;
         }
 
         content.push({
           type: "resource",
           resource: {
-            uri: `qmd://${encodeQmdPath(file.displayPath)}`,
-            name: file.displayPath,
-            title: file.title,
+            uri: `qmd://${encodeQmdPath(result.doc.displayPath)}`,
+            name: result.doc.displayPath,
+            title: result.doc.title,
             mimeType: "text/markdown",
             text,
           },

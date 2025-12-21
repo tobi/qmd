@@ -4,7 +4,16 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import { getLlama, resolveModelFile, type Llama, type LlamaModel, type LlamaEmbeddingContext, type LlamaContext, type LlamaChatSession } from "node-llama-cpp";
+import {
+  getLlama,
+  resolveModelFile,
+  LlamaChatSession,
+  LlamaLogLevel,
+  type Llama,
+  type LlamaModel,
+  type LlamaEmbeddingContext,
+  type Token as LlamaToken,
+} from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
@@ -190,8 +199,21 @@ export type LlamaCppConfig = {
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
-  /** Inactivity timeout in ms before unloading models (default: 2 minutes, 0 to disable) */
+  /**
+   * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
+   *
+   * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
+   * contexts when idle, since contexts (and their sequences) are the heavy per-session objects.
+   * @see https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
+   */
   inactivityTimeoutMs?: number;
+  /**
+   * Whether to dispose models on inactivity (default: false).
+   *
+   * Keeping models loaded avoids repeated VRAM thrash; set to true only if you need aggressive
+   * memory reclaim.
+   */
+  disposeModelsOnInactivity?: boolean;
 };
 
 /**
@@ -205,7 +227,6 @@ export class LlamaCpp implements LLM {
   private embedModel: LlamaModel | null = null;
   private embedContext: LlamaEmbeddingContext | null = null;
   private generateModel: LlamaModel | null = null;
-  private generateContext: LlamaContext | null = null;
   private rerankModel: LlamaModel | null = null;
   private rerankContext: Awaited<ReturnType<LlamaModel["createRankingContext"]>> | null = null;
 
@@ -214,17 +235,19 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
 
-  private initPromise: Promise<void> | null = null;
+  // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
+  private embedModelLoadPromise: Promise<LlamaModel> | null = null;
+  private generateModelLoadPromise: Promise<LlamaModel> | null = null;
+  private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private inactivityTimeoutMs: number;
+  private disposeModelsOnInactivity: boolean;
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
-  // Mutex for generation to prevent "No sequences left" error with single sequence
-  private generateLock: Promise<void> = Promise.resolve();
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
@@ -232,6 +255,7 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+    this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
 
   /**
@@ -245,11 +269,11 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Only set timer if we have loaded models and timeout is enabled
-    if (this.inactivityTimeoutMs > 0 && this.hasLoadedModels()) {
+    // Only set timer if we have disposable contexts and timeout is enabled
+    if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
-        this.unloadModels().catch(err => {
-          console.error("Error unloading models:", err);
+        this.unloadIdleResources().catch(err => {
+          console.error("Error unloading idle resources:", err);
         });
       }, this.inactivityTimeoutMs);
       // Don't keep process alive just for this timer
@@ -258,17 +282,19 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Check if any models are currently loaded
+   * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
    */
-  private hasLoadedModels(): boolean {
-    return !!(this.embedModel || this.generateModel || this.rerankModel);
+  private hasLoadedContexts(): boolean {
+    return !!(this.embedContext || this.rerankContext);
   }
 
   /**
-   * Unload all models but keep the instance alive for future use.
-   * Models will be reloaded lazily on next operation.
+   * Unload idle resources but keep the instance alive for future use.
+   *
+   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
+   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
    */
-  async unloadModels(): Promise<void> {
+  async unloadIdleResources(): Promise<void> {
     // Don't unload if already disposed
     if (this.disposed) {
       return;
@@ -285,27 +311,29 @@ export class LlamaCpp implements LLM {
       await this.embedContext.dispose();
       this.embedContext = null;
     }
-    if (this.generateContext) {
-      await this.generateContext.dispose();
-      this.generateContext = null;
-    }
     if (this.rerankContext) {
       await this.rerankContext.dispose();
       this.rerankContext = null;
     }
 
-    // Dispose models
-    if (this.embedModel) {
-      await this.embedModel.dispose();
-      this.embedModel = null;
-    }
-    if (this.generateModel) {
-      await this.generateModel.dispose();
-      this.generateModel = null;
-    }
-    if (this.rerankModel) {
-      await this.rerankModel.dispose();
-      this.rerankModel = null;
+    // Optionally dispose models too (opt-in)
+    if (this.disposeModelsOnInactivity) {
+      if (this.embedModel) {
+        await this.embedModel.dispose();
+        this.embedModel = null;
+      }
+      if (this.generateModel) {
+        await this.generateModel.dispose();
+        this.generateModel = null;
+      }
+      if (this.rerankModel) {
+        await this.rerankModel.dispose();
+        this.rerankModel = null;
+      }
+      // Reset load promises so models can be reloaded later
+      this.embedModelLoadPromise = null;
+      this.generateModelLoadPromise = null;
+      this.rerankModelLoadPromise = null;
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -325,7 +353,7 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: "error" });
+      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
     }
     return this.llama;
   }
@@ -340,42 +368,107 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Load embedding model and context (lazy)
+   * Load embedding model (lazy)
+   */
+  private async ensureEmbedModel(): Promise<LlamaModel> {
+    if (this.embedModel) {
+      return this.embedModel;
+    }
+    if (this.embedModelLoadPromise) {
+      return await this.embedModelLoadPromise;
+    }
+
+    this.embedModelLoadPromise = (async () => {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.embedModelUri);
+      const model = await llama.loadModel({ modelPath });
+      this.embedModel = model;
+      return model;
+    })();
+
+    try {
+      return await this.embedModelLoadPromise;
+    } finally {
+      // Keep the resolved model cached; clear only the in-flight promise.
+      this.embedModelLoadPromise = null;
+    }
+  }
+
+  /**
+   * Load embedding context (lazy). Context can be disposed and recreated without reloading the model.
    */
   private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
     if (!this.embedContext) {
-      const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.embedModelUri);
-      this.embedModel = await llama.loadModel({ modelPath });
-      this.embedContext = await this.embedModel.createEmbeddingContext();
+      const model = await this.ensureEmbedModel();
+      this.embedContext = await model.createEmbeddingContext();
     }
     this.touchActivity();
     return this.embedContext;
   }
 
   /**
-   * Load generation model and context (lazy)
+   * Load generation model (lazy) - context is created fresh per call
    */
-  private async ensureGenerateContext(): Promise<LlamaContext> {
-    if (!this.generateContext) {
-      const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.generateModelUri);
-      this.generateModel = await llama.loadModel({ modelPath });
-      this.generateContext = await this.generateModel.createContext();
+  private async ensureGenerateModel(): Promise<LlamaModel> {
+    if (!this.generateModel) {
+      if (this.generateModelLoadPromise) {
+        return await this.generateModelLoadPromise;
+      }
+
+      this.generateModelLoadPromise = (async () => {
+        const llama = await this.ensureLlama();
+        const modelPath = await this.resolveModel(this.generateModelUri);
+        const model = await llama.loadModel({ modelPath });
+        this.generateModel = model;
+        return model;
+      })();
+
+      try {
+        await this.generateModelLoadPromise;
+      } finally {
+        this.generateModelLoadPromise = null;
+      }
     }
     this.touchActivity();
-    return this.generateContext;
+    if (!this.generateModel) {
+      throw new Error("Generate model not loaded");
+    }
+    return this.generateModel;
   }
 
   /**
-   * Load rerank model and context (lazy)
+   * Load rerank model (lazy)
+   */
+  private async ensureRerankModel(): Promise<LlamaModel> {
+    if (this.rerankModel) {
+      return this.rerankModel;
+    }
+    if (this.rerankModelLoadPromise) {
+      return await this.rerankModelLoadPromise;
+    }
+
+    this.rerankModelLoadPromise = (async () => {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.rerankModelUri);
+      const model = await llama.loadModel({ modelPath });
+      this.rerankModel = model;
+      return model;
+    })();
+
+    try {
+      return await this.rerankModelLoadPromise;
+    } finally {
+      this.rerankModelLoadPromise = null;
+    }
+  }
+
+  /**
+   * Load rerank context (lazy). Context can be disposed and recreated without reloading the model.
    */
   private async ensureRerankContext(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> {
     if (!this.rerankContext) {
-      const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.rerankModelUri);
-      this.rerankModel = await llama.loadModel({ modelPath });
-      this.rerankContext = await this.rerankModel.createRankingContext();
+      const model = await this.ensureRerankModel();
+      this.rerankContext = await model.createRankingContext();
     }
     this.touchActivity();
     return this.rerankContext;
@@ -387,9 +480,9 @@ export class LlamaCpp implements LLM {
 
   /**
    * Tokenize text using the embedding model's tokenizer
-   * Returns array of token IDs
+   * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
-  async tokenize(text: string): Promise<number[]> {
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -408,7 +501,7 @@ export class LlamaCpp implements LLM {
   /**
    * Detokenize token IDs back to text
    */
-  async detokenize(tokens: number[]): Promise<string> {
+  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -469,46 +562,35 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
-    // Serialize generation calls to avoid "No sequences left" with single sequence
-    let unlock: () => void;
-    const waitForLock = this.generateLock;
-    this.generateLock = new Promise(resolve => { unlock = resolve; });
-    await waitForLock;
+    // Ensure model is loaded
+    await this.ensureGenerateModel();
 
+    // Create fresh context -> sequence -> session for each call
+    const context = await this.generateModel!.createContext();
+    const sequence = context.getSequence();
+    const session = new LlamaChatSession({ contextSequence: sequence });
+
+    const maxTokens = options.maxTokens ?? 150;
+    const temperature = options.temperature ?? 0;
+
+    let result = "";
     try {
-      const context = await this.ensureGenerateContext();
-      const { LlamaChatSession } = await import("node-llama-cpp");
-      const session = new LlamaChatSession({
-        contextSequence: context.getSequence(),
+      await session.prompt(prompt, {
+        maxTokens,
+        temperature,
+        onTextChunk: (text) => {
+          result += text;
+        },
       });
-
-      const maxTokens = options.maxTokens ?? 150;
-      const temperature = options.temperature ?? 0;
-
-      let result = "";
-      try {
-        await session.prompt(prompt, {
-          maxTokens,
-          temperature,
-          onTextChunk: (text) => {
-            result += text;
-          },
-        });
-      } finally {
-        // Dispose session to release the sequence
-        await session.dispose();
-      }
 
       return {
         text: result,
         model: this.generateModelUri,
         done: true,
       };
-    } catch (error) {
-      console.error("Generation error:", error);
-      return null;
     } finally {
-      unlock!();
+      // Dispose context (which disposes dependent sequences/sessions per lifecycle rules)
+      await context.dispose();
     }
   }
 
@@ -573,7 +655,7 @@ Output exactly ${numVariations} variations, one per line, no numbering or bullet
    */
   async expandQueryStructured(query: string, includeLexical: boolean = true): Promise<ExpandedQuery> {
     const llama = await this.ensureLlama();
-    const context = await this.ensureGenerateContext();
+    await this.ensureGenerateModel();
 
     // Define JSON schema for structured output
     const schema = {
@@ -592,7 +674,7 @@ Output exactly ${numVariations} variations, one per line, no numbering or bullet
           description: "Write a short passage (50-100 words) that directly answers the query as if from a relevant document"
         }
       },
-      required: ["vectorQuery", "hyde"] as const
+      required: [] as const
     };
 
     const grammar = await llama.createGrammarForJsonSchema(schema);
@@ -607,25 +689,24 @@ Given a query, generate:
 Keep proper nouns exactly as written. Be concise.`
       : `You expand search queries for semantic search.
 Given a query, generate:
-1. vectorQuery: Semantically rephrased query capturing the full intent
-2. hyde: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
+1. vectorQuery: Semantically rephrased query capturing the full intent (must be different from the original query)
+2. HyDE: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
 
-Keep proper nouns exactly as written. Be concise. Set lexicalQuery to empty string.`;
+Keep proper nouns exactly as written. Be concise.`;
 
     const prompt = `Query: "${query}"
 
 Generate the structured expansion:`;
 
-    const { LlamaChatSession } = await import("node-llama-cpp");
-    const session = new LlamaChatSession({
-      contextSequence: context.getSequence(),
-      systemPrompt,
-    });
+    // Create fresh context for each call
+    const context = await this.generateModel!.createContext();
+    const sequence = context.getSequence();
+    const session = new LlamaChatSession({ contextSequence: sequence, systemPrompt });
 
     try {
       const result = await session.prompt(prompt, {
         grammar,
-        maxTokens: 300,
+        maxTokens: 500,
         temperature: 0,
       });
 
@@ -649,7 +730,8 @@ Generate the structured expansion:`;
         hyde: "",
       };
     } finally {
-      await session.dispose();
+      // Dispose context (disposes session too per lifecycle rules)
+      await context.dispose();
     }
   }
 
@@ -658,47 +740,34 @@ Generate the structured expansion:`;
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
-    try {
-      const context = await this.ensureRerankContext();
+    const context = await this.ensureRerankContext();
 
-      // Build a map from document text to original indices (for lookup after sorting)
-      const textToDoc = new Map<string, { file: string; index: number }>();
-      documents.forEach((doc, index) => {
-        textToDoc.set(doc.text, { file: doc.file, index });
-      });
+    // Build a map from document text to original indices (for lookup after sorting)
+    const textToDoc = new Map<string, { file: string; index: number }>();
+    documents.forEach((doc, index) => {
+      textToDoc.set(doc.text, { file: doc.file, index });
+    });
 
-      // Extract just the text for ranking
-      const texts = documents.map((doc) => doc.text);
+    // Extract just the text for ranking
+    const texts = documents.map((doc) => doc.text);
 
-      // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
-      const ranked = await context.rankAndSort(query, texts);
+    // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
+    const ranked = await context.rankAndSort(query, texts);
 
-      // Map back to our result format using the text-to-doc map
-      const results: RerankDocumentResult[] = ranked.map((item) => {
-        const docInfo = textToDoc.get(item.document)!;
-        return {
-          file: docInfo.file,
-          score: item.score,
-          index: docInfo.index,
-        };
-      });
-
+    // Map back to our result format using the text-to-doc map
+    const results: RerankDocumentResult[] = ranked.map((item) => {
+      const docInfo = textToDoc.get(item.document)!;
       return {
-        results,
-        model: this.rerankModelUri,
+        file: docInfo.file,
+        score: item.score,
+        index: docInfo.index,
       };
-    } catch (error) {
-      console.error("Rerank error:", error);
-      // Return documents in original order with zero scores on error
-      return {
-        results: documents.map((doc, index) => ({
-          file: doc.file,
-          score: 0,
-          index,
-        })),
-        model: this.rerankModelUri,
-      };
-    }
+    });
+
+    return {
+      results,
+      model: this.rerankModelUri,
+    };
   }
 
   async dispose(): Promise<void> {
@@ -722,12 +791,16 @@ Generate the structured expansion:`;
 
     // Clear references
     this.embedContext = null;
-    this.generateContext = null;
     this.rerankContext = null;
     this.embedModel = null;
     this.generateModel = null;
     this.rerankModel = null;
     this.llama = null;
+
+    // Clear any in-flight load promises
+    this.embedModelLoadPromise = null;
+    this.generateModelLoadPromise = null;
+    this.rerankModelLoadPromise = null;
   }
 }
 
@@ -765,18 +838,3 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
   }
 }
 
-// =============================================================================
-// Legacy exports for backwards compatibility
-// =============================================================================
-
-// Keep Ollama as an alias for now during transition
-export { LlamaCpp as Ollama };
-export type { LlamaCppConfig as OllamaConfig };
-
-export function getDefaultOllama(): LlamaCpp {
-  return getDefaultLlamaCpp();
-}
-
-export function setDefaultOllama(llm: LlamaCpp | null): void {
-  setDefaultLlamaCpp(llm);
-}

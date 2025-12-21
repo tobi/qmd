@@ -18,11 +18,11 @@
     "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.24.3",
+    "@modelcontextprotocol/sdk": "^1.25.1",
     "node-llama-cpp": "^3.14.5",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
-    "zod": "^4.1.13"
+    "zod": "^4.2.1"
   },
   "optionalDependencies": {
     "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
@@ -34,7 +34,7 @@
     "@types/bun": "latest"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   },
   "engines": {
     "bun": ">=1.0.0"

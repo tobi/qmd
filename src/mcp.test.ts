@@ -10,7 +10,7 @@ import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { setDefaultLlamaCpp, LlamaCpp } from "./llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +24,11 @@ import type { CollectionConfig } from "./collections";
 let testDb: Database;
 let testDbPath: string;
 let testConfigDir: string;
+
+afterAll(async () => {
+  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
+  await disposeDefaultLlamaCpp();
+});
 
 function initTestDatabase(db: Database): void {
   sqliteVec.load(db);
@@ -178,8 +183,9 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
-  getDocument,
-  getMultipleDocuments,
+  findDocument,
+  getDocumentBody,
+  findDocuments,
   getStatus,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -197,7 +203,8 @@ import type { RankedResult } from "./store";
 describe("MCP Server", () => {
   beforeAll(async () => {
     // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
-    setDefaultLlamaCpp(new LlamaCpp());
+    // Use shared singleton to avoid creating multiple instances with separate GPU resources
+    getDefaultLlamaCpp();
 
     // Set up test config directory
     const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -250,7 +257,7 @@ describe("MCP Server", () => {
     test("returns results for matching query", () => {
       const results = searchFTS(testDb, "readme", 10);
       expect(results.length).toBeGreaterThan(0);
-      expect(results[0].displayPath).toBe("docs/readme.md");
+      expect(results[0]!.displayPath).toBe("docs/readme.md");
     });
 
     test("returns empty for non-matching query", () => {
@@ -271,8 +278,8 @@ describe("MCP Server", () => {
         file: r.displayPath,
         title: r.title,
         score: Math.round(r.score * 100) / 100,
-        context: getContextForFile(testDb, r.file),
-        snippet: extractSnippet(r.body, "api", 300, r.chunkPos).snippet,
+        context: getContextForFile(testDb, r.filepath),
+        snippet: extractSnippet(r.body || "", "api", 300, r.chunkPos).snippet,
       }));
       // MCP now returns structuredContent with results array
       expect(filtered.length).toBeGreaterThan(0);
@@ -345,7 +352,7 @@ describe("MCP Server", () => {
       ];
       const reranked = await rerank("readme", docs, DEFAULT_RERANK_MODEL, testDb);
       expect(reranked.length).toBe(2);
-      expect(reranked[0].score).toBeGreaterThan(0);
+      expect(reranked[0]!.score).toBeGreaterThan(0);
     });
 
     test("full hybrid search pipeline", async () => {
@@ -390,29 +397,29 @@ describe("MCP Server", () => {
 
   describe("qmd_get tool", () => {
     test("retrieves document by display_path", () => {
-      const result = getDocument(testDb, "readme.md");
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.displayPath).toBe("docs/readme.md");
-        expect(result.body).toContain("Project README");
-      }
+      const meta = findDocument(testDb, "readme.md", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      const body = getDocumentBody(testDb, meta) ?? "";
+
+      expect(meta.displayPath).toBe("docs/readme.md");
+      expect(body).toContain("Project README");
     });
 
     test("retrieves document by filepath", () => {
-      const result = getDocument(testDb, "/test/docs/api.md");
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.title).toBe("API Documentation");
-      }
+      const meta = findDocument(testDb, "/test/docs/api.md", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      expect(meta.title).toBe("API Documentation");
     });
 
     test("retrieves document by partial path", () => {
-      const result = getDocument(testDb, "api.md");
+      const result = findDocument(testDb, "api.md", { includeBody: false });
       expect("error" in result).toBe(false);
     });
 
     test("returns not found for missing document", () => {
-      const result = getDocument(testDb, "nonexistent.md");
+      const result = findDocument(testDb, "nonexistent.md", { includeBody: false });
       expect("error" in result).toBe(true);
       if ("error" in result) {
         expect(result.error).toBe("not_found");
@@ -420,7 +427,7 @@ describe("MCP Server", () => {
     });
 
     test("suggests similar files when not found", () => {
-      const result = getDocument(testDb, "readm.md"); // typo
+      const result = findDocument(testDb, "readm.md", { includeBody: false }); // typo
       expect("error" in result).toBe(true);
       if ("error" in result) {
         expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
@@ -428,37 +435,36 @@ describe("MCP Server", () => {
     });
 
     test("supports line range with :line suffix", () => {
-      const result = getDocument(testDb, "readme.md:2", undefined, 2);
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        const lines = result.body.split("\n");
-        expect(lines.length).toBeLessThanOrEqual(2);
-      }
+      const meta = findDocument(testDb, "readme.md:2", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      const body = getDocumentBody(testDb, meta, 2, 2) ?? "";
+      const lines = body.split("\n");
+      expect(lines.length).toBeLessThanOrEqual(2);
     });
 
     test("supports fromLine parameter", () => {
-      const result = getDocument(testDb, "readme.md", 3);
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.body).not.toContain("# Project README");
-      }
+      const meta = findDocument(testDb, "readme.md", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      const body = getDocumentBody(testDb, meta, 3) ?? "";
+      expect(body).not.toContain("# Project README");
     });
 
     test("supports maxLines parameter", () => {
-      const result = getDocument(testDb, "api.md", 1, 3);
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        const lines = result.body.split("\n");
-        expect(lines.length).toBeLessThanOrEqual(3);
-      }
+      const meta = findDocument(testDb, "api.md", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      const body = getDocumentBody(testDb, meta, 1, 3) ?? "";
+      const lines = body.split("\n");
+      expect(lines.length).toBeLessThanOrEqual(3);
     });
 
     test("includes context for documents in context path", () => {
-      const result = getDocument(testDb, "meetings/meeting-2024-01.md");
+      const result = findDocument(testDb, "meetings/meeting-2024-01.md", { includeBody: false });
       expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        expect(result.context).toBe("Meeting notes and transcripts");
-      }
+      if ("error" in result) return;
+      expect(result.context).toBe("Meeting notes and transcripts");
     });
   });
 
@@ -468,59 +474,65 @@ describe("MCP Server", () => {
 
   describe("qmd_multi_get tool", () => {
     test("retrieves multiple documents by glob pattern", () => {
-      const { files, errors } = getMultipleDocuments(testDb, "meetings/*.md");
+      const { docs, errors } = findDocuments(testDb, "meetings/*.md", { includeBody: true });
       expect(errors.length).toBe(0);
-      expect(files.length).toBe(2);
-      expect(files.some(f => f.displayPath === "docs/meetings/meeting-2024-01.md")).toBe(true);
-      expect(files.some(f => f.displayPath === "docs/meetings/meeting-2024-02.md")).toBe(true);
+      expect(docs.length).toBe(2);
+      const paths = docs.map(d => d.doc.displayPath);
+      expect(paths).toContain("docs/meetings/meeting-2024-01.md");
+      expect(paths).toContain("docs/meetings/meeting-2024-02.md");
     });
 
     test("retrieves documents by comma-separated list", () => {
-      const { files, errors } = getMultipleDocuments(testDb, "readme.md, api.md");
+      const { docs, errors } = findDocuments(testDb, "readme.md, api.md", { includeBody: true });
       expect(errors.length).toBe(0);
-      expect(files.length).toBe(2);
+      expect(docs.length).toBe(2);
     });
 
     test("returns errors for missing files in comma list", () => {
-      const { files, errors } = getMultipleDocuments(testDb, "readme.md, nonexistent.md");
-      expect(files.length).toBe(1);
+      const { docs, errors } = findDocuments(testDb, "readme.md, nonexistent.md", { includeBody: true });
+      expect(docs.length).toBe(1);
       expect(errors.length).toBe(1);
       expect(errors[0]).toContain("not found");
     });
 
     test("skips files larger than maxBytes", () => {
-      const { files } = getMultipleDocuments(testDb, "*.md", undefined, 1000); // 1KB limit
-      const largeFile = files.find(f => f.displayPath === "docs/large-file.md");
-      expect(largeFile).toBeDefined();
-      expect(largeFile?.skipped).toBe(true);
-      if (largeFile?.skipped) {
-        expect(largeFile.skipReason).toContain("too large");
-      }
+      const { docs } = findDocuments(testDb, "*.md", { includeBody: true, maxBytes: 1000 }); // 1KB limit
+      const large = docs.find(d => d.doc.displayPath === "docs/large-file.md");
+      expect(large).toBeDefined();
+      expect(large?.skipped).toBe(true);
+      if (large?.skipped) expect(large.skipReason).toContain("too large");
     });
 
     test("respects maxLines parameter", () => {
-      const { files } = getMultipleDocuments(testDb, "readme.md", 2);
-      expect(files.length).toBe(1);
-      if (!files[0].skipped) {
-        const lines = files[0].body.split("\n");
-        // maxLines + truncation message
-        expect(lines.length).toBeLessThanOrEqual(4);
+      const { docs } = findDocuments(testDb, "readme.md", { includeBody: true, maxBytes: DEFAULT_MULTI_GET_MAX_BYTES });
+      expect(docs.length).toBe(1);
+      const d = docs[0]!;
+      expect(d.skipped).toBe(false);
+      if (d.skipped) return;
+      if (!("body" in d.doc)) {
+        throw new Error("Expected body to be included in findDocuments result");
       }
+      const lines = (d.doc.body || "").split("\n").slice(0, 2);
+      expect(lines.length).toBeLessThanOrEqual(2);
     });
 
     test("returns error for non-matching glob", () => {
-      const { files, errors } = getMultipleDocuments(testDb, "nonexistent/*.md");
-      expect(files.length).toBe(0);
+      const { docs, errors } = findDocuments(testDb, "nonexistent/*.md", { includeBody: true });
+      expect(docs.length).toBe(0);
       expect(errors.length).toBe(1);
       expect(errors[0]).toContain("No files matched");
     });
 
     test("includes context in results", () => {
-      const { files } = getMultipleDocuments(testDb, "meetings/meeting-2024-01.md");
-      expect(files.length).toBe(1);
-      if (!files[0].skipped) {
-        expect(files[0].context).toBe("Meeting notes and transcripts");
+      const { docs } = findDocuments(testDb, "meetings/meeting-2024-01.md", { includeBody: true });
+      expect(docs.length).toBe(1);
+      const d = docs[0]!;
+      expect(d.skipped).toBe(false);
+      if (d.skipped) return;
+      if (!("context" in d.doc)) {
+        throw new Error("Expected context to be present on document result");
       }
+      expect(d.doc.context).toBe("Meeting notes and transcripts");
     });
   });
 
@@ -534,7 +546,7 @@ describe("MCP Server", () => {
       expect(status.totalDocuments).toBe(5);
       expect(status.hasVectorIndex).toBe(true);
       expect(status.collections.length).toBe(1);
-      expect(status.collections[0].path).toBe("/test/docs");
+      expect(status.collections[0]!.path).toBe("/test/docs");
     });
 
     test("shows documents needing embedding", () => {
@@ -816,12 +828,12 @@ QMD is your on-device search engine for markdown knowledge bases.`;
         file: r.displayPath,
         title: r.title,
         score: Math.round(r.score * 100) / 100,
-        context: getContextForFile(testDb, r.file),
-        snippet: extractSnippet(r.body, "readme", 300, r.chunkPos).snippet,
+        context: getContextForFile(testDb, r.filepath),
+        snippet: extractSnippet(r.body || "", "readme", 300, r.chunkPos).snippet,
       }));
 
       expect(structured.length).toBeGreaterThan(0);
-      const item = structured[0];
+      const item = structured[0]!;
       expect(typeof item.file).toBe("string");
       expect(typeof item.title).toBe("string");
       expect(typeof item.score).toBe("number");
@@ -837,25 +849,25 @@ QMD is your on-device search engine for markdown knowledge bases.`;
         isError: true,
       };
       expect(errorResponse.isError).toBe(true);
-      expect(errorResponse.content[0].type).toBe("text");
+      expect(errorResponse.content[0]!.type).toBe("text");
     });
 
     test("embedded resources include name and title", () => {
       // Simulate what qmd_get returns
-      const result = getDocument(testDb, "readme.md");
-      expect("error" in result).toBe(false);
-      if (!("error" in result)) {
-        const resource = {
-          uri: `qmd://${result.displayPath}`,
-          name: result.displayPath,
-          title: result.title,
-          mimeType: "text/markdown",
-          text: result.body,
-        };
-        expect(resource.name).toBe("docs/readme.md");
-        expect(resource.title).toBe("Project README");
-        expect(resource.mimeType).toBe("text/markdown");
-      }
+      const meta = findDocument(testDb, "readme.md", { includeBody: false });
+      expect("error" in meta).toBe(false);
+      if ("error" in meta) return;
+      const body = getDocumentBody(testDb, meta) ?? "";
+      const resource = {
+        uri: `qmd://${meta.displayPath}`,
+        name: meta.displayPath,
+        title: meta.title,
+        mimeType: "text/markdown",
+        text: body,
+      };
+      expect(resource.name).toBe("docs/readme.md");
+      expect(resource.title).toBe("Project README");
+      expect(resource.mimeType).toBe("text/markdown");
     });
 
     test("status response includes structuredContent", () => {
@@ -866,7 +878,7 @@ QMD is your on-device search engine for markdown knowledge bases.`;
       expect(typeof status.hasVectorIndex).toBe("boolean");
       expect(Array.isArray(status.collections)).toBe(true);
       if (status.collections.length > 0) {
-        const col = status.collections[0];
+        const col = status.collections[0]!;
         expect(typeof col.name).toBe("string"); // Collections now use names, not IDs
         expect(typeof col.path).toBe("string");
         expect(typeof col.pattern).toBe("string");
