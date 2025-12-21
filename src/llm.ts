@@ -223,6 +223,9 @@ export class LlamaCpp implements LLM {
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
+  // Mutex for generation to prevent "No sequences left" error with single sequence
+  private generateLock: Promise<void> = Promise.resolve();
+
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
@@ -358,8 +361,8 @@ export class LlamaCpp implements LLM {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.generateModelUri);
       this.generateModel = await llama.loadModel({ modelPath });
-      // Create context with 4 sequences for parallel generation support
-      this.generateContext = await this.generateModel.createContext({ sequences: 4 });
+      // Use single sequence to minimize VRAM when multiple models are loaded
+      this.generateContext = await this.generateModel.createContext({ sequences: 1 });
     }
     this.touchActivity();
     return this.generateContext;
@@ -467,6 +470,12 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    // Serialize generation calls to avoid "No sequences left" with single sequence
+    let unlock: () => void;
+    const waitForLock = this.generateLock;
+    this.generateLock = new Promise(resolve => { unlock = resolve; });
+    await waitForLock;
+
     try {
       const context = await this.ensureGenerateContext();
       const { LlamaChatSession } = await import("node-llama-cpp");
@@ -499,6 +508,8 @@ export class LlamaCpp implements LLM {
     } catch (error) {
       console.error("Generation error:", error);
       return null;
+    } finally {
+      unlock!();
     }
   }
 
