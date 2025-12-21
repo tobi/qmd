@@ -12,7 +12,6 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
-  disposeDefaultLlamaCpp,
   type RerankDocument,
 } from "./llm.js";
 
@@ -59,7 +58,7 @@ describe("Default LlamaCpp Singleton", () => {
 
 describe("LlamaCpp.modelExists", () => {
   test("returns exists:true for HuggingFace model URIs", async () => {
-    const llm = new LlamaCpp();
+    const llm = getDefaultLlamaCpp();
     const result = await llm.modelExists("hf:org/repo/model.gguf");
 
     expect(result.exists).toBe(true);
@@ -67,7 +66,7 @@ describe("LlamaCpp.modelExists", () => {
   });
 
   test("returns exists:false for non-existent local paths", async () => {
-    const llm = new LlamaCpp();
+    const llm = getDefaultLlamaCpp();
     const result = await llm.modelExists("/nonexistent/path/model.gguf");
 
     expect(result.exists).toBe(false);
@@ -80,13 +79,8 @@ describe("LlamaCpp.modelExists", () => {
 // =============================================================================
 
 describe("LlamaCpp Integration", () => {
-  let llm: LlamaCpp;
-
-  beforeAll(() => {
-    llm = new LlamaCpp();
-  });
-
-  // Don't dispose - let process exit handle Metal cleanup naturally
+  // Use the singleton to avoid multiple Metal contexts
+  const llm = getDefaultLlamaCpp();
 
   describe("embed", () => {
     test("returns embedding with correct dimensions", async () => {
@@ -339,3 +333,4 @@ describe("LlamaCpp Integration", () => {
     });
   });
 });
+

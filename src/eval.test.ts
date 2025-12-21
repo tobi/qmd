@@ -34,7 +34,7 @@ import {
   DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
+import { getDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -393,6 +393,5 @@ describe("Hybrid Search (RRF)", () => {
 // =============================================================================
 
 afterAll(() => {
-  // Don't dispose llama - let process exit handle Metal cleanup naturally
   rmSync(tempDir, { recursive: true, force: true });
 });

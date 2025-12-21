@@ -704,38 +704,20 @@ Generate the structured expansion:`;
       this.inactivityTimer = null;
     }
 
-    // Dispose in order: contexts -> models -> llama
-    // Contexts depend on models, models depend on llama
-    if (this.embedContext) {
-      await this.embedContext.dispose();
-      this.embedContext = null;
-    }
-    if (this.generateContext) {
-      await this.generateContext.dispose();
-      this.generateContext = null;
-    }
-    if (this.rerankContext) {
-      await this.rerankContext.dispose();
-      this.rerankContext = null;
-    }
-
-    if (this.embedModel) {
-      await this.embedModel.dispose();
-      this.embedModel = null;
-    }
-    if (this.generateModel) {
-      await this.generateModel.dispose();
-      this.generateModel = null;
-    }
-    if (this.rerankModel) {
-      await this.rerankModel.dispose();
-      this.rerankModel = null;
-    }
-
+    // Disposing llama cascades to models and contexts automatically
+    // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
     if (this.llama) {
       await this.llama.dispose();
-      this.llama = null;
     }
+
+    // Clear references
+    this.embedContext = null;
+    this.generateContext = null;
+    this.rerankContext = null;
+    this.embedModel = null;
+    this.generateModel = null;
+    this.rerankModel = null;
+    this.llama = null;
   }
 }
 
