@@ -40,7 +40,7 @@ import { getDefaultLlamaCpp, formatDocForEmbedding } from "./llm";
 const evalQueries: {
   query: string;
   expectedDoc: string;
-  difficulty: "easy" | "medium" | "hard";
+  difficulty: "easy" | "medium" | "hard" | "fusion";
 }[] = [
   // EASY: Exact keyword matches
   { query: "API versioning", expectedDoc: "api-design", difficulty: "easy" },
@@ -65,6 +65,15 @@ const evalQueries: {
   { query: "F1 score precision recall", expectedDoc: "machine-learning", difficulty: "hard" },
   { query: "quarterly team gathering travel", expectedDoc: "remote-work", difficulty: "hard" },
   { query: "beta program 47 bugs", expectedDoc: "product-launch", difficulty: "hard" },
+
+  // FUSION: Multi-signal queries that need both lexical AND semantic matching
+  // These should have weak individual scores but strong combined RRF scores
+  { query: "how much runway before running out of money", expectedDoc: "fundraising", difficulty: "fusion" },
+  { query: "datacenter replication sync strategy", expectedDoc: "distributed-systems", difficulty: "fusion" },
+  { query: "splitting data for training and testing", expectedDoc: "machine-learning", difficulty: "fusion" },
+  { query: "JSON response codes error messages", expectedDoc: "api-design", difficulty: "fusion" },
+  { query: "video calls camera async messaging", expectedDoc: "remote-work", difficulty: "fusion" },
+  { query: "CI/CD pipeline testing coverage", expectedDoc: "product-launch", difficulty: "fusion" },
 ];
 
 // Helper to check if result matches expected doc
@@ -333,14 +342,49 @@ describe("Hybrid Search (RRF)", () => {
     expect(hits / hardQueries.length).toBeGreaterThanOrEqual(threshold);
   }, 60000);
 
+  test("fusion queries: ≥50% Hit@3 (RRF combines weak signals)", async () => {
+    if (!hasVectors) return; // Fusion requires both methods
+
+    const fusionQueries = evalQueries.filter(q => q.difficulty === "fusion");
+    let hybridHits = 0;
+    let bm25Hits = 0;
+    let vecHits = 0;
+
+    for (const { query, expectedDoc } of fusionQueries) {
+      // Hybrid results
+      const hybridResults = await hybridSearch(query);
+      if (hybridResults.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hybridHits++;
+
+      // BM25 results for comparison
+      const bm25Results = searchFTS(db, query, 5);
+      if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
+
+      // Vector results for comparison
+      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
+    }
+
+    const hybridRate = hybridHits / fusionQueries.length;
+    const bm25Rate = bm25Hits / fusionQueries.length;
+    const vecRate = vecHits / fusionQueries.length;
+
+    // Fusion should achieve at least 50% on these multi-signal queries
+    expect(hybridRate).toBeGreaterThanOrEqual(0.5);
+
+    // Fusion should outperform or match the best individual method
+    expect(hybridRate).toBeGreaterThanOrEqual(Math.max(bm25Rate, vecRate));
+  }, 60000);
+
   test("overall Hit@3 ≥60% with vectors, ≥40% without", async () => {
+    // Filter out fusion queries for overall score (they're tested separately)
+    const standardQueries = evalQueries.filter(q => q.difficulty !== "fusion");
     let hits = 0;
-    for (const { query, expectedDoc } of evalQueries) {
+    for (const { query, expectedDoc } of standardQueries) {
       const results = await hybridSearch(query);
       if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
     }
     const threshold = hasVectors ? 0.6 : 0.4;
-    expect(hits / evalQueries.length).toBeGreaterThanOrEqual(threshold);
+    expect(hits / standardQueries.length).toBeGreaterThanOrEqual(threshold);
   }, 60000);
 });
 
