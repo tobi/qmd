@@ -361,8 +361,7 @@ export class LlamaCpp implements LLM {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.generateModelUri);
       this.generateModel = await llama.loadModel({ modelPath });
-      // Use single sequence to minimize VRAM when multiple models are loaded
-      this.generateContext = await this.generateModel.createContext({ sequences: 1 });
+      this.generateContext = await this.generateModel.createContext();
     }
     this.touchActivity();
     return this.generateContext;
