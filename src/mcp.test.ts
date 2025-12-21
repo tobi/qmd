@@ -10,7 +10,7 @@ import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { setDefaultLlamaCpp, LlamaCpp } from "./llm";
+import { setDefaultLlamaCpp, disposeDefaultLlamaCpp, LlamaCpp } from "./llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -225,7 +225,7 @@ describe("MCP Server", () => {
   });
 
   afterAll(async () => {
-    setDefaultLlamaCpp(null);
+    // Don't dispose llama - let process exit handle Metal cleanup naturally
     testDb.close();
     try {
       require("fs").unlinkSync(testDbPath);

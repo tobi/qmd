@@ -392,8 +392,7 @@ describe("Hybrid Search (RRF)", () => {
 // Cleanup
 // =============================================================================
 
-afterAll(async () => {
-  // Dispose llama before process exit to properly free Metal resources
-  await disposeDefaultLlamaCpp();
+afterAll(() => {
+  // Don't dispose llama - let process exit handle Metal cleanup naturally
   rmSync(tempDir, { recursive: true, force: true });
 });

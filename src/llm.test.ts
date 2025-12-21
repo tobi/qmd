@@ -12,6 +12,7 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
+  disposeDefaultLlamaCpp,
   type RerankDocument,
 } from "./llm.js";
 
@@ -20,9 +21,7 @@ import {
 // =============================================================================
 
 describe("Default LlamaCpp Singleton", () => {
-  afterAll(() => {
-    setDefaultLlamaCpp(null);
-  });
+  // Don't dispose - let process exit handle Metal cleanup naturally
 
   test("getDefaultLlamaCpp creates instance on first call", () => {
     setDefaultLlamaCpp(null);
@@ -87,9 +86,7 @@ describe("LlamaCpp Integration", () => {
     llm = new LlamaCpp();
   });
 
-  afterAll(async () => {
-    await llm.dispose();
-  });
+  // Don't dispose - let process exit handle Metal cleanup naturally
 
   describe("embed", () => {
     test("returns embedding with correct dimensions", async () => {
