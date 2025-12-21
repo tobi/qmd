@@ -2031,34 +2031,50 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // Expand query using structured output
-  const expanded = await expandQueryStructured(query, true);
+  // Run initial BM25 search (will be reused for retrieval)
+  const initialFts = searchFTS(db, query, 20, collectionName as any);
+  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
-  // Build query lists for each retrieval type
-  const ftsQueries: string[] = [query];
-  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
-    ftsQueries.push(expanded.lexicalQuery);
-  }
+  // Check if initial results have strong signals (skip expansion if so)
+  // Strong signal = top result has high normalized score (> 0.7)
+  const hasStrongSignal = initialFts.length > 0 && initialFts[0].score > 0.7;
 
-  const vectorQueries: string[] = [query];
-  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
-    vectorQueries.push(expanded.vectorQuery);
-  }
-  if (expanded.hyde && expanded.hyde.length > 20) {
-    vectorQueries.push(expanded.hyde);
+  let ftsQueries: string[] = [query];
+  let vectorQueries: string[] = [query];
+
+  if (hasStrongSignal) {
+    // Strong BM25 signal - skip expensive LLM expansion
+    process.stderr.write(`${c.dim}Strong BM25 signal (${initialFts[0].score.toFixed(2)}) - skipping expansion${c.reset}\n`);
+  } else {
+    // Weak signal - expand query for better recall
+    const expanded = await expandQueryStructured(query, true);
+
+    if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
+      ftsQueries.push(expanded.lexicalQuery);
+    }
+    if (expanded.vectorQuery && expanded.vectorQuery !== query) {
+      vectorQueries.push(expanded.vectorQuery);
+    }
+    if (expanded.hyde && expanded.hyde.length > 20) {
+      vectorQueries.push(expanded.hyde);
+    }
   }
 
   process.stderr.write(`${c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${c.reset}\n`);
 
   // Collect ranked result lists for RRF fusion
   const rankedLists: RankedResult[][] = [];
-  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Map to store hash by filepath for final results
   const hashMap = new Map<string, string>();
 
-  // FTS searches with lexical queries
-  for (const q of ftsQueries) {
+  // FTS searches with lexical queries (reuse initial search for original query)
+  if (initialFts.length > 0) {
+    for (const r of initialFts) hashMap.set(r.filepath, r.hash);
+    rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+  }
+  // Run expanded queries (skip first which is original)
+  for (const q of ftsQueries.slice(1)) {
     const ftsResults = searchFTS(db, q, 20, collectionName as any);
     if (ftsResults.length > 0) {
       for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
