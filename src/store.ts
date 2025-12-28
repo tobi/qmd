@@ -603,11 +603,11 @@ export function handelize(path: string): string {
   }
 
   // Check for paths that are just extensions or only dots/special chars
-  // A valid path must have at least one alphanumeric character before processing
+  // A valid path must have at least one letter or number (including Unicode) before processing
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[a-zA-Z0-9]/.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
@@ -626,14 +626,14 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[\W_]+/g, '-')  // Replace non-word chars with dash
+          .replace(/[^\p{L}\p{N}]+/gu, '-')  // Replace non-letter/number chars with dash (Unicode-aware)
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
       } else {
         // For directories, just clean normally
         return segment
-          .replace(/[\W_]+/g, '-')
+          .replace(/[^\p{L}\p{N}]+/gu, '-')  // Unicode-aware
           .replace(/^-+|-+$/g, '');
       }
     })

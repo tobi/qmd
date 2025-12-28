@@ -353,12 +353,16 @@ describe("handelize", () => {
   });
 
   test("handles unicode characters", () => {
-    // Pure unicode with no alphanumerics throws error
-    expect(() => handelize("日本語.md")).toThrow("no valid filename content");
-    // Mixed unicode/ascii preserves the ascii parts
-    expect(handelize("café-notes.md")).toBe("caf-notes.md");
-    expect(handelize("naïve.md")).toBe("na-ve.md");
-    expect(handelize("日本語-notes.md")).toBe("notes.md");
+    // Pure unicode filenames are now supported (Unicode letters/numbers preserved)
+    expect(handelize("日本語.md")).toBe("日本語.md");
+    expect(handelize("腾讯混元.md")).toBe("腾讯混元.md");
+    expect(handelize("한국어.md")).toBe("한국어.md");
+    // Mixed unicode/ascii preserves all letters
+    expect(handelize("café-notes.md")).toBe("café-notes.md");
+    expect(handelize("naïve.md")).toBe("naïve.md");
+    expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
+    // Folder paths with unicode
+    expect(handelize("中文/文档.md")).toBe("中文/文档.md");
   });
 
   test("handles dates and times in filenames", () => {
