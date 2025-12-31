@@ -11,7 +11,6 @@ import {
   enableProductionMode,
   searchFTS,
   searchVec,
-  reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -64,7 +63,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type ExpandedQuery } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -281,7 +280,7 @@ function showStatus(): void {
   try {
     const stat = Bun.file(dbPath).size;
     indexSize = stat;
-  } catch {}
+  } catch { }
 
   // Collections info (from YAML + database stats)
   const collections = listCollections(db);
@@ -350,15 +349,15 @@ function showStatus(): void {
     // Show examples of virtual paths
     console.log(`\n${c.bold}Examples${c.reset}`);
     console.log(`  ${c.dim}# List files in a collection${c.reset}`);
-    if (collections.length > 0) {
+    if (collections.length > 0 && collections[0]) {
       console.log(`  qmd ls ${collections[0].name}`);
     }
     console.log(`  ${c.dim}# Get a document${c.reset}`);
-    if (collections.length > 0) {
+    if (collections.length > 0 && collections[0]) {
       console.log(`  qmd get qmd://${collections[0].name}/path/to/file.md`);
     }
     console.log(`  ${c.dim}# Search within a collection${c.reset}`);
-    if (collections.length > 0) {
+    if (collections.length > 0 && collections[0]) {
       console.log(`  qmd search "query" -c ${collections[0].name}`);
     }
   } else {
@@ -388,6 +387,7 @@ async function updateCollections(): Promise<void> {
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
+    if (!col) continue;
     console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
@@ -643,13 +643,14 @@ function contextCheck(): void {
 
   // Check for top-level paths without context within collections that DO have context
   const collectionsWithContext = allCollections.filter(c =>
-    !collectionsWithoutContext.some(cwc => cwc.id === c.id)
+    c && !collectionsWithoutContext.some(cwc => cwc.name === c.name)
   );
 
   let hasPathSuggestions = false;
 
   for (const coll of collectionsWithContext) {
-    const missingPaths = getTopLevelPathsWithoutContext(db, coll.id);
+    if (!coll) continue;
+    const missingPaths = getTopLevelPathsWithoutContext(db, coll.name);
 
     if (missingPaths.length > 0) {
       if (!hasPathSuggestions) {
@@ -681,8 +682,11 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   let inputPath = filename;
   const colonMatch = inputPath.match(/:(\d+)$/);
   if (colonMatch && !fromLine) {
-    fromLine = parseInt(colonMatch[1], 10);
-    inputPath = inputPath.slice(0, -colonMatch[0].length);
+    const matched = colonMatch[1];
+    if (matched) {
+      fromLine = parseInt(matched, 10);
+      inputPath = inputPath.slice(0, -colonMatch[0].length);
+    }
   }
 
   let doc: { collectionName: string; path: string; body: string } | null = null;
@@ -727,9 +731,9 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
         const possiblePath = parts.slice(1).join('/');
 
         // Check if this collection exists
-        const collExists = db.prepare(`
+        const collExists = possibleCollection ? db.prepare(`
           SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
-        `).get(possibleCollection);
+        `).get(possibleCollection) : null;
 
         if (collExists) {
           // Try exact match on collection + path
@@ -738,7 +742,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
             FROM documents d
             JOIN content ON content.hash = d.hash
             WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(possibleCollection, possiblePath) as typeof doc;
+          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
 
           if (!doc) {
             // Try fuzzy match by path ending
@@ -748,7 +752,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
               JOIN content ON content.hash = d.hash
               WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
               LIMIT 1
-            `).get(possibleCollection, `%${possiblePath}`) as typeof doc;
+            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
           }
 
           if (doc) {
@@ -782,7 +786,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
           FROM documents d
           JOIN content ON content.hash = d.hash
           WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(detected.collectionName, detected.relativePath) as typeof doc;
+        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
       }
 
       // Fuzzy match by filename (last component of path)
@@ -794,7 +798,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
           JOIN content ON content.hash = d.hash
           WHERE d.path LIKE ? AND d.active = 1
           LIMIT 1
-        `).get(`%${filename}`) as typeof doc;
+        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
       }
 
       if (doc) {
@@ -805,6 +809,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     }
   }
 
+  // Ensure doc is not null before proceeding
   if (!doc) {
     console.error(`Document not found: ${filename}`);
     closeDb();
@@ -882,7 +887,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
           JOIN content ON content.hash = d.hash
           WHERE d.path = ? AND d.active = 1
           LIMIT 1
-        `).get(name) as typeof doc;
+        `).get(name) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
 
         // Try suffix match
         if (!doc) {
@@ -896,7 +901,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
             JOIN content ON content.hash = d.hash
             WHERE d.path LIKE ? AND d.active = 1
             LIMIT 1
-          `).get(`%${name}`) as typeof doc;
+          `).get(`%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
         }
       }
 
@@ -1004,7 +1009,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     }));
     console.log(JSON.stringify(output, null, 2));
   } else if (format === "csv") {
-    const escapeField = (val: string | null): string => {
+    const escapeField = (val: string | null | undefined): string => {
       if (val === null || val === undefined) return "";
       const str = String(val);
       if (str.includes(",") || str.includes('"') || str.includes("\n")) {
@@ -1014,7 +1019,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     };
     console.log("file,title,context,skipped,body");
     for (const r of results) {
-      console.log([r.displayPath, r.title, r.context || "", r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
     for (const r of results) {
@@ -1125,7 +1130,7 @@ function listFiles(pathArg?: string): void {
   } else {
     // Just collection name or collection/path
     const parts = pathArg.split('/');
-    collectionName = parts[0];
+    collectionName = parts[0] || '';
     if (parts.length > 1) {
       pathPrefix = parts.slice(1).join('/');
     }
@@ -1228,7 +1233,7 @@ function collectionList(): void {
   console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
 
   for (const coll of collections) {
-    const updatedAt = new Date(coll.updated_at);
+    const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
     const timeAgo = formatTimeAgo(updatedAt);
 
     console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
@@ -1243,15 +1248,16 @@ function collectionList(): void {
 
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
   // If name not provided, generate from pwd basename
-  if (!name) {
+  let collName = name;
+  if (!collName) {
     const parts = pwd.split('/').filter(Boolean);
-    name = parts[parts.length - 1] || 'root';
+    collName = parts[parts.length - 1] || 'root';
   }
 
   // Check if collection with this name already exists in YAML
-  const existing = getCollectionFromYaml(name);
+  const existing = getCollectionFromYaml(collName);
   if (existing) {
-    console.error(`${c.yellow}Collection '${name}' already exists.${c.reset}`);
+    console.error(`${c.yellow}Collection '${collName}' already exists.${c.reset}`);
     console.error(`Use a different name with --name <name>`);
     process.exit(1);
   }
@@ -1270,12 +1276,12 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Add to YAML config
   const { addCollection } = await import("./collections.js");
-  addCollection(name, pwd, globPattern);
+  addCollection(collName, pwd, globPattern);
 
   // Create the collection and index files
-  console.log(`Creating collection '${name}'...`);
-  await indexFiles(pwd, globPattern, name);
-  console.log(`${c.green}✓${c.reset} Collection '${name}' created successfully`);
+  console.log(`Creating collection '${collName}'...`);
+  await indexFiles(pwd, globPattern, collName);
+  console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
 function collectionRemove(name: string): void {
@@ -1492,11 +1498,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       allChunks.push({
         hash: item.hash,
         title,
-        text: chunks[seq].text,
+        text: chunks[seq]!.text, // Chunk is guaranteed to exist by seq loop
         seq,
-        pos: chunks[seq].pos,
-        tokens: chunks[seq].tokens,
-        bytes: encoder.encode(chunks[seq].text).length,
+        pos: chunks[seq]!.pos,
+        tokens: chunks[seq]!.tokens,
+        bytes: encoder.encode(chunks[seq]!.text).length,
         displayName,
       });
     }
@@ -1524,7 +1530,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   // Get embedding dimensions from first chunk
   progress.indeterminate();
   const llm = getDefaultLlamaCpp();
-  const firstText = formatDocForEmbedding(allChunks[0].text, allChunks[0].title);
+  const firstChunk = allChunks[0];
+  if (!firstChunk) {
+    throw new Error("No chunks available to embed");
+  }
+  const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
   const firstResult = await llm.embed(firstText);
   if (!firstResult) {
     throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1551,7 +1561,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
       // Insert each embedding
       for (let i = 0; i < batch.length; i++) {
-        const chunk = batch[i];
+        const chunk = batch[i]!;
         const embedding = embeddings[i];
 
         if (embedding) {
@@ -1630,7 +1640,7 @@ function buildFTS5Query(query: string): string {
     .filter(term => term.length >= 2); // Skip single chars and empty
 
   if (terms.length === 0) return "";
-  if (terms.length === 1) return `"${terms[0].replace(/"/g, '""')}"`;
+  if (terms.length === 1) return `"${terms[0]!.replace(/"/g, '""')}"`;
 
   // Strategy: exact phrase OR proximity match OR individual terms
   // Exact phrase matches rank highest, then close proximity, then any term
@@ -1666,7 +1676,6 @@ function normalizeScores(results: SearchResult[]): SearchResult[] {
 // Reciprocal Rank Fusion: combines multiple ranked lists
 // RRF score = sum(1 / (k + rank)) across all lists where doc appears
 // k=60 is standard, provides good balance between top and lower ranks
-export type RankedResult = { file: string; displayPath: string; title: string; body: string; score: number };
 
 function reciprocalRankFusion(
   resultLists: RankedResult[][],
@@ -1677,9 +1686,11 @@ function reciprocalRankFusion(
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const results = resultLists[listIdx];
+    if (!results) continue;
     const weight = weights[listIdx] ?? 1.0;
     for (let rank = 0; rank < results.length; rank++) {
       const doc = results[rank];
+      if (!doc) continue; // Ensure doc is not undefined
       const rrfScore = weight / (k + rank + 1);
       const existing = scores.get(doc.file);
       if (existing) {
@@ -1711,6 +1722,7 @@ type OutputOptions = {
   all?: boolean;
   collection?: string;  // Filter by collection name (pwd suffix match)
   lineNumbers?: boolean; // Add line numbers to output
+  context?: string;      // Optional context for query expansion
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1791,6 +1803,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   } else if (opts.format === "cli") {
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
+      if (!row) continue;
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
@@ -1827,7 +1840,9 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (i < filtered.length - 1) console.log('\n');
     }
   } else if (opts.format === "md") {
-    for (const row of filtered) {
+    for (let i = 0; i < filtered.length; i++) {
+      const row = filtered[i];
+      if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
@@ -1859,7 +1874,8 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         content = addLineNumbers(content, line);
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title)},${escapeCSV(row.context || "")},${line},${escapeCSV(content)}`);
+      const snippetText = content || "";
+      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`);
     }
   }
 }
@@ -1886,7 +1902,11 @@ function search(query: string, opts: OutputOptions): void {
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
-    ...r,
+    file: r.filepath,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body || "",
+    score: r.score,
     context: getContextForFile(db, r.filepath),
   }));
 
@@ -1925,15 +1945,16 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   checkIndexHealth(db);
 
   // Expand query using structured output (no lexical for vector-only search)
-  const expanded = await expandQueryStructured(query, false);
+  const queryables = await expandQueryStructured(query, false, opts.context);
 
-  // Build list of queries for vector search: original, vectorQuery, and hyde
+  // Build list of queries for vector search: original, vec, and hyde
   const vectorQueries: string[] = [query];
-  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
-    vectorQueries.push(expanded.vectorQuery);
-  }
-  if (expanded.hyde && expanded.hyde.length > 20) {
-    vectorQueries.push(expanded.hyde);
+  for (const q of queryables) {
+    if (q.type === 'vec' || q.type === 'hyde') {
+      if (q.text && q.text !== query) {
+        vectorQueries.push(q.text);
+      }
+    }
   }
 
   process.stderr.write(`${c.dim}Searching ${vectorQueries.length} vector queries...${c.reset}\n`);
@@ -1942,7 +1963,8 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  for (const q of vectorQueries) {
+  // Use Promise.all for concurrent vector searches
+  await Promise.all(vectorQueries.map(async (q) => {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -1950,7 +1972,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
         allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
       }
     }
-  }
+  }));
 
   // Sort by max score and limit to requested count
   const results = Array.from(allResults.values())
@@ -1967,50 +1989,50 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   outputResults(results, query, { ...opts, limit: results.length }); // Already limited
 }
 
-// Expand query using structured output with JSON schema grammar
-async function expandQueryStructured(query: string, includeLexical: boolean = true): Promise<ExpandedQuery> {
+// Expand query using structured output with GBNF grammar
+async function expandQueryStructured(query: string, includeLexical: boolean = true, context?: string): Promise<Queryable[]> {
   process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
 
   const llm = getDefaultLlamaCpp();
-  const expanded = await llm.expandQueryStructured(query, includeLexical);
+  const queryables = await llm.expandQuery(query, { includeLexical, context });
 
-  // Log the expansion as a tree, starting with original query
+  // Log the expansion as a tree
   const lines: string[] = [];
   const bothLabel = includeLexical ? ' · (lexical+vector)' : ' · (vector)';
   lines.push(`${c.dim}├─ ${query}${bothLabel}${c.reset}`);
 
-  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
-    lines.push(`${c.dim}├─ ${expanded.lexicalQuery} · (lexical)${c.reset}`);
-  }
-  if (expanded.vectorQuery && expanded.vectorQuery !== query) {
-    lines.push(`${c.dim}├─ ${expanded.vectorQuery} · (vector)${c.reset}`);
-  }
-  if (expanded.hyde && expanded.hyde.length > 20) {
-    // Truncate hyde to first ~60 chars for display
-    const hydePreview = expanded.hyde.length > 60
-      ? expanded.hyde.substring(0, 60).replace(/\n/g, ' ') + '...'
-      : expanded.hyde.replace(/\n/g, ' ');
-    lines.push(`${c.dim}├─ ${hydePreview} · (vector)${c.reset}`);
+  for (let i = 0; i < queryables.length; i++) {
+    const q = queryables[i];
+    if (!q || q.text === query) continue;
+
+    let textPreview = q.text.replace(/\n/g, ' ');
+    if (textPreview.length > 80) {
+      textPreview = textPreview.substring(0, 77) + '...';
+    }
+
+    const label = q.type === 'lex' ? 'lexical' : (q.type === 'hyde' ? 'hyde' : 'vector');
+    lines.push(`${c.dim}├─ ${textPreview} · (${label})${c.reset}`);
   }
 
   // Fix last item to use └─ instead of ├─
   if (lines.length > 0) {
-    lines[lines.length - 1] = lines[lines.length - 1].replace('├─', '└─');
+    lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
   }
 
   for (const line of lines) {
     process.stderr.write(line + '\n');
   }
 
-  return expanded;
+  return queryables;
 }
 
 async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database): Promise<string[]> {
-  const expanded = await expandQueryStructured(query, true);
-  const queries = [query];
-  if (expanded.lexicalQuery && expanded.lexicalQuery !== query) queries.push(expanded.lexicalQuery);
-  if (expanded.vectorQuery && expanded.vectorQuery !== query) queries.push(expanded.vectorQuery);
-  return queries;
+  const queryables = await expandQueryStructured(query, true);
+  const queries = new Set<string>([query]);
+  for (const q of queryables) {
+    queries.add(q.text);
+  }
+  return Array.from(queries);
 }
 
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2033,7 +2055,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   // Run initial BM25 search (will be reused for retrieval)
   const initialFts = searchFTS(db, query, 20, collectionName as any);
-  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
   // Strong signal = top result is strong AND clearly separated from runner-up.
@@ -2052,21 +2074,19 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     {
       const lines: string[] = [];
       lines.push(`${c.dim}├─ ${query} · (lexical+vector)${c.reset}`);
-      lines[lines.length - 1] = lines[lines.length - 1].replace('├─', '└─');
+      lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
       for (const line of lines) process.stderr.write(line + '\n');
     }
   } else {
     // Weak signal - expand query for better recall
-    const expanded = await expandQueryStructured(query, true);
+    const queryables = await expandQueryStructured(query, true, opts.context);
 
-    if (expanded.lexicalQuery && expanded.lexicalQuery !== query) {
-      ftsQueries.push(expanded.lexicalQuery);
-    }
-    if (expanded.vectorQuery && expanded.vectorQuery !== query) {
-      vectorQueries.push(expanded.vectorQuery);
-    }
-    if (expanded.hyde && expanded.hyde.length > 20) {
-      vectorQueries.push(expanded.hyde);
+    for (const q of queryables) {
+      if (q.type === 'lex') {
+        if (q.text && q.text !== query) ftsQueries.push(q.text);
+      } else if (q.type === 'vec' || q.type === 'hyde') {
+        if (q.text && q.text !== query) vectorQueries.push(q.text);
+      }
     }
   }
 
@@ -2078,30 +2098,39 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Map to store hash by filepath for final results
   const hashMap = new Map<string, string>();
 
-  // FTS searches with lexical queries (reuse initial search for original query)
-  if (initialFts.length > 0) {
-    for (const r of initialFts) hashMap.set(r.filepath, r.hash);
-    rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+  // Run all searches concurrently (FTS + Vector)
+  const searchPromises: Promise<void>[] = [];
+
+  // FTS searches
+  for (const q of ftsQueries) {
+    if (!q) continue;
+    searchPromises.push((async () => {
+      const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) {
+          // Mutex for hashMap is not strictly needed as it's just adding values
+          hashMap.set(r.filepath, r.hash);
+        }
+        rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+      }
+    })());
   }
-  // Run expanded queries (skip first which is original)
-  for (const q of ftsQueries.slice(1)) {
-    const ftsResults = searchFTS(db, q, 20, collectionName as any);
-    if (ftsResults.length > 0) {
-      for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
-      rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+
+  // Vector searches
+  if (hasVectors) {
+    for (const q of vectorQueries) {
+      if (!q) continue;
+      searchPromises.push((async () => {
+        const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any);
+        if (vecResults.length > 0) {
+          for (const r of vecResults) hashMap.set(r.filepath, r.hash);
+          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+        }
+      })());
     }
   }
 
-  // Vector searches with semantic queries + hyde
-  if (hasVectors) {
-    for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
-      if (vecResults.length > 0) {
-        for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-        rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-      }
-    }
-  }
+  await Promise.all(searchPromises);
 
   // Apply Reciprocal Rank Fusion to combine all ranked lists
   // Give 2x weight to original query results (first 2 lists: FTS + vector)
@@ -2215,7 +2244,12 @@ function parseCLI() {
     args: Bun.argv.slice(2), // Skip bun and script path
     options: {
       // Global options
-      index: { type: "string" },
+      context: {
+        type: "string",
+      },
+      "no-lex": {
+        type: "boolean",
+      },
       help: { type: "boolean", short: "h" },
       // Search options
       n: { type: "string" },
@@ -2246,8 +2280,9 @@ function parseCLI() {
   });
 
   // Select index name (default: "index")
-  if (values.index) {
-    setIndexName(values.index);
+  const indexName = values.index as string | undefined;
+  if (indexName) {
+    setIndexName(indexName);
   }
 
   // Determine output format
@@ -2261,16 +2296,16 @@ function parseCLI() {
   // Default limit: 20 for --files/--json, 5 otherwise
   // --all means return all results (use very large limit)
   const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
-  const isAll = values.all || false;
+  const isAll = !!values.all;
 
   const opts: OutputOptions = {
     format,
-    full: values.full || false,
-    limit: isAll ? 100000 : (values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit),
-    minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
+    full: !!values.full,
+    limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
+    minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string | undefined,
-    lineNumbers: values["line-numbers"] || false,
+    lineNumbers: !!values["line-numbers"],
   };
 
   return {
@@ -2334,255 +2369,255 @@ function showHelp(): void {
 
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
-const cli = parseCLI();
+  const cli = parseCLI();
 
-if (!cli.command || cli.values.help) {
-  showHelp();
-  process.exit(cli.values.help ? 0 : 1);
-}
+  if (!cli.command || cli.values.help) {
+    showHelp();
+    process.exit(cli.values.help ? 0 : 1);
+  }
 
-switch (cli.command) {
-  case "context": {
-    const subcommand = cli.args[0];
-    if (!subcommand) {
-      console.error("Usage: qmd context <add|list|check|rm>");
-      console.error("");
-      console.error("Commands:");
-      console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
-      console.error("  qmd context add / \"text\"       - Add global context to all collections");
-      console.error("  qmd context list                - List all contexts");
-      console.error("  qmd context check               - Check for missing contexts");
-      console.error("  qmd context rm <path>           - Remove context");
-      process.exit(1);
-    }
-
-    switch (subcommand) {
-      case "add": {
-        if (cli.args.length < 2) {
-          console.error("Usage: qmd context add [path] \"text\"");
-          console.error("");
-          console.error("Examples:");
-          console.error("  qmd context add \"Context for current directory\"");
-          console.error("  qmd context add . \"Context for current directory\"");
-          console.error("  qmd context add /subfolder \"Context for subfolder\"");
-          console.error("  qmd context add / \"Global context for all collections\"");
-          console.error("");
-          console.error("  Using virtual paths:");
-          console.error("  qmd context add qmd://journals/ \"Context for entire journals collection\"");
-          console.error("  qmd context add qmd://journals/2024 \"Context for 2024 journals\"");
-          process.exit(1);
-        }
-
-        let pathArg: string | undefined;
-        let contextText: string;
-
-        // Check if first arg looks like a path or if it's the context text
-        const firstArg = cli.args[1];
-        const secondArg = cli.args[2];
-
-        if (secondArg) {
-          // Two args: path + context
-          pathArg = firstArg;
-          contextText = cli.args.slice(2).join(" ");
-        } else {
-          // One arg: context only (use current directory)
-          pathArg = undefined;
-          contextText = firstArg;
-        }
-
-        await contextAdd(pathArg, contextText);
-        break;
-      }
-
-      case "list": {
-        contextList();
-        break;
-      }
-
-      case "check": {
-        contextCheck();
-        break;
-      }
-
-      case "rm":
-      case "remove": {
-        if (cli.args.length < 2) {
-          console.error("Usage: qmd context rm <path>");
-          console.error("Examples:");
-          console.error("  qmd context rm /");
-          console.error("  qmd context rm qmd://journals/2024");
-          process.exit(1);
-        }
-        contextRemove(cli.args[1]);
-        break;
-      }
-
-      default:
-        console.error(`Unknown subcommand: ${subcommand}`);
-        console.error("Available: add, list, check, rm");
+  switch (cli.command) {
+    case "context": {
+      const subcommand = cli.args[0];
+      if (!subcommand) {
+        console.error("Usage: qmd context <add|list|check|rm>");
+        console.error("");
+        console.error("Commands:");
+        console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
+        console.error("  qmd context add / \"text\"       - Add global context to all collections");
+        console.error("  qmd context list                - List all contexts");
+        console.error("  qmd context check               - Check for missing contexts");
+        console.error("  qmd context rm <path>           - Remove context");
         process.exit(1);
-    }
-    break;
-  }
-
-  case "get": {
-    if (!cli.args[0]) {
-      console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
-      process.exit(1);
-    }
-    const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
-    const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-    getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
-    break;
-  }
-
-  case "multi-get": {
-    if (!cli.args[0]) {
-      console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
-      console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
-      process.exit(1);
-    }
-    const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-    const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
-    multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
-    break;
-  }
-
-  case "ls": {
-    listFiles(cli.args[0]);
-    break;
-  }
-
-  case "collection": {
-    const subcommand = cli.args[0];
-    switch (subcommand) {
-      case "list": {
-        collectionList();
-        break;
       }
 
-      case "add": {
-        const pwd = cli.args[1] || getPwd();
-        const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-        const globPattern = cli.values.mask as string || DEFAULT_GLOB;
-        const name = cli.values.name as string | undefined;
+      switch (subcommand) {
+        case "add": {
+          if (cli.args.length < 2) {
+            console.error("Usage: qmd context add [path] \"text\"");
+            console.error("");
+            console.error("Examples:");
+            console.error("  qmd context add \"Context for current directory\"");
+            console.error("  qmd context add . \"Context for current directory\"");
+            console.error("  qmd context add /subfolder \"Context for subfolder\"");
+            console.error("  qmd context add / \"Global context for all collections\"");
+            console.error("");
+            console.error("  Using virtual paths:");
+            console.error("  qmd context add qmd://journals/ \"Context for entire journals collection\"");
+            console.error("  qmd context add qmd://journals/2024 \"Context for 2024 journals\"");
+            process.exit(1);
+          }
 
-        await collectionAdd(resolvedPwd, globPattern, name);
-        break;
-      }
+          let pathArg: string | undefined;
+          let contextText: string;
 
-      case "remove":
-      case "rm": {
-        if (!cli.args[1]) {
-          console.error("Usage: qmd collection remove <name>");
-          console.error("  Use 'qmd collection list' to see available collections");
-          process.exit(1);
+          // Check if first arg looks like a path or if it's the context text
+          const firstArg = cli.args[1] || '';
+          const secondArg = cli.args[2];
+
+          if (secondArg) {
+            // Two args: path + context
+            pathArg = firstArg;
+            contextText = cli.args.slice(2).join(" ");
+          } else {
+            // One arg: context only (use current directory)
+            pathArg = undefined;
+            contextText = firstArg;
+          }
+
+          await contextAdd(pathArg, contextText);
+          break;
         }
-        collectionRemove(cli.args[1]);
-        break;
-      }
 
-      case "rename":
-      case "mv": {
-        if (!cli.args[1] || !cli.args[2]) {
-          console.error("Usage: qmd collection rename <old-name> <new-name>");
-          console.error("  Use 'qmd collection list' to see available collections");
-          process.exit(1);
+        case "list": {
+          contextList();
+          break;
         }
-        collectionRename(cli.args[1], cli.args[2]);
-        break;
-      }
 
-      default:
-        console.error(`Unknown subcommand: ${subcommand}`);
-        console.error("Available: list, add, remove, rename");
+        case "check": {
+          contextCheck();
+          break;
+        }
+
+        case "rm":
+        case "remove": {
+          if (cli.args.length < 2 || !cli.args[1]) {
+            console.error("Usage: qmd context rm <path>");
+            console.error("Examples:");
+            console.error("  qmd context rm /");
+            console.error("  qmd context rm qmd://journals/2024");
+            process.exit(1);
+          }
+          contextRemove(cli.args[1]);
+          break;
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Available: add, list, check, rm");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "get": {
+      if (!cli.args[0]) {
+        console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
         process.exit(1);
+      }
+      const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
+      const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      break;
     }
-    break;
+
+    case "multi-get": {
+      if (!cli.args[0]) {
+        console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
+        console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
+        process.exit(1);
+      }
+      const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+      const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
+      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      break;
+    }
+
+    case "ls": {
+      listFiles(cli.args[0]);
+      break;
+    }
+
+    case "collection": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case "list": {
+          collectionList();
+          break;
+        }
+
+        case "add": {
+          const pwd = cli.args[1] || getPwd();
+          const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
+          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const name = cli.values.name as string | undefined;
+
+          await collectionAdd(resolvedPwd, globPattern, name);
+          break;
+        }
+
+        case "remove":
+        case "rm": {
+          if (!cli.args[1]) {
+            console.error("Usage: qmd collection remove <name>");
+            console.error("  Use 'qmd collection list' to see available collections");
+            process.exit(1);
+          }
+          collectionRemove(cli.args[1]);
+          break;
+        }
+
+        case "rename":
+        case "mv": {
+          if (!cli.args[1] || !cli.args[2]) {
+            console.error("Usage: qmd collection rename <old-name> <new-name>");
+            console.error("  Use 'qmd collection list' to see available collections");
+            process.exit(1);
+          }
+          collectionRename(cli.args[1], cli.args[2]);
+          break;
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Available: list, add, remove, rename");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "status":
+      showStatus();
+      break;
+
+    case "update":
+      await updateCollections();
+      break;
+
+    case "embed":
+      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      break;
+
+    case "search":
+      if (!cli.query) {
+        console.error("Usage: qmd search [options] <query>");
+        process.exit(1);
+      }
+      search(cli.query, cli.opts);
+      break;
+
+    case "vsearch":
+      if (!cli.query) {
+        console.error("Usage: qmd vsearch [options] <query>");
+        process.exit(1);
+      }
+      // Default min-score for vector search is 0.3
+      if (!cli.values["min-score"]) {
+        cli.opts.minScore = 0.3;
+      }
+      await vectorSearch(cli.query, cli.opts);
+      break;
+
+    case "query":
+      if (!cli.query) {
+        console.error("Usage: qmd query [options] <query>");
+        process.exit(1);
+      }
+      await querySearch(cli.query, cli.opts);
+      break;
+
+    case "mcp": {
+      const { startMcpServer } = await import("./mcp.js");
+      await startMcpServer();
+      break;
+    }
+
+    case "cleanup": {
+      const db = getDb();
+
+      // 1. Clear llm_cache
+      const cacheCount = deleteLLMCache(db);
+      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
+
+      // 2. Remove orphaned vectors
+      const orphanedVecs = cleanupOrphanedVectors(db);
+      if (orphanedVecs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      } else {
+        console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+      }
+
+      // 3. Remove inactive documents
+      const inactiveDocs = deleteInactiveDocuments(db);
+      if (inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      }
+
+      // 4. Vacuum to reclaim space
+      vacuumDatabase(db);
+      console.log(`${c.green}✓${c.reset} Database vacuumed`);
+
+      closeDb();
+      break;
+    }
+
+    default:
+      console.error(`Unknown command: ${cli.command}`);
+      console.error("Run 'qmd --help' for usage.");
+      process.exit(1);
   }
 
-  case "status":
-    showStatus();
-    break;
-
-  case "update":
-    await updateCollections();
-    break;
-
-  case "embed":
-    await vectorIndex(DEFAULT_EMBED_MODEL, cli.values.force || false);
-    break;
-
-  case "search":
-    if (!cli.query) {
-      console.error("Usage: qmd search [options] <query>");
-      process.exit(1);
-    }
-    search(cli.query, cli.opts);
-    break;
-
-  case "vsearch":
-    if (!cli.query) {
-      console.error("Usage: qmd vsearch [options] <query>");
-      process.exit(1);
-    }
-    // Default min-score for vector search is 0.3
-    if (!cli.values["min-score"]) {
-      cli.opts.minScore = 0.3;
-    }
-    await vectorSearch(cli.query, cli.opts);
-    break;
-
-  case "query":
-    if (!cli.query) {
-      console.error("Usage: qmd query [options] <query>");
-      process.exit(1);
-    }
-    await querySearch(cli.query, cli.opts);
-    break;
-
-  case "mcp": {
-    const { startMcpServer } = await import("./mcp.js");
-    await startMcpServer();
-    break;
-  }
-
-  case "cleanup": {
-    const db = getDb();
-
-    // 1. Clear llm_cache
-    const cacheCount = deleteLLMCache(db);
-    console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
-
-    // 2. Remove orphaned vectors
-    const orphanedVecs = cleanupOrphanedVectors(db);
-    if (orphanedVecs > 0) {
-      console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
-    } else {
-      console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
-    }
-
-    // 3. Remove inactive documents
-    const inactiveDocs = deleteInactiveDocuments(db);
-    if (inactiveDocs > 0) {
-      console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
-    }
-
-    // 4. Vacuum to reclaim space
-    vacuumDatabase(db);
-    console.log(`${c.green}✓${c.reset} Database vacuumed`);
-
-    closeDb();
-    break;
-  }
-
-  default:
-    console.error(`Unknown command: ${cli.command}`);
-    console.error("Run 'qmd --help' for usage.");
-    process.exit(1);
-}
-
-// Cleanup LlamaCpp instance to prevent NAPI crash on exit
-await disposeDefaultLlamaCpp();
+  // Cleanup LlamaCpp instance to prevent NAPI crash on exit
+  await disposeDefaultLlamaCpp();
 
 } // end if (import.meta.main)

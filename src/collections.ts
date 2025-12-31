@@ -344,7 +344,7 @@ export function findContextForPath(
   // Return most specific match (longest prefix)
   if (matches.length > 0) {
     matches.sort((a, b) => b.prefix.length - a.prefix.length);
-    return matches[0].context;
+    return matches[0]!.context;
   }
 
   // Fallback to global context

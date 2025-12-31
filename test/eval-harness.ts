@@ -175,7 +175,7 @@ function evaluate(mode: "search" | "query") {
       .map((r, i) => ({ rank: i + 1, matches: r.file.toLowerCase().includes(expectedDoc) }))
       .filter(r => r.matches);
 
-    const firstHit = ranks.length > 0 ? ranks[0].rank : -1;
+    const firstHit = ranks.length > 0 ? ranks[0]!.rank : -1;
 
     results[difficulty].total++;
     if (firstHit === 1) results[difficulty].hit1++;

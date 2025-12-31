@@ -528,8 +528,8 @@ describe("Document Chunking", () => {
     const content = "Small document content";
     const chunks = chunkDocument(content, 1000, 0);
     expect(chunks).toHaveLength(1);
-    expect(chunks[0].text).toBe(content);
-    expect(chunks[0].pos).toBe(0);
+    expect(chunks[0]!.text).toBe(content);
+    expect(chunks[0]!.pos).toBe(0);
   });
 
   test("chunkDocument splits large documents", () => {
@@ -539,9 +539,9 @@ describe("Document Chunking", () => {
 
     // All chunks should have correct positions
     for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i].pos).toBeGreaterThanOrEqual(0);
+      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
       if (i > 0) {
-        expect(chunks[i].pos).toBeGreaterThan(chunks[i - 1].pos);
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     }
   });
@@ -554,12 +554,12 @@ describe("Document Chunking", () => {
     // With overlap, positions should be closer together than without
     // Each new chunk starts 150 chars before where the previous one ended
     for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
-      const currentStart = chunks[i].pos;
+      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
+      const currentStart = chunks[i]!.pos;
       // Current chunk should start before the previous chunk ended (overlap)
       expect(currentStart).toBeLessThan(prevEnd);
       // But should still make forward progress
-      expect(currentStart).toBeGreaterThan(chunks[i - 1].pos);
+      expect(currentStart).toBeGreaterThan(chunks[i - 1]!.pos);
     }
   });
 
@@ -594,8 +594,8 @@ describe("Document Chunking", () => {
     const chunks = chunkDocument(content);
     expect(chunks.length).toBeGreaterThan(1);
     // Each chunk should be around 3200 chars (except last)
-    expect(chunks[0].text.length).toBeGreaterThan(2500);
-    expect(chunks[0].text.length).toBeLessThanOrEqual(3200);
+    expect(chunks[0]!.text.length).toBeGreaterThan(2500);
+    expect(chunks[0]!.text.length).toBeLessThanOrEqual(3200);
   });
 });
 
@@ -604,10 +604,10 @@ describe("Token-based Chunking", () => {
     const content = "This is a small document.";
     const chunks = await chunkDocumentByTokens(content, 800, 120);
     expect(chunks).toHaveLength(1);
-    expect(chunks[0].text).toBe(content);
-    expect(chunks[0].pos).toBe(0);
-    expect(chunks[0].tokens).toBeGreaterThan(0);
-    expect(chunks[0].tokens).toBeLessThan(800);
+    expect(chunks[0]!.text).toBe(content);
+    expect(chunks[0]!.pos).toBe(0);
+    expect(chunks[0]!.tokens).toBeGreaterThan(0);
+    expect(chunks[0]!.tokens).toBeLessThan(800);
   });
 
   test("chunkDocumentByTokens splits large documents", async () => {
@@ -625,9 +625,9 @@ describe("Token-based Chunking", () => {
 
     // Chunks should have correct positions
     for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i].pos).toBeGreaterThanOrEqual(0);
+      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
       if (i > 0) {
-        expect(chunks[i].pos).toBeGreaterThan(chunks[i - 1].pos);
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     }
   });
@@ -640,8 +640,8 @@ describe("Token-based Chunking", () => {
 
     // With overlap, consecutive chunks should have overlapping positions
     for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
-      const currentStart = chunks[i].pos;
+      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
+      const currentStart = chunks[i]!.pos;
       // Current chunk should start before the previous chunk ended (overlap)
       expect(currentStart).toBeLessThan(prevEnd);
     }
@@ -653,8 +653,8 @@ describe("Token-based Chunking", () => {
 
     expect(chunks).toHaveLength(1);
     // The token count should be reasonable (not 0, not equal to char count)
-    expect(chunks[0].tokens).toBeGreaterThan(0);
-    expect(chunks[0].tokens).toBeLessThan(content.length);  // Tokens < chars for English
+    expect(chunks[0]!.tokens).toBeGreaterThan(0);
+    expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
   });
 });
 
@@ -805,9 +805,9 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("fox", 10);
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0].displayPath).toBe(`${collectionName}/test/doc1.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
-    expect(results[0].source).toBe("fts");
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/doc1.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
+    expect(results[0]!.source).toBe("fts");
 
     await cleanupTestDb(store);
   });
@@ -836,7 +836,7 @@ describe("FTS Search", () => {
     // Both documents contain "fox" in the body now, so we should get 2 results
     expect(results.length).toBe(2);
     // Title/name match should rank higher due to BM25 weights
-    expect(results[0].displayPath).toBe(`${collectionName}/test/title.md`);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/title.md`);
 
     await cleanupTestDb(store);
   });
@@ -883,7 +883,7 @@ describe("FTS Search", () => {
     // Filter by collection name (collectionId is now treated as collection name string)
     const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
     expect(filtered).toHaveLength(1);
-    expect(filtered[0].displayPath).toBe(`${collection1}/doc1.md`);
+    expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 
     await cleanupTestDb(store);
   });
@@ -925,8 +925,8 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("findme", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`${collectionName}/test/active.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/active.md`);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/active.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/active.md`);
 
     await cleanupTestDb(store);
   });
@@ -1231,9 +1231,9 @@ describe("Document Retrieval", () => {
 
       const { docs } = store.findDocuments("large.md", { maxBytes: 10000 });
       expect(docs).toHaveLength(1);
-      expect(docs[0].skipped).toBe(true);
-      if (docs[0].skipped) {
-        expect(docs[0].skipReason).toContain("too large");
+      expect(docs[0]!.skipped).toBe(true);
+      if (docs[0]!.skipped) {
+        expect((docs[0] as { skipped: true; skipReason: string }).skipReason).toContain("too large");
       }
 
       await cleanupTestDb(store);
@@ -1251,9 +1251,9 @@ describe("Document Retrieval", () => {
       });
 
       const { docs } = store.findDocuments("doc1.md", { includeBody: true });
-      expect(docs[0].skipped).toBe(false);
-      if (!docs[0].skipped) {
-        expect(docs[0].doc.body).toBe("The content");
+      expect(docs[0]!.skipped).toBe(false);
+      if (!docs[0]!.skipped) {
+        expect((docs[0] as { doc: { body: string }; skipped: false }).doc.body).toBe("The content");
       }
 
       await cleanupTestDb(store);
@@ -1339,10 +1339,10 @@ describe("Snippet Extraction", () => {
     expect(headerMatch).not.toBeNull();
 
     const [, startLine, count, before, after] = headerMatch!;
-    expect(parseInt(startLine)).toBe(2); // Snippet starts at line 2 (B)
-    expect(parseInt(count)).toBe(4);     // 4 lines: B, C keyword, D, E
-    expect(parseInt(before)).toBe(1);    // A is before
-    expect(parseInt(after)).toBe(3);     // F, G, H are after
+    expect(parseInt(startLine!)).toBe(2); // Snippet starts at line 2 (B)
+    expect(parseInt(count!)).toBe(4);     // 4 lines: B, C keyword, D, E
+    expect(parseInt(before!)).toBe(1);    // A is before
+    expect(parseInt(after!)).toBe(3);     // F, G, H are after
   });
 
   test("extractSnippet at document start shows 0 before", () => {
@@ -1412,9 +1412,9 @@ describe("Reciprocal Rank Fusion", () => {
     const fused = reciprocalRankFusion([list1]);
 
     // Order should be preserved
-    expect(fused[0].file).toBe("doc1");
-    expect(fused[1].file).toBe("doc2");
-    expect(fused[2].file).toBe("doc3");
+    expect(fused[0]!.file).toBe("doc1");
+    expect(fused[1]!.file).toBe("doc2");
+    expect(fused[2]!.file).toBe("doc3");
   });
 
   test("RRF merges documents from multiple lists", () => {
@@ -1437,7 +1437,7 @@ describe("Reciprocal Rank Fusion", () => {
     const fused = reciprocalRankFusion([list1, list2], [2.0, 1.0]);
 
     // doc1 should rank higher due to weight
-    expect(fused[0].file).toBe("doc1");
+    expect(fused[0]!.file).toBe("doc1");
   });
 
   test("RRF adds top-rank bonus", () => {
@@ -1468,7 +1468,7 @@ describe("Reciprocal Rank Fusion", () => {
     const fused30 = reciprocalRankFusion([list], [], 30);
 
     // Lower k = higher scores for top ranks
-    expect(fused30[0].score).toBeGreaterThan(fused60[0].score);
+    expect(fused30[0]!.score).toBeGreaterThan(fused60[0]!.score);
   });
 });
 
@@ -1746,12 +1746,12 @@ describe("Integration", () => {
     const results2 = store2.searchFTS("different", 10);
 
     expect(results1).toHaveLength(1);
-    expect(results1[0].displayPath).toBe("store1/doc.md");
-    expect(results1[0].filepath).toBe("qmd://store1/doc.md");
+    expect(results1[0]!.displayPath).toBe("store1/doc.md");
+    expect(results1[0]!.filepath).toBe("qmd://store1/doc.md");
 
     expect(results2).toHaveLength(1);
-    expect(results2[0].displayPath).toBe("store2/doc.md");
-    expect(results2[0].filepath).toBe("qmd://store2/doc.md");
+    expect(results2[0]!.displayPath).toBe("store2/doc.md");
+    expect(results2[0]!.filepath).toBe("qmd://store2/doc.md");
 
     // Cross-check: store1 shouldn't find store2's content
     const cross1 = store1.searchFTS("different", 10);
@@ -1806,9 +1806,9 @@ describe("LlamaCpp Integration", () => {
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`${collectionName}/doc1.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/doc1.md`);
-    expect(results[0].source).toBe("vec");
+    expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
+    expect(results[0]!.source).toBe("vec");
 
     await cleanupTestDb(store);
   });
@@ -1849,7 +1849,7 @@ describe("LlamaCpp Integration", () => {
     const results = await store.rerank("topic", docs);
     expect(results).toHaveLength(2);
     // LlamaCpp reranker returns relevance scores
-    expect(results[0].score).toBeGreaterThan(0);
+    expect(results[0]!.score).toBeGreaterThan(0);
 
     await cleanupTestDb(store);
   });
@@ -2106,7 +2106,7 @@ describe("Content-Addressable Storage", () => {
     // All documents should point to the same hash
     const hashes = store.db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
     expect(hashes).toHaveLength(1);
-    expect(hashes[0].hash).toBe(sharedHash);
+    expect(hashes[0]!.hash).toBe(sharedHash);
 
     await cleanupTestDb(store);
   });

@@ -40,7 +40,7 @@ type StatusResult = {
   needsEmbedding: number;
   hasVectorIndex: boolean;
   collections: {
-    id: number;
+    name: string;
     path: string;
     pattern: string;
     documents: number;
@@ -104,7 +104,7 @@ export async function startMcpServer(): Promise<void> {
 
   server.registerResource(
     "document",
-    new ResourceTemplate("qmd://{+path}", {}),
+    new ResourceTemplate("qmd://{+path}", { list: undefined }),
     {
       title: "QMD Document",
       description: "A markdown document from your QMD knowledge base. Use search tools to discover documents.",
@@ -112,11 +112,12 @@ export async function startMcpServer(): Promise<void> {
     },
     async (uri, { path }) => {
       // Decode URL-encoded path (MCP clients send encoded URIs)
-      const decodedPath = decodeURIComponent(path);
+      const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
+      const decodedPath = decodeURIComponent(pathStr);
 
       // Parse virtual path: collection/relative/path
       const parts = decodedPath.split('/');
-      const collection = parts[0];
+      const collection = parts[0] || '';
       const relativePath = parts.slice(1).join('/');
 
       // Find document by collection and path, join with content table
@@ -461,7 +462,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       let parsedFromLine = fromLine;
       let lookup = file;
       const colonMatch = lookup.match(/:(\d+)$/);
-      if (colonMatch && parsedFromLine === undefined) {
+      if (colonMatch && colonMatch[1] && parsedFromLine === undefined) {
         parsedFromLine = parseInt(colonMatch[1], 10);
         lookup = lookup.slice(0, -colonMatch[0].length);
       }

@@ -84,7 +84,7 @@ describe("LlamaCpp Integration", () => {
 
       // Embeddings should be identical for the same input
       for (let i = 0; i < result1!.embedding.length; i++) {
-        expect(result1!.embedding[i]).toBeCloseTo(result2!.embedding[i], 5);
+        expect(result1!.embedding[i]).toBeCloseTo(result2!.embedding[i]!, 5);
       }
     });
 
@@ -100,9 +100,11 @@ describe("LlamaCpp Integration", () => {
       let norm1 = 0;
       let norm2 = 0;
       for (let i = 0; i < result1!.embedding.length; i++) {
-        dotProduct += result1!.embedding[i] * result2!.embedding[i];
-        norm1 += result1!.embedding[i] ** 2;
-        norm2 += result2!.embedding[i] ** 2;
+        const v1 = result1!.embedding[i]!;
+        const v2 = result2!.embedding[i]!;
+        dotProduct += v1 * v2;
+        norm1 += v1 ** 2;
+        norm2 += v2 ** 2;
       }
       const similarity = dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
 
@@ -136,7 +138,7 @@ describe("LlamaCpp Integration", () => {
         expect(batchResults[i]).not.toBeNull();
         expect(individualResults[i]).not.toBeNull();
         for (let j = 0; j < batchResults[i]!.embedding.length; j++) {
-          expect(batchResults[i]!.embedding[j]).toBeCloseTo(individualResults[i]!.embedding[j], 5);
+          expect(batchResults[i]!.embedding[j]).toBeCloseTo(individualResults[i]!.embedding[j]!, 5);
         }
       }
     });
@@ -181,15 +183,15 @@ describe("LlamaCpp Integration", () => {
       expect(result.results).toHaveLength(3);
 
       // The France document should score highest
-      expect(result.results[0].file).toBe("france.txt");
-      expect(result.results[0].score).toBeGreaterThan(0.7);
+      expect(result.results[0]!.file).toBe("france.txt");
+      expect(result.results[0]!.score).toBeGreaterThan(0.7);
 
       // Canada should be somewhat relevant (also about capitals)
-      expect(result.results[1].file).toBe("canada.txt");
+      expect(result.results[1]!.file).toBe("canada.txt");
 
       // Butterflies should score lowest
-      expect(result.results[2].file).toBe("butterflies.txt");
-      expect(result.results[2].score).toBeLessThan(0.6);
+      expect(result.results[2]!.file).toBe("butterflies.txt");
+      expect(result.results[2]!.score).toBeLessThan(0.6);
     });
 
     test("scores authentication query correctly", async () => {
@@ -227,12 +229,12 @@ describe("LlamaCpp Integration", () => {
       const result = await llm.rerank(query, documents);
 
       // JavaScript errors doc should score highest
-      expect(result.results[0].file).toBe("errors.md");
-      expect(result.results[0].score).toBeGreaterThan(0.7);
+      expect(result.results[0]!.file).toBe("errors.md");
+      expect(result.results[0]!.score).toBeGreaterThan(0.7);
 
       // Python doc might be somewhat relevant (same concept, different language)
       // Cooking should be least relevant
-      expect(result.results[2].file).toBe("cooking.md");
+      expect(result.results[2]!.file).toBe("cooking.md");
     });
 
     test("handles empty document list", async () => {
@@ -243,7 +245,7 @@ describe("LlamaCpp Integration", () => {
     test("handles single document", async () => {
       const result = await llm.rerank("test", [{ file: "doc.md", text: "content" }]);
       expect(result.results).toHaveLength(1);
-      expect(result.results[0].file).toBe("doc.md");
+      expect(result.results[0]!.file).toBe("doc.md");
     });
 
     test("preserves original file paths", async () => {
@@ -303,14 +305,17 @@ describe("LlamaCpp Integration", () => {
     test("returns at least the original query", async () => {
       const result = await llm.expandQuery("test query");
 
-      expect(result).toContain("test query");
+      // Result is now Queryable[] - check that at least one has the original query text
+      const texts = result.map(q => q.text);
+      expect(texts).toContain("test query");
       expect(result.length).toBeGreaterThanOrEqual(1);
     }, 30000); // 30s timeout for model loading
 
     test("returns original query first", async () => {
       const result = await llm.expandQuery("authentication setup");
 
-      expect(result[0]).toBe("authentication setup");
+      // First result should have the original query text
+      expect(result[0]?.text).toBe("authentication setup");
     });
   });
 });

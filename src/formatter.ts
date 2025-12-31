@@ -6,14 +6,32 @@
  */
 
 import { extractSnippet } from "./store.js";
-import type { SearchResult, MultiGetFile, MultiGetResult, DocumentResult } from "./store.js";
+import type { SearchResult, MultiGetResult, DocumentResult } from "./store.js";
 
 // =============================================================================
 // Types
 // =============================================================================
 
 // Re-export store types for convenience
-export type { SearchResult, MultiGetFile, MultiGetResult, DocumentResult };
+export type { SearchResult, MultiGetResult, DocumentResult };
+
+// Flattened type for formatter convenience (extracts info from MultiGetResult)
+export type MultiGetFile = {
+  filepath: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  context?: string | null;
+  skipped: false;
+} | {
+  filepath: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  context?: string | null;
+  skipped: true;
+  skipReason: string;
+};
 
 export type OutputFormat = "cli" | "csv" | "md" | "xml" | "files" | "json";
 
