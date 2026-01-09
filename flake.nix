@@ -31,11 +31,11 @@
             mkdir -p $out/bin
 
             cp -r node_modules $out/lib/qmd/
-            cp qmd.ts $out/lib/qmd/
+            cp -r src $out/lib/qmd/
             cp package.json $out/lib/qmd/
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
-              --add-flags "$out/lib/qmd/qmd.ts" \
+              --add-flags "$out/lib/qmd/src/qmd.ts" \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
               --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
           '';
@@ -67,7 +67,7 @@
 
           shellHook = ''
             echo "QMD development shell"
-            echo "Run: bun qmd.ts <command>"
+            echo "Run: bun src/qmd.ts <command>"
           '';
         };
       }
