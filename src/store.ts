@@ -43,7 +43,7 @@ import {
 const HOME = Bun.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-export const DEFAULT_QUERY_MODEL = "qwen3:0.6b";
+export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
@@ -106,7 +106,7 @@ export function getDefaultDbPath(indexName: string = "index"): string {
 
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch {}
+  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
   return resolve(qmdCacheDir, `${indexName}.sqlite`);
 }
 
@@ -120,7 +120,7 @@ export function getRealPath(path: string): string {
     if (result.success) {
       return result.stdout.toString().trim();
     }
-  } catch {}
+  } catch { }
   return resolve(path);
 }
 
@@ -270,7 +270,7 @@ if (process.platform === "darwin") {
     if (Bun.file(homebrewSqlitePath).size > 0) {
       Database.setCustomSQLite(homebrewSqlitePath);
     }
-  } catch {}
+  } catch { }
 }
 
 function initializeDatabase(db: Database): void {
@@ -1665,7 +1665,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId !== undefined) {
+  if (collectionId) {
     // Note: collectionId is a legacy parameter that should be phased out
     // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
     // This code path is likely unused as collection filtering should be done at CLI level.
@@ -1729,7 +1729,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     WHERE v.embedding MATCH ? AND k = ?
   `;
 
-  if (collectionId !== undefined) {
+  if (collectionId) {
     // Note: collectionId is a legacy parameter that should be phased out
     // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
     sql += ` AND d.collection = ?`;
@@ -1843,14 +1843,16 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query, 2);
+  const results = await llm.expandQuery(query);
+  const queryTexts = results.map(r => r.text);
 
   // Cache the expanded queries (excluding original)
-  if (results.length > 1) {
-    setCachedResult(db, cacheKey, results.slice(1).join('\n'));
+  const expandedOnly = queryTexts.filter(t => t !== query);
+  if (expandedOnly.length > 0) {
+    setCachedResult(db, cacheKey, expandedOnly.join('\n'));
   }
 
-  return results;
+  return Array.from(new Set([query, ...queryTexts]));
 }
 
 // =============================================================================

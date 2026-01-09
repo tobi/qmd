@@ -120,12 +120,16 @@ export type RerankOptions = {
 };
 
 /**
- * Structured query expansion result
+ * Supported query types for different search backends
  */
-export type ExpandedQuery = {
-  lexicalQuery: string | null;  // Alternative query for BM25/keyword search
-  vectorQuery: string;          // Alternative query for semantic search
-  hyde: string;                 // Hypothetical document that would answer the query
+export type QueryType = 'lex' | 'vec' | 'hyde';
+
+/**
+ * A single query and its target backend type
+ */
+export type Queryable = {
+  type: QueryType;
+  text: string;
 };
 
 /**
@@ -145,7 +149,8 @@ export type RerankDocument = {
 // Format: hf:<user>/<repo>/<file>
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+// const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-1.7B-GGUF/Qwen3-1.7b-q8_0.gguf";
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
@@ -174,9 +179,10 @@ export interface LLM {
   modelExists(model: string): Promise<ModelInfo>;
 
   /**
-   * Expand a search query into multiple variations
+   * Expand a search query into multiple variations for different backends.
+   * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, numVariations?: number): Promise<string[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -613,125 +619,96 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, numVariations: number = 2): Promise<string[]> {
-    const prompt = `You are a search query expander. Given a search query, generate ${numVariations} alternative queries that would help find relevant documents.
-
-Rules:
-- Use synonyms and related terminology
-- Rephrase to capture different angles
-- Keep proper nouns exactly as written
-- Each variation should be 3-8 words, natural search terms
-- Do NOT append words like "search" or "find"
-
-Query: "${query}"
-
-Output exactly ${numVariations} variations, one per line, no numbering or bullets:`;
-
-    const result = await this.generate(prompt, {
-      maxTokens: 150,
-      temperature: 0,
-    });
-
-    if (!result) {
-      return [query];
-    }
-
-    // Parse response - filter out thinking tags and clean up
-    const cleanText = result.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-    const lines = cleanText
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 2 && l.length < 100 && !l.startsWith("<"));
-
-    return [query, ...lines.slice(0, numVariations)];
-  }
-
-  /**
-   * Expand query using structured output with JSON schema grammar.
-   * Returns different query types optimized for different retrieval methods.
-   *
-   * @param query - Original search query
-   * @param includeLexical - Whether to include lexical query (false for vector-only search)
-   */
-  async expandQueryStructured(query: string, includeLexical: boolean = true): Promise<ExpandedQuery> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
 
-    // Define JSON schema for structured output
-    const schema = {
-      type: "object" as const,
-      properties: {
-        lexicalQuery: {
-          type: "string" as const,
-          description: "Alternative keyword-based query using synonyms (3-6 words)"
-        },
-        vectorQuery: {
-          type: "string" as const,
-          description: "Semantically rephrased query capturing the intent (5-10 words)"
-        },
-        hyde: {
-          type: "string" as const,
-          description: "Write a short passage (50-100 words) that directly answers the query as if from a relevant document"
-        }
-      },
-      required: [] as const
-    };
+    const includeLexical = options.includeLexical ?? true;
+    const context = options.context;
 
-    const grammar = await llama.createGrammarForJsonSchema(schema);
+    const grammar = await llama.createGrammar({
+      grammar: `
+        root ::= line+
+        line ::= type ": " content "\\n"
+        type ::= "lex" | "vec" | "hyde"
+        content ::= [^\\n]+
+      `
+    });
 
-    const systemPrompt = includeLexical
-      ? `You expand search queries into structured alternatives for a hybrid search system.
-Given a query, generate:
-1. lexicalQuery: Alternative keywords using synonyms (for BM25 keyword search)
-2. vectorQuery: Semantically rephrased query (for vector/embedding search)
-3. hyde: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
+    const prompt = `You are a search query optimization expert. Your task is to improve retrieval by rewriting queries and generating hypothetical documents.
 
-Keep proper nouns exactly as written. Be concise.`
-      : `You expand search queries for semantic search.
-Given a query, generate:
-1. vectorQuery: Semantically rephrased query capturing the full intent (must be different from the original query)
-2. HyDE: Write a brief example passage (50-100 words) that answers the query, as if excerpted from a relevant document
+Original Query: ${query}
 
-Keep proper nouns exactly as written. Be concise.`;
+${context ? `Additional Context, ONLY USE IF RELEVANT:\n\n<context>${context}</context>` : ""}
 
-    const prompt = `Query: "${query}"
+## Step 1: Query Analysis
+Identify entities, search intent, and missing context.
 
-Generate the structured expansion:`;
+## Step 2: Generate Hypothetical Document
+Write a focused sentence passage that would answer the query. Include specific terminology and domain vocabulary.
+
+## Step 3: Query Rewrites
+Generate 2-3 alternative search queries that resolve ambiguities. Use terminology from the hypothetical document.
+
+## Step 4: Final Retrieval Text
+Output exactly 1-3 'lex' lines, 1-3 'vec' lines, and MAX ONE 'hyde' line.
+
+<format>
+lex: {single search term}
+vec: {single vector query}
+hyde: {complete hypothetical document passage from Step 2 on a SINGLE LINE}
+</format>
+
+<example>
+Example (FOR FORMAT ONLY - DO NOT COPY THIS CONTENT):
+lex: example keyword 1
+lex: example keyword 2
+vec: example semantic query
+hyde: This is an example of a hypothetical document passage that would answer the example query. It contains multiple sentences and relevant vocabulary.
+</example>
+
+<rules>
+- DO NOT repeat the same line.
+- Each 'lex:' line MUST be a different keyword variation based on the ORIGINAL QUERY.
+- Each 'vec:' line MUST be a different semantic variation based on the ORIGINAL QUERY.
+- The 'hyde:' line MUST be the full sentence passage from Step 2, but all on one line.
+- DO NOT use the example content above.
+${!includeLexical ? "- Do NOT output any 'lex:' lines" : ""}
+</rules>
+
+Final Output:`;
 
     // Create fresh context for each call
-    const context = await this.generateModel!.createContext();
-    const sequence = context.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence, systemPrompt });
+    const genContext = await this.generateModel!.createContext();
+    const sequence = genContext.getSequence();
+    const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
       const result = await session.prompt(prompt, {
         grammar,
-        maxTokens: 500,
-        temperature: 0,
+        maxTokens: 1000,
+        temperature: 1,
       });
 
-      const parsed = grammar.parse(result) as {
-        lexicalQuery?: string;
-        vectorQuery: string;
-        hyde: string;
-      };
+      const lines = result.trim().split("\n");
+      const queryables: Queryable[] = lines.map(line => {
+        const colonIdx = line.indexOf(":");
+        if (colonIdx === -1) return null;
+        const type = line.slice(0, colonIdx).trim();
+        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+        const text = line.slice(colonIdx + 1).trim();
+        return { type: type as QueryType, text };
+      }).filter((q): q is Queryable => q !== null);
 
-      return {
-        lexicalQuery: includeLexical && parsed.lexicalQuery ? parsed.lexicalQuery : null,
-        vectorQuery: parsed.vectorQuery || query,
-        hyde: parsed.hyde || "",
-      };
+      return queryables;
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
-      return {
-        lexicalQuery: includeLexical ? query : null,
-        vectorQuery: query,
-        hyde: "",
-      };
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
     } finally {
-      // Dispose context (disposes session too per lifecycle rules)
-      await context.dispose();
+      await genContext.dispose();
     }
   }
 
@@ -785,8 +762,11 @@ Generate the structured expansion:`;
 
     // Disposing llama cascades to models and contexts automatically
     // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
+    // Note: llama.dispose() can hang indefinitely, so we use a timeout
     if (this.llama) {
-      await this.llama.dispose();
+      const disposePromise = this.llama.dispose();
+      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      await Promise.race([disposePromise, timeoutPromise]);
     }
 
     // Clear references

@@ -1908,6 +1908,8 @@ function search(query: string, opts: OutputOptions): void {
     body: r.body || "",
     score: r.score,
     context: getContextForFile(db, r.filepath),
+    hash: r.hash,
+    docid: r.docid,
   }));
 
   closeDb();
@@ -2619,5 +2621,6 @@ if (import.meta.main) {
 
   // Cleanup LlamaCpp instance to prevent NAPI crash on exit
   await disposeDefaultLlamaCpp();
+  process.exit(0);
 
 } // end if (import.meta.main)
