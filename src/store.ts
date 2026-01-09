@@ -1729,16 +1729,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
     WHERE v.embedding MATCH ? AND k = ?
   `;
 
+  const params: (Float32Array | number | string)[] = [new Float32Array(embedding), limit * 3];
   if (collectionId !== undefined) {
     // Note: collectionId is a legacy parameter that should be phased out
     // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
     sql += ` AND d.collection = ?`;
-    sql = sql.replace('?', String(collectionId)); // Hacky but maintains compatibility
+    params.push(String(collectionId));
   }
 
   sql += ` ORDER BY v.distance`;
 
-  const rows = db.prepare(sql).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
+  const rows = db.prepare(sql).all(...params) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
 
   const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
   for (const row of rows) {
