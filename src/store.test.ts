@@ -353,12 +353,13 @@ describe("handelize", () => {
   });
 
   test("handles unicode characters", () => {
-    // Pure unicode with no alphanumerics throws error
-    expect(() => handelize("日本語.md")).toThrow("no valid filename content");
-    // Mixed unicode/ascii preserves the ascii parts
-    expect(handelize("café-notes.md")).toBe("caf-notes.md");
-    expect(handelize("naïve.md")).toBe("na-ve.md");
-    expect(handelize("日本語-notes.md")).toBe("notes.md");
+    // Pure unicode filenames are now supported (fixes GitHub issue #10)
+    expect(handelize("日本語.md")).toBe("日本語.md");
+    expect(handelize("Зоны и проекты.md")).toBe("зоны-и-проекты.md");
+    // Mixed unicode/ascii preserves both
+    expect(handelize("café-notes.md")).toBe("café-notes.md");
+    expect(handelize("naïve.md")).toBe("naïve.md");
+    expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
   });
 
   test("handles dates and times in filenames", () => {
@@ -1809,6 +1810,47 @@ describe("LlamaCpp Integration", () => {
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
     expect(results[0]!.source).toBe("vec");
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec filters by collection name", async () => {
+    const store = await createTestStore();
+    const collection1 = await createTestCollection({ name: "coll1", pwd: "/test/coll1" });
+    const collection2 = await createTestCollection({ name: "coll2", pwd: "/test/coll2" });
+
+    const hash1 = "hash1abc";
+    const hash2 = "hash2xyz";
+
+    await insertTestDocument(store.db, collection1, {
+      name: "doc1",
+      hash: hash1,
+      body: "Content in collection one",
+    });
+
+    await insertTestDocument(store.db, collection2, {
+      name: "doc2",
+      hash: hash2,
+      body: "Content in collection two",
+    });
+
+    // Create vectors_vec table with correct dimensions (768 for embeddinggemma)
+    store.ensureVecTable(768);
+    const embedding1 = Array(768).fill(0).map(() => Math.random());
+    const embedding2 = Array(768).fill(0).map(() => Math.random());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
+
+    // Search without filter - should return both
+    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    expect(allResults).toHaveLength(2);
+
+    // Search with collection filter - should return only from collection1
+    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1 as unknown as number);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.collectionName).toBe(collection1);
 
     await cleanupTestDb(store);
   });

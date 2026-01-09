@@ -603,11 +603,11 @@ export function handelize(path: string): string {
   }
 
   // Check for paths that are just extensions or only dots/special chars
-  // A valid path must have at least one alphanumeric character before processing
+  // A valid path must have at least one letter or digit (including Unicode)
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[a-zA-Z0-9]/.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
@@ -626,14 +626,14 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[\W_]+/g, '-')  // Replace non-word chars with dash
+          .replace(/[^\p{L}\p{N}]+/gu, '-')  // Replace non-letter/digit chars with dash
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
       } else {
         // For directories, just clean normally
         return segment
-          .replace(/[\W_]+/g, '-')
+          .replace(/[^\p{L}\p{N}]+/gu, '-')
           .replace(/^-+|-+$/g, '');
       }
     })
@@ -1729,16 +1729,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
     WHERE v.embedding MATCH ? AND k = ?
   `;
 
+  const params: (Float32Array | number | string)[] = [new Float32Array(embedding), limit * 3];
+
   if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
+    // Filter by collection name
     sql += ` AND d.collection = ?`;
-    sql = sql.replace('?', String(collectionId)); // Hacky but maintains compatibility
+    params.push(String(collectionId));
   }
 
   sql += ` ORDER BY v.distance`;
 
-  const rows = db.prepare(sql).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
+  const rows = db.prepare(sql).all(...params) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
 
   const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
   for (const row of rows) {

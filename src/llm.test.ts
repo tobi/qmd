@@ -302,20 +302,25 @@ describe("LlamaCpp Integration", () => {
   });
 
   describe("expandQuery", () => {
-    test("returns at least the original query", async () => {
+    test("returns query expansions with correct types", async () => {
       const result = await llm.expandQuery("test query");
 
-      // Result is now Queryable[] - check that at least one has the original query text
-      const texts = result.map(q => q.text);
-      expect(texts).toContain("test query");
+      // Result is Queryable[] containing lex, vec, and/or hyde entries
       expect(result.length).toBeGreaterThanOrEqual(1);
+
+      // Each result should have a valid type
+      for (const q of result) {
+        expect(["lex", "vec", "hyde"]).toContain(q.type);
+        expect(q.text.length).toBeGreaterThan(0);
+      }
     }, 30000); // 30s timeout for model loading
 
-    test("returns original query first", async () => {
-      const result = await llm.expandQuery("authentication setup");
+    test("can exclude lexical queries", async () => {
+      const result = await llm.expandQuery("authentication setup", { includeLexical: false });
 
-      // First result should have the original query text
-      expect(result[0]?.text).toBe("authentication setup");
+      // Should not contain any 'lex' type entries
+      const lexEntries = result.filter(q => q.type === "lex");
+      expect(lexEntries).toHaveLength(0);
     });
   });
 });

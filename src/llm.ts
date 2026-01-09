@@ -700,6 +700,10 @@ Final Output:`;
         return { type: type as QueryType, text };
       }).filter((q): q is Queryable => q !== null);
 
+      // Filter out lex entries if not requested
+      if (!includeLexical) {
+        return queryables.filter(q => q.type !== 'lex');
+      }
       return queryables;
     } catch (error) {
       console.error("Structured query expansion failed:", error);
