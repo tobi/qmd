@@ -1379,6 +1379,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     seenPaths.add(path);
 
     const content = await Bun.file(filepath).text();
+
+    // Skip empty files - nothing useful to index
+    if (!content.trim()) {
+      processed++;
+      continue;
+    }
+
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
