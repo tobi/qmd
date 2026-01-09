@@ -13,6 +13,7 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
+import { realpathSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -116,12 +117,10 @@ export function getPwd(): string {
 
 export function getRealPath(path: string): string {
   try {
-    const result = Bun.spawnSync(["realpath", path]);
-    if (result.success) {
-      return result.stdout.toString().trim();
-    }
-  } catch { }
-  return resolve(path);
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 // =============================================================================
