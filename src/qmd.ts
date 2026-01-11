@@ -2588,7 +2588,8 @@ if (import.meta.main) {
     case "mcp": {
       const { startMcpServer } = await import("./mcp.js");
       await startMcpServer();
-      break;
+      // MCP server runs until stdin closes - wait indefinitely
+      await new Promise(() => {});
     }
 
     case "cleanup": {

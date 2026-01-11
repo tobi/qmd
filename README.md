@@ -71,7 +71,13 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
 
-**Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Claude Code CLI:**
+
+```sh
+claude mcp add qmd -- qmd mcp
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -84,7 +90,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 }
 ```
 
-**Claude Code configuration** (`~/.claude/settings.json`):
+**Claude Code manual configuration** (`~/.claude.json`):
 
 ```json
 {
