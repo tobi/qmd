@@ -615,9 +615,28 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   // ---------------------------------------------------------------------------
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
 
-  // Note: Database stays open - it will be closed when the process exits
+  // Return a promise that resolves when the transport closes
+  // This allows the caller to properly wait for server shutdown
+  return new Promise<void>((resolve) => {
+    // Handle graceful shutdown on signals
+    const shutdown = () => {
+      store.close();
+      resolve();
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+
+    // Handle transport close (when stdin closes)
+    transport.onclose = () => {
+      store.close();
+      resolve();
+    };
+
+    // Connect and let the transport keep the process alive via stdin listeners
+    server.connect(transport);
+  });
 }
 
 // Run if this is the main module
