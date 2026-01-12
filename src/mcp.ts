@@ -403,15 +403,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, 30);
 
-      // Rerank - truncate bodies to avoid NAPI deadlock with very large documents
-      // Reranking models only need enough context to judge relevance, not full documents
-      const MAX_RERANK_TEXT = 4000;  // ~1000 tokens, sufficient for relevance scoring
+      // Rerank candidates
       const reranked = await store.rerank(
         query,
-        candidates.map(c => ({
-          file: c.file,
-          text: c.body.length > MAX_RERANK_TEXT ? c.body.slice(0, MAX_RERANK_TEXT) : c.body
-        })),
+        candidates.map(c => ({ file: c.file, text: c.body })),
         DEFAULT_RERANK_MODEL
       );
 
@@ -620,9 +615,24 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   // ---------------------------------------------------------------------------
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
 
-  // Note: Database stays open - it will be closed when the process exits
+  // Keep server alive until transport closes or signal received
+  return new Promise<void>((resolve) => {
+    let shuttingDown = false;
+    const shutdown = (reason: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.error(`[qmd] shutdown: ${reason}`);
+      store.close();
+      resolve();
+    };
+
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    transport.onclose = () => shutdown("transport.onclose");
+
+    server.connect(transport);
+  });
 }
 
 // Run if this is the main module

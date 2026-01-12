@@ -799,7 +799,11 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    // Extend inactivity timeout to 6 minutes (default is 2 min).
+    // MCP servers have long-running operations and unpredictable gaps between
+    // requests. The default timeout can dispose contexts mid-operation, causing
+    // "Object is disposed" errors. 6 min balances VRAM cleanup with reliability.
+    defaultLlamaCpp = new LlamaCpp({ inactivityTimeoutMs: 6 * 60 * 1000 });
   }
   return defaultLlamaCpp;
 }
