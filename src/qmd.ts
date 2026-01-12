@@ -1972,8 +1972,8 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  // Use Promise.all for concurrent vector searches
-  await Promise.all(vectorQueries.map(async (q) => {
+  // Run vector searches sequentially (node-llama-cpp embedding context doesn't handle concurrent calls)
+  for (const q of vectorQueries) {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -1981,7 +1981,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
         allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
       }
     }
-  }));
+  }
 
   // Sort by max score and limit to requested count
   const results = Array.from(allResults.values())

@@ -1679,48 +1679,61 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
 
-  // sqlite-vec requires "k = ?" for KNN queries
-  let sql = `
+  // Step 1: Get vector matches (sqlite-vec doesn't work with JOINs)
+  const vecResults = db.prepare(`
+    SELECT hash_seq, distance
+    FROM vectors_vec
+    WHERE embedding MATCH ? AND k = ?
+  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+
+  if (vecResults.length === 0) return [];
+
+  // Step 2: Get chunk info and document data
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+
+  // Build query for document lookup
+  const placeholders = hashSeqs.map(() => '?').join(',');
+  let docSql = `
     SELECT
-      v.hash_seq,
-      v.distance,
+      cv.hash || '_' || cv.seq as hash_seq,
+      cv.hash,
+      cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
-      cv.hash,
-      cv.pos
-    FROM vectors_vec v
-    JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
+      content.doc as body
+    FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
-    WHERE v.embedding MATCH ? AND k = ?
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-
-  const params: (Float32Array | number | string)[] = [new Float32Array(embedding), limit * 3];
+  const params: string[] = [...hashSeqs];
 
   if (collectionId) {
-    // Filter by collection name
-    sql += ` AND d.collection = ?`;
+    docSql += ` AND d.collection = ?`;
     params.push(String(collectionId));
   }
 
-  sql += ` ORDER BY v.distance`;
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash_seq: string; hash: string; pos: number; filepath: string;
+    display_path: string; title: string; body: string;
+  }[];
 
-  const rows = db.prepare(sql).all(...params) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
-
-  const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
-  for (const row of rows) {
+  // Combine with distances and dedupe by filepath
+  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  for (const row of docRows) {
+    const distance = distanceMap.get(row.hash_seq) ?? 1;
     const existing = seen.get(row.filepath);
-    if (!existing || row.distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: row.distance });
+    if (!existing || distance < existing.bestDist) {
+      seen.set(row.filepath, { row, bestDist: distance });
     }
   }
 
   return Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
-    .map(({ row }) => {
+    .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
@@ -1733,7 +1746,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
+        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
