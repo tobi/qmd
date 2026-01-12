@@ -330,12 +330,12 @@ describe("MCP Server", () => {
 
     test("performs RRF fusion on multiple result lists", () => {
       const list1: RankedResult[] = [
-        { file: "/a", displayPath: "a.md", title: "A", body: "body", score: 1 },
-        { file: "/b", displayPath: "b.md", title: "B", body: "body", score: 0.8 },
+        { file: "/a", displayPath: "a.md", title: "A", body: "body", hash: "a12345", score: 1 },
+        { file: "/b", displayPath: "b.md", title: "B", body: "body", hash: "b12345", score: 0.8 },
       ];
       const list2: RankedResult[] = [
-        { file: "/b", displayPath: "b.md", title: "B", body: "body", score: 1 },
-        { file: "/c", displayPath: "c.md", title: "C", body: "body", score: 0.9 },
+        { file: "/b", displayPath: "b.md", title: "B", body: "body", hash: "b12345", score: 1 },
+        { file: "/c", displayPath: "c.md", title: "C", body: "body", hash: "c12345", score: 0.9 },
       ];
 
       const fused = reciprocalRankFusion([list1, list2]);
@@ -369,6 +369,7 @@ describe("MCP Server", () => {
             displayPath: r.displayPath,
             title: r.title,
             body: r.body || "",
+            hash: r.hash,
             score: r.score,
           })));
         }

@@ -298,6 +298,7 @@ describe("Hybrid Search (RRF)", () => {
         displayPath: r.displayPath,
         title: r.title,
         body: r.body || "",
+        hash: r.hash,
         score: r.score
       })));
     }
@@ -310,6 +311,7 @@ describe("Hybrid Search (RRF)", () => {
         displayPath: r.displayPath,
         title: r.title,
         body: r.body || "",
+        hash: r.hash,
         score: r.score
       })));
     }

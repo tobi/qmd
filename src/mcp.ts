@@ -15,6 +15,7 @@ import {
   createStore,
   reciprocalRankFusion,
   extractSnippet,
+  rerankByChunks,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -386,14 +387,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
           .filter(r => !collection || r.collectionName === collection);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash })));
         }
         if (hasVectors) {
           const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
             .then(results => results.filter(r => !collection || r.collectionName === collection));
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash })));
           }
         }
       }
@@ -403,11 +404,12 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, 30);
 
-      // Rerank candidates
-      const reranked = await store.rerank(
+      // Rerank candidates using chunk-based scoring
+      const reranked = await rerankByChunks(
         query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL
+        candidates.map(c => ({ file: c.file, hash: c.hash, body: c.body })),
+        DEFAULT_RERANK_MODEL,
+        store.db
       );
 
       // Blend scores

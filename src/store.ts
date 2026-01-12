@@ -664,6 +664,7 @@ export type RankedResult = {
   title: string;
   body: string;
   score: number;
+  hash: string;
 };
 
 /**
@@ -1860,6 +1861,124 @@ export async function rerank(query: string, documents: { file: string; text: str
   return documents
     .map(doc => ({ file: doc.file, score: cachedResults.get(doc.file) || 0 }))
     .sort((a, b) => b.score - a.score);
+}
+
+// =============================================================================
+// Chunk-based Reranking
+// =============================================================================
+
+/**
+ * Get chunks for a document using stored chunk positions.
+ * Returns array of { seq, pos, text } for each chunk.
+ */
+export function getDocChunks(db: Database, hash: string, body: string): { seq: number; pos: number; text: string }[] {
+  const positions = db.prepare(`
+    SELECT seq, pos FROM content_vectors
+    WHERE hash = ? ORDER BY seq
+  `).all(hash) as { seq: number; pos: number }[];
+
+  if (positions.length === 0) {
+    // No chunks stored, return whole doc as single chunk (truncated)
+    return [{ seq: 0, pos: 0, text: body.slice(0, 4000) }];
+  }
+
+  return positions.map((p, i) => {
+    const start = p.pos;
+    const end = positions[i + 1]?.pos ?? body.length;
+    return { seq: p.seq, pos: start, text: body.slice(start, end) };
+  });
+}
+
+/**
+ * Aggregate chunk scores using normalized top-K.
+ * Takes top 30% of chunks (min 1, max 5) and averages them.
+ * This is fair to both short docs (1 chunk) and long docs (30+ chunks).
+ */
+function aggregateChunkScores(scores: number[]): number {
+  if (scores.length === 0) return 0;
+
+  const sorted = [...scores].sort((a, b) => b - a);
+
+  // Take top 30% of chunks, minimum 1, maximum 5
+  const k = Math.max(1, Math.min(5, Math.ceil(sorted.length * 0.3)));
+
+  const topK = sorted.slice(0, k);
+  return topK.reduce((a, b) => a + b, 0) / topK.length;
+}
+
+/**
+ * Rerank documents by scoring their chunks and aggregating.
+ * Uses normalized top-K aggregation for fairness across doc lengths.
+ * Each chunk is ~800 tokens, safe for cross-encoder context limits.
+ */
+export async function rerankByChunks(
+  query: string,
+  candidates: { file: string; hash: string; body: string }[],
+  model: string = DEFAULT_RERANK_MODEL,
+  db: Database
+): Promise<{ file: string; score: number }[]> {
+  // 1. Extract all chunks from all candidates
+  const allChunks: { file: string; chunkId: string; text: string }[] = [];
+  const chunksByDoc = new Map<string, string[]>(); // file -> chunkIds
+
+  for (const doc of candidates) {
+    if (!doc.hash) {
+      console.error(`[qmd:rerank] Warning: missing hash for ${doc.file}, using truncated doc`);
+    }
+    const chunks = getDocChunks(db, doc.hash, doc.body);
+    const docChunkIds: string[] = [];
+
+    for (const chunk of chunks) {
+      const chunkId = `${doc.file}:${chunk.seq}`;
+      allChunks.push({ file: doc.file, chunkId, text: chunk.text });
+      docChunkIds.push(chunkId);
+    }
+    chunksByDoc.set(doc.file, docChunkIds);
+  }
+
+  // 2. Check cache and separate cached/uncached chunks
+  const chunkScores = new Map<string, number>();
+  const uncachedChunks: { chunkId: string; text: string }[] = [];
+
+  for (const chunk of allChunks) {
+    const cacheKey = getCacheKey("rerank_chunk", { query, chunkId: chunk.chunkId, model });
+    const cached = getCachedResult(db, cacheKey);
+    if (cached !== null) {
+      chunkScores.set(chunk.chunkId, parseFloat(cached));
+    } else {
+      uncachedChunks.push({ chunkId: chunk.chunkId, text: chunk.text });
+    }
+  }
+
+  // 3. Rerank uncached chunks
+  if (uncachedChunks.length > 0) {
+    const llm = getDefaultLlamaCpp();
+    const rerankResult = await llm.rerank(
+      query,
+      uncachedChunks.map(c => ({ file: c.chunkId, text: c.text })),
+      { model }
+    );
+
+    // Cache results
+    for (const result of rerankResult.results) {
+      const cacheKey = getCacheKey("rerank_chunk", { query, chunkId: result.file, model });
+      setCachedResult(db, cacheKey, result.score.toString());
+      chunkScores.set(result.file, result.score);
+    }
+  }
+
+  // 4. Aggregate scores per document using normalized top-K
+  const docScores: { file: string; score: number }[] = [];
+
+  for (const doc of candidates) {
+    const docChunkIds = chunksByDoc.get(doc.file) || [];
+    const scores = docChunkIds.map(id => chunkScores.get(id) || 0);
+    const aggregated = aggregateChunkScores(scores);
+    docScores.push({ file: doc.file, score: aggregated });
+  }
+
+  // 5. Return sorted by aggregated score
+  return docScores.sort((a, b) => b.score - a.score);
 }
 
 // =============================================================================

@@ -1400,6 +1400,7 @@ describe("Reciprocal Rank Fusion", () => {
     displayPath: file,
     title: file,
     body: "body",
+    hash: file.replace(/[^a-z0-9]/gi, "").slice(0, 6) || "abcdef",
     score,
   });
 
