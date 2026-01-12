@@ -21,6 +21,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { RankedResult } from "./store.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -90,6 +91,7 @@ function addLineNumbers(text: string, startLine: number = 1): string {
 
 export async function startMcpServer(): Promise<void> {
   // Open database once at startup - keep it open for the lifetime of the server
+  // Note: LLM models are loaded lazily on first use by the store
   const store = createStore();
 
   const server = new McpServer({
@@ -403,10 +405,15 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, 30);
 
-      // Rerank
+      // Rerank - truncate bodies to avoid NAPI deadlock with very large documents
+      // Reranking models only need enough context to judge relevance, not full documents
+      const MAX_RERANK_TEXT = 4000;  // ~1000 tokens, sufficient for relevance scoring
       const reranked = await store.rerank(
         query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
+        candidates.map(c => ({
+          file: c.file,
+          text: c.body.length > MAX_RERANK_TEXT ? c.body.slice(0, MAX_RERANK_TEXT) : c.body
+        })),
         DEFAULT_RERANK_MODEL
       );
 
@@ -615,9 +622,42 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   // ---------------------------------------------------------------------------
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
 
-  // Note: Database stays open - it will be closed when the process exits
+  // Return a promise that resolves when the transport closes
+  // This allows the caller to properly wait for server shutdown
+  return new Promise<void>((resolve) => {
+    let shuttingDown = false;
+
+    // Handle graceful shutdown - dispose LlamaCpp to prevent Bun segfault on exit
+    const shutdown = async (reason: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.error(`[qmd] Shutdown triggered: ${reason}`);
+
+      // Dispose LlamaCpp first to prevent segfault on process exit
+      try {
+        await disposeDefaultLlamaCpp();
+      } catch {
+        // Ignore disposal errors during shutdown
+      }
+
+      store.close();
+      resolve();
+    };
+
+    process.on("SIGINT", () => void shutdown("SIGINT"));
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+    // Handle stdin close (transport.onclose may not fire on pipe close)
+    process.stdin.on("close", () => void shutdown("stdin close"));
+    process.stdin.on("end", () => void shutdown("stdin end"));
+
+    // Handle transport close (for proper MCP disconnect)
+    transport.onclose = () => void shutdown("transport.onclose");
+
+    // Connect and let the transport keep the process alive via stdin listeners
+    server.connect(transport);
+  });
 }
 
 // Run if this is the main module
