@@ -1972,7 +1972,10 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  // Run vector searches sequentially (node-llama-cpp embedding context doesn't handle concurrent calls)
+  // IMPORTANT: Run vector searches sequentially, not with Promise.all.
+  // node-llama-cpp's embedding context hangs when multiple concurrent embed() calls
+  // are made. This is a known limitation of the LlamaEmbeddingContext.
+  // See: https://github.com/tobi/qmd/pull/23
   for (const q of vectorQueries) {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {

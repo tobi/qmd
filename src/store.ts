@@ -1679,7 +1679,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
 
-  // Step 1: Get vector matches (sqlite-vec doesn't work with JOINs)
+  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
+  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
+  // "optimize" this by combining into a single query with JOINs - it will break.
+  // See: https://github.com/tobi/qmd/pull/23
+
+  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec

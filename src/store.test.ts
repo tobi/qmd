@@ -1855,6 +1855,42 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
+  // Regression test for https://github.com/tobi/qmd/pull/23
+  // sqlite-vec virtual tables hang when combined with JOINs in the same query.
+  // The fix uses a two-step approach: vector query first, then separate JOINs.
+  test("searchVec uses two-step query to avoid sqlite-vec JOIN hang", async () => {
+    const store = await createTestStore();
+
+    // Add test document with embedding
+    await store.addDocument("collection", "test.md", "Test content for vector search");
+    await store.updateIndex();
+
+    // Generate embedding for the test doc
+    const llm = (await import("./llm.js")).getDefaultLlamaCpp();
+    const embedding = await llm.embed("Test content for vector search");
+    if (embedding) {
+      // Manually insert vector to test the query path
+      const hash = hashContent("Test content for vector search");
+      store.db.prepare(`
+        INSERT OR REPLACE INTO content_vectors (hash, seq, pos) VALUES (?, 0, 0)
+      `).run(hash);
+      store.db.prepare(`
+        INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)
+      `).run(`${hash}_0`, new Float32Array(embedding.embedding));
+    }
+
+    // This should complete quickly (not hang) due to the two-step fix
+    const startTime = Date.now();
+    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const elapsed = Date.now() - startTime;
+
+    // If the query took more than 10 seconds, something is wrong
+    // (the hang bug would cause it to never return)
+    expect(elapsed).toBeLessThan(10000);
+
+    await cleanupTestDb(store);
+  }, 30000);
+
   test("expandQuery returns original plus expanded queries", async () => {
     const store = await createTestStore();
 
