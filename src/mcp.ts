@@ -403,10 +403,15 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, 30);
 
-      // Rerank
+      // Rerank - truncate bodies to avoid NAPI deadlock with very large documents
+      // Reranking models only need enough context to judge relevance, not full documents
+      const MAX_RERANK_TEXT = 4000;  // ~1000 tokens, sufficient for relevance scoring
       const reranked = await store.rerank(
         query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
+        candidates.map(c => ({
+          file: c.file,
+          text: c.body.length > MAX_RERANK_TEXT ? c.body.slice(0, MAX_RERANK_TEXT) : c.body
+        })),
         DEFAULT_RERANK_MODEL
       );
 
