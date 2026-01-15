@@ -2354,6 +2354,7 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
+  console.log("  qmd db <subcommand>           - Database exploration (run 'qmd db' for details)");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2625,6 +2626,12 @@ if (import.meta.main) {
       console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
       closeDb();
+      break;
+    }
+
+    case "db": {
+      const { handleDbCommand } = await import("./db-explorer.js");
+      await handleDbCommand(cli.args);
       break;
     }
 
