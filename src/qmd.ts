@@ -79,6 +79,7 @@ import {
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
+  isValidCollectionName,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -1252,6 +1253,13 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   if (!collName) {
     const parts = pwd.split('/').filter(Boolean);
     collName = parts[parts.length - 1] || 'root';
+  }
+
+  // Validate collection name - must contain only alphanumeric, hyphens, and underscores
+  if (!isValidCollectionName(collName)) {
+    console.error(`${c.yellow}Invalid collection name: '${collName}'${c.reset}`);
+    console.error(`Collection names must contain only letters, numbers, hyphens (-), and underscores (_).`);
+    process.exit(1);
   }
 
   // Check if collection with this name already exists in YAML

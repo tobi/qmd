@@ -115,6 +115,11 @@ export async function startMcpServer(): Promise<void> {
       const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
       const decodedPath = decodeURIComponent(pathStr);
 
+      // Security: reject paths with directory traversal attempts
+      if (decodedPath.includes('..') || decodedPath.includes('\0')) {
+        return { contents: [{ uri: uri.href, text: `Invalid path: path traversal not allowed` }] };
+      }
+
       // Parse virtual path: collection/relative/path
       const parts = decodedPath.split('/');
       const collection = parts[0] || '';
