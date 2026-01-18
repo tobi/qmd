@@ -1972,8 +1972,11 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  // Use Promise.all for concurrent vector searches
-  await Promise.all(vectorQueries.map(async (q) => {
+  // IMPORTANT: Run vector searches sequentially, not with Promise.all.
+  // node-llama-cpp's embedding context hangs when multiple concurrent embed() calls
+  // are made. This is a known limitation of the LlamaEmbeddingContext.
+  // See: https://github.com/tobi/qmd/pull/23
+  for (const q of vectorQueries) {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -1981,7 +1984,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
         allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
       }
     }
-  }));
+  }
 
   // Sort by max score and limit to requested count
   const results = Array.from(allResults.values())
