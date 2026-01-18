@@ -2626,8 +2626,9 @@ if (import.meta.main) {
       process.exit(1);
   }
 
-  // Cleanup LlamaCpp instance to prevent NAPI crash on exit
-  await disposeDefaultLlamaCpp();
-  process.exit(0);
+  if (cli.command !== "mcp") {
+    await disposeDefaultLlamaCpp();
+    process.exit(0);
+  }
 
 } // end if (import.meta.main)
