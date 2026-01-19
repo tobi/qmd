@@ -422,11 +422,19 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name);
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
     console.log("");
   }
 
+  // Check if any documents need embedding (show once at end)
+  const finalDb = getDb();
+  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  closeDb();
+
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (needsEmbedding > 0) {
+    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
 }
 
 /**
@@ -1329,7 +1337,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1450,7 +1458,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
 
-  if (needsEmbedding > 0) {
+  if (needsEmbedding > 0 && !suppressEmbedNotice) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 
