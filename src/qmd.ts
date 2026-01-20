@@ -18,6 +18,7 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
+  findDocumentByDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   getHashesForEmbedding,
@@ -694,6 +695,18 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     if (matched) {
       fromLine = parseInt(matched, 10);
       inputPath = inputPath.slice(0, -colonMatch[0].length);
+    }
+  }
+
+  // Handle docid lookup (#hash or 6-char hex)
+  if (inputPath.startsWith('#') || /^[a-f0-9]{6}$/i.test(inputPath)) {
+    const docidMatch = findDocumentByDocid(db, inputPath);
+    if (docidMatch) {
+      inputPath = docidMatch.filepath;
+    } else {
+      console.error(`Document not found: ${filename}`);
+      closeDb();
+      process.exit(1);
     }
   }
 
