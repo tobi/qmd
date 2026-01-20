@@ -19,6 +19,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocumentByDocid,
+  isDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   getHashesForEmbedding,
@@ -698,8 +699,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     }
   }
 
-  // Handle docid lookup (#hash or 6-char hex)
-  if (inputPath.startsWith('#') || /^[a-f0-9]{6}$/i.test(inputPath)) {
+  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
+  if (isDocid(inputPath)) {
     const docidMatch = findDocumentByDocid(db, inputPath);
     if (docidMatch) {
       inputPath = docidMatch.filepath;

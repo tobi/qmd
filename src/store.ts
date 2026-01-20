@@ -1146,13 +1146,47 @@ function levenshtein(a: string, b: string): number {
 }
 
 /**
+ * Normalize a docid input by stripping surrounding quotes and leading #.
+ * Handles: "#abc123", 'abc123', "abc123", #abc123, abc123
+ * Returns the bare hex string.
+ */
+export function normalizeDocid(docid: string): string {
+  let normalized = docid.trim();
+
+  // Strip surrounding quotes (single or double)
+  if ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+      (normalized.startsWith("'") && normalized.endsWith("'"))) {
+    normalized = normalized.slice(1, -1);
+  }
+
+  // Strip leading # if present
+  if (normalized.startsWith('#')) {
+    normalized = normalized.slice(1);
+  }
+
+  return normalized;
+}
+
+/**
+ * Check if a string looks like a docid reference.
+ * Accepts: #abc123, abc123, "#abc123", "abc123", '#abc123', 'abc123'
+ * Returns true if the normalized form is a valid hex string of 6+ chars.
+ */
+export function isDocid(input: string): boolean {
+  const normalized = normalizeDocid(input);
+  // Must be at least 6 hex characters
+  return normalized.length >= 6 && /^[a-f0-9]+$/i.test(normalized);
+}
+
+/**
  * Find a document by its short docid (first 6 characters of hash).
  * Returns the document's virtual path if found, null otherwise.
  * If multiple documents match the same short hash (collision), returns the first one.
+ *
+ * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
  */
 export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
-  // Normalize: remove leading # if present
-  const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
+  const shortHash = normalizeDocid(docid);
 
   if (shortHash.length < 1) return null;
 
@@ -1962,8 +1996,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
     filepath = filepath.slice(0, -colonMatch[0].length);
   }
 
-  // Check if this is a docid lookup (#hash or just 6-char hex)
-  if (filepath.startsWith('#') || /^[a-f0-9]{6}$/i.test(filepath)) {
+  // Check if this is a docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
+  if (isDocid(filepath)) {
     const docidMatch = findDocumentByDocid(db, filepath);
     if (docidMatch) {
       filepath = docidMatch.filepath;
