@@ -262,18 +262,47 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-// On macOS, use Homebrew's SQLite which supports extensions
-if (process.platform === "darwin") {
-  const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  try {
-    if (Bun.file(homebrewSqlitePath).size > 0) {
-      Database.setCustomSQLite(homebrewSqlitePath);
+function setSQLiteFromBrewPrefixEnv(): void {
+  const candidates: string[] = [];
+
+  if (process.platform === "darwin") {
+    // Use BREW_PREFIX for non-standard Homebrew installs (common on corporate Macs).
+    const brewPrefix = Bun.env.BREW_PREFIX || Bun.env.HOMEBREW_PREFIX;
+    if (brewPrefix) {
+      // Homebrew can place SQLite in opt/sqlite (keg-only) or directly under the prefix.
+      candidates.push(`${brewPrefix}/opt/sqlite/lib/libsqlite3.dylib`);
+      candidates.push(`${brewPrefix}/lib/libsqlite3.dylib`);
+    } else {
+      candidates.push("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib");
+      candidates.push("/usr/local/opt/sqlite/lib/libsqlite3.dylib");
     }
-  } catch { }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (Bun.file(candidate).size > 0) {
+        Database.setCustomSQLite(candidate);
+        return;
+      }
+    } catch { }
+  }
 }
 
+setSQLiteFromBrewPrefixEnv();
+
 function initializeDatabase(db: Database): void {
-  sqliteVec.load(db);
+  try {
+    sqliteVec.load(db);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
+      throw new Error(
+        "SQLite build does not support dynamic extension loading. " +
+        "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
+        "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
+      );
+    }
+    throw err;
+  }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
