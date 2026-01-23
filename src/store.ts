@@ -1748,11 +1748,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
+  const vecParams: Array<Float32Array | number> = [new Float32Array(embedding), limit * 3];
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(...vecParams) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -1778,7 +1779,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionId) {
+  if (collectionId !== undefined) {
     docSql += ` AND d.collection = ?`;
     params.push(String(collectionId));
   }
