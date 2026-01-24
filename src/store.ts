@@ -63,23 +63,125 @@ export function homedir(): string {
   return HOME;
 }
 
+/**
+ * Check if a path is absolute (works on both Unix and Windows)
+ * Handles:
+ * - Unix: /path/to/file
+ * - Windows native: C:\path\to\file or C:/path/to/file
+ * - Git Bash/MSYS: /c/Users/... or /C/Users/...
+ */
+export function isAbsolutePath(path: string): boolean {
+  if (!path) return false;
+  // Unix absolute path
+  if (path.startsWith('/')) {
+    // Check for Git Bash style /c/Users or /C/Users
+    if (/^\/[a-zA-Z]\//.test(path)) {
+      return true;
+    }
+    return true;
+  }
+  // Windows absolute path: C:\ or C:/
+  if (/^[a-zA-Z]:[/\\]/.test(path)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize path separators to forward slashes
+ */
+export function normalizePathSeparators(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+/**
+ * Check if path is a Windows-style absolute path (C:\ or C:/)
+ */
+function isWindowsDrivePath(path: string): boolean {
+  return /^[a-zA-Z]:[/\\]/.test(path);
+}
+
+/**
+ * Check if a path starts with a given prefix (handles both Unix and Windows paths)
+ * Returns the relative path after the prefix if it matches, or null if no match.
+ */
+export function getRelativePathFromPrefix(fullPath: string, prefix: string): string | null {
+  const normalizedFull = normalizePathSeparators(fullPath);
+  const normalizedPrefix = normalizePathSeparators(prefix);
+
+  // Check for exact match (path equals prefix)
+  if (normalizedFull === normalizedPrefix) {
+    return '';
+  }
+
+  // Check if full path starts with prefix followed by /
+  if (normalizedFull.startsWith(normalizedPrefix + '/')) {
+    return normalizedFull.slice(normalizedPrefix.length + 1);
+  }
+
+  return null;
+}
+
 export function resolve(...paths: string[]): string {
   if (paths.length === 0) {
     throw new Error("resolve: at least one path segment is required");
   }
-  let result = paths[0]!.startsWith('/') ? '' : Bun.env.PWD || process.cwd();
-  for (const p of paths) {
-    if (p.startsWith('/')) {
+
+  // Normalize the first path
+  const firstPath = normalizePathSeparators(paths[0]!);
+
+  // Determine initial result based on whether first path is absolute
+  let result: string;
+  if (isAbsolutePath(firstPath)) {
+    // For Windows paths like C:/..., keep the drive letter
+    if (isWindowsDrivePath(firstPath)) {
+      result = firstPath;
+    } else {
+      // Unix absolute path or Git Bash style
+      result = firstPath;
+    }
+  } else {
+    // Relative path - prepend current working directory
+    result = normalizePathSeparators(Bun.env.PWD || process.cwd());
+  }
+
+  // Process remaining path segments
+  for (let i = (isAbsolutePath(firstPath) ? 0 : 0); i < paths.length; i++) {
+    const p = normalizePathSeparators(paths[i]!);
+
+    // Skip first path if it was absolute (already handled)
+    if (i === 0 && isAbsolutePath(firstPath)) {
+      result = p;
+      continue;
+    }
+
+    if (isAbsolutePath(p)) {
+      // Absolute path replaces result
       result = p;
     } else {
+      // Relative path - append
       result = result + '/' + p;
     }
   }
+
+  // Normalize the result
+  // For Windows paths, preserve drive letter
+  const isWindows = isWindowsDrivePath(result);
+  let driveLetter = '';
+  if (isWindows) {
+    driveLetter = result.slice(0, 2); // e.g., "C:"
+    result = result.slice(2); // Remove drive letter for normalization
+  }
+
   const parts = result.split('/').filter(Boolean);
   const normalized: string[] = [];
   for (const part of parts) {
     if (part === '..') normalized.pop();
     else if (part !== '.') normalized.push(part);
+  }
+
+  if (isWindows) {
+    return driveLetter + '/' + normalized.join('/');
   }
   return '/' + normalized.join('/');
 }
@@ -235,12 +337,8 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
-    if (absolutePath.startsWith(coll.path + '/') || absolutePath === coll.path) {
-      // Extract relative path
-      const relativePath = absolutePath.startsWith(coll.path + '/')
-        ? absolutePath.slice(coll.path.length + 1)
-        : '';
-
+    const relativePath = getRelativePathFromPrefix(absolutePath, coll.path);
+    if (relativePath !== null) {
       // Verify this document exists in the database
       const doc = db.prepare(`
         SELECT d.path
@@ -1347,12 +1445,10 @@ export function getContextForFile(db: Database, filepath: string): string | null
       // Skip collections with missing paths
       if (!coll || !coll.path) continue;
 
-      if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
+      const relPath = getRelativePathFromPrefix(filepath, coll.path);
+      if (relPath !== null) {
         collectionName = coll.name;
-        // Extract relative path
-        relativePath = filepath.startsWith(coll.path + '/')
-          ? filepath.slice(coll.path.length + 1)
-          : '';
+        relativePath = relPath;
         break;
       }
     }
@@ -2080,11 +2176,12 @@ export function findDocument(db: Database, filename: string, options: { includeB
       let relativePath: string | null = null;
 
       // If filepath is absolute and starts with collection path, extract relative part
-      if (filepath.startsWith(coll.path + '/')) {
-        relativePath = filepath.slice(coll.path.length + 1);
+      const relFromPrefix = getRelativePathFromPrefix(filepath, coll.path);
+      if (relFromPrefix !== null) {
+        relativePath = relFromPrefix;
       }
       // Otherwise treat filepath as relative to collection
-      else if (!filepath.startsWith('/')) {
+      else if (!isAbsolutePath(filepath)) {
         relativePath = filepath;
       }
 
@@ -2147,8 +2244,8 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   if (!row) {
     const collections = collectionsListCollections();
     for (const coll of collections) {
-      if (filepath.startsWith(coll.path + '/')) {
-        const relativePath = filepath.slice(coll.path.length + 1);
+      const relativePath = getRelativePathFromPrefix(filepath, coll.path);
+      if (relativePath !== null) {
         row = db.prepare(`
           SELECT content.doc as body
           FROM documents d
