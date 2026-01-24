@@ -1,0 +1,12 @@
+# Model checkpoints (stored on HuggingFace Hub)
+qmd-query-expansion-*/
+*.pt
+*.safetensors
+
+# Large data files (stored on HuggingFace Hub)
+data/train/train.jsonl
+data/train/train_chat.jsonl
+data/train/val.jsonl
+
+# Keep the generated source data
+!data/qmd_expansion.jsonl
