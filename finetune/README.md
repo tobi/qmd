@@ -28,9 +28,13 @@ hyde: To configure authentication, set the AUTH_SECRET environment variable and 
 
 | Model | HuggingFace | Format Compliance | Status |
 |-------|-------------|-------------------|--------|
-| **Qwen3-0.6B (finetuned)** | [tobil/qmd-query-expansion-0.6B](https://huggingface.co/tobil/qmd-query-expansion-0.6B) | **95%** | Recommended |
-| Qwen3-1.7B (finetuned) | [tobil/qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | 0% | Training issues |
+| **Qwen3-0.6B (SFT)** | [tobil/qmd-query-expansion-0.6B](https://huggingface.co/tobil/qmd-query-expansion-0.6B) | **95%** | Recommended |
+| Qwen3-1.7B v2 (SFT) | [tobil/qmd-query-expansion-1.7B-v2](https://huggingface.co/tobil/qmd-query-expansion-1.7B-v2) | TBD | Completed |
+| Qwen3-0.6B (GRPO) | [tobil/qmd-query-expansion-0.6B-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-grpo) | 0% | Failed - lost formatting |
+| Qwen3-1.7B v1 (SFT) | [tobil/qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | 0% | Training issues |
 | Qwen3-0.6B (baseline) | - | 0% | Untrained |
+
+**Note:** GRPO (RL) training caused catastrophic forgetting - the model lost all learned formatting.
 
 ## Training Dataset
 
