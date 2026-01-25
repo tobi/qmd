@@ -20,91 +20,116 @@ hyde: To configure authentication, set the AUTH_SECRET environment variable and 
 
 | Type | Purpose | Count |
 |------|---------|-------|
-| `lex` | BM25 keyword variations | 1-3 |
-| `vec` | Semantic reformulations | 1-3 |
-| `hyde` | Hypothetical document passage | 0-1 |
+| `lex:` | BM25 keyword variations (short, keyword-focused) | 1-3 |
+| `vec:` | Semantic reformulations (natural language) | 1-3 |
+| `hyde:` | Hypothetical document passage (50-150 chars) | 0-1 |
 
 ## Trained Models
 
-| Model | HuggingFace | Format Compliance | Status |
-|-------|-------------|-------------------|--------|
-| **Qwen3-0.6B (SFT)** | [tobil/qmd-query-expansion-0.6B](https://huggingface.co/tobil/qmd-query-expansion-0.6B) | **95%** | Recommended |
-| Qwen3-1.7B v2 (SFT) | [tobil/qmd-query-expansion-1.7B-v2](https://huggingface.co/tobil/qmd-query-expansion-1.7B-v2) | TBD | Completed |
-| Qwen3-0.6B (GRPO) | [tobil/qmd-query-expansion-0.6B-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-grpo) | 0% | Failed - lost formatting |
-| Qwen3-1.7B v1 (SFT) | [tobil/qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | 0% | Training issues |
-| Qwen3-0.6B (baseline) | - | 0% | Untrained |
+| Model | HuggingFace | Score | Status |
+|-------|-------------|-------|--------|
+| **Qwen3-0.6B v4 (SFT)** | [tobil/qmd-query-expansion-0.6B-v4](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4) | **98.8%** | Recommended |
+| Qwen3-0.6B v4 (GRPO) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | 0% | Failed - catastrophic drift |
 
-**Note:** GRPO (RL) training caused catastrophic forgetting - the model lost all learned formatting.
+## Prompt Format
 
-## Training Dataset
+The models use **Qwen3 chat template** with `/no_think` to disable thinking mode.
 
-- **Dataset**: [tobil/qmd-query-expansion-train](https://huggingface.co/datasets/tobil/qmd-query-expansion-train)
-- **Source**: Transformed from [s-emanuilov/query-expansion](https://huggingface.co/datasets/s-emanuilov/query-expansion) (CC BY 4.0)
-- **Size**: 5,157 examples (train: 4,641, eval: 516)
-- **Format**: Chat messages with user query and assistant response in lex/vec/hyde format
+### Inference (Python)
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+
+# CRITICAL: Use /no_think to disable Qwen3's thinking mode
+messages = [{"role": "user", "content": f"/no_think Expand this search query: {query}"}]
+
+prompt = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+
+# Generate and decode
+output = tokenizer.decode(tokens, skip_special_tokens=True)
+
+# Extract assistant response (skip_special_tokens converts to "user\n...\nassistant\n...")
+if "\nassistant\n" in output:
+    expansion = output.split("\nassistant\n")[-1].strip()
+```
+
+### Raw Format
+
+```
+<|im_start|>user
+/no_think Expand this search query: auth<|im_end|>
+<|im_start|>assistant
+lex: authentication configuration
+lex: auth settings
+vec: how to configure authentication
+vec: authentication setup guide
+hyde: To configure authentication, set AUTH_SECRET in your environment.<|im_end|>
+```
+
+See `PROMPT_FORMAT.md` for complete specification.
 
 ## Directory Structure
 
 ```
 finetune/
-├── README.md                 # This file
-├── DATASETS.md               # Dataset research findings
-├── TRAINING_JOBS.md          # HuggingFace Jobs tracking
-├── generate_data_offline.py  # Transform s-emanuilov dataset to QMD format
-├── prepare_data.py           # Upload to HuggingFace Hub
-├── train_0.6B.py             # Training script for 0.6B model
-├── train_1.7B.py             # Training script for 1.7B model
-├── train_grpo.py             # GRPO RL training (optional)
-├── evaluate_model.py         # Evaluate finetuned models
-├── evaluate_baseline.py      # Evaluate base models
-├── data/
-│   ├── qmd_expansion.jsonl   # Generated training data
-│   └── train/                # Prepared chat format
-└── evaluation_*.json         # Evaluation results
+├── train.py              # SFT training (uses YAML config)
+├── rl.py                 # GRPO/RL training (uses YAML config)
+├── evaluate_model.py     # Evaluate finetuned models
+├── tui.py                # Interactive testing interface
+├── configs/
+│   ├── sft_v4.yaml       # SFT training config
+│   └── grpo_v4.yaml      # GRPO training config
+├── dataset/
+│   ├── prepare_data.py   # Prepare training data
+│   ├── clean_data.py     # Data quality improvements
+│   └── generate_data*.py # Generate from source datasets
+├── PROMPT_FORMAT.md      # Prompt format specification
+├── SCORING.md            # Scoring criteria
+└── data/
+    └── train/            # Prepared training data
 ```
 
 ## Quick Start
 
-### 1. Generate Training Data
+### 1. Prepare Training Data
 
 ```bash
-# Transform s-emanuilov dataset to QMD format (no API needed)
-uv run generate_data_offline.py
+cd dataset
+uv run prepare_data.py --add-short 5
 ```
 
-### 2. Prepare and Upload Dataset
+### 2. Train with YAML Config
 
 ```bash
-# Convert to chat format and upload to HuggingFace Hub
-uv run prepare_data.py
+# Local training
+uv run train.py --config configs/sft_v4.yaml
+
+# Or on HuggingFace Jobs
+hf jobs uv run --flavor a10g-large --timeout 2h --secrets HF_TOKEN \
+  "https://huggingface.co/datasets/tobil/qmd-query-expansion-train-v2/resolve/main/train_sft_v4.py"
 ```
 
-### 3. Train on HuggingFace Jobs
+### 3. Evaluate
 
 ```bash
-# Train Qwen3-0.6B (recommended)
-hf jobs uv run --flavor a10g-large --timeout 3h --secrets HF_TOKEN \
-  "https://huggingface.co/tobil/qmd-training-scripts/resolve/main/train_0.6B.py"
+uv run evaluate_model.py --model tobil/qmd-query-expansion-0.6B-v4
 ```
 
-### 4. Evaluate
+### 4. Interactive Testing
 
 ```bash
-# Evaluate finetuned model
-uv run evaluate_model.py --model tobil/qmd-query-expansion-0.6B --base-model Qwen/Qwen3-0.6B
-
-# Compare to baseline
-uv run evaluate_baseline.py --model Qwen/Qwen3-0.6B --num-queries 10
-```
-
-### 5. Export to GGUF
-
-```bash
-# Convert to GGUF for node-llama-cpp (TODO)
-uv run export_gguf.py --model tobil/qmd-query-expansion-0.6B --quantization Q8_0
+uv run tui.py
 ```
 
 ## Training Configuration
+
+Default SFT config (`configs/sft_v4.yaml`):
 
 | Parameter | Value |
 |-----------|-------|
@@ -115,37 +140,37 @@ uv run export_gguf.py --model tobil/qmd-query-expansion-0.6B --quantization Q8_0
 | Max Seq Length | 512 |
 | Target Modules | q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj |
 
-## Prompt Format
+## Training Dataset
 
-The models are trained on this simple prompt format:
+- **Dataset**: [tobil/qmd-query-expansion-train-v2](https://huggingface.co/datasets/tobil/qmd-query-expansion-train-v2)
+- **Size**: 6,180 examples (26.5% short queries)
+- **Format**: Qwen3 chat messages with `/no_think` directive
 
-```
-Expand this search query:
-
-{query}
-```
-
-The model responds with lex/vec/hyde lines directly.
+Key improvements in v2:
+- Short query examples with proper expansions
+- Hyde passages truncated to 150 chars
+- Key term preservation in lex lines
 
 ## Evaluation Results
 
-### 0.6B Finetuned Model (95% format compliance)
+### SFT v4 (98.8% average score)
 
-Sample outputs:
+All 21 test queries rated "Excellent":
 
-| Query | Output |
-|-------|--------|
-| `how to configure authentication` | lex: steps for setting up authentication<br>vec: steps for setting up authentication in cloud services<br>hyde: The process of configure authentication... |
-| `kubernetes vs docker swarm` | lex: kubernetes and docker swarm<br>vec: kubernetes vs docker swarm<br>hyde: Kubernetes vs docker swarm is an important concept... |
-| `cors error fix` | lex: how to fix cors<br>vec: how to fix cors issues in web apps<br>hyde: The topic of cors error fix guide... |
+| Query | Score | Rating |
+|-------|-------|--------|
+| `how to configure authentication` | 99% | Excellent |
+| `auth` | 95% | Excellent |
+| `git rebase vs merge` | 100% | Excellent |
+| `react useEffect cleanup` | 100% | Excellent |
 
-### Baseline Model (0% format compliance)
+### GRPO v4 (0% - Failed)
 
-The untrained model generates random prose, code blocks, or repetitive text with no understanding of the lex/vec/hyde format.
+The GRPO training caused catastrophic drift. The model now generates verbose explanations instead of structured `lex:/vec:/hyde:` format.
 
-## Future Work
+**Root cause**: Reward function didn't enforce format strictly enough. The model learned that verbose explanations could score higher than concise structured output.
 
-- [ ] Export to GGUF for local inference
-- [ ] Integrate into QMD as default query expansion model
-- [ ] GRPO training for improved diversity (optional)
-- [ ] Fix 1.7B training issues
+## Known Issues
+
+- **GRPO drift**: RL training causes the model to lose SFT-learned formatting. Needs stricter format enforcement in reward function.
+- **Key term preservation**: Some lex lines still too generic (missing query key terms)

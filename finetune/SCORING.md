@@ -56,29 +56,63 @@ hyde: Authentication can be configured by setting the AUTH_SECRET environment va
 
 | Criterion | Points | Deduction |
 |-----------|--------|-----------|
-| Base relevance | +10 | Subjective |
-| Lex lines preserve key terms from query | +5 | -5 if lex is generic (e.g., "features" without "shop.app") |
+| Base relevance | +5 | Subjective |
+| Lex lines preserve key terms from query | +5 | -5 if lex is generic |
 | Lex lines are keyword-focused (shorter) | +5 | -2 if lex is longer than vec |
 | Vec lines are natural language (complete phrases) | +5 | -2 if vec is just keywords |
 
-**Key Term Preservation Rule**: `lex:` lines MUST contain at least one significant word from the original query (excluding stopwords like "what", "is", "how", "the", etc.).
+### 5. Named Entity Preservation (0-20 points, CRITICAL)
 
-Bad: `what is shop.app` → `lex: features and benefits`
-Good: `what is shop.app` → `lex: shop.app features`
+Named entities are proper nouns, brand names, technical terms, and acronyms that MUST appear in lex queries. This prevents generic expansions that lose the specific topic.
+
+| Criterion | Points | Deduction |
+|-----------|--------|-----------|
+| All lex lines contain at least one entity | +15 | - |
+| Some lex lines contain entities | +5 | - |
+| NO lex lines contain entities | - | **-30 HEAVY PENALTY** |
+| Generic filler phrases in lex | - | -15 per phrase |
+| Entities also in vec lines | +5 | - |
+
+**Named Entity Detection:**
+- All-caps acronyms: `TDS`, `API`, `GPU`, `AWS`
+- Capitalized proper nouns: `React`, `Docker`, `Kubernetes`
+- Technical terms: `node.js`, `C++`, `.NET`
+- CamelCase: `JavaScript`, `TypeScript`
+- Compound names: `TDS motorsports` → both words are entities
+
+**Generic Filler Phrases (BANNED in lex):**
+- "find information about"
+- "search for", "look up"
+- "get information", "learn about"
+- "details about", "guide to"
+
+**Examples:**
+
+| Query | Bad Lex (Score: 0.30) | Good Lex (Score: 1.00) |
+|-------|----------------------|------------------------|
+| `who is TDS motorsports` | `lex: find information about` | `lex: TDS motorsports history` |
+| | `lex: company details` | `lex: TDS motorsports founders` |
+| `how to use React hooks` | `lex: programming tutorial` | `lex: React hooks tutorial` |
+| | `lex: how to code` | `lex: useEffect useState hooks` |
+
+**Key Rule**: If a query mentions a specific entity (brand, product, technology), EVERY lex line should include that entity or a direct variation of it.
 
 ## Score Calculation
 
 ```
-Total Score = Format + Diversity + Hyde + Quality
-Max Score = 100 (80 without hyde)
+Total Score = Format + Diversity + Hyde + Quality + Entity
+Max Score = 120 (100 without hyde)
+Normalized = Total / Max (0.0 - 1.0)
 ```
 
 **Rating:**
-- 80-100: Excellent
-- 60-79: Good
-- 40-59: Acceptable
-- 20-39: Poor
-- 0-19: Failed
+- 0.80-1.00: Excellent
+- 0.60-0.79: Good
+- 0.40-0.59: Acceptable
+- 0.20-0.39: Poor
+- 0.00-0.19: Failed
+
+**Note:** Entity score can go negative, heavily penalizing outputs that miss named entities.
 
 ## Examples
 
@@ -172,6 +206,76 @@ def echoes_query(expansion, query):
     exp = expansion.lower().strip()
     q = query.lower().strip()
     return exp == q or exp in q or q in exp
+```
+
+### Named Entity Extraction
+
+```python
+KEY_TERM_STOPWORDS = {'what', 'is', 'how', 'to', 'the', 'a', 'an', 'in', 'on', 'for', 'of',
+                      'and', 'or', 'with', 'my', 'your', 'do', 'does', 'can', 'i', 'me', 'we',
+                      'who', 'where', 'when', 'why', 'which', 'find', 'get', 'show', 'tell'}
+
+def extract_named_entities(query: str) -> set:
+    """Extract named entities using simple heuristics."""
+    entities = set()
+    words = query.split()
+    prev_was_entity = False
+
+    for i, word in enumerate(words):
+        clean = word.strip('.,!?:;()[]"\'')
+        if not clean:
+            prev_was_entity = False
+            continue
+
+        is_entity = False
+
+        # All-caps acronyms: TDS, API, GPU
+        if clean.isupper() and len(clean) >= 2:
+            entities.add(clean.lower())
+            is_entity = True
+        # Capitalized proper nouns (not first word)
+        elif i > 0 and clean[0].isupper() and clean.lower() not in KEY_TERM_STOPWORDS:
+            entities.add(clean.lower())
+            is_entity = True
+        # Technical terms: node.js, C++
+        elif any(c in clean for c in '.+-#@') and len(clean) >= 2:
+            entities.add(clean.lower())
+            is_entity = True
+        # CamelCase: JavaScript
+        elif len(clean) > 1 and any(c.isupper() for c in clean[1:]) and clean[0].isupper():
+            entities.add(clean.lower())
+            is_entity = True
+        # Word following an entity (compound names: TDS motorsports)
+        elif prev_was_entity and clean.lower() not in KEY_TERM_STOPWORDS:
+            entities.add(clean.lower())
+            is_entity = True
+
+        prev_was_entity = is_entity
+
+    return entities
+```
+
+### Generic Phrase Detection
+
+```python
+GENERIC_LEX_PHRASES = {
+    'find information about', 'search for', 'look up', 'get information',
+    'learn about', 'information on', 'details about', 'find out about',
+    'what is', 'how to', 'guide to', 'help with'
+}
+
+def lex_is_generic(lex_line: str) -> bool:
+    """Check if lex line is a useless generic filler."""
+    lex_lower = lex_line.lower().strip()
+    for phrase in GENERIC_LEX_PHRASES:
+        if phrase in lex_lower:
+            # Check if there's specific content beyond the generic phrase
+            remaining = lex_lower
+            for word in phrase.split():
+                remaining = remaining.replace(word, '', 1).strip()
+            if len(remaining) < 3:  # Nothing specific left
+                return True
+    return False
 ```
 
 ## Training Data Requirements
