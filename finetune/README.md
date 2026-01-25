@@ -26,13 +26,11 @@ hyde: To configure authentication, set the AUTH_SECRET environment variable and 
 
 ## Trained Models
 
-All models are in a single HuggingFace repo: **[tobil/qmd-query-expansion](https://huggingface.co/tobil/qmd-query-expansion)**
-
 | Size | SFT Adapter | GRPO Adapter | Base Model |
 |------|-------------|--------------|------------|
-| **0.6B** | `0.6B-sft` | `0.6B-grpo` | `Qwen/Qwen3-0.6B` |
-| **1.7B** | `1.7B-sft` | `1.7B-grpo` | `Qwen/Qwen3-1.7B` |
-| **4B** | `4B-sft` | `4B-grpo` | `Qwen/Qwen3-4B` |
+| **0.6B** | [tobil/qmd-query-expansion-0.6B-v4](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | `Qwen/Qwen3-0.6B` |
+| **1.7B** | [tobil/qmd-query-expansion-1.7B-sft](https://huggingface.co/tobil/qmd-query-expansion-1.7B-sft) | tobil/qmd-query-expansion-1.7B-grpo | `Qwen/Qwen3-1.7B` |
+| **4B** | [tobil/qmd-query-expansion-4B-sft](https://huggingface.co/tobil/qmd-query-expansion-4B-sft) | tobil/qmd-query-expansion-4B-grpo | `Qwen/Qwen3-4B` |
 
 ### Loading Models
 
@@ -42,13 +40,13 @@ from transformers import AutoModelForCausalLM
 
 # Load SFT model (recommended)
 base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
-model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion", subfolder="1.7B-sft")
+model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion-1.7B-sft")
 
 # Load GRPO model (requires SFT first)
 base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
-model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion", subfolder="1.7B-sft")
+model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion-1.7B-sft")
 model = model.merge_and_unload()
-model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion", subfolder="1.7B-grpo")
+model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-1.7B-grpo")
 ```
 
 **Note on GRPO models**: GRPO adapters were trained on top of merged SFT weights, so you must load and merge SFT first before applying GRPO.
