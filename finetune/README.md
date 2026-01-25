@@ -29,7 +29,20 @@ hyde: To configure authentication, set the AUTH_SECRET environment variable and 
 | Model | HuggingFace | Score | Status |
 |-------|-------------|-------|--------|
 | **Qwen3-0.6B v4 (SFT)** | [tobil/qmd-query-expansion-0.6B-v4](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4) | **98.8%** | Recommended |
-| Qwen3-0.6B v4 (GRPO) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | 0% | Failed - catastrophic drift |
+| Qwen3-0.6B v4 (GRPO) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | 89.7% | Requires SFT base (see note) |
+
+**Note on GRPO model**: The GRPO adapter was trained on top of the merged SFT model, so you must load SFT first:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+# Load base → merge SFT → apply GRPO
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-0.6B-v4")
+model = model.merge_and_unload()
+model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-0.6B-v4-grpo")
+```
 
 ## Prompt Format
 
@@ -171,13 +184,21 @@ All 21 test queries rated "Excellent":
 | `git rebase vs merge` | 100% | Excellent |
 | `react useEffect cleanup` | 100% | Excellent |
 
-### GRPO v4 (0% - Failed)
+### GRPO v4 (89.7% - with SFT base)
 
-The GRPO training caused catastrophic drift. The model now generates verbose explanations instead of structured `lex:/vec:/hyde:` format.
+All 26 test queries rated "Excellent" when loaded correctly (SFT first, then GRPO adapter).
 
-**Root cause**: Reward function didn't enforce format strictly enough. The model learned that verbose explanations could score higher than concise structured output.
+| Query | Score | Rating |
+|-------|-------|--------|
+| `AWS Lambda functions` | 96% | Excellent |
+| `typescript async await` | 92% | Excellent |
+| `kubernetes vs docker swarm` | 92% | Excellent |
+| `who is TDS motorsports` | 89% | Excellent |
+
+**Important**: Loading GRPO directly on base model results in 0% (catastrophic drift) because GRPO was trained on merged SFT weights.
 
 ## Known Issues
 
-- **GRPO drift**: RL training causes the model to lose SFT-learned formatting. Needs stricter format enforcement in reward function.
+- **GRPO loading**: Requires SFT adapter loaded first before GRPO adapter (see model card note above)
 - **Key term preservation**: Some lex lines still too generic (missing query key terms)
+- **Entity scoring**: Named entity detection is heuristic-based, may miss some cases
