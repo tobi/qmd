@@ -195,6 +195,11 @@ def score_expansion(query: str, expansion: str) -> float:
     """Score expansion. Returns 0.0-1.0 for RL reward."""
     text = expansion.strip()
 
+    # HARD FAIL: Chat template artifacts (model confused about format)
+    if any(token in text for token in ['<|im_start|>', '<|im_end|>', '<think>', '</think>',
+                                        '\nassistant\n', '\nuser\n', '<|endoftext|>']):
+        return 0.0  # Zero reward for chat template leakage
+
     # HARD FAIL: Must start with valid prefix (prevents verbose explanations)
     first_line = text.split("\n")[0].strip() if text else ""
     if not first_line.startswith(("lex:", "vec:", "hyde:")):
@@ -372,6 +377,19 @@ def main():
         bad_tech = "lex: programming tutorial\nlex: how to code\nvec: learn web development"
         print(f"    Good (preserves React): {score_expansion(query_tech, good_tech):.2f}")
         print(f"    Bad (generic): {score_expansion(query_tech, bad_tech):.2f}")
+
+        # Test 4: Chat template leakage (MUST be 0.0)
+        print(f"\n  Chat template leakage tests (all should be 0.00):")
+        leakage_tests = [
+            "<think>Let me think...</think>\nlex: auth",
+            "<|im_start|>assistant\nlex: auth",
+            "lex: auth<|im_end|>",
+            "lex: auth\nassistant\nmore stuff",
+        ]
+        for test in leakage_tests:
+            score = score_expansion("auth", test)
+            status = "✓" if score == 0.0 else "✗ FAIL"
+            print(f"    {status} '{test[:40]}...' -> {score:.2f}")
 
         return
 
