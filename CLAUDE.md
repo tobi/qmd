@@ -1,7 +1,5 @@
 # QMD - Quick Markdown Search
 
-**Note**: This project uses [bd (beads)](https://github.com/steveyegge/beads) for issue tracking. Use `bd` commands instead of markdown TODOs. See AGENTS.md for workflow details.
-
 Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 
 ## Commands
