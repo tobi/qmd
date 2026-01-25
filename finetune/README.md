@@ -26,23 +26,32 @@ hyde: To configure authentication, set the AUTH_SECRET environment variable and 
 
 ## Trained Models
 
-| Model | HuggingFace | Score | Status |
-|-------|-------------|-------|--------|
-| **Qwen3-0.6B v4 (SFT)** | [tobil/qmd-query-expansion-0.6B-v4](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4) | **98.8%** | Recommended |
-| Qwen3-0.6B v4 (GRPO) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | 89.7% | Requires SFT base (see note) |
+All models are in a single HuggingFace repo: **[tobil/qmd-query-expansion](https://huggingface.co/tobil/qmd-query-expansion)**
 
-**Note on GRPO model**: The GRPO adapter was trained on top of the merged SFT model, so you must load SFT first:
+| Size | SFT Adapter | GRPO Adapter | Base Model |
+|------|-------------|--------------|------------|
+| **0.6B** | `0.6B-sft` | `0.6B-grpo` | `Qwen/Qwen3-0.6B` |
+| **1.7B** | `1.7B-sft` | `1.7B-grpo` | `Qwen/Qwen3-1.7B` |
+| **4B** | `4B-sft` | `4B-grpo` | `Qwen/Qwen3-4B` |
+
+### Loading Models
 
 ```python
 from peft import PeftModel
 from transformers import AutoModelForCausalLM
 
-# Load base → merge SFT → apply GRPO
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
-model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-0.6B-v4")
+# Load SFT model (recommended)
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
+model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion", subfolder="1.7B-sft")
+
+# Load GRPO model (requires SFT first)
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
+model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion", subfolder="1.7B-sft")
 model = model.merge_and_unload()
-model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-0.6B-v4-grpo")
+model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion", subfolder="1.7B-grpo")
 ```
+
+**Note on GRPO models**: GRPO adapters were trained on top of merged SFT weights, so you must load and merge SFT first before applying GRPO.
 
 ## Prompt Format
 
