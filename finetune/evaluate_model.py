@@ -52,9 +52,8 @@ TEST_QUERIES = [
     "setting up ci cd pipeline with github actions",
 ]
 
-PROMPT_TEMPLATE = """Expand this search query:
-
-{query}"""
+# Prompt is generated via tokenizer.apply_chat_template() - see generate_expansion()
+# Don't manually construct <|im_start|> tags
 
 STOPWORDS = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in', 'and', 'or', 'it', 'this', 'that', 'be', 'with', 'as', 'on', 'by'}
 
@@ -110,6 +109,23 @@ def echoes_query(expansion: str, query: str) -> bool:
     return False
 
 
+def get_key_terms(query: str) -> set:
+    """Extract key terms from query (excluding stopwords)."""
+    stopwords = {'what', 'is', 'how', 'to', 'the', 'a', 'an', 'in', 'on', 'for', 'of',
+                 'and', 'or', 'with', 'my', 'your', 'do', 'does', 'can', 'i', 'me', 'we'}
+    words = set(query.lower().split())
+    return words - stopwords
+
+
+def lex_preserves_key_terms(lex_line: str, query: str) -> bool:
+    """Check if lex line contains at least one key term from query."""
+    key_terms = get_key_terms(query)
+    if not key_terms:  # Very short query
+        return True
+    lex_words = set(lex_line.lower().split())
+    return bool(key_terms & lex_words)
+
+
 def word_repetition_penalty(text: str) -> int:
     """Count penalty for repeated words (excluding stopwords)."""
     words = re.findall(r'\b\w+\b', text.lower())
@@ -121,12 +137,56 @@ def word_repetition_penalty(text: str) -> int:
     return penalty
 
 
+def is_continuation(expansion: str) -> bool:
+    """
+    Detect if output is a continuation rather than proper expansion.
+
+    A continuation is when the model continues the query as prose
+    instead of outputting lex:/vec:/hyde: lines.
+    """
+    text = expansion.strip()
+    if not text:
+        return True
+
+    # Check first non-empty line
+    first_line = text.split("\n")[0].strip()
+
+    # Valid outputs must start with a prefix
+    valid_prefixes = ("lex:", "vec:", "hyde:")
+    if first_line.startswith(valid_prefixes):
+        return False
+
+    # If first line doesn't have a valid prefix, it's a continuation
+    # Exception: empty first line (check second)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if lines and not lines[0].startswith(valid_prefixes):
+        return True
+
+    return False
+
+
 def score_expansion(query: str, expansion: str) -> dict:
     """
     Score an expansion based on SCORING.md criteria.
 
     Returns dict with score breakdown and total (0-100).
     """
+    # HARD FAIL: Continuation detection
+    if is_continuation(expansion):
+        return {
+            "format": 0,
+            "diversity": 0,
+            "hyde": 0,
+            "quality": 0,
+            "total": 0,
+            "max_possible": 80,
+            "percentage": 0,
+            "rating": "Failed",
+            "deductions": ["CONTINUATION DETECTED - output does not start with lex:/vec:/hyde:"],
+            "parsed": {"lex": [], "vec": [], "hyde": [], "invalid": [expansion[:100]]},
+            "is_continuation": True,
+        }
+
     parsed = parse_expansion(expansion)
     scores = {
         "format": 0,
@@ -264,7 +324,17 @@ def score_expansion(query: str, expansion: str) -> dict:
             quality_score += 2
             scores["deductions"].append("some vec lines too short/keyword-like")
 
-    scores["quality"] = quality_score
+    # Lex lines must preserve key terms from query (not be generic)
+    if parsed["lex"]:
+        lex_with_terms = sum(1 for l in parsed["lex"] if lex_preserves_key_terms(l, query))
+        if lex_with_terms == len(parsed["lex"]):
+            quality_score += 5
+        elif lex_with_terms > 0:
+            quality_score += 2
+        else:
+            scores["deductions"].append("lex lines too generic - missing key terms from query")
+
+    scores["quality"] = min(20, quality_score)  # Cap at 20
 
     # === TOTAL ===
     scores["total"] = scores["format"] + scores["diversity"] + scores["hyde"] + scores["quality"]
@@ -285,6 +355,7 @@ def score_expansion(query: str, expansion: str) -> dict:
         scores["rating"] = "Failed"
 
     scores["parsed"] = parsed
+    scores["is_continuation"] = False
     return scores
 
 
@@ -310,8 +381,14 @@ def load_model(model_name: str, base_model: str = "Qwen/Qwen3-0.6B"):
 
 
 def generate_expansion(model, tokenizer, query: str, max_new_tokens: int = 200) -> str:
-    """Generate query expansion."""
-    prompt = PROMPT_TEMPLATE.format(query=query)
+    """Generate query expansion using proper Qwen3 chat template."""
+    # Use tokenizer's chat template with /no_think to disable thinking mode
+    messages = [{"role": "user", "content": f"/no_think Expand this search query: {query}"}]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
@@ -325,8 +402,25 @@ def generate_expansion(model, tokenizer, query: str, max_new_tokens: int = 200) 
             eos_token_id=tokenizer.eos_token_id,
         )
 
+    # Decode and extract expansion
+    # skip_special_tokens=True strips <|im_start|> etc, leaving "user\n...\nassistant\n..."
     full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    expansion = full_output[len(prompt):].strip()
+
+    # Extract assistant response
+    if "\nassistant\n" in full_output:
+        expansion = full_output.split("\nassistant\n")[-1].strip()
+    elif "assistant\n" in full_output:
+        expansion = full_output.split("assistant\n")[-1].strip()
+    else:
+        # Fallback: strip prompt length
+        expansion = full_output[len(prompt):].strip()
+
+    # Remove any <think> tags that might remain
+    if expansion.startswith("<think>"):
+        # Find end of thinking block
+        think_end = expansion.find("</think>")
+        if think_end != -1:
+            expansion = expansion[think_end + 8:].strip()
 
     return expansion
 

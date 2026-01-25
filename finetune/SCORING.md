@@ -56,9 +56,15 @@ hyde: Authentication can be configured by setting the AUTH_SECRET environment va
 
 | Criterion | Points | Deduction |
 |-----------|--------|-----------|
-| Expansions are relevant to query | +10 | Subjective |
+| Base relevance | +10 | Subjective |
+| Lex lines preserve key terms from query | +5 | -5 if lex is generic (e.g., "features" without "shop.app") |
 | Lex lines are keyword-focused (shorter) | +5 | -2 if lex is longer than vec |
 | Vec lines are natural language (complete phrases) | +5 | -2 if vec is just keywords |
+
+**Key Term Preservation Rule**: `lex:` lines MUST contain at least one significant word from the original query (excluding stopwords like "what", "is", "how", "the", etc.).
+
+Bad: `what is shop.app` → `lex: features and benefits`
+Good: `what is shop.app` → `lex: shop.app features`
 
 ## Score Calculation
 

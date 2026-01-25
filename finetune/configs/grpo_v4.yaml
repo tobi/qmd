@@ -1,0 +1,39 @@
+# GRPO Training Config for QMD Query Expansion v4
+# Uses SFT model as starting point with RL fine-tuning
+
+model:
+  sft: "tobil/qmd-query-expansion-0.6B-v4"  # Starting point
+  base: "Qwen/Qwen3-0.6B"  # For tokenizer
+  output: "tobil/qmd-query-expansion-0.6B-v4-grpo"
+
+dataset:
+  name: "tobil/qmd-query-expansion-train-v2"
+  prompt_field: "messages"
+  max_samples: 2000
+
+training:
+  epochs: 1
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1e-6  # Very low for RL stability
+  max_grad_norm: 0.5
+
+grpo:
+  num_generations: 4
+  max_completion_length: 200
+
+lora:
+  rank: 4  # Smaller for RL stability
+  alpha: 8
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "grpo-v4-key-term-preservation"
+
+# Note: GRPO v4 failed due to reward function not enforcing format strictly enough.
+# The model drifted to verbose explanations instead of lex:/vec:/hyde: format.
+# Recommendation: Add hard penalty when output doesn't start with valid prefix.

@@ -1,0 +1,664 @@
+[
+  {
+    "query": "how to configure authentication",
+    "expansion": "lex: authentication settings\nlex: user login\nvec: authentication settings\nvec: user login\nhyde: To configure authentication, start by reviewing the requirements and dependencies. Configure authentication settings in your project configuration.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 19,
+      "deductions": [
+        "some vec lines too short/keyword-like"
+      ],
+      "total": 99,
+      "max_possible": 100,
+      "percentage": 99.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "authentication settings",
+        "user login"
+      ],
+      "vec": [
+        "authentication settings",
+        "user login"
+      ],
+      "hyde": [
+        "To configure authentication, start by reviewing the requirements and dependencies. Configure authentication settings in your project configuration."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "typescript async await",
+    "expansion": "lex: asynchronous await\nlex: await typescript\nvec: asynchronous await\nvec: await typescript\nhyde: Typescript async await is an important concept that relates to asynchronous await. It provides functionality for various use cases in software development.",
+    "scores": {
+      "format": 30,
+      "diversity": 28,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "vec duplicates: 'asynchronous await...' ~ 'await typescript...'"
+      ],
+      "total": 98,
+      "max_possible": 100,
+      "percentage": 98.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "asynchronous await",
+        "await typescript"
+      ],
+      "vec": [
+        "asynchronous await",
+        "await typescript"
+      ],
+      "hyde": [
+        "Typescript async await is an important concept that relates to asynchronous await. It provides functionality for various use cases in software development."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "docker compose networking",
+    "expansion": "lex: docker-compose config\nlex: docker-compose settings\nvec: docker-compose config\nvec: docker-compose settings\nhyde: Docker compose networking is an important concept that relates to docker-compose settings. It provides functionality for various use cases in software development.",
+    "scores": {
+      "format": 30,
+      "diversity": 28,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "vec duplicates: 'docker-compose confi...' ~ 'docker-compose setti...'",
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 98,
+      "max_possible": 100,
+      "percentage": 98.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "docker-compose config",
+        "docker-compose settings"
+      ],
+      "vec": [
+        "docker-compose config",
+        "docker-compose settings"
+      ],
+      "hyde": [
+        "Docker compose networking is an important concept that relates to docker-compose settings. It provides functionality for various use cases in software development."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "git rebase vs merge",
+    "expansion": "lex: difference between rebase\nlex: what's the\nvec: difference between rebase and merge\nvec: what's the difference between git rebase and merge\nhyde: The topic of git rebase vs merge covers what's the difference between rebase and merge.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "difference between rebase",
+        "what's the"
+      ],
+      "vec": [
+        "difference between rebase and merge",
+        "what's the difference between git rebase and merge"
+      ],
+      "hyde": [
+        "The topic of git rebase vs merge covers what's the difference between rebase and merge."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "react useEffect cleanup",
+    "expansion": "lex: react cleanup code\nlex: react cleanup example\nvec: code examples for react useEffect cleanup\nvec: practical useEffect cleanup implementation examples\nhyde: Here are some practical examples of useEffect cleanup in action. Each example demonstrates a common use case with working code.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "react cleanup code",
+        "react cleanup example"
+      ],
+      "vec": [
+        "code examples for react useEffect cleanup",
+        "practical useEffect cleanup implementation examples"
+      ],
+      "hyde": [
+        "Here are some practical examples of useEffect cleanup in action. Each example demonstrates a common use case with working code."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "auth",
+    "expansion": "lex: access\nlex: login\nvec: access\nvec: login\nhyde: The topic of auth covers sign in. Proper implementation follows established patterns and best practices.",
+    "scores": {
+      "format": 30,
+      "diversity": 28,
+      "hyde": 20,
+      "quality": 17,
+      "deductions": [
+        "vec duplicates: 'access...' ~ 'login...'",
+        "some vec lines too short/keyword-like",
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 95,
+      "max_possible": 100,
+      "percentage": 95.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "access",
+        "login"
+      ],
+      "vec": [
+        "access",
+        "login"
+      ],
+      "hyde": [
+        "The topic of auth covers sign in. Proper implementation follows established patterns and best practices."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "config",
+    "expansion": "lex: config fix\nlex: config error\nvec: troubleshooting common config problems\nvec: how to fix config errors\nhyde: If you encounter config issues, check your configuration first. Common problems include missing dependencies and incorrect settings.",
+    "scores": {
+      "format": 30,
+      "diversity": 25,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "echoes query: 'config fix...'",
+        "echoes query: 'config error...'"
+      ],
+      "total": 95,
+      "max_possible": 100,
+      "percentage": 95.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "config fix",
+        "config error"
+      ],
+      "vec": [
+        "troubleshooting common config problems",
+        "how to fix config errors"
+      ],
+      "hyde": [
+        "If you encounter config issues, check your configuration first. Common problems include missing dependencies and incorrect settings."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "setup",
+    "expansion": "lex: install\nlex: setup guide\nvec: install setup tutorial\nvec: setup guide\nhyde: This guide covers setup configuration and usage. Follow the steps below to get started with your first implementation.",
+    "scores": {
+      "format": 30,
+      "diversity": 25,
+      "hyde": 20,
+      "quality": 19,
+      "deductions": [
+        "echoes query: 'setup guide...'",
+        "echoes query: 'setup guide...'",
+        "some vec lines too short/keyword-like"
+      ],
+      "total": 94,
+      "max_possible": 100,
+      "percentage": 94.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "install",
+        "setup guide"
+      ],
+      "vec": [
+        "install setup tutorial",
+        "setup guide"
+      ],
+      "hyde": [
+        "This guide covers setup configuration and usage. Follow the steps below to get started with your first implementation."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "api",
+    "expansion": "lex: api troubleshooting\nlex: api fixes\nvec: troubleshooting common api problems\nvec: how to fix api errors\nhyde: If you encounter api issues, check your configuration first. Common problems include missing dependencies and incorrect settings.",
+    "scores": {
+      "format": 30,
+      "diversity": 25,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "echoes query: 'api fixes...'"
+      ],
+      "total": 95,
+      "max_possible": 100,
+      "percentage": 95.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "api troubleshooting",
+        "api fixes"
+      ],
+      "vec": [
+        "troubleshooting common api problems",
+        "how to fix api errors"
+      ],
+      "hyde": [
+        "If you encounter api issues, check your configuration first. Common problems include missing dependencies and incorrect settings."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "meeting notes project kickoff",
+    "expansion": "lex: invite attendees to\nlex: agenda setup and\nvec: invite attendees to organize a meeting notes project\nvec: agenda setup and preparation for meeting notes\nhyde: Understanding meeting notes project kickoff is essential for modern development. Key aspects include agenda setup and preparation for.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "invite attendees to",
+        "agenda setup and"
+      ],
+      "vec": [
+        "invite attendees to organize a meeting notes project",
+        "agenda setup and preparation for meeting notes"
+      ],
+      "hyde": [
+        "Understanding meeting notes project kickoff is essential for modern development. Key aspects include agenda setup and preparation for."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "ideas for new feature",
+    "expansion": "lex: brainstorm new enhancements\nlex: how to develop\nvec: brainstorm new enhancements\nvec: how to develop a new feature idea\nhyde: Ideas for new feature is an important concept that relates to how to develop a new feature idea.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "brainstorm new enhancements",
+        "how to develop"
+      ],
+      "vec": [
+        "brainstorm new enhancements",
+        "how to develop a new feature idea"
+      ],
+      "hyde": [
+        "Ideas for new feature is an important concept that relates to how to develop a new feature idea."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "todo list app architecture",
+    "expansion": "lex: task manager design\nlex: list app structure\nvec: task manager design\nvec: list app structure\nhyde: Todo list app architecture is an important concept that relates to task manager design.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "task manager design",
+        "list app structure"
+      ],
+      "vec": [
+        "task manager design",
+        "list app structure"
+      ],
+      "hyde": [
+        "Todo list app architecture is an important concept that relates to task manager design."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "what is dependency injection",
+    "expansion": "lex: definition of dependency\nlex: how to use\nvec: definition of dependency injection and its benefits\nvec: how to use dependency injection in code\nhyde: Dependency injection is defined as examples of dependency injection in practice. This plays a crucial role in modern development practices.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "definition of dependency",
+        "how to use"
+      ],
+      "vec": [
+        "definition of dependency injection and its benefits",
+        "how to use dependency injection in code"
+      ],
+      "hyde": [
+        "Dependency injection is defined as examples of dependency injection in practice. This plays a crucial role in modern development practices."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "difference between sql and nosql",
+    "expansion": "lex: distinctions between sql\nlex: sql vs nosql\nvec: distinctions between sql and nosql\nvec: sql vs nosql\nhyde: The topic of difference between sql and nosql covers distinctions between sql and nosql. Proper implementation follows established patterns and best practices.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "some vec lines too short/keyword-like"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "distinctions between sql",
+        "sql vs nosql"
+      ],
+      "vec": [
+        "distinctions between sql and nosql",
+        "sql vs nosql"
+      ],
+      "hyde": [
+        "The topic of difference between sql and nosql covers distinctions between sql and nosql. Proper implementation follows established patterns and best practices."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "kubernetes vs docker swarm",
+    "expansion": "lex: docker vs\nlex: kubernetes and\nvec: docker vs kubernetes\nvec: kubernetes and docker comparison\nhyde: The topic of kubernetes vs docker swarm covers comparison between kubernetes and docker.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "docker vs",
+        "kubernetes and"
+      ],
+      "vec": [
+        "docker vs kubernetes",
+        "kubernetes and docker comparison"
+      ],
+      "hyde": [
+        "The topic of kubernetes vs docker swarm covers comparison between kubernetes and docker."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "connection timeout error",
+    "expansion": "lex: error handling for\nlex: connection timeout\nvec: error handling for connection timeouts\nvec: connection timeout handling in software\nhyde: If you encounter connection timeout error, verify that the issue is resolved by checking the configuration.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "error handling for",
+        "connection timeout"
+      ],
+      "vec": [
+        "error handling for connection timeouts",
+        "connection timeout handling in software"
+      ],
+      "hyde": [
+        "If you encounter connection timeout error, verify that the issue is resolved by checking the configuration."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "memory leak debugging",
+    "expansion": "lex: troubleshooting common memory\nlex: memory leak fix\nvec: troubleshooting common memory leaks\nvec: memory leak fix\nhyde: Memory leak debugging is an important concept that relates to memory leak fix. Proper implementation follows established patterns and best practices.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "some vec lines too short/keyword-like"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "troubleshooting common memory",
+        "memory leak fix"
+      ],
+      "vec": [
+        "troubleshooting common memory leaks",
+        "memory leak fix"
+      ],
+      "hyde": [
+        "Memory leak debugging is an important concept that relates to memory leak fix. Proper implementation follows established patterns and best practices."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "cors error fix",
+    "expansion": "lex: cors fix\nlex: cors error handling\nvec: how to fix cors errors\nvec: common cors troubleshooting problems\nhyde: If you encounter cors error fix issues, check your configuration first. Common problems include missing dependencies and incorrect settings.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "cors fix",
+        "cors error handling"
+      ],
+      "vec": [
+        "how to fix cors errors",
+        "common cors troubleshooting problems"
+      ],
+      "hyde": [
+        "If you encounter cors error fix issues, check your configuration first. Common problems include missing dependencies and incorrect settings."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "how to implement caching with redis in nodejs",
+    "expansion": "lex: steps for setting\nlex: guide to configuring\nvec: steps for setting up redis caching in nodejs\nvec: guide to configuring redis caching in nodejs\nhyde: To implement caching with redis in nodejs, first configure the redis settings in your project configuration.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "steps for setting",
+        "guide to configuring"
+      ],
+      "vec": [
+        "steps for setting up redis caching in nodejs",
+        "guide to configuring redis caching in nodejs"
+      ],
+      "hyde": [
+        "To implement caching with redis in nodejs, first configure the redis settings in your project configuration."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "best practices for api rate limiting",
+    "expansion": "lex: recommendations for implementing\nlex: guidelines for setting\nvec: recommendations for implementing rate limiting in api calls\nvec: guidelines for setting up api rate limiting\nhyde: The process of best practices for api rate limiting involves several steps. First, recommendations for implementing rate limiting in api calls.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "recommendations for implementing",
+        "guidelines for setting"
+      ],
+      "vec": [
+        "recommendations for implementing rate limiting in api calls",
+        "guidelines for setting up api rate limiting"
+      ],
+      "hyde": [
+        "The process of best practices for api rate limiting involves several steps. First, recommendations for implementing rate limiting in api calls."
+      ],
+      "invalid": []
+    }
+  },
+  {
+    "query": "setting up ci cd pipeline with github actions",
+    "expansion": "lex: how to configure\nlex: guide to configuring\nvec: how to configure github actions for ci cd pipeline\nvec: guide to configuring a github actions ci cd pipeline\nhyde: Setting up ci cd pipeline with github actions requires several steps. First, setup the necessary dependencies.",
+    "scores": {
+      "format": 30,
+      "diversity": 30,
+      "hyde": 20,
+      "quality": 20,
+      "deductions": [
+        "lex lines too generic - missing key terms from query"
+      ],
+      "total": 100,
+      "max_possible": 100,
+      "percentage": 100.0,
+      "rating": "Excellent",
+      "is_continuation": false
+    },
+    "parsed": {
+      "lex": [
+        "how to configure",
+        "guide to configuring"
+      ],
+      "vec": [
+        "how to configure github actions for ci cd pipeline",
+        "guide to configuring a github actions ci cd pipeline"
+      ],
+      "hyde": [
+        "Setting up ci cd pipeline with github actions requires several steps. First, setup the necessary dependencies."
+      ],
+      "invalid": []
+    }
+  }
+]
