@@ -80,11 +80,14 @@ See `PROMPT_FORMAT.md` for complete specification.
 finetune/
 ├── train.py              # SFT training (uses YAML config)
 ├── rl.py                 # GRPO/RL training (uses YAML config)
-├── evaluate_model.py     # Evaluate finetuned models
 ├── tui.py                # Interactive testing interface
 ├── configs/
 │   ├── sft_v4.yaml       # SFT training config
 │   └── grpo_v4.yaml      # GRPO training config
+├── evals/
+│   ├── run.py            # Generate model outputs to JSONL
+│   ├── score.py          # Score outputs from JSONL
+│   └── queries.txt       # Test queries
 ├── dataset/
 │   ├── prepare_data.py   # Prepare training data
 │   ├── clean_data.py     # Data quality improvements
@@ -118,7 +121,11 @@ hf jobs uv run --flavor a10g-large --timeout 2h --secrets HF_TOKEN \
 ### 3. Evaluate
 
 ```bash
-uv run evaluate_model.py --model tobil/qmd-query-expansion-0.6B-v4
+# Generate outputs
+uv run evals/run.py --model tobil/qmd-query-expansion-0.6B-v4
+
+# Score them
+uv run evals/score.py evals/results_tobil_qmd-query-expansion-0.6B-v4.jsonl
 ```
 
 ### 4. Interactive Testing
