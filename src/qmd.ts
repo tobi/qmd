@@ -8,6 +8,9 @@ import {
   getRealPath,
   homedir,
   resolve,
+  isAbsolutePath,
+  getRelativePathFromPrefix,
+  normalizePathSeparators,
   enableProductionMode,
   searchFTS,
   searchVec,
@@ -202,13 +205,14 @@ function computeDisplayPath(
   existingPaths: Set<string>
 ): string {
   // Get path relative to collection (include collection dir name)
-  const collectionDir = collectionPath.replace(/\/$/, '');
+  const collectionDir = normalizePathSeparators(collectionPath).replace(/\/$/, '');
   const collectionName = collectionDir.split('/').pop() || '';
 
   let relativePath: string;
-  if (filepath.startsWith(collectionDir + '/')) {
+  const relFromPrefix = getRelativePathFromPrefix(filepath, collectionDir);
+  if (relFromPrefix !== null) {
     // filepath is under collection: use collection name + relative path
-    relativePath = collectionName + filepath.slice(collectionDir.length);
+    relativePath = collectionName + '/' + relFromPrefix;
   } else {
     // Fallback: just use the filepath
     relativePath = filepath;
@@ -444,34 +448,27 @@ async function updateCollections(): Promise<void> {
  * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
  */
 function detectCollectionFromPath(db: Database, fsPath: string): { collectionName: string; relativePath: string } | null {
-  const realPath = getRealPath(fsPath);
+  const realPath = normalizePathSeparators(getRealPath(fsPath));
 
   // Find collections that this path is under from YAML
   const allCollections = yamlListCollections();
 
   // Find longest matching path
-  let bestMatch: { name: string; path: string } | null = null;
+  let bestMatch: { name: string; path: string; relativePath: string } | null = null;
   for (const coll of allCollections) {
-    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
+    const relPath = getRelativePathFromPrefix(realPath, coll.path);
+    if (relPath !== null) {
       if (!bestMatch || coll.path.length > bestMatch.path.length) {
-        bestMatch = { name: coll.name, path: coll.path };
+        bestMatch = { name: coll.name, path: coll.path, relativePath: relPath };
       }
     }
   }
 
   if (!bestMatch) return null;
 
-  // Calculate relative path
-  let relativePath = realPath;
-  if (relativePath.startsWith(bestMatch.path + '/')) {
-    relativePath = relativePath.slice(bestMatch.path.length + 1);
-  } else if (relativePath === bestMatch.path) {
-    relativePath = '';
-  }
-
   return {
     collectionName: bestMatch.name,
-    relativePath
+    relativePath: bestMatch.relativePath
   };
 }
 
@@ -493,7 +490,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('qmd://')) {
+  } else if (!isAbsolutePath(fsPath) && !fsPath.startsWith('qmd://')) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -605,7 +602,7 @@ function contextRemove(pathArg: string): void {
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/')) {
+  } else if (!isAbsolutePath(fsPath)) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -745,8 +742,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     virtualPath = inputPath;
   } else {
     // Try to interpret as collection/path format first (before filesystem path)
-    // If path is relative (no / or ~ prefix), check if first component is a collection name
-    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
+    // If path is relative (no / or ~ or absolute path prefix), check if first component is a collection name
+    if (!isAbsolutePath(inputPath) && !inputPath.startsWith('~')) {
       const parts = inputPath.split('/');
       if (parts.length >= 2) {
         const possibleCollection = parts[0];
@@ -792,7 +789,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       // Expand ~ to home directory
       if (fsPath.startsWith('~/')) {
         fsPath = homedir() + fsPath.slice(1);
-      } else if (!fsPath.startsWith('/')) {
+      } else if (!isAbsolutePath(fsPath)) {
         // Relative path - resolve from current directory
         fsPath = resolve(getPwd(), fsPath);
       }
