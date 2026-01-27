@@ -63,25 +63,171 @@ export function homedir(): string {
   return HOME;
 }
 
+/**
+ * Check if a path is absolute.
+ * Supports:
+ * - Unix paths: /path/to/file
+ * - Windows native: C:\path or C:/path
+ * - Git Bash: /c/path or /C/path (C-Z drives, excluding A/B floppy drives)
+ * 
+ * Note: /c without trailing slash is treated as Unix path (directory named "c"),
+ * while /c/ or /c/path are treated as Git Bash paths (C: drive).
+ */
+export function isAbsolutePath(path: string): boolean {
+  if (!path) return false;
+  
+  // Unix absolute path
+  if (path.startsWith('/')) {
+    // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
+    // Requires path[2] === '/' to distinguish from Unix paths like /c or /cache
+    if (path.length >= 3 && path[2] === '/') {
+      const driveLetter = path[1];
+      if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+        return true;
+      }
+    }
+    // Any other path starting with / is Unix absolute
+    return true;
+  }
+  
+  // Windows native path: C:\ or C:/ (any letter A-Z)
+  if (path.length >= 2 && /[a-zA-Z]/.test(path[0]!) && path[1] === ':') {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Normalize path separators to forward slashes.
+ * Converts Windows backslashes to forward slashes.
+ */
+export function normalizePathSeparators(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+/**
+ * Get the relative path from a prefix.
+ * Returns null if path is not under prefix.
+ * Returns empty string if path equals prefix.
+ */
+export function getRelativePathFromPrefix(path: string, prefix: string): string | null {
+  // Empty prefix is invalid
+  if (!prefix) {
+    return null;
+  }
+  
+  const normalizedPath = normalizePathSeparators(path);
+  const normalizedPrefix = normalizePathSeparators(prefix);
+  
+  // Ensure prefix ends with / for proper matching
+  const prefixWithSlash = !normalizedPrefix.endsWith('/') 
+    ? normalizedPrefix + '/' 
+    : normalizedPrefix;
+  
+  // Exact match
+  if (normalizedPath === normalizedPrefix) {
+    return '';
+  }
+  
+  // Check if path starts with prefix
+  if (normalizedPath.startsWith(prefixWithSlash)) {
+    return normalizedPath.slice(prefixWithSlash.length);
+  }
+  
+  return null;
+}
+
 export function resolve(...paths: string[]): string {
   if (paths.length === 0) {
     throw new Error("resolve: at least one path segment is required");
   }
-  let result = paths[0]!.startsWith('/') ? '' : Bun.env.PWD || process.cwd();
-  for (const p of paths) {
-    if (p.startsWith('/')) {
-      result = p;
+  
+  // Normalize all paths to use forward slashes
+  const normalizedPaths = paths.map(normalizePathSeparators);
+  
+  let result = '';
+  let windowsDrive = '';
+  
+  // Check if first path is absolute
+  const firstPath = normalizedPaths[0]!;
+  if (isAbsolutePath(firstPath)) {
+    result = firstPath;
+    
+    // Extract Windows drive letter if present
+    if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
+      windowsDrive = firstPath.slice(0, 2);
+      result = firstPath.slice(2);
+    } else if (firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
+      // Git Bash style: /c/ -> C: (C-Z drives only, not A or B)
+      const driveLetter = firstPath[1];
+      if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+        windowsDrive = driveLetter.toUpperCase() + ':';
+        result = firstPath.slice(2);
+      }
+    }
+  } else {
+    // Start with PWD or cwd, then append the first relative path
+    const pwd = normalizePathSeparators(Bun.env.PWD || process.cwd());
+    
+    // Extract Windows drive from PWD if present
+    if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
+      windowsDrive = pwd.slice(0, 2);
+      result = pwd.slice(2) + '/' + firstPath;
     } else {
+      result = pwd + '/' + firstPath;
+    }
+  }
+  
+  // Process remaining paths
+  for (let i = 1; i < normalizedPaths.length; i++) {
+    const p = normalizedPaths[i]!;
+    if (isAbsolutePath(p)) {
+      // Absolute path replaces everything
+      result = p;
+      
+      // Update Windows drive if present
+      if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
+        windowsDrive = p.slice(0, 2);
+        result = p.slice(2);
+      } else if (p.startsWith('/') && p.length >= 3 && p[2] === '/') {
+        // Git Bash style (C-Z drives only, not A or B)
+        const driveLetter = p[1];
+        if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+          windowsDrive = driveLetter.toUpperCase() + ':';
+          result = p.slice(2);
+        } else {
+          windowsDrive = '';
+        }
+      } else {
+        windowsDrive = '';
+      }
+    } else {
+      // Relative path - append
       result = result + '/' + p;
     }
   }
+  
+  // Normalize . and .. components
   const parts = result.split('/').filter(Boolean);
   const normalized: string[] = [];
   for (const part of parts) {
-    if (part === '..') normalized.pop();
-    else if (part !== '.') normalized.push(part);
+    if (part === '..') {
+      normalized.pop();
+    } else if (part !== '.') {
+      normalized.push(part);
+    }
   }
-  return '/' + normalized.join('/');
+  
+  // Build final path
+  const finalPath = '/' + normalized.join('/');
+  
+  // Prepend Windows drive if present
+  if (windowsDrive) {
+    return windowsDrive + finalPath;
+  }
+  
+  return finalPath;
 }
 
 // Flag to indicate production mode (set by qmd.ts at startup)
