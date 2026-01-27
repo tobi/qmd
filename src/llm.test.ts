@@ -167,6 +167,30 @@ describe("LlamaCpp Integration", () => {
       // Performance is machine/load dependent. We only assert batch isn't drastically worse.
       expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
     });
+
+    test("handles large batch without context disposal errors", async () => {
+      // This test verifies the fix for a race condition where concurrent calls to
+      // ensureEmbedContext() could create multiple contexts, causing "Context is disposed"
+      // errors. The fix uses a promise guard to ensure only one context is created.
+      // See: https://github.com/tobi/qmd/pull/54
+      const texts = Array(20).fill(null).map((_, i) =>
+        `Document ${i} with enough content to be meaningful for embedding purposes. ` +
+        `This includes various words and phrases to test the embedding model thoroughly.`
+      );
+
+      const results = await llm.embedBatch(texts);
+
+      // All embeddings should succeed - no null results from context disposal errors
+      expect(results).toHaveLength(20);
+      const successCount = results.filter(r => r !== null).length;
+      expect(successCount).toBe(20);
+
+      // Verify embeddings are valid
+      for (const result of results) {
+        expect(result).not.toBeNull();
+        expect(result!.embedding.length).toBe(768);
+      }
+    }, 60000); // 60s timeout for CPU-only systems
   });
 
   describe("rerank", () => {
