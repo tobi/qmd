@@ -1857,6 +1857,41 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchVec handles hyphenated collection names", async () => {
+    const store = await createTestStore();
+    const hyphenated = await createTestCollection({ name: "claude-sessions", pwd: "/test/claude-sessions" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+
+    const hyphenHash = "hyphen-hash";
+    const otherHash = "other-hash";
+
+    await insertTestDocument(store.db, hyphenated, {
+      name: "doc-hyphen",
+      hash: hyphenHash,
+      body: "Content in hyphenated collection",
+    });
+
+    await insertTestDocument(store.db, other, {
+      name: "doc-other",
+      hash: otherHash,
+      body: "Content in other collection",
+    });
+
+    store.ensureVecTable(768);
+    const hyphenEmbedding = Array(768).fill(0).map(() => Math.random());
+    const otherEmbedding = Array(768).fill(0).map(() => Math.random());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hyphenHash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(otherHash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hyphenHash}_0`, new Float32Array(hyphenEmbedding));
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${otherHash}_0`, new Float32Array(otherEmbedding));
+
+    const filtered = await store.searchVec("content", "embeddinggemma", 10, hyphenated as unknown as number);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.collectionName).toBe(hyphenated);
+
+    await cleanupTestDb(store);
+  });
+
   // Regression test for https://github.com/tobi/qmd/pull/23
   // sqlite-vec virtual tables hang when combined with JOINs in the same query.
   // The fix uses a two-step approach: vector query first, then separate JOINs.
