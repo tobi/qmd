@@ -4,16 +4,28 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      treefmt-nix,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        treefmtEval = treefmt-nix.lib.evalModule pkgs {
+          projectRootFile = "flake.nix";
+          programs.nixfmt.enable = true;
+        };
 
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
-          configureFlags = (old.configureFlags or []) ++ [
+          configureFlags = (old.configureFlags or [ ]) ++ [
             "--enable-load-extension"
           ];
         });
@@ -24,7 +36,10 @@
 
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bun pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.bun
+            pkgs.makeWrapper
+          ];
 
           buildInputs = [ pkgs.sqlite ];
 
@@ -56,6 +71,8 @@
         };
       in
       {
+        formatter = treefmtEval.config.build.wrapper;
+
         packages = {
           default = qmd;
           qmd = qmd;
