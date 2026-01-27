@@ -799,8 +799,9 @@ Final Output:`;
     this.rerankModel = null;
     this.llama = null;
 
-    // Clear any in-flight load promises
+    // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
+    this.embedContextCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }
