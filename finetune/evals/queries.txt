@@ -36,6 +36,12 @@ connection timeout error
 memory leak debugging
 cors error fix
 
+# Temporal / recency queries (should expand with years, "recent", "latest")
+recent news about Shopify
+latest AI developments
+best laptops right now
+what changed in kubernetes latest version
+
 # Complex queries
 how to implement caching with redis in nodejs
 best practices for api rate limiting

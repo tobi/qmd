@@ -21,21 +21,37 @@ These feed into QMD's three search backends:
 
 ## Quick Start
 
-### End-to-end pipeline for Qwen3-1.7B
+### Cloud training via HuggingFace Jobs (no GPU needed)
 
 ```bash
-# 1. SFT: teach the model the output format from labeled examples
-uv run train.py sft --config configs/sft.yaml
+# 1. SFT: teach the model the output format (~45 min on A10G, ~$1.50)
+hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 
-# 2. GRPO: improve quality via RL using the reward function
-uv run train.py grpo --config configs/grpo.yaml
+# 2. GRPO: RL refinement on top of SFT (~20 min on A10G, ~$0.50)
+hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 4h jobs/grpo.py
 
-# 3. Evaluate against test queries
+# 3. Evaluate against test queries (needs local GPU or use eval job)
 uv run eval.py --model tobil/qmd-query-expansion-1.7B-grpo \
                --sft-model tobil/qmd-query-expansion-1.7B-sft
 
 # 4. Convert to GGUF for local deployment (Ollama, llama.cpp)
 uv run convert_gguf.py --size 1.7B
+```
+
+### Local training (if you have a GPU)
+
+```bash
+uv run train.py sft  --config configs/sft.yaml
+uv run train.py grpo --config configs/grpo.yaml
+```
+
+### Monitoring HF Jobs
+
+```bash
+hf jobs ps                           # list running jobs
+hf jobs inspect <job-id>             # check status
+hf jobs logs <job-id>                # stream logs
+hf jobs cancel <job-id>              # cancel a job
 ```
 
 ## Prompt Format
@@ -59,13 +75,16 @@ finetune/
 ├── train.py           # Unified SFT + GRPO training (two subcommands)
 ├── eval.py            # Generate expansions and score them
 ├── convert_gguf.py    # GGUF conversion for Ollama/llama.cpp
+├── jobs/
+│   ├── sft.py         # Self-contained SFT for HuggingFace Jobs
+│   └── grpo.py        # Self-contained GRPO for HuggingFace Jobs
 ├── configs/
 │   ├── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
 │   └── grpo.yaml      # GRPO hyperparameters for Qwen3-1.7B
 ├── evals/
-│   └── queries.txt    # 27 test queries across 7 categories
+│   └── queries.txt    # 31 test queries across 8 categories
 ├── data/
-│   └── qmd_expansion.jsonl  # Source training data (5,730 examples)
+│   └── qmd_expansion.jsonl  # Source training data (5,742 examples)
 ├── dataset/
 │   ├── generate_data.py         # Generate data via Claude API
 │   ├── generate_data_offline.py # Generate from existing HF dataset
@@ -86,7 +105,7 @@ Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 | Base model | `Qwen/Qwen3-1.7B` |
 | Method | LoRA (rank 16, alpha 32) |
 | Target modules | All projection layers (q/k/v/o/gate/up/down) |
-| Dataset | 6,180 examples (26.5% short queries) |
+| Dataset | 11,124 examples (train split) |
 | Effective batch size | 16 (4 × 4 gradient accumulation) |
 | Epochs | 3 |
 | Learning rate | 2e-4 (cosine schedule) |
@@ -231,3 +250,26 @@ The two-stage training approach (SFT → GRPO) is standard for structured-output
 
 The reward function is entirely rule-based (no LLM judge) which makes it fast,
 deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubric.
+
+## Training Results (Qwen3-1.7B)
+
+### SFT
+
+| Metric | Value |
+|--------|-------|
+| Final train loss | 0.223 |
+| Final eval loss | 0.321 |
+| Token accuracy (train) | 94.8% |
+| Token accuracy (eval) | 92.4% |
+| Hardware | A10G (24 GB VRAM) |
+
+### GRPO
+
+| Metric | Value |
+|--------|-------|
+| Mean reward | 0.757 |
+| Final loss | 0.0005 |
+| KL divergence | 0.00048 |
+| Mean completion length | ~58 tokens |
+| Training time | ~19 min (200 steps) |
+| Hardware | A10G (24 GB VRAM) |
