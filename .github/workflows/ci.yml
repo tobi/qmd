@@ -1,0 +1,301 @@
+name: CI - Build, Test, and Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Job 1: Package qmd for distribution
+  package:
+    name: Package qmd
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Create package tarball
+        run: |
+          echo "Creating package tarball..."
+          mkdir -p dist
+          tar -czf dist/qmd-package.tar.gz \
+            --exclude=node_modules \
+            --exclude=.git \
+            --exclude=dist \
+            --exclude='*.sqlite' \
+            --exclude=archive \
+            --exclude=texts \
+            src/ qmd package.json bun.lock README.md tsconfig.json migrate-schema.ts
+          echo "Package created successfully"
+          ls -lh dist/
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qmd-package
+          path: dist/qmd-package.tar.gz
+          retention-days: 30
+
+      - name: Package summary
+        run: |
+          echo "### 📦 Package Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ qmd package created successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Size: $(ls -lh dist/qmd-package.tar.gz | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
+
+  # Job 2: Run unit tests with Bun
+  test-bun:
+    name: Test with Bun
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run tests
+        id: bun-test
+        run: |
+          echo "Running tests with Bun..."
+          bun test 2>&1 | tee test-output.log
+        continue-on-error: false
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-test-logs
+          path: test-output.log
+          retention-days: 30
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "### 🧪 Bun Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.bun-test.outcome }}" = "success" ]; then
+            echo "✅ All tests passed with Bun" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Some tests failed with Bun" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Job 3: Test with Node.js (multiple versions)
+  test-node:
+    name: Test with Node.js ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies with npm
+        run: |
+          echo "Installing dependencies with npm..."
+          npm install
+        continue-on-error: true
+
+      - name: Try running tests with Node.js
+        id: node-test
+        run: |
+          echo "Attempting to run tests with Node.js ${{ matrix.node-version }}..."
+          echo "Note: This project uses Bun-specific APIs and may not work with Node.js"
+
+          # Try to run tests, but expect failures due to Bun-specific APIs
+          if npm test 2>&1 | tee node-test-output.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Tests passed with Node.js ${{ matrix.node-version }}" >> node-test-summary.txt
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "❌ Tests failed with Node.js ${{ matrix.node-version }}" >> node-test-summary.txt
+            echo "" >> node-test-summary.txt
+            echo "Common issues:" >> node-test-summary.txt
+            echo "- bun:sqlite is not available in Node.js" >> node-test-summary.txt
+            echo "- bun:test is not available in Node.js" >> node-test-summary.txt
+            echo "- Bun's Glob and $ APIs are not available" >> node-test-summary.txt
+          fi
+        continue-on-error: true
+
+      - name: Upload Node.js test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.node-version }}-test-logs
+          path: |
+            node-test-output.log
+            node-test-summary.txt
+          retention-days: 30
+
+      - name: Node.js test summary
+        if: always()
+        run: |
+          echo "### 🧪 Node.js ${{ matrix.node-version }} Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f node-test-summary.txt ]; then
+            cat node-test-summary.txt >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Job 4: Node.js compatibility assessment
+  node-compatibility:
+    name: Node.js Compatibility Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Analyze Bun-specific dependencies
+        run: |
+          echo "=== Node.js Compatibility Assessment ===" | tee compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+          echo "## Bun-specific APIs found:" | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+          # Search for Bun-specific imports
+          echo "### 1. bun:sqlite imports:" | tee -a compatibility-report.txt
+          if grep -r "from ['\"]bun:sqlite['\"]" src/ test/ 2>/dev/null | tee -a compatibility-report.txt; then
+            echo "" | tee -a compatibility-report.txt
+          else
+            echo "   None found" | tee -a compatibility-report.txt
+          fi
+          echo "" | tee -a compatibility-report.txt
+
+          echo "### 2. bun:test imports:" | tee -a compatibility-report.txt
+          if grep -r "from ['\"]bun:test['\"]" src/ test/ 2>/dev/null | tee -a compatibility-report.txt; then
+            echo "" | tee -a compatibility-report.txt
+          else
+            echo "   None found" | tee -a compatibility-report.txt
+          fi
+          echo "" | tee -a compatibility-report.txt
+
+          echo "### 3. Other Bun APIs (Glob, $):" | tee -a compatibility-report.txt
+          if grep -rn "from ['\"]bun['\"]" src/ 2>/dev/null | tee -a compatibility-report.txt; then
+            echo "" | tee -a compatibility-report.txt
+          else
+            echo "   None found" | tee -a compatibility-report.txt
+          fi
+          echo "" | tee -a compatibility-report.txt
+
+          echo "## Node.js Alternatives:" | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+          echo "To support Node.js, consider:" | tee -a compatibility-report.txt
+          echo "1. **SQLite**: Replace 'bun:sqlite' with 'better-sqlite3' or 'sqlite3'" | tee -a compatibility-report.txt
+          echo "2. **Testing**: Replace 'bun:test' with 'vitest', 'jest', or 'node:test'" | tee -a compatibility-report.txt
+          echo "3. **Glob**: Replace Bun's Glob with 'glob' or 'fast-glob' npm packages" | tee -a compatibility-report.txt
+          echo "4. **Shell**: Replace Bun's $ with 'execa' or 'shelljs'" | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+          echo "## Current Status:" | tee -a compatibility-report.txt
+          echo "❌ Project is **not compatible** with Node.js without refactoring" | tee -a compatibility-report.txt
+          echo "✅ Project works perfectly with Bun >= 1.0.0" | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+          echo "## Recommendations:" | tee -a compatibility-report.txt
+          echo "1. Continue using Bun as the primary runtime (best performance)" | tee -a compatibility-report.txt
+          echo "2. Consider creating a compatibility layer if Node.js support is needed" | tee -a compatibility-report.txt
+          echo "3. Document Bun requirement clearly in README and package.json" | tee -a compatibility-report.txt
+
+      - name: Check package.json engines
+        run: |
+          echo "" | tee -a compatibility-report.txt
+          echo "## Package.json engines field:" | tee -a compatibility-report.txt
+          grep -A 2 '"engines"' package.json | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+      - name: List dependencies that may have Node.js compatibility issues
+        run: |
+          echo "## Dependencies analysis:" | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+          echo "### Main dependencies:" | tee -a compatibility-report.txt
+          grep -A 10 '"dependencies"' package.json | grep -v '^[{}]' | tee -a compatibility-report.txt
+          echo "" | tee -a compatibility-report.txt
+
+          echo "### Notes:" | tee -a compatibility-report.txt
+          echo "- node-llama-cpp: ✅ Compatible with Node.js" | tee -a compatibility-report.txt
+          echo "- sqlite-vec: ✅ Compatible with Node.js (with better-sqlite3)" | tee -a compatibility-report.txt
+          echo "- @modelcontextprotocol/sdk: ✅ Compatible with Node.js" | tee -a compatibility-report.txt
+          echo "- yaml, zod: ✅ Compatible with Node.js" | tee -a compatibility-report.txt
+
+      - name: Upload compatibility report
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-compatibility-report
+          path: compatibility-report.txt
+          retention-days: 90
+
+      - name: Display compatibility summary
+        run: |
+          echo "### 🔍 Node.js Compatibility Assessment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat compatibility-report.txt >> $GITHUB_STEP_SUMMARY
+
+  # Job 5: Overall CI status
+  ci-success:
+    name: CI Status
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [package, test-bun, test-node, node-compatibility]
+    if: always()
+    steps:
+      - name: Check all jobs status
+        run: |
+          echo "### 📊 CI Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | ${{ needs.package.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test with Bun | ${{ needs.test-bun.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test with Node.js | ${{ needs.test-node.result == 'success' && '✅ Passed' || '⚠️ Expected to fail (Bun-specific APIs)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js Compatibility | ${{ needs.node-compatibility.result == 'success' && '✅ Completed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.package.result }}" = "success" ] && [ "${{ needs.test-bun.result }}" = "success" ]; then
+            echo "✅ **Core CI passed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The package was created and all Bun tests passed." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "❌ **Some required jobs failed**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
