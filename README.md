@@ -7,8 +7,11 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 ## Quick Start
 
 ```sh
-# Install globally
+# Install globally with Bun
 bun install -g https://github.com/tobi/qmd
+
+# Or with Nix Flakes
+nix profile install github:tobi/qmd
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
@@ -219,9 +222,19 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ## Installation
 
+### With Bun
+
 ```sh
 bun install
 ```
+
+### With Nix Flakes
+
+```sh
+nix run github:tobi/qmd
+```
+
+The flake includes the nix-community binary cache to fetch pre-built bun2nix binaries instead of compiling from source.
 
 ## Usage
 
