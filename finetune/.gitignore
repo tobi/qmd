@@ -7,6 +7,15 @@ qmd-query-expansion-*/
 data/train/train.jsonl
 data/train/train_chat.jsonl
 data/train/val.jsonl
+data/qmd_expansion_cleaned.jsonl
+data/quality_report.txt
+
+# Eval results
+evals/results_*.jsonl
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Keep the generated source data
 !data/qmd_expansion.jsonl

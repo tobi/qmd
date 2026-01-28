@@ -1,9 +1,11 @@
-# SFT Training Config for QMD Query Expansion v4
-# Uses Qwen3-0.6B with LoRA, trained with key term preservation
+# SFT Training Config for QMD Query Expansion
+# Target: Qwen3-1.7B with LoRA
+#
+# Usage: uv run train.py sft --config configs/sft.yaml
 
 model:
-  base: "Qwen/Qwen3-0.6B"
-  output: "tobil/qmd-query-expansion-0.6B-v4"
+  base: "Qwen/Qwen3-1.7B"
+  output: "tobil/qmd-query-expansion-1.7B-sft"
 
 dataset:
   name: "tobil/qmd-query-expansion-train-v2"
@@ -35,4 +37,4 @@ lora:
 
 tracking:
   project: "qmd-query-expansion"
-  run_name: "sft-v4-key-term-preservation"
+  run_name: "sft-1.7B"

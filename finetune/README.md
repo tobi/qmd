@@ -1,211 +1,233 @@
-# QMD Query Expansion Model Finetuning
+# QMD Query Expansion Fine-Tuning
 
-Finetune small Qwen models for QMD's query expansion task.
+Train small language models to expand search queries for [QMD](https://github.com/tobi/qmd)'s hybrid retrieval pipeline.
 
-## Goal
+## What This Does
 
-Train models that convert user queries into retrieval-optimized outputs:
-
-```
-Input: "how to configure authentication"
-
-Output:
-lex: authentication setup
-lex: auth configuration
-vec: how to set up user authentication in the application
-hyde: To configure authentication, set the AUTH_SECRET environment variable and enable the auth middleware in your application config.
-```
-
-## Output Format
-
-| Type | Purpose | Count |
-|------|---------|-------|
-| `lex:` | BM25 keyword variations (short, keyword-focused) | 1-3 |
-| `vec:` | Semantic reformulations (natural language) | 1-3 |
-| `hyde:` | Hypothetical document passage (50-150 chars) | 0-1 |
-
-## Trained Models
-
-| Size | SFT Adapter | GRPO Adapter | Base Model |
-|------|-------------|--------------|------------|
-| **0.6B** | [tobil/qmd-query-expansion-0.6B-v4](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4) | [tobil/qmd-query-expansion-0.6B-v4-grpo](https://huggingface.co/tobil/qmd-query-expansion-0.6B-v4-grpo) | `Qwen/Qwen3-0.6B` |
-| **1.7B** | [tobil/qmd-query-expansion-1.7B-sft](https://huggingface.co/tobil/qmd-query-expansion-1.7B-sft) | tobil/qmd-query-expansion-1.7B-grpo | `Qwen/Qwen3-1.7B` |
-| **4B** | [tobil/qmd-query-expansion-4B-sft](https://huggingface.co/tobil/qmd-query-expansion-4B-sft) | tobil/qmd-query-expansion-4B-grpo | `Qwen/Qwen3-4B` |
-
-### Loading Models
-
-```python
-from peft import PeftModel
-from transformers import AutoModelForCausalLM
-
-# Load SFT model (recommended)
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
-model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion-1.7B-sft")
-
-# Load GRPO model (requires SFT first)
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", torch_dtype="bfloat16")
-model = PeftModel.from_pretrained(base, "tobil/qmd-query-expansion-1.7B-sft")
-model = model.merge_and_unload()
-model = PeftModel.from_pretrained(model, "tobil/qmd-query-expansion-1.7B-grpo")
-```
-
-**Note on GRPO models**: GRPO adapters were trained on top of merged SFT weights, so you must load and merge SFT first before applying GRPO.
-
-## Prompt Format
-
-The models use **Qwen3 chat template** with `/no_think` to disable thinking mode.
-
-### Inference (Python)
-
-```python
-from transformers import AutoTokenizer
-
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-
-# CRITICAL: Use /no_think to disable Qwen3's thinking mode
-messages = [{"role": "user", "content": f"/no_think Expand this search query: {query}"}]
-
-prompt = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True
-)
-
-# Generate and decode
-output = tokenizer.decode(tokens, skip_special_tokens=True)
-
-# Extract assistant response (skip_special_tokens converts to "user\n...\nassistant\n...")
-if "\nassistant\n" in output:
-    expansion = output.split("\nassistant\n")[-1].strip()
-```
-
-### Raw Format
+Given a raw search query like `"auth config"`, the trained model produces structured expansions:
 
 ```
-<|im_start|>user
-/no_think Expand this search query: auth<|im_end|>
-<|im_start|>assistant
 lex: authentication configuration
-lex: auth settings
-vec: how to configure authentication
-vec: authentication setup guide
-hyde: To configure authentication, set AUTH_SECRET in your environment.<|im_end|>
+lex: auth settings setup
+vec: how to configure authentication settings
+vec: authentication configuration options
+hyde: Authentication can be configured by setting the AUTH_SECRET environment variable.
 ```
 
-See `PROMPT_FORMAT.md` for complete specification.
-
-## Directory Structure
-
-```
-finetune/
-├── train.py              # SFT training (uses YAML config)
-├── rl.py                 # GRPO/RL training (uses YAML config)
-├── tui.py                # Interactive testing interface
-├── configs/
-│   ├── sft_v4.yaml       # SFT training config
-│   └── grpo_v4.yaml      # GRPO training config
-├── evals/
-│   ├── run.py            # Generate model outputs to JSONL
-│   ├── score.py          # Score outputs from JSONL
-│   └── queries.txt       # Test queries
-├── dataset/
-│   ├── prepare_data.py   # Prepare training data
-│   ├── clean_data.py     # Data quality improvements
-│   └── generate_data*.py # Generate from source datasets
-├── PROMPT_FORMAT.md      # Prompt format specification
-├── SCORING.md            # Scoring criteria
-└── data/
-    └── train/            # Prepared training data
-```
+These feed into QMD's three search backends:
+- **`lex:`** lines go to BM25 full-text search (short, keyword-focused)
+- **`vec:`** lines go to vector similarity search (natural language phrases)
+- **`hyde:`** is a hypothetical document passage for embedding-based retrieval ([HyDE](https://arxiv.org/abs/2212.10496) technique)
 
 ## Quick Start
 
-### 1. Prepare Training Data
+### End-to-end pipeline for Qwen3-1.7B
 
 ```bash
-cd dataset
-uv run prepare_data.py --add-short 5
+# 1. SFT: teach the model the output format from labeled examples
+uv run train.py sft --config configs/sft.yaml
+
+# 2. GRPO: improve quality via RL using the reward function
+uv run train.py grpo --config configs/grpo.yaml
+
+# 3. Evaluate against test queries
+uv run eval.py --model tobil/qmd-query-expansion-1.7B-grpo \
+               --sft-model tobil/qmd-query-expansion-1.7B-sft
+
+# 4. Convert to GGUF for local deployment (Ollama, llama.cpp)
+uv run convert_gguf.py --size 1.7B
 ```
 
-### 2. Train with YAML Config
+## Prompt Format
 
-```bash
-# Local training
-uv run train.py --config configs/sft_v4.yaml
+All tools use the same prompt — **Qwen3 chat template with `/no_think`**:
 
-# Or on HuggingFace Jobs
-hf jobs uv run --flavor a10g-large --timeout 2h --secrets HF_TOKEN \
-  "https://huggingface.co/datasets/tobil/qmd-query-expansion-train-v2/resolve/main/train_sft_v4.py"
+```
+<|im_start|>user
+/no_think Expand this search query: {query}<|im_end|>
+<|im_start|>assistant
 ```
 
-### 3. Evaluate
+The `/no_think` directive suppresses Qwen3's chain-of-thought mode, producing
+direct `lex:/vec:/hyde:` output without `<think>` blocks.
 
-```bash
-# Generate outputs
-uv run evals/run.py --model tobil/qmd-query-expansion-0.6B-v4
+## File Structure
 
-# Score them
-uv run evals/score.py evals/results_tobil_qmd-query-expansion-0.6B-v4.jsonl
+```
+finetune/
+├── reward.py          # Scoring/reward function (single source of truth)
+├── train.py           # Unified SFT + GRPO training (two subcommands)
+├── eval.py            # Generate expansions and score them
+├── convert_gguf.py    # GGUF conversion for Ollama/llama.cpp
+├── configs/
+│   ├── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
+│   └── grpo.yaml      # GRPO hyperparameters for Qwen3-1.7B
+├── evals/
+│   └── queries.txt    # 27 test queries across 7 categories
+├── data/
+│   └── qmd_expansion.jsonl  # Source training data (5,730 examples)
+├── dataset/
+│   ├── generate_data.py         # Generate data via Claude API
+│   ├── generate_data_offline.py # Generate from existing HF dataset
+│   ├── prepare_data.py          # Format for Qwen3 chat template
+│   └── clean_data.py            # Detect technical term misinterpretations
+├── SCORING.md         # Detailed scoring rubric reference
+└── README.md          # This file
 ```
 
-### 4. Interactive Testing
+## Training Pipeline
 
-```bash
-uv run tui.py
-```
+### Stage 1: SFT (Supervised Fine-Tuning)
 
-## Training Configuration
-
-Default SFT config (`configs/sft_v4.yaml`):
+Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 
 | Parameter | Value |
 |-----------|-------|
+| Base model | `Qwen/Qwen3-1.7B` |
 | Method | LoRA (rank 16, alpha 32) |
-| Learning Rate | 2e-4 |
+| Target modules | All projection layers (q/k/v/o/gate/up/down) |
+| Dataset | 6,180 examples (26.5% short queries) |
+| Effective batch size | 16 (4 × 4 gradient accumulation) |
 | Epochs | 3 |
-| Batch Size | 4 (with 4x gradient accumulation) |
-| Max Seq Length | 512 |
-| Target Modules | q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj |
+| Learning rate | 2e-4 (cosine schedule) |
 
-## Training Dataset
+```bash
+uv run train.py sft --config configs/sft.yaml
+uv run train.py sft --config configs/sft.yaml --dry-run  # preview config
+```
 
-- **Dataset**: [tobil/qmd-query-expansion-train-v2](https://huggingface.co/datasets/tobil/qmd-query-expansion-train-v2)
-- **Size**: 6,180 examples (26.5% short queries)
-- **Format**: Qwen3 chat messages with `/no_think` directive
+### Stage 2: GRPO (Group Relative Policy Optimization)
 
-Key improvements in v2:
-- Short query examples with proper expansions
-- Hyde passages truncated to 150 chars
-- Key term preservation in lex lines
+Reinforcement learning on top of the merged SFT weights. The model generates
+multiple expansions per query, they are scored by the reward function, and the
+model is updated to prefer higher-scoring outputs.
 
-## Evaluation Results
+| Parameter | Value |
+|-----------|-------|
+| Base | Merged SFT checkpoint |
+| Method | LoRA (rank 4, alpha 8) — smaller for RL stability |
+| Target modules | q_proj, v_proj only |
+| Reward | `reward.py` (rule-based, 5 dimensions) |
+| KL beta | 0.04 — prevents drift from SFT checkpoint |
+| Generations per prompt | 4 |
+| Max steps | 200 |
+| Learning rate | 5e-7 |
 
-### SFT v4 (98.8% average score)
+**Important:** `beta > 0` is critical. With `beta=0` the model experiences
+catastrophic drift and scores drop to 0%.
 
-All 21 test queries rated "Excellent":
+```bash
+uv run train.py grpo --config configs/grpo.yaml
+uv run train.py grpo --config configs/grpo.yaml --dry-run  # test reward function
+```
 
-| Query | Score | Rating |
-|-------|-------|--------|
-| `how to configure authentication` | 99% | Excellent |
-| `auth` | 95% | Excellent |
-| `git rebase vs merge` | 100% | Excellent |
-| `react useEffect cleanup` | 100% | Excellent |
+## Evaluation
 
-### GRPO v4 (89.7% - with SFT base)
+`eval.py` generates expansions from a model and scores them against test queries:
 
-All 26 test queries rated "Excellent" when loaded correctly (SFT first, then GRPO adapter).
+```bash
+# Evaluate an SFT model
+uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft
 
-| Query | Score | Rating |
-|-------|-------|--------|
-| `AWS Lambda functions` | 96% | Excellent |
-| `typescript async await` | 92% | Excellent |
-| `kubernetes vs docker swarm` | 92% | Excellent |
-| `who is TDS motorsports` | 89% | Excellent |
+# Evaluate a GRPO model (needs SFT adapter merged first)
+uv run eval.py --model tobil/qmd-query-expansion-1.7B-grpo \
+               --sft-model tobil/qmd-query-expansion-1.7B-sft
 
-**Important**: Loading GRPO directly on base model results in 0% (catastrophic drift) because GRPO was trained on merged SFT weights.
+# Verbose output with deduction details
+uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -v
 
-## Known Issues
+# Save detailed scores to JSON
+uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -o scores.json
 
-- **GRPO loading**: Requires SFT adapter loaded first before GRPO adapter (see model card note above)
-- **Key term preservation**: Some lex lines still too generic (missing query key terms)
-- **Entity scoring**: Named entity detection is heuristic-based, may miss some cases
+# Score an existing JSONL file (backwards compat with old run.py output)
+uv run eval.py --score-only evals/results_old.jsonl
+```
+
+## Reward Function
+
+`reward.py` is the single source of truth for scoring. It is used both as the
+GRPO reward signal during training and for evaluation.
+
+Five scoring dimensions (max 120 without hyde, 140 with):
+
+| Dimension | Points | What It Measures |
+|-----------|--------|------------------|
+| **Format** | 0-30 | Has lex/vec lines, no invalid lines |
+| **Diversity** | 0-30 | Multiple expansion types, diverse content, no query echoes |
+| **HyDE** | 0-20 | Present, 50-200 chars, single line, not repetitive |
+| **Quality** | 0-20 | Lex shorter than vec, natural language, preserves key terms |
+| **Entity** | -45 to +20 | Named entities preserved in lex and vec lines |
+| **Think bonus** | 0-20 | Reward for NOT using `<think>` mode |
+
+**Hard failures** (instant 0.0):
+- Chat template leakage (`<|im_start|>`, `<|im_end|>`, etc.)
+- Any line without a valid `lex:`, `vec:`, or `hyde:` prefix
+
+```bash
+# Self-test the reward function
+uv run reward.py
+```
+
+## GGUF Conversion
+
+Merges base + SFT + GRPO adapters into a single model and produces
+quantized GGUF files for deployment:
+
+```bash
+# Use preset for 1.7B
+uv run convert_gguf.py --size 1.7B
+
+# Use preset for 4B
+uv run convert_gguf.py --size 4B
+
+# Custom models
+uv run convert_gguf.py --base Qwen/Qwen3-1.7B \
+                       --sft tobil/qmd-query-expansion-1.7B-sft \
+                       --grpo tobil/qmd-query-expansion-1.7B-grpo \
+                       --output tobil/qmd-query-expansion-1.7B-gguf
+```
+
+### Using with Ollama
+
+```bash
+huggingface-cli download tobil/qmd-query-expansion-1.7B-gguf \
+    qmd-query-expansion-1.7B-q4_k_m.gguf --local-dir .
+
+echo 'FROM ./qmd-query-expansion-1.7B-q4_k_m.gguf' > Modelfile
+ollama create qmd-expand -f Modelfile
+ollama run qmd-expand
+```
+
+## Data Pipeline
+
+The training data (5,730 examples in `data/qmd_expansion.jsonl`) was generated
+from two sources and cleaned for quality. To regenerate:
+
+```bash
+# Generate from existing HuggingFace dataset (bulk, no API needed)
+uv run dataset/generate_data_offline.py
+
+# Generate via Claude API (higher quality, needs ANTHROPIC_API_KEY)
+uv run dataset/generate_data.py --count 100
+
+# Detect and fix technical term misinterpretations
+uv run dataset/clean_data.py
+
+# Format for Qwen3 chat template, add short-query augmentation, split train/val
+uv run dataset/prepare_data.py
+```
+
+## Architecture Notes
+
+The two-stage training approach (SFT → GRPO) is standard for structured-output models:
+
+1. **SFT** establishes format compliance and basic query understanding. It uses
+   a large LoRA (rank 16, all projection layers) because it needs to learn a
+   new output format from scratch.
+
+2. **GRPO** refines quality within the learned format. It uses a small LoRA
+   (rank 4, q/v only) and KL regularization to make incremental improvements
+   without losing what SFT taught.
+
+The reward function is entirely rule-based (no LLM judge) which makes it fast,
+deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubric.

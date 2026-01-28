@@ -1,0 +1,43 @@
+# GRPO Training Config for QMD Query Expansion
+# Target: Qwen3-1.7B, trained on top of merged SFT weights
+#
+# Usage: uv run train.py grpo --config configs/grpo.yaml
+#
+# The reward function (reward.py) scores expansions on format compliance,
+# diversity, hyde quality, content quality, and named entity preservation.
+# beta > 0 is critical to prevent drift from the SFT checkpoint.
+
+model:
+  base: "Qwen/Qwen3-1.7B"
+  sft: "tobil/qmd-query-expansion-1.7B-sft"
+  output: "tobil/qmd-query-expansion-1.7B-grpo"
+
+dataset:
+  name: "tobil/qmd-query-expansion-train-v2"
+  prompt_field: "messages"
+  max_samples: 1000
+
+training:
+  epochs: 1
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5e-7
+  max_grad_norm: 0.5
+  max_steps: 200
+
+grpo:
+  num_generations: 4
+  max_completion_length: 200
+  beta: 0.04  # KL regularization - prevents drift from SFT checkpoint
+
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "grpo-1.7B"
