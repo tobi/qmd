@@ -1391,54 +1391,63 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     return;
   }
 
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0, skipped = 0;
+  const skippedFiles: { file: string; error: string }[] = [];
   const seenPaths = new Set<string>();
   const startTime = Date.now();
 
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = handelize(relativeFile); // Normalize path for token-friendliness
-    seenPaths.add(path);
+    try {
+      const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
+      const path = handelize(relativeFile); // Normalize path for token-friendliness
+      seenPaths.add(path);
 
-    const content = await Bun.file(filepath).text();
+      const content = await Bun.file(filepath).text();
 
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
+      // Skip empty files - nothing useful to index
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
 
-    // Check if document exists in this collection with this path
-    const existing = findActiveDocument(db, collectionName, path);
+      // Check if document exists in this collection with this path
+      const existing = findActiveDocument(db, collectionName, path);
 
-    if (existing) {
-      if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
+      if (existing) {
+        if (existing.hash === hash) {
+          // Hash unchanged, but check if title needs updating
+          if (existing.title !== title) {
+            updateDocumentTitle(db, existing.id, title, now);
+            updated++;
+          } else {
+            unchanged++;
+          }
         } else {
-          unchanged++;
+          // Content changed - insert new content hash and update document
+          insertContent(db, hash, content, now);
+          const stat = await Bun.file(filepath).stat();
+          updateDocument(db, existing.id, title, hash,
+            stat ? new Date(stat.mtime).toISOString() : now);
+          updated++;
         }
       } else {
-        // Content changed - insert new content hash and update document
+        // New document - insert content and document
+        indexed++;
         insertContent(db, hash, content, now);
         const stat = await Bun.file(filepath).stat();
-        updateDocument(db, existing.id, title, hash,
+        insertDocument(db, collectionName, path, title, hash,
+          stat ? new Date(stat.birthtime).toISOString() : now,
           stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
       }
-    } else {
-      // New document - insert content and document
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = await Bun.file(filepath).stat();
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+    } catch (err) {
+      // Skip files that cause errors (e.g., invalid filenames, permission issues, binary files)
+      skipped++;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      skippedFiles.push({ file: relativeFile, error: errorMsg });
+      // Continue to next file without adding to seenPaths (so it won't be deactivated)
     }
 
     processed++;
@@ -1468,8 +1477,24 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  if (skipped > 0) {
+    console.log(`${c.yellow}Skipped: ${skipped} file(s) due to errors${c.reset}`);
+  }
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+
+  // Show details for skipped files (limited to first 10)
+  if (skippedFiles.length > 0) {
+    console.log(`\n${c.yellow}Skipped files:${c.reset}`);
+    const displayCount = Math.min(skippedFiles.length, 10);
+    for (let i = 0; i < displayCount; i++) {
+      const { file, error } = skippedFiles[i]!;
+      console.log(`  ${c.dim}${file}:${c.reset} ${error}`);
+    }
+    if (skippedFiles.length > 10) {
+      console.log(`  ${c.dim}... and ${skippedFiles.length - 10} more${c.reset}`);
+    }
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
