@@ -64,6 +64,18 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  // Graph functions
+  createEntity,
+  getEntity,
+  listEntities,
+  searchEntities,
+  deleteEntity,
+  createEdge,
+  getEdges,
+  deleteEdge,
+  traverse,
+  findPath,
+  getGraphStats,
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
@@ -2372,6 +2384,18 @@ function showHelp(): void {
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
   console.log("");
+  console.log("Graph commands (knowledge graph):");
+  console.log("  qmd graph entity add <type> <name>  - Create entity (person, company, topic, etc.)");
+  console.log("  qmd graph entity get <id>           - Get entity details");
+  console.log("  qmd graph entity list [--type <t>]  - List entities");
+  console.log("  qmd graph entity search <query>     - FTS search on entity names");
+  console.log("  qmd graph entity rm <id>            - Delete entity");
+  console.log("  qmd graph edge add <src> <rel> <tgt> - Create relationship");
+  console.log("  qmd graph edge list <entity>        - List entity's relationships");
+  console.log("  qmd graph traverse <id> [--depth N] - Multi-hop traversal");
+  console.log("  qmd graph path <from> <to>          - Find shortest path between entities");
+  console.log("  qmd graph stats                     - Entity/edge counts by type");
+  console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
   console.log("");
@@ -2641,6 +2665,155 @@ if (import.meta.main) {
       vacuumDatabase(db);
       console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
+      closeDb();
+      break;
+    }
+
+    // =========================================================================
+    // Graph Commands
+    // =========================================================================
+    case "graph": {
+      const subCmd = cli.args[0];
+      const db = getDb();
+
+      switch (subCmd) {
+        case "entity": {
+          const action = cli.args[1];
+          switch (action) {
+            case "add": {
+              const type = cli.args[2];
+              const name = cli.args.slice(3).join(" ");
+              if (!type || !name) { console.error("Usage: qmd graph entity add <type> <name>"); process.exit(1); }
+              const id = cli.values["id"] as string | undefined;
+              const entity = createEntity(db, type, name, id);
+              console.log(`${c.green}✓${c.reset} Created entity: ${c.cyan}${entity.id}${c.reset} (${entity.type}: ${entity.name})`);
+              break;
+            }
+            case "get": {
+              const id = cli.args[2];
+              if (!id) { console.error("Usage: qmd graph entity get <id>"); process.exit(1); }
+              const entity = getEntity(db, id);
+              if (!entity) { console.error(`Entity not found: ${id}`); process.exit(1); }
+              console.log(JSON.stringify(entity, null, 2));
+              break;
+            }
+            case "list": {
+              const type = cli.values["type"] as string | undefined;
+              const limit = Number(cli.values["n"]) || 100;
+              const entities = listEntities(db, type, limit);
+              if (entities.length === 0) { console.log(`${c.dim}No entities found${c.reset}`); }
+              else { for (const e of entities) console.log(`${c.cyan}${e.id}${c.reset} ${c.dim}(${e.type})${c.reset} ${e.name}`); }
+              break;
+            }
+            case "search": {
+              const query = cli.args.slice(2).join(" ");
+              if (!query) { console.error("Usage: qmd graph entity search <query>"); process.exit(1); }
+              const entities = searchEntities(db, query);
+              for (const e of entities) console.log(`${c.cyan}${e.id}${c.reset} ${c.dim}(${e.type})${c.reset} ${e.name}`);
+              break;
+            }
+            case "rm": case "remove": {
+              const id = cli.args[2];
+              if (!id) { console.error("Usage: qmd graph entity rm <id>"); process.exit(1); }
+              if (deleteEntity(db, id)) console.log(`${c.green}✓${c.reset} Deleted entity: ${id}`);
+              else { console.error(`Entity not found: ${id}`); process.exit(1); }
+              break;
+            }
+            default: console.error("Usage: qmd graph entity <add|get|list|search|rm> ..."); process.exit(1);
+          }
+          break;
+        }
+        case "edge": {
+          const action = cli.args[1];
+          switch (action) {
+            case "add": {
+              const source = cli.args[2], relation = cli.args[3], target = cli.args[4];
+              if (!source || !relation || !target) { console.error("Usage: qmd graph edge add <source> <relation> <target>"); process.exit(1); }
+              const weight = Number(cli.values["weight"]) || 1.0;
+              createEdge(db, source, target, relation, weight);
+              console.log(`${c.green}✓${c.reset} Created edge: ${c.cyan}${source}${c.reset} -[${c.yellow}${relation}${c.reset}]-> ${c.cyan}${target}${c.reset}`);
+              break;
+            }
+            case "list": {
+              const nodeId = cli.args[2];
+              if (!nodeId) { console.error("Usage: qmd graph edge list <node>"); process.exit(1); }
+              const dir = (cli.values["dir"] as string) || "both";
+              const rel = cli.values["rel"] as string | undefined;
+              const direction = dir === "in" ? "incoming" : dir === "out" ? "outgoing" : "both";
+              const edges = getEdges(db, nodeId, direction, rel);
+              if (edges.length === 0) console.log(`${c.dim}No edges found${c.reset}`);
+              else for (const e of edges) console.log(`${c.cyan}${e.source_id}${c.reset} -[${c.yellow}${e.relation}${c.reset}]-> ${c.cyan}${e.target_id}${c.reset}`);
+              break;
+            }
+            case "rm": case "remove": {
+              const source = cli.args[2], target = cli.args[3];
+              if (!source || !target) { console.error("Usage: qmd graph edge rm <source> <target>"); process.exit(1); }
+              const count = deleteEdge(db, source, target, cli.values["rel"] as string | undefined);
+              console.log(`${c.green}✓${c.reset} Deleted ${count} edge(s)`);
+              break;
+            }
+            default: console.error("Usage: qmd graph edge <add|list|rm> ..."); process.exit(1);
+          }
+          break;
+        }
+        case "traverse": {
+          const startId = cli.args[1];
+          if (!startId) { console.error("Usage: qmd graph traverse <start> [--depth N]"); process.exit(1); }
+          const maxDepth = Number(cli.values["depth"]) || 2;
+          const dir = (cli.values["dir"] as string) || "both";
+          const direction = dir === "in" ? "incoming" : dir === "out" ? "outgoing" : "both";
+          const results = traverse(db, startId, maxDepth, undefined, direction);
+          if (results.length === 0) console.log(`${c.dim}No connections found${c.reset}`);
+          else for (const r of results) {
+            const indent = "  ".repeat(r.depth - 1) + (r.depth > 0 ? "└─ " : "");
+            const rel = r.relations[r.relations.length - 1] || "";
+            console.log(`${indent}${c.cyan}${r.node_id}${c.reset} ${c.dim}(${r.node_type})${c.reset}${rel ? ` via ${c.yellow}${rel}${c.reset}` : ""}`);
+          }
+          break;
+        }
+        case "path": {
+          const fromId = cli.args[1], toId = cli.args[2];
+          if (!fromId || !toId) { console.error("Usage: qmd graph path <from> <to>"); process.exit(1); }
+          const maxDepth = Number(cli.values["depth"]) || 5;
+          const path = findPath(db, fromId, toId, maxDepth);
+          if (!path) console.log(`${c.dim}No path found within ${maxDepth} hops${c.reset}`);
+          else {
+            console.log(`Path (${path.depth} hops):`);
+            for (let i = 0; i < path.path.length; i++) {
+              const node = path.path[i], rel = path.relations[i - 1];
+              console.log(i === 0 ? `  ${c.cyan}${node}${c.reset}` : `  -[${c.yellow}${rel}${c.reset}]-> ${c.cyan}${node}${c.reset}`);
+            }
+          }
+          break;
+        }
+        case "stats": {
+          const stats = getGraphStats(db);
+          console.log(`${c.bold}Graph Statistics${c.reset}\n  Entities: ${stats.entity_count}\n  Edges: ${stats.edge_count}`);
+          if (Object.keys(stats.entity_types).length > 0) {
+            console.log(`\n${c.bold}Entity Types${c.reset}`);
+            for (const [type, count] of Object.entries(stats.entity_types)) console.log(`  ${type}: ${count}`);
+          }
+          if (Object.keys(stats.relation_types).length > 0) {
+            console.log(`\n${c.bold}Relation Types${c.reset}`);
+            for (const [rel, count] of Object.entries(stats.relation_types)) console.log(`  ${rel}: ${count}`);
+          }
+          break;
+        }
+        default:
+          console.error("Usage: qmd graph <entity|edge|traverse|path|stats> ...");
+          console.error("\nCommands:");
+          console.error("  entity add <type> <name>   Create an entity (e.g., person, company, topic)");
+          console.error("  entity list [--type <t>]   List all entities");
+          console.error("  entity search <query>      Search entities by name");
+          console.error("  entity rm <id>             Delete an entity");
+          console.error("  edge add <src> <rel> <dst> Create a relationship");
+          console.error("  edge list <node>           List edges for a node");
+          console.error("  edge rm <src> <dst>        Delete edge(s)");
+          console.error("  traverse <start>           Find connected nodes");
+          console.error("  path <from> <to>           Find shortest path");
+          console.error("  stats                      Show graph statistics");
+          process.exit(1);
+      }
       closeDb();
       break;
     }
