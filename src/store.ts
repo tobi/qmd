@@ -2074,6 +2074,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
+// Max characters per document for reranking (~500 tokens)
+// Prevents context overflow with large documents
+const RERANK_MAX_CHARS = 1500;
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
@@ -2085,7 +2089,11 @@ export async function rerank(query: string, documents: { file: string; text: str
     if (cached !== null) {
       cachedResults.set(doc.file, parseFloat(cached));
     } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
+      // Truncate document text to prevent context overflow
+      const truncatedText = doc.text.length > RERANK_MAX_CHARS
+        ? doc.text.slice(0, RERANK_MAX_CHARS) + "..."
+        : doc.text;
+      uncachedDocs.push({ file: doc.file, text: truncatedText });
     }
   }
 

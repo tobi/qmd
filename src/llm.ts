@@ -149,8 +149,8 @@ export type RerankDocument = {
 // Format: hf:<user>/<repo>/<file>
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-// const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+// const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf";
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
@@ -225,8 +225,8 @@ export type LlamaCppConfig = {
 /**
  * LLM implementation using node-llama-cpp
  */
-// Default inactivity timeout: 2 minutes
-const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
+// Default inactivity timeout: 10 minutes (increased to avoid disposal during long reranking)
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -567,6 +567,7 @@ export class LlamaCpp implements LLM {
         texts.map(async (text) => {
           try {
             const embedding = await context.getEmbeddingFor(text);
+            this.touchActivity();  // Keep-alive during slow batches (fix for issue #40)
             return {
               embedding: Array.from(embedding.vector),
               model: this.embedModelUri,
@@ -752,6 +753,7 @@ Final Output:`;
 
     // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
     const ranked = await context.rankAndSort(query, texts);
+    this.touchActivity();  // Keep-alive after reranking completes
 
     // Map back to our result format using the text-to-doc map
     const results: RerankDocumentResult[] = ranked.map((item) => {
@@ -815,10 +817,13 @@ let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
+ * Disables inactivity timeout to prevent GC crashes during disposal (Bun/node-llama-cpp issue)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp({
+      inactivityTimeoutMs: 0,  // Disable auto-disposal to avoid GC crash
+    });
   }
   return defaultLlamaCpp;
 }
