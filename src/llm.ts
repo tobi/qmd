@@ -567,6 +567,7 @@ export class LlamaCpp implements LLM {
         texts.map(async (text) => {
           try {
             const embedding = await context.getEmbeddingFor(text);
+            this.touchActivity();  // Keep-alive during slow batches
             return {
               embedding: Array.from(embedding.vector),
               model: this.embedModelUri,
