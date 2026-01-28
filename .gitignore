@@ -8,3 +8,4 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
+!skills/**/*.md
