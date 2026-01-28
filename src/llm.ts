@@ -241,8 +241,9 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
 
-  // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
+  // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
+  private embedContextCreatePromise: Promise<LlamaEmbeddingContext> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -402,11 +403,28 @@ export class LlamaCpp implements LLM {
 
   /**
    * Load embedding context (lazy). Context can be disposed and recreated without reloading the model.
+   * Uses promise guard to prevent concurrent context creation race condition.
    */
   private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
     if (!this.embedContext) {
-      const model = await this.ensureEmbedModel();
-      this.embedContext = await model.createEmbeddingContext();
+      // If context creation is already in progress, wait for it
+      if (this.embedContextCreatePromise) {
+        return await this.embedContextCreatePromise;
+      }
+
+      // Start context creation and store promise so concurrent calls wait
+      this.embedContextCreatePromise = (async () => {
+        const model = await this.ensureEmbedModel();
+        const context = await model.createEmbeddingContext();
+        this.embedContext = context;
+        return context;
+      })();
+
+      try {
+        await this.embedContextCreatePromise;
+      } finally {
+        this.embedContextCreatePromise = null;
+      }
     }
     this.touchActivity();
     return this.embedContext;
@@ -781,8 +799,9 @@ Final Output:`;
     this.rerankModel = null;
     this.llama = null;
 
-    // Clear any in-flight load promises
+    // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
+    this.embedContextCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }

@@ -167,6 +167,63 @@ describe("LlamaCpp Integration", () => {
       // Performance is machine/load dependent. We only assert batch isn't drastically worse.
       expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
     });
+
+    test("handles concurrent embedBatch calls on fresh instance without race condition", async () => {
+      // This test verifies the fix for a race condition where concurrent calls to
+      // ensureEmbedContext() could create multiple contexts. Without the promise guard,
+      // each concurrent embedBatch call sees embedContext === null and creates its own
+      // context, causing resource leaks and potential "Context is disposed" errors.
+      //
+      // See: https://github.com/tobi/qmd/pull/54
+      //
+      // The fix uses a promise guard to ensure only one context creation runs at a time.
+      // We verify this by instrumenting createEmbeddingContext to count invocations.
+      
+      const freshLlm = new LlamaCpp({});
+      let contextCreateCount = 0;
+      
+      // Instrument the model's createEmbeddingContext to count calls
+      const originalEnsureEmbedModel = (freshLlm as any).ensureEmbedModel.bind(freshLlm);
+      let modelInstrumented = false;
+      (freshLlm as any).ensureEmbedModel = async function() {
+        const model = await originalEnsureEmbedModel();
+        if (!modelInstrumented) {
+          modelInstrumented = true;
+          const originalCreate = model.createEmbeddingContext.bind(model);
+          model.createEmbeddingContext = async function(...args: any[]) {
+            contextCreateCount++;
+            return originalCreate(...args);
+          };
+        }
+        return model;
+      };
+      
+      const texts = Array(10).fill(null).map((_, i) => `Document ${i}`);
+
+      // Call embedBatch 5 TIMES in parallel on fresh instance.
+      // Without the promise guard fix, this would create 5 contexts (one per call).
+      // With the fix, only 1 context should be created.
+      const batches = await Promise.all([
+        freshLlm.embedBatch(texts.slice(0, 2)),
+        freshLlm.embedBatch(texts.slice(2, 4)),
+        freshLlm.embedBatch(texts.slice(4, 6)),
+        freshLlm.embedBatch(texts.slice(6, 8)),
+        freshLlm.embedBatch(texts.slice(8, 10)),
+      ]);
+
+      const allResults = batches.flat();
+      expect(allResults).toHaveLength(10);
+      
+      const successCount = allResults.filter(r => r !== null).length;
+      expect(successCount).toBe(10);
+
+      // THE KEY ASSERTION: Only 1 context should be created, not 5
+      // Without the fix, contextCreateCount would be 5 (one per concurrent embedBatch call)
+      console.log(`Context creation count: ${contextCreateCount} (expected: 1)`);
+      expect(contextCreateCount).toBe(1);
+      
+      await freshLlm.dispose();
+    }, 60000);
   });
 
   describe("rerank", () => {
