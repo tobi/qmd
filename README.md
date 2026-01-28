@@ -417,6 +417,64 @@ qmd multi-get "docs/*.md" --json
 qmd cleanup
 ```
 
+## Graph Layer
+
+QMD includes a lightweight graph layer for storing relationships between entities (people, companies, topics, etc.) alongside your documents.
+
+### Entity Management
+
+```bash
+# Create entities
+qmd graph entity add person "Joe Bloggs"
+qmd graph entity add company "Acme Corp"
+qmd graph entity add topic "Software Dev"
+
+# List and search entities
+qmd graph entity list                    # All entities
+qmd graph entity list --type person      # Filter by type
+qmd graph entity search "Joe"          # FTS search
+
+# Delete an entity (also removes its edges)
+qmd graph entity rm person:joe-bloggs
+```
+
+### Relationships (Edges)
+
+```bash
+# Create relationships
+qmd graph edge add person:joe-bloggs works_at company:acme-corp
+qmd graph edge add person:john-smith owns company:acme-corp
+qmd graph edge add company:acme-corp related_to topic:software-dev
+
+# List edges
+qmd graph edge list person:joe-bloggs           # All edges
+qmd graph edge list company:acme-corp --dir in    # Incoming only
+qmd graph edge list person:john-smith --rel owns    # Filter by relation
+
+# Delete edges
+qmd graph edge rm person:joe-bloggs company:acme-corp
+```
+
+### Graph Traversal
+
+```bash
+# Find connected nodes (default: 2 hops)
+qmd graph traverse person:john-smith
+qmd graph traverse company:acme-corp --depth 3
+
+# Find shortest path between nodes
+qmd graph path person:joe-bloggs person:john-smith
+
+# Graph statistics
+qmd graph stats
+```
+
+### Use Cases
+
+- **Memory systems**: Track relationships between people, companies, and projects
+- **Knowledge graphs**: Connect documents to entities they mention
+- **Agent context**: Build rich context by traversing relationships
+
 ## Data Storage
 
 Index stored in: `~/.cache/qmd/index.sqlite`
