@@ -77,14 +77,17 @@ finetune/
 ├── convert_gguf.py    # GGUF conversion for Ollama/llama.cpp
 ├── jobs/
 │   ├── sft.py         # Self-contained SFT for HuggingFace Jobs
-│   └── grpo.py        # Self-contained GRPO for HuggingFace Jobs
+│   ├── grpo.py        # Self-contained GRPO for HuggingFace Jobs
+│   ├── eval.py        # Self-contained eval for HuggingFace Jobs
+│   ├── eval_common.py # Shared eval utilities
+│   └── quantize.py    # GGUF quantization for HuggingFace Jobs
 ├── configs/
 │   ├── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
 │   └── grpo.yaml      # GRPO hyperparameters for Qwen3-1.7B
 ├── evals/
 │   └── queries.txt    # 31 test queries across 8 categories
 ├── data/
-│   └── qmd_expansion.jsonl  # Source training data (5,742 examples)
+│   └── qmd_expansion_v2.jsonl  # Source training data (1,000 high-quality examples)
 ├── dataset/
 │   ├── generate_data.py         # Generate data via Claude API
 │   ├── generate_data_offline.py # Generate from existing HF dataset
@@ -105,9 +108,9 @@ Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 | Base model | `Qwen/Qwen3-1.7B` |
 | Method | LoRA (rank 16, alpha 32) |
 | Target modules | All projection layers (q/k/v/o/gate/up/down) |
-| Dataset | 11,124 examples (train split) |
+| Dataset | ~2,290 examples (train split) |
 | Effective batch size | 16 (4 × 4 gradient accumulation) |
-| Epochs | 3 |
+| Epochs | 5 |
 | Learning rate | 2e-4 (cosine schedule) |
 
 ```bash
@@ -219,7 +222,7 @@ ollama run qmd-expand
 
 ## Data Pipeline
 
-The training data (5,730 examples in `data/qmd_expansion.jsonl`) was generated
+The training data (1,000 examples in `data/qmd_expansion_v2.jsonl`) was generated
 from two sources and cleaned for quality. To regenerate:
 
 ```bash
@@ -251,16 +254,17 @@ The two-stage training approach (SFT → GRPO) is standard for structured-output
 The reward function is entirely rule-based (no LLM judge) which makes it fast,
 deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubric.
 
-## Training Results (Qwen3-1.7B)
+## Training Results (Qwen3-1.7B, v2)
 
 ### SFT
 
 | Metric | Value |
 |--------|-------|
-| Final train loss | 0.223 |
-| Final eval loss | 0.321 |
-| Token accuracy (train) | 94.8% |
-| Token accuracy (eval) | 92.4% |
+| Final train loss | 0.472 |
+| Final eval loss | 0.304 |
+| Token accuracy (train) | 97.4% |
+| Token accuracy (eval) | 93.8% |
+| Epochs | 5 |
 | Hardware | A10G (24 GB VRAM) |
 
 ### GRPO
@@ -273,3 +277,10 @@ deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubri
 | Mean completion length | ~58 tokens |
 | Training time | ~19 min (200 steps) |
 | Hardware | A10G (24 GB VRAM) |
+
+### Evaluation Scores
+
+| Model | Average Score | Excellent (30) |
+|-------|--------------|-----------------|
+| SFT | 92.0% | 30/30 |
+| GRPO | 91.7% | 30/30 |

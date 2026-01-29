@@ -19,6 +19,7 @@ Self-contained script for HuggingFace Jobs:
 """
 
 import os
+import sys
 from huggingface_hub import login
 
 # --- Config (inlined from configs/sft.yaml) ---
@@ -32,6 +33,7 @@ if hf_token:
 
 from datasets import load_dataset
 from peft import LoraConfig
+from transformers import AutoTokenizer
 from trl import SFTTrainer, SFTConfig
 
 # Load and split dataset
@@ -51,7 +53,7 @@ config = SFTConfig(
     hub_model_id=OUTPUT_MODEL,
     hub_strategy="every_save",
 
-    num_train_epochs=3,
+    num_train_epochs=5,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
@@ -96,3 +98,14 @@ trainer.train()
 print("Pushing to Hub...")
 trainer.push_to_hub()
 print(f"Done! Model: https://huggingface.co/{OUTPUT_MODEL}")
+
+# --- Automatic evaluation ---
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import run_eval
+
+print("\nStarting automatic evaluation...")
+eval_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+if eval_tokenizer.pad_token is None:
+    eval_tokenizer.pad_token = eval_tokenizer.eos_token
+trainer.model.eval()
+run_eval(trainer.model, eval_tokenizer, "sft")

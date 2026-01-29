@@ -112,7 +112,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
                         ▼                             ▼
                ┌────────────────┐            ┌────────────────┐
                │ Query Expansion│            │  Original Query│
-               │   (Qwen3-1.7B) │            │   (×2 weight)  │
+               │  (fine-tuned)  │            │   (×2 weight)  │
                └───────┬────────┘            └───────┬────────┘
                        │                             │
                        │ 2 alternative queries       │
@@ -213,7 +213,7 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 |-------|---------|------|
 | `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
-| `Qwen3-1.7B-Q8_0` | Query expansion | ~2.2GB |
+| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
@@ -515,7 +515,7 @@ Models are configured in `src/llm.ts` as HuggingFace URIs:
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
 ### EmbeddingGemma Prompt Format
