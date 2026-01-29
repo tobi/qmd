@@ -18,8 +18,11 @@ import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
+  getProviderInfo,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  type LLM,
   type RerankDocument,
 } from "./llm";
 import {
@@ -1160,7 +1163,7 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
-export { formatQueryForEmbedding, formatDocForEmbedding };
+export { formatQueryForEmbedding, formatDocForEmbedding, getProviderInfo };
 
 export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
   if (content.length <= maxChars) {
@@ -1991,7 +1994,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
-  const llm = getDefaultLlamaCpp();
+  const llm = await getDefaultLLM();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
   const result = await llm.embed(formattedText, { model, isQuery });
@@ -2056,8 +2059,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     return [query, ...lines.slice(0, 2)];
   }
 
+  // Query expansion always uses local LlamaCpp (not available via remote API)
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query);
   const queryTexts = results.map(r => r.text);
 
@@ -2089,9 +2092,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = await getDefaultLLM();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results
