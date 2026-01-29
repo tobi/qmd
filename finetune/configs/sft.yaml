@@ -14,7 +14,7 @@ dataset:
   eval_split: 0.1
 
 training:
-  epochs: 3
+  epochs: 5
   batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 2e-4
