@@ -1,0 +1,40 @@
+# SFT Training Config for QMD Query Expansion
+# Target: Qwen3-1.7B with LoRA
+#
+# Usage: uv run train.py sft --config configs/sft.yaml
+
+model:
+  base: "Qwen/Qwen3-1.7B"
+  output: "tobil/qmd-query-expansion-1.7B-sft"
+
+dataset:
+  name: "tobil/qmd-query-expansion-train-v2"
+  text_field: "text"
+  split: "train"
+  eval_split: 0.1
+
+training:
+  epochs: 5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_length: 512
+  warmup_ratio: 0.03
+  lr_scheduler: "cosine"
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "sft-1.7B"

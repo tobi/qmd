@@ -1,0 +1,12 @@
+{
+  "dataset_name": "qmd-query-expansion",
+  "train_samples": 1145,
+  "val_samples": 128,
+  "short_query_pct": 29.3,
+  "columns": [
+    "prompt",
+    "completion",
+    "text",
+    "messages"
+  ]
+}
