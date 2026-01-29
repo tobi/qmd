@@ -1,3 +1,16 @@
+---
+license: mit
+language:
+  - en
+base_model: Qwen/Qwen3-1.7B
+tags:
+  - query-expansion
+  - search
+  - gguf
+  - qwen3
+pipeline_tag: text-generation
+---
+
 # QMD Query Expansion Fine-Tuning
 
 Train small language models to expand search queries for [QMD](https://github.com/tobi/qmd)'s hybrid retrieval pipeline.
