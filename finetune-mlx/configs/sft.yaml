@@ -1,0 +1,23 @@
+# SFT Training Config for QMD Query Expansion (Apple Silicon)
+# Uses MLX with LoRA for efficient fine-tuning
+
+model:
+  # Qwen2.5-1.5B is well-supported by MLX and fits in 8GB
+  base: "Qwen/Qwen2.5-1.5B"
+  output: "qmd-query-expansion-1.5B-sft"
+
+dataset:
+  name: "tobil/qmd-query-expansion-train-v2"
+  text_field: "text"
+  eval_split: 0.1
+
+training:
+  batch_size: 4
+  iters: 1000          # ~5 epochs on typical dataset
+  learning_rate: 1e-4
+  max_length: 512
+  grad_accumulation_steps: 4
+
+lora:
+  num_layers: 16       # Number of layers to apply LoRA
+  rank: 16             # LoRA rank (mlx-lm default)
