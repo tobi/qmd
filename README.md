@@ -438,6 +438,41 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_PROVIDER` | `local` | Embedding provider: `local`, `voyage`, or `openai` |
+| `VOYAGE_API_KEY` | - | API key for Voyage AI (required when `QMD_PROVIDER=voyage`) |
+| `VOYAGE_EMBED_MODEL` | `voyage-4-lite` | Voyage embedding model |
+| `VOYAGE_RERANK_MODEL` | `rerank-2` | Voyage reranking model |
+| `OPENAI_API_KEY` | - | API key for OpenAI (required when `QMD_PROVIDER=openai`) |
+| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | Base URL (for OpenAI-compatible APIs) |
+
+### Remote Embedding Providers
+
+QMD supports remote embedding APIs as an alternative to local models. This is useful when:
+- You want faster embeddings without GPU
+- You need higher quality embeddings (e.g., Voyage AI)
+- You're running on a machine without enough resources for local models
+
+**Voyage AI** (recommended for quality):
+```bash
+export QMD_PROVIDER=voyage
+export VOYAGE_API_KEY=your-api-key
+
+qmd embed     # Uses Voyage for embeddings
+qmd vsearch "query"  # Uses Voyage for query embedding
+qmd query "query"    # Uses Voyage for embeddings + reranking
+```
+
+**OpenAI-compatible APIs**:
+```bash
+export QMD_PROVIDER=openai
+export OPENAI_API_KEY=your-api-key
+
+# Or use a local OpenAI-compatible server (Ollama, vLLM, etc.)
+export OPENAI_API_BASE=http://localhost:11434/v1
+```
+
+**Note:** Query expansion always uses local models (LlamaCpp) regardless of the provider setting.
 
 ## How It Works
 
