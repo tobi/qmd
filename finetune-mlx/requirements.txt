@@ -1,0 +1,14 @@
+# Core MLX dependencies
+mlx-lm>=0.20.0
+mlx>=0.21.0
+
+# Data handling
+huggingface_hub>=0.20.0
+datasets>=2.14.0
+
+# Config and utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Testing (optional)
+pytest>=7.0.0

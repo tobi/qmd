@@ -1,0 +1,48 @@
+# Test queries for QMD query expansion evaluation
+# One query per line, comments start with #
+
+# Technical documentation
+how to configure authentication
+typescript async await
+docker compose networking
+git rebase vs merge
+react useEffect cleanup
+
+# Short/ambiguous queries
+auth
+config
+setup
+api
+
+# Named entities (critical for entity preservation testing)
+who is TDS motorsports
+React hooks tutorial
+Docker container networking
+Kubernetes pod deployment
+AWS Lambda functions
+
+# Personal notes / journals style
+meeting notes project kickoff
+ideas for new feature
+todo list app architecture
+
+# Research / learning
+what is dependency injection
+difference between sql and nosql
+kubernetes vs docker swarm
+
+# Error/debugging
+connection timeout error
+memory leak debugging
+cors error fix
+
+# Temporal / recency queries (should expand with years, "recent", "latest")
+recent news about Shopify
+latest AI developments
+best laptops right now
+what changed in kubernetes latest version
+
+# Complex queries
+how to implement caching with redis in nodejs
+best practices for api rate limiting
+setting up ci cd pipeline with github actions
