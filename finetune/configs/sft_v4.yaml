@@ -1,0 +1,38 @@
+# SFT Training Config - v4 with /only: support
+# Usage: accelerate launch --config_file configs/accelerate_multi_gpu.yaml train.py sft --config configs/sft_v4.yaml
+
+model:
+  base: "Qwen/Qwen3-1.7B"
+  output: "qmd-sft-v4"
+
+dataset:
+  name: "data/train_v4"
+  text_field: "text"
+  split: "train"
+  eval_split: 0.1
+
+training:
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+  max_length: 512
+  warmup_ratio: 0.03
+  lr_scheduler: "cosine"
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "sft-1.7B-v4-only-modes"
