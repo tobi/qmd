@@ -7,7 +7,7 @@
     "qmd": "./qmd"
   },
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --preload ./src/test-preload.ts",
     "qmd": "bun src/qmd.ts",
     "index": "bun src/qmd.ts index",
     "vector": "bun src/qmd.ts vector",
