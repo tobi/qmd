@@ -213,14 +213,25 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 |-------|---------|------|
 | `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
-| [`qmd-query-expansion-1.7B-q4_k_m`](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | Query expansion (fine-tuned) | ~1.1GB |
+| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ## Installation
 
 ```sh
+bun install -g github:tobi/qmd
+```
+
+Make sure `~/.bun/bin` is in your PATH.
+
+### Development
+
+```sh
+git clone https://github.com/tobi/qmd
+cd qmd
 bun install
+bun link
 ```
 
 ## Usage

@@ -120,6 +120,32 @@ export type RerankOptions = {
 };
 
 /**
+ * Options for LLM sessions
+ */
+export type LLMSessionOptions = {
+  /** Max session duration in ms (default: 10 minutes) */
+  maxDuration?: number;
+  /** External abort signal */
+  signal?: AbortSignal;
+  /** Debug name for logging */
+  name?: string;
+};
+
+/**
+ * Session interface for scoped LLM access with lifecycle guarantees
+ */
+export interface ILLMSession {
+  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+  /** Whether this session is still valid (not released or aborted) */
+  readonly isValid: boolean;
+  /** Abort signal for this session (aborts on release or maxDuration) */
+  readonly signal: AbortSignal;
+}
+
+/**
  * Supported query types for different search backends
  */
 export type QueryType = 'lex' | 'vec' | 'hyde';
@@ -225,8 +251,8 @@ export type LlamaCppConfig = {
 /**
  * LLM implementation using node-llama-cpp
  */
-// Default inactivity timeout: 2 minutes
-const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
+// Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -241,8 +267,9 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
 
-  // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
+  // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
+  private embedContextCreatePromise: Promise<LlamaEmbeddingContext> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -266,7 +293,7 @@ export class LlamaCpp implements LLM {
 
   /**
    * Reset the inactivity timer. Called after each model operation.
-   * When timer fires, models are unloaded to free memory.
+   * When timer fires, models are unloaded to free memory (if no active sessions).
    */
   private touchActivity(): void {
     // Clear existing timer
@@ -278,6 +305,14 @@ export class LlamaCpp implements LLM {
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
+        // Check if session manager allows unloading
+        // canUnloadLLM is defined later in this file - it checks the session manager
+        // We use dynamic import pattern to avoid circular dependency issues
+        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
+          // Active sessions/operations - reschedule timer
+          this.touchActivity();
+          return;
+        }
         this.unloadIdleResources().catch(err => {
           console.error("Error unloading idle resources:", err);
         });
@@ -389,6 +424,8 @@ export class LlamaCpp implements LLM {
       const modelPath = await this.resolveModel(this.embedModelUri);
       const model = await llama.loadModel({ modelPath });
       this.embedModel = model;
+      // Model loading counts as activity - ping to keep alive
+      this.touchActivity();
       return model;
     })();
 
@@ -402,11 +439,30 @@ export class LlamaCpp implements LLM {
 
   /**
    * Load embedding context (lazy). Context can be disposed and recreated without reloading the model.
+   * Uses promise guard to prevent concurrent context creation race condition.
    */
   private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
     if (!this.embedContext) {
-      const model = await this.ensureEmbedModel();
-      this.embedContext = await model.createEmbeddingContext();
+      // If context creation is already in progress, wait for it
+      if (this.embedContextCreatePromise) {
+        return await this.embedContextCreatePromise;
+      }
+
+      // Start context creation and store promise so concurrent calls wait
+      this.embedContextCreatePromise = (async () => {
+        const model = await this.ensureEmbedModel();
+        const context = await model.createEmbeddingContext();
+        this.embedContext = context;
+        return context;
+      })();
+
+      try {
+        const context = await this.embedContextCreatePromise;
+        this.touchActivity();
+        return context;
+      } finally {
+        this.embedContextCreatePromise = null;
+      }
     }
     this.touchActivity();
     return this.embedContext;
@@ -458,6 +514,8 @@ export class LlamaCpp implements LLM {
       const modelPath = await this.resolveModel(this.rerankModelUri);
       const model = await llama.loadModel({ modelPath });
       this.rerankModel = model;
+      // Model loading counts as activity - ping to keep alive
+      this.touchActivity();
       return model;
     })();
 
@@ -520,6 +578,9 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
+
     try {
       const context = await this.ensureEmbedContext();
       const embedding = await context.getEmbeddingFor(text);
@@ -539,6 +600,9 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
+
     if (texts.length === 0) return [];
 
     try {
@@ -549,6 +613,7 @@ export class LlamaCpp implements LLM {
         texts.map(async (text) => {
           try {
             const embedding = await context.getEmbeddingFor(text);
+            this.touchActivity();  // Keep-alive during slow batches
             return {
               embedding: Array.from(embedding.vector),
               model: this.embedModelUri,
@@ -568,6 +633,9 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
+
     // Ensure model is loaded
     await this.ensureGenerateModel();
 
@@ -620,6 +688,9 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
+
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
 
@@ -721,6 +792,9 @@ Final Output:`;
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
+
     const context = await this.ensureRerankContext();
 
     // Build a map from document text to original indices (for lookup after sorting)
@@ -781,11 +855,238 @@ Final Output:`;
     this.rerankModel = null;
     this.llama = null;
 
-    // Clear any in-flight load promises
+    // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
+    this.embedContextCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }
+}
+
+// =============================================================================
+// Session Management Layer
+// =============================================================================
+
+/**
+ * Manages LLM session lifecycle with reference counting.
+ * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
+ */
+class LLMSessionManager {
+  private llm: LlamaCpp;
+  private _activeSessionCount = 0;
+  private _inFlightOperations = 0;
+
+  constructor(llm: LlamaCpp) {
+    this.llm = llm;
+  }
+
+  get activeSessionCount(): number {
+    return this._activeSessionCount;
+  }
+
+  get inFlightOperations(): number {
+    return this._inFlightOperations;
+  }
+
+  /**
+   * Returns true only when both session count and in-flight operations are 0.
+   * Used by LlamaCpp to determine if idle unload is safe.
+   */
+  canUnload(): boolean {
+    return this._activeSessionCount === 0 && this._inFlightOperations === 0;
+  }
+
+  acquire(): void {
+    this._activeSessionCount++;
+  }
+
+  release(): void {
+    this._activeSessionCount = Math.max(0, this._activeSessionCount - 1);
+  }
+
+  operationStart(): void {
+    this._inFlightOperations++;
+  }
+
+  operationEnd(): void {
+    this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
+  }
+
+  getLlamaCpp(): LlamaCpp {
+    return this.llm;
+  }
+}
+
+/**
+ * Error thrown when an operation is attempted on a released or aborted session.
+ */
+export class SessionReleasedError extends Error {
+  constructor(message = "LLM session has been released or aborted") {
+    super(message);
+    this.name = "SessionReleasedError";
+  }
+}
+
+/**
+ * Scoped LLM session with automatic lifecycle management.
+ * Wraps LlamaCpp methods with operation tracking and abort handling.
+ */
+class LLMSession implements ILLMSession {
+  private manager: LLMSessionManager;
+  private released = false;
+  private abortController: AbortController;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+  private name: string;
+
+  constructor(manager: LLMSessionManager, options: LLMSessionOptions = {}) {
+    this.manager = manager;
+    this.name = options.name || "unnamed";
+    this.abortController = new AbortController();
+
+    // Link external abort signal if provided
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.abortController.abort(options.signal.reason);
+      } else {
+        options.signal.addEventListener("abort", () => {
+          this.abortController.abort(options.signal!.reason);
+        }, { once: true });
+      }
+    }
+
+    // Set up max duration timer
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000; // Default 10 minutes
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(new Error(`Session "${this.name}" exceeded max duration of ${maxDuration}ms`));
+      }, maxDuration);
+      this.maxDurationTimer.unref(); // Don't keep process alive
+    }
+
+    // Acquire session lease
+    this.manager.acquire();
+  }
+
+  get isValid(): boolean {
+    return !this.released && !this.abortController.signal.aborted;
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  /**
+   * Release the session and decrement ref count.
+   * Called automatically by withLLMSession when the callback completes.
+   */
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+
+    if (this.maxDurationTimer) {
+      clearTimeout(this.maxDurationTimer);
+      this.maxDurationTimer = null;
+    }
+
+    this.abortController.abort(new Error("Session released"));
+    this.manager.release();
+  }
+
+  /**
+   * Wrap an operation with tracking and abort checking.
+   */
+  private async withOperation<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.isValid) {
+      throw new SessionReleasedError();
+    }
+
+    this.manager.operationStart();
+    try {
+      // Check abort before starting
+      if (this.abortController.signal.aborted) {
+        throw new SessionReleasedError(
+          this.abortController.signal.reason?.message || "Session aborted"
+        );
+      }
+      return await fn();
+    } finally {
+      this.manager.operationEnd();
+    }
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+  }
+
+  async expandQuery(
+    query: string,
+    options?: { context?: string; includeLexical?: boolean }
+  ): Promise<Queryable[]> {
+    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options?: RerankOptions
+  ): Promise<RerankResult> {
+    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+  }
+}
+
+// Session manager for the default LlamaCpp instance
+let defaultSessionManager: LLMSessionManager | null = null;
+
+/**
+ * Get the session manager for the default LlamaCpp instance.
+ */
+function getSessionManager(): LLMSessionManager {
+  const llm = getDefaultLlamaCpp();
+  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+    defaultSessionManager = new LLMSessionManager(llm);
+  }
+  return defaultSessionManager;
+}
+
+/**
+ * Execute a function with a scoped LLM session.
+ * The session provides lifecycle guarantees - resources won't be disposed mid-operation.
+ *
+ * @example
+ * ```typescript
+ * await withLLMSession(async (session) => {
+ *   const expanded = await session.expandQuery(query);
+ *   const embeddings = await session.embedBatch(texts);
+ *   const reranked = await session.rerank(query, docs);
+ *   return reranked;
+ * }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+ * ```
+ */
+export async function withLLMSession<T>(
+  fn: (session: ILLMSession) => Promise<T>,
+  options?: LLMSessionOptions
+): Promise<T> {
+  const manager = getSessionManager();
+  const session = new LLMSession(manager, options);
+
+  try {
+    return await fn(session);
+  } finally {
+    session.release();
+  }
+}
+
+/**
+ * Check if idle unload is safe (no active sessions or operations).
+ * Used internally by LlamaCpp idle timer.
+ */
+export function canUnloadLLM(): boolean {
+  if (!defaultSessionManager) return true;
+  return defaultSessionManager.canUnload();
 }
 
 // =============================================================================

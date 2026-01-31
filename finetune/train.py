@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     "torch",
 #     "trl>=0.12.0",
 #     "peft>=0.7.0",
 #     "transformers>=4.45.0",
@@ -34,7 +35,6 @@ import yaml
 
 def cmd_sft(args):
     """Run supervised fine-tuning."""
-    import trackio
     from datasets import load_dataset
     from peft import LoraConfig
     from trl import SFTTrainer, SFTConfig
@@ -47,8 +47,20 @@ def cmd_sft(args):
         print(yaml.dump(cfg, default_flow_style=False))
         return
 
-    print(f"Loading dataset: {cfg['dataset']['name']}...")
-    dataset = load_dataset(cfg["dataset"]["name"], split=cfg["dataset"]["split"])
+    dataset_name = cfg["dataset"]["name"]
+    print(f"Loading dataset: {dataset_name}...")
+
+    # Support local JSONL files
+    if dataset_name.startswith("data/") or dataset_name.endswith(".jsonl"):
+        from pathlib import Path
+        data_path = Path(dataset_name)
+        if data_path.is_dir():
+            train_file = data_path / "train.jsonl"
+            dataset = load_dataset("json", data_files=str(train_file), split="train")
+        else:
+            dataset = load_dataset("json", data_files=dataset_name, split="train")
+    else:
+        dataset = load_dataset(dataset_name, split=cfg["dataset"]["split"])
     print(f"Dataset loaded: {len(dataset)} examples")
 
     split = dataset.train_test_split(test_size=cfg["dataset"]["eval_split"], seed=42)
@@ -56,11 +68,15 @@ def cmd_sft(args):
     eval_dataset = split["test"]
     print(f"  Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
 
+    # Check if output looks like a HF Hub path (contains /)
+    output_name = cfg["model"]["output"]
+    push_to_hub = "/" in output_name
+
     config = SFTConfig(
-        output_dir=cfg["model"]["output"].split("/")[-1],
-        push_to_hub=True,
-        hub_model_id=cfg["model"]["output"],
-        hub_strategy="every_save",
+        output_dir=output_name.split("/")[-1] if push_to_hub else output_name,
+        push_to_hub=push_to_hub,
+        hub_model_id=output_name if push_to_hub else None,
+        hub_strategy="every_save" if push_to_hub else "end",
 
         num_train_epochs=cfg["training"]["epochs"],
         per_device_train_batch_size=cfg["training"]["batch_size"],
@@ -78,9 +94,7 @@ def cmd_sft(args):
         warmup_ratio=cfg["training"]["warmup_ratio"],
         lr_scheduler_type=cfg["training"]["lr_scheduler"],
 
-        report_to="trackio",
-        project=cfg["tracking"]["project"],
-        run_name=cfg["tracking"]["run_name"],
+        report_to="none",  # Disable tracking for local training
     )
 
     peft_config = LoraConfig(
@@ -104,10 +118,13 @@ def cmd_sft(args):
     print("Starting SFT training...")
     trainer.train()
 
-    print("Pushing to Hub...")
-    trainer.push_to_hub()
-    trackio.finish()
-    print(f"Done! Model: https://huggingface.co/{cfg['model']['output']}")
+    if push_to_hub:
+        print("Pushing to Hub...")
+        trainer.push_to_hub()
+        print(f"Done! Model: https://huggingface.co/{output_name}")
+    else:
+        trainer.save_model()
+        print(f"Done! Model saved to: {output_name}")
 
 
 def cmd_grpo(args):

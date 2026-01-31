@@ -1,8 +1,8 @@
 {
   "dataset_name": "qmd-query-expansion",
-  "train_samples": 5562,
-  "val_samples": 618,
-  "short_query_pct": 26.5,
+  "train_samples": 1891,
+  "val_samples": 211,
+  "short_query_pct": 33.6,
   "columns": [
     "prompt",
     "completion",

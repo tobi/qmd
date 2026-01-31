@@ -13,40 +13,471 @@ except ImportError:
     print("Install anthropic: pip install anthropic")
     exit(1)
 
-# Sample query templates for diverse training data
+# Sample query templates for diverse training data - organized by category
 QUERY_TEMPLATES = [
-    # Technical documentation
+    # === Technical documentation (35% of queries) ===
     "how to {action} {technology}",
     "{technology} {concept} example",
     "configure {technology} for {use_case}",
     "{error_type} error in {technology}",
     "best practices for {concept}",
-
-    # Personal notes / journals
+    "{technology} vs {technology2}",
+    "{action} {technology} {use_case}",
+    "setup {technology} {use_case}",
+    "{technology} tutorial for beginners",
+    "{technology} documentation",
+    "{technology} {error_type} troubleshooting",
+    "{concept} in {technology}",
+    "migrate from {technology} to {technology2}",
+    "{action} {concept} {technology}",
+    # === Personal notes / journals (15% of queries) ===
     "meeting notes {topic}",
     "ideas for {project}",
     "{date} journal entry",
     "thoughts on {topic}",
-
-    # Research / learning
+    "{project} {topic} notes",
+    "{topic} meeting {date}",
+    "reflect on {topic}",
+    "brainstorm {project}",
+    # === Research / learning (20% of queries) ===
     "what is {concept}",
     "difference between {thing1} and {thing2}",
     "{topic} tutorial",
     "learn {skill}",
-
-    # Short queries
+    "understand {concept}",
+    "explain {concept}",
+    "{topic} fundamentals",
+    "intro to {skill}",
+    "{thing1} or {thing2}",
+    "when to use {concept}",
+    # === Short / keyword queries (15% of queries) ===
     "{keyword}",
     "{keyword} {modifier}",
+    "{keyword} {action}",
+    "{keyword} {use_case}",
+    "{technology} {keyword}",
+    "{concept} {keyword}",
+    # === Temporal / recency queries (10% of queries) ===
+    "latest {topic}",
+    "recent {concept} changes",
+    "new {technology} features",
+    "{topic} update {date}",
+    "what changed in {technology}",
+    "{technology} changelog {date}",
+    "{topic} news {date}",
+    # === Named entities / specific topics (5% of queries) ===
+    "{named_entity} {topic}",
+    "{person} {concept}",
+    "{organization} {use_case}",
+    "{product} {action}",
 ]
 
-ACTIONS = ["install", "configure", "setup", "debug", "deploy", "test", "optimize", "migrate"]
-TECHNOLOGIES = ["python", "typescript", "react", "docker", "kubernetes", "postgres", "redis", "nginx", "git", "linux"]
-CONCEPTS = ["authentication", "caching", "logging", "testing", "deployment", "API", "database", "security"]
-USE_CASES = ["production", "development", "CI/CD", "local", "cloud"]
-ERROR_TYPES = ["connection", "timeout", "permission", "memory", "syntax"]
-TOPICS = ["productivity", "workflow", "architecture", "design", "performance"]
-KEYWORDS = ["auth", "config", "setup", "api", "data", "cache", "log", "test"]
-MODIFIERS = ["best", "fast", "simple", "advanced", "secure"]
+# Category weights for balanced sampling
+TEMPLATE_CATEGORIES = {
+    "technical": list(range(0, 14)),  # 0-13
+    "personal": list(range(14, 22)),  # 14-21
+    "research": list(range(22, 31)),  # 22-30
+    "short": list(range(31, 36)),  # 31-35
+    "temporal": list(range(36, 42)),  # 36-41
+    "entities": list(range(42, 46)),  # 42-45
+}
+
+ACTIONS = [
+    "install",
+    "configure",
+    "setup",
+    "debug",
+    "deploy",
+    "test",
+    "optimize",
+    "migrate",
+    "build",
+    "run",
+    "lint",
+    "format",
+    "backup",
+    "restore",
+    "update",
+    "rollback",
+    "monitor",
+    "scale",
+    "secure",
+    "integrate",
+    "automate",
+    "refactor",
+    "initialize",
+]
+
+TECHNOLOGIES = [
+    # Languages
+    "python",
+    "typescript",
+    "javascript",
+    "rust",
+    "golang",
+    "java",
+    "kotlin",
+    "swift",
+    "ruby",
+    "php",
+    "cpp",
+    "c",
+    "elixir",
+    "scala",
+    "clojure",
+    "dart",
+    # Frameworks/Frontend
+    "react",
+    "vue",
+    "angular",
+    "svelte",
+    "solid",
+    "htmx",
+    "alpine",
+    "nextjs",
+    "nuxt",
+    # Backend
+    "django",
+    "flask",
+    "fastapi",
+    "express",
+    "rails",
+    "spring",
+    "laravel",
+    # Infrastructure
+    "docker",
+    "kubernetes",
+    "terraform",
+    "ansible",
+    "jenkins",
+    "github-actions",
+    # Databases
+    "postgres",
+    "mysql",
+    "mongodb",
+    "redis",
+    "elasticsearch",
+    "sqlite",
+    "dynamodb",
+    "cassandra",
+    "cockroachdb",
+    "supabase",
+    "firebase",
+    # Tools
+    "git",
+    "nginx",
+    "apache",
+    "linux",
+    "aws",
+    "gcp",
+    "azure",
+    "vercel",
+    "netlify",
+    # Data/ML
+    "pandas",
+    "numpy",
+    "tensorflow",
+    "pytorch",
+    "scikit-learn",
+    "jupyter",
+    "spark",
+    "kafka",
+    "airflow",
+    "dbt",
+]
+
+TECHNOLOGIES_2 = [
+    "docker",
+    "kubernetes",
+    "postgres",
+    "mysql",
+    "redis",
+    "mongodb",
+    "aws",
+    "gcp",
+    "react",
+    "vue",
+    "angular",
+    "python",
+    "javascript",
+    "typescript",
+    "github-actions",
+    "gitlab-ci",
+    "jenkins",
+    "terraform",
+    "ansible",
+]
+
+CONCEPTS = [
+    "authentication",
+    "caching",
+    "logging",
+    "testing",
+    "deployment",
+    "API",
+    "database",
+    "security",
+    "monitoring",
+    "performance",
+    "scalability",
+    "reliability",
+    "observability",
+    "microservices",
+    "serverless",
+    "virtualization",
+    "containerization",
+    "orchestration",
+    "CI/CD",
+    "version control",
+    "dependency injection",
+    "event sourcing",
+    "CQRS",
+    "load balancing",
+    "rate limiting",
+    "circuit breaker",
+    "retry logic",
+    "idempotency",
+]
+
+USE_CASES = [
+    "production",
+    "development",
+    "CI/CD",
+    "local",
+    "cloud",
+    "staging",
+    "testing",
+    "microservices",
+    "serverless",
+    "hybrid",
+    "multi-tenant",
+    "high-availability",
+    "real-time",
+    "batch processing",
+    "stream processing",
+    "data pipeline",
+]
+
+ERROR_TYPES = [
+    "connection",
+    "timeout",
+    "permission",
+    "memory",
+    "syntax",
+    "runtime",
+    "configuration",
+    "dependency",
+    "network",
+    "authentication",
+    "authorization",
+    "validation",
+    "concurrency",
+    "deadlock",
+    "resource",
+    "quota",
+]
+
+TOPICS = [
+    "productivity",
+    "workflow",
+    "architecture",
+    "design",
+    "performance",
+    "security",
+    "scalability",
+    "reliability",
+    "observability",
+    "maintainability",
+    "testing",
+    "documentation",
+    "refactoring",
+    "debugging",
+    "optimization",
+    "best practices",
+    "patterns",
+    "anti-patterns",
+    "trade-offs",
+    "decision making",
+]
+
+KEYWORDS = [
+    "auth",
+    "config",
+    "setup",
+    "api",
+    "cache",
+    "log",
+    "test",
+    "debug",
+    "env",
+    "vars",
+    "secrets",
+    "tokens",
+    "headers",
+    "params",
+    "query",
+    "body",
+    "route",
+    "middleware",
+    "handler",
+    "controller",
+    "model",
+    "view",
+    "template",
+    "migration",
+    "seed",
+    "fixture",
+    "mock",
+    "stub",
+    "spy",
+    "fake",
+    "build",
+    "bundle",
+    "compile",
+    "transpile",
+    "minify",
+    "optimize",
+    "deploy",
+    "release",
+    "rollback",
+    "promote",
+    "freeze",
+    "thaw",
+    "pull",
+    "push",
+    "commit",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "stash",
+    "up",
+    "down",
+    "scale",
+    "restart",
+    "reload",
+    "refresh",
+    "flush",
+    "cron",
+    "queue",
+    "job",
+    "worker",
+    "scheduler",
+    "trigger",
+    "webhook",
+    "alert",
+    "metric",
+    "trace",
+    "span",
+    "event",
+    "incident",
+    "oncall",
+]
+
+MODIFIERS = [
+    "best",
+    "fast",
+    "simple",
+    "advanced",
+    "secure",
+    "quick",
+    "easy",
+    "proper",
+    "correct",
+    "safe",
+    "efficient",
+    "reliable",
+    "robust",
+    "latest",
+    "recent",
+    "new",
+    "old",
+    "legacy",
+    "modern",
+    "local",
+    "remote",
+    "global",
+    "shared",
+    "private",
+    "public",
+]
+
+NAMED_ENTITIES = [
+    "React",
+    "Vue",
+    "Angular",
+    "Docker",
+    "Kubernetes",
+    "AWS",
+    "GCP",
+    "GitHub",
+    "GitLab",
+    "Vercel",
+    "Netlify",
+    "Supabase",
+    "Firebase",
+    "Stripe",
+    "Twilio",
+    "SendGrid",
+    "Datadog",
+    "PagerDuty",
+    "Sentry",
+    "Terraform",
+    "Ansible",
+    "Jenkins",
+    "CircleCI",
+    "TravisCI",
+]
+
+PERSONS = [
+    "Kent Beck",
+    "Martin Fowler",
+    "Robert Martin",
+    "Dave Thomas",
+    "Guido van Rossum",
+    "Brendan Eich",
+    "Ryan Dahl",
+    "Anders Hejlsberg",
+    "Linus Torvalds",
+    "DHH",
+    "Yukihiro Matsumoto",
+    "Rich Hickey",
+]
+
+ORGANIZATIONS = [
+    "Google",
+    "Microsoft",
+    "Amazon",
+    "Meta",
+    "Apple",
+    "Netflix",
+    "Spotify",
+    "Stripe",
+    "Shopify",
+    "Airbnb",
+    "Uber",
+    "Lyft",
+    "Slack",
+    "Discord",
+]
+
+PRODUCTS = [
+    "VS Code",
+    "IntelliJ",
+    "PyCharm",
+    "WebStorm",
+    "DataGrip",
+    "Postman",
+    "Insomnia",
+    "TablePlus",
+    "Docker Desktop",
+    "Lens",
+    "Figma",
+    "Sketch",
+    "Notion",
+    "Linear",
+    "Jira",
+    "Trello",
+]
 
 SYSTEM_PROMPT = """You are a search query optimization expert for a markdown document search system called QMD.
 
@@ -90,24 +521,72 @@ Query: {query}
 Respond with ONLY the lex/vec/hyde lines, nothing else."""
 
 
-def generate_random_query() -> str:
-    """Generate a random query from templates."""
-    template = random.choice(QUERY_TEMPLATES)
+# Category weights - BALANCED approach
+# Tech at 15% (reasonable for QMD's technical document use case)
+CATEGORY_WEIGHTS = {
+    "technical": 0.15,  # 15% - Technical documentation
+    "personal": 0.10,  # 10% - Personal notes, journals
+    "research": 0.10,  # 10% - Research and learning
+    "short": 0.15,  # 15% - Short keyword queries
+    "temporal": 0.10,  # 10% - Temporal/recency queries (2025/2026)
+    "entities": 0.05,  # 5% - Named entity queries
+    "health": 0.10,  # 10% - Health & wellness
+    "finance": 0.10,  # 10% - Finance & business
+    "lifestyle": 0.10,  # 10% - Home, food, hobbies, travel
+    "education": 0.05,  # 5% - Education & arts
+}
 
+
+def generate_random_query() -> str:
+    """Generate a random query from templates with category-weighted sampling."""
+    # Select category based on weights
+    categories = list(CATEGORY_WEIGHTS.keys())
+    weights = list(CATEGORY_WEIGHTS.values())
+    selected_category = random.choices(categories, weights=weights, k=1)[0]
+
+    # Select template from that category
+    template_idx = random.choice(TEMPLATE_CATEGORIES[selected_category])
+    template = QUERY_TEMPLATES[template_idx]
+
+    # Build replacements based on template type
     replacements = {
         "{action}": random.choice(ACTIONS),
         "{technology}": random.choice(TECHNOLOGIES),
+        "{technology2}": random.choice(TECHNOLOGIES_2),
         "{concept}": random.choice(CONCEPTS),
         "{use_case}": random.choice(USE_CASES),
         "{error_type}": random.choice(ERROR_TYPES),
         "{topic}": random.choice(TOPICS),
-        "{project}": random.choice(["website", "app", "CLI tool", "API", "library"]),
-        "{date}": random.choice(["2024-01", "2024-06", "yesterday", "today"]),
-        "{thing1}": random.choice(CONCEPTS[:4]),
-        "{thing2}": random.choice(CONCEPTS[4:]),
+        "{project}": random.choice(
+            ["website", "app", "CLI tool", "API", "library", "service", "platform"]
+        ),
+        "{date}": random.choice(
+            # Emphasize 2025/2026 for recency queries (current era)
+            [
+                "2026",
+                "2026",
+                "2025",
+                "2025",
+                "January 2026",
+                "February 2026",
+                "March 2026",
+                "last month",
+                "this week",
+                "yesterday",
+                "today",
+                "recently",
+                "latest",
+            ]
+        ),
+        "{thing1}": random.choice(CONCEPTS[:10]),
+        "{thing2}": random.choice(CONCEPTS[10:] if len(CONCEPTS) > 10 else CONCEPTS),
         "{skill}": random.choice(TECHNOLOGIES),
         "{keyword}": random.choice(KEYWORDS),
         "{modifier}": random.choice(MODIFIERS),
+        "{named_entity}": random.choice(NAMED_ENTITIES),
+        "{person}": random.choice(PERSONS),
+        "{organization}": random.choice(ORGANIZATIONS),
+        "{product}": random.choice(PRODUCTS),
     }
 
     query = template
@@ -126,7 +605,7 @@ def generate_expansion(client: anthropic.Anthropic, query: str) -> str | None:
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": USER_PROMPT_TEMPLATE.format(query=query)}
-            ]
+            ],
         )
         return response.content[0].text.strip()
     except Exception as e:
@@ -160,10 +639,21 @@ def validate_output(output: str) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate QMD query expansion training data")
-    parser.add_argument("--count", type=int, default=100, help="Number of examples to generate")
-    parser.add_argument("--output", type=str, default="data/qmd_expansion.jsonl", help="Output file path")
-    parser.add_argument("--queries", type=str, help="Optional file with custom queries (one per line)")
+    parser = argparse.ArgumentParser(
+        description="Generate QMD query expansion training data"
+    )
+    parser.add_argument(
+        "--count", type=int, default=100, help="Number of examples to generate"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="data/qmd_expansion.jsonl",
+        help="Output file path",
+    )
+    parser.add_argument(
+        "--queries", type=str, help="Optional file with custom queries (one per line)"
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")

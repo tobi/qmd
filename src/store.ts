@@ -21,6 +21,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
+  type ILLMSession,
 } from "./llm";
 import {
   findContextForPath as collectionsFindContextForPath,
@@ -63,25 +64,171 @@ export function homedir(): string {
   return HOME;
 }
 
+/**
+ * Check if a path is absolute.
+ * Supports:
+ * - Unix paths: /path/to/file
+ * - Windows native: C:\path or C:/path
+ * - Git Bash: /c/path or /C/path (C-Z drives, excluding A/B floppy drives)
+ * 
+ * Note: /c without trailing slash is treated as Unix path (directory named "c"),
+ * while /c/ or /c/path are treated as Git Bash paths (C: drive).
+ */
+export function isAbsolutePath(path: string): boolean {
+  if (!path) return false;
+  
+  // Unix absolute path
+  if (path.startsWith('/')) {
+    // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
+    // Requires path[2] === '/' to distinguish from Unix paths like /c or /cache
+    if (path.length >= 3 && path[2] === '/') {
+      const driveLetter = path[1];
+      if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+        return true;
+      }
+    }
+    // Any other path starting with / is Unix absolute
+    return true;
+  }
+  
+  // Windows native path: C:\ or C:/ (any letter A-Z)
+  if (path.length >= 2 && /[a-zA-Z]/.test(path[0]!) && path[1] === ':') {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Normalize path separators to forward slashes.
+ * Converts Windows backslashes to forward slashes.
+ */
+export function normalizePathSeparators(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+/**
+ * Get the relative path from a prefix.
+ * Returns null if path is not under prefix.
+ * Returns empty string if path equals prefix.
+ */
+export function getRelativePathFromPrefix(path: string, prefix: string): string | null {
+  // Empty prefix is invalid
+  if (!prefix) {
+    return null;
+  }
+  
+  const normalizedPath = normalizePathSeparators(path);
+  const normalizedPrefix = normalizePathSeparators(prefix);
+  
+  // Ensure prefix ends with / for proper matching
+  const prefixWithSlash = !normalizedPrefix.endsWith('/') 
+    ? normalizedPrefix + '/' 
+    : normalizedPrefix;
+  
+  // Exact match
+  if (normalizedPath === normalizedPrefix) {
+    return '';
+  }
+  
+  // Check if path starts with prefix
+  if (normalizedPath.startsWith(prefixWithSlash)) {
+    return normalizedPath.slice(prefixWithSlash.length);
+  }
+  
+  return null;
+}
+
 export function resolve(...paths: string[]): string {
   if (paths.length === 0) {
     throw new Error("resolve: at least one path segment is required");
   }
-  let result = paths[0]!.startsWith('/') ? '' : Bun.env.PWD || process.cwd();
-  for (const p of paths) {
-    if (p.startsWith('/')) {
-      result = p;
+  
+  // Normalize all paths to use forward slashes
+  const normalizedPaths = paths.map(normalizePathSeparators);
+  
+  let result = '';
+  let windowsDrive = '';
+  
+  // Check if first path is absolute
+  const firstPath = normalizedPaths[0]!;
+  if (isAbsolutePath(firstPath)) {
+    result = firstPath;
+    
+    // Extract Windows drive letter if present
+    if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
+      windowsDrive = firstPath.slice(0, 2);
+      result = firstPath.slice(2);
+    } else if (firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
+      // Git Bash style: /c/ -> C: (C-Z drives only, not A or B)
+      const driveLetter = firstPath[1];
+      if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+        windowsDrive = driveLetter.toUpperCase() + ':';
+        result = firstPath.slice(2);
+      }
+    }
+  } else {
+    // Start with PWD or cwd, then append the first relative path
+    const pwd = normalizePathSeparators(Bun.env.PWD || process.cwd());
+    
+    // Extract Windows drive from PWD if present
+    if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
+      windowsDrive = pwd.slice(0, 2);
+      result = pwd.slice(2) + '/' + firstPath;
     } else {
+      result = pwd + '/' + firstPath;
+    }
+  }
+  
+  // Process remaining paths
+  for (let i = 1; i < normalizedPaths.length; i++) {
+    const p = normalizedPaths[i]!;
+    if (isAbsolutePath(p)) {
+      // Absolute path replaces everything
+      result = p;
+      
+      // Update Windows drive if present
+      if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
+        windowsDrive = p.slice(0, 2);
+        result = p.slice(2);
+      } else if (p.startsWith('/') && p.length >= 3 && p[2] === '/') {
+        // Git Bash style (C-Z drives only, not A or B)
+        const driveLetter = p[1];
+        if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
+          windowsDrive = driveLetter.toUpperCase() + ':';
+          result = p.slice(2);
+        } else {
+          windowsDrive = '';
+        }
+      } else {
+        windowsDrive = '';
+      }
+    } else {
+      // Relative path - append
       result = result + '/' + p;
     }
   }
+  
+  // Normalize . and .. components
   const parts = result.split('/').filter(Boolean);
   const normalized: string[] = [];
   for (const part of parts) {
-    if (part === '..') normalized.pop();
-    else if (part !== '.') normalized.push(part);
+    if (part === '..') {
+      normalized.pop();
+    } else if (part !== '.') {
+      normalized.push(part);
+    }
   }
-  return '/' + normalized.join('/');
+  
+  // Build final path
+  const finalPath = '/' + normalized.join('/');
+  
+  // Prepend Windows drive if present
+  if (windowsDrive) {
+    return windowsDrive + finalPath;
+  }
+  
+  return finalPath;
 }
 
 // Flag to indicate production mode (set by qmd.ts at startup)
@@ -473,7 +620,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<string[]>;
@@ -556,7 +703,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -891,17 +1038,36 @@ export async function hashContent(content: string): Promise<string> {
   return hash.digest("hex");
 }
 
-export function extractTitle(content: string, filename: string): string {
-  const match = content.match(/^##?\s+(.+)$/m);
-  if (match) {
-    const title = (match[1] ?? "").trim();
-    if (title === "📝 Notes" || title === "Notes") {
-      const nextMatch = content.match(/^##\s+(.+)$/m);
-      if (nextMatch?.[1]) return nextMatch[1].trim();
+const titleExtractors: Record<string, (content: string) => string | null> = {
+  '.md': (content) => {
+    const match = content.match(/^##?\s+(.+)$/m);
+    if (match) {
+      const title = (match[1] ?? "").trim();
+      if (title === "📝 Notes" || title === "Notes") {
+        const nextMatch = content.match(/^##\s+(.+)$/m);
+        if (nextMatch?.[1]) return nextMatch[1].trim();
+      }
+      return title;
     }
-    return title;
+    return null;
+  },
+  '.org': (content) => {
+    const titleProp = content.match(/^#\+TITLE:\s*(.+)$/im);
+    if (titleProp?.[1]) return titleProp[1].trim();
+    const heading = content.match(/^\*+\s+(.+)$/m);
+    if (heading?.[1]) return heading[1].trim();
+    return null;
+  },
+};
+
+export function extractTitle(content: string, filename: string): string {
+  const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
+  const extractor = titleExtractors[ext];
+  if (extractor) {
+    const title = extractor(content);
+    if (title) return title;
   }
-  return filename.replace(/\.md$/, "").split("/").pop() || filename;
+  return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
 }
 
 // =============================================================================
@@ -1735,11 +1901,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true);
+  const embedding = await getEmbedding(query, model, true, session);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -1778,9 +1944,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionId) {
+  if (collectionName) {
     docSql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+    params.push(collectionName);
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -1825,11 +1991,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
-  const llm = getDefaultLlamaCpp();
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = await llm.embed(formattedText, { model, isQuery });
+  const result = session
+    ? await session.embed(formattedText, { model, isQuery })
+    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 

@@ -26,6 +26,10 @@ from collections import Counter
 # Constants
 # =============================================================================
 
+# "only:" mode patterns - when query ends with these, expect only that type
+# Format: "query /only:lex" (slash prefix, no space after colon)
+ONLY_MODE_PATTERN = re.compile(r'\s+/only:(lex|vec|hyde)\s*$', re.IGNORECASE)
+
 STOPWORDS = frozenset({
     'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
     'and', 'or', 'it', 'this', 'that', 'be', 'with', 'as', 'on', 'by',
@@ -70,6 +74,19 @@ def parse_expansion(text: str) -> dict:
         else:
             result["invalid"].append(line)
     return result
+
+
+def detect_only_mode(query: str) -> tuple[str | None, str]:
+    """Detect if query ends with 'only: lex/vec/hyde'.
+    
+    Returns (only_type, base_query) where only_type is None for normal queries.
+    """
+    match = ONLY_MODE_PATTERN.search(query)
+    if match:
+        only_type = match.group(1).lower()
+        base_query = query[:match.start()].strip()
+        return only_type, base_query
+    return None, query
 
 
 def clean_model_output(text: str) -> tuple[str, bool]:
@@ -195,10 +212,148 @@ def word_repetition_penalty(text: str) -> int:
 # Scoring
 # =============================================================================
 
+def _score_only_mode(query: str, base_query: str, text: str, used_thinking: bool, only_type: str) -> dict:
+    """Score an 'only:' mode expansion. Expects ONLY the requested type."""
+    parsed = parse_expansion(text)
+    deductions = []
+    
+    # Expected type must be present
+    expected_items = parsed.get(only_type, [])
+    if not expected_items:
+        return {
+            "format": 0, "diversity": 0, "hyde": 0, "quality": 0, "entity": 0,
+            "think_bonus": 0, "total": 0, "max_possible": 100,
+            "percentage": 0.0, "rating": "Failed",
+            "deductions": [f"missing expected {only_type}: output"],
+            "parsed": parsed,
+            "entities_detected": [],
+            "only_mode": only_type,
+        }
+    
+    # Penalize presence of OTHER types
+    other_types = {"lex", "vec", "hyde"} - {only_type}
+    unwanted_count = sum(len(parsed.get(t, [])) for t in other_types)
+    if unwanted_count > 0:
+        deductions.append(f"contains unwanted types (expected only {only_type})")
+    
+    # --- Format (0-30) ---
+    format_score = 30 if unwanted_count == 0 else max(0, 30 - unwanted_count * 10)
+    
+    # --- Diversity (0-30) ---
+    diversity_score = 0
+    if len(expected_items) >= 2:
+        diversity_score += 15
+        # Check for diversity among items
+        div_score = 15
+        for i, a in enumerate(expected_items):
+            for b in expected_items[i+1:]:
+                if not is_diverse(a, b, 2):
+                    div_score -= 5
+                    deductions.append(f"{only_type} duplicate: {a[:20]}...")
+        diversity_score += max(0, div_score)
+    elif len(expected_items) == 1:
+        diversity_score = 15  # One item is fine for single-type output
+    
+    # Check for echoes
+    for exp in expected_items:
+        if echoes_query(exp, base_query):
+            diversity_score -= 5
+            deductions.append(f"echoes query: {exp[:20]}...")
+    diversity_score = max(0, diversity_score)
+    
+    # --- Type-specific quality (0-20) ---
+    quality_score = 10  # base
+    entities = extract_named_entities(base_query)
+    
+    if only_type == "lex":
+        # Lex should be short keyword phrases with key terms
+        with_terms = sum(1 for l in expected_items if lex_preserves_key_terms(l, base_query))
+        if with_terms == len(expected_items):
+            quality_score += 5
+        # Check for generic phrases
+        generic = sum(1 for l in expected_items if lex_is_generic(l))
+        if generic == 0:
+            quality_score += 5
+        else:
+            deductions.append(f"{generic} generic lex phrases")
+    
+    elif only_type == "vec":
+        # Vec should be natural language sentences
+        natural = sum(1 for v in expected_items if " " in v and len(v) > 15)
+        if natural == len(expected_items):
+            quality_score += 10
+        else:
+            quality_score += 5
+            deductions.append("vec not all natural language")
+    
+    elif only_type == "hyde":
+        # Hyde should be a document snippet (50-200 chars)
+        hyde_text = expected_items[0]
+        hyde_len = len(hyde_text)
+        if 50 <= hyde_len <= 200:
+            quality_score += 10
+        elif 30 <= hyde_len <= 300:
+            quality_score += 5
+            deductions.append(f"hyde length {hyde_len} (ideal: 50-200)")
+        else:
+            deductions.append(f"hyde length {hyde_len} out of range")
+    
+    # --- Entity preservation (0-20) ---
+    entity_score = 10  # base
+    if entities:
+        with_entities = sum(1 for item in expected_items if lex_preserves_entities(item, entities))
+        if with_entities == len(expected_items):
+            entity_score += 10
+        elif with_entities > 0:
+            entity_score += 5
+        else:
+            entity_score = 0
+            deductions.append(f"missing entities: {entities}")
+    
+    # --- Think bonus (0-20) ---
+    think_bonus = 0 if used_thinking else 20
+    
+    # --- Total ---
+    total = format_score + diversity_score + quality_score + entity_score + think_bonus
+    max_possible = 120
+    percentage = max(0.0, min(100.0, total / max_possible * 100))
+    
+    if percentage >= 80:
+        rating = "Excellent"
+    elif percentage >= 60:
+        rating = "Good"
+    elif percentage >= 40:
+        rating = "Acceptable"
+    elif percentage >= 20:
+        rating = "Poor"
+    else:
+        rating = "Failed"
+    
+    return {
+        "format": format_score,
+        "diversity": diversity_score,
+        "hyde": 0,  # not used in only mode (quality covers it)
+        "quality": quality_score,
+        "entity": entity_score,
+        "think_bonus": think_bonus,
+        "total": total,
+        "max_possible": max_possible,
+        "percentage": round(percentage, 1),
+        "rating": rating,
+        "deductions": deductions,
+        "parsed": parsed,
+        "entities_detected": list(entities) if entities else [],
+        "only_mode": only_type,
+    }
+
+
 def score_expansion_detailed(query: str, expansion: str) -> dict:
     """Score an expansion with full breakdown. Returns dict with all dimensions."""
     text, used_thinking = clean_model_output(expansion.strip())
     deductions = []
+
+    # Detect "only:" mode
+    only_type, base_query = detect_only_mode(query)
 
     def _fail(reason):
         return {
@@ -208,6 +363,7 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
             "deductions": [reason],
             "parsed": parse_expansion(expansion),
             "entities_detected": [],
+            "only_mode": only_type,
         }
 
     # Hard fail: remaining chat template tokens
@@ -219,6 +375,10 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
         line = line.strip()
         if line and not line.startswith(("lex:", "vec:", "hyde:")):
             return _fail(f"INVALID LINE: {line[:50]}")
+
+    # --- Handle "only:" mode separately ---
+    if only_type:
+        return _score_only_mode(query, base_query, text, used_thinking, only_type)
 
     parsed = parse_expansion(text)
 
@@ -364,6 +524,7 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
         "deductions": deductions,
         "parsed": parsed,
         "entities_detected": list(entities) if entities else [],
+        "only_mode": None,
     }
 
 
@@ -417,12 +578,19 @@ if __name__ == "__main__":
         ("how to use React hooks", "lex: React hooks tutorial\nlex: useEffect useState\nvec: how to use React hooks in functional components"),
         ("auth", "<think>Let me think...</think>\nlex: auth"),
         ("auth", "lex: auth\nThis is some explanation\nvec: more"),
+        # "/only:" mode tests (slash prefix)
+        ("auth /only:lex", "lex: auth setup\nlex: authentication config\nlex: login credentials"),
+        ("auth /only:lex", "lex: auth setup\nvec: how to configure authentication"),  # should fail - has vec
+        ("React hooks /only:vec", "vec: how to use React hooks in functional components\nvec: useState and useEffect patterns in React"),
+        ("PostgreSQL indexing /only:hyde", "hyde: PostgreSQL uses B-tree indexes by default. Create indexes with CREATE INDEX idx_name ON table(column). EXPLAIN ANALYZE shows whether queries use indexes efficiently."),
     ]
 
     for query, expansion in tests:
         score = score_expansion(query, expansion)
         detail = score_expansion_detailed(query, expansion)
-        print(f"\n  Query: '{query}'")
+        only_mode = detail.get("only_mode")
+        mode_str = f" [only:{only_mode}]" if only_mode else ""
+        print(f"\n  Query: '{query}'{mode_str}")
         print(f"  Score: {score:.2f} ({detail['rating']})")
         if detail["deductions"]:
             print(f"  Issues: {', '.join(detail['deductions'][:3])}")
