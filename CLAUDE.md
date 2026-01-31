@@ -1,4 +1,4 @@
-# QMD - Quick Markdown Search
+# QMD - Query Markup Documents
 
 Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 
