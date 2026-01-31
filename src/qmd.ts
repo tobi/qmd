@@ -65,7 +65,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -2316,6 +2316,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      refresh: { type: "boolean" },
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2594,6 +2595,26 @@ if (import.meta.main) {
     case "embed":
       await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
       break;
+
+    case "pull": {
+      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const models = [
+        DEFAULT_EMBED_MODEL_URI,
+        DEFAULT_GENERATE_MODEL_URI,
+        DEFAULT_RERANK_MODEL_URI,
+      ];
+      console.log(`${c.bold}Pulling models${c.reset}`);
+      const results = await pullModels(models, {
+        refresh,
+        cacheDir: DEFAULT_MODEL_CACHE_DIR,
+      });
+      for (const result of results) {
+        const size = formatBytes(result.sizeBytes);
+        const note = result.refreshed ? "refreshed" : "cached/checked";
+        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      }
+      break;
+    }
 
     case "search":
       if (!cli.query) {
