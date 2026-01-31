@@ -5,7 +5,7 @@
 
 model:
   base: "Qwen/Qwen3-1.7B"
-  output: "tobil/qmd-query-expansion-1.7B-sft"
+  output: "outputs/sft"  # Local training output (push to HF manually after eval)
 
 dataset:
   name: "tobil/qmd-query-expansion-train-v2"

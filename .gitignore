@@ -9,3 +9,6 @@ texts/
 !README.md
 !CLAUDE.md
 !skills/**/*.md
+!finetune/*.md
+finetune/outputs/
+finetune/data/train/
