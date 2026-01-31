@@ -27,7 +27,8 @@ from collections import Counter
 # =============================================================================
 
 # "only:" mode patterns - when query ends with these, expect only that type
-ONLY_MODE_PATTERN = re.compile(r'\s+only:\s*(lex|vec|hyde)\s*$', re.IGNORECASE)
+# Format: "query only:lex" (no space after colon)
+ONLY_MODE_PATTERN = re.compile(r'\s+only:(lex|vec|hyde)\s*$', re.IGNORECASE)
 
 STOPWORDS = frozenset({
     'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
@@ -577,11 +578,11 @@ if __name__ == "__main__":
         ("how to use React hooks", "lex: React hooks tutorial\nlex: useEffect useState\nvec: how to use React hooks in functional components"),
         ("auth", "<think>Let me think...</think>\nlex: auth"),
         ("auth", "lex: auth\nThis is some explanation\nvec: more"),
-        # "only:" mode tests
-        ("auth only: lex", "lex: auth setup\nlex: authentication config\nlex: login credentials"),
-        ("auth only: lex", "lex: auth setup\nvec: how to configure authentication"),  # should fail - has vec
-        ("React hooks only: vec", "vec: how to use React hooks in functional components\nvec: useState and useEffect patterns in React"),
-        ("PostgreSQL indexing only: hyde", "hyde: PostgreSQL uses B-tree indexes by default. Create indexes with CREATE INDEX idx_name ON table(column). EXPLAIN ANALYZE shows whether queries use indexes efficiently."),
+        # "only:" mode tests (no space after colon)
+        ("auth only:lex", "lex: auth setup\nlex: authentication config\nlex: login credentials"),
+        ("auth only:lex", "lex: auth setup\nvec: how to configure authentication"),  # should fail - has vec
+        ("React hooks only:vec", "vec: how to use React hooks in functional components\nvec: useState and useEffect patterns in React"),
+        ("PostgreSQL indexing only:hyde", "hyde: PostgreSQL uses B-tree indexes by default. Create indexes with CREATE INDEX idx_name ON table(column). EXPLAIN ANALYZE shows whether queries use indexes efficiently."),
     ]
 
     for query, expansion in tests:

@@ -20,59 +20,438 @@ from transformers import AutoTokenizer
 
 _tokenizer = None
 
+
 def get_tokenizer():
     global _tokenizer
     if _tokenizer is None:
         _tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     return _tokenizer
 
-# Short single-word queries that need proper expansion examples
+
+# Short single-word queries that need proper expansion examples - organized by category
 SHORT_QUERIES = [
-    # Technical keywords
-    "auth", "config", "setup", "api", "cache", "log", "test", "debug",
-    "deploy", "build", "lint", "format", "migrate", "backup", "restore",
-    "docker", "git", "npm", "pip", "brew", "curl", "ssh", "ssl", "tls",
-    "cors", "csrf", "jwt", "oauth", "saml", "ldap", "rbac", "acl",
-    "crud", "rest", "graphql", "grpc", "websocket", "sse", "http",
-    "redis", "mongo", "postgres", "mysql", "sqlite", "elastic", "kafka",
-    "nginx", "apache", "caddy", "traefik", "haproxy", "envoy",
-    "react", "vue", "angular", "svelte", "solid", "htmx", "alpine",
-    "node", "deno", "bun", "python", "rust", "golang", "java", "kotlin",
-    "webpack", "vite", "esbuild", "rollup", "parcel", "turbopack",
-    "jest", "vitest", "pytest", "mocha", "cypress", "playwright",
-    # Common short phrases
-    "env vars", "api keys", "error handling", "rate limiting",
-    "file upload", "user auth", "db connection", "query params",
-    "hot reload", "code split", "tree shake", "lazy load",
+    # === Programming Languages & Runtimes ===
+    "python",
+    "typescript",
+    "javascript",
+    "rust",
+    "golang",
+    "java",
+    "kotlin",
+    "swift",
+    "ruby",
+    "php",
+    "cpp",
+    "c",
+    "elixir",
+    "scala",
+    "clojure",
+    "dart",
+    "r",
+    "node",
+    "deno",
+    "bun",
+    # === Frontend Frameworks ===
+    "react",
+    "vue",
+    "angular",
+    "svelte",
+    "solid",
+    "htmx",
+    "alpine",
+    "nextjs",
+    "nuxt",
+    "jquery",
+    "backbone",
+    "ember",
+    # === Backend Frameworks ===
+    "django",
+    "flask",
+    "fastapi",
+    "express",
+    "rails",
+    "spring",
+    "laravel",
+    "gin",
+    # === Databases ===
+    "postgres",
+    "mysql",
+    "mongodb",
+    "redis",
+    "elasticsearch",
+    "sqlite",
+    "dynamodb",
+    "cassandra",
+    "cockroachdb",
+    "neo4j",
+    "couchdb",
+    # === Infrastructure & DevOps ===
+    "docker",
+    "kubernetes",
+    "terraform",
+    "ansible",
+    "vagrant",
+    "packer",
+    "jenkins",
+    "gitlab-ci",
+    "github-actions",
+    "circleci",
+    "travis",
+    "argo",
+    "nginx",
+    "apache",
+    "caddy",
+    "traefik",
+    "haproxy",
+    "envoy",
+    # === Cloud Platforms ===
+    "aws",
+    "gcp",
+    "azure",
+    "vercel",
+    "netlify",
+    "heroku",
+    "digitalocean",
+    "cloudflare",
+    "flyio",
+    "render",
+    # === Tools & Utilities ===
+    "git",
+    "linux",
+    "bash",
+    "zsh",
+    "vim",
+    "tmux",
+    "curl",
+    "wget",
+    "ssh",
+    "npm",
+    "pip",
+    "brew",
+    "apt",
+    "yum",
+    "cargo",
+    "gem",
+    "composer",
+    "maven",
+    # === Security & Auth ===
+    "auth",
+    "oauth",
+    "jwt",
+    "saml",
+    "ldap",
+    "rbac",
+    "cors",
+    "csrf",
+    "xss",
+    "ssl",
+    "tls",
+    "cert",
+    "encrypt",
+    "hash",
+    "cipher",
+    # === Web Technologies ===
+    "rest",
+    "graphql",
+    "grpc",
+    "websocket",
+    "sse",
+    "http",
+    "https",
+    "html",
+    "css",
+    "sass",
+    "less",
+    "styled-components",
+    "tailwind",
+    # === Data & ML ===
+    "pandas",
+    "numpy",
+    "tensorflow",
+    "pytorch",
+    "sklearn",
+    "jupyter",
+    "spark",
+    "kafka",
+    "airflow",
+    "dbt",
+    "hadoop",
+    "hive",
+    "presto",
+    # === Testing ===
+    "jest",
+    "vitest",
+    "pytest",
+    "mocha",
+    "cypress",
+    "playwright",
+    "selenium",
+    "rspec",
+    "junit",
+    "testng",
+    # === Build Tools ===
+    "webpack",
+    "vite",
+    "esbuild",
+    "rollup",
+    "parcel",
+    "turbopack",
+    "babel",
+    # === Monitoring & Observability ===
+    "prometheus",
+    "grafana",
+    "datadog",
+    "newrelic",
+    "sentry",
+    "jaeger",
+    "logging",
+    "metrics",
+    "tracing",
+    "observability",
+    # === API & Integration ===
+    "swagger",
+    "openapi",
+    "postman",
+    "api",
+    "webhook",
+    "sdk",
+    "cli",
+    # === Architecture Patterns ===
+    "microservices",
+    "serverless",
+    "monolith",
+    "event-driven",
+    "cqrs",
+    "event-sourcing",
+    "saga",
+    "circuit-breaker",
+    "retry",
+    "idempotency",
+    # === Development Concepts ===
+    "config",
+    "setup",
+    "cache",
+    "log",
+    "debug",
+    "deploy",
+    "build",
+    "lint",
+    "format",
+    "migrate",
+    "backup",
+    "restore",
+    "env",
+    "vars",
+    "secrets",
+    "rate-limit",
+    "load-balance",
+    "scale",
+    "replicate",
+    "shard",
+    # === General Knowledge: Trivia ===
+    "trivia",
+    "quiz",
+    "facts",
+    "did-you-know",
+    "random-facts",
+    "world-records",
+    # === General Knowledge: Geography ===
+    "countries",
+    "capitals",
+    "continents",
+    "oceans",
+    "rivers",
+    "mountains",
+    "deserts",
+    "islands",
+    "climate",
+    "population",
+    "maps",
+    "coordinates",
+    # === General Knowledge: Philosophy ===
+    "ethics",
+    "metaphysics",
+    "epistemology",
+    "logic",
+    "stoicism",
+    "existentialism",
+    "nihilism",
+    "utilitarianism",
+    "deontology",
+    "virtue-ethics",
+    "free-will",
+    # === General Knowledge: History ===
+    "ancient",
+    "medieval",
+    "renaissance",
+    "industrial",
+    "world-war",
+    "cold-war",
+    "revolution",
+    "empire",
+    "civilization",
+    "archaeology",
+    "timeline",
+    # === General Knowledge: Science ===
+    "physics",
+    "chemistry",
+    "biology",
+    "astronomy",
+    "geology",
+    "ecology",
+    "evolution",
+    "genetics",
+    "quantum",
+    "relativity",
+    "thermodynamics",
+    # === General Knowledge: Arts & Culture ===
+    "art",
+    "music",
+    "literature",
+    "film",
+    "theater",
+    "dance",
+    "sculpture",
+    "painting",
+    "photography",
+    "architecture",
+    "poetry",
+    "novel",
+    # === Common Short Phrases ===
+    "env vars",
+    "api keys",
+    "error handling",
+    "rate limiting",
+    "file upload",
+    "user auth",
+    "db connection",
+    "query params",
+    "hot reload",
+    "code split",
+    "tree shake",
+    "lazy load",
+    "dependency injection",
+    "event listener",
+    "middleware chain",
+    "route handler",
+    "controller logic",
+    "service layer",
+    "repository pattern",
+    "unit of work",
+    "domain model",
+    "value object",
+    "aggregate root",
+    "event bus",
+    "message queue",
+    "job scheduler",
+    "web server",
+    "app server",
+    "proxy server",
+    "load balancer",
+    "cdn",
+    "dns",
+    "ssl-cert",
+    "firewall",
+    "subnet",
+    "vpc",
+    "gateway",
 ]
 
 # Templates for generating short query expansions
 # IMPORTANT: All lex lines MUST include {q} to preserve key terms
 SHORT_TEMPLATES = [
+    # Configuration/Setup templates
     {
-        "lex": ["{q} configuration", "{q} settings", "{q} setup"],
-        "vec": ["how to configure {q} in my project", "{q} setup and configuration tutorial"],
+        "lex": ["{q} configuration", "{q} settings", "{q} setup guide"],
+        "vec": [
+            "how to configure {q} in my project",
+            "{q} setup and configuration tutorial",
+        ],
         "hyde": "To set up {q}, first install the required dependencies. Then configure the settings in your project configuration file.",
     },
+    # Tutorial/Learning templates
     {
         "lex": ["{q} tutorial", "{q} guide", "{q} basics"],
         "vec": ["beginner guide to {q}", "how to get started with {q}"],
         "hyde": "This guide covers the basics of {q}. Follow the steps below to get started with your first implementation.",
     },
+    # Best practices templates
     {
         "lex": ["{q} best practices", "{q} patterns", "{q} tips"],
         "vec": ["best practices for using {q}", "recommended patterns for {q}"],
         "hyde": "When working with {q}, follow these best practices: use consistent naming, handle errors properly, and document your code.",
     },
+    # Troubleshooting templates
     {
         "lex": ["{q} troubleshooting", "{q} fix", "{q} errors"],
         "vec": ["how to fix {q} errors", "troubleshooting common {q} problems"],
         "hyde": "If you encounter {q} issues, check your configuration first. Common problems include missing dependencies and incorrect settings.",
     },
+    # Examples/Code templates
     {
-        "lex": ["{q} examples", "{q} code", "{q} usage"],
+        "lex": ["{q} examples", "{q} code samples", "{q} usage"],
         "vec": ["code examples for {q}", "practical {q} implementation examples"],
         "hyde": "Here are some practical examples of {q} in action. Each example demonstrates a common use case with working code.",
+    },
+    # Documentation/Reference templates
+    {
+        "lex": ["{q} documentation", "{q} reference", "{q} manual"],
+        "vec": ["official {q} documentation", "{q} API reference guide"],
+        "hyde": "The official documentation for {q} provides comprehensive information about features, configuration options, and usage examples.",
+    },
+    # Installation templates
+    {
+        "lex": ["{q} install", "{q} setup", "{q} getting started"],
+        "vec": ["how to install {q} on my system", "{q} installation guide"],
+        "hyde": "To install {q}, run the appropriate package manager command for your system. Verify the installation by checking the version.",
+    },
+    # Comparison templates
+    {
+        "lex": ["{q} comparison", "{q} vs alternatives", "{q} differences"],
+        "vec": ["how does {q} compare to alternatives", "{q} pros and cons"],
+        "hyde": "When comparing {q} to similar tools, consider factors like performance, ease of use, community support, and ecosystem compatibility.",
+    },
+    # Performance templates
+    {
+        "lex": ["{q} performance", "{q} optimization", "{q} speed"],
+        "vec": ["how to optimize {q} performance", "{q} performance tuning tips"],
+        "hyde": "To improve {q} performance, profile your application to identify bottlenecks. Common optimizations include caching, lazy loading, and query optimization.",
+    },
+    # Security templates
+    {
+        "lex": ["{q} security", "{q} hardening", "{q} vulnerabilities"],
+        "vec": ["how to secure {q} configuration", "{q} security best practices"],
+        "hyde": "Security considerations for {q} include input validation, authentication, authorization, and keeping dependencies up to date with security patches.",
+    },
+    # Testing templates
+    {
+        "lex": ["{q} testing", "{q} test suite", "{q} unit tests"],
+        "vec": ["how to test {q} code", "{q} testing strategies and frameworks"],
+        "hyde": "Testing {q} involves writing unit tests, integration tests, and end-to-end tests. Use appropriate testing frameworks for your language and platform.",
+    },
+    # Deployment templates
+    {
+        "lex": ["{q} deployment", "{q} production", "{q} release"],
+        "vec": ["how to deploy {q} to production", "{q} production deployment guide"],
+        "hyde": "Deploying {q} to production requires proper configuration, environment variables, monitoring, and rollback procedures for reliability.",
+    },
+    # Debugging templates
+    {
+        "lex": ["{q} debugging", "{q} troubleshooting", "{q} error handling"],
+        "vec": ["how to debug {q} issues", "{q} debugging techniques and tools"],
+        "hyde": "Debugging {q} involves using logging, breakpoints, stack traces, and specialized debugging tools to identify and fix issues efficiently.",
+    },
+    # Integration templates
+    {
+        "lex": ["{q} integration", "{q} connect", "{q} interoperability"],
+        "vec": ["how to integrate {q} with other systems", "{q} integration patterns"],
+        "hyde": "Integrating {q} with other systems requires understanding APIs, data formats, authentication mechanisms, and error handling strategies.",
+    },
+    # Migration templates
+    {
+        "lex": ["{q} migration", "{q} upgrade", "{q} versioning"],
+        "vec": ["how to migrate to {q}", "{q} upgrade guide and breaking changes"],
+        "hyde": "Migrating to {q} involves planning, testing compatibility, addressing breaking changes, and validating functionality before production deployment.",
     },
 ]
 
@@ -85,13 +464,13 @@ def truncate_hyde(hyde_text: str, max_len: int = 150) -> str:
     truncated = hyde_text[:max_len]
     last_period = truncated.rfind(". ")
     if last_period > max_len // 2:
-        return truncated[:last_period + 1]
+        return truncated[: last_period + 1]
 
     last_space = truncated.rfind(" ")
     if last_space > max_len // 2:
         return truncated[:last_space] + "."
 
-    return truncated[:max_len-1] + "."
+    return truncated[: max_len - 1] + "."
 
 
 def clean_output(output: str) -> str:
@@ -134,8 +513,11 @@ def format_for_training(input_text: str, output_text: str) -> dict:
 
     # Use /no_think to disable thinking mode - we want direct output
     messages = [
-        {"role": "user", "content": f"/no_think Expand this search query: {input_text}"},
-        {"role": "assistant", "content": output_text}
+        {
+            "role": "user",
+            "content": f"/no_think Expand this search query: {input_text}",
+        },
+        {"role": "assistant", "content": output_text},
     ]
 
     # Use tokenizer to generate proper chat format with special tokens
@@ -145,9 +527,9 @@ def format_for_training(input_text: str, output_text: str) -> dict:
         add_generation_prompt=False,
     )
 
-    # Strip empty <think> tags - we don't want thinking mode
-    # The template adds "<think>\n\n</think>\n\n" which we remove
-    text = text.replace("<think>\n\n</think>\n\n", "")
+    # Strip empty   tags - we don't want thinking mode
+    # The template adds " \n\n\u5df4\u6bd4\n\n" which we remove
+    text = text.replace(" \n\n\u5df4\u6bd4\n\n", "")
 
     return {
         "text": text,
@@ -157,10 +539,18 @@ def format_for_training(input_text: str, output_text: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare data for training")
-    parser.add_argument("--input", type=str, default="data/qmd_expansion.jsonl", help="Input JSONL file")
-    parser.add_argument("--output", type=str, default="data/train", help="Output directory")
-    parser.add_argument("--split", type=float, default=0.1, help="Validation split ratio")
-    parser.add_argument("--add-short", type=int, default=3, help="Variations per short query to add")
+    parser.add_argument(
+        "--input", type=str, default="data/qmd_expansion.jsonl", help="Input JSONL file"
+    )
+    parser.add_argument(
+        "--output", type=str, default="data/train", help="Output directory"
+    )
+    parser.add_argument(
+        "--split", type=float, default=0.1, help="Validation split ratio"
+    )
+    parser.add_argument(
+        "--add-short", type=int, default=3, help="Variations per short query to add"
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -252,7 +642,9 @@ def main():
 
     print(f"\n=== Summary ===")
     print(f"Total examples: {len(all_examples)}")
-    print(f"Short queries: {short_final} ({100*short_final/len(all_examples):.1f}%)")
+    print(
+        f"Short queries: {short_final} ({100 * short_final / len(all_examples):.1f}%)"
+    )
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
     print(f"Output: {output_dir}")
 
@@ -261,7 +653,7 @@ def main():
         "dataset_name": "qmd-query-expansion",
         "train_samples": len(train_data),
         "val_samples": len(val_data),
-        "short_query_pct": round(100*short_final/len(all_examples), 1),
+        "short_query_pct": round(100 * short_final / len(all_examples), 1),
         "columns": ["prompt", "completion", "text", "messages"],
     }
     with open(output_dir / "dataset_info.json", "w") as f:

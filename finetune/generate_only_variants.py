@@ -81,8 +81,8 @@ def generate_only_variants(input_query: str, output: str) -> list[dict]:
     for only_type in ["lex", "vec", "hyde"]:
         formatted = format_output(parsed, only_type)
         if formatted:
-            # Add the 'only:' suffix to the query
-            new_query = f"{input_query} only: {only_type}"
+            # Add the 'only:' suffix to the query (no space after colon)
+            new_query = f"{input_query} only:{only_type}"
             variants.append({
                 "input": new_query,
                 "output": formatted,

@@ -74,7 +74,9 @@ def load_model(model_path: str, base_model: str = None, sft_model: str = None):
 
     print(f"Loading base model {base_model}...", file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.bfloat16, device_map="auto",
+        base_model,
+        torch_dtype=torch.float32,
+        device_map="auto",
     )
 
     if sft_model:
@@ -94,16 +96,21 @@ def generate_expansion(model, tokenizer, query: str, max_new_tokens: int = 200) 
     """Generate a query expansion using Qwen3 chat template with /no_think."""
     import torch
 
-    messages = [{"role": "user", "content": f"/no_think Expand this search query: {query}"}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    messages = [
+        {"role": "user", "content": f"/no_think Expand this search query: {query}"}
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.7,
+            temperature=0.1,
             do_sample=True,
+            top_p=0.9,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -116,27 +123,32 @@ def generate_expansion(model, tokenizer, query: str, max_new_tokens: int = 200) 
     elif "assistant\n" in full_output:
         expansion = full_output.split("assistant\n")[-1].strip()
     else:
-        expansion = full_output[len(prompt):].strip()
+        expansion = full_output[len(prompt) :].strip()
 
     # Strip leftover <think> blocks
     import re
+
     if "<think>" in expansion:
-        expansion = re.sub(r'<think>.*?</think>', '', expansion, flags=re.DOTALL).strip()
+        expansion = re.sub(
+            r"<think>.*?</think>", "", expansion, flags=re.DOTALL
+        ).strip()
 
     return expansion
 
 
 def print_result(query: str, expansion: str, scores: dict, verbose: bool = False):
     """Print a single scored result."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Query: {query}")
-    print(f"{'~'*60}")
+    print(f"{'~' * 60}")
     print(expansion)
-    print(f"{'~'*60}")
+    print(f"{'~' * 60}")
     print(f"Score: {scores['percentage']:.0f}% ({scores['rating']})")
-    print(f"  Format: {scores['format']}/30  Diversity: {scores['diversity']}/30  "
-          f"Hyde: {scores['hyde']}/20  Quality: {scores['quality']}/20  "
-          f"Entity: {scores['entity']}/20  Think: {scores['think_bonus']}/20")
+    print(
+        f"  Format: {scores['format']}/30  Diversity: {scores['diversity']}/30  "
+        f"Hyde: {scores['hyde']}/20  Quality: {scores['quality']}/20  "
+        f"Entity: {scores['entity']}/20  Think: {scores['think_bonus']}/20"
+    )
     if verbose and scores["deductions"]:
         print(f"  Issues: {', '.join(scores['deductions'][:5])}")
     if verbose and scores["entities_detected"]:
@@ -145,11 +157,13 @@ def print_result(query: str, expansion: str, scores: dict, verbose: bool = False
 
 def print_summary(scored_results: list):
     """Print aggregate summary."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
-    avg_score = sum(r["scores"]["percentage"] for r in scored_results) / len(scored_results)
+    avg_score = sum(r["scores"]["percentage"] for r in scored_results) / len(
+        scored_results
+    )
     ratings = Counter(r["scores"]["rating"] for r in scored_results)
 
     print(f"  Total queries: {len(scored_results)}")
@@ -176,13 +190,19 @@ def cmd_generate_and_score(args):
         if not args.summary_only:
             print_result(query, expansion, scores, args.verbose)
 
-        scored_results.append({
-            "query": query,
-            "expansion": expansion,
-            "scores": {k: v for k, v in scores.items() if k not in ("parsed", "deductions", "entities_detected")},
-            "deductions": scores["deductions"],
-            "entities_detected": scores["entities_detected"],
-        })
+        scored_results.append(
+            {
+                "query": query,
+                "expansion": expansion,
+                "scores": {
+                    k: v
+                    for k, v in scores.items()
+                    if k not in ("parsed", "deductions", "entities_detected")
+                },
+                "deductions": scores["deductions"],
+                "entities_detected": scores["entities_detected"],
+            }
+        )
 
     print_summary(scored_results)
 
@@ -191,7 +211,11 @@ def cmd_generate_and_score(args):
             "metadata": {"model": args.model, "timestamp": datetime.now().isoformat()},
             "summary": {
                 "total": len(scored_results),
-                "average_score": round(sum(r["scores"]["percentage"] for r in scored_results) / len(scored_results), 1),
+                "average_score": round(
+                    sum(r["scores"]["percentage"] for r in scored_results)
+                    / len(scored_results),
+                    1,
+                ),
             },
             "results": scored_results,
         }
@@ -218,13 +242,19 @@ def cmd_score_only(args):
         if not args.summary_only:
             print_result(query, expansion, scores, args.verbose)
 
-        scored_results.append({
-            "query": query,
-            "expansion": expansion,
-            "scores": {k: v for k, v in scores.items() if k not in ("parsed", "deductions", "entities_detected")},
-            "deductions": scores["deductions"],
-            "entities_detected": scores["entities_detected"],
-        })
+        scored_results.append(
+            {
+                "query": query,
+                "expansion": expansion,
+                "scores": {
+                    k: v
+                    for k, v in scores.items()
+                    if k not in ("parsed", "deductions", "entities_detected")
+                },
+                "deductions": scores["deductions"],
+                "entities_detected": scores["entities_detected"],
+            }
+        )
 
     print_summary(scored_results)
 
@@ -244,13 +274,25 @@ Examples:
 
     # Model evaluation mode
     parser.add_argument("--model", help="Model path (HF Hub or local)")
-    parser.add_argument("--base-model", default=None, help="Base model for tokenizer (default: Qwen/Qwen3-1.7B)")
-    parser.add_argument("--sft-model", default=None, help="SFT adapter to merge first (for GRPO models)")
+    parser.add_argument(
+        "--base-model",
+        default=None,
+        help="Base model for tokenizer (default: Qwen/Qwen3-1.7B)",
+    )
+    parser.add_argument(
+        "--sft-model", default=None, help="SFT adapter to merge first (for GRPO models)"
+    )
     parser.add_argument("--queries", default="evals/queries.txt", help="Queries file")
-    parser.add_argument("--max-tokens", type=int, default=200, help="Max tokens per generation")
+    parser.add_argument(
+        "--max-tokens", type=int, default=200, help="Max tokens per generation"
+    )
 
     # Score-only mode
-    parser.add_argument("--score-only", metavar="JSONL", help="Score existing JSONL file instead of generating")
+    parser.add_argument(
+        "--score-only",
+        metavar="JSONL",
+        help="Score existing JSONL file instead of generating",
+    )
 
     # Output options
     parser.add_argument("--output", "-o", help="Save detailed scores to JSON file")
