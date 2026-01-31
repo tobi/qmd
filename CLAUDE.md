@@ -128,7 +128,7 @@ bun link               # Install globally as 'qmd'
 - sqlite-vec for vector similarity search
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
-- Token-based chunking: 800 tokens/chunk with 15% overlap
+- Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 
 ## Important: Do NOT run automatically
 

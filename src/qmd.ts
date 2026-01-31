@@ -2117,7 +2117,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
+  console.log("  qmd embed [-f]                - Create vector embeddings (900 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
