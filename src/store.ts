@@ -2681,14 +2681,17 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): SnippetResult {
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
 
   if (chunkPos && chunkPos > 0) {
+    // Search within the chunk region, with some padding for context
+    // Use provided chunkLen or fall back to max chunk size (covers variable-length chunks)
+    const searchLen = chunkLen || CHUNK_SIZE_CHARS;
     const contextStart = Math.max(0, chunkPos - 100);
-    const contextEnd = Math.min(body.length, chunkPos + maxLen + 100);
+    const contextEnd = Math.min(body.length, chunkPos + searchLen + 100);
     searchBody = body.slice(contextStart, contextEnd);
     if (contextStart > 0) {
       lineOffset = body.slice(0, contextStart).split('\n').length - 1;
