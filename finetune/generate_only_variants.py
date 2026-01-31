@@ -81,8 +81,8 @@ def generate_only_variants(input_query: str, output: str) -> list[dict]:
     for only_type in ["lex", "vec", "hyde"]:
         formatted = format_output(parsed, only_type)
         if formatted:
-            # Add the 'only:' suffix to the query (no space after colon)
-            new_query = f"{input_query} only:{only_type}"
+            # Add the '/only:' suffix to the query (slash prefix)
+            new_query = f"{input_query} /only:{only_type}"
             variants.append({
                 "input": new_query,
                 "output": formatted,
@@ -120,8 +120,8 @@ def process_file(input_path: Path) -> list[dict]:
             if not input_query or not output:
                 continue
             
-            # Skip if query already has 'only:' suffix
-            if " only: " in input_query.lower():
+            # Skip if query already has '/only:' suffix
+            if " /only:" in input_query.lower():
                 continue
             
             # Skip duplicates
