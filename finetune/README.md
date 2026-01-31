@@ -20,11 +20,11 @@ Train small language models to expand search queries for [QMD](https://github.co
 Given a raw search query like `"auth config"`, the trained model produces structured expansions:
 
 ```
+hyde: Authentication can be configured by setting the AUTH_SECRET environment variable.
 lex: authentication configuration
 lex: auth settings setup
 vec: how to configure authentication settings
 vec: authentication configuration options
-hyde: Authentication can be configured by setting the AUTH_SECRET environment variable.
 ```
 
 These feed into QMD's three search backends:

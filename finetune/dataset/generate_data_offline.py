@@ -110,6 +110,10 @@ def transform_to_qmd_format(query: str, expansions: list[str]) -> str:
     """Transform s-emanuilov format to QMD lex/vec/hyde format."""
     lines = []
 
+    # Generate hyde line first
+    hyde = generate_hyde(query, expansions)
+    lines.append(f"hyde: {hyde}")
+
     # Generate lex lines (keyword-focused, shorter)
     lex_candidates = []
     for exp in expansions:
@@ -135,10 +139,6 @@ def transform_to_qmd_format(query: str, expansions: list[str]) -> str:
     for vec in vec_candidates[:2]:
         if vec.lower() != query.lower():
             lines.append(f"vec: {vec}")
-
-    # Generate hyde line
-    hyde = generate_hyde(query, expansions)
-    lines.append(f"hyde: {hyde}")
 
     return "\n".join(lines)
 

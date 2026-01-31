@@ -119,11 +119,11 @@ def generate_short_example(query: str) -> dict:
     hyde_line = template["hyde"]
 
     output_lines = []
+    output_lines.append(f"hyde: {hyde_line.format(q=query)}")
     for lex in lex_lines:
         output_lines.append(f"lex: {lex.format(q=query)}")
     for vec in vec_lines:
         output_lines.append(f"vec: {vec.format(q=query)}")
-    output_lines.append(f"hyde: {hyde_line.format(q=query)}")
 
     return {"input": query, "output": "\n".join(output_lines)}
 

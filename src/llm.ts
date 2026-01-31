@@ -651,20 +651,20 @@ Write a focused sentence passage that would answer the query. Include specific t
 Generate 2-3 alternative search queries that resolve ambiguities. Use terminology from the hypothetical document.
 
 ## Step 4: Final Retrieval Text
-Output exactly 1-3 'lex' lines, 1-3 'vec' lines, and MAX ONE 'hyde' line.
+Output MAX ONE 'hyde' line FIRST, then 1-3 'lex' lines, then 1-3 'vec' lines.
 
 <format>
+hyde: {complete hypothetical document passage from Step 2 on a SINGLE LINE}
 lex: {single search term}
 vec: {single vector query}
-hyde: {complete hypothetical document passage from Step 2 on a SINGLE LINE}
 </format>
 
 <example>
 Example (FOR FORMAT ONLY - DO NOT COPY THIS CONTENT):
+hyde: This is an example of a hypothetical document passage that would answer the example query. It contains multiple sentences and relevant vocabulary.
 lex: example keyword 1
 lex: example keyword 2
 vec: example semantic query
-hyde: This is an example of a hypothetical document passage that would answer the example query. It contains multiple sentences and relevant vocabulary.
 </example>
 
 <rules>

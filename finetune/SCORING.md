@@ -7,11 +7,11 @@ Transform a random typed query into a great set of retrieval-optimized expansion
 **Input:** `"auth config"`
 **Output:**
 ```
+hyde: Authentication can be configured by setting the AUTH_SECRET environment variable and enabling the auth middleware in your application's config file.
 lex: authentication configuration
 lex: auth settings setup
 vec: how to configure authentication settings
 vec: authentication configuration options
-hyde: Authentication can be configured by setting the AUTH_SECRET environment variable and enabling the auth middleware in your application's config file.
 ```
 
 ## Output Format
@@ -122,11 +122,11 @@ Normalized = Total / Max (0.0 - 1.0)
 
 **Output:**
 ```
+hyde: React Hooks allow you to use state and lifecycle features in functional components without writing a class.
 lex: react hooks tutorial
 lex: usestate useeffect
 vec: how to use react hooks in functional components
 vec: react hooks best practices guide
-hyde: React Hooks allow you to use state and lifecycle features in functional components without writing a class.
 ```
 
 **Scoring:**
@@ -158,9 +158,9 @@ The answer should be in Chinese.
 
 **Output:**
 ```
+hyde: Docker networking is an important concept. Docker networking is used for container communication. Docker networking configuration is essential.
 lex: docker networking
 vec: docker networking
-hyde: Docker networking is an important concept. Docker networking is used for container communication. Docker networking configuration is essential.
 ```
 
 **Scoring:**

@@ -70,10 +70,10 @@ Your task is to transform user queries into retrieval-optimized outputs with THR
 
 Output format (STRICT - follow exactly):
 ```
+hyde: A passage that would appear in a document answering this query.
 lex: keyword1
 lex: keyword2
 vec: semantic query reformulation
-hyde: A passage that would appear in a document answering this query.
 ```
 
 Rules:
