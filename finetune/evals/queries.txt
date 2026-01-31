@@ -46,3 +46,11 @@ what changed in kubernetes latest version
 how to implement caching with redis in nodejs
 best practices for api rate limiting
 setting up ci cd pipeline with github actions
+
+# /only: mode tests - should output ONLY the requested type
+auth /only:lex
+React hooks tutorial /only:lex
+kubernetes pod deployment /only:vec
+how to configure authentication /only:vec
+TDS motorsports history /only:hyde
+AWS Lambda cold start /only:hyde

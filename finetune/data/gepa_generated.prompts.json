@@ -1,0 +1,32 @@
+{
+  "predict": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Expand a search query into retrieval-optimized variations.\n\nOutput format:\n- lex: lines are short, keyword-focused (for BM25 search)\n- vec: lines are natural language phrases (for vector search)  \n- hyde: is a hypothetical document passage (optional)\n\nRules:\n- Include 2-3 lex: lines with key terms preserved\n- Include 2-3 vec: lines as complete natural phrases\n- Named entities (brands, technologies) MUST appear in lex lines\n- Never use generic phrases like \"find information about\"",
+      "fields": [
+        {
+          "prefix": "Query:",
+          "description": "The search query to expand"
+        },
+        {
+          "prefix": "Reasoning: Let's think step by step in order to",
+          "description": "${reasoning}"
+        },
+        {
+          "prefix": "Expansion:",
+          "description": "Multi-line expansion with lex:, vec:, and optional hyde: prefixes"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.14",
+      "dspy": "3.1.2",
+      "cloudpickle": "3.1"
+    }
+  }
+}

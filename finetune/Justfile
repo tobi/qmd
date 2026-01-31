@@ -1,0 +1,31 @@
+set shell := ["bash", "-uc"]
+
+validate:
+    uv run dataset/validate_schema.py
+    uv run dataset/score_data.py
+    for f in data/*.jsonl; do \
+      uv run dataset/analyze_data.py --input "$f" --show-examples 0; \
+    done
+
+score:
+    uv run dataset/score_data.py
+
+schema:
+    uv run dataset/validate_schema.py
+
+analyze:
+    for f in data/*.jsonl; do \
+      uv run dataset/analyze_data.py --input "$f" --show-examples 0; \
+    done
+
+prepare:
+    QMD_BASE_MODEL=Qwen/Qwen3-1.7B uv run dataset/prepare_data.py --seed 42
+
+train-local:
+    just prepare
+    HF_TOKEN=${HF_TOKEN} uv run torchrun --standalone --nproc_per_node auto \
+      train.py sft --config configs/sft_local.yaml |& tee /tmp/qmd-sft-train.log
+
+grpo-local:
+    CUDA_VISIBLE_DEVICES=1,2,3 HF_TOKEN=${HF_TOKEN} uv run torchrun --standalone --nproc_per_node 3 \
+      train.py grpo --config configs/grpo.yaml |& tee /tmp/qmd-grpo-train.log

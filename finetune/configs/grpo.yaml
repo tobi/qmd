@@ -11,6 +11,10 @@ model:
   base: "Qwen/Qwen3-1.7B"
   sft: "outputs/sft"  # Use local SFT output (or HF path if uploaded)
   output: "outputs/grpo"  # Local training output (push to HF manually after eval)
+  push_to_hub: false
+  torch_dtype: "bfloat16"
+  load_in_4bit: false
+  load_in_8bit: false
 
 dataset:
   # Local: run `uv run dataset/prepare_data.py` first, then use "data/train/"
@@ -23,7 +27,7 @@ training:
   epochs: 1
   batch_size: 2
   gradient_accumulation_steps: 8
-  learning_rate: 5e-7
+  learning_rate: 0.0000005
   max_grad_norm: 0.5
   max_steps: 200
 

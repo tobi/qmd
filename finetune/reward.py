@@ -422,11 +422,20 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
     diversity_score += max(0, vec_div)
 
     echo = 5
-    for exp in parsed["lex"] + parsed["vec"]:
+    lex_echo_count = 0
+    for exp in parsed["lex"]:
         if echoes_query(exp, query):
-            echo -= 3
-            deductions.append(f"echoes query: {exp[:20]}...")
-    diversity_score += max(0, echo)
+            lex_echo_count += 1
+            deductions.append(f"lex echoes query: {exp[:20]}...")
+    # Harsh penalty for lex echoes - they're useless
+    if lex_echo_count > 0:
+        echo -= lex_echo_count * 10  # -10 per echo
+    
+    for exp in parsed["vec"]:
+        if echoes_query(exp, query):
+            echo -= 3  # vec echoes less severe (natural language overlap ok)
+            deductions.append(f"vec echoes query: {exp[:20]}...")
+    diversity_score += max(-10, echo)  # can go negative
 
     # --- HyDE (0-20, optional bonus) ---
     hyde_score = 0
@@ -498,6 +507,11 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
     total = format_score + diversity_score + hyde_score + quality_score + entity_score + think_bonus
     max_possible = 140 if parsed["hyde"] else 120
     percentage = max(0.0, min(100.0, total / max_possible * 100))
+
+    # Hard cap: lex echoes are unacceptable - cap at 50%
+    if lex_echo_count > 0:
+        percentage = min(percentage, 50.0)
+        deductions.insert(0, f"CAPPED: {lex_echo_count} lex echo(es)")
 
     if percentage >= 80:
         rating = "Excellent"

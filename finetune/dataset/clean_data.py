@@ -18,10 +18,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
 
+from dataset.schema import (
+    normalize_output_items,
+    output_items_to_text,
+    parse_output_text,
+)
+
 
 @dataclass
 class TechnicalTerm:
     """Definition of a technical term that might be misunderstood."""
+
     term: str  # The ambiguous term (e.g., "liquid", "gem", "yarn")
     context_indicators: list[str]  # Words that suggest tech context
     wrong_expansions: list[str]  # Patterns that indicate wrong interpretation
@@ -38,43 +45,115 @@ KNOWN_TECHNICAL_TERMS = [
         wrong_expansions=["fluid", "water", "pour", "drink", "beverage", "h2o", "wet"],
         correct_domain="Shopify/Jekyll templating language",
         correct_lex=["shopify template syntax", "liquid template filter"],
-        correct_vec=["shopify liquid templating language", "liquid template engine filters"],
+        correct_vec=[
+            "shopify liquid templating language",
+            "liquid template engine filters",
+        ],
     ),
     TechnicalTerm(
         term="gem",
-        context_indicators=["ruby", "bundler", "install", "gemfile", "rails", "require"],
-        wrong_expansions=["mineral", "crystal", "jewel", "stone", "diamond", "jewelry", "precious"],
+        context_indicators=[
+            "ruby",
+            "bundler",
+            "install",
+            "gemfile",
+            "rails",
+            "require",
+        ],
+        wrong_expansions=[
+            "mineral",
+            "crystal",
+            "jewel",
+            "stone",
+            "diamond",
+            "jewelry",
+            "precious",
+        ],
         correct_domain="Ruby package manager",
         correct_lex=["ruby gem package", "gem install command"],
         correct_vec=["ruby gem package manager", "rubygems library installation"],
     ),
     TechnicalTerm(
         term="yarn",
-        context_indicators=["npm", "package", "install", "node", "javascript", "react", "webpack"],
-        wrong_expansions=["thread", "wool", "knit", "spin", "textile", "fabric", "sew", "twist"],
+        context_indicators=[
+            "npm",
+            "package",
+            "install",
+            "node",
+            "javascript",
+            "react",
+            "webpack",
+        ],
+        wrong_expansions=[
+            "thread",
+            "wool",
+            "knit",
+            "spin",
+            "textile",
+            "fabric",
+            "sew",
+            "twist",
+        ],
         correct_domain="JavaScript package manager",
         correct_lex=["yarn package manager", "yarn install dependencies"],
         correct_vec=["yarn javascript package manager", "yarn npm alternative"],
     ),
     TechnicalTerm(
         term="hook",
-        context_indicators=["react", "use", "state", "effect", "component", "callback", "git"],
+        context_indicators=[
+            "react",
+            "use",
+            "state",
+            "effect",
+            "component",
+            "callback",
+            "git",
+        ],
         wrong_expansions=["fish", "fishing", "bait", "catch", "hang", "pirate"],
         correct_domain="React hooks or Git hooks",
         correct_lex=["react hooks api", "usestate useeffect"],
-        correct_vec=["react hooks state management", "react functional component hooks"],
+        correct_vec=[
+            "react hooks state management",
+            "react functional component hooks",
+        ],
     ),
     TechnicalTerm(
         term="container",
-        context_indicators=["docker", "kubernetes", "k8s", "image", "orchestration", "pod"],
-        wrong_expansions=["box", "storage", "shipping", "cargo", "tupperware", "jar", "vessel"],
+        context_indicators=[
+            "docker",
+            "kubernetes",
+            "k8s",
+            "image",
+            "orchestration",
+            "pod",
+        ],
+        wrong_expansions=[
+            "box",
+            "storage",
+            "shipping",
+            "cargo",
+            "tupperware",
+            "jar",
+            "vessel",
+        ],
         correct_domain="Docker/Kubernetes containers",
         correct_lex=["docker container", "container image"],
-        correct_vec=["docker container virtualization", "container orchestration platform"],
+        correct_vec=[
+            "docker container virtualization",
+            "container orchestration platform",
+        ],
     ),
     TechnicalTerm(
         term="branch",
-        context_indicators=["git", "merge", "checkout", "commit", "main", "master", "repo"],
+        context_indicators=[
+            "git",
+            "merge",
+            "checkout",
+            "commit",
+            "main",
+            "master",
+            "repo",
+        ],
         wrong_expansions=["tree", "limb", "wood", "leaf", "twig", "forest"],
         correct_domain="Git version control",
         correct_lex=["git branch", "git checkout branch"],
@@ -83,14 +162,28 @@ KNOWN_TECHNICAL_TERMS = [
     TechnicalTerm(
         term="decorator",
         context_indicators=["python", "@", "function", "wrapper", "class", "def"],
-        wrong_expansions=["interior", "design", "paint", "furniture", "decor", "ornament"],
+        wrong_expansions=[
+            "interior",
+            "design",
+            "paint",
+            "furniture",
+            "decor",
+            "ornament",
+        ],
         correct_domain="Python decorators",
         correct_lex=["python decorator function", "@decorator syntax"],
         correct_vec=["python function decorators", "python decorator pattern"],
     ),
     TechnicalTerm(
         term="bean",
-        context_indicators=["java", "spring", "injection", "dependency", "servlet", "ejb"],
+        context_indicators=[
+            "java",
+            "spring",
+            "injection",
+            "dependency",
+            "servlet",
+            "ejb",
+        ],
         wrong_expansions=["coffee", "food", "vegetable", "legume", "plant", "soy"],
         correct_domain="Java Beans / Spring Beans",
         correct_lex=["java bean class", "spring bean injection"],
@@ -98,7 +191,15 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="shell",
-        context_indicators=["bash", "script", "terminal", "command", "linux", "unix", "zsh"],
+        context_indicators=[
+            "bash",
+            "script",
+            "terminal",
+            "command",
+            "linux",
+            "unix",
+            "zsh",
+        ],
         wrong_expansions=["seashell", "ocean", "beach", "clam", "oyster", "egg"],
         correct_domain="Unix/Linux shell scripting",
         correct_lex=["bash shell script", "shell command"],
@@ -106,7 +207,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="rust",
-        context_indicators=["cargo", "crate", "ownership", "borrow", "lifetime", "unsafe"],
+        context_indicators=[
+            "cargo",
+            "crate",
+            "ownership",
+            "borrow",
+            "lifetime",
+            "unsafe",
+        ],
         wrong_expansions=["oxidation", "metal", "corrosion", "decay", "iron", "orange"],
         correct_domain="Rust programming language",
         correct_lex=["rust programming language", "rust cargo package"],
@@ -114,8 +222,23 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="go",
-        context_indicators=["golang", "goroutine", "channel", "defer", "gofmt", "module"],
-        wrong_expansions=["travel", "move", "walk", "game", "board game", "leave", "depart"],
+        context_indicators=[
+            "golang",
+            "goroutine",
+            "channel",
+            "defer",
+            "gofmt",
+            "module",
+        ],
+        wrong_expansions=[
+            "travel",
+            "move",
+            "walk",
+            "game",
+            "board game",
+            "leave",
+            "depart",
+        ],
         correct_domain="Go programming language",
         correct_lex=["golang programming", "go language syntax"],
         correct_vec=["go programming language", "golang concurrent programming"],
@@ -130,7 +253,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="pod",
-        context_indicators=["kubernetes", "k8s", "deployment", "service", "cluster", "node"],
+        context_indicators=[
+            "kubernetes",
+            "k8s",
+            "deployment",
+            "service",
+            "cluster",
+            "node",
+        ],
         wrong_expansions=["pea", "seed", "plant", "vegetable", "legume", "whale"],
         correct_domain="Kubernetes pods",
         correct_lex=["kubernetes pod", "k8s pod deployment"],
@@ -138,7 +268,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="redis",
-        context_indicators=["cache", "database", "key-value", "memory", "pub/sub", "queue"],
+        context_indicators=[
+            "cache",
+            "database",
+            "key-value",
+            "memory",
+            "pub/sub",
+            "queue",
+        ],
         wrong_expansions=[],  # "redis" doesn't have common wrong meanings
         correct_domain="Redis in-memory database",
         correct_lex=["redis cache", "redis database"],
@@ -146,15 +283,37 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="kafka",
-        context_indicators=["message", "stream", "queue", "broker", "topic", "producer", "consumer"],
-        wrong_expansions=["franz", "author", "writer", "novel", "metamorphosis", "literature"],
+        context_indicators=[
+            "message",
+            "stream",
+            "queue",
+            "broker",
+            "topic",
+            "producer",
+            "consumer",
+        ],
+        wrong_expansions=[
+            "franz",
+            "author",
+            "writer",
+            "novel",
+            "metamorphosis",
+            "literature",
+        ],
         correct_domain="Apache Kafka message queue",
         correct_lex=["apache kafka", "kafka message broker"],
         correct_vec=["apache kafka streaming platform", "kafka message queue"],
     ),
     TechnicalTerm(
         term="elastic",
-        context_indicators=["elasticsearch", "search", "index", "kibana", "logstash", "query"],
+        context_indicators=[
+            "elasticsearch",
+            "search",
+            "index",
+            "kibana",
+            "logstash",
+            "query",
+        ],
         wrong_expansions=["stretch", "rubber", "flexible", "band", "bouncy"],
         correct_domain="Elasticsearch",
         correct_lex=["elasticsearch", "elastic search index"],
@@ -171,7 +330,14 @@ KNOWN_TECHNICAL_TERMS = [
     TechnicalTerm(
         term="flask",
         context_indicators=["python", "web", "route", "api", "jinja", "werkzeug"],
-        wrong_expansions=["bottle", "container", "lab", "chemistry", "drink", "thermos"],
+        wrong_expansions=[
+            "bottle",
+            "container",
+            "lab",
+            "chemistry",
+            "drink",
+            "thermos",
+        ],
         correct_domain="Flask web framework",
         correct_lex=["flask python web framework", "flask api"],
         correct_vec=["flask python web development", "flask microframework"],
@@ -186,7 +352,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="rails",
-        context_indicators=["ruby", "gem", "activerecord", "model", "controller", "migration"],
+        context_indicators=[
+            "ruby",
+            "gem",
+            "activerecord",
+            "model",
+            "controller",
+            "migration",
+        ],
         wrong_expansions=["train", "track", "railroad", "railway", "metal"],
         correct_domain="Ruby on Rails",
         correct_lex=["ruby on rails", "rails web framework"],
@@ -194,7 +367,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="node",
-        context_indicators=["javascript", "npm", "express", "async", "require", "module"],
+        context_indicators=[
+            "javascript",
+            "npm",
+            "express",
+            "async",
+            "require",
+            "module",
+        ],
         wrong_expansions=["lump", "knot", "bump", "growth", "junction"],
         correct_domain="Node.js",
         correct_lex=["node.js javascript", "nodejs runtime"],
@@ -202,7 +382,14 @@ KNOWN_TECHNICAL_TERMS = [
     ),
     TechnicalTerm(
         term="maven",
-        context_indicators=["java", "pom", "dependency", "build", "artifact", "repository"],
+        context_indicators=[
+            "java",
+            "pom",
+            "dependency",
+            "build",
+            "artifact",
+            "repository",
+        ],
         wrong_expansions=["expert", "specialist", "connoisseur"],
         correct_domain="Apache Maven",
         correct_lex=["apache maven", "maven build tool"],
@@ -230,6 +417,7 @@ KNOWN_TECHNICAL_TERMS = [
 @dataclass
 class Issue:
     """Represents an issue found in a dataset example."""
+
     line_number: int
     input_text: str
     output_text: str
@@ -242,9 +430,12 @@ class Issue:
 @dataclass
 class AnalysisResult:
     """Results of analyzing the dataset."""
+
     total_examples: int = 0
     issues_found: list[Issue] = field(default_factory=list)
-    examples_with_correct_tech_terms: list[tuple[int, str]] = field(default_factory=list)
+    examples_with_correct_tech_terms: list[tuple[int, str]] = field(
+        default_factory=list
+    )
     term_statistics: dict = field(default_factory=lambda: defaultdict(int))
 
 
@@ -272,11 +463,11 @@ def is_likely_tech_query(input_text: str) -> bool:
     Short queries like "gem find" or "yarn spin" are ambiguous.
     """
     tech_patterns = [
-        r'\b(install|config|setup|build|run|debug|test|deploy|compile)\b',
-        r'\b(api|cli|sdk|lib|pkg|npm|pip|cargo)\b',
-        r'\b(func|class|method|var|const|let|def)\b',
-        r'\b(http|https|url|port|host|server|client)\b',
-        r'\b(json|xml|yaml|csv|sql|html|css|js)\b',
+        r"\b(install|config|setup|build|run|debug|test|deploy|compile)\b",
+        r"\b(api|cli|sdk|lib|pkg|npm|pip|cargo)\b",
+        r"\b(func|class|method|var|const|let|def)\b",
+        r"\b(http|https|url|port|host|server|client)\b",
+        r"\b(json|xml|yaml|csv|sql|html|css|js)\b",
     ]
     input_lower = input_text.lower()
     for pattern in tech_patterns:
@@ -295,15 +486,83 @@ def has_non_tech_context(input_text: str, term: TechnicalTerm) -> bool:
 
     # Define non-tech context indicators for each ambiguous term
     non_tech_contexts = {
-        "rust": ["car", "metal", "iron", "steel", "corrosion", "prevention", "remove", "body"],
-        "gem": ["gemstone", "jewelry", "jewel", "diamond", "precious", "stone", "cut", "shop", "buy", "wear"],
-        "yarn": ["knit", "crochet", "spin", "wool", "thread", "textile", "fabric", "sew", "weave"],
+        "rust": [
+            "car",
+            "metal",
+            "iron",
+            "steel",
+            "corrosion",
+            "prevention",
+            "remove",
+            "body",
+        ],
+        "gem": [
+            "gemstone",
+            "jewelry",
+            "jewel",
+            "diamond",
+            "precious",
+            "stone",
+            "cut",
+            "shop",
+            "buy",
+            "wear",
+        ],
+        "yarn": [
+            "knit",
+            "crochet",
+            "spin",
+            "wool",
+            "thread",
+            "textile",
+            "fabric",
+            "sew",
+            "weave",
+        ],
         "hook": ["fishing", "crochet", "hang", "coat", "wall", "ceiling"],
-        "container": ["storage", "plastic", "food", "shipping", "cargo", "kitchen", "box"],
+        "container": [
+            "storage",
+            "plastic",
+            "food",
+            "shipping",
+            "cargo",
+            "kitchen",
+            "box",
+        ],
         "branch": ["tree", "bank", "library", "store", "office", "organization"],
-        "decorator": ["interior", "home", "room", "house", "design", "party", "cake", "wedding"],
-        "bean": ["coffee", "soy", "kidney", "black", "green", "garden", "cooking", "food", "plant", "grow"],
-        "shell": ["sea", "beach", "egg", "nut", "turtle", "snail", "crab", "clam", "oyster"],
+        "decorator": [
+            "interior",
+            "home",
+            "room",
+            "house",
+            "design",
+            "party",
+            "cake",
+            "wedding",
+        ],
+        "bean": [
+            "coffee",
+            "soy",
+            "kidney",
+            "black",
+            "green",
+            "garden",
+            "cooking",
+            "food",
+            "plant",
+            "grow",
+        ],
+        "shell": [
+            "sea",
+            "beach",
+            "egg",
+            "nut",
+            "turtle",
+            "snail",
+            "crab",
+            "clam",
+            "oyster",
+        ],
         "spark": ["plug", "fire", "ignite", "car", "engine", "electric", "romance"],
         "go": ["travel", "vacation", "trip", "walk", "run", "leave", "visit", "tour"],
         "swift": ["taylor", "concert", "music", "singer", "speed", "fast", "bird"],
@@ -312,10 +571,26 @@ def has_non_tech_context(input_text: str, term: TechnicalTerm) -> bool:
         "node": ["lymph", "medical", "body", "tree", "network point"],
         "rails": ["train", "railroad", "railway", "track", "transit", "fence"],
         "flask": ["lab", "chemistry", "drink", "hip", "thermos", "bottle", "water"],
-        "django": ["jazz", "music", "reinhardt", "guitar", "movie", "western", "unchained"],
+        "django": [
+            "jazz",
+            "music",
+            "reinhardt",
+            "guitar",
+            "movie",
+            "western",
+            "unchained",
+        ],
         "maven": ["expert", "connoisseur", "specialist", "guru"],
         "gradle": ["grade", "school", "slope"],
-        "kafka": ["franz", "author", "novel", "metamorphosis", "literature", "writer", "book"],
+        "kafka": [
+            "franz",
+            "author",
+            "novel",
+            "metamorphosis",
+            "literature",
+            "writer",
+            "book",
+        ],
         "elastic": ["band", "rubber", "stretch", "flexible", "waist", "fabric"],
     }
 
@@ -365,11 +640,13 @@ def analyze_example(line_num: int, input_text: str, output_text: str) -> list[Is
             issue = Issue(
                 line_number=line_num,
                 input_text=input_text,
-                output_text=output_text[:200] + "..." if len(output_text) > 200 else output_text,
+                output_text=output_text[:200] + "..."
+                if len(output_text) > 200
+                else output_text,
                 issue_type="wrong_tech_expansion",
                 technical_term=term.term,
                 wrong_expansion_found=wrong_expansion,
-                suggested_fix=suggested_output
+                suggested_fix=suggested_output,
             )
             issues.append(issue)
         elif word_count <= 2 and term_lower in words:
@@ -377,11 +654,13 @@ def analyze_example(line_num: int, input_text: str, output_text: str) -> list[Is
             issue = Issue(
                 line_number=line_num,
                 input_text=input_text,
-                output_text=output_text[:200] + "..." if len(output_text) > 200 else output_text,
+                output_text=output_text[:200] + "..."
+                if len(output_text) > 200
+                else output_text,
                 issue_type="ambiguous_term",
                 technical_term=term.term,
                 wrong_expansion_found=wrong_expansion,
-                suggested_fix=None
+                suggested_fix=None,
             )
             issues.append(issue)
 
@@ -392,7 +671,7 @@ def analyze_dataset(filepath: Path) -> AnalysisResult:
     """Analyze the entire dataset for issues."""
     result = AnalysisResult()
 
-    with open(filepath, 'r', encoding='utf-8') as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -400,8 +679,13 @@ def analyze_dataset(filepath: Path) -> AnalysisResult:
 
             try:
                 example = json.loads(line)
-                input_text = example.get('input', '')
-                output_text = example.get('output', '')
+                input_text = example.get("query", "") or example.get("input", "")
+                output_raw = example.get("output", [])
+                if isinstance(output_raw, str):
+                    output_items = normalize_output_items(parse_output_text(output_raw))
+                else:
+                    output_items = normalize_output_items(output_raw)
+                output_text = output_items_to_text(output_items)
 
                 result.total_examples += 1
 
@@ -426,19 +710,29 @@ def fix_example(example: dict, issues: list[Issue]) -> Optional[dict]:
     Returns None if no fix is needed or possible.
     """
     # Only fix examples with definite tech context issues
-    tech_issues = [i for i in issues if i.issue_type == "wrong_tech_expansion" and i.suggested_fix]
+    tech_issues = [
+        i for i in issues if i.issue_type == "wrong_tech_expansion" and i.suggested_fix
+    ]
 
     if not tech_issues:
         return None
 
     # Use the first tech issue's fix (they should be similar)
     issue = tech_issues[0]
+    if not issue.suggested_fix:
+        return None
 
     fixed = example.copy()
-    fixed['output'] = issue.suggested_fix
-    fixed['_fixed'] = True
-    fixed['_original_output'] = example['output']
-    fixed['_fix_reason'] = f"Technical term '{issue.technical_term}' was incorrectly expanded as '{issue.wrong_expansion_found}'"
+    fixed_output_items = normalize_output_items(parse_output_text(issue.suggested_fix))
+    fixed["output"] = fixed_output_items
+    fixed["_fixed"] = True
+    original_items = example.get("output", [])
+    if isinstance(original_items, str):
+        original_items = normalize_output_items(parse_output_text(original_items))
+    fixed["_original_output"] = output_items_to_text(original_items)
+    fixed["_fix_reason"] = (
+        f"Technical term '{issue.technical_term}' was incorrectly expanded as '{issue.wrong_expansion_found}'"
+    )
 
     return fixed
 
@@ -502,9 +796,10 @@ def save_cleaned_dataset(filepath: Path, output_path: Path, result: AnalysisResu
     fixed_count = 0
     flagged_count = 0
 
-    with open(filepath, 'r', encoding='utf-8') as f_in, \
-         open(output_path, 'w', encoding='utf-8') as f_out:
-
+    with (
+        open(filepath, "r", encoding="utf-8") as f_in,
+        open(output_path, "w", encoding="utf-8") as f_out,
+    ):
         for line_num, line in enumerate(f_in, 1):
             line = line.strip()
             if not line:
@@ -512,26 +807,38 @@ def save_cleaned_dataset(filepath: Path, output_path: Path, result: AnalysisResu
 
             try:
                 example = json.loads(line)
+                if "query" not in example and "input" in example:
+                    example["query"] = example.pop("input")
+
+                output_raw = example.get("output", [])
+                if isinstance(output_raw, str):
+                    example["output"] = normalize_output_items(
+                        parse_output_text(output_raw)
+                    )
+                else:
+                    example["output"] = normalize_output_items(output_raw)
 
                 if line_num in issues_by_line:
                     issues = issues_by_line[line_num]
                     fixed = fix_example(example, issues)
 
                     if fixed:
-                        f_out.write(json.dumps(fixed) + '\n')
+                        f_out.write(json.dumps(fixed) + "\n")
                         fixed_count += 1
                     else:
                         # Flag but don't fix ambiguous cases
-                        example['_flagged'] = True
-                        example['_flag_reason'] = f"Ambiguous term '{issues[0].technical_term}' may need review"
-                        f_out.write(json.dumps(example) + '\n')
+                        example["_flagged"] = True
+                        example["_flag_reason"] = (
+                            f"Ambiguous term '{issues[0].technical_term}' may need review"
+                        )
+                        f_out.write(json.dumps(example) + "\n")
                         flagged_count += 1
                 else:
-                    f_out.write(json.dumps(example) + '\n')
+                    f_out.write(json.dumps(example) + "\n")
 
             except json.JSONDecodeError:
                 # Keep problematic lines as-is
-                f_out.write(line + '\n')
+                f_out.write(line + "\n")
 
     return fixed_count, flagged_count
 
@@ -559,7 +866,7 @@ def main():
     print(report)
 
     # Save report to file
-    with open(report_path, 'w', encoding='utf-8') as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\nReport saved to: {report_path}")
 
@@ -569,7 +876,9 @@ def main():
     print(f"\nCleaned dataset saved to: {output_path}")
     print(f"  - Examples fixed: {fixed_count}")
     print(f"  - Examples flagged for review: {flagged_count}")
-    print(f"  - Examples unchanged: {result.total_examples - fixed_count - flagged_count}")
+    print(
+        f"  - Examples unchanged: {result.total_examples - fixed_count - flagged_count}"
+    )
 
     # Summary statistics
     print("\n" + "=" * 50)
@@ -578,7 +887,9 @@ def main():
     print(f"Total examples: {result.total_examples}")
     print(f"Total issues found: {len(result.issues_found)}")
 
-    tech_issues = [i for i in result.issues_found if i.issue_type == "wrong_tech_expansion"]
+    tech_issues = [
+        i for i in result.issues_found if i.issue_type == "wrong_tech_expansion"
+    ]
     ambig_issues = [i for i in result.issues_found if i.issue_type == "ambiguous_term"]
 
     print(f"  - Definite tech term errors: {len(tech_issues)}")

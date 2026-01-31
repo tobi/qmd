@@ -14,6 +14,8 @@ import json
 import random
 from pathlib import Path
 
+from dataset.schema import normalize_output_items, parse_output_text
+
 # HyDE passage templates for different query types
 HYDE_TEMPLATES = {
     "how_to": [
@@ -39,10 +41,13 @@ HYDE_TEMPLATES = {
     ],
 }
 
+
 def classify_query(query: str) -> str:
     """Classify query type for hyde template selection."""
     q = query.lower()
-    if any(w in q for w in ["how to", "how do", "setup", "install", "configure", "create"]):
+    if any(
+        w in q for w in ["how to", "how do", "setup", "install", "configure", "create"]
+    ):
         return "how_to"
     if any(w in q for w in ["what is", "what are", "definition", "meaning"]):
         return "what_is"
@@ -56,9 +61,16 @@ def classify_query(query: str) -> str:
 def extract_topic(query: str) -> str:
     """Extract main topic from query."""
     # Remove common prefixes
-    for prefix in ["how to ", "how do i ", "what is ", "what are ", "configure ", "setup "]:
+    for prefix in [
+        "how to ",
+        "how do i ",
+        "what is ",
+        "what are ",
+        "configure ",
+        "setup ",
+    ]:
         if query.lower().startswith(prefix):
-            return query[len(prefix):].strip()
+            return query[len(prefix) :].strip()
     return query
 
 
@@ -149,6 +161,7 @@ def main():
     except ImportError:
         print("Installing datasets...")
         import subprocess
+
         subprocess.run(["uv", "pip", "install", "datasets"], check=True)
         from datasets import load_dataset
 
@@ -167,7 +180,8 @@ def main():
         expansions = item["expansions"]
 
         output = transform_to_qmd_format(query, expansions)
-        examples.append({"input": query, "output": output})
+        output_items = normalize_output_items(parse_output_text(output))
+        examples.append({"query": query, "output": output_items})
 
     # Shuffle
     random.seed(42)
@@ -184,8 +198,8 @@ def main():
     print("\nSample output:")
     print("-" * 50)
     sample = examples[0]
-    print(f"Input: {sample['input']}")
-    print(f"Output:\n{sample['output']}")
+    print(f"Input: {sample['query']}")
+    print(f"Output: {sample['output']}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,40 @@
+# SFT Training Config - Local Data, Multi-GPU
+# Usage: accelerate launch --config_file configs/accelerate_multi_gpu.yaml train.py sft --config configs/sft_local.yaml
+
+model:
+  base: "Qwen/Qwen3-1.7B"
+  output: "outputs/sft"  # Local output
+  push_to_hub: false
+
+dataset:
+  name: "data/train"  # Local path
+  text_field: "text"
+  split: "train"
+  eval_split: 0.1
+
+training:
+  epochs: 5
+  batch_size: 2  # Per GPU, effective batch = 2 * 4 GPUs * 4 accum = 32
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002  # 2e-4 as float
+  max_length: 512
+  warmup_ratio: 0.03
+  lr_scheduler: "cosine"
+  ddp_find_unused_parameters: false
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "{day} {time}"

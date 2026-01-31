@@ -7,6 +7,8 @@ import os
 import random
 from pathlib import Path
 
+from dataset.schema import normalize_output_items, parse_output_text
+
 try:
     import anthropic
 except ImportError:
@@ -694,7 +696,8 @@ def main():
         # Generate expansion
         output = generate_expansion(client, query)
         if output and validate_output(output):
-            examples.append({"input": query, "output": output})
+            output_items = normalize_output_items(parse_output_text(output))
+            examples.append({"query": query, "output": output_items})
             print(f"[{len(examples)}/{args.count}] {query[:50]}...")
         else:
             print(f"  Skipped invalid output for: {query[:50]}...")

@@ -1,0 +1,16 @@
+FROM /home/tobi/src/github.com/tobi/qmd/finetune/outputs/sft/gguf/sft-q4_k_m.gguf
+
+PARAMETER temperature 0.0
+PARAMETER top_p 1.0
+PARAMETER top_k 0
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 4096
+
+TEMPLATE """<|im_start|>system
+You are a helpful assistant.
+<|im_end|>
+<|im_start|>user
+/no_think Expand this search query: {{ .Prompt }}
+<|im_end|>
+<|im_start|>assistant
+"""

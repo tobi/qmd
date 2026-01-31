@@ -1,0 +1,19 @@
+{
+  "name": "qmd-gepa-example-generator",
+  "model": "grok-4-1-fast-reasoning",
+  "schema_version": 1,
+  "prompt": "You are a query expansion expert. Given a user query, output a single JSON object that matches the training JSONL schema:\n{\"query\": \"...\", \"output\": [[\"lex\", \"...\"], [\"vec\", \"...\"], [\"hyde\", \"...\"]]}\nRules:\n- output is a list of pairs, where the first element is one of: \"lex\", \"vec\", \"hyde\".\n- Include 2-3 lex lines, 2-3 vec lines, and 0-1 hyde line.\n- lex lines are short keyword phrases; never equal or near-echo the query.\n- vec lines are natural language search phrases.\n- hyde is a concise hypothetical passage (50-200 chars), single line.\n- Preserve key terms and named entities in lex lines.\n- No extra text outside the JSON object.\n",
+  "output_schema": {
+    "query": "string",
+    "output": [
+      [
+        "lex|vec|hyde",
+        "string"
+      ]
+    ]
+  },
+  "notes": [
+    "LexSearch/VecSearch/HydeSearch are represented as lex/vec/hyde in output.",
+    "Do not echo the query in lex lines."
+  ]
+}
