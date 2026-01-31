@@ -18,14 +18,20 @@ vec: another semantic variation
 - `lex:` lines for BM25 keyword search (1-3 lines, short keywords)
 - `vec:` lines for vector similarity search (1-3 lines, natural language)
 
-## Model Repository
+## HuggingFace Repositories
 
-**Single destination**: `tobil/qmd-query-expansion-1.7B`
+| Repository | Purpose |
+|------------|---------|
+| `tobil/qmd-query-expansion-1.7B` | Final merged model (SFT + GRPO) |
+| `tobil/qmd-query-expansion-1.7B-gguf` | GGUF quantized versions for deployment |
+| `tobil/qmd-query-expansion-1.7B-sft` | SFT adapter checkpoint (intermediate) |
+| `tobil/qmd-query-expansion-1.7B-grpo` | GRPO adapter checkpoint (intermediate) |
+| `tobil/qmd-query-expansion-train` | Prepared training dataset |
 
-- No versioned directories (`-v1`, `-v2`, `-v4`, etc.)
-- No separate `-sft` or `-grpo` repos for final models
-- Update the main repo only when eval scores improve
-- GGUF variants go to `tobil/qmd-query-expansion-1.7B-gguf`
+**Rules:**
+- No versioned repos (`-v1`, `-v2`, `-v4`, etc.) - update in place
+- Only push when eval scores improve over current deployed model
+- Always include eval results in model card when pushing
 
 ## Training Data
 

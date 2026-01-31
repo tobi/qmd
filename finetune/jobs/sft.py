@@ -25,7 +25,7 @@ from huggingface_hub import login
 # --- Config (inlined from configs/sft.yaml) ---
 BASE_MODEL = "Qwen/Qwen3-1.7B"
 OUTPUT_MODEL = "tobil/qmd-query-expansion-1.7B-sft"
-DATASET = "tobil/qmd-query-expansion-train-v2"
+DATASET = "tobil/qmd-query-expansion-train"
 
 hf_token = os.environ.get("HF_TOKEN")
 if hf_token:

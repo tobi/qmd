@@ -46,7 +46,7 @@ from eval_common import QMDRewardFunction, run_eval
 BASE_MODEL = "Qwen/Qwen3-1.7B"
 SFT_MODEL = "tobil/qmd-query-expansion-1.7B-sft"
 OUTPUT_MODEL = "tobil/qmd-query-expansion-1.7B-grpo"
-DATASET = "tobil/qmd-query-expansion-train-v2"
+DATASET = "tobil/qmd-query-expansion-train"
 
 
 def main():
