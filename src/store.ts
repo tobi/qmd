@@ -13,7 +13,7 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -427,7 +427,7 @@ function setSQLiteFromBrewPrefixEnv(): void {
 
   for (const candidate of candidates) {
     try {
-      if (Bun.file(candidate).size > 0) {
+      if (statSync(candidate).size > 0) {
         Database.setCustomSQLite(candidate);
         return;
       }
