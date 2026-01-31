@@ -204,14 +204,18 @@ describe("MCP Server", () => {
   const prevBackend = process.env.QMD_QUERY_EXPAND_BACKEND;
   const prevPy = process.env.QMD_MLX_PYTHON;
   const prevScript = process.env.QMD_MLX_EXPAND_SCRIPT;
+  const prevTimeout = process.env.QMD_MLX_TIMEOUT_MS;
 
   beforeAll(async () => {
-    // Use MLX sidecar for query expansion in tests to avoid downloading/loading large GGUF generate models.
-    // Keep this portable (no absolute paths).
-    process.env.QMD_QUERY_EXPAND_BACKEND = "mlx";
-    process.env.QMD_MLX_PYTHON = process.env.QMD_MLX_PYTHON || process.env.PYTHON || "python3";
-    process.env.QMD_MLX_EXPAND_SCRIPT = process.env.QMD_MLX_EXPAND_SCRIPT || "scripts/mlx_expand.py";
-    process.env.QMD_MLX_TIMEOUT_MS = process.env.QMD_MLX_TIMEOUT_MS || "60000";
+    // MLX sidecar is optional and should not be required for CI.
+    // Enable MLX only when explicitly requested by the environment.
+    const useMlx = (process.env.QMD_QUERY_EXPAND_BACKEND || "").toLowerCase() === "mlx";
+    if (useMlx) {
+      process.env.QMD_MLX_PYTHON = process.env.QMD_MLX_PYTHON || process.env.PYTHON || "python3";
+      process.env.QMD_MLX_EXPAND_SCRIPT = process.env.QMD_MLX_EXPAND_SCRIPT || "scripts/mlx_expand.py";
+      process.env.QMD_MLX_TIMEOUT_MS = process.env.QMD_MLX_TIMEOUT_MS || "60000";
+    }
+
     // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
     // Use shared singleton to avoid creating multiple instances with separate GPU resources
     getDefaultLlamaCpp();
@@ -267,6 +271,9 @@ describe("MCP Server", () => {
 
     if (prevScript === undefined) delete process.env.QMD_MLX_EXPAND_SCRIPT;
     else process.env.QMD_MLX_EXPAND_SCRIPT = prevScript;
+
+    if (prevTimeout === undefined) delete process.env.QMD_MLX_TIMEOUT_MS;
+    else process.env.QMD_MLX_TIMEOUT_MS = prevTimeout;
   });
 
   // ===========================================================================

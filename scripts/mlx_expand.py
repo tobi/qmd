@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """QMD MLX Query Expansion (sidecar).
 
+⚠️  EXPERIMENTAL / DEV TOOL
+This script is a bridge for iterating on fine-tuned MLX adapters locally.
+It requires Apple Silicon + mlx_lm. If unavailable or failing, QMD falls back
+to the default llama.cpp-based query expansion.
+
 Outputs query expansions in the exact line-oriented format expected by QMD:
   lex: ...
   vec: ...
