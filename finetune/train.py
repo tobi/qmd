@@ -50,15 +50,25 @@ def cmd_sft(args):
     dataset_name = cfg["dataset"]["name"]
     print(f"Loading dataset: {dataset_name}...")
 
-    # Support local JSONL files
+    # Support local JSONL files and glob patterns
     if dataset_name.startswith("data/") or dataset_name.endswith(".jsonl"):
         from pathlib import Path
-        data_path = Path(dataset_name)
-        if data_path.is_dir():
-            train_file = data_path / "train.jsonl"
-            dataset = load_dataset("json", data_files=str(train_file), split="train")
+        import glob
+
+        # Handle glob patterns like "data/*.jsonl"
+        if "*" in dataset_name:
+            jsonl_files = sorted(glob.glob(dataset_name))
+            if not jsonl_files:
+                raise ValueError(f"No files found matching: {dataset_name}")
+            print(f"  Found {len(jsonl_files)} JSONL files: {[Path(f).name for f in jsonl_files]}")
+            dataset = load_dataset("json", data_files=jsonl_files, split="train")
         else:
-            dataset = load_dataset("json", data_files=dataset_name, split="train")
+            data_path = Path(dataset_name)
+            if data_path.is_dir():
+                train_file = data_path / "train.jsonl"
+                dataset = load_dataset("json", data_files=str(train_file), split="train")
+            else:
+                dataset = load_dataset("json", data_files=dataset_name, split="train")
     else:
         dataset = load_dataset(dataset_name, split=cfg["dataset"]["split"])
     print(f"Dataset loaded: {len(dataset)} examples")

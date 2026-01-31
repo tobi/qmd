@@ -70,6 +70,21 @@ Always use **Qwen3-1.7B** as the base model unless explicitly stated otherwise.
 
 Training can run **locally** (requires CUDA GPU) or via **HuggingFace Jobs** (cloud GPU, no local hardware needed).
 
+### Stage 0: Prepare Data
+
+Raw data in `data/*.jsonl` must be converted to Qwen3 chat format before training:
+
+```bash
+# Process all JSONL files in data/
+uv run dataset/prepare_data.py
+# Creates: data/train/train.jsonl, data/train/val.jsonl
+
+# Or process a specific file
+uv run dataset/prepare_data.py --input data/qmd_expansion_v2.jsonl
+```
+
+This applies the Qwen3 chat template, deduplicates, and splits into train/val sets.
+
 ### Stage 1: SFT
 
 ```bash

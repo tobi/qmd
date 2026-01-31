@@ -13,7 +13,9 @@ model:
   output: "outputs/grpo"  # Local training output (push to HF manually after eval)
 
 dataset:
-  name: "tobil/qmd-query-expansion-train-v2"
+  # Local: run `uv run dataset/prepare_data.py` first, then use "data/train/"
+  # HuggingFace: use "tobil/qmd-query-expansion-train" (already prepared)
+  name: "data/train/"
   prompt_field: "messages"
   max_samples: 1000
 
