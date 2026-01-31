@@ -12,7 +12,11 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  withLLMSession,
+  canUnloadLLM,
+  SessionReleasedError,
   type RerankDocument,
+  type ILLMSession,
 } from "./llm.js";
 
 // =============================================================================
@@ -378,6 +382,177 @@ describe("LlamaCpp Integration", () => {
       // Should not contain any 'lex' type entries
       const lexEntries = result.filter(q => q.type === "lex");
       expect(lexEntries).toHaveLength(0);
+    });
+  });
+});
+
+// =============================================================================
+// Session Management Tests
+// =============================================================================
+
+describe("LLM Session Management", () => {
+  describe("withLLMSession", () => {
+    test("session provides access to LLM operations", async () => {
+      const result = await withLLMSession(async (session) => {
+        expect(session.isValid).toBe(true);
+        const embedding = await session.embed("test text");
+        expect(embedding).not.toBeNull();
+        expect(embedding!.embedding.length).toBe(768);
+        return "success";
+      });
+      expect(result).toBe("success");
+    });
+
+    test("session is invalid after release", async () => {
+      let capturedSession: ILLMSession | null = null;
+
+      await withLLMSession(async (session) => {
+        capturedSession = session;
+        expect(session.isValid).toBe(true);
+      });
+
+      // Session should be invalid after withLLMSession returns
+      expect(capturedSession).not.toBeNull();
+      expect(capturedSession!.isValid).toBe(false);
+    });
+
+    test("session prevents idle unload during operations", async () => {
+      await withLLMSession(async (session) => {
+        // While inside a session, canUnloadLLM should return false
+        expect(canUnloadLLM()).toBe(false);
+
+        // Perform an operation
+        await session.embed("test");
+
+        // Still should not be able to unload
+        expect(canUnloadLLM()).toBe(false);
+      });
+
+      // After session ends, should be able to unload
+      expect(canUnloadLLM()).toBe(true);
+    });
+
+    test("nested sessions increment ref count", async () => {
+      await withLLMSession(async (outerSession) => {
+        expect(canUnloadLLM()).toBe(false);
+
+        await withLLMSession(async (innerSession) => {
+          expect(canUnloadLLM()).toBe(false);
+          expect(innerSession.isValid).toBe(true);
+          expect(outerSession.isValid).toBe(true);
+        });
+
+        // Inner session released, but outer still active
+        expect(canUnloadLLM()).toBe(false);
+        expect(outerSession.isValid).toBe(true);
+      });
+
+      // All sessions released
+      expect(canUnloadLLM()).toBe(true);
+    });
+
+    test("session embedBatch works correctly", async () => {
+      await withLLMSession(async (session) => {
+        const texts = ["Hello world", "Test text", "Another document"];
+        const results = await session.embedBatch(texts);
+
+        expect(results).toHaveLength(3);
+        for (const result of results) {
+          expect(result).not.toBeNull();
+          expect(result!.embedding.length).toBe(768);
+        }
+      });
+    });
+
+    test("session rerank works correctly", async () => {
+      await withLLMSession(async (session) => {
+        const documents: RerankDocument[] = [
+          { file: "a.txt", text: "The capital of France is Paris." },
+          { file: "b.txt", text: "Dogs are great pets." },
+        ];
+
+        const result = await session.rerank("What is the capital of France?", documents);
+
+        expect(result.results).toHaveLength(2);
+        expect(result.results[0]!.file).toBe("a.txt");
+        expect(result.results[0]!.score).toBeGreaterThan(result.results[1]!.score);
+      });
+    });
+
+    test("max duration aborts session after timeout", async () => {
+      let aborted = false;
+
+      try {
+        await withLLMSession(async (session) => {
+          // Wait longer than max duration
+          await new Promise(resolve => setTimeout(resolve, 150));
+
+          // This operation should throw because session was aborted
+          await session.embed("test");
+        }, { maxDuration: 50 }); // 50ms max
+      } catch (err) {
+        if (err instanceof SessionReleasedError) {
+          aborted = true;
+        } else {
+          throw err;
+        }
+      }
+
+      expect(aborted).toBe(true);
+    }, 5000);
+
+    test("external abort signal propagates to session", async () => {
+      const abortController = new AbortController();
+      let sessionAborted = false;
+
+      const promise = withLLMSession(async (session) => {
+        // Wait a bit then check if aborted
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        if (!session.isValid) {
+          sessionAborted = true;
+          throw new SessionReleasedError("Session aborted");
+        }
+
+        return "should not reach";
+      }, { signal: abortController.signal });
+
+      // Abort after 20ms
+      setTimeout(() => abortController.abort(), 20);
+
+      try {
+        await promise;
+      } catch (err) {
+        // Expected
+      }
+
+      expect(sessionAborted).toBe(true);
+    }, 5000);
+
+    test("session provides abort signal for monitoring", async () => {
+      await withLLMSession(async (session) => {
+        expect(session.signal).toBeInstanceOf(AbortSignal);
+        expect(session.signal.aborted).toBe(false);
+      });
+    });
+
+    test("returns value from callback", async () => {
+      const result = await withLLMSession(async (session) => {
+        await session.embed("test");
+        return { status: "complete", count: 42 };
+      });
+
+      expect(result).toEqual({ status: "complete", count: 42 });
+    });
+
+    test("propagates errors from callback", async () => {
+      const customError = new Error("Custom test error");
+
+      await expect(
+        withLLMSession(async () => {
+          throw customError;
+        })
+      ).rejects.toThrow("Custom test error");
     });
   });
 });

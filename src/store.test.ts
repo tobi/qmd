@@ -1850,7 +1850,7 @@ describe("LlamaCpp Integration", () => {
     expect(allResults).toHaveLength(2);
 
     // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1 as unknown as number);
+    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(collection1);
 
