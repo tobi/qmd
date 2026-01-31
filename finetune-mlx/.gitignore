@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Training artifacts
+adapters/
+models/
+data/
+exports/
+checkpoints/
+*.safetensors
+*.gguf
+
+# MLX cache
+.mlx_cache/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
