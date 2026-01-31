@@ -1453,29 +1453,44 @@ export async function chunkDocumentByTokens(
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
-  // Convert token params to character params (~4 chars per token)
-  const avgCharsPerToken = 4;
+  // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
+  // If chunks exceed limit, they'll be re-split with actual ratio
+  const avgCharsPerToken = 3;
   const maxChars = maxTokens * avgCharsPerToken;
   const overlapChars = overlapTokens * avgCharsPerToken;
   const windowChars = windowTokens * avgCharsPerToken;
 
-  // Chunk entirely in character space
-  const charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  // Chunk in character space with conservative estimate
+  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
 
-  // Batch tokenize: get token counts for all chunks
-  const tokenCounts = await Promise.all(
-    charChunks.map(async (chunk) => {
-      const tokens = await llm.tokenize(chunk.text);
-      return tokens.length;
-    })
-  );
+  // Tokenize and split any chunks that still exceed limit
+  const results: { text: string; pos: number; tokens: number }[] = [];
 
-  // Combine chunks with their token counts
-  return charChunks.map((chunk, i) => ({
-    text: chunk.text,
-    pos: chunk.pos,
-    tokens: tokenCounts[i]!,
-  }));
+  for (const chunk of charChunks) {
+    const tokens = await llm.tokenize(chunk.text);
+
+    if (tokens.length <= maxTokens) {
+      results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
+    } else {
+      // Chunk is still too large - split it further
+      // Use actual token count to estimate better char limit
+      const actualCharsPerToken = chunk.text.length / tokens.length;
+      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
+
+      const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
+
+      for (const subChunk of subChunks) {
+        const subTokens = await llm.tokenize(subChunk.text);
+        results.push({
+          text: subChunk.text,
+          pos: chunk.pos + subChunk.pos,
+          tokens: subTokens.length,
+        });
+      }
+    }
+  }
+
+  return results;
 }
 
 // =============================================================================
