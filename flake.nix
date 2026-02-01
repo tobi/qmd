@@ -3,81 +3,57 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
+  outputs =
+    inputs:
+    inputs.flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
 
-        # SQLite with loadable extension support for sqlite-vec
-        sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
-          configureFlags = (old.configureFlags or []) ++ [
-            "--enable-load-extension"
-          ];
-        });
+      imports = [ inputs.treefmt-nix.flakeModule ];
 
-        qmd = pkgs.stdenv.mkDerivation {
-          pname = "qmd";
-          version = "1.0.0";
+      perSystem =
+        {
+          pkgs,
+          self',
+          ...
+        }:
+        let
+          sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
+            configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-load-extension" ];
+          });
+        in
+        {
+          packages = {
+            default = self'.packages.qmd;
+            qmd = pkgs.callPackage ./nix/package.nix {
+              inherit (pkgs) vulkan-loader autoAddDriverRunpath cudaPackages;
+            };
+          };
 
-          src = ./.;
+          devShells.default = pkgs.mkShell {
+            buildInputs = [
+              pkgs.bun
+              sqliteWithExtensions
+            ];
+            shellHook = ''
+              export BREW_PREFIX="''${BREW_PREFIX:-${sqliteWithExtensions.out}}"
+            '';
+          };
 
-          nativeBuildInputs = [ pkgs.bun pkgs.makeWrapper ];
-
-          buildInputs = [ pkgs.sqlite ];
-
-          buildPhase = ''
-            export HOME=$(mktemp -d)
-            bun install --frozen-lockfile
-          '';
-
-          installPhase = ''
-            mkdir -p $out/lib/qmd
-            mkdir -p $out/bin
-
-            cp -r node_modules $out/lib/qmd/
-            cp -r src $out/lib/qmd/
-            cp package.json $out/lib/qmd/
-
-            makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
-              --add-flags "$out/lib/qmd/src/qmd.ts" \
-              --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
-              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
-          '';
-
-          meta = with pkgs.lib; {
-            description = "On-device search engine for markdown notes, meeting transcripts, and knowledge bases";
-            homepage = "https://github.com/tobi/qmd";
-            license = licenses.mit;
-            platforms = platforms.unix;
+          treefmt = {
+            projectRootFile = "flake.nix";
+            programs = {
+              nixfmt.enable = true;
+            };
           };
         };
-      in
-      {
-        packages = {
-          default = qmd;
-          qmd = qmd;
-        };
-
-        apps.default = {
-          type = "app";
-          program = "${qmd}/bin/qmd";
-        };
-
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            pkgs.bun
-            sqliteWithExtensions
-          ];
-
-          shellHook = ''
-            export BREW_PREFIX="''${BREW_PREFIX:-${sqliteWithExtensions.out}}"
-            echo "QMD development shell"
-            echo "Run: bun src/qmd.ts <command>"
-          '';
-        };
-      }
-    );
+    };
 }
