@@ -2,6 +2,7 @@
 import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
+import { readFileSync, statSync } from "fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   getPwd,
@@ -282,7 +283,7 @@ function showStatus(): void {
   // Index size
   let indexSize = 0;
   try {
-    const stat = Bun.file(dbPath).size;
+    const stat = statSync(dbPath).size;
     indexSize = stat;
   } catch { }
 
@@ -1402,7 +1403,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = await Bun.file(filepath).text();
+    const content = readFileSync(filepath, "utf-8");
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
@@ -1428,7 +1429,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       } else {
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
-        const stat = await Bun.file(filepath).stat();
+        const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
         updated++;
@@ -1437,7 +1438,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       // New document - insert content and document
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = await Bun.file(filepath).stat();
+      const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
