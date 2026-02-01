@@ -41,6 +41,8 @@
           devShells.default = pkgs.mkShell {
             buildInputs = [
               pkgs.bun
+              pkgs.nodejs # for npm (lockfile generation)
+              pkgs.jq
               sqliteWithExtensions
             ];
             shellHook = ''

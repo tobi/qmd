@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@main
+
+      - name: Check package-lock.json is up to date
+        run: |
+          nix develop -c bash -c '
+            npm install --package-lock-only
+            jq "del(.packages[\"node_modules/sqlite-vec-win32-x64\"])" package-lock.json > package-lock-filtered.json
+            diff package-lock-filtered.json nix/package-lock.json || {
+              echo "::error::nix/package-lock.json is out of date"
+              echo "Run: .github/actions/update-lockfile.sh"
+              exit 1
+            }
+          '
+
+      - name: Build
+        run: nix build -L
+
+      - name: Check flake
+        run: nix flake check
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@main
+
+      - name: Check formatting
+        run: nix fmt -- --fail-on-change
