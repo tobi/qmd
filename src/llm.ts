@@ -742,13 +742,17 @@ export class LlamaCpp implements LLM {
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
-    const temperature = options.temperature ?? 0;
+    // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
+    // DO NOT use greedy decoding (temp=0) - causes repetition loops
+    const temperature = options.temperature ?? 0.7;
 
     let result = "";
     try {
       await session.prompt(prompt, {
         maxTokens,
         temperature,
+        topK: 20,
+        topP: 0.8,
         onTextChunk: (text) => {
           result += text;
         },
@@ -811,10 +815,19 @@ export class LlamaCpp implements LLM {
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
+      // Qwen3 recommended settings for non-thinking mode:
+      // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
+      // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
         grammar,
         maxTokens: 600,
-        temperature: 0.1,
+        temperature: 0.7,
+        topK: 20,
+        topP: 0.8,
+        repeatPenalty: {
+          lastTokens: 64,
+          presencePenalty: 0.5,
+        },
       });
 
       const lines = result.trim().split("\n");
