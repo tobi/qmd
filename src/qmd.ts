@@ -2143,39 +2143,30 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     // Map to store hash by filepath for final results
     const hashMap = new Map<string, string>();
 
-    // Run all searches concurrently (FTS + Vector)
-    const searchPromises: Promise<void>[] = [];
-
-    // FTS searches
+    // FTS searches (synchronous)
     for (const q of ftsQueries) {
       if (!q) continue;
-      searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) {
-            // Mutex for hashMap is not strictly needed as it's just adding values
-            hashMap.set(r.filepath, r.hash);
-          }
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+      const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) {
+          // Mutex for hashMap is not strictly needed as it's just adding values
+          hashMap.set(r.filepath, r.hash);
         }
-      })());
-    }
-
-    // Vector searches (session ensures contexts stay alive)
-    if (hasVectors) {
-      for (const q of vectorQueries) {
-        if (!q) continue;
-        searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        })());
+        rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
     }
 
-    await Promise.all(searchPromises);
+    // Vector searches must be sequential to avoid node-llama-cpp embedding context hangs
+    if (hasVectors) {
+      for (const q of vectorQueries) {
+        if (!q) continue;
+        const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
+        if (vecResults.length > 0) {
+          for (const r of vecResults) hashMap.set(r.filepath, r.hash);
+          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+        }
+      }
+    }
 
     // Apply Reciprocal Rank Fusion to combine all ranked lists
     // Give 2x weight to original query results (first 2 lists: FTS + vector)
