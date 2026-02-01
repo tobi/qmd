@@ -50,6 +50,17 @@ export interface NamedCollection extends Collection {
 // Configuration paths
 // ============================================================================
 
+// Current index name (default: "index")
+let currentIndexName: string = "index";
+
+/**
+ * Set the current index name for config file lookup
+ * Config file will be ~/.config/qmd/{indexName}.yml
+ */
+export function setConfigIndexName(name: string): void {
+  currentIndexName = name;
+}
+
 function getConfigDir(): string {
   // Allow override via QMD_CONFIG_DIR for testing
   if (process.env.QMD_CONFIG_DIR) {
@@ -59,7 +70,7 @@ function getConfigDir(): string {
 }
 
 function getConfigFilePath(): string {
-  return join(getConfigDir(), "index.yml");
+  return join(getConfigDir(), `${currentIndexName}.yml`);
 }
 
 /**
