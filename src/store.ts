@@ -620,11 +620,11 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<string[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, model?: string, session?: ILLMSession) => Promise<string[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, session?: ILLMSession) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -703,11 +703,11 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession) => searchVec(db, query, model, limit, collectionName, session),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, model?: string, session?: ILLMSession) => expandQuery(query, model, db, session),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, session?: ILLMSession) => rerank(query, documents, model, db, session),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2049,7 +2049,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, session?: ILLMSession): Promise<string[]> {
   // Check cache first
   const cacheKey = getCacheKey("expandQuery", { query, model });
   const cached = getCachedResult(db, cacheKey);
@@ -2058,9 +2058,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     return [query, ...lines.slice(0, 2)];
   }
 
-  const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = session
+    ? await session.expandQuery(query)
+    : await getDefaultLlamaCpp().expandQuery(query);
   const queryTexts = results.map(r => r.text);
 
   // Cache the expanded queries (excluding original)
@@ -2076,7 +2077,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
@@ -2093,8 +2094,9 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const rerankResult = session
+      ? await session.rerank(query, uncachedDocs, { model })
+      : await getDefaultLlamaCpp().rerank(query, uncachedDocs, { model });
 
     // Cache results
     for (const result of rerankResult.results) {
