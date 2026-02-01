@@ -1877,9 +1877,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (lower is better) into a stable (0..1] score where higher is better.
+    // Convert bm25 (negative, lower is better) into a stable (0..1] score where higher is better.
+    // BM25 scores in SQLite FTS5 are negative (e.g., -10 is strong, -2 is weak).
     // Avoid per-query normalization so "strong signal" heuristics can work.
-    const score = 1 / (1 + Math.max(0, row.bm25_score));
+    const score = 1 / (1 + Math.abs(row.bm25_score));
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
