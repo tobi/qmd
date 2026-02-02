@@ -1,0 +1,29 @@
+{
+	"name": "qmd",
+	"owner": {
+		"name": "tobi",
+		"email": "tobi@lutke.com"
+	},
+	"plugins": [
+		{
+			"name": "qmd",
+			"source": "./",
+			"description": "Search and retrieve documents from local markdown files.",
+			"version": "0.1.0",
+			"author": {
+				"name": "tobi",
+				"email": "tobi@lutke.com"
+			},
+			"repository": "https://github.com/tobi/qmd",
+			"license": "MIT",
+			"keywords": ["markdown", "search", "qmd"],
+			"skills": ["./skills/"],
+			"mcpServers": {
+				"qmd": {
+					"command": "qmd",
+					"args": ["mcp"]
+				}
+			}
+		}
+	]
+}

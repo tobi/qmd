@@ -1,17 +1,21 @@
 ---
 name: qmd
-description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
+description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
 license: MIT
-compatibility: Requires qmd installed via `bun install -g https://github.com/tobi/qmd`. Works with Claude Code CLI and MCP-compatible agents.
+compatibility: Requires qmd CLI or MCP server. Install via `bun install -g https://github.com/tobi/qmd`.
 metadata:
   author: tobi
-  version: "1.0"
-allowed-tools: Bash(qmd:*)
+  version: "1.1.1"
+allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
 # QMD - Quick Markdown Search
 
 QMD is a local, on-device search engine for markdown content. It indexes your notes, meeting transcripts, documentation, and knowledge bases for fast retrieval.
+
+## QMD Status
+
+!`qmd status 2>/dev/null || echo "Not installed. Run: bun install -g https://github.com/tobi/qmd"`
 
 ## When to Use This Skill
 
@@ -32,7 +36,7 @@ Choose the right search mode for the task:
 | `qmd vsearch` | Keywords aren't working, need conceptual matches | Medium |
 | `qmd query` | Best results needed, speed not critical | Slower |
 
-```sh
+```bash
 # Fast keyword search (BM25)
 qmd search "your query"
 
@@ -45,7 +49,7 @@ qmd query "your query"
 
 ## Common Options
 
-```sh
+```bash
 -n <num>                 # Number of results (default: 5)
 -c, --collection <name>  # Restrict to specific collection
 --all                    # Return all matches
@@ -58,7 +62,7 @@ qmd query "your query"
 
 ## Document Retrieval
 
-```sh
+```bash
 # Get document by path
 qmd get "collection/path/to/doc.md"
 
@@ -77,7 +81,7 @@ qmd multi-get "doc1.md, doc2.md, #abc123"
 
 ## Index Management
 
-```sh
+```bash
 # Check index status and available collections
 qmd status
 
@@ -110,7 +114,7 @@ qmd update
 
 ## Example: Finding Meeting Notes
 
-```sh
+```bash
 # Search for meetings about a topic
 qmd search "quarterly review" -c meetings -n 5
 
@@ -123,7 +127,7 @@ qmd get "#abc123" --full
 
 ## Example: Research Across All Notes
 
-```sh
+```bash
 # Hybrid search for best results
 qmd query "authentication implementation" --min-score 0.3 --json
 
@@ -133,7 +137,7 @@ qmd query "auth flow" --all --files --min-score 0.4
 
 ## MCP Server Integration
 
-QMD also works as an MCP server, providing these tools directly:
+This plugin configures the qmd MCP server automatically. When available, prefer MCP tools over Bash for tighter integration:
 
 | MCP Tool | Equivalent CLI | Purpose |
 |----------|---------------|---------|
@@ -144,17 +148,4 @@ QMD also works as an MCP server, providing these tools directly:
 | `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
 | `qmd_status` | `qmd status` | Index health and collection info |
 
-To enable MCP tools, add to `~/.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-When MCP is configured, prefer using the `qmd_*` tools directly instead of Bash commands for better integration.
+For manual MCP setup without the plugin, see [references/mcp-setup.md](references/mcp-setup.md).

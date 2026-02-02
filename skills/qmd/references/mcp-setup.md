@@ -1,26 +1,10 @@
 # QMD MCP Server Setup
 
-Detailed instructions for configuring QMD as an MCP (Model Context Protocol) server.
+Manual MCP configuration for use without the qmd plugin.
 
-## Prerequisites
+> **Note**: If using the qmd plugin, MCP configuration is included automatically. This is only needed for manual setup.
 
-1. Install qmd globally:
-   ```sh
-   bun install -g https://github.com/tobi/qmd
-   ```
-
-2. Verify installation:
-   ```sh
-   qmd --help
-   ```
-
-3. Set up at least one collection:
-   ```sh
-   qmd collection add ~/Documents/notes --name notes
-   qmd embed  # Generate vector embeddings
-   ```
-
-## Claude Code Configuration
+## Claude Code
 
 Add to `~/.claude/settings.json`:
 
@@ -35,7 +19,7 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-## Claude Desktop Configuration
+## Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
