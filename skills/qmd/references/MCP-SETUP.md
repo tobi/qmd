@@ -60,7 +60,7 @@ Fast BM25 keyword search.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_vsearch
@@ -69,7 +69,7 @@ Semantic vector search for conceptual similarity.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_query
@@ -78,15 +78,16 @@ Hybrid search combining BM25, vector search, and LLM re-ranking.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_get
 Retrieve a document by path or docid.
 
 **Parameters:**
-- `path` (required): Document path or docid (e.g., `#abc123`)
-- `full` (optional): Return full content (default: true)
+- `file` (required): File path or docid from search results (e.g., `#abc123`)
+- `fromLine` (optional): Start from this line number (1-indexed)
+- `maxLines` (optional): Maximum number of lines to return
 - `lineNumbers` (optional): Include line numbers
 
 ### qmd_multi_get
@@ -94,7 +95,9 @@ Retrieve multiple documents.
 
 **Parameters:**
 - `pattern` (required): Glob pattern or comma-separated list
+- `maxLines` (optional): Maximum lines per file
 - `maxBytes` (optional): Skip files larger than this (default: 10KB)
+- `lineNumbers` (optional): Add line numbers to output (default: false)
 
 ### qmd_status
 Get index health and collection information.
