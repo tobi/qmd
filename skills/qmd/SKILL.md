@@ -85,8 +85,15 @@ qmd multi-get "doc1.md, doc2.md, #abc123"
 # Check index status and available collections
 qmd status
 
+# Add a new collection and index files
+qmd collection add ~/notes --name notes --mask "**/*.md"
+
 # List all collections
 qmd collection list
+
+# Add/list path context metadata
+qmd context add qmd://notes/projects "Project planning and design notes"
+qmd context list
 
 # List files in a collection
 qmd ls <collection-name>
@@ -147,5 +154,9 @@ This plugin configures the qmd MCP server automatically. When available, prefer 
 | `qmd_get` | `qmd get` | Retrieve document by path or docid |
 | `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
 | `qmd_status` | `qmd status` | Index health and collection info |
+| `qmd_collection_add` | `qmd collection add` | Create and index a collection |
+| `qmd_collection_list` | `qmd collection list` | List configured collections |
+| `qmd_context_add` | `qmd context add` | Add global or path-specific context |
+| `qmd_context_list` | `qmd context list` | List all configured contexts |
 
 For manual MCP setup without the plugin, see [references/mcp-setup.md](references/mcp-setup.md).

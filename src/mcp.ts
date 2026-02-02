@@ -11,6 +11,9 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { existsSync, statSync, readFileSync } from "fs";
+import { resolve, basename } from "path";
+import { Glob } from "bun";
 import {
   createStore,
   reciprocalRankFusion,
@@ -19,8 +22,32 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  hashContent,
+  extractTitle,
+  insertContent,
+  insertDocument,
+  findActiveDocument,
+  updateDocument,
+  updateDocumentTitle,
+  listCollections as storeListCollections,
+  parseVirtualPath,
+  isVirtualPath,
+  handelize,
+  clearCache,
+  getHashesNeedingEmbedding,
+  getActiveDocumentPaths,
+  deactivateDocument,
+  cleanupOrphanedContent,
 } from "./store.js";
 import type { RankedResult } from "./store.js";
+import {
+  addCollection as yamlAddCollection,
+  getCollection,
+  listCollections as yamlListCollections,
+  addContext,
+  setGlobalContext,
+  listAllContexts,
+} from "./collections.js";
 
 // =============================================================================
 // Types for structured content
@@ -46,6 +73,40 @@ type StatusResult = {
     documents: number;
     lastUpdated: string;
   }[];
+};
+
+// =============================================================================
+// Types for collection management
+// =============================================================================
+
+type IndexResult = {
+  indexed: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  errors: string[];
+};
+
+type CollectionAddResult = {
+  name: string;
+  path: string;
+  pattern: string;
+  stats: IndexResult;
+  needsEmbedding: number;
+};
+
+type CollectionListItem = {
+  name: string;
+  path: string;
+  pattern: string;
+  documents: number;
+  lastModified: string | null;
+};
+
+type ContextItem = {
+  collection: string;
+  path: string;
+  context: string;
 };
 
 // =============================================================================
@@ -82,6 +143,115 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
 function addLineNumbers(text: string, startLine: number = 1): string {
   const lines = text.split('\n');
   return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
+}
+
+// =============================================================================
+// File indexing for MCP
+// =============================================================================
+
+/**
+ * Index files for a collection (MCP-specific version without CLI progress bars).
+ * This is a simplified version of the CLI's indexFiles function.
+ */
+async function indexFilesForMcp(
+  db: ReturnType<typeof createStore>["db"],
+  pwd: string,
+  globPattern: string,
+  collectionName: string
+): Promise<IndexResult> {
+  const now = new Date().toISOString();
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  const errors: string[] = [];
+
+  // Clear LLM cache on index
+  clearCache(db);
+
+  const glob = new Glob(globPattern);
+  const files: string[] = [];
+  for await (const file of glob.scan({ cwd: pwd, onlyFiles: true, followSymlinks: true })) {
+    // Skip node_modules, hidden folders (.*), and other common excludes
+    const parts = file.split("/");
+    const shouldSkip = parts.some(part =>
+      part === "node_modules" ||
+      part.startsWith(".") ||
+      excludeDirs.includes(part)
+    );
+    if (!shouldSkip) {
+      files.push(file);
+    }
+  }
+
+  if (files.length === 0) {
+    return { indexed: 0, updated: 0, unchanged: 0, removed: 0, errors: [] };
+  }
+
+  let indexed = 0, updated = 0, unchanged = 0;
+  const seenPaths = new Set<string>();
+
+  for (const relativeFile of files) {
+    try {
+      const filepath = resolve(pwd, relativeFile);
+      const path = handelize(relativeFile);
+      seenPaths.add(path);
+
+      const content = readFileSync(filepath, "utf-8");
+
+      // Skip empty files
+      if (!content.trim()) {
+        continue;
+      }
+
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+
+      // Check if document exists in this collection with this path
+      const existing = findActiveDocument(db, collectionName, path);
+
+      if (existing) {
+        if (existing.hash === hash) {
+          // Hash unchanged, but check if title needs updating
+          if (existing.title !== title) {
+            updateDocumentTitle(db, existing.id, title, now);
+            updated++;
+          } else {
+            unchanged++;
+          }
+        } else {
+          // Content changed - insert new content hash and update document
+          insertContent(db, hash, content, now);
+          const stat = statSync(filepath);
+          updateDocument(db, existing.id, title, hash,
+            stat ? new Date(stat.mtime).toISOString() : now);
+          updated++;
+        }
+      } else {
+        // New document - insert content and document
+        indexed++;
+        insertContent(db, hash, content, now);
+        const stat = statSync(filepath);
+        insertDocument(db, collectionName, path, title, hash,
+          stat ? new Date(stat.birthtime).toISOString() : now,
+          stat ? new Date(stat.mtime).toISOString() : now);
+      }
+    } catch (err) {
+      errors.push(`${relativeFile}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Deactivate documents in this collection that no longer exist
+  const allActive = getActiveDocumentPaths(db, collectionName);
+  let removed = 0;
+  for (const path of allActive) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionName, path);
+      removed++;
+    }
+  }
+
+  // Clean up orphaned content hashes
+  cleanupOrphanedContent(db);
+
+  return { indexed, updated, unchanged, removed, errors };
 }
 
 // =============================================================================
@@ -606,6 +776,268 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       return {
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: status,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: collection_add (Create and index a collection)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "collection_add",
+    {
+      title: "Add Collection",
+      description: "Create a new collection and index files from a directory. May take time for large directories.",
+      inputSchema: {
+        path: z.string().describe("Absolute path to the directory to index"),
+        name: z.string().optional().describe("Collection name (default: derived from directory basename)"),
+        pattern: z.string().optional().default("**/*.md").describe("Glob pattern for files (default: **/*.md)"),
+      },
+    },
+    async ({ path: dirPath, name, pattern }) => {
+      // Validate path exists and is a directory
+      if (!existsSync(dirPath)) {
+        return {
+          content: [{ type: "text", text: `Error: Path does not exist: ${dirPath}` }],
+          isError: true,
+        };
+      }
+
+      const stat = statSync(dirPath);
+      if (!stat.isDirectory()) {
+        return {
+          content: [{ type: "text", text: `Error: Path is not a directory: ${dirPath}` }],
+          isError: true,
+        };
+      }
+
+      // Generate name from basename if not provided
+      const collName = name || basename(dirPath) || "root";
+
+      // Check for duplicate collection name
+      const existing = getCollection(collName);
+      if (existing) {
+        return {
+          content: [{ type: "text", text: `Error: Collection '${collName}' already exists. Use a different name.` }],
+          isError: true,
+        };
+      }
+
+      // Check if a collection with this path+pattern already exists
+      const allCollections = yamlListCollections();
+      const existingPwdGlob = allCollections.find(c => c.path === dirPath && c.pattern === pattern);
+      if (existingPwdGlob) {
+        return {
+          content: [{ type: "text", text: `Error: A collection already exists for this path and pattern: ${existingPwdGlob.name}` }],
+          isError: true,
+        };
+      }
+
+      // Add to YAML config
+      yamlAddCollection(collName, dirPath, pattern || "**/*.md");
+
+      // Index files
+      const stats = await indexFilesForMcp(store.db, dirPath, pattern || "**/*.md", collName);
+      const needsEmbedding = getHashesNeedingEmbedding(store.db);
+
+      const result: CollectionAddResult = {
+        name: collName,
+        path: dirPath,
+        pattern: pattern || "**/*.md",
+        stats,
+        needsEmbedding,
+      };
+
+      const summary = [
+        `Created collection '${collName}':`,
+        `  Path: ${dirPath}`,
+        `  Pattern: ${pattern || "**/*.md"}`,
+        `  Indexed: ${stats.indexed} new, ${stats.updated} updated, ${stats.unchanged} unchanged, ${stats.removed} removed`,
+      ];
+
+      if (stats.errors.length > 0) {
+        summary.push(`  Errors: ${stats.errors.length}`);
+      }
+
+      if (needsEmbedding > 0) {
+        summary.push(`  Note: Run 'qmd embed' to generate embeddings (${needsEmbedding} hashes need vectors)`);
+      }
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: result,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: collection_list (List all collections)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "collection_list",
+    {
+      title: "List Collections",
+      description: "List all configured collections with document counts and metadata.",
+      inputSchema: {},
+    },
+    async () => {
+      const collections = storeListCollections(store.db);
+
+      if (collections.length === 0) {
+        return {
+          content: [{ type: "text", text: "No collections configured." }],
+          structuredContent: { collections: [] },
+        };
+      }
+
+      const items: CollectionListItem[] = collections.map(c => ({
+        name: c.name,
+        path: c.pwd,
+        pattern: c.glob_pattern,
+        documents: c.active_count,
+        lastModified: c.last_modified,
+      }));
+
+      const summary = [`Collections (${collections.length}):\n`];
+      for (const c of items) {
+        summary.push(`  ${c.name}: ${c.path} (${c.documents} docs)`);
+        summary.push(`    Pattern: ${c.pattern}`);
+        if (c.lastModified) {
+          summary.push(`    Last modified: ${c.lastModified}`);
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: { collections: items },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: context_add (Add context to a path)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "context_add",
+    {
+      title: "Add Context",
+      description: "Add context description to a path. Use '/' for global context, 'qmd://collection/' for collection root, or 'qmd://collection/path' for specific path.",
+      inputSchema: {
+        path: z.string().describe("Path: '/' for global, or 'qmd://collection/path' format"),
+        context: z.string().describe("Context description text"),
+      },
+    },
+    async ({ path: contextPath, context }) => {
+      // Handle global context
+      if (contextPath === "/" || contextPath === "") {
+        setGlobalContext(context);
+        return {
+          content: [{ type: "text", text: `Set global context: "${context}"` }],
+          structuredContent: { type: "global", path: "/", context },
+        };
+      }
+
+      // Parse virtual path
+      const parsed = parseVirtualPath(contextPath);
+      if (!parsed) {
+        return {
+          content: [{ type: "text", text: `Error: Invalid path format. Use '/' for global or 'qmd://collection/path' format.` }],
+          isError: true,
+        };
+      }
+
+      // Validate collection exists
+      const coll = getCollection(parsed.collectionName);
+      if (!coll) {
+        return {
+          content: [{ type: "text", text: `Error: Collection '${parsed.collectionName}' not found.` }],
+          isError: true,
+        };
+      }
+
+      // Add context
+      const pathPrefix = parsed.path ? `/${parsed.path}` : "/";
+      const success = addContext(parsed.collectionName, pathPrefix, context);
+
+      if (!success) {
+        return {
+          content: [{ type: "text", text: `Error: Failed to add context to collection '${parsed.collectionName}'.` }],
+          isError: true,
+        };
+      }
+
+      const displayPath = `qmd://${parsed.collectionName}${pathPrefix}`;
+      return {
+        content: [{ type: "text", text: `Added context to ${displayPath}: "${context}"` }],
+        structuredContent: {
+          type: "collection",
+          collection: parsed.collectionName,
+          path: pathPrefix,
+          context,
+        },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: context_list (List all contexts)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "context_list",
+    {
+      title: "List Contexts",
+      description: "List all configured context descriptions.",
+      inputSchema: {},
+    },
+    async () => {
+      const contexts = listAllContexts();
+
+      if (contexts.length === 0) {
+        return {
+          content: [{ type: "text", text: "No contexts configured." }],
+          structuredContent: { contexts: [] },
+        };
+      }
+
+      const items: ContextItem[] = contexts.map(c => ({
+        collection: c.collection,
+        path: c.path,
+        context: c.context,
+      }));
+
+      const summary = [`Contexts (${contexts.length}):\n`];
+
+      // Group by collection
+      const grouped = new Map<string, ContextItem[]>();
+      for (const item of items) {
+        const key = item.collection;
+        if (!grouped.has(key)) {
+          grouped.set(key, []);
+        }
+        grouped.get(key)!.push(item);
+      }
+
+      for (const [collection, ctxItems] of grouped) {
+        if (collection === "*") {
+          summary.push(`  Global:`);
+        } else {
+          summary.push(`  ${collection}:`);
+        }
+        for (const item of ctxItems) {
+          const truncatedContext = item.context.length > 60
+            ? item.context.slice(0, 57) + "..."
+            : item.context;
+          summary.push(`    ${item.path}: "${truncatedContext}"`);
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: { contexts: items },
       };
     }
   );
