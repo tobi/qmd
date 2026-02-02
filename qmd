@@ -2,6 +2,12 @@
 # qmd - Quick Markdown Search
 set -euo pipefail
 
+# Load Voyage API key if not already set
+if [[ -z "${VOYAGE_API_KEY:-}" ]] && [[ -f "$HOME/.bashrc" ]]; then
+  # Extract VOYAGE_API_KEY from bashrc without sourcing everything
+  eval "$(grep -E '^export VOYAGE_API_KEY=' "$HOME/.bashrc" 2>/dev/null || true)"
+fi
+
 # Find bun - prefer PATH, fallback to known locations
 find_bun() {
   # First: check if bun is in PATH and modern enough
