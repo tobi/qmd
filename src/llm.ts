@@ -317,6 +317,16 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+
+  /**
+   * Tokenize text into tokens (for chunking)
+   */
+  tokenize(text: string): Promise<readonly number[]>;
+
+  /**
+   * Convert tokens back to text
+   */
+  detokenize(tokens: readonly number[]): Promise<string>;
 }
 
 // =============================================================================
@@ -491,7 +501,10 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      this.llama = await getLlama({ 
+        gpu: process.env.QMD_GPU as "cuda" | "vulkan" | "auto" | false || "auto",
+        logLevel: LlamaLogLevel.error 
+      });
     }
     return this.llama;
   }
@@ -1174,25 +1187,30 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance (LlamaCpp or VoyageLLM)
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LLM instance (creates one if needed).
+ * Automatically uses VoyageLLM if VOYAGE_API_KEY is set, otherwise LlamaCpp.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    if (process.env.VOYAGE_API_KEY) {
+      // Dynamically import VoyageLLM to avoid circular dependency
+      const { VoyageLLM } = require("./voyage");
+      console.log("🚀 Using Voyage-4-large for SOTA embeddings");
+      defaultLlamaCpp = new VoyageLLM();
+    } else {
+      defaultLlamaCpp = new LlamaCpp();
+    }
   }
   return defaultLlamaCpp;
 }
 
-/**
- * Set a custom default LlamaCpp instance (useful for testing)
- */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   defaultLlamaCpp = llm;
 }
 
