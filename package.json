@@ -13,7 +13,6 @@
     "vector": "bun src/qmd.ts vector",
     "search": "bun src/qmd.ts search",
     "vsearch": "bun src/qmd.ts vsearch",
-    "rerank": "bun src/qmd.ts rerank",
     "link": "bun link",
     "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
@@ -46,8 +45,7 @@
     "vector",
     "sqlite",
     "bm25",
-    "embeddings",
-    "ollama"
+    "embeddings"
   ],
   "license": "MIT"
 }

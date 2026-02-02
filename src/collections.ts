@@ -11,6 +11,19 @@ import { homedir } from "os";
 import YAML from "yaml";
 
 // ============================================================================
+// Config cache
+// ============================================================================
+
+let _configCache: CollectionConfig | null = null;
+
+/**
+ * Clear the config cache. Used by tests that write config files directly.
+ */
+export function clearConfigCache(): void {
+  _configCache = null;
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -59,6 +72,7 @@ let currentIndexName: string = "index";
  */
 export function setConfigIndexName(name: string): void {
   currentIndexName = name;
+  _configCache = null; // Invalidate cache when index changes
 }
 
 function getConfigDir(): string {
@@ -92,6 +106,11 @@ function ensureConfigDir(): void {
  * Returns empty config if file doesn't exist
  */
 export function loadConfig(): CollectionConfig {
+  // Return cached version if available
+  if (_configCache) {
+    return _configCache;
+  }
+
   const configPath = getConfigFilePath();
   if (!existsSync(configPath)) {
     return { collections: {} };
@@ -106,6 +125,8 @@ export function loadConfig(): CollectionConfig {
       config.collections = {};
     }
 
+    // Cache before returning
+    _configCache = config;
     return config;
   } catch (error) {
     throw new Error(`Failed to parse ${configPath}: ${error}`);
@@ -116,6 +137,9 @@ export function loadConfig(): CollectionConfig {
  * Save configuration to ~/.config/qmd/index.yml
  */
 export function saveConfig(config: CollectionConfig): void {
+  // Invalidate cache
+  _configCache = null;
+
   ensureConfigDir();
   const configPath = getConfigFilePath();
 
@@ -125,6 +149,9 @@ export function saveConfig(config: CollectionConfig): void {
       lineWidth: 0,  // Don't wrap lines
     });
     writeFileSync(configPath, yaml, "utf-8");
+
+    // Cache the new config after successful write
+    _configCache = config;
   } catch (error) {
     throw new Error(`Failed to write ${configPath}: ${error}`);
   }

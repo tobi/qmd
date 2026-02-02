@@ -881,10 +881,15 @@ export class LlamaCpp implements LLM {
 
     const context = await this.ensureRerankContext();
 
-    // Build a map from document text to original indices (for lookup after sorting)
-    const textToDoc = new Map<string, { file: string; index: number }>();
+    // Build a map from document text to original documents (handles duplicates via arrays)
+    const textToDocs = new Map<string, Array<{ file: string; index: number }>>();
     documents.forEach((doc, index) => {
-      textToDoc.set(doc.text, { file: doc.file, index });
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index }]);
+      }
     });
 
     // Extract just the text for ranking
@@ -893,9 +898,10 @@ export class LlamaCpp implements LLM {
     // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
     const ranked = await context.rankAndSort(query, texts);
 
-    // Map back to our result format using the text-to-doc map
+    // Map back to our result format — shift from each text's queue to handle duplicates correctly
     const results: RerankDocumentResult[] = ranked.map((item) => {
-      const docInfo = textToDoc.get(item.document)!;
+      const docs = textToDocs.get(item.document);
+      const docInfo = docs?.shift() ?? { file: "unknown", index: -1 };
       return {
         file: docInfo.file,
         score: item.score,
