@@ -394,3 +394,45 @@ export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
 }
+
+// ============================================================================
+// S3 Configuration
+// ============================================================================
+
+/**
+ * Get S3 configuration
+ */
+export function getS3Config(): S3Config | undefined {
+  const config = loadConfig();
+  return config.s3;
+}
+
+/**
+ * Set S3 configuration
+ */
+export function setS3Config(s3Config: S3Config): void {
+  const config = loadConfig();
+  config.s3 = s3Config;
+  saveConfig(config);
+}
+
+/**
+ * Update S3 configuration (merge with existing)
+ */
+export function updateS3Config(updates: Partial<S3Config>): void {
+  const config = loadConfig();
+  config.s3 = {
+    ...config.s3,
+    ...updates,
+  };
+  saveConfig(config);
+}
+
+/**
+ * Remove S3 configuration
+ */
+export function removeS3Config(): void {
+  const config = loadConfig();
+  delete config.s3;
+  saveConfig(config);
+}

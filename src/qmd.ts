@@ -83,6 +83,10 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  getS3Config,
+  setS3Config,
+  removeS3Config,
+  getConfigPath,
 } from "./collections.js";
 import { createStorageBackend, type StorageBackend } from "./storage.js";
 
@@ -2662,6 +2666,68 @@ if (import.meta.main) {
     case "mcp": {
       const { startMcpServer } = await import("./mcp.js");
       await startMcpServer();
+      break;
+    }
+
+    case "s3": {
+      const subcommand = cli.args[0];
+      
+      switch (subcommand) {
+        case "config": {
+          const endpoint = cli.args[1];
+          const region = cli.args[2] || "us-east-1";
+          
+          if (!endpoint) {
+            // Show current config
+            const config = getS3Config();
+            if (config) {
+              console.log(`S3 Configuration (${getConfigPath()}):`);
+              console.log(`  endpoint: ${config.endpoint || "(not set)"}`);
+              console.log(`  region: ${config.region || "(not set)"}`);
+            } else {
+              console.log("S3 not configured.");
+              console.log(`\nUsage: qmd s3 config <endpoint> [region]`);
+              console.log(`Example: qmd s3 config http://localhost:9000 us-east-1`);
+            }
+          } else {
+            // Set config
+            setS3Config({ endpoint, region });
+            console.log(`${c.green}✓${c.reset} S3 configured:`);
+            console.log(`  endpoint: ${endpoint}`);
+            console.log(`  region: ${region}`);
+            console.log(`\nSet AWS credentials via environment variables:`);
+            console.log(`  export AWS_ACCESS_KEY_ID=your-key`);
+            console.log(`  export AWS_SECRET_ACCESS_KEY=your-secret`);
+          }
+          break;
+        }
+        
+        case "remove":
+        case "rm": {
+          const config = getS3Config();
+          if (config) {
+            removeS3Config();
+            console.log(`${c.green}✓${c.reset} S3 configuration removed`);
+          } else {
+            console.log("S3 not configured.");
+          }
+          break;
+        }
+        
+        default:
+          console.log("Usage: qmd s3 <command>");
+          console.log("");
+          console.log("Commands:");
+          console.log("  config [endpoint] [region]  Show or set S3 configuration");
+          console.log("  remove                      Remove S3 configuration");
+          console.log("");
+          console.log("Examples:");
+          console.log("  qmd s3 config                           # Show current config");
+          console.log("  qmd s3 config http://localhost:9000     # Set MinIO endpoint");
+          console.log("  qmd s3 config https://s3.amazonaws.com us-west-2  # Set AWS S3");
+          console.log("  qmd s3 remove                           # Remove config");
+          break;
+      }
       break;
     }
 
