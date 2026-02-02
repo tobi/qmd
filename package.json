@@ -18,6 +18,7 @@
     "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.980.0",
     "@modelcontextprotocol/sdk": "^1.25.1",
     "node-llama-cpp": "^3.14.5",
     "sqlite-vec": "^0.1.7-alpha.2",

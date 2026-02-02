@@ -245,6 +245,9 @@ qmd collection add . --name myproject
 # Create a collection with explicit path and custom glob mask
 qmd collection add ~/Documents/notes --name notes --mask "**/*.md"
 
+# Create a collection from S3 (see S3 Configuration below)
+qmd collection add s3://my-bucket/docs --name s3-docs --mask "**/*.md"
+
 # List all collections
 qmd collection list
 
@@ -258,6 +261,35 @@ qmd collection rename myproject my-project
 qmd ls notes
 qmd ls notes/subfolder
 ```
+
+### S3 Configuration
+
+QMD supports indexing documents from S3 or S3-compatible storage (MinIO, etc.).
+
+**1. Add S3 configuration to `~/.config/qmd/index.yml`:**
+
+```yaml
+collections: {}
+
+s3:
+  endpoint: http://localhost:9000   # For MinIO, or omit for AWS S3
+  region: us-east-1
+```
+
+**2. Set AWS credentials** (via environment variables or `~/.aws/credentials`):
+
+```sh
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+```
+
+**3. Add an S3 collection:**
+
+```sh
+qmd collection add s3://bucket-name/prefix --name my-s3-docs --mask "**/*.md"
+```
+
+All S3 documents are indexed into the local SQLite database, so searches are fast and work offline after indexing.
 
 ### Generate Vector Embeddings
 

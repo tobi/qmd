@@ -31,12 +31,18 @@ export interface Collection {
   update?: string;        // Optional bash command to run during qmd update
 }
 
+export interface S3Config {
+  region?: string;
+  endpoint?: string;
+}
+
 /**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  s3?: S3Config;
 }
 
 /**

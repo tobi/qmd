@@ -84,6 +84,7 @@ import {
   listAllContexts,
   setConfigIndexName,
 } from "./collections.js";
+import { createStorageBackend, type StorageBackend } from "./storage.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -1359,6 +1360,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  const storage: StorageBackend = createStorageBackend(resolvedPwd);
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1371,20 +1373,20 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const glob = new Glob(globPattern);
-  const files: string[] = [];
-  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
-    // Skip node_modules, hidden folders (.*), and other common excludes
-    const parts = file.split("/");
-    const shouldSkip = parts.some(part =>
-      part === "node_modules" ||
-      part.startsWith(".") ||
-      excludeDirs.includes(part)
-    );
-    if (!shouldSkip) {
-      files.push(file);
-    }
-  }
+  // const glob = new Glob(globPattern);
+  const files: string[] = await storage.listFiles(resolvedPwd, globPattern);
+  // for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
+  //   // Skip node_modules, hidden folders (.*), and other common excludes
+  //   const parts = file.split("/");
+  //   const shouldSkip = parts.some(part =>
+  //     part === "node_modules" ||
+  //     part.startsWith(".") ||
+  //     excludeDirs.includes(part)
+  //   );
+  //   if (!shouldSkip) {
+  //     files.push(file);
+  //   }
+  // }
 
   const total = files.length;
   if (total === 0) {
@@ -1399,11 +1401,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const startTime = Date.now();
 
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
+    // For S3 paths, join with / instead of using resolve()
+    const filepath = resolvedPwd.startsWith('s3://') 
+      ? `${resolvedPwd.replace(/\/$/, '')}/${relativeFile}`
+      : getRealPath(resolve(resolvedPwd, relativeFile));
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = readFileSync(filepath, "utf-8");
+    // const content = readFileSync(filepath, "utf-8");
+    const content = await storage.readFile(filepath);
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
@@ -1429,19 +1435,19 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       } else {
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
+        const stat = await storage.getFileStats(filepath);
         updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+          stat ? new Date(stat.modifiedTime).toISOString() : now);
         updated++;
       }
     } else {
       // New document - insert content and document
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
+      const stat = await storage.getFileStats(filepath);
       insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        stat ? new Date(stat.createdTime).toISOString() : now,
+        stat ? new Date(stat.modifiedTime).toISOString() : now);
     }
 
     processed++;
@@ -2552,7 +2558,10 @@ if (import.meta.main) {
 
         case "add": {
           const pwd = cli.args[1] || getPwd();
-          const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
+          // Don't resolve S3 URLs as local paths
+          const resolvedPwd = pwd.startsWith('s3://') 
+            ? pwd 
+            : (pwd === '.' ? getPwd() : getRealPath(resolve(pwd)));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
 
