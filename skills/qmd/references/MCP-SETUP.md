@@ -60,7 +60,7 @@ Fast BM25 keyword search.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_vsearch
@@ -69,7 +69,7 @@ Semantic vector search for conceptual similarity.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_query
@@ -78,15 +78,16 @@ Hybrid search combining BM25, vector search, and LLM re-ranking.
 **Parameters:**
 - `query` (required): Search query string
 - `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
+- `limit` (optional): Number of results (default: 10)
 - `minScore` (optional): Minimum relevance score
 
 ### qmd_get
 Retrieve a document by path or docid.
 
 **Parameters:**
-- `path` (required): Document path or docid (e.g., `#abc123`)
-- `full` (optional): Return full content (default: true)
+- `file` (required): Document path or docid (e.g., `#abc123`)
+- `fromLine` (optional): Start from this line number (1-indexed)
+- `maxLines` (optional): Maximum number of lines to return
 - `lineNumbers` (optional): Include line numbers
 
 ### qmd_multi_get
@@ -98,6 +99,31 @@ Retrieve multiple documents.
 
 ### qmd_status
 Get index health and collection information.
+
+**Parameters:** None
+
+### qmd_collection_add
+Create a new collection and index files from a directory.
+
+**Parameters:**
+- `path` (required): Absolute path to a directory to index
+- `name` (optional): Collection name (default: directory basename)
+- `pattern` (optional): Glob pattern (default: `**/*.md`)
+
+### qmd_collection_list
+List all configured collections with document counts and metadata.
+
+**Parameters:** None
+
+### qmd_context_add
+Add context text for a global path (`/`) or virtual path (`qmd://collection/path`).
+
+**Parameters:**
+- `path` (required): `/` for global context, or `qmd://collection/path`
+- `context` (required): Context description
+
+### qmd_context_list
+List all configured context descriptions.
 
 **Parameters:** None
 

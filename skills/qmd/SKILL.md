@@ -81,8 +81,15 @@ qmd multi-get "doc1.md, doc2.md, #abc123"
 # Check index status and available collections
 qmd status
 
+# Add a new collection and index files
+qmd collection add ~/notes --name notes --mask "**/*.md"
+
 # List all collections
 qmd collection list
+
+# Add/list path context metadata
+qmd context add qmd://notes/projects "Project planning and design notes"
+qmd context list
 
 # List files in a collection
 qmd ls <collection-name>
@@ -143,6 +150,10 @@ QMD also works as an MCP server, providing these tools directly:
 | `qmd_get` | `qmd get` | Retrieve document by path or docid |
 | `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
 | `qmd_status` | `qmd status` | Index health and collection info |
+| `qmd_collection_add` | `qmd collection add` | Create and index a collection |
+| `qmd_collection_list` | `qmd collection list` | List configured collections |
+| `qmd_context_add` | `qmd context add` | Add global or path-specific context |
+| `qmd_context_list` | `qmd context list` | List all configured contexts |
 
 To enable MCP tools, add to `~/.claude/settings.json`:
 
@@ -157,4 +168,4 @@ To enable MCP tools, add to `~/.claude/settings.json`:
 }
 ```
 
-When MCP is configured, prefer using the `qmd_*` tools directly instead of Bash commands for better integration.
+When MCP is configured, prefer using QMD MCP tools directly (often exposed with `qmd_*` names) instead of Bash commands for better integration.
