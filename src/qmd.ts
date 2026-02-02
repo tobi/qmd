@@ -2416,7 +2416,7 @@ function showHelp(): void {
   console.log("Models (auto-downloaded from HuggingFace):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
+  console.log("  Generation: qmd-query-expansion-1.7B-q4_k_m");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
