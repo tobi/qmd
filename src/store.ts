@@ -24,6 +24,25 @@ import {
   type ILLMSession,
 } from "./llm";
 import {
+  initGraphSchema,
+  createEntity,
+  getEntity,
+  listEntities,
+  searchEntities,
+  deleteEntity,
+  createEdge,
+  getEdges,
+  deleteEdge,
+  traverse,
+  findPath,
+  getGraphStats,
+  entityId,
+  type Entity,
+  type Edge,
+  type TraversalResult,
+  type GraphStats,
+} from "./graph";
+import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
   removeContext as collectionsRemoveContext,
@@ -559,6 +578,9 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  // Initialize graph schema (entities + edges)
+  initGraphSchema(db);
 }
 
 
@@ -2569,3 +2591,26 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
     snippetLines: snippetLineCount,
   };
 }
+
+// =============================================================================
+// Graph Re-exports
+// =============================================================================
+
+export {
+  createEntity,
+  getEntity,
+  listEntities,
+  searchEntities,
+  deleteEntity,
+  createEdge,
+  getEdges,
+  deleteEdge,
+  traverse,
+  findPath,
+  getGraphStats,
+  entityId,
+  type Entity,
+  type Edge,
+  type TraversalResult,
+  type GraphStats,
+};
