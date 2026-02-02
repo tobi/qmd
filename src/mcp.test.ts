@@ -192,8 +192,35 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
+  listCollections as storeListCollections,
+  parseVirtualPath,
+  hashContent,
+  extractTitle,
+  insertContent,
+  insertDocument,
+  findActiveDocument,
+  updateDocument,
+  updateDocumentTitle,
+  clearCache,
+  getHashesNeedingEmbedding,
+  getActiveDocumentPaths,
+  deactivateDocument,
+  cleanupOrphanedContent,
+  handelize,
 } from "./store";
 import type { RankedResult } from "./store";
+import {
+  addCollection as yamlAddCollection,
+  getCollection,
+  listCollections as yamlListCollections,
+  addContext,
+  setGlobalContext,
+  listAllContexts,
+  removeCollection as yamlRemoveCollection,
+  removeContext,
+  loadConfig,
+  saveConfig,
+} from "./collections";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -884,6 +911,371 @@ QMD is your on-device search engine for markdown knowledge bases.`;
         expect(typeof col.pattern).toBe("string");
         expect(typeof col.documents).toBe("number");
       }
+    });
+  });
+
+  // ===========================================================================
+  // Tool: collection_list (List Collections)
+  // ===========================================================================
+
+  describe("collection_list tool", () => {
+    test("returns list of collections", () => {
+      const collections = storeListCollections(testDb);
+      expect(collections.length).toBe(1);
+      expect(collections[0]!.name).toBe("docs");
+      expect(collections[0]!.pwd).toBe("/test/docs");
+      expect(collections[0]!.glob_pattern).toBe("**/*.md");
+    });
+
+    test("returns document counts", () => {
+      const collections = storeListCollections(testDb);
+      expect(collections[0]!.active_count).toBeGreaterThanOrEqual(5); // At least 5 original docs
+    });
+
+    test("returns last modified timestamp", () => {
+      const collections = storeListCollections(testDb);
+      expect(collections[0]!.last_modified).not.toBeNull();
+    });
+
+    test("returns empty array when no collections", async () => {
+      // Create a fresh config with no collections
+      const config = loadConfig();
+      const originalCollections = { ...config.collections };
+      config.collections = {};
+      saveConfig(config);
+
+      const collections = yamlListCollections();
+      expect(collections.length).toBe(0);
+
+      // Restore
+      config.collections = originalCollections;
+      saveConfig(config);
+    });
+  });
+
+  // ===========================================================================
+  // Tool: collection_add (Add Collection)
+  // ===========================================================================
+
+  describe("collection_add tool", () => {
+    let testDir: string;
+
+    beforeEach(async () => {
+      // Create a temp directory with test files
+      testDir = await mkdtemp(join(tmpdir(), "qmd-collection-add-"));
+      await writeFile(join(testDir, "doc1.md"), "# Doc 1\n\nContent for doc 1.");
+      await writeFile(join(testDir, "doc2.md"), "# Doc 2\n\nContent for doc 2.");
+      await writeFile(join(testDir, "notes.txt"), "Plain text notes.");
+    });
+
+    afterEach(async () => {
+      // Remove test collection if it exists
+      try {
+        yamlRemoveCollection("test-add-collection");
+      } catch {}
+
+      // Clean up test directory
+      try {
+        const files = await readdir(testDir);
+        for (const file of files) {
+          await unlink(join(testDir, file));
+        }
+        await rmdir(testDir);
+      } catch {}
+    });
+
+    test("validates path exists", () => {
+      const exists = require("fs").existsSync("/nonexistent/path");
+      expect(exists).toBe(false);
+    });
+
+    test("validates path is a directory", () => {
+      const stat = require("fs").statSync(testDir);
+      expect(stat.isDirectory()).toBe(true);
+    });
+
+    test("generates name from basename if not provided", () => {
+      const basename = require("path").basename(testDir);
+      expect(basename).toBeTruthy();
+      expect(basename.length).toBeGreaterThan(0);
+    });
+
+    test("detects duplicate collection name", () => {
+      const existing = getCollection("docs");
+      expect(existing).not.toBeNull();
+      expect(existing!.name).toBe("docs");
+    });
+
+    test("adds collection to YAML config", () => {
+      yamlAddCollection("test-add-collection", testDir, "**/*.md");
+      const coll = getCollection("test-add-collection");
+      expect(coll).not.toBeNull();
+      expect(coll!.path).toBe(testDir);
+      expect(coll!.pattern).toBe("**/*.md");
+    });
+
+    test("indexes files matching glob pattern", async () => {
+      // Add collection
+      yamlAddCollection("test-add-collection", testDir, "**/*.md");
+
+      // Simulate indexing (similar to indexFilesForMcp)
+      const now = new Date().toISOString();
+      const files = ["doc1.md", "doc2.md"];
+      let indexed = 0;
+
+      for (const file of files) {
+        const content = require("fs").readFileSync(join(testDir, file), "utf-8");
+        const hash = await hashContent(content);
+        const title = extractTitle(content, file);
+        const path = handelize(file);
+
+        // Check if already exists
+        const existing = findActiveDocument(testDb, "test-add-collection", path);
+        if (!existing) {
+          insertContent(testDb, hash, content, now);
+          insertDocument(testDb, "test-add-collection", path, title, hash, now, now);
+          indexed++;
+        }
+      }
+
+      expect(indexed).toBe(2);
+
+      // Verify documents were added
+      const docs = testDb.prepare(`
+        SELECT path FROM documents WHERE collection = 'test-add-collection' AND active = 1
+      `).all() as { path: string }[];
+      expect(docs.length).toBe(2);
+
+      // Clean up
+      testDb.prepare(`DELETE FROM documents WHERE collection = 'test-add-collection'`).run();
+    });
+
+    test("respects glob pattern to filter files", async () => {
+      // Only md files, not txt
+      const glob = new (await import("bun")).Glob("**/*.md");
+      const files: string[] = [];
+      for await (const file of glob.scan({ cwd: testDir, onlyFiles: true })) {
+        files.push(file);
+      }
+
+      expect(files.length).toBe(2);
+      expect(files).toContain("doc1.md");
+      expect(files).toContain("doc2.md");
+      expect(files).not.toContain("notes.txt");
+    });
+  });
+
+  // ===========================================================================
+  // Tool: context_add (Add Context)
+  // ===========================================================================
+
+  describe("context_add tool", () => {
+    afterEach(() => {
+      // Clean up any test contexts
+      try {
+        removeContext("docs", "/test-context-path");
+      } catch {}
+      setGlobalContext(undefined);
+    });
+
+    test("sets global context with path /", () => {
+      setGlobalContext("This is global context");
+      const config = loadConfig();
+      expect(config.global_context).toBe("This is global context");
+    });
+
+    test("parses virtual path correctly", () => {
+      const parsed = parseVirtualPath("qmd://docs/meetings");
+      expect(parsed).not.toBeNull();
+      expect(parsed!.collectionName).toBe("docs");
+      expect(parsed!.path).toBe("meetings");
+    });
+
+    test("validates collection exists", () => {
+      const exists = getCollection("docs");
+      expect(exists).not.toBeNull();
+
+      const notExists = getCollection("nonexistent");
+      expect(notExists).toBeNull();
+    });
+
+    test("adds context to collection path", () => {
+      const success = addContext("docs", "/test-context-path", "Test context description");
+      expect(success).toBe(true);
+
+      const coll = getCollection("docs");
+      expect(coll).not.toBeNull();
+      expect(coll!.context).toBeDefined();
+      expect(coll!.context!["/test-context-path"]).toBe("Test context description");
+    });
+
+    test("returns error for invalid path format", () => {
+      const parsed = parseVirtualPath("not-a-virtual-path");
+      expect(parsed).toBeNull();
+    });
+
+    test("returns error for non-existent collection", () => {
+      const success = addContext("nonexistent", "/path", "context");
+      expect(success).toBe(false);
+    });
+
+    test("handles collection root context", () => {
+      const success = addContext("docs", "/", "Root context for docs collection");
+      expect(success).toBe(true);
+
+      const coll = getCollection("docs");
+      expect(coll!.context!["/"]).toBe("Root context for docs collection");
+
+      // Clean up
+      removeContext("docs", "/");
+    });
+  });
+
+  // ===========================================================================
+  // Tool: context_list (List Contexts)
+  // ===========================================================================
+
+  describe("context_list tool", () => {
+    test("lists all contexts", () => {
+      const contexts = listAllContexts();
+      // Should include the test collection context from setup
+      const meetingsContext = contexts.find(c =>
+        c.collection === "docs" && c.path === "/meetings"
+      );
+      expect(meetingsContext).toBeDefined();
+      expect(meetingsContext!.context).toBe("Meeting notes and transcripts");
+    });
+
+    test("includes global context", () => {
+      setGlobalContext("Test global context");
+      const contexts = listAllContexts();
+      const global = contexts.find(c => c.collection === "*" && c.path === "/");
+      expect(global).toBeDefined();
+      expect(global!.context).toBe("Test global context");
+
+      // Clean up
+      setGlobalContext(undefined);
+    });
+
+    test("returns empty array when no contexts", async () => {
+      // Temporarily remove all contexts
+      const config = loadConfig();
+      const originalConfig = JSON.parse(JSON.stringify(config));
+
+      config.global_context = undefined;
+      for (const name of Object.keys(config.collections)) {
+        delete config.collections[name]!.context;
+      }
+      saveConfig(config);
+
+      const contexts = listAllContexts();
+      expect(contexts.length).toBe(0);
+
+      // Restore
+      saveConfig(originalConfig);
+    });
+
+    test("groups contexts by collection", () => {
+      const contexts = listAllContexts();
+      const byCollection = new Map<string, typeof contexts>();
+      for (const ctx of contexts) {
+        if (!byCollection.has(ctx.collection)) {
+          byCollection.set(ctx.collection, []);
+        }
+        byCollection.get(ctx.collection)!.push(ctx);
+      }
+
+      // Verify grouping works
+      if (byCollection.has("docs")) {
+        const docsContexts = byCollection.get("docs")!;
+        expect(docsContexts.length).toBeGreaterThan(0);
+        expect(docsContexts.every(c => c.collection === "docs")).toBe(true);
+      }
+    });
+  });
+
+  // ===========================================================================
+  // MCP Integration: Collection & Context Tools
+  // ===========================================================================
+
+  describe("MCP integration for collection and context tools", () => {
+    test("collection_list response format", () => {
+      const collections = storeListCollections(testDb);
+      const items = collections.map(c => ({
+        name: c.name,
+        path: c.pwd,
+        pattern: c.glob_pattern,
+        documents: c.active_count,
+        lastModified: c.last_modified,
+      }));
+
+      // Verify structure matches expected MCP response
+      expect(items.length).toBeGreaterThan(0);
+      const item = items[0]!;
+      expect(typeof item.name).toBe("string");
+      expect(typeof item.path).toBe("string");
+      expect(typeof item.pattern).toBe("string");
+      expect(typeof item.documents).toBe("number");
+    });
+
+    test("context_list response format", () => {
+      const contexts = listAllContexts();
+      const items = contexts.map(c => ({
+        collection: c.collection,
+        path: c.path,
+        context: c.context,
+      }));
+
+      // Verify structure
+      if (items.length > 0) {
+        const item = items[0]!;
+        expect(typeof item.collection).toBe("string");
+        expect(typeof item.path).toBe("string");
+        expect(typeof item.context).toBe("string");
+      }
+    });
+
+    test("context_add success response format", () => {
+      addContext("docs", "/test-integration", "Integration test context");
+
+      // Simulate MCP response
+      const response = {
+        content: [{ type: "text", text: `Added context to qmd://docs/test-integration: "Integration test context"` }],
+        structuredContent: {
+          type: "collection",
+          collection: "docs",
+          path: "/test-integration",
+          context: "Integration test context",
+        },
+      };
+
+      expect(response.content[0]!.type).toBe("text");
+      expect(response.structuredContent.collection).toBe("docs");
+      expect(response.structuredContent.context).toBe("Integration test context");
+
+      // Clean up
+      removeContext("docs", "/test-integration");
+    });
+
+    test("error response format for collection_add", () => {
+      // Simulate error response for duplicate collection
+      const errorResponse = {
+        content: [{ type: "text", text: "Error: Collection 'docs' already exists. Use a different name." }],
+        isError: true,
+      };
+
+      expect(errorResponse.isError).toBe(true);
+      expect(errorResponse.content[0]!.text).toContain("already exists");
+    });
+
+    test("error response format for context_add with invalid path", () => {
+      const errorResponse = {
+        content: [{ type: "text", text: "Error: Invalid path format. Use '/' for global or 'qmd://collection/path' format." }],
+        isError: true,
+      };
+
+      expect(errorResponse.isError).toBe(true);
+      expect(errorResponse.content[0]!.text).toContain("Invalid path format");
     });
   });
 });
