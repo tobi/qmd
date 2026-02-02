@@ -11,6 +11,7 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { addLineNumbers } from "./formatter.js";
 import {
   createStore,
   reciprocalRankFusion,
@@ -75,14 +76,6 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
-/**
- * Add line numbers to text content.
- * Each line becomes: "{lineNum}: {content}"
- */
-function addLineNumbers(text: string, startLine: number = 1): string {
-  const lines = text.split('\n');
-  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
-}
 
 // =============================================================================
 // MCP Server
@@ -266,8 +259,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ query, limit, minScore, collection }) => {
+      // Check for empty index
+      const status = store.getStatus();
+      if (status.totalDocuments === 0) {
+        return {
+          content: [{ type: "text", text: "Index is empty. No collections are configured.\n\nTo get started:\n1. Run: qmd collection add <path> --name <name>\n2. Run: qmd update\n3. Run: qmd embed (for semantic search)" }],
+        };
+      }
+
       // Note: Collection filtering is now done post-search since collections are managed in YAML
       const results = store.searchFTS(query, limit || 10)
         .filter(r => !collection || r.collectionName === collection);
@@ -307,8 +309,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ query, limit, minScore, collection }) => {
+      // Check for empty index
+      const status = store.getStatus();
+      if (status.totalDocuments === 0) {
+        return {
+          content: [{ type: "text", text: "Index is empty. No collections are configured.\n\nTo get started:\n1. Run: qmd collection add <path> --name <name>\n2. Run: qmd update\n3. Run: qmd embed (for semantic search)" }],
+        };
+      }
+
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
         return {
@@ -371,8 +382,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ query, limit, minScore, collection }) => {
+      // Check for empty index
+      const status = store.getStatus();
+      if (status.totalDocuments === 0) {
+        return {
+          content: [{ type: "text", text: "Index is empty. No collections are configured.\n\nTo get started:\n1. Run: qmd collection add <path> --name <name>\n2. Run: qmd update\n3. Run: qmd embed (for semantic search)" }],
+        };
+      }
+
       // Expand query
       const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
 
@@ -456,6 +476,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         maxLines: z.number().optional().describe("Maximum number of lines to return"),
         lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ file, fromLine, maxLines, lineNumbers }) => {
       // Support :line suffix in `file` (e.g. "foo.md:120") when fromLine isn't provided
@@ -520,6 +541,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
         lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
       const { docs, errors } = store.findDocuments(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
@@ -587,6 +609,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
       inputSchema: {},
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
       const status: StatusResult = store.getStatus();

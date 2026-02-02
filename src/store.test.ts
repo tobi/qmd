@@ -40,7 +40,7 @@ import {
   type SearchResult,
   type RankedResult,
 } from "./store.js";
-import type { CollectionConfig } from "./collections.js";
+import { clearConfigCache, type CollectionConfig } from "./collections.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -66,6 +66,9 @@ async function createTestStore(): Promise<Store> {
 
   // Set environment variable to use test config
   process.env.QMD_CONFIG_DIR = testConfigDir;
+
+  // Clear config cache from previous test
+  clearConfigCache();
 
   // Create empty YAML config
   const emptyConfig: CollectionConfig = { collections: {} };
@@ -172,8 +175,9 @@ async function createTestCollection(
     pattern: glob,
   };
 
-  // Write back
+  // Write back and clear cache
   await writeFile(configPath, YAML.stringify(config));
+  clearConfigCache();
   return name;
 }
 
@@ -196,8 +200,9 @@ async function addPathContext(collectionName: string, pathPrefix: string, contex
 
   config.collections[collectionName].context![pathPrefix] = contextText;
 
-  // Write back
+  // Write back and clear cache
   await writeFile(configPath, YAML.stringify(config));
+  clearConfigCache();
 }
 
 // Helper to add global context in YAML config
@@ -210,6 +215,7 @@ async function addGlobalContext(contextText: string): Promise<void> {
   config.global_context = contextText;
 
   await writeFile(configPath, YAML.stringify(config));
+  clearConfigCache();
 }
 
 // =============================================================================
@@ -884,7 +890,7 @@ describe("FTS Search", () => {
     expect(allResults).toHaveLength(2);
 
     // Filter by collection name (collectionId is now treated as collection name string)
-    const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
+    const filtered = store.searchFTS("searchable", 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 

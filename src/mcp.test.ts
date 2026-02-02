@@ -15,7 +15,7 @@ import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "./collections";
+import { clearConfigCache, type CollectionConfig } from "./collections";
 
 // =============================================================================
 // Test Database Setup
@@ -84,19 +84,42 @@ function initTestDatabase(db: Database): void {
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      name, body,
-      content='documents',
-      content_rowid='id',
+      filepath, title, body,
       tokenize='porter unicode61'
     )
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body)
-      SELECT new.id, new.path, content.doc
-      FROM content
-      WHERE content.hash = new.hash;
+    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+    WHEN new.active = 1
+    BEGIN
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
     END
   `);
 
@@ -224,6 +247,7 @@ describe("MCP Server", () => {
       }
     };
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
+    clearConfigCache();
 
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
     testDb = new Database(testDbPath);

@@ -65,12 +65,12 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  reciprocalRankFusion,
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
-  formatSearchResults,
-  formatDocuments,
+  addLineNumbers,
   escapeXml,
   escapeCSV,
   type OutputFormat,
@@ -149,8 +149,8 @@ const cursor = {
 };
 
 // Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
+process.on('SIGINT', () => { cursor.show(); closeDb(); process.exit(130); });
+process.on('SIGTERM', () => { cursor.show(); closeDb(); process.exit(143); });
 
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
@@ -194,42 +194,6 @@ function checkIndexHealth(db: Database): void {
   if (daysStale !== null && daysStale >= 14) {
     process.stderr.write(`${c.dim}Tip: Index last updated ${daysStale} days ago. Run 'qmd update' to refresh.${c.reset}\n`);
   }
-}
-
-// Compute unique display path for a document
-// Always include at least parent folder + filename, add more parent dirs until unique
-function computeDisplayPath(
-  filepath: string,
-  collectionPath: string,
-  existingPaths: Set<string>
-): string {
-  // Get path relative to collection (include collection dir name)
-  const collectionDir = collectionPath.replace(/\/$/, '');
-  const collectionName = collectionDir.split('/').pop() || '';
-
-  let relativePath: string;
-  if (filepath.startsWith(collectionDir + '/')) {
-    // filepath is under collection: use collection name + relative path
-    relativePath = collectionName + filepath.slice(collectionDir.length);
-  } else {
-    // Fallback: just use the filepath
-    relativePath = filepath;
-  }
-
-  const parts = relativePath.split('/').filter(p => p.length > 0);
-
-  // Always include at least parent folder + filename (minimum 2 parts if available)
-  // Then add more parent dirs until unique
-  const minParts = Math.min(2, parts.length);
-  for (let i = parts.length - minParts; i >= 0; i--) {
-    const candidate = parts.slice(i).join('/');
-    if (!existingPaths.has(candidate)) {
-      return candidate;
-    }
-  }
-
-  // Absolute fallback: use full path (should be unique)
-  return filepath;
 }
 
 // Rerank documents using node-llama-cpp cross-encoder model
@@ -1659,97 +1623,6 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   closeDb();
 }
 
-// Sanitize a term for FTS5: remove punctuation except apostrophes
-function sanitizeFTS5Term(term: string): string {
-  // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
-  return term.replace(/[^\w']/g, '').trim();
-}
-
-// Build FTS5 query: phrase-aware with fallback to individual terms
-function buildFTS5Query(query: string): string {
-  // Sanitize the full query for phrase matching
-  const sanitizedQuery = query.replace(/[^\w\s']/g, '').trim();
-
-  const terms = query
-    .split(/\s+/)
-    .map(sanitizeFTS5Term)
-    .filter(term => term.length >= 2); // Skip single chars and empty
-
-  if (terms.length === 0) return "";
-  if (terms.length === 1) return `"${terms[0]!.replace(/"/g, '""')}"`;
-
-  // Strategy: exact phrase OR proximity match OR individual terms
-  // Exact phrase matches rank highest, then close proximity, then any term
-  const phrase = `"${sanitizedQuery.replace(/"/g, '""')}"`;
-  const quotedTerms = terms.map(t => `"${t.replace(/"/g, '""')}"`);
-
-  // FTS5 NEAR syntax: NEAR(term1 term2, distance)
-  const nearPhrase = `NEAR(${quotedTerms.join(' ')}, 10)`;
-  const orTerms = quotedTerms.join(' OR ');
-
-  // Exact phrase > proximity > any term
-  return `(${phrase}) OR (${nearPhrase}) OR (${orTerms})`;
-}
-
-// Normalize BM25 score to 0-1 range using sigmoid
-function normalizeBM25(score: number): number {
-  // BM25 scores are negative in SQLite (lower = better)
-  // Typical range: -15 (excellent) to -2 (weak match)
-  // Map to 0-1 where higher is better
-  const absScore = Math.abs(score);
-  // Sigmoid-ish normalization: maps ~2-15 range to ~0.1-0.95
-  return 1 / (1 + Math.exp(-(absScore - 5) / 3));
-}
-
-function normalizeScores(results: SearchResult[]): SearchResult[] {
-  if (results.length === 0) return results;
-  const maxScore = Math.max(...results.map(r => r.score));
-  const minScore = Math.min(...results.map(r => r.score));
-  const range = maxScore - minScore || 1;
-  return results.map(r => ({ ...r, score: (r.score - minScore) / range }));
-}
-
-// Reciprocal Rank Fusion: combines multiple ranked lists
-// RRF score = sum(1 / (k + rank)) across all lists where doc appears
-// k=60 is standard, provides good balance between top and lower ranks
-
-function reciprocalRankFusion(
-  resultLists: RankedResult[][],
-  weights: number[] = [],  // Weight per result list (default 1.0)
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { score: number; displayPath: string; title: string; body: string; bestRank: number }>();
-
-  for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
-    const results = resultLists[listIdx];
-    if (!results) continue;
-    const weight = weights[listIdx] ?? 1.0;
-    for (let rank = 0; rank < results.length; rank++) {
-      const doc = results[rank];
-      if (!doc) continue; // Ensure doc is not undefined
-      const rrfScore = weight / (k + rank + 1);
-      const existing = scores.get(doc.file);
-      if (existing) {
-        existing.score += rrfScore;
-        existing.bestRank = Math.min(existing.bestRank, rank);
-      } else {
-        scores.set(doc.file, { score: rrfScore, displayPath: doc.displayPath, title: doc.title, body: doc.body, bestRank: rank });
-      }
-    }
-  }
-
-  // Add bonus for best rank: documents that ranked #1-3 in any list get a boost
-  // This prevents dilution of exact matches by expansion queries
-  return Array.from(scores.entries())
-    .map(([file, { score, displayPath, title, body, bestRank }]) => {
-      let bonus = 0;
-      if (bestRank === 0) bonus = 0.05;  // Ranked #1 somewhere
-      else if (bestRank <= 2) bonus = 0.02;  // Ranked top-3 somewhere
-      return { file, displayPath, title, body, score: score + bonus };
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
 type OutputOptions = {
   format: OutputFormat;
   full: boolean;
@@ -1782,20 +1655,6 @@ function formatScore(score: number): string {
   return `${c.dim}${pct}%${c.reset}`;
 }
 
-// Shorten directory path for display - relative to $HOME (used for context paths, not documents)
-function shortPath(dirpath: string): string {
-  const home = homedir();
-  if (dirpath.startsWith(home)) {
-    return '~' + dirpath.slice(home.length);
-  }
-  return dirpath;
-}
-
-// Add line numbers to text content
-function addLineNumbers(text: string, startLine: number = 1): string {
-  const lines = text.split('\n');
-  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
-}
 
 function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
@@ -1934,7 +1793,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-  const results = searchFTS(db, query, fetchLimit, collectionName as any);
+  const results = searchFTS(db, query, fetchLimit, collectionName);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2008,7 +1867,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     // are made. This is a known limitation of the LlamaEmbeddingContext.
     // See: https://github.com/tobi/qmd/pull/23
     for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, session);
+      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName, session);
       for (const r of vecResults) {
         const existing = allResults.get(r.filepath);
         if (!existing || r.score > existing.score) {
@@ -2099,7 +1958,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   checkIndexHealth(db);
 
   // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
+  const initialFts = searchFTS(db, query, 20, collectionName);
   let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
@@ -2139,49 +1998,46 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
     process.stderr.write(`${c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${c.reset}\n`);
 
-    // Collect ranked result lists for RRF fusion
-    const rankedLists: RankedResult[][] = [];
+    // Collect ranked result lists for RRF fusion, separated by source for deterministic weighting
+    const originalLists: RankedResult[][] = [];
+    const expansionLists: RankedResult[][] = [];
 
     // Map to store hash by filepath for final results
     const hashMap = new Map<string, string>();
 
-    // Run all searches concurrently (FTS + Vector)
-    const searchPromises: Promise<void>[] = [];
+    const toRankedList = (results: SearchResult[]): RankedResult[] =>
+      results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score }));
 
-    // FTS searches
-    for (const q of ftsQueries) {
+    // FTS searches (synchronous, safe to run in sequence)
+    for (let i = 0; i < ftsQueries.length; i++) {
+      const q = ftsQueries[i];
       if (!q) continue;
-      searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) {
-            // Mutex for hashMap is not strictly needed as it's just adding values
-            hashMap.set(r.filepath, r.hash);
-          }
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-      })());
-    }
-
-    // Vector searches (session ensures contexts stay alive)
-    if (hasVectors) {
-      for (const q of vectorQueries) {
-        if (!q) continue;
-        searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        })());
+      const ftsResults = searchFTS(db, q, 20, collectionName || "");
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
+        const list = toRankedList(ftsResults);
+        if (i === 0) originalLists.push(list); else expansionLists.push(list);
       }
     }
 
-    await Promise.all(searchPromises);
+    // Vector searches — run sequentially to avoid node-llama-cpp embedding context hangs
+    // (see comment at line ~2004: concurrent embed() calls cause indefinite hangs)
+    if (hasVectors) {
+      for (let i = 0; i < vectorQueries.length; i++) {
+        const q = vectorQueries[i];
+        if (!q) continue;
+        const vecResults = await searchVec(db, q, embedModel, 20, collectionName || "", session);
+        if (vecResults.length > 0) {
+          for (const r of vecResults) hashMap.set(r.filepath, r.hash);
+          const list = toRankedList(vecResults);
+          if (i === 0) originalLists.push(list); else expansionLists.push(list);
+        }
+      }
+    }
 
-    // Apply Reciprocal Rank Fusion to combine all ranked lists
-    // Give 2x weight to original query results (first 2 lists: FTS + vector)
-    const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+    // Apply Reciprocal Rank Fusion — original query lists get 2x weight
+    const rankedLists = [...originalLists, ...expansionLists];
+    const weights = rankedLists.map((_, i) => i < originalLists.length ? 2.0 : 1.0);
     const fused = reciprocalRankFusion(rankedLists, weights);
     // Hard cap reranking for latency/cost. We rerank per-document (best chunk only).
     const RERANK_DOC_LIMIT = 40;
@@ -2303,6 +2159,7 @@ function parseCLI() {
         type: "boolean",
       },
       help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2329,7 +2186,7 @@ function parseCLI() {
       "line-numbers": { type: "boolean" },  // add line numbers to output
     },
     allowPositionals: true,
-    strict: false, // Allow unknown options to pass through
+    strict: true,
   });
 
   // Select index name (default: "index")
@@ -2360,6 +2217,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    context: values.context as string | undefined,
   };
 
   return {
@@ -2372,58 +2230,66 @@ function parseCLI() {
 }
 
 function showHelp(): void {
-  console.log("Usage:");
-  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create/index collection");
-  console.log("  qmd collection list           - List all collections with details");
-  console.log("  qmd collection remove <name>  - Remove a collection by name");
-  console.log("  qmd collection rename <old> <new>  - Rename a collection");
-  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
-  console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
-  console.log("  qmd context list              - List all contexts");
-  console.log("  qmd context rm <path>         - Remove context");
-  console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
-  console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
-  console.log("  qmd status                    - Show index status and collections");
-  console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
-  console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
-  console.log("  qmd search <query>            - Full-text search (BM25)");
-  console.log("  qmd vsearch <query>           - Vector similarity search");
-  console.log("  qmd query <query>             - Combined search with query expansion + reranking");
-  console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
-  console.log("");
-  console.log("Global options:");
-  console.log("  --index <name>             - Use custom index name (default: index)");
-  console.log("");
-  console.log("Search options:");
-  console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
-  console.log("  --all                      - Return all matches (use with --min-score to filter)");
-  console.log("  --min-score <num>          - Minimum similarity score");
-  console.log("  --full                     - Output full document instead of snippet");
-  console.log("  --line-numbers             - Add line numbers to output");
-  console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
-  console.log("  --json                     - JSON output with snippets (default: 20 results)");
-  console.log("  --csv                      - CSV output with snippets");
-  console.log("  --md                       - Markdown output");
-  console.log("  --xml                      - XML output");
-  console.log("  -c, --collection <name>    - Filter results to a specific collection");
-  console.log("");
-  console.log("Multi-get options:");
-  console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
-  console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
-  console.log("");
-  console.log("Models (auto-downloaded from HuggingFace):");
-  console.log("  Embedding: embeddinggemma-300M-Q8_0");
-  console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
-  console.log("");
-  console.log(`Index: ${getDbPath()}`);
+  console.log(`${c.bold}qmd${c.reset} — Query Markup Documents\n`);
+  console.log(`Usage: qmd <command> [options]\n`);
+  console.log(`${c.bold}Search Commands:${c.reset}`);
+  console.log("  qmd search <query>          BM25 full-text search (fast)");
+  console.log("  qmd vsearch <query>         Vector semantic search");
+  console.log("  qmd query <query>           Hybrid search + reranking (best quality)\n");
+  console.log(`${c.bold}Document Retrieval:${c.reset}`);
+  console.log("  qmd get <file>[:line]       Get document by path, docid, or line");
+  console.log("  qmd multi-get <pattern>     Get multiple docs by glob or list");
+  console.log("  qmd ls [collection[/path]]  List collections or files\n");
+  console.log(`${c.bold}Collection Management:${c.reset}`);
+  console.log("  qmd collection add <path>   Index a directory");
+  console.log("  qmd collection list         Show all collections");
+  console.log("  qmd collection remove <n>   Remove a collection");
+  console.log("  qmd collection rename       Rename a collection\n");
+  console.log(`${c.bold}Context & Maintenance:${c.reset}`);
+  console.log("  qmd context add [path] \"d\"  Add context description");
+  console.log("  qmd context list            Show all contexts");
+  console.log("  qmd context check           Find missing contexts");
+  console.log("  qmd context rm <path>       Remove context");
+  console.log("  qmd update [--pull]         Re-index collections");
+  console.log("  qmd embed [-f]              Generate vector embeddings");
+  console.log("  qmd status                  Index health and info");
+  console.log("  qmd cleanup                 Clean cache and orphaned data");
+  console.log("  qmd mcp                     Start MCP server\n");
+  console.log(`${c.bold}Options:${c.reset}`);
+  console.log("  -n <num>               Number of results");
+  console.log("  -c, --collection <n>   Filter by collection");
+  console.log("  --context <text>       Context for query expansion");
+  console.log("  --min-score <num>      Minimum score threshold");
+  console.log("  --full                 Show full document content");
+  console.log("  --line-numbers         Add line numbers");
+  console.log("  --all                  Return all matches");
+  console.log("  --index <name>         Use named index\n");
+  console.log(`${c.bold}Output Formats:${c.reset}`);
+  console.log("  --json  --csv  --md  --xml  --files\n");
+  console.log(`${c.bold}Other:${c.reset}`);
+  console.log("  --help, -h             Show this help");
+  console.log("  --version, -v          Show version");
 }
 
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
-  const cli = parseCLI();
+  let cli: ReturnType<typeof parseCLI>;
+  try {
+    cli = parseCLI();
+  } catch (e: any) {
+    if (e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION') {
+      console.error(e.message);
+      console.error(`\nRun 'qmd --help' for usage information.`);
+      process.exit(1);
+    }
+    throw e;
+  }
+
+  if (cli.values.version || cli.values.v) {
+    const pkg = await Bun.file(new URL("../package.json", import.meta.url)).json();
+    console.log(`qmd ${pkg.version}`);
+    process.exit(0);
+  }
 
   if (!cli.command || cli.values.help) {
     showHelp();

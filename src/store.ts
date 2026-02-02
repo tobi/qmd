@@ -13,7 +13,7 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
-import { realpathSync, statSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -25,15 +25,11 @@ import {
 } from "./llm";
 import {
   findContextForPath as collectionsFindContextForPath,
-  addContext as collectionsAddContext,
-  removeContext as collectionsRemoveContext,
-  listAllContexts as collectionsListAllContexts,
   getCollection,
   listCollections as collectionsListCollections,
   addCollection as collectionsAddCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
-  setGlobalContext,
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
 } from "./collections";
@@ -254,7 +250,7 @@ export function getDefaultDbPath(indexName: string = "index"): string {
 
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
+  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
   return resolve(qmdCacheDir, `${indexName}.sqlite`);
 }
 
@@ -619,7 +615,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -702,7 +698,7 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
+    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
 
     // Query expansion & reranking
@@ -1656,91 +1652,6 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   collectionsRenameCollection(oldName, newName);
 }
 
-// =============================================================================
-// Context Management Operations
-// =============================================================================
-
-/**
- * Insert or update a context for a specific collection and path prefix.
- */
-export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
-  // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) {
-    throw new Error(`Collection with id ${collectionId} not found`);
-  }
-
-  // Use collections.ts to add context
-  collectionsAddContext(coll.name, pathPrefix, context);
-}
-
-/**
- * Delete a context for a specific collection and path prefix.
- * Returns the number of contexts deleted.
- */
-export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
-  // Use collections.ts to remove context
-  const success = collectionsRemoveContext(collectionName, pathPrefix);
-  return success ? 1 : 0;
-}
-
-/**
- * Delete all global contexts (contexts with empty path_prefix).
- * Returns the number of contexts deleted.
- */
-export function deleteGlobalContexts(db: Database): number {
-  let deletedCount = 0;
-
-  // Remove global context
-  setGlobalContext(undefined);
-  deletedCount++;
-
-  // Remove root context (empty string) from all collections
-  const collections = collectionsListCollections();
-  for (const coll of collections) {
-    const success = collectionsRemoveContext(coll.name, '');
-    if (success) {
-      deletedCount++;
-    }
-  }
-
-  return deletedCount;
-}
-
-/**
- * List all contexts, grouped by collection.
- * Returns contexts ordered by collection name, then by path prefix length (longest first).
- */
-export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const allContexts = collectionsListAllContexts();
-
-  // Convert to expected format and sort
-  return allContexts.map(ctx => ({
-    collection_name: ctx.collection,
-    path_prefix: ctx.path,
-    context: ctx.context,
-  })).sort((a, b) => {
-    // Sort by collection name first
-    if (a.collection_name !== b.collection_name) {
-      return a.collection_name.localeCompare(b.collection_name);
-    }
-    // Then by path prefix length (longest first)
-    if (a.path_prefix.length !== b.path_prefix.length) {
-      return b.path_prefix.length - a.path_prefix.length;
-    }
-    // Then alphabetically
-    return a.path_prefix.localeCompare(b.path_prefix);
-  });
-}
-
-/**
- * Get all collections (name only - from YAML config).
- */
-export function getAllCollections(db: Database): { name: string }[] {
-  const collections = collectionsListCollections();
-  return collections.map(c => ({ name: c.name }));
-}
-
 /**
  * Check which collections don't have any context defined.
  * Returns collections that have no context entries at all (not even root context).
@@ -1831,19 +1742,28 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // =============================================================================
 
 function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+  // Use Unicode-aware pattern to preserve CJK and other non-ASCII word characters
+  return term.replace(/[^\p{L}\p{N}']/gu, '').trim();
 }
 
 function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t.length > 0);
+  const sanitizedQuery = query.replace(/[^\p{L}\p{N}\s']/gu, '').trim();
+  const terms = query
+    .split(/\s+/)
+    .map(sanitizeFTS5Term)
+    .filter(term => term.length >= 2);
   if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  if (terms.length === 1) return `"${terms[0]!.replace(/"/g, '""')}"`;
+
+  // Strategy: exact phrase OR proximity match OR individual terms
+  const phrase = `"${sanitizedQuery.replace(/"/g, '""')}"`;
+  const quotedTerms = terms.map(t => `"${t.replace(/"/g, '""')}"`);
+  const nearPhrase = `NEAR(${quotedTerms.join(' ')}, 10)`;
+  const orTerms = quotedTerms.join(' OR ');
+  return `(${phrase}) OR (${nearPhrase}) OR (${orTerms})`;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1854,7 +1774,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
+      bm25(documents_fts, 2.0, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
@@ -1862,12 +1782,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
+  if (collectionName) {
     sql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+    params.push(collectionName);
   }
 
   // bm25 lower is better; sort ascending.
@@ -1880,7 +1797,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     // Convert bm25 (negative, lower is better) into a stable (0..1] score where higher is better.
     // BM25 scores in SQLite FTS5 are negative (e.g., -10 is strong, -2 is weak).
     // Avoid per-query normalization so "strong signal" heuristics can work.
-    const score = 1 / (1 + Math.abs(row.bm25_score));
+    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
