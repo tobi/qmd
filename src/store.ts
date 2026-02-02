@@ -957,44 +957,60 @@ export function getDocid(hash: string): string {
  * - Remove leading/trailing dashes from path segments
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
+ * - Encode segments that would be empty after cleaning
  */
 export function handelize(path: string): string {
   if (!path || path.trim() === '') {
     throw new Error('handelize: path cannot be empty');
   }
 
-  // Allow route-style "$" filenames while still rejecting paths with no usable content.
-  const segments = path.split('/').filter(Boolean);
-  const lastSegment = segments[segments.length - 1] || '';
-  const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}$]/u.test(filenameWithoutExt);
-  if (!hasValidContent) {
-    throw new Error(`handelize: path "${path}" has no valid filename content`);
-  }
+  const slugify = (segment: string): string => {
+    return segment
+      .replace(/[^\p{L}\p{N}$]+/gu, '-')
+      .replace(/^-+|-+$/g, '');
+  };
+
+  const encodeSegment = (segment: string): string => {
+    const codepoints: string[] = [];
+    for (const ch of segment) {
+      const codepoint = ch.codePointAt(0);
+      if (codepoint === undefined) continue;
+      codepoints.push(codepoint.toString(16));
+    }
+    // Use a prefix that slugify can never produce (it strips underscores),
+    // so encoded segments can't collide with "normal" slugified names.
+    return `_u${codepoints.join('-') || '0'}`;
+  };
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
     .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
+      if (!segment) return '';
       const isLastSegment = idx === arr.length - 1;
 
       if (isLastSegment) {
         // For the filename (last segment), preserve the extension
         const extMatch = segment.match(/(\.[a-z0-9]+)$/i);
-        const ext = extMatch ? extMatch[1] : '';
-        const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
+        let ext = '';
+        let nameWithoutExt = segment;
+        if (extMatch) {
+          const extCandidate = extMatch[1];
+          const baseCandidate = segment.slice(0, -extCandidate.length);
+          if (baseCandidate.length > 0) {
+            ext = extCandidate;
+            nameWithoutExt = baseCandidate;
+          }
+        }
 
-        const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
-          .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
-
-        return cleanedName + ext;
+        const cleanedName = slugify(nameWithoutExt);
+        const safeName = cleanedName || encodeSegment(nameWithoutExt);
+        return safeName + ext;
       } else {
         // For directories, just clean normally
-        return segment
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')
-          .replace(/^-+|-+$/g, '');
+        const cleanedDir = slugify(segment);
+        return cleanedDir || encodeSegment(segment);
       }
     })
     .filter(Boolean)

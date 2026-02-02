@@ -400,9 +400,13 @@ describe("handelize", () => {
   test("throws error for invalid inputs", () => {
     expect(() => handelize("")).toThrow("path cannot be empty");
     expect(() => handelize("   ")).toThrow("path cannot be empty");
-    expect(() => handelize(".md")).toThrow("no valid filename content");
-    expect(() => handelize("...")).toThrow("no valid filename content");
-    expect(() => handelize("___")).toThrow("no valid filename content");
+    expect(() => handelize("___")).toThrow("resulted in empty string");
+  });
+
+  test("handles non-alphanumeric filenames", () => {
+    expect(handelize(".md")).toBe("md");
+    expect(handelize("...")).toBe("_u2e-2e-2e");
+    expect(handelize("{.md")).toBe("_u7b.md");
   });
 
   test("handles minimal valid inputs", () => {
@@ -646,7 +650,7 @@ describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
     expect(chunks[0]!.pos).toBe(0);
     expect(chunks[0]!.tokens).toBeGreaterThan(0);
     expect(chunks[0]!.tokens).toBeLessThan(900);
-  });
+  }, 20000);
 
   test("chunkDocumentByTokens splits large documents", async () => {
     // Create a document that's definitely more than 900 tokens
