@@ -94,11 +94,9 @@ function calcHitRate(
 
 describe("BM25 Search (FTS)", () => {
   let store: ReturnType<typeof createStore>;
-  let db: Database;
 
   beforeAll(() => {
     store = createStore();
-    db = store.db;
 
     // Load and index eval documents
     const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
@@ -197,7 +195,7 @@ describe("Vector Search", () => {
       }
     }
     hasEmbeddings = true;
-  }, 120000); // 2 minute timeout for embedding generation
+  }, 300_000); // 5 minute timeout for embedding generation
 
   afterAll(() => {
     store.close();

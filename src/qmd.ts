@@ -84,10 +84,6 @@ function getStore(): ReturnType<typeof createStore> {
   return store;
 }
 
-function getDb(): Database {
-  return getStore().db;
-}
-
 function closeDb(): void {
   if (store) {
     store.close();

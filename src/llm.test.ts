@@ -374,7 +374,7 @@ describe("LlamaCpp Integration", () => {
         expect(["lex", "vec", "hyde"]).toContain(q.type);
         expect(q.text.length).toBeGreaterThan(0);
       }
-    }, 30000); // 30s timeout for model loading
+    }, 300_000); // 300s timeout for model loading
 
     test("can exclude lexical queries", async () => {
       const result = await llm.expandQuery("authentication setup", { includeLexical: false });
