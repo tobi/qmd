@@ -1,0 +1,27 @@
+services:
+  qmd:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: qmd:latest
+    container_name: qmd-engine
+    env_file:
+      - .env
+    volumes:
+      # Mount Obsidian vault as read-only
+      - ${OBSIDIAN_VAULT_PATH}:/vault:ro
+      # Mount persistent data directory (index, models, cache)
+      - ${QMD_DATA_PATH}:/data:rw
+    # Run as your local user to avoid permission issues
+    # Define UID and GID in .env if they are not 1000
+    user: "${UID:-1000}:${GID:-1000}"
+    # Optional: limit resources if desired
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 4G
+    environment:
+      # Override index PATH if necessary, although QMD uses XDG_CACHE_HOME defined in Dockerfile
+      # Force index into the data volume
+      - INDEX_PATH=/data/index.sqlite
+    restart: unless-stopped

@@ -12,3 +12,5 @@ texts/
 !finetune/*.md
 finetune/outputs/
 finetune/data/train/
+qmd-data/
+.env
