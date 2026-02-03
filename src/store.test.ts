@@ -15,6 +15,7 @@ import YAML from "yaml";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
+  getDefaultDbPath,
   homedir,
   resolve,
   getPwd,
@@ -275,14 +276,12 @@ describe("Path Utilities", () => {
     if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
   });
 
-  test("store.getDefaultDbPath uses INDEX_PATH when set", () => {
+  test("getDefaultDbPath uses INDEX_PATH when set", () => {
     const originalIndexPath = process.env.INDEX_PATH;
     process.env.INDEX_PATH = "/tmp/test-index.sqlite";
 
-    const store = createStore();
-    expect(store.getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
-    expect(store.getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
-    store.close();
+    expect(getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
+    expect(getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
 
     // Restore
     if (originalIndexPath) {
