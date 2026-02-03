@@ -35,6 +35,7 @@ import {
   parseVirtualPath,
   normalizeDocid,
   isDocid,
+  buildFTS5Query,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -930,6 +931,123 @@ describe("FTS Search", () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/test/active.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/active.md`);
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
+// buildFTS5Query Unit Tests
+// =============================================================================
+
+describe("buildFTS5Query", () => {
+  test("returns null for empty query", () => {
+    expect(buildFTS5Query("")).toBeNull();
+    expect(buildFTS5Query("   ")).toBeNull();
+  });
+
+  test("single term becomes prefix match", () => {
+    expect(buildFTS5Query("hello")).toBe('"hello"*');
+  });
+
+  test("multiple terms become prefix matches with AND", () => {
+    expect(buildFTS5Query("hello world")).toBe('"hello"* AND "world"*');
+  });
+
+  test("quoted phrase becomes exact phrase match", () => {
+    expect(buildFTS5Query('"hello world"')).toBe('"hello world"');
+  });
+
+  test("mixed quoted and unquoted terms", () => {
+    expect(buildFTS5Query('meeting "Q1 planning"')).toBe('"q1 planning" AND "meeting"*');
+  });
+
+  test("multiple quoted phrases", () => {
+    expect(buildFTS5Query('"hello world" "foo bar"')).toBe('"hello world" AND "foo bar"');
+  });
+
+  test("quoted phrase with unquoted terms on both sides", () => {
+    expect(buildFTS5Query('before "exact phrase" after')).toBe('"exact phrase" AND "before"* AND "after"*');
+  });
+
+  test("sanitizes special characters in terms", () => {
+    expect(buildFTS5Query("foo(bar)")).toBe('"foobar"*');
+  });
+
+  test("sanitizes special characters in phrases", () => {
+    expect(buildFTS5Query('"foo(bar) baz"')).toBe('"foo bar baz"');
+  });
+
+  test("handles unicode in terms", () => {
+    expect(buildFTS5Query("日本語")).toBe('"日本語"*');
+  });
+
+  test("handles unicode in phrases", () => {
+    expect(buildFTS5Query('"日本語 テスト"')).toBe('"日本語 テスト"');
+  });
+
+  test("normalizes case in terms", () => {
+    expect(buildFTS5Query("Hello WORLD")).toBe('"hello"* AND "world"*');
+  });
+
+  test("normalizes case in phrases", () => {
+    expect(buildFTS5Query('"Hello WORLD"')).toBe('"hello world"');
+  });
+
+  test("empty quoted phrase is ignored", () => {
+    expect(buildFTS5Query('"" hello')).toBe('"hello"*');
+  });
+
+  test("phrase with only special chars is ignored", () => {
+    expect(buildFTS5Query('"()" hello')).toBe('"hello"*');
+  });
+});
+
+describe("FTS Search with exact phrases", () => {
+  test("searchFTS finds exact phrase match", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      body: "The quick brown fox jumps over the lazy dog",
+      displayPath: "test/doc1.md",
+    });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc2",
+      body: "The brown quick fox is here",
+      displayPath: "test/doc2.md",
+    });
+
+    // Exact phrase "quick brown" should only match doc1
+    const results = store.searchFTS('"quick brown"', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/doc1.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS combines exact phrase with prefix term", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      body: "Meeting notes about project timeline discussion",
+      displayPath: "test/doc1.md",
+    });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc2",
+      body: "The project timeline is important",
+      displayPath: "test/doc2.md",
+    });
+
+    // Should match doc1 which has both "meeting" and "project timeline"
+    const results = store.searchFTS('meeting "project timeline"', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/doc1.md`);
 
     await cleanupTestDb(store);
   });

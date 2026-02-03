@@ -1834,13 +1834,51 @@ function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
 }
 
-function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
+/**
+ * Sanitize a phrase for FTS5 exact phrase matching.
+ * Removes characters that could break FTS5 syntax but preserves spaces.
+ */
+function sanitizeFTS5Phrase(phrase: string): string {
+  // Remove quotes and special FTS5 operators, but keep spaces and alphanumerics
+  return phrase.replace(/[^\p{L}\p{N}\s']/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Build an FTS5 query string that supports:
+ * - Quoted phrases: "hello world" → exact phrase match
+ * - Unquoted terms: hello world → prefix matches with AND
+ * - Mixed: meeting "Q1 planning" → "meeting"* AND "Q1 planning"
+ */
+export function buildFTS5Query(query: string): string | null {
+  const parts: string[] = [];
+  let remaining = query;
+
+  // Extract quoted phrases first
+  const phraseRegex = /"([^"]+)"/g;
+  let match;
+  while ((match = phraseRegex.exec(query)) !== null) {
+    const phrase = sanitizeFTS5Phrase(match[1]);
+    if (phrase.length > 0) {
+      // Exact phrase match (no asterisk)
+      parts.push(`"${phrase}"`);
+    }
+  }
+  // Remove quoted phrases from remaining text
+  remaining = remaining.replace(phraseRegex, ' ');
+
+  // Process remaining unquoted terms as prefix matches
+  const terms = remaining.split(/\s+/)
     .map(t => sanitizeFTS5Term(t))
     .filter(t => t.length > 0);
-  if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+
+  for (const term of terms) {
+    // Prefix match with asterisk
+    parts.push(`"${term}"*`);
+  }
+
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  return parts.join(' AND ');
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
