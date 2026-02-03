@@ -1,5 +1,4 @@
 #!/usr/bin/env bun
-import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
 import { readFileSync, statSync } from "fs";
@@ -101,8 +100,7 @@ function setIndexName(name: string | null): void {
   closeDb();
 }
 
-function ensureVecTable(_db: Database, dimensions: number): void {
-  // Store owns the DB; ignore `_db` and ensure vec table on the active store
+function ensureVecTable(dimensions: number): void {
   getStore().ensureVecTable(dimensions);
 }
 
@@ -210,7 +208,7 @@ function computeDisplayPath(
 }
 
 // Rerank documents using node-llama-cpp cross-encoder model
-async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
+async function rerank(query: string, documents: { file: string; text: string }[], session?: ILLMSession): Promise<{ file: string; score: number }[]> {
   if (documents.length === 0) return [];
 
   const total = documents.length;
@@ -1538,7 +1536,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
-    ensureVecTable(db, firstResult.embedding.length);
+    ensureVecTable(firstResult.embedding.length);
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
@@ -2036,15 +2034,6 @@ async function expandQueryStructured(query: string, includeLexical: boolean = tr
   return queryables;
 }
 
-async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database, session?: ILLMSession): Promise<string[]> {
-  const queryables = await expandQueryStructured(query, true, undefined, session);
-  const queries = new Set<string>([query]);
-  for (const q of queryables) {
-    queries.add(q.text);
-  }
-  return Array.from(queries);
-}
-
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
@@ -2190,8 +2179,6 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     const reranked = await rerank(
       query,
       chunksToRerank.map(ch => ({ file: ch.file, text: ch.text })),
-      rerankModel,
-      undefined,
       session
     );
 
