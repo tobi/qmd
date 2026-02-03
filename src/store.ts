@@ -16,10 +16,10 @@ import { Glob } from "bun";
 import { realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  supportsTokenization,
   type RerankDocument,
   type ILLMSession,
 } from "./llm";
@@ -1250,6 +1250,15 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
+
+  if (!supportsTokenization(llm)) {
+    const chunks = chunkDocument(content, maxTokens * 4, overlapTokens * 4);
+    return chunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+    }));
+  }
 
   // Tokenize once upfront
   const allTokens = await llm.tokenize(content);
