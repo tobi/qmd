@@ -17,6 +17,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { loadLLMConfig, getLLMConfigPath, type OpenAIConfig } from "./llm_config.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -292,6 +293,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -319,9 +325,394 @@ export interface LLM {
   dispose(): Promise<void>;
 }
 
+export type TokenizerLLM = LLM & {
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
+  countTokens?(text: string): Promise<number>;
+};
+
+export function supportsTokenization(llm: LLM): llm is TokenizerLLM {
+  return typeof (llm as TokenizerLLM).tokenize === "function"
+    && typeof (llm as TokenizerLLM).detokenize === "function";
+}
+
 // =============================================================================
 // node-llama-cpp Implementation
 // =============================================================================
+
+type OpenAIModelConfig = {
+  embed: string;
+  generate: string;
+  rerank: string;
+};
+
+type OpenAITemperatureConfig = {
+  generate: number;
+  rerank: number;
+};
+
+type OpenAIClientConfig = {
+  baseUrl: string;
+  apiKey?: string;
+  models: OpenAIModelConfig;
+  temperatures: OpenAITemperatureConfig;
+  timeoutMs: number;
+  useResponsesForRerank: boolean;
+};
+
+function resolveOpenAIBaseUrl(config: OpenAIConfig): string {
+  if (config.base_url) {
+    return config.base_url.replace(/\/+$/, "");
+  }
+  const protocol = config.protocol || "http";
+  const host = config.host || "localhost";
+  const port = config.port ?? 8000;
+  return `${protocol}://${host}:${port}`;
+}
+
+function normalizeOpenAIConfig(config?: OpenAIConfig): OpenAIClientConfig {
+  if (!config) {
+    throw new Error("OpenAI configuration missing.");
+  }
+  const models = config.models || {};
+  const embed = models.embed;
+  const generate = models.generate;
+  const rerank = models.rerank;
+  if (!embed || !generate || !rerank) {
+    throw new Error(
+      `OpenAI config missing model identifiers (embed/generate/rerank). Check ${getLLMConfigPath()}.`
+    );
+  }
+
+  return {
+    baseUrl: resolveOpenAIBaseUrl(config),
+    apiKey: config.api_key,
+    models: { embed, generate, rerank },
+    temperatures: {
+      generate: config.temperatures?.generate ?? 0.7,
+      rerank: config.temperatures?.rerank ?? 0.1,
+    },
+    timeoutMs: config.timeout_ms ?? 60_000,
+    useResponsesForRerank: config.responses?.rerank ?? false,
+  };
+}
+
+function buildOpenAIHeaders(apiKey?: string): HeadersInit {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  return headers;
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenAI request failed (${response.status}): ${text}`);
+  }
+  return JSON.parse(text) as T;
+}
+
+function extractJsonArray(text: string): unknown[] | null {
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1)) as unknown[];
+  } catch {
+    return null;
+  }
+}
+
+function extractResponsesOutputText(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload as {
+    output?: { content?: { type?: string; text?: string }[] }[];
+    output_text?: string;
+  };
+  if (typeof data.output_text === "string") {
+    return data.output_text;
+  }
+  if (Array.isArray(data.output)) {
+    for (const item of data.output) {
+      const content = item?.content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (part?.type === "output_text" && typeof part.text === "string") {
+          return part.text;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function parseRerankScores(
+  content: string,
+  docs: RerankDocument[]
+): RerankDocumentResult[] | null {
+  const parsed = extractJsonArray(content);
+  if (!parsed) return null;
+
+  const scores = new Map<number, number>();
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    const obj = entry as { index?: unknown; score?: unknown };
+    const index = typeof obj.index === "number" ? obj.index : Number(obj.index);
+    const score = typeof obj.score === "number" ? obj.score : Number(obj.score);
+    if (!Number.isFinite(index) || !Number.isFinite(score)) continue;
+    if (index < 0 || index >= docs.length) continue;
+    scores.set(index, score);
+  }
+
+  if (scores.size === 0) return null;
+  return docs
+    .map((doc, index) => ({
+      file: doc.file,
+      score: scores.get(index) ?? 0,
+      index,
+    }))
+    .sort((a, b) => b.score - a.score);
+}
+
+export class OpenAICompatibleLLM implements LLM {
+  private config: OpenAIClientConfig;
+
+  constructor(config: OpenAIConfig) {
+    this.config = normalizeOpenAIConfig(config);
+  }
+
+  private async request<T>(path: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const compositeSignal = typeof AbortSignal.any === "function"
+      ? AbortSignal.any([controller.signal, ...(signal ? [signal] : [])])
+      : signal ?? controller.signal;
+
+    try {
+      const resp = await fetch(`${this.config.baseUrl}${path}`, {
+        method: "POST",
+        headers: buildOpenAIHeaders(this.config.apiKey),
+        body: JSON.stringify(payload),
+        signal: compositeSignal,
+      });
+      return await parseJsonResponse<T>(resp);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async requestResponses<T>(payload: unknown, signal?: AbortSignal): Promise<T> {
+    return this.request<T>("/v1/responses", payload, signal);
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      const model = options.model || this.config.models.embed;
+      const payload = { model, input: text };
+      const data = await this.request<{ data: { embedding: number[] }[] }>("/v1/embeddings", payload);
+      if (!data.data?.length) return null;
+      return { embedding: data.data[0].embedding, model };
+    } catch (error) {
+      console.error("Remote embedding error:", error);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    try {
+      const payload = { model: this.config.models.embed, input: texts };
+      const data = await this.request<{ data: { embedding: number[]; index?: number }[] }>(
+        "/v1/embeddings",
+        payload
+      );
+      const results: (EmbeddingResult | null)[] = texts.map(() => null);
+      for (const [idx, item] of (data.data || []).entries()) {
+        const targetIndex = typeof item.index === "number" ? item.index : idx;
+        if (targetIndex >= 0 && targetIndex < results.length) {
+          results[targetIndex] = { embedding: item.embedding, model: this.config.models.embed };
+        }
+      }
+      return results;
+    } catch (error) {
+      console.error("Remote batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    try {
+      const model = options.model || this.config.models.generate;
+      const temperature = options.temperature ?? this.config.temperatures.generate;
+      const maxTokens = options.maxTokens ?? 300;
+      const payload = {
+        model,
+        messages: [{ role: "user", content: prompt }],
+        temperature,
+        max_tokens: maxTokens,
+      };
+      const data = await this.request<{ choices: { message: { content: string } }[] }>(
+        "/v1/chat/completions",
+        payload
+      );
+      const text = data.choices?.[0]?.message?.content ?? "";
+      return { text, model, done: true };
+    } catch (error) {
+      console.error("Remote generate error:", error);
+      return null;
+    }
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    try {
+      const resp = await fetch(`${this.config.baseUrl}/v1/models`, {
+        headers: buildOpenAIHeaders(this.config.apiKey),
+      });
+      if (!resp.ok) {
+        return { name: model, exists: true };
+      }
+      const data = await resp.json() as { data?: { id: string }[] };
+      const exists = data.data?.some((entry) => entry.id === model) ?? true;
+      return { name: model, exists };
+    } catch {
+      return { name: model, exists: true };
+    }
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean } = {}
+  ): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const contextLine = options.context ? `Context: ${options.context}\n` : "";
+    const prompt = `${contextLine}Expand the search query into multiple variations.\n` +
+      "Return each line in the format: type: text\n" +
+      "Types must be one of: lex, vec, hyde.\n" +
+      `Query: ${query}`;
+
+    const result = await this.generate(prompt, { temperature: this.config.temperatures.generate });
+    if (!result?.text) {
+      const fallback: Queryable[] = [
+        { type: "hyde", text: `Information about ${query}` },
+        { type: "lex", text: query },
+        { type: "vec", text: query },
+      ];
+      return includeLexical ? fallback : fallback.filter((item) => item.type !== "lex");
+    }
+
+    const lines = result.text.trim().split("\n");
+    const queryLower = query.toLowerCase();
+    const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+    const hasQueryTerm = (text: string): boolean => {
+      if (queryTerms.length === 0) return true;
+      const lower = text.toLowerCase();
+      return queryTerms.some(term => lower.includes(term));
+    };
+
+    const queryables: Queryable[] = lines.map(line => {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx === -1) return null;
+      const type = line.slice(0, colonIdx).trim();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+      const text = line.slice(colonIdx + 1).trim();
+      if (!hasQueryTerm(text)) return null;
+      return { type: type as QueryType, text };
+    }).filter((q): q is Queryable => q !== null);
+
+    const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+    if (filtered.length > 0) return filtered;
+
+    const fallback: Queryable[] = [
+      { type: "hyde", text: `Information about ${query}` },
+      { type: "lex", text: query },
+      { type: "vec", text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    _options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    const basePrompt =
+      "Score each document for relevance to the query on a 0-1 scale.\n" +
+      `Query: ${query}\n` +
+      documents.map((doc, index) => `Document ${index}:\n${doc.text}`).join("\n\n");
+
+    try {
+      if (this.config.useResponsesForRerank) {
+        const payload = {
+          model: this.config.models.rerank,
+          input: `${basePrompt}\nReturn JSON.`,
+          temperature: this.config.temperatures.rerank,
+          max_output_tokens: 400,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  index: { type: "integer" },
+                  score: { type: "number" },
+                },
+                required: ["index", "score"],
+              },
+            },
+          },
+        };
+        const data = await this.requestResponses<unknown>(payload);
+        const content = extractResponsesOutputText(data) ?? "";
+        const parsed = parseRerankScores(content, documents);
+        if (parsed) {
+          return { results: parsed, model: this.config.models.rerank };
+        }
+      }
+
+      const chatPayload = {
+        model: this.config.models.rerank,
+        messages: [
+          {
+            role: "user",
+            content:
+              `${basePrompt}\n` +
+              "Return a JSON array of objects with fields: index, score.",
+          },
+        ],
+        temperature: this.config.temperatures.rerank,
+        max_tokens: 400,
+      };
+      const data = await this.request<{ choices: { message: { content: string } }[] }>(
+        "/v1/chat/completions",
+        chatPayload
+      );
+      const content = data.choices?.[0]?.message?.content ?? "";
+      const parsed = parseRerankScores(content, documents);
+      if (parsed) {
+        return { results: parsed, model: this.config.models.rerank };
+      }
+    } catch (error) {
+      console.error("Remote rerank error:", error);
+    }
+
+    const fallback = documents.map((doc, index) => ({
+      file: doc.file,
+      score: 0,
+      index,
+    }));
+    return { results: fallback, model: this.config.models.rerank };
+  }
+
+  async dispose(): Promise<void> {
+    return;
+  }
+}
 
 export type LlamaCppConfig = {
   embedModel?: string;
@@ -956,11 +1347,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -996,7 +1387,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): LLM {
     return this.llm;
   }
 }
@@ -1177,14 +1568,19 @@ export function canUnloadLLM(): boolean {
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const config = loadLLMConfig();
+    if (config.provider === "openai") {
+      defaultLlamaCpp = new OpenAICompatibleLLM(config.openai);
+    } else {
+      defaultLlamaCpp = new LlamaCpp();
+    }
   }
   return defaultLlamaCpp;
 }
@@ -1192,7 +1588,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 /**
  * Set a custom default LlamaCpp instance (useful for testing)
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   defaultLlamaCpp = llm;
 }
 

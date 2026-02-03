@@ -536,6 +536,69 @@ const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-re
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
+### Remote OpenAI-Compatible LLMs
+
+QMD can use a remote OpenAI-compatible API instead of local GGUF models. Create
+`~/.config/qmd/llm.yml` with your host/port, model identifiers, and temperatures:
+
+```yaml
+provider: openai
+openai:
+  host: localhost
+  port: 8000
+  protocol: http
+  # Optional: base_url: http://localhost:8000
+  # Optional: api_key: sk-...
+  # Optional: use LM Studio structured output for reranking
+  responses:
+    rerank: true
+  models:
+    embed: embeddinggemma
+    generate: qmd-query-expansion
+    rerank: qwen3-reranker
+  temperatures:
+    generate: 0.7
+    rerank: 0.1
+```
+
+QMD uses `/v1/embeddings` for vectorization, `/v1/chat/completions` for query
+expansion and reranking, and `/v1/models` to validate model availability when
+possible.
+
+If you enable `openai.responses.rerank`, QMD will call `/v1/responses` with a
+JSON schema payload (compatible with LM Studio structured output) to force
+structured rerank scores.
+
+We recommend enabling this flag when your server supports `/v1/responses` because
+it is the newer OpenAI-compatible endpoint and provides stronger guarantees that
+the rerank output is valid JSON.
+
+LM Studio structured output schema (copy/paste when configuring the rerank model):
+
+```json
+{
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "index": { "type": "integer" },
+      "score": { "type": "number" }
+    },
+    "required": ["index", "score"]
+  }
+}
+```
+
+To sanity-check your remote setup, run:
+
+```bash
+bun scripts/test-remote-llm.ts
+```
+
+The script reads `~/.config/qmd/llm.yml`, calls `/v1/models`, sends an embedding
+request, runs a small chat completion, and verifies the reranker prompt.
+
 ### EmbeddingGemma Prompt Format
 
 ```
