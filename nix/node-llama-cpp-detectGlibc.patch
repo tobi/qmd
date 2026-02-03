@@ -1,0 +1,12 @@
+--- a/node_modules/node-llama-cpp/dist/bindings/utils/detectGlibc.js
++++ b/node_modules/node-llama-cpp/dist/bindings/utils/detectGlibc.js
+@@ -3,6 +3,9 @@
+ import { asyncSome } from "./asyncSome.js";
+ import { hasFileInPath } from "./hasFileInPath.js";
+ export async function detectGlibc({ platform }) {
++    // NixOS: glibc exists but not in FHS paths - always return true on Linux
++    if (platform === "linux")
++        return true;
+     if (platform === "linux") {
+         const librarySearchPaths = [
+             process.env.LD_LIBRARY_PATH,
