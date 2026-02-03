@@ -221,6 +221,7 @@ describe("MCP Server", () => {
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
     testStore = createStore(testDbPath);
     testDb = testStore.db;
+    initTestDatabase(testDb);
     seedTestData(testDb);
   });
 
@@ -300,6 +301,7 @@ describe("MCP Server", () => {
 
     test("returns empty when no vector table exists", async () => {
       const emptyStore = createStore(":memory:");
+      initTestDatabase(emptyStore.db);
       emptyStore.db.exec("DROP TABLE IF EXISTS vectors_vec");
 
       const results = await emptyStore.searchVec("test", DEFAULT_EMBED_MODEL, 10);

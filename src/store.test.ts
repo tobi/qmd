@@ -453,7 +453,7 @@ describe("Store Creation", () => {
     expect(() => store.db.prepare("SELECT 1").get()).toThrow();
     try {
       await unlink(testDbPath);
-    } catch {}
+    } catch { }
   });
 });
 
