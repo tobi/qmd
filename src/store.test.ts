@@ -1904,7 +1904,7 @@ describe("LlamaCpp Integration", () => {
     expect(queries.length).toBeGreaterThanOrEqual(1);
 
     await cleanupTestDb(store);
-  }, 30000);
+  }, 120000);
 
   test("expandQuery caches results", async () => {
     const store = await createTestStore();

@@ -22,11 +22,6 @@ process.env.INDEX_PATH = join(tempDir, "eval.sqlite");
 
 import {
   createStore,
-  searchFTS,
-  searchVec,
-  insertDocument,
-  insertContent,
-  insertEmbedding,
   chunkDocumentByTokens,
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
@@ -115,8 +110,8 @@ describe("BM25 Search (FTS)", () => {
       const hash = Bun.hash(content).toString(16).slice(0, 12);
       const now = new Date().toISOString();
 
-      insertContent(db, hash, content, now);
-      insertDocument(db, "eval-docs", file, title, hash, now, now);
+      store.insertContent(hash, content, now);
+      store.insertDocument("eval-docs", file, title, hash, now, now);
     }
   });
 
@@ -126,24 +121,24 @@ describe("BM25 Search (FTS)", () => {
 
   test("easy queries: ≥80% Hit@3", () => {
     const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
-    const hitRate = calcHitRate(easyQueries, q => searchFTS(db, q, 5), 3);
+    const hitRate = calcHitRate(easyQueries, q => store.searchFTS(q, 5), 3);
     expect(hitRate).toBeGreaterThanOrEqual(0.8);
   });
 
   test("medium queries: ≥15% Hit@3 (BM25 struggles with semantic)", () => {
     const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
-    const hitRate = calcHitRate(mediumQueries, q => searchFTS(db, q, 5), 3);
+    const hitRate = calcHitRate(mediumQueries, q => store.searchFTS(q, 5), 3);
     expect(hitRate).toBeGreaterThanOrEqual(0.15);
   });
 
   test("hard queries: ≥15% Hit@5 (BM25 baseline)", () => {
     const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
-    const hitRate = calcHitRate(hardQueries, q => searchFTS(db, q, 5), 5);
+    const hitRate = calcHitRate(hardQueries, q => store.searchFTS(q, 5), 5);
     expect(hitRate).toBeGreaterThanOrEqual(0.15);
   });
 
   test("overall Hit@3 ≥40% (BM25 baseline)", () => {
-    const hitRate = calcHitRate(evalQueries, q => searchFTS(db, q, 5), 3);
+    const hitRate = calcHitRate(evalQueries, q => store.searchFTS(q, 5), 3);
     expect(hitRate).toBeGreaterThanOrEqual(0.4);
   });
 });
@@ -197,7 +192,7 @@ describe("Vector Search", () => {
           // Convert to Float32Array for sqlite-vec
           const embedding = new Float32Array(result.embedding);
           const now = new Date().toISOString();
-          insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
+          store.insertEmbedding(hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
         }
       }
     }
@@ -217,7 +212,7 @@ describe("Vector Search", () => {
     const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
     let hits = 0;
     for (const { query, expectedDoc } of easyQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
@@ -229,7 +224,7 @@ describe("Vector Search", () => {
     const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
     let hits = 0;
     for (const { query, expectedDoc } of mediumQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     // Vector search should do better on semantic queries than BM25
@@ -242,7 +237,7 @@ describe("Vector Search", () => {
     const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
     let hits = 0;
     for (const { query, expectedDoc } of hardQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, 5);
       if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
@@ -253,7 +248,7 @@ describe("Vector Search", () => {
 
     let hits = 0;
     for (const { query, expectedDoc } of evalQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
@@ -291,7 +286,7 @@ describe("Hybrid Search (RRF)", () => {
     const rankedLists: RankedResult[][] = [];
 
     // FTS results
-    const ftsResults = searchFTS(db, query, 20);
+    const ftsResults = store.searchFTS(query, 20);
     if (ftsResults.length > 0) {
       rankedLists.push(ftsResults.map(r => ({
         file: r.filepath,
@@ -303,7 +298,7 @@ describe("Hybrid Search (RRF)", () => {
     }
 
     // Vector results
-    const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
+    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20);
     if (vecResults.length > 0) {
       rankedLists.push(vecResults.map(r => ({
         file: r.filepath,
@@ -369,11 +364,11 @@ describe("Hybrid Search (RRF)", () => {
       if (hybridResults.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hybridHits++;
 
       // BM25 results for comparison
-      const bm25Results = searchFTS(db, query, 5);
+      const bm25Results = store.searchFTS(query, 5);
       if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
 
       // Vector results for comparison
-      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 5);
       if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
     }
 
