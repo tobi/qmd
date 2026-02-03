@@ -11,7 +11,6 @@ import {
   homedir,
   resolve,
   enableProductionMode,
-  getDefaultDbPath,
   // Virtual path utilities (pure - no db dependency)
   parseVirtualPath,
   buildVirtualPath,
@@ -60,6 +59,17 @@ import {
 // Tests must set INDEX_PATH or use createStore() with explicit path
 enableProductionMode();
 
+// Compute default db path (needed before store exists for --index option)
+function computeDefaultDbPath(indexName: string = "index"): string {
+  if (Bun.env.INDEX_PATH) {
+    return Bun.env.INDEX_PATH;
+  }
+  const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  const qmdCacheDir = resolve(cacheDir, "qmd");
+  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
+  return resolve(qmdCacheDir, `${indexName}.sqlite`);
+}
+
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
 // =============================================================================
@@ -86,11 +96,11 @@ function closeDb(): void {
 }
 
 function getDbPath(): string {
-  return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
+  return store?.dbPath ?? storeDbPathOverride ?? computeDefaultDbPath();
 }
 
 function setIndexName(name: string | null): void {
-  storeDbPathOverride = name ? getDefaultDbPath(name) : undefined;
+  storeDbPathOverride = name ? computeDefaultDbPath(name) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
 }

@@ -15,7 +15,6 @@ import YAML from "yaml";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
-  getDefaultDbPath,
   homedir,
   resolve,
   getPwd,
@@ -264,24 +263,26 @@ describe("Path Utilities", () => {
     expect(resolve("/foo/bar/../../baz")).toBe("/baz");
   });
 
-  test("getDefaultDbPath throws in test mode without INDEX_PATH", () => {
-    // In test mode, getDefaultDbPath should throw to prevent accidental writes to global index
+  test("createStore throws in test mode without INDEX_PATH or explicit path", () => {
+    // In test mode, createStore should throw to prevent accidental writes to global index
     // This is intentional safety behavior
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
 
-    expect(() => getDefaultDbPath()).toThrow("Database path not set");
+    expect(() => createStore()).toThrow("Database path not set");
 
     // Restore
     if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
   });
 
-  test("getDefaultDbPath uses INDEX_PATH when set", () => {
+  test("store.getDefaultDbPath uses INDEX_PATH when set", () => {
     const originalIndexPath = process.env.INDEX_PATH;
     process.env.INDEX_PATH = "/tmp/test-index.sqlite";
 
-    expect(getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
-    expect(getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
+    const store = createStore();
+    expect(store.getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
+    expect(store.getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
+    store.close();
 
     // Restore
     if (originalIndexPath) {

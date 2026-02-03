@@ -238,7 +238,7 @@ export function enableProductionMode(): void {
   _productionMode = true;
 }
 
-export function getDefaultDbPath(indexName: string = "index"): string {
+function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (Bun.env.INDEX_PATH) {
     return Bun.env.INDEX_PATH;
@@ -583,6 +583,7 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
+  getDefaultDbPath: (indexName?: string) => string;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -678,6 +679,7 @@ export function createStore(dbPath?: string): Store {
   return {
     db,
     dbPath: resolvedPath,
+    getDefaultDbPath,
     close: () => db.close(),
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
