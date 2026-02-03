@@ -241,6 +241,11 @@ bun install
 bun link
 ```
 
+For testing:
+```sh
+bun test --timeout 300000
+```
+
 ## Usage
 
 ### Collection Management

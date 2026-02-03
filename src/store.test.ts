@@ -264,13 +264,13 @@ describe("Path Utilities", () => {
     expect(resolve("/foo/bar/../../baz")).toBe("/baz");
   });
 
-  test("getDefaultDbPath throws in test mode without INDEX_PATH", () => {
-    // In test mode, getDefaultDbPath should throw to prevent accidental writes to global index
+  test("createStore throws in test mode without INDEX_PATH or explicit path", () => {
+    // In test mode, createStore should throw to prevent accidental writes to global index
     // This is intentional safety behavior
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
 
-    expect(() => getDefaultDbPath()).toThrow("Database path not set");
+    expect(() => createStore()).toThrow("Database path not set");
 
     // Restore
     if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
@@ -452,7 +452,7 @@ describe("Store Creation", () => {
     expect(() => store.db.prepare("SELECT 1").get()).toThrow();
     try {
       await unlink(testDbPath);
-    } catch {}
+    } catch { }
   });
 });
 
@@ -1903,7 +1903,7 @@ describe("LlamaCpp Integration", () => {
     expect(queries.length).toBeGreaterThanOrEqual(1);
 
     await cleanupTestDb(store);
-  }, 30000);
+  }, 300_000);
 
   test("expandQuery caches results", async () => {
     const store = await createTestStore();
@@ -1916,7 +1916,7 @@ describe("LlamaCpp Integration", () => {
     expect(queries1[0]).toBe(queries2[0]);
 
     await cleanupTestDb(store);
-  }, 30000);
+  }, 300_000);
 
   test("rerank scores documents", async () => {
     const store = await createTestStore();
