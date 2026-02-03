@@ -362,7 +362,7 @@ export function isVirtualPath(path: string): boolean {
 /**
  * Resolve a virtual path to absolute filesystem path.
  */
-export function resolveVirtualPath(db: Database, virtualPath: string): string | null {
+function resolveVirtualPath(db: Database, virtualPath: string): string | null {
   const parsed = parseVirtualPath(virtualPath);
   if (!parsed) return null;
 
@@ -376,7 +376,7 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  * Convert an absolute filesystem path to a virtual path.
  * Returns null if the file is not in any indexed collection.
  */
-export function toVirtualPath(db: Database, absolutePath: string): string | null {
+function toVirtualPath(db: Database, absolutePath: string): string | null {
   // Get all collections from YAML config
   const collections = collectionsListCollections();
 
@@ -620,7 +620,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<string[]>;
@@ -649,6 +649,18 @@ export type Store = {
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+
+  // Collection management
+  listCollections: () => { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[];
+  removeCollection: (name: string) => { deletedDocs: number; cleanedHashes: number };
+  renameCollection: (oldName: string, newName: string) => void;
+  getAllCollections: () => { name: string }[];
+
+  // Context management
+  insertContext: (collectionId: number, pathPrefix: string, context: string) => void;
+  deleteContext: (collectionName: string, pathPrefix: string) => number;
+  deleteGlobalContexts: () => number;
+  listPathContexts: () => { collection_name: string; path_prefix: string; context: string }[];
 };
 
 /**
@@ -703,7 +715,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession) => searchVec(db, query, model, limit, collectionName, session),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -732,6 +744,18 @@ export function createStore(dbPath?: string): Store {
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+
+    // Collection management
+    listCollections: () => listCollections(db),
+    removeCollection: (name: string) => removeCollection(db, name),
+    renameCollection: (oldName: string, newName: string) => renameCollection(db, oldName, newName),
+    getAllCollections: () => getAllCollections(db),
+
+    // Context management
+    insertContext: (collectionId: number, pathPrefix: string, context: string) => insertContext(db, collectionId, pathPrefix, context),
+    deleteContext: (collectionName: string, pathPrefix: string) => deleteContext(db, collectionName, pathPrefix),
+    deleteGlobalContexts: () => deleteGlobalContexts(db),
+    listPathContexts: () => listPathContexts(db),
   };
 }
 
@@ -882,7 +906,7 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+function getHashesNeedingEmbedding(db: Database): number {
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
@@ -898,7 +922,7 @@ export type IndexHealthInfo = {
   daysStale: number | null;
 };
 
-export function getIndexHealth(db: Database): IndexHealthInfo {
+function getIndexHealth(db: Database): IndexHealthInfo {
   const needsEmbedding = getHashesNeedingEmbedding(db);
   const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
 
@@ -923,12 +947,12 @@ export function getCacheKey(url: string, body: object): string {
   return hash.digest("hex");
 }
 
-export function getCachedResult(db: Database, cacheKey: string): string | null {
+function getCachedResult(db: Database, cacheKey: string): string | null {
   const row = db.prepare(`SELECT result FROM llm_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
   return row?.result || null;
 }
 
-export function setCachedResult(db: Database, cacheKey: string, result: string): void {
+function setCachedResult(db: Database, cacheKey: string, result: string): void {
   const now = new Date().toISOString();
   db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
   if (Math.random() < 0.01) {
@@ -936,7 +960,7 @@ export function setCachedResult(db: Database, cacheKey: string, result: string):
   }
 }
 
-export function clearCache(db: Database): void {
+function clearCache(db: Database): void {
   db.exec(`DELETE FROM llm_cache`);
 }
 
@@ -948,7 +972,7 @@ export function clearCache(db: Database): void {
  * Delete cached LLM API responses.
  * Returns the number of cached responses deleted.
  */
-export function deleteLLMCache(db: Database): number {
+function deleteLLMCache(db: Database): number {
   const result = db.prepare(`DELETE FROM llm_cache`).run();
   return result.changes;
 }
@@ -957,7 +981,7 @@ export function deleteLLMCache(db: Database): number {
  * Remove inactive document records (active = 0).
  * Returns the number of inactive documents deleted.
  */
-export function deleteInactiveDocuments(db: Database): number {
+function deleteInactiveDocuments(db: Database): number {
   const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
   return result.changes;
 }
@@ -966,7 +990,7 @@ export function deleteInactiveDocuments(db: Database): number {
  * Remove orphaned content hashes that are not referenced by any active document.
  * Returns the number of orphaned content hashes deleted.
  */
-export function cleanupOrphanedContent(db: Database): number {
+function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
     WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
@@ -978,7 +1002,7 @@ export function cleanupOrphanedContent(db: Database): number {
  * Remove orphaned vector embeddings that are not referenced by any active document.
  * Returns the number of orphaned embedding chunks deleted.
  */
-export function cleanupOrphanedVectors(db: Database): number {
+function cleanupOrphanedVectors(db: Database): number {
   // Check if vectors_vec table exists
   const tableExists = db.prepare(`
     SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
@@ -1024,7 +1048,7 @@ export function cleanupOrphanedVectors(db: Database): number {
  * Run VACUUM to reclaim unused space in the database.
  * This operation rebuilds the database file to eliminate fragmentation.
  */
-export function vacuumDatabase(db: Database): void {
+function vacuumDatabase(db: Database): void {
   db.exec(`VACUUM`);
 }
 
@@ -1078,7 +1102,7 @@ export function extractTitle(content: string, filename: string): string {
  * Insert content into the content table (content-addressable storage).
  * Uses INSERT OR IGNORE so duplicate hashes are skipped.
  */
-export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
+function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
   db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
     .run(hash, content, createdAt);
 }
@@ -1086,7 +1110,7 @@ export function insertContent(db: Database, hash: string, content: string, creat
 /**
  * Insert a new document into the documents table.
  */
-export function insertDocument(
+function insertDocument(
   db: Database,
   collectionName: string,
   path: string,
@@ -1104,7 +1128,7 @@ export function insertDocument(
 /**
  * Find an active document by collection name and path.
  */
-export function findActiveDocument(
+function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
@@ -1118,7 +1142,7 @@ export function findActiveDocument(
 /**
  * Update the title and modified_at timestamp for a document.
  */
-export function updateDocumentTitle(
+function updateDocumentTitle(
   db: Database,
   documentId: number,
   title: string,
@@ -1132,7 +1156,7 @@ export function updateDocumentTitle(
  * Update an existing document's hash, title, and modified_at timestamp.
  * Used when content changes but the file path stays the same.
  */
-export function updateDocument(
+function updateDocument(
   db: Database,
   documentId: number,
   title: string,
@@ -1146,7 +1170,7 @@ export function updateDocument(
 /**
  * Deactivate a document (mark as inactive but don't delete).
  */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
+function deactivateDocument(db: Database, collectionName: string, path: string): void {
   db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
     .run(collectionName, path);
 }
@@ -1154,7 +1178,7 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
 /**
  * Get all active document paths for a collection.
  */
-export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
+function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
   const rows = db.prepare(`
     SELECT path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
@@ -1380,7 +1404,7 @@ export function isDocid(input: string): boolean {
  *
  * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
  */
-export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
+function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
   const shortHash = normalizeDocid(docid);
 
   if (shortHash.length < 1) return null;
@@ -1396,7 +1420,7 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
   return doc;
 }
 
-export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
+function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
     SELECT d.path
     FROM documents d
@@ -1411,7 +1435,7 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
   return scored.map(f => f.path);
 }
 
-export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
+function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
   const allFiles = db.prepare(`
     SELECT
       'qmd://' || d.collection || '/' || d.path as virtual_path,
@@ -1447,7 +1471,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * @param path Relative path within the collection
  * @returns Context string or null if no context is defined
  */
-export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
+function getContextForPath(db: Database, collectionName: string, path: string): string | null {
   const config = collectionsLoadConfig();
   const coll = getCollection(collectionName);
 
@@ -1491,7 +1515,7 @@ export function getContextForPath(db: Database, collectionName: string, path: st
  * Get context for a file path (virtual or filesystem).
  * Resolves the collection and relative path using the YAML collections config.
  */
-export function getContextForFile(db: Database, filepath: string): string | null {
+function getContextForFile(db: Database, filepath: string): string | null {
   // Handle undefined or null filepath
   if (!filepath) return null;
 
@@ -1578,7 +1602,7 @@ export function getContextForFile(db: Database, filepath: string): string | null
  * Get collection by name from YAML config.
  * Returns collection metadata from ~/.config/qmd/index.yml
  */
-export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
+function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
   const collection = getCollection(name);
   if (!collection) return null;
 
@@ -1593,7 +1617,7 @@ export function getCollectionByName(db: Database, name: string): { name: string;
  * List all collections with document counts from database.
  * Merges YAML config with database statistics.
  */
-export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
+function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
   const collections = collectionsListCollections();
 
   // Get document counts from database for each collection
@@ -1624,7 +1648,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
  * Remove a collection and clean up its documents.
  * Uses collections.ts to remove from YAML config and cleans up database.
  */
-export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
+function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
   // Delete documents from database
   const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
@@ -1647,7 +1671,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
  * Rename a collection.
  * Updates both YAML config and database documents table.
  */
-export function renameCollection(db: Database, oldName: string, newName: string): void {
+function renameCollection(db: Database, oldName: string, newName: string): void {
   // Update all documents with the new collection name in database
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
     .run(newName, oldName);
@@ -1663,7 +1687,7 @@ export function renameCollection(db: Database, oldName: string, newName: string)
 /**
  * Insert or update a context for a specific collection and path prefix.
  */
-export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
+function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
   // Get collection name from ID
   const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
   if (!coll) {
@@ -1678,7 +1702,7 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
  * Delete a context for a specific collection and path prefix.
  * Returns the number of contexts deleted.
  */
-export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
+function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
   // Use collections.ts to remove context
   const success = collectionsRemoveContext(collectionName, pathPrefix);
   return success ? 1 : 0;
@@ -1688,7 +1712,7 @@ export function deleteContext(db: Database, collectionName: string, pathPrefix: 
  * Delete all global contexts (contexts with empty path_prefix).
  * Returns the number of contexts deleted.
  */
-export function deleteGlobalContexts(db: Database): number {
+function deleteGlobalContexts(db: Database): number {
   let deletedCount = 0;
 
   // Remove global context
@@ -1711,7 +1735,7 @@ export function deleteGlobalContexts(db: Database): number {
  * List all contexts, grouped by collection.
  * Returns contexts ordered by collection name, then by path prefix length (longest first).
  */
-export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
+function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
   const allContexts = collectionsListAllContexts();
 
   // Convert to expected format and sort
@@ -1736,7 +1760,7 @@ export function listPathContexts(db: Database): { collection_name: string; path_
 /**
  * Get all collections (name only - from YAML config).
  */
-export function getAllCollections(db: Database): { name: string }[] {
+function getAllCollections(db: Database): { name: string }[] {
   const collections = collectionsListCollections();
   return collections.map(c => ({ name: c.name }));
 }
@@ -1745,7 +1769,7 @@ export function getAllCollections(db: Database): { name: string }[] {
  * Check which collections don't have any context defined.
  * Returns collections that have no context entries at all (not even root context).
  */
-export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
+function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
   // Get all collections from YAML config
   const yamlCollections = collectionsListCollections();
 
@@ -1777,7 +1801,7 @@ export function getCollectionsWithoutContext(db: Database): { name: string; pwd:
  * Get top-level directories in a collection that don't have context.
  * Useful for suggesting where context might be needed.
  */
-export function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
+function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
   // Get all paths in the collection from database
   const paths = db.prepare(`
     SELECT DISTINCT path FROM documents
@@ -1843,7 +1867,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1902,7 +1926,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2005,7 +2029,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
@@ -2020,7 +2044,7 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Clear all embeddings from the database (force re-index).
  * Deletes all rows from content_vectors and drops the vectors_vec table.
  */
-export function clearAllEmbeddings(db: Database): void {
+function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
 }
@@ -2029,7 +2053,7 @@ export function clearAllEmbeddings(db: Database): void {
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
  */
-export function insertEmbedding(
+function insertEmbedding(
   db: Database,
   hash: string,
   seq: number,
@@ -2050,7 +2074,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
+async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
   // Check cache first
   const cacheKey = getCacheKey("expandQuery", { query, model });
   const cached = getCachedResult(db, cacheKey);
@@ -2077,7 +2101,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
@@ -2186,7 +2210,7 @@ type DbDocRow = {
  * - Relative paths: path/to/file.md
  * - Short docid: #abc123 (first 6 chars of hash)
  */
-export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
+function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
@@ -2295,7 +2319,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
  * Get the body content for a document
  * Optionally slice by line range
  */
-export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
+function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
   const filepath = doc.filepath;
 
   // Try to resolve document by filepath (absolute or virtual)
@@ -2345,7 +2369,7 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
  * Find multiple documents by glob pattern or comma-separated list
  * Returns documents without body by default (use getDocumentBody to load)
  */
-export function findDocuments(
+function findDocuments(
   db: Database,
   pattern: string,
   options: { includeBody?: boolean; maxBytes?: number } = {}
@@ -2455,7 +2479,7 @@ export function findDocuments(
 // Status
 // =============================================================================
 
-export function getStatus(db: Database): IndexStatus {
+function getStatus(db: Database): IndexStatus {
   // Load collections from YAML
   const yamlCollections = collectionsListCollections();
 
