@@ -63,6 +63,25 @@ qmd get "docs/api-reference.md" --full
 
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
+### Query Expansion Backend (MLX sidecar)
+
+QMD supports an optional MLX (Python) sidecar for query expansion (useful while iterating on finetuned MLX adapters).
+
+Enable it:
+
+```bash
+export QMD_QUERY_EXPAND_BACKEND=mlx
+export QMD_MLX_PYTHON=python3          # or path to your venv python
+export QMD_MLX_EXPAND_SCRIPT=scripts/mlx_expand.py
+export QMD_MLX_TIMEOUT_MS=60000        # optional
+
+qmd query "auth config"
+```
+
+Notes:
+- Requires `mlx_lm` available in that Python environment.
+- If the sidecar fails, QMD falls back to the default llama.cpp-based expansion.
+
 **Tools exposed:**
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
 - `qmd_vsearch` - Semantic vector search (supports collection filter)

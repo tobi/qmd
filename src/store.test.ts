@@ -12,7 +12,7 @@ import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { disposeDefaultLlamaCpp, LlamaCpp } from "./llm.js";
 import {
   createStore,
   getDefaultDbPath,
@@ -1896,30 +1896,56 @@ describe("LlamaCpp Integration", () => {
   test("expandQuery returns original plus expanded queries", async () => {
     const store = await createTestStore();
 
+    // Avoid downloading/initializing a large GGUF generate model during unit tests.
+    // We only want to validate store-level behavior (original query included, caching, etc.).
+    const mockExpand = spyOn(LlamaCpp.prototype, "expandQuery").mockResolvedValue([
+      { type: "lex", text: "test query" },
+      { type: "vec", text: "test query" },
+      { type: "vec", text: "test query expanded" },
+      { type: "hyde", text: "This is a hypothetical document." },
+    ]);
+
     const queries = await store.expandQuery("test query");
     expect(queries).toContain("test query");
     expect(queries[0]).toBe("test query");
-    // LlamaCpp returns original + variations
     expect(queries.length).toBeGreaterThanOrEqual(1);
 
+    mockExpand.mockRestore();
     await cleanupTestDb(store);
-  }, 30000);
+  });
 
   test("expandQuery caches results", async () => {
     const store = await createTestStore();
 
+    const mockExpand = spyOn(LlamaCpp.prototype, "expandQuery").mockResolvedValue([
+      { type: "lex", text: "cached query test" },
+      { type: "vec", text: "cached query test" },
+      { type: "vec", text: "cached query test expanded" },
+      { type: "hyde", text: "This is a hypothetical document." },
+    ]);
+
     // First call
     const queries1 = await store.expandQuery("cached query test");
-    // Second call - should hit cache
+    // Second call - should hit cache (and not require extra LLM work)
     const queries2 = await store.expandQuery("cached query test");
 
     expect(queries1[0]).toBe(queries2[0]);
 
+    mockExpand.mockRestore();
     await cleanupTestDb(store);
-  }, 30000);
+  });
 
   test("rerank scores documents", async () => {
     const store = await createTestStore();
+
+    // Avoid downloading/initializing large rerank GGUFs during unit tests.
+    const mockRerank = spyOn(LlamaCpp.prototype, "rerank").mockResolvedValue({
+      model: "test",
+      results: [
+        { file: "doc1.md", index: 0, score: 0.9 },
+        { file: "doc2.md", index: 1, score: 0.1 },
+      ],
+    });
 
     const docs = [
       { file: "doc1.md", text: "Relevant content about the topic" },
@@ -1928,14 +1954,19 @@ describe("LlamaCpp Integration", () => {
 
     const results = await store.rerank("topic", docs);
     expect(results).toHaveLength(2);
-    // LlamaCpp reranker returns relevance scores
     expect(results[0]!.score).toBeGreaterThan(0);
 
+    mockRerank.mockRestore();
     await cleanupTestDb(store);
   });
 
   test("rerank caches results", async () => {
     const store = await createTestStore();
+
+    const mockRerank = spyOn(LlamaCpp.prototype, "rerank").mockResolvedValue({
+      model: "test",
+      results: [{ file: "doc1.md", index: 0, score: 0.5 }],
+    });
 
     const docs = [{ file: "doc1.md", text: "Content for caching test" }];
 
@@ -1946,6 +1977,7 @@ describe("LlamaCpp Integration", () => {
 
     expect(results).toHaveLength(1);
 
+    mockRerank.mockRestore();
     await cleanupTestDb(store);
   });
 });

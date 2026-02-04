@@ -12,3 +12,7 @@ texts/
 !finetune/*.md
 finetune/outputs/
 finetune/data/train/
+
+# finetune-mlx artifacts (local runs)
+finetune-mlx/*.nohup.log
+finetune-mlx/eval_results.json

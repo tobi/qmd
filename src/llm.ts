@@ -17,6 +17,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { spawnSync } from "node:child_process";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -788,9 +789,79 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
+  private parseQueryableLines(text: string, includeLexical: boolean): Queryable[] {
+    const lines = (text || "").trim().split("\n").map(l => l.trim()).filter(Boolean);
+    const queryables: Queryable[] = [];
+
+    for (const line of lines) {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx === -1) continue;
+      const type = line.slice(0, colonIdx).trim();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") continue;
+      if (!includeLexical && type === "lex") continue;
+      const content = line.slice(colonIdx + 1).trim();
+      if (!content) continue;
+      queryables.push({ type: type as QueryType, text: content });
+    }
+
+    // De-dupe exact duplicates while keeping order.
+    const seen = new Set<string>();
+    return queryables.filter(q => {
+      const k = `${q.type}:${q.text}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
+
+  private async expandQueryWithMlxSidecar(query: string): Promise<string> {
+    // Default to the script shipped in-repo. Override if needed.
+    // NOTE: Keep env usage portable by defaulting to a relative script path.
+    const script = process.env.QMD_MLX_EXPAND_SCRIPT || "scripts/mlx_expand.py";
+    const python = process.env.QMD_MLX_PYTHON || process.env.PYTHON || "python3";
+    const timeoutMs = Number.parseInt(process.env.QMD_MLX_TIMEOUT_MS || "20000", 10);
+
+    if (!existsSync(script)) {
+      throw new Error(
+        `MLX expand script not found at: ${script}. ` +
+        `Set QMD_MLX_EXPAND_SCRIPT (default: scripts/mlx_expand.py) or run from the qmd repo root.`
+      );
+    }
+
+    const res = spawnSync(python, [script, query], {
+      encoding: "utf8",
+      timeout: Number.isFinite(timeoutMs) ? timeoutMs : 20000,
+      env: process.env as Record<string, string>,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+
+    if (res.error) throw res.error;
+    if (res.status !== 0) {
+      const stderr = (res.stderr || "").trim();
+      throw new Error(`mlx sidecar exited ${res.status}${stderr ? `: ${stderr}` : ""}`);
+    }
+
+    return (res.stdout || "").toString();
+  }
+
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
+
+    // Optional MLX sidecar backend (Python).
+    // Enable with: QMD_QUERY_EXPAND_BACKEND=mlx
+    // This is a pragmatic bridge until we can ship a GGUF for query expansion.
+    if ((process.env.QMD_QUERY_EXPAND_BACKEND || "").toLowerCase() === "mlx") {
+      const includeLexical = options.includeLexical ?? true;
+      try {
+        const out = await this.expandQueryWithMlxSidecar(query);
+        const queryables = this.parseQueryableLines(out, includeLexical);
+        if (queryables.length > 0) return queryables;
+      } catch (err) {
+        // Fall back to llama.cpp implementation.
+        console.error("MLX query expansion failed; falling back to llama.cpp:", err);
+      }
+    }
 
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();

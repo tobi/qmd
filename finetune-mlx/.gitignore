@@ -1,0 +1,21 @@
+# Training artifacts (large files)
+adapters/
+models/
+exports/merged/
+exports/*.gguf
+
+# Keep Modelfiles (small, useful)
+!exports/*.Modelfile
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+*.nohup.log
+
+# Data (downloaded separately)
+data/
+eval_results.json
