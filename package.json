@@ -41,6 +41,7 @@
     "better-sqlite3": "^11.0.0",
     "fast-glob": "^3.3.0",
     "node-llama-cpp": "^3.14.5",
+    "openai": "^4.77.0",
     "picomatch": "^4.0.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",

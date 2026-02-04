@@ -19,6 +19,8 @@ import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultEmbeddingLLM,
+  isUsingOpenAI,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -2146,9 +2148,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const llm = getDefaultEmbeddingLLM();
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await llm.embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2202,6 +2205,12 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+  // Skip query expansion when using OpenAI (avoids loading local model)
+  // Return a lex query to let BM25 handle it
+  if (isUsingOpenAI()) {
+    return [{ type: 'lex' as const, text: query }];
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model });
   const cached = getCachedResult(db, cacheKey);
@@ -2235,6 +2244,15 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // =============================================================================
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+  // Skip reranking when using OpenAI (avoids loading local model)
+  // Return documents with decreasing scores to preserve original order
+  if (isUsingOpenAI()) {
+    return documents.map((doc, index) => ({
+      file: doc.file,
+      score: 1 - (index * 0.001),
+    }));
+  }
+
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 

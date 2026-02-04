@@ -32,11 +32,23 @@ export interface Collection {
 }
 
 /**
+ * Embedding provider configuration (optional in config file)
+ */
+export interface EmbeddingProviderConfig {
+  provider?: 'local' | 'openai';  // Default: 'local'
+  openai?: {
+    api_key?: string;             // Falls back to OPENAI_API_KEY env var
+    model?: string;               // Default: 'text-embedding-3-small'
+  };
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
-  collections: Record<string, Collection>;    // Collection name -> config
+  collections: Record<string, Collection>;   // Collection name -> config
+  embedding?: EmbeddingProviderConfig;        // Optional embedding provider settings
 }
 
 /**
@@ -391,4 +403,13 @@ export function configExists(): boolean {
 export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+/**
+ * Get embedding configuration from config file
+ * Returns default (local) config if not specified
+ */
+export function getEmbeddingConfig(): EmbeddingProviderConfig {
+  const config = loadConfig();
+  return config.embedding || { provider: 'local' };
 }
