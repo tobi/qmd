@@ -293,6 +293,16 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in a batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -386,6 +396,13 @@ export class LlamaCpp implements LLM {
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string {
+    return this.embedModelUri;
   }
 
   /**
