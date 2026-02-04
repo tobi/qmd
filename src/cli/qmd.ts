@@ -277,7 +277,6 @@ function computeDisplayPath(
   return filepath;
 }
 
-
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -2699,13 +2698,15 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
-  // Load embedding configuration from config file
+  // Load embedding configuration from config file or env var
   const embeddingYamlConfig = getEmbeddingConfigFromYaml();
-  if (embeddingYamlConfig.provider === 'openai') {
+  const useOpenAI = process.env.QMD_OPENAI === '1' || embeddingYamlConfig.provider === 'openai';
+  
+  if (useOpenAI) {
     setEmbeddingConfig({
       provider: 'openai',
       openai: {
-        apiKey: embeddingYamlConfig.openai?.api_key,
+        apiKey: process.env.OPENAI_API_KEY || embeddingYamlConfig.openai?.api_key,
         embedModel: embeddingYamlConfig.openai?.model,
       },
     });
