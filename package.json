@@ -15,7 +15,8 @@
     "vsearch": "bun src/qmd.ts vsearch",
     "rerank": "bun src/qmd.ts rerank",
     "link": "bun link",
-    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
+    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp",
+    "postinstall": "bun2nix -o bun.nix"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
@@ -31,7 +32,8 @@
     "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "bun2nix": "latest"
   },
   "peerDependencies": {
     "typescript": "^5.9.3"
