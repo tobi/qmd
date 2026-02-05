@@ -372,7 +372,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collection?: string | number) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -459,7 +459,7 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
+    searchFTS: (query: string, limit?: number, collection?: string | number) => searchFTS(db, query, limit, collection),
     searchVec: (query: string, model: string, limit?: number, collection?: string | number) => searchVec(db, query, model, limit, collection),
 
     // Query expansion & reranking
@@ -1418,10 +1418,19 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+export function searchFTS(
+  db: Database,
+  query: string,
+  limit: number = 20,
+  collection?: string | number
+): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
+  // Important: when adding a collection filter, SQLite may choose a pathological
+  // join order (scan documents first, then probe FTS), making `qmd search -c ...`
+  // extremely slow. Use CROSS JOIN and join predicates in WHERE to preserve the
+  // left-to-right order starting from the FTS MATCH.
   let sql = `
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
@@ -1431,18 +1440,18 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.hash,
       bm25(documents_fts, 10.0, 1.0) as score
     FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
-    JOIN content ON content.hash = d.hash
-    WHERE documents_fts MATCH ? AND d.active = 1
+    CROSS JOIN documents d
+    CROSS JOIN content
+    WHERE documents_fts MATCH ?
+      AND d.id = f.rowid
+      AND content.hash = d.hash
+      AND d.active = 1
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId !== undefined) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
+  if (collection !== undefined && collection !== null && `${collection}`.length > 0) {
     sql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+    params.push(String(collection));
   }
 
   sql += ` ORDER BY score LIMIT ?`;
