@@ -460,7 +460,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
+    searchVec: (query: string, model: string, limit?: number, collection?: string | number) => searchVec(db, query, model, limit, collection),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -1473,41 +1473,57 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+export async function searchVec(
+  db: Database,
+  query: string,
+  model: string,
+  limit: number = 20,
+  collection?: string | number
+): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
 
-  // sqlite-vec requires "k = ?" for KNN queries
+  // Important: when joining vec0 results with other tables, SQLite may choose a
+  // disastrous join order (e.g. scan all documents first), making vector search
+  // appear "hung". Materializing the KNN result forces the vec0 scan to run
+  // first and keeps the rest of the query fast.
+  const k = limit * 3;
+
   let sql = `
+    WITH knn AS MATERIALIZED (
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = ?
+    )
     SELECT
-      v.hash_seq,
-      v.distance,
+      knn.hash_seq,
+      knn.distance,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.path as display_path,
       d.title,
       content.doc as body,
       cv.hash,
       cv.pos
-    FROM vectors_vec v
-    JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    FROM knn
+    JOIN content_vectors cv ON cv.hash || '_' || cv.seq = knn.hash_seq
+    JOIN documents d ON d.hash = cv.hash
     JOIN content ON content.hash = d.hash
-    WHERE v.embedding MATCH ? AND k = ?
+    WHERE d.active = 1
   `;
 
-  if (collectionId !== undefined) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
+  const params: any[] = [new Float32Array(embedding), k];
+
+  if (collection !== undefined && collection !== null && `${collection}`.length > 0) {
     sql += ` AND d.collection = ?`;
-    sql = sql.replace('?', String(collectionId)); // Hacky but maintains compatibility
+    params.push(String(collection));
   }
 
-  sql += ` ORDER BY v.distance`;
+  sql += ` ORDER BY knn.distance`;
 
-  const rows = db.prepare(sql).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
+  const rows = db.prepare(sql).all(...params) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
 
   const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
   for (const row of rows) {

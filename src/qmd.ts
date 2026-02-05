@@ -1984,7 +1984,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
 
   for (const q of queries) {
     // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
+    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -2112,7 +2112,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     // Vector search - get ranked results
     if (hasVectors) {
       // searchVec accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-      const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
+      const vecResults = await searchVec(db, q, embedModel, 20, collectionName);
       if (vecResults.length > 0) {
         rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
