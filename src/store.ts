@@ -15,9 +15,12 @@ import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
+import { encoding_for_model } from "tiktoken";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultEmbeddingLLM,
+  isUsingOpenAI,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -1244,14 +1247,83 @@ export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHA
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
  */
+// Cached tiktoken encoder for OpenAI tokenization
+let tiktokenEncoder: ReturnType<typeof encoding_for_model> | null = null;
+
+function getTiktokenEncoder() {
+  if (!tiktokenEncoder) {
+    // Use cl100k_base which is used by text-embedding-3-small
+    tiktokenEncoder = encoding_for_model("gpt-4");
+  }
+  return tiktokenEncoder;
+}
+
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  // Use tiktoken for OpenAI (fast, no model loading)
+  // Use llama-cpp for local models (accurate to the model)
+  if (isUsingOpenAI()) {
+    return chunkWithTiktoken(content, maxTokens, overlapTokens);
+  }
+  return chunkWithLlamaCpp(content, maxTokens, overlapTokens);
+}
 
-  // Tokenize once upfront
+/**
+ * Chunk using tiktoken (fast, for OpenAI embeddings)
+ */
+function chunkWithTiktoken(
+  content: string,
+  maxTokens: number,
+  overlapTokens: number
+): { text: string; pos: number; tokens: number }[] {
+  const encoder = getTiktokenEncoder();
+  // Allow all special tokens in documents (they might contain code examples, etc.)
+  const allTokens = encoder.encode(content, "all");
+  const totalTokens = allTokens.length;
+
+  if (totalTokens <= maxTokens) {
+    return [{ text: content, pos: 0, tokens: totalTokens }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  const step = maxTokens - overlapTokens;
+  const decoder = new TextDecoder();
+  let tokenPos = 0;
+
+  while (tokenPos < totalTokens) {
+    const chunkEnd = Math.min(tokenPos + maxTokens, totalTokens);
+    const chunkTokens = allTokens.slice(tokenPos, chunkEnd);
+    let chunkText = decoder.decode(encoder.decode(chunkTokens));
+
+    // Find a good break point if not at end of document
+    if (chunkEnd < totalTokens) {
+      chunkText = findGoodBreakPoint(chunkText);
+    }
+
+    // Approximate character position
+    const avgCharsPerToken = content.length / totalTokens;
+    const charPos = Math.floor(tokenPos * avgCharsPerToken);
+    chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
+
+    if (chunkEnd >= totalTokens) break;
+    tokenPos += step;
+  }
+
+  return chunks;
+}
+
+/**
+ * Chunk using llama-cpp tokenizer (for local models)
+ */
+async function chunkWithLlamaCpp(
+  content: string,
+  maxTokens: number,
+  overlapTokens: number
+): Promise<{ text: string; pos: number; tokens: number }[]> {
+  const llm = getDefaultLlamaCpp();
   const allTokens = await llm.tokenize(content);
   const totalTokens = allTokens.length;
 
@@ -1271,49 +1343,53 @@ export async function chunkDocumentByTokens(
 
     // Find a good break point if not at end of document
     if (chunkEnd < totalTokens) {
-      const searchStart = Math.floor(chunkText.length * 0.7);
-      const searchSlice = chunkText.slice(searchStart);
-
-      let breakOffset = -1;
-      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
-      if (paragraphBreak >= 0) {
-        breakOffset = paragraphBreak + 2;
-      } else {
-        const sentenceEnd = Math.max(
-          searchSlice.lastIndexOf('. '),
-          searchSlice.lastIndexOf('.\n'),
-          searchSlice.lastIndexOf('? '),
-          searchSlice.lastIndexOf('?\n'),
-          searchSlice.lastIndexOf('! '),
-          searchSlice.lastIndexOf('!\n')
-        );
-        if (sentenceEnd >= 0) {
-          breakOffset = sentenceEnd + 2;
-        } else {
-          const lineBreak = searchSlice.lastIndexOf('\n');
-          if (lineBreak >= 0) {
-            breakOffset = lineBreak + 1;
-          }
-        }
-      }
-
-      if (breakOffset >= 0) {
-        chunkText = chunkText.slice(0, searchStart + breakOffset);
-      }
+      chunkText = findGoodBreakPoint(chunkText);
     }
 
-    // Approximate character position based on token position
     const charPos = Math.floor(tokenPos * avgCharsPerToken);
     chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
 
-    // Move forward
     if (chunkEnd >= totalTokens) break;
-
-    // Advance by step tokens (maxTokens - overlap)
     tokenPos += step;
   }
 
   return chunks;
+}
+
+/**
+ * Find a good break point in text (paragraph, sentence, or line)
+ */
+function findGoodBreakPoint(text: string): string {
+  const searchStart = Math.floor(text.length * 0.7);
+  const searchSlice = text.slice(searchStart);
+
+  let breakOffset = -1;
+  const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+  if (paragraphBreak >= 0) {
+    breakOffset = paragraphBreak + 2;
+  } else {
+    const sentenceEnd = Math.max(
+      searchSlice.lastIndexOf('. '),
+      searchSlice.lastIndexOf('.\n'),
+      searchSlice.lastIndexOf('? '),
+      searchSlice.lastIndexOf('?\n'),
+      searchSlice.lastIndexOf('! '),
+      searchSlice.lastIndexOf('!\n')
+    );
+    if (sentenceEnd >= 0) {
+      breakOffset = sentenceEnd + 2;
+    } else {
+      const lineBreak = searchSlice.lastIndexOf('\n');
+      if (lineBreak >= 0) {
+        breakOffset = lineBreak + 1;
+      }
+    }
+  }
+
+  if (breakOffset >= 0) {
+    return text.slice(0, searchStart + breakOffset);
+  }
+  return text;
 }
 
 // =============================================================================
@@ -1995,6 +2071,15 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  
+  // Always use OpenAI when configured, regardless of session
+  if (isUsingOpenAI()) {
+    const llm = getDefaultEmbeddingLLM();
+    const result = await llm.embed(formattedText, { model, isQuery });
+    return result?.embedding || null;
+  }
+  
+  // Use session if available, otherwise default LlamaCpp
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
@@ -2052,16 +2137,24 @@ export function insertEmbedding(
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
   // Check cache first
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", { query, model, provider: isUsingOpenAI() ? 'openai' : 'local' });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     const lines = cached.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     return [query, ...lines.slice(0, 2)];
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  let results;
+  if (isUsingOpenAI()) {
+    // Use OpenAI for fast query expansion
+    const llm = getDefaultEmbeddingLLM();
+    results = await llm.expandQuery(query);
+  } else {
+    // Use local LlamaCpp model
+    const llm = getDefaultLlamaCpp();
+    results = await llm.expandQuery(query);
+  }
+  
   const queryTexts = results.map(r => r.text);
 
   // Cache the expanded queries (excluding original)
@@ -2078,6 +2171,15 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // =============================================================================
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+  // Skip reranking when using OpenAI (avoids loading local model)
+  // Return documents with decreasing scores to preserve original order
+  if (isUsingOpenAI()) {
+    return documents.map((doc, index) => ({
+      file: doc.file,
+      score: 1 - (index * 0.001),
+    }));
+  }
+
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
