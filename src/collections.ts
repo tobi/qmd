@@ -66,6 +66,11 @@ function getConfigDir(): string {
   if (process.env.QMD_CONFIG_DIR) {
     return process.env.QMD_CONFIG_DIR;
   }
+  // Respect XDG_CONFIG_HOME per XDG Base Directory spec
+  const xdgConfig = process.env.XDG_CONFIG_HOME;
+  if (xdgConfig) {
+    return join(xdgConfig, "qmd");
+  }
   return join(homedir(), ".config", "qmd");
 }
 
