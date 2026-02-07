@@ -20,6 +20,7 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  formatTextForEmbedding,
   type RerankDocument,
   type ILLMSession,
 } from "./llm";
@@ -1161,7 +1162,7 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
-export { formatQueryForEmbedding, formatDocForEmbedding };
+export { formatQueryForEmbedding, formatDocForEmbedding, formatTextForEmbedding };
 
 export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
   if (content.length <= maxChars) {
@@ -1993,8 +1994,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const formattedText = formatTextForEmbedding(text, { isQuery, embedModelUri: model });
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
