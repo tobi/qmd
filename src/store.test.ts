@@ -24,6 +24,7 @@ import {
   extractTitle,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  formatTextForEmbedding,
   chunkDocument,
   chunkDocumentByTokens,
   reciprocalRankFusion,
@@ -519,6 +520,31 @@ describe("Embedding Formatting", () => {
   test("formatDocForEmbedding handles missing title", () => {
     const formatted = formatDocForEmbedding("Some content");
     expect(formatted).toBe("title: none | text: Some content");
+  });
+
+  test("formatTextForEmbedding with nomic URI uses search_query for query", () => {
+    const nomicUri = "hf:nomic-ai/nomic-embed-text-v2-moe-GGUF/nomic-embed-text-v2-moe.Q6_K.gguf";
+    const formatted = formatTextForEmbedding("how to deploy", { isQuery: true, embedModelUri: nomicUri });
+    expect(formatted).toBe("search_query: how to deploy");
+  });
+
+  test("formatTextForEmbedding with nomic URI uses search_document for document", () => {
+    const nomicUri = "hf:nomic-ai/nomic-embed-text-v2-moe-GGUF/nomic-embed-text-v2-moe.Q6_K.gguf";
+    const formatted = formatTextForEmbedding("Some content", { isQuery: false, title: "My Title", embedModelUri: nomicUri });
+    expect(formatted).toBe("search_document: My Title\nSome content");
+  });
+
+  test("formatTextForEmbedding with nomic URI and no title", () => {
+    const nomicUri = "hf:nomic-ai/nomic-embed-text-v2-moe-GGUF/nomic-embed-text-v2-moe.Q6_K.gguf";
+    const formatted = formatTextForEmbedding("Some content", { isQuery: false, embedModelUri: nomicUri });
+    expect(formatted).toBe("search_document: Some content");
+  });
+
+  test("formatTextForEmbedding without embedModelUri uses embeddinggemma format", () => {
+    const queryFormatted = formatTextForEmbedding("query", { isQuery: true });
+    expect(queryFormatted).toBe("task: search result | query: query");
+    const docFormatted = formatTextForEmbedding("text", { isQuery: false, title: "T" });
+    expect(docFormatted).toBe("title: T | text: text");
   });
 });
 

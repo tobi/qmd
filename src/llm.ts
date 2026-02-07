@@ -17,25 +17,50 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { loadConfig } from "./collections.js";
 
 // =============================================================================
 // Embedding Formatting Functions
 // =============================================================================
 
-/**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
- */
-export function formatQueryForEmbedding(query: string): string {
-  return `task: search result | query: ${query}`;
+/** True if the embed model URI is nomic-embed-text (uses search_query:/search_document: prefixes) */
+export function isNomicEmbedUri(uri: string): boolean {
+  return uri.includes("nomic-embed-text");
 }
 
 /**
- * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * Format text for embedding with model-aware prefixes.
+ * When embedModelUri indicates nomic (contains "nomic-embed-text"), uses search_query:/search_document:.
+ * Otherwise uses embeddinggemma-style task/title|text format.
+ */
+export function formatTextForEmbedding(
+  text: string,
+  options: { isQuery: boolean; title?: string; embedModelUri?: string }
+): string {
+  const uri = options.embedModelUri ?? DEFAULT_EMBED_MODEL;
+  if (isNomicEmbedUri(uri)) {
+    if (options.isQuery) return `search_query: ${text}`;
+    return `search_document: ${options.title ? options.title + "\n" : ""}${text}`;
+  }
+  // embeddinggemma-style
+  if (options.isQuery) return `task: search result | query: ${text}`;
+  return `title: ${options.title || "none"} | text: ${text}`;
+}
+
+/**
+ * Format a query for embedding (default: embeddinggemma-style).
+ * For model-aware formatting with a specific embed model, use formatTextForEmbedding with embedModelUri.
+ */
+export function formatQueryForEmbedding(query: string): string {
+  return formatTextForEmbedding(query, { isQuery: true });
+}
+
+/**
+ * Format a document for embedding (default: embeddinggemma-style).
+ * For model-aware formatting with a specific embed model, use formatTextForEmbedding with embedModelUri.
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
-  return `title: ${title || "none"} | text: ${text}`;
+  return formatTextForEmbedding(text, { isQuery: false, title });
 }
 
 // =============================================================================
@@ -181,6 +206,11 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
+
+/** Resolve effective embedding model: env QMD_EMBED_MODEL → config embed_model → default */
+export function getEffectiveEmbedModel(): string {
+  return process.env.QMD_EMBED_MODEL ?? loadConfig().embed_model ?? DEFAULT_EMBED_MODEL;
+}
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
@@ -670,6 +700,20 @@ export class LlamaCpp implements LLM {
     return this.embedModel.detokenize(tokens);
   }
 
+  /** Nomic embed models have 512 token max; truncate when needed */
+  private static readonly NOMIC_EMBED_MAX_TOKENS = 512;
+
+  /**
+   * Truncate text to maxTokens when using nomic embed model (512 token limit).
+   * No-op for other models.
+   */
+  private async truncateForEmbedIfNeeded(text: string, maxTokens: number = LlamaCpp.NOMIC_EMBED_MAX_TOKENS): Promise<string> {
+    if (!isNomicEmbedUri(this.embedModelUri)) return text;
+    const tokens = await this.tokenize(text);
+    if (tokens.length <= maxTokens) return text;
+    return this.detokenize(tokens.slice(0, maxTokens));
+  }
+
   // ==========================================================================
   // Core API methods
   // ==========================================================================
@@ -680,7 +724,8 @@ export class LlamaCpp implements LLM {
 
     try {
       const context = await this.ensureEmbedContext();
-      const embedding = await context.getEmbeddingFor(text);
+      const toEmbed = await this.truncateForEmbedIfNeeded(text);
+      const embedding = await context.getEmbeddingFor(toEmbed);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -706,8 +751,9 @@ export class LlamaCpp implements LLM {
       const context = await this.ensureEmbedContext();
 
       // node-llama-cpp handles batching internally when we make parallel requests
+      const truncatedTexts = await Promise.all(texts.map((t) => this.truncateForEmbedIfNeeded(t)));
       const embeddings = await Promise.all(
-        texts.map(async (text) => {
+        truncatedTexts.map(async (text) => {
           try {
             const embedding = await context.getEmbeddingFor(text);
             this.touchActivity();  // Keep-alive during slow batches
@@ -1184,7 +1230,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp({ embedModel: getEffectiveEmbedModel() });
   }
   return defaultLlamaCpp;
 }

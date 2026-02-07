@@ -36,6 +36,7 @@ export interface Collection {
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
+  embed_model?: string;                       // Optional override for embedding model (e.g. hf:user/repo/file.gguf)
   collections: Record<string, Collection>;    // Collection name -> config
 }
 

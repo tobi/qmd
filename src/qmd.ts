@@ -66,7 +66,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, getEffectiveEmbedModel, formatTextForEmbedding, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -1554,7 +1554,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const modelToUse = getEffectiveEmbedModel();
+  console.log(`${c.dim}Model: ${modelToUse}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
@@ -1568,7 +1569,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (!firstChunk) {
       throw new Error("No chunks available to embed");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+    const firstText = formatTextForEmbedding(firstChunk.text, { isQuery: false, title: firstChunk.title, embedModelUri: modelToUse });
     const firstResult = await session.embed(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1586,8 +1587,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
       const batch = allChunks.slice(batchStart, batchEnd);
 
-      // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+      // Format texts for embedding (model-aware prefixes)
+      const texts = batch.map(chunk => formatTextForEmbedding(chunk.text, { isQuery: false, title: chunk.title, embedModelUri: modelToUse }));
 
       try {
         // Batch embed all texts at once
@@ -1599,7 +1600,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           const embedding = embeddings[i];
 
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), modelToUse, now);
             chunksEmbedded++;
           } else {
             errors++;
@@ -1611,10 +1612,10 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         // If batch fails, try individual embeddings as fallback
         for (const chunk of batch) {
           try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const text = formatTextForEmbedding(chunk.text, { isQuery: false, title: chunk.title, embedModelUri: modelToUse });
             const result = await session.embed(text);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), modelToUse, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1957,7 +1958,7 @@ function search(query: string, opts: OutputOptions): void {
   outputResults(resultsWithContext, query, opts);
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(query: string, opts: OutputOptions, model: string = getEffectiveEmbedModel()): Promise<void> {
   const db = getDb();
 
   // Validate collection filter if specified
@@ -2080,7 +2081,7 @@ async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, 
   return Array.from(queries);
 }
 
-async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(query: string, opts: OutputOptions, embedModel: string = getEffectiveEmbedModel(), rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
   // Validate collection filter if specified
@@ -2413,8 +2414,13 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
+  const embedDisplay = (() => {
+    const uri = getEffectiveEmbedModel();
+    const name = uri.split("/").pop()?.replace(/\.gguf$/i, "") ?? uri;
+    return name;
+  })();
   console.log("Models (auto-downloaded from HuggingFace):");
-  console.log("  Embedding: embeddinggemma-300M-Q8_0");
+  console.log(`  Embedding: ${embedDisplay}`);
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
   console.log("  Generation: Qwen3-0.6B-Q8_0");
   console.log("");
@@ -2605,7 +2611,7 @@ if (import.meta.main) {
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const models = [
-        DEFAULT_EMBED_MODEL_URI,
+        getEffectiveEmbedModel(),
         DEFAULT_GENERATE_MODEL_URI,
         DEFAULT_RERANK_MODEL_URI,
       ];
