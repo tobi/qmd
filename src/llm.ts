@@ -1,7 +1,8 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - LLM abstraction layer for QMD
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking using local GGUF models
+ * or OpenRouter-hosted models.
  */
 
 import {
@@ -168,6 +169,11 @@ export type RerankDocument = {
   title?: string;
 };
 
+/**
+ * Backing inference provider
+ */
+export type LLMProvider = "local" | "openrouter";
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
@@ -178,10 +184,19 @@ const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+const DEFAULT_PROVIDER: LLMProvider = "local";
+
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_EMBED_MODEL = "openai/text-embedding-3-small";
+const DEFAULT_OPENROUTER_GENERATE_MODEL = "openai/gpt-4o-mini";
+const DEFAULT_OPENROUTER_RERANK_MODEL = "openai/text-embedding-3-small";
+const DEFAULT_OPENROUTER_API_KEY_FILE = join(homedir(), ".config", "qmd", "openrouter.key");
 
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
+export const DEFAULT_OPENROUTER_BASE_URL_URI = DEFAULT_OPENROUTER_BASE_URL;
+export const DEFAULT_OPENROUTER_API_KEY_PATH = DEFAULT_OPENROUTER_API_KEY_FILE;
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
@@ -279,6 +294,93 @@ export async function pullModels(
   return results;
 }
 
+function normalizeProvider(provider: string | undefined): LLMProvider {
+  const value = (provider || DEFAULT_PROVIDER).trim().toLowerCase();
+  if (value === "local" || value === "openrouter") {
+    return value;
+  }
+  console.error(`Unknown QMD_LLM_PROVIDER="${provider}". Falling back to "local".`);
+  return "local";
+}
+
+function stripTrailingSlash(url: string): string {
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+function trimSingleLine(value: string): string {
+  const firstLine = value.split(/\r?\n/, 1)[0] ?? "";
+  return firstLine.trim();
+}
+
+function loadOpenRouterApiKey(config: { apiKey?: string; apiKeyFile?: string } = {}): string {
+  const directKey = config.apiKey?.trim();
+  if (directKey) return directKey;
+
+  const envKey = process.env.QMD_OPENROUTER_API_KEY?.trim() || process.env.OPENROUTER_API_KEY?.trim();
+  if (envKey) return envKey;
+
+  const keyFile = config.apiKeyFile || process.env.QMD_OPENROUTER_API_KEY_FILE || DEFAULT_OPENROUTER_API_KEY_FILE;
+  if (existsSync(keyFile)) {
+    const fileKey = trimSingleLine(readFileSync(keyFile, "utf-8"));
+    if (fileKey) return fileKey;
+    throw new Error(`OpenRouter API key file exists but is empty: ${keyFile}`);
+  }
+
+  throw new Error(
+    `OpenRouter API key missing. Set QMD_OPENROUTER_API_KEY (or OPENROUTER_API_KEY), ` +
+    `or write the key to ${keyFile}`
+  );
+}
+
+function parseExpandedQueryLines(raw: string, query: string, includeLexical: boolean): Queryable[] {
+  const lines = raw.trim().split("\n").map(line => line.trim()).filter(Boolean);
+  const queryLower = query.toLowerCase();
+  const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+  const hasQueryTerm = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    if (queryTerms.length === 0) return true;
+    return queryTerms.some(term => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines.map(line => {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) return null;
+    const type = line.slice(0, colonIdx).trim();
+    if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+    const text = line.slice(colonIdx + 1).trim();
+    if (!hasQueryTerm(text)) return null;
+    return { type: type as QueryType, text };
+  }).filter((q): q is Queryable => q !== null);
+
+  const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+  if (filtered.length > 0) return filtered;
+
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${query}` },
+    { type: "lex", text: query },
+    { type: "vec", text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
+
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const va = a[i] ?? 0;
+    const vb = b[i] ?? 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
 // =============================================================================
 // LLM Interface
 // =============================================================================
@@ -291,6 +393,11 @@ export interface LLM {
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Batch embed multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -318,6 +425,261 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+}
+
+// =============================================================================
+// OpenRouter Implementation
+// =============================================================================
+
+type OpenRouterEmbeddingResponse = {
+  data?: Array<{
+    embedding?: number[];
+    index?: number;
+  }>;
+};
+
+type OpenRouterChatResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string | Array<{ text?: string }>;
+    };
+  }>;
+};
+
+export type OpenRouterConfig = {
+  apiKey?: string;
+  apiKeyFile?: string;
+  baseUrl?: string;
+  embedModel?: string;
+  generateModel?: string;
+  rerankModel?: string;
+  appName?: string;
+  appUrl?: string;
+  requestTimeoutMs?: number;
+};
+
+export class OpenRouterLLM implements LLM {
+  private apiKey: string;
+  private baseUrl: string;
+  private embedModelUri: string;
+  private generateModelUri: string;
+  private rerankModelUri: string;
+  private appName: string;
+  private appUrl: string;
+  private requestTimeoutMs: number;
+
+  constructor(config: OpenRouterConfig = {}) {
+    this.apiKey = loadOpenRouterApiKey(config);
+    this.baseUrl = stripTrailingSlash(config.baseUrl || process.env.QMD_OPENROUTER_BASE_URL || DEFAULT_OPENROUTER_BASE_URL);
+    this.embedModelUri = config.embedModel || process.env.QMD_OPENROUTER_EMBED_MODEL || DEFAULT_OPENROUTER_EMBED_MODEL;
+    this.generateModelUri = config.generateModel || process.env.QMD_OPENROUTER_GENERATE_MODEL || DEFAULT_OPENROUTER_GENERATE_MODEL;
+    this.rerankModelUri = config.rerankModel || process.env.QMD_OPENROUTER_RERANK_MODEL || DEFAULT_OPENROUTER_RERANK_MODEL;
+    this.appName = config.appName || process.env.QMD_OPENROUTER_APP_NAME || "qmd";
+    this.appUrl = config.appUrl || process.env.QMD_OPENROUTER_APP_URL || "https://github.com/tobi/qmd";
+    this.requestTimeoutMs = config.requestTimeoutMs ?? 60_000;
+  }
+
+  private async postJson<T>(path: string, payload: unknown): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": this.appUrl,
+          "X-Title": this.appName,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      const raw = await response.text();
+      if (!response.ok) {
+        const body = raw.slice(0, 500);
+        throw new Error(`OpenRouter ${path} failed (${response.status}): ${body}`);
+      }
+
+      return JSON.parse(raw) as T;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private static contentToString(content: string | Array<{ text?: string }> | undefined): string {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map(part => (typeof part?.text === "string" ? part.text : ""))
+        .join("");
+    }
+    return "";
+  }
+
+  private async requestEmbeddings(input: string | string[], model: string): Promise<number[][]> {
+    const response = await this.postJson<OpenRouterEmbeddingResponse>("/embeddings", {
+      model,
+      input,
+      encoding_format: "float",
+    });
+
+    const rows = Array.isArray(response.data) ? [...response.data] : [];
+    rows.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
+    return rows.map((row) => {
+      if (!Array.isArray(row.embedding)) return [];
+      return row.embedding;
+    });
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      const model = options.model || this.embedModelUri;
+      const vectors = await this.requestEmbeddings(text, model);
+      const vector = vectors[0];
+      if (!vector || vector.length === 0) {
+        throw new Error("OpenRouter embedding response missing embedding vector");
+      }
+
+      return { embedding: vector, model };
+    } catch (error) {
+      console.error("OpenRouter embedding error:", error);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    try {
+      const data = await this.requestEmbeddings(texts, this.embedModelUri);
+
+      return texts.map((_, i) => {
+        const vector = data[i];
+        if (!vector || vector.length === 0) return null;
+        return { embedding: vector, model: this.embedModelUri };
+      });
+    } catch (error) {
+      console.error("OpenRouter batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    try {
+      const model = options.model || this.generateModelUri;
+      const response = await this.postJson<OpenRouterChatResponse>("/chat/completions", {
+        model,
+        temperature: options.temperature ?? 0.7,
+        max_tokens: options.maxTokens ?? 150,
+        messages: [
+          { role: "user", content: prompt },
+        ],
+      });
+
+      const content = OpenRouterLLM.contentToString(response.choices?.[0]?.message?.content);
+      if (!content) {
+        throw new Error("OpenRouter completion response missing content");
+      }
+
+      return {
+        text: content,
+        model,
+        done: true,
+      };
+    } catch (error) {
+      console.error("OpenRouter generation error:", error);
+      return null;
+    }
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    return { name: model, exists: true };
+  }
+
+  async expandQuery(query: string, options: { context?: string; includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const context = options.context;
+    const contextBlock = context ? `Context: ${context}\n` : "";
+    const lexicalRule = includeLexical
+      ? "You may use lex, vec, and hyde query types."
+      : "Use only vec and hyde query types (no lex entries).";
+
+    const prompt = [
+      "Expand the search query into short retrieval variants.",
+      "Output only lines in this exact format: type: text",
+      "Allowed type values: lex, vec, hyde.",
+      lexicalRule,
+      "Keep at least one important term from the original query in each line.",
+      contextBlock,
+      `Original query: ${query}`,
+    ].filter(Boolean).join("\n");
+
+    try {
+      const response = await this.postJson<OpenRouterChatResponse>("/chat/completions", {
+        model: this.generateModelUri,
+        temperature: 0.2,
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      });
+
+      const content = OpenRouterLLM.contentToString(response.choices?.[0]?.message?.content);
+      return parseExpandedQueryLines(content, query, includeLexical);
+    } catch (error) {
+      console.error("OpenRouter query expansion error:", error);
+      const fallback: Queryable[] = [{ type: "vec", text: query }];
+      if (includeLexical) fallback.unshift({ type: "lex", text: query });
+      return fallback;
+    }
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    if (documents.length === 0) {
+      return { results: [], model: options.model || this.rerankModelUri };
+    }
+
+    try {
+      const model = options.model || this.rerankModelUri;
+      const queryVectors = await this.requestEmbeddings(query, model);
+      const queryEmbedding = queryVectors[0];
+      if (!queryEmbedding || queryEmbedding.length === 0) {
+        throw new Error("Failed to embed rerank query");
+      }
+
+      const docEmbeddings = await this.requestEmbeddings(documents.map(doc => doc.text), model);
+      const scored: RerankDocumentResult[] = documents.map((doc, index) => {
+        const emb = docEmbeddings[index];
+        const rawCosine = emb ? cosineSimilarity(queryEmbedding, emb) : 0;
+        return {
+          file: doc.file,
+          index,
+          score: (rawCosine + 1) / 2, // Normalize cosine [-1,1] -> [0,1]
+        };
+      });
+
+      scored.sort((a, b) => b.score - a.score);
+      return {
+        results: scored,
+        model,
+      };
+    } catch (error) {
+      console.error("OpenRouter rerank error:", error);
+      return {
+        results: documents.map((doc, index) => ({ file: doc.file, index, score: 0 })),
+        model: options.model || this.rerankModelUri,
+      };
+    }
+  }
+
+  async dispose(): Promise<void> {
+    // No local resources to dispose.
+  }
 }
 
 // =============================================================================
@@ -803,7 +1165,7 @@ export class LlamaCpp implements LLM {
       const embedding = await context.getEmbeddingFor(text);
 
       return {
-        embedding: Array.from(embedding.vector),
+        embedding: Array.from(embedding.vector) as number[],
         model: this.embedModelUri,
       };
     } catch (error) {
@@ -975,36 +1337,7 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      return parseExpandedQueryLines(result, query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
@@ -1146,11 +1479,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1186,7 +1519,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1289,18 +1622,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1308,19 +1641,77 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
-// Session manager for the default LlamaCpp instance
+// Session manager for the default LLM instance
 let defaultSessionManager: LLMSessionManager | null = null;
+let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultOpenRouterLLM: OpenRouterLLM | null = null;
+let defaultLLM: LLM | null = null;
+let defaultLLMProvider: LLMProvider | null = null;
+let didWarnOpenRouterRemote = false;
 
 /**
- * Get the session manager for the default LlamaCpp instance.
+ * Emit the remote-provider notice once per process.
+ */
+function warnOpenRouterOnce(): void {
+  if (didWarnOpenRouterRemote) return;
+  didWarnOpenRouterRemote = true;
+  process.stderr.write(
+    "Notice: QMD is using OpenRouter (remote inference over HTTPS) for model operations.\n"
+  );
+}
+
+/**
+ * Resolve the default provider from environment.
+ * Defaults to local so remote inference is always opt-in.
+ */
+export function getDefaultLLMProvider(): LLMProvider {
+  return defaultLLMProvider ?? normalizeProvider(process.env.QMD_LLM_PROVIDER);
+}
+
+function getDefaultOpenRouterLLM(): OpenRouterLLM {
+  if (!defaultOpenRouterLLM) {
+    defaultOpenRouterLLM = new OpenRouterLLM();
+  }
+  return defaultOpenRouterLLM;
+}
+
+/**
+ * Get the default LLM instance (local or OpenRouter based on QMD_LLM_PROVIDER).
+ */
+export function getDefaultLLM(): LLM {
+  const provider = normalizeProvider(process.env.QMD_LLM_PROVIDER);
+  if (defaultLLM && defaultLLMProvider === provider) {
+    return defaultLLM;
+  }
+
+  if (defaultLLM && defaultLLMProvider !== provider) {
+    defaultSessionManager = null;
+    void defaultLLM.dispose().catch(() => {});
+    defaultLLM = null;
+  }
+
+  if (provider === "openrouter") {
+    warnOpenRouterOnce();
+    defaultLLM = getDefaultOpenRouterLLM();
+    defaultLLMProvider = "openrouter";
+    return defaultLLM;
+  }
+
+  defaultLLM = getDefaultLlamaCpp();
+  defaultLLMProvider = "local";
+  return defaultLLM;
+}
+
+/**
+ * Get the session manager for the default LLM instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1364,10 +1755,8 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton accessors
 // =============================================================================
-
-let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
@@ -1384,6 +1773,10 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+  if (defaultLLMProvider === "local") {
+    defaultLLM = llm;
+    defaultSessionManager = null;
+  }
 }
 
 /**
@@ -1392,7 +1785,47 @@ export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
   if (defaultLlamaCpp) {
+    const existing = defaultLlamaCpp;
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
+    if (defaultLLM === existing) {
+      defaultLLM = null;
+      defaultLLMProvider = null;
+      defaultSessionManager = null;
+    }
   }
+}
+
+/**
+ * Dispose the active default LLM instance (provider-aware).
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  const disposed = new Set<LLM>();
+  const disposeOne = async (llm: LLM | null): Promise<void> => {
+    if (!llm || disposed.has(llm)) return;
+    disposed.add(llm);
+    await llm.dispose();
+  };
+
+  await disposeOne(defaultLLM);
+  await disposeOne(defaultLlamaCpp);
+  await disposeOne(defaultOpenRouterLLM);
+
+  defaultLLM = null;
+  defaultLLMProvider = null;
+  defaultLlamaCpp = null;
+  defaultOpenRouterLLM = null;
+  defaultSessionManager = null;
+}
+
+/**
+ * Test helper: clears default singleton state without disposing native resources.
+ */
+export function resetDefaultLLMForTests(): void {
+  defaultLLM = null;
+  defaultLLMProvider = null;
+  defaultLlamaCpp = null;
+  defaultOpenRouterLLM = null;
+  defaultSessionManager = null;
+  didWarnOpenRouterRemote = false;
 }
