@@ -17,8 +17,9 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
+  getDefaultLLMProvider,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -1475,6 +1476,16 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (getDefaultLLMProvider() !== "local") {
+    // Remote providers do not expose tokenizer APIs; fall back to char chunking.
+    const approxChunks = chunkDocument(content, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS);
+    return approxChunks.map(chunk => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+    }));
+  }
+
   const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
@@ -2290,10 +2301,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
+  const provider = getDefaultLLMProvider();
+  const formattedText = isQuery
+    ? formatQueryForEmbedding(text, provider === "local" ? model : undefined)
+    : formatDocForEmbedding(text, undefined, provider === "local" ? model : undefined);
+  const options = provider === "local"
+    ? { model, isQuery }
+    : { isQuery };
   const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    ? await session.embed(formattedText, options)
+    : await getDefaultLLM().embed(formattedText, options);
   return result?.embedding || null;
 }
 
@@ -2347,8 +2364,9 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+  const provider = getDefaultLLMProvider();
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
+  const cacheKey = getCacheKey("expandQuery", { query, model, provider, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2358,9 +2376,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query, { intent });
+  const results = provider === "local"
+    ? await getDefaultLlamaCpp().expandQuery(query, { intent })
+    : await getDefaultLLM().expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2382,7 +2400,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
-
+  const provider = getDefaultLLMProvider();
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
 
@@ -2392,9 +2410,16 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, provider, chunk: doc.text });
+    const legacyProviderAgnosticKey = provider === "local"
+      ? getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text })
+      : null;
+    const legacyFileKey = provider === "local"
+      ? getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text })
+      : null;
+    const cached = getCachedResult(db, cacheKey)
+      ?? (legacyProviderAgnosticKey ? getCachedResult(db, legacyProviderAgnosticKey) : null)
+      ?? (legacyFileKey ? getCachedResult(db, legacyFileKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
@@ -2402,17 +2427,17 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = provider === "local"
+      ? await getDefaultLlamaCpp().rerank(rerankQuery, uncachedDocs, { model })
+      : await getDefaultLLM().rerank(rerankQuery, uncachedDocs);
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, provider, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
