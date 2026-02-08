@@ -10,17 +10,19 @@
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebStandardStreamableHTTPServerTransport }
+  from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import {
   createStore,
-  reciprocalRankFusion,
   extractSnippet,
-  DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
-  DEFAULT_RERANK_MODEL,
+  addLineNumbers,
+  hybridQuery,
+  vectorSearchQuery,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { RankedResult } from "./store.js";
+import type { Store } from "./store.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -75,23 +77,15 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
-/**
- * Add line numbers to text content.
- * Each line becomes: "{lineNum}: {content}"
- */
-function addLineNumbers(text: string, startLine: number = 1): string {
-  const lines = text.split('\n');
-  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
-}
-
 // =============================================================================
 // MCP Server
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
-  // Open database once at startup - keep it open for the lifetime of the server
-  const store = createStore();
-
+/**
+ * Create an MCP server with all QMD tools, resources, and prompts registered.
+ * Shared by both stdio and HTTP transports.
+ */
+function createMcpServer(store: Store): McpServer {
   const server = new McpServer({
     name: "qmd",
     version: "1.0.0",
@@ -309,45 +303,30 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-      if (!tableExists) {
-        return {
-          content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
-          isError: true,
-        };
-      }
+      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
 
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
-
-      // Collect results (filter by collection after search)
-      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; docid: string }>();
-      for (const q of queries) {
-        const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10)
-          .then(results => results.filter(r => !collection || r.collectionName === collection));
-        for (const r of vecResults) {
-          const existing = allResults.get(r.filepath);
-          if (!existing || r.score > existing.score) {
-            allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, docid: r.docid });
-          }
+      if (results.length === 0) {
+        // Distinguish "no embeddings" from "no matches" — check if vector table exists
+        const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+        if (!tableExists) {
+          return {
+            content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
+            isError: true,
+          };
         }
       }
 
-      const filtered: SearchResultItem[] = Array.from(allResults.values())
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit || 10)
-        .filter(r => r.score >= (minScore || 0.3))
-        .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.file),
-            snippet: addLineNumbers(snippet, line),  // Default to line numbers
-          };
-        });
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.body, query, 300);
+        return {
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          snippet: addLineNumbers(snippet, line),
+        };
+      });
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
@@ -373,66 +352,19 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
+      const results = await hybridQuery(store, query, { collection, limit, minScore });
 
-      // Collect ranked lists (filter by collection after search)
-      const rankedLists: RankedResult[][] = [];
-      const docidMap = new Map<string, string>(); // filepath -> docid
-      const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-
-      for (const q of queries) {
-        const ftsResults = store.searchFTS(q, 20)
-          .filter(r => !collection || r.collectionName === collection);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-        if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
-            .then(results => results.filter(r => !collection || r.collectionName === collection));
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        }
-      }
-
-      // RRF fusion
-      const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-      const fused = reciprocalRankFusion(rankedLists, weights);
-      const candidates = fused.slice(0, 30);
-
-      // Rerank
-      const reranked = await store.rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL
-      );
-
-      // Blend scores
-      const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-      const filtered: SearchResultItem[] = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        let rrfWeight: number;
-        if (rrfRank <= 3) rrfWeight = 0.75;
-        else if (rrfRank <= 10) rrfWeight = 0.60;
-        else rrfWeight = 0.40;
-        const rrfScore = 1 / rrfRank;
-        const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-        const candidate = candidateMap.get(r.file);
-        const { line, snippet } = extractSnippet(candidate?.body || "", query, 300);
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.body, query, 300);
         return {
-          docid: `#${docidMap.get(r.file) || ""}`,
-          file: candidate?.displayPath || "",
-          title: candidate?.title || "",
-          score: Math.round(blendedScore * 100) / 100,
-          context: store.getContextForFile(r.file),
-          snippet: addLineNumbers(snippet, line),  // Default to line numbers
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          snippet: addLineNumbers(snippet, line),
         };
-      }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
+      });
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
@@ -610,14 +542,125 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     }
   );
 
-  // ---------------------------------------------------------------------------
-  // Connect via stdio
-  // ---------------------------------------------------------------------------
+  return server;
+}
 
+// =============================================================================
+// Transport: stdio (default)
+// =============================================================================
+
+export async function startMcpServer(): Promise<void> {
+  const store = createStore();
+  const server = createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
 
-  // Note: Database stays open - it will be closed when the process exits
+// =============================================================================
+// Transport: Streamable HTTP
+// =============================================================================
+
+export type HttpServerHandle = {
+  httpServer: ReturnType<typeof Bun.serve>;
+  port: number;
+  stop: () => Promise<void>;
+};
+
+/**
+ * Start MCP server over Streamable HTTP (JSON responses, no SSE).
+ * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ */
+export async function startMcpHttpServer(port: number): Promise<HttpServerHandle> {
+  const store = createStore();
+  const mcpServer = createMcpServer(store);
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    enableJsonResponse: true,
+  });
+  await mcpServer.connect(transport);
+
+  const startTime = Date.now();
+
+  /** Format timestamp for request logging */
+  function ts(): string {
+    return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
+  }
+
+  /** Extract a human-readable label from a JSON-RPC body */
+  function describeRequest(body: any): string {
+    const method = body?.method ?? "unknown";
+    if (method === "tools/call") {
+      const tool = body.params?.name ?? "?";
+      const args = body.params?.arguments;
+      // Show query string if present, truncated
+      if (args?.query) {
+        const q = String(args.query).slice(0, 80);
+        return `tools/call ${tool} "${q}"`;
+      }
+      if (args?.path) return `tools/call ${tool} ${args.path}`;
+      if (args?.pattern) return `tools/call ${tool} ${args.pattern}`;
+      return `tools/call ${tool}`;
+    }
+    return method;
+  }
+
+  const httpServer = Bun.serve({
+    port,
+    hostname: "localhost",
+    async fetch(req) {
+      const reqStart = Date.now();
+      const pathname = new URL(req.url).pathname;
+
+      if (pathname === "/health" && req.method === "GET") {
+        const res = Response.json({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+        });
+        console.error(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return res;
+      }
+
+      if (pathname === "/mcp" && req.method === "POST") {
+        const body = await req.json();
+        const label = describeRequest(body);
+        const res = await transport.handleRequest(req, { parsedBody: body });
+        console.error(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
+        return res;
+      }
+
+      // Pass other methods (GET, DELETE) to transport for protocol handling
+      if (pathname === "/mcp") {
+        return transport.handleRequest(req);
+      }
+
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+
+  const actualPort = httpServer.port;
+
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await transport.close();
+    httpServer.stop();
+    store.close();
+    await disposeDefaultLlamaCpp();
+  };
+
+  process.on("SIGTERM", async () => {
+    console.error("Shutting down (SIGTERM)...");
+    await stop();
+    process.exit(0);
+  });
+  process.on("SIGINT", async () => {
+    console.error("Shutting down (SIGINT)...");
+    await stop();
+    process.exit(0);
+  });
+
+  console.error(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  return { httpServer, port: actualPort, stop };
 }
 
 // Run if this is the main module
