@@ -1196,7 +1196,7 @@ class RemoteLLM implements LLM {
   private baseUrl: string;
   /** Cache last tokenized content for local detokenize (avoids remote round-trips during chunking) */
   private lastTokenizedContent: string | null = null;
-  private lastTokenizedCharsPerToken: number = 4;
+  private lastTokenizedCharsPerToken: number = 2;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -1229,10 +1229,12 @@ class RemoteLLM implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     try {
+      // Sanitize: strip lone surrogates that break llama-server's JSON parser
+      const sanitized = text.replace(/[\uD800-\uDFFF]/g, '\uFFFD');
       const res = await this.fetchWithRetry(`${this.baseUrl}/v1/embeddings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text }),
+        body: JSON.stringify({ input: sanitized }),
       }, 3, 60000);
       if (!res.ok) throw new Error(`Remote embed failed: ${res.status} ${res.statusText}`);
       const data = await res.json() as any;
@@ -1246,30 +1248,33 @@ class RemoteLLM implements LLM {
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
     try {
+      // Sanitize: strip lone surrogates that break llama-server's JSON parser
+      const sanitized = texts.map(t => t.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
       const res = await this.fetchWithRetry(`${this.baseUrl}/v1/embeddings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: texts }),
+        body: JSON.stringify({ input: sanitized }),
       }, 3, 120000);
       if (!res.ok) throw new Error(`Remote embedBatch failed: ${res.status} ${res.statusText}`);
       const data = await res.json() as any;
       return data.data.map((d: any) => ({ embedding: d.embedding, model: 'remote' }));
     } catch (err) {
-      console.error('Remote embedBatch error:', err);
-      return texts.map(() => null);
+      // Batch failed — retry each item individually to isolate bad items
+      console.error('Remote embedBatch error, retrying individually:', err);
+      return Promise.all(texts.map(t => this.embed(t)));
     }
   }
 
   /**
    * Local tokenization approximation — avoids thousands of HTTP round-trips during chunking.
-   * Uses ~4 chars/token heuristic (accurate enough for chunk boundary decisions).
+   * Uses ~2 chars/token heuristic (conservative for code/Unicode-heavy content).
    * Returns fake token IDs (sequential integers) since they're only used for counting/slicing.
    * Caches the content so detokenize can reconstruct text from token positions.
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
     // Cache for detokenize reconstruction
     this.lastTokenizedContent = text;
-    const charsPerToken = 4;
+    const charsPerToken = 2;  // Conservative: stays under model's 2048-token context for code/Unicode-heavy content
     this.lastTokenizedCharsPerToken = charsPerToken;
     const approxTokenCount = Math.ceil(text.length / charsPerToken);
     const tokens = Array.from({ length: approxTokenCount }, (_, i) => i) as unknown as LlamaToken[];
@@ -1289,7 +1294,7 @@ class RemoteLLM implements LLM {
   }
 
   async countTokens(text: string): Promise<number> {
-    return Math.ceil(text.length / 4);
+    return Math.ceil(text.length / 2);
   }
 
   // --- Stub methods (not needed for embedding workflow) ---
