@@ -66,7 +66,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLLM, disposeDefaultLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -247,7 +247,7 @@ async function rerank(query: string, documents: { file: string; text: string }[]
 
   const result = session
     ? await session.rerank(query, rerankDocs)
-    : await getDefaultLlamaCpp().rerank(query, rerankDocs);
+    : await getDefaultLLM().rerank(query, rerankDocs);
 
   progress.clear();
   process.stderr.write("\n");
@@ -1522,7 +1522,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+    const chunks = await chunkDocumentByTokens(item.body);  // Falls back to char chunking for remote providers
 
     if (chunks.length > 1) multiChunkDocs++;
 
@@ -2039,7 +2039,7 @@ async function expandQueryStructured(query: string, includeLexical: boolean = tr
 
   const queryables = session
     ? await session.expandQuery(query, { includeLexical, context })
-    : await getDefaultLlamaCpp().expandQuery(query, { includeLexical, context });
+    : await getDefaultLLM().expandQuery(query, { includeLexical, context });
 
   // Log the expansion as a tree
   const lines: string[] = [];
@@ -2394,6 +2394,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  Env: QMD_LLM_PROVIDER=openrouter - Use OpenRouter instead of local GGUF models");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2413,7 +2414,7 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
-  console.log("Models (auto-downloaded from HuggingFace):");
+  console.log("Local models (auto-downloaded from HuggingFace when provider=local):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
   console.log("  Generation: Qwen3-0.6B-Q8_0");
@@ -2692,7 +2693,7 @@ if (import.meta.main) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
+    await disposeDefaultLLM();
     process.exit(0);
   }
 
