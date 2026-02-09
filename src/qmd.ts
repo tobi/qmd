@@ -2122,7 +2122,7 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
-  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 3000)");
+  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
   console.log("  qmd mcp stop                  - Stop background MCP daemon");
   console.log("");
@@ -2413,7 +2413,7 @@ if (import.meta.main) {
       }
 
       if (cli.values.http) {
-        const port = Number(cli.values.port) || 3000;
+        const port = Number(cli.values.port) || 8181;
 
         if (cli.values.daemon) {
           // Guard: check if already running

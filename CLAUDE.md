@@ -23,7 +23,7 @@ qmd search <query>                # BM25 full-text search
 qmd vsearch <query>               # Vector similarity search
 qmd query <query>                 # Hybrid search with reranking (best quality)
 qmd mcp                           # Start MCP server (stdio transport)
-qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 3000)
+qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
 ```
