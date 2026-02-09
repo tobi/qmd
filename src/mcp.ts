@@ -15,6 +15,7 @@ import {
   createStore,
   reciprocalRankFusion,
   extractSnippet,
+  chunkDocument,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -403,10 +404,31 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, 30);
 
-      // Rerank
+      // Rerank — chunk documents first to avoid exceeding reranker context limits.
+      // Pick the best chunk per document using keyword overlap (matches CLI querySearch behaviour).
+      const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+      const chunksToRerank: { file: string; text: string }[] = [];
+      for (const cand of candidates) {
+        const chunks = chunkDocument(cand.body);
+        if (chunks.length === 0) {
+          chunksToRerank.push({ file: cand.file, text: cand.body.slice(0, 2000) });
+          continue;
+        }
+        let bestIdx = 0;
+        let bestScore = -1;
+        for (let i = 0; i < chunks.length; i++) {
+          const chunkLower = chunks[i]!.text.toLowerCase();
+          const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+          }
+        }
+        chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
+      }
       const reranked = await store.rerank(
         query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
+        chunksToRerank,
         DEFAULT_RERANK_MODEL
       );
 
