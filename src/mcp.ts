@@ -22,6 +22,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { Store } from "./store.js";
+import { getCollection, getGlobalContext } from "./collections.js";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
@@ -82,14 +83,73 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
 // =============================================================================
 
 /**
+ * Build dynamic server instructions from actual index state.
+ * Injected into the LLM's system prompt via MCP initialize response —
+ * gives the LLM immediate context about what's searchable without a tool call.
+ */
+function buildInstructions(store: Store): string {
+  const status = store.getStatus();
+  const lines: string[] = [];
+
+  // --- What is this? ---
+  const globalCtx = getGlobalContext();
+  lines.push(`QMD is your local search engine over ${status.totalDocuments} markdown documents.`);
+  if (globalCtx) lines.push(`Context: ${globalCtx}`);
+
+  // --- What's searchable? ---
+  if (status.collections.length > 0) {
+    lines.push("");
+    lines.push("Collections (scope with `collection` parameter):");
+    for (const col of status.collections) {
+      const collConfig = getCollection(col.name);
+      const rootCtx = collConfig?.context?.[""] || collConfig?.context?.["/"];
+      const desc = rootCtx ? ` — ${rootCtx}` : "";
+      lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
+    }
+  }
+
+  // --- Capability gaps ---
+  if (!status.hasVectorIndex) {
+    lines.push("");
+    lines.push("Note: No vector embeddings. Only `search` (BM25) is available.");
+  } else if (status.needsEmbedding > 0) {
+    lines.push("");
+    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
+  }
+
+  // --- When to use which tool (escalation ladder) ---
+  // Tool schemas describe parameters; instructions describe strategy.
+  lines.push("");
+  lines.push("Search (escalate as needed):");
+  lines.push("  1. `search` — keyword lookup (~30ms). Start here.");
+  lines.push("  2. `vsearch` — semantic search (~2s). For conceptual/\"how do I\" queries or when keywords don't match.");
+  lines.push("  3. `query` — highest quality (~10s). Keyword + semantic + LLM reranking.");
+
+  // --- Retrieval workflow ---
+  lines.push("");
+  lines.push("Retrieval:");
+  lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
+  lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+
+  // --- Non-obvious things that prevent mistakes ---
+  lines.push("");
+  lines.push("Tips:");
+  lines.push("  - File paths in results are relative to their collection.");
+  lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
+  lines.push("  - Results include a `context` field describing the content type.");
+
+  return lines.join("\n");
+}
+
+/**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
 function createMcpServer(store: Store): McpServer {
-  const server = new McpServer({
-    name: "qmd",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    { name: "qmd", version: "1.0.0" },
+    { instructions: buildInstructions(store) },
+  );
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -254,6 +314,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Search (BM25)",
       description: "Fast keyword-based full-text search using BM25. Best for finding documents with specific words or phrases.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Search query - keywords or phrases to find"),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
@@ -295,6 +356,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Vector Search (Semantic)",
       description: "Semantic similarity search using vector embeddings. Finds conceptually related content even without exact keyword matches. Requires embeddings (run 'qmd embed' first).",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
@@ -344,6 +406,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Hybrid Query (Best Quality)",
       description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
@@ -382,6 +445,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Get Document",
       description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         file: z.string().describe("File path or docid from search results (e.g., 'pages/meeting.md', '#abc123', or 'pages/meeting.md:100' to start at line 100)"),
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
@@ -446,6 +510,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Multi-Get Documents",
       description: "Retrieve multiple documents by glob pattern (e.g., 'journals/2025-05*.md') or comma-separated list. Skips files larger than maxBytes.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
@@ -518,6 +583,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {},
     },
     async () => {
