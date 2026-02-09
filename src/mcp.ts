@@ -355,7 +355,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       const results = await hybridQuery(store, query, { collection, limit, minScore });
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, query, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, query, 300);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
