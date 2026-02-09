@@ -66,7 +66,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, getDefaultEmbeddingLLM, disposeDefaultLlamaCpp, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -83,6 +83,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -235,6 +236,18 @@ function computeDisplayPath(
 // Rerank documents using node-llama-cpp cross-encoder model
 async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
   if (documents.length === 0) return [];
+
+  // Use OpenAI-based reranking when in OpenAI mode (avoids loading local model)
+  if (isUsingOpenAI()) {
+    process.stderr.write(`Reranking ${documents.length} documents (OpenAI)...\n`);
+    const embeddingLLM = getDefaultEmbeddingLLM();
+    const rerankDocs: RerankDocument[] = documents.map((doc) => ({
+      file: doc.file,
+      text: doc.text.slice(0, 4000),
+    }));
+    const result = await embeddingLLM.rerank(query, rerankDocs);
+    return result.results.map((r) => ({ file: r.file, score: r.score }));
+  }
 
   const total = documents.length;
   process.stderr.write(`Reranking ${total} documents...\n`);
@@ -1554,14 +1567,19 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  
+  // Use OpenAI or local model based on config
+  const useOpenAI = isUsingOpenAI();
+  const embeddingLLM = useOpenAI ? getDefaultEmbeddingLLM() : null;
+  const displayModel = useOpenAI ? embeddingLLM!.getModelName() : model;
+  
+  console.log(`${c.dim}Model: ${displayModel}${useOpenAI ? ' (OpenAI)' : ''}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
+  // Helper function to do the actual embedding work
+  const doEmbedding = async (embedFn: (text: string) => Promise<import('./llm.js').EmbeddingResult | null>, embedBatchFn: (texts: string[]) => Promise<(import('./llm.js').EmbeddingResult | null)[]>) => {
     // Get embedding dimensions from first chunk
     progress.indeterminate();
     const firstChunk = allChunks[0];
@@ -1569,7 +1587,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       throw new Error("No chunks available to embed");
     }
     const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
+    const firstResult = await embedFn(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
@@ -1579,8 +1597,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const startTime = Date.now();
 
     // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
+    // Process in batches of 32 to balance memory usage and efficiency (OpenAI supports larger batches)
+    const BATCH_SIZE = useOpenAI ? 100 : 32;
 
     for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
@@ -1591,7 +1609,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
       try {
         // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await embedBatchFn(texts);
 
         // Insert each embedding
         for (let i = 0; i < batch.length; i++) {
@@ -1599,7 +1617,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           const embedding = embeddings[i];
 
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), displayModel, now);
             chunksEmbedded++;
           } else {
             errors++;
@@ -1612,9 +1630,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         for (const chunk of batch) {
           try {
             const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
+            const result = await embedFn(text);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), displayModel, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1642,6 +1660,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
       process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+
+      // Rate limit delay for OpenAI API (avoid 429s)
+      if (useOpenAI && batchStart + BATCH_SIZE < allChunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
     }
 
     progress.clear();
@@ -1654,7 +1677,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  };
+
+  // Run with either OpenAI directly or wrapped in LLM session
+  if (useOpenAI) {
+    // OpenAI: call directly, no session management needed
+    await doEmbedding(
+      (text) => embeddingLLM!.embed(text),
+      (texts) => embeddingLLM!.embedBatch(texts)
+    );
+  } else {
+    // Local model: wrap in session for lifecycle management
+    await withLLMSession(async (session) => {
+      await doEmbedding(
+        (text) => session.embed(text),
+        (texts) => session.embedBatch(texts)
+      );
+    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  }
 
   closeDb();
 }
@@ -1756,12 +1796,36 @@ type OutputOptions = {
   limit: number;
   minScore: number;
   all?: boolean;
-  collection?: string;  // Filter by collection name (pwd suffix match)
+  collection?: string;  // Filter by collection name(s), comma-separated for multi-collection
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
+/**
+ * Resolve comma-separated collection names into validated collection names.
+ * Returns undefined if no collection filter specified.
+ * Exits with error if any collection name is not found.
+ */
+function resolveCollectionFilter(collectionArg: string | undefined): string[] | undefined {
+  if (!collectionArg) return undefined;
+
+  const names = collectionArg.split(",").map(s => s.trim()).filter(Boolean);
+  const validated: string[] = [];
+
+  for (const name of names) {
+    const coll = getCollectionFromYaml(name);
+    if (!coll) {
+      console.error(`Collection not found: ${name}`);
+      closeDb();
+      process.exit(1);
+    }
+    validated.push(name);
+  }
+
+  return validated.length > 0 ? validated : undefined;
+}
+
 function highlightTerms(text: string, query: string): string {
   if (!useColor) return text;
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
@@ -1919,22 +1983,12 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-  const results = searchFTS(db, query, fetchLimit, collectionName as any);
+  const results = searchFTS(db, query, fetchLimit, collections);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1960,17 +2014,8 @@ function search(query: string, opts: OutputOptions): void {
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
@@ -2008,7 +2053,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     // are made. This is a known limitation of the LlamaEmbeddingContext.
     // See: https://github.com/tobi/qmd/pull/23
     for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, session);
+      const vecResults = await searchVec(db, q, model, perQueryLimit, collections, session);
       for (const r of vecResults) {
         const existing = allResults.get(r.filepath);
         if (!existing || r.score > existing.score) {
@@ -2035,6 +2080,13 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
 
 // Expand query using structured output with GBNF grammar
 async function expandQueryStructured(query: string, includeLexical: boolean = true, context?: string, session?: ILLMSession): Promise<Queryable[]> {
+  // Use OpenAI for fast query expansion when configured
+  if (isUsingOpenAI()) {
+    process.stderr.write(`${c.dim}Using OpenAI for query expansion...${c.reset}\n`);
+    const llm = getDefaultEmbeddingLLM();
+    return await llm.expandQuery(query, { includeLexical, context });
+  }
+
   process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
 
   const queryables = session
@@ -2083,23 +2135,14 @@ async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, 
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   // Check index health and warn about issues
   checkIndexHealth(db);
 
   // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
+  const initialFts = searchFTS(db, query, 20, collections);
   let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
@@ -2152,7 +2195,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     for (const q of ftsQueries) {
       if (!q) continue;
       searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
+        const ftsResults = searchFTS(db, q, 20, collections);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) {
             // Mutex for hashMap is not strictly needed as it's just adding values
@@ -2168,7 +2211,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       for (const q of vectorQueries) {
         if (!q) continue;
         searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
+          const vecResults = await searchVec(db, q, embedModel, 20, collections, session);
           if (vecResults.length > 0) {
             for (const r of vecResults) hashMap.set(r.filepath, r.hash);
             rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -2428,6 +2471,20 @@ if (import.meta.main) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration from config file or env var
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  const useOpenAI = process.env.QMD_OPENAI === '1' || embeddingYamlConfig.provider === 'openai';
+  
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: process.env.OPENAI_API_KEY || embeddingYamlConfig.openai?.api_key,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {

@@ -20,7 +20,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
     "node-llama-cpp": "^3.14.5",
+    "openai": "^4.77.0",
     "sqlite-vec": "^0.1.7-alpha.2",
+    "tiktoken": "^1.0.22",
     "yaml": "^2.8.2",
     "zod": "^4.2.1"
   },
