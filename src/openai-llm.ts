@@ -229,16 +229,97 @@ Generate 1-2 of each type. Be concise. Include the original query terms.`
   }
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
-    // Not implemented - use local model for reranking
-    console.warn('OpenAIEmbedding.rerank() not implemented, returning original order');
-    return {
-      results: documents.map((doc, index) => ({
-        file: doc.file,
-        score: 1 - (index * 0.01), // Preserve original order with decreasing scores
-        index,
-      })),
-      model: 'passthrough',
-    };
+    if (documents.length === 0) {
+      return { results: [], model: `${this.expansionModel}-rerank` };
+    }
+
+    // For very small sets, skip the API call — not worth the latency
+    if (documents.length <= 2) {
+      return {
+        results: documents.map((doc, index) => ({
+          file: doc.file,
+          score: 1 - (index * 0.01),
+          index,
+        })),
+        model: 'passthrough',
+      };
+    }
+
+    try {
+      // Truncate documents for the prompt — 500 chars each is enough for relevance judgment
+      const truncated = documents.map((doc, i) => 
+        `[${i}] ${doc.title ? doc.title + ': ' : ''}${doc.text.slice(0, 500).replace(/\n+/g, ' ')}`
+      );
+
+      const response = await withRetry(() => this.client.chat.completions.create({
+        model: this.expansionModel,
+        messages: [
+          {
+            role: 'system',
+            content: `You are a document relevance ranker. Given a search query and numbered documents, rank them by relevance.
+
+Output ONLY a comma-separated list of document indices, most relevant first. Include ALL indices exactly once.
+Example output for 5 documents: 2,0,4,1,3`
+          },
+          {
+            role: 'user',
+            content: `Query: ${query}\n\nDocuments:\n${truncated.join('\n\n')}`
+          }
+        ],
+        temperature: 0,
+        max_tokens: 200,
+      }), { context: 'rerank' });
+
+      const content = response.choices[0]?.message?.content?.trim() || '';
+      
+      // Parse the comma-separated indices
+      const indices = content
+        .replace(/[^0-9,]/g, '') // Strip anything that isn't a digit or comma
+        .split(',')
+        .map(s => parseInt(s.trim(), 10))
+        .filter(n => !isNaN(n) && n >= 0 && n < documents.length);
+
+      // Deduplicate while preserving order
+      const seen = new Set<number>();
+      const uniqueIndices: number[] = [];
+      for (const idx of indices) {
+        if (!seen.has(idx)) {
+          seen.add(idx);
+          uniqueIndices.push(idx);
+        }
+      }
+
+      // Add any missing indices at the end (in case the model missed some)
+      for (let i = 0; i < documents.length; i++) {
+        if (!seen.has(i)) {
+          uniqueIndices.push(i);
+        }
+      }
+
+      // Convert rank position to score (1.0 for rank 1, decreasing)
+      const results = uniqueIndices.map((docIndex, rank) => ({
+        file: documents[docIndex]!.file,
+        score: 1.0 - (rank / uniqueIndices.length),
+        index: docIndex,
+      }));
+
+      return {
+        results,
+        model: `${this.expansionModel}-rerank`,
+      };
+    } catch (error) {
+      // Fallback: preserve original order if reranking fails
+      console.warn('[OpenAI] Rerank failed, preserving original order:', 
+        error instanceof Error ? error.message : String(error));
+      return {
+        results: documents.map((doc, index) => ({
+          file: doc.file,
+          score: 1 - (index * 0.01),
+          index,
+        })),
+        model: 'passthrough-fallback',
+      };
+    }
   }
 
   async dispose(): Promise<void> {
