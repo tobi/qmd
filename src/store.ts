@@ -2110,8 +2110,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   const uncachedDocs: RerankDocument[] = [];
 
   // Check cache for each document
+  // Cache key includes chunk text — different queries can select different chunks
+  // from the same file, and the reranker score depends on which chunk was sent.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model });
+    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey);
     if (cached !== null) {
       cachedResults.set(doc.file, parseFloat(cached));
@@ -2125,9 +2127,10 @@ export async function rerank(query: string, documents: { file: string; text: str
     const llm = getDefaultLlamaCpp();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
-    // Cache results
+    // Cache results — use original doc.text for cache key (result.file lacks chunk text)
+    const textByFile = new Map(documents.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model });
+      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(result.file, result.score);
     }
