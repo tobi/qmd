@@ -3119,17 +3119,23 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
-  // Prepend intent to rerank query so the reranker scores with domain context
-  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
-
-  // Skip reranking when using OpenAI (avoids loading local model)
-  // Return documents with decreasing scores to preserve original order
+  // Use OpenAI reranker when configured
   if (isUsingOpenAI()) {
-    return documents.map((doc, index) => ({
+    const llm = getDefaultEmbeddingLLM();
+    const rerankDocs: RerankDocument[] = documents.map((doc) => ({
       file: doc.file,
-      score: 1 - (index * 0.001),
+      text: doc.text.slice(0, 4000),
     }));
+    const result = await llm.rerank(query, rerankDocs);
+    return result.results.map((r) => ({ file: r.file, score: r.score }));
+  }  if (isUsingOpenAI()) {
+    const embeddingLLM = getDefaultEmbeddingLLM();
+    const rerankDocs: RerankDocument[] = documents.map((doc) => ({
+      file: doc.file,
+      text: doc.text.slice(0, 4000),
+    }));
+    const result = await embeddingLLM.rerank(query, rerankDocs);
+    return result.results.map((r) => ({ file: r.file, score: r.score }));
   }
 
 
