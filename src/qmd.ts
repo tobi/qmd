@@ -237,14 +237,16 @@ function computeDisplayPath(
 async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
   if (documents.length === 0) return [];
 
-  // Skip reranking when using OpenAI (avoids loading local model)
-  // Return documents with decreasing scores to preserve original order
+  // Use OpenAI-based reranking when in OpenAI mode (avoids loading local model)
   if (isUsingOpenAI()) {
-    process.stderr.write(`${c.dim}Using OpenAI (skipping local reranking)${c.reset}\n`);
-    return documents.map((doc, index) => ({
+    process.stderr.write(`Reranking ${documents.length} documents (OpenAI)...\n`);
+    const embeddingLLM = getDefaultEmbeddingLLM();
+    const rerankDocs: RerankDocument[] = documents.map((doc) => ({
       file: doc.file,
-      score: 1 - (index * 0.001),
+      text: doc.text.slice(0, 4000),
     }));
+    const result = await embeddingLLM.rerank(query, rerankDocs);
+    return result.results.map((r) => ({ file: r.file, score: r.score }));
   }
 
   const total = documents.length;
