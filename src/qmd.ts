@@ -1796,12 +1796,36 @@ type OutputOptions = {
   limit: number;
   minScore: number;
   all?: boolean;
-  collection?: string;  // Filter by collection name (pwd suffix match)
+  collection?: string;  // Filter by collection name(s), comma-separated for multi-collection
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
+/**
+ * Resolve comma-separated collection names into validated collection names.
+ * Returns undefined if no collection filter specified.
+ * Exits with error if any collection name is not found.
+ */
+function resolveCollectionFilter(collectionArg: string | undefined): string[] | undefined {
+  if (!collectionArg) return undefined;
+
+  const names = collectionArg.split(",").map(s => s.trim()).filter(Boolean);
+  const validated: string[] = [];
+
+  for (const name of names) {
+    const coll = getCollectionFromYaml(name);
+    if (!coll) {
+      console.error(`Collection not found: ${name}`);
+      closeDb();
+      process.exit(1);
+    }
+    validated.push(name);
+  }
+
+  return validated.length > 0 ? validated : undefined;
+}
+
 function highlightTerms(text: string, query: string): string {
   if (!useColor) return text;
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
@@ -1959,22 +1983,12 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-  const results = searchFTS(db, query, fetchLimit, collectionName as any);
+  const results = searchFTS(db, query, fetchLimit, collections);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2000,17 +2014,8 @@ function search(query: string, opts: OutputOptions): void {
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
@@ -2048,7 +2053,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     // are made. This is a known limitation of the LlamaEmbeddingContext.
     // See: https://github.com/tobi/qmd/pull/23
     for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, session);
+      const vecResults = await searchVec(db, q, model, perQueryLimit, collections, session);
       for (const r of vecResults) {
         const existing = allResults.get(r.filepath);
         if (!existing || r.score > existing.score) {
@@ -2130,23 +2135,14 @@ async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, 
 async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-    collectionName = opts.collection;
-  }
+  // Validate collection filter(s) — supports comma-separated names
+  const collections = resolveCollectionFilter(opts.collection);
 
   // Check index health and warn about issues
   checkIndexHealth(db);
 
   // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
+  const initialFts = searchFTS(db, query, 20, collections);
   let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
@@ -2199,7 +2195,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     for (const q of ftsQueries) {
       if (!q) continue;
       searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
+        const ftsResults = searchFTS(db, q, 20, collections);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) {
             // Mutex for hashMap is not strictly needed as it's just adding values
@@ -2215,7 +2211,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       for (const q of vectorQueries) {
         if (!q) continue;
         searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
+          const vecResults = await searchVec(db, q, embedModel, 20, collections, session);
           if (vecResults.length > 0) {
             for (const r of vecResults) hashMap.set(r.filepath, r.hash);
             rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));

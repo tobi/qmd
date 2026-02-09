@@ -622,8 +622,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collections?: string | string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collections?: string | string[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<string[]>;
@@ -705,8 +705,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchFTS: (query: string, limit?: number, collections?: string | string[]) => searchFTS(db, query, limit, collections),
+    searchVec: (query: string, model: string, limit?: number, collections?: string | string[]) => searchVec(db, query, model, limit, collections),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -1919,7 +1919,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collections?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1938,12 +1938,16 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+  if (collections) {
+    const collArray = Array.isArray(collections) ? collections : [collections];
+    if (collArray.length === 1 && collArray[0]) {
+      sql += ` AND d.collection = ?`;
+      params.push(collArray[0]);
+    } else if (collArray.length > 1) {
+      const valid = collArray.filter(Boolean);
+      sql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
+      params.push(...valid);
+    }
   }
 
   // bm25 lower is better; sort ascending.
@@ -1978,7 +1982,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2021,9 +2025,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+  if (collections) {
+    const collArray = Array.isArray(collections) ? collections : [collections];
+    if (collArray.length === 1 && collArray[0]) {
+      docSql += ` AND d.collection = ?`;
+      params.push(collArray[0]);
+    } else if (collArray.length > 1) {
+      const valid = collArray.filter(Boolean);
+      docSql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
+      params.push(...valid);
+    }
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
