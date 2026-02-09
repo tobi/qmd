@@ -321,11 +321,14 @@ describe("MCP Server", () => {
   // ===========================================================================
 
   describe("qmd_query tool", () => {
-    test("expands query with variations", async () => {
-      const queries = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
-      // Always returns at least the original query, may have more if generation succeeds
-      expect(queries.length).toBeGreaterThanOrEqual(1);
-      expect(queries[0]).toBe("api documentation");
+    test("expands query with typed variations", async () => {
+      const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
+      // Returns ExpandedQuery[] — typed expansions, original excluded
+      expect(expanded.length).toBeGreaterThanOrEqual(1);
+      for (const q of expanded) {
+        expect(['lex', 'vec', 'hyde']).toContain(q.type);
+        expect(q.text.length).toBeGreaterThan(0);
+      }
     }, 30000); // 30s timeout for model loading
 
     test("performs RRF fusion on multiple result lists", () => {
@@ -356,22 +359,33 @@ describe("MCP Server", () => {
     });
 
     test("full hybrid search pipeline", async () => {
-      // Simulate full qmd_query flow
+      // Simulate full qmd_query flow with type-routed queries
       const query = "meeting notes";
-      const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
+      const expanded = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
 
       const rankedLists: RankedResult[][] = [];
-      for (const q of queries) {
-        const ftsResults = searchFTS(testDb, q, 20);
-        if (ftsResults.length > 0) {
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath,
-            displayPath: r.displayPath,
-            title: r.title,
-            body: r.body || "",
-            score: r.score,
-          })));
+
+      // Original query → FTS (probe)
+      const probeFts = searchFTS(testDb, query, 20);
+      if (probeFts.length > 0) {
+        rankedLists.push(probeFts.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+      }
+
+      // Expanded queries → route by type: lex→FTS, vec/hyde skipped (no vectors in test)
+      for (const q of expanded) {
+        if (q.type === 'lex') {
+          const ftsResults = searchFTS(testDb, q.text, 20);
+          if (ftsResults.length > 0) {
+            rankedLists.push(ftsResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+          }
         }
+        // vec/hyde would go to searchVec — not available in this unit test
       }
 
       expect(rankedLists.length).toBeGreaterThan(0);

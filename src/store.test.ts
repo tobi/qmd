@@ -1893,27 +1893,32 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
-  test("expandQuery returns original plus expanded queries", async () => {
+  test("expandQuery returns typed expansions (no original query)", async () => {
     const store = await createTestStore();
 
-    const queries = await store.expandQuery("test query");
-    expect(queries).toContain("test query");
-    expect(queries[0]).toBe("test query");
-    // LlamaCpp returns original + variations
-    expect(queries.length).toBeGreaterThanOrEqual(1);
+    const expanded = await store.expandQuery("test query");
+    // Returns ExpandedQuery[] — typed results from LLM, excluding original
+    expect(expanded.length).toBeGreaterThanOrEqual(1);
+    for (const q of expanded) {
+      expect(['lex', 'vec', 'hyde']).toContain(q.type);
+      expect(q.text.length).toBeGreaterThan(0);
+      expect(q.text).not.toBe("test query"); // original excluded
+    }
 
     await cleanupTestDb(store);
   }, 30000);
 
-  test("expandQuery caches results", async () => {
+  test("expandQuery caches results as JSON with types", async () => {
     const store = await createTestStore();
 
-    // First call
+    // First call — hits LLM
     const queries1 = await store.expandQuery("cached query test");
-    // Second call - should hit cache
+    // Second call — hits cache
     const queries2 = await store.expandQuery("cached query test");
 
-    expect(queries1[0]).toBe(queries2[0]);
+    // Cache should preserve full typed structure
+    expect(queries1).toEqual(queries2);
+    expect(queries2[0]?.type).toBeDefined();
 
     await cleanupTestDb(store);
   }, 30000);

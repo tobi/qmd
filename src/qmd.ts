@@ -57,6 +57,7 @@ import {
   hybridQuery,
   vectorSearchQuery,
   addLineNumbers,
+  type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
@@ -1895,14 +1896,13 @@ function search(query: string, opts: OutputOptions): void {
 }
 
 // Log query expansion as a tree to stderr (CLI progress feedback)
-function logExpansionTree(originalQuery: string, queries: string[]): void {
+function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): void {
   const lines: string[] = [];
   lines.push(`${c.dim}├─ ${originalQuery}${c.reset}`);
-  for (const q of queries) {
-    if (q === originalQuery) continue;
-    let preview = q.replace(/\n/g, ' ');
-    if (preview.length > 80) preview = preview.substring(0, 77) + '...';
-    lines.push(`${c.dim}├─ ${preview}${c.reset}`);
+  for (const q of expanded) {
+    let preview = q.text.replace(/\n/g, ' ');
+    if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+    lines.push(`${c.dim}├─ ${q.type}: ${preview}${c.reset}`);
   }
   if (lines.length > 0) {
     lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
@@ -1930,9 +1930,9 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
-        onExpand: (queries) => {
-          logExpansionTree(query, queries);
-          process.stderr.write(`${c.dim}Searching ${queries.length} vector queries...${c.reset}\n`);
+        onExpand: (original, expanded) => {
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
         },
       },
     });
@@ -1979,9 +1979,9 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         onStrongSignal: (score) => {
           process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
         },
-        onExpand: (queries) => {
-          logExpansionTree(query, queries);
-          process.stderr.write(`${c.dim}Searching ${queries.length} queries...${c.reset}\n`);
+        onExpand: (original, expanded) => {
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
         },
         onRerankStart: (chunkCount) => {
           process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
