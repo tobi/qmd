@@ -550,7 +550,7 @@ export type HttpServerHandle = {
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
   const store = createStore();
   const mcpServer = createMcpServer(store);
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -559,6 +559,7 @@ export async function startMcpHttpServer(port: number): Promise<HttpServerHandle
   await mcpServer.connect(transport);
 
   const startTime = Date.now();
+  const quiet = options?.quiet ?? false;
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -583,6 +584,10 @@ export async function startMcpHttpServer(port: number): Promise<HttpServerHandle
     return method;
   }
 
+  function log(msg: string): void {
+    if (!quiet) console.error(msg);
+  }
+
   const httpServer = Bun.serve({
     port,
     hostname: "localhost",
@@ -595,7 +600,7 @@ export async function startMcpHttpServer(port: number): Promise<HttpServerHandle
           status: "ok",
           uptime: Math.floor((Date.now() - startTime) / 1000),
         });
-        console.error(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
         return res;
       }
 
@@ -603,7 +608,7 @@ export async function startMcpHttpServer(port: number): Promise<HttpServerHandle
         const body = await req.json();
         const label = describeRequest(body);
         const res = await transport.handleRequest(req, { parsedBody: body });
-        console.error(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
+        log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
         return res;
       }
 
@@ -639,7 +644,7 @@ export async function startMcpHttpServer(port: number): Promise<HttpServerHandle
     process.exit(0);
   });
 
-  console.error(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 

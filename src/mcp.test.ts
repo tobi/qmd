@@ -902,7 +902,7 @@ describe("MCP HTTP Transport", () => {
     process.env.INDEX_PATH = httpTestDbPath;
     process.env.QMD_CONFIG_DIR = httpTestConfigDir;
 
-    handle = await startMcpHttpServer(0); // OS-assigned ephemeral port
+    handle = await startMcpHttpServer(0, { quiet: true }); // OS-assigned ephemeral port
     baseUrl = `http://localhost:${handle.port}`;
   });
 
