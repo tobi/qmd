@@ -2,8 +2,7 @@
 import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
-import { readFileSync, statSync } from "fs";
-import * as sqliteVec from "sqlite-vec";
+import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
   getPwd,
   getRealPath,
@@ -11,7 +10,6 @@ import {
   resolve,
   enableProductionMode,
   searchFTS,
-  searchVec,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -30,8 +28,6 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
-  formatQueryForEmbedding,
-  chunkDocument,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -58,16 +54,18 @@ import {
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
+  hybridQuery,
+  vectorSearchQuery,
+  addLineNumbers,
+  type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
-import type { SearchResult, RankedResult } from "./store.js";
+import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -232,28 +230,6 @@ function computeDisplayPath(
   return filepath;
 }
 
-// Rerank documents using node-llama-cpp cross-encoder model
-async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
-  if (documents.length === 0) return [];
-
-  const total = documents.length;
-  process.stderr.write(`Reranking ${total} documents...\n`);
-  progress.indeterminate();
-
-  const rerankDocs: RerankDocument[] = documents.map((doc) => ({
-    file: doc.file,
-    text: doc.text.slice(0, 4000), // Truncate to context limit
-  }));
-
-  const result = session
-    ? await session.rerank(query, rerankDocs)
-    : await getDefaultLlamaCpp().rerank(query, rerankDocs);
-
-  progress.clear();
-  process.stderr.write("\n");
-
-  return result.results.map((r) => ({ file: r.file, score: r.score }));
-}
 
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -300,7 +276,24 @@ function showStatus(): void {
 
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
-  console.log(`Size:  ${formatBytes(indexSize)}\n`);
+  console.log(`Size:  ${formatBytes(indexSize)}`);
+
+  // MCP daemon status (check PID file liveness)
+  const mcpCacheDir = Bun.env.XDG_CACHE_HOME
+    ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
+  if (existsSync(mcpPidPath)) {
+    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
+    try {
+      process.kill(mcpPid, 0);
+      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+    } catch {
+      unlinkSync(mcpPidPath);
+      // Stale PID file cleaned up silently
+    }
+  }
+  console.log("");
 
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
@@ -1701,55 +1694,6 @@ function normalizeBM25(score: number): number {
   return 1 / (1 + Math.exp(-(absScore - 5) / 3));
 }
 
-function normalizeScores(results: SearchResult[]): SearchResult[] {
-  if (results.length === 0) return results;
-  const maxScore = Math.max(...results.map(r => r.score));
-  const minScore = Math.min(...results.map(r => r.score));
-  const range = maxScore - minScore || 1;
-  return results.map(r => ({ ...r, score: (r.score - minScore) / range }));
-}
-
-// Reciprocal Rank Fusion: combines multiple ranked lists
-// RRF score = sum(1 / (k + rank)) across all lists where doc appears
-// k=60 is standard, provides good balance between top and lower ranks
-
-function reciprocalRankFusion(
-  resultLists: RankedResult[][],
-  weights: number[] = [],  // Weight per result list (default 1.0)
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { score: number; displayPath: string; title: string; body: string; bestRank: number }>();
-
-  for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
-    const results = resultLists[listIdx];
-    if (!results) continue;
-    const weight = weights[listIdx] ?? 1.0;
-    for (let rank = 0; rank < results.length; rank++) {
-      const doc = results[rank];
-      if (!doc) continue; // Ensure doc is not undefined
-      const rrfScore = weight / (k + rank + 1);
-      const existing = scores.get(doc.file);
-      if (existing) {
-        existing.score += rrfScore;
-        existing.bestRank = Math.min(existing.bestRank, rank);
-      } else {
-        scores.set(doc.file, { score: rrfScore, displayPath: doc.displayPath, title: doc.title, body: doc.body, bestRank: rank });
-      }
-    }
-  }
-
-  // Add bonus for best rank: documents that ranked #1-3 in any list get a boost
-  // This prevents dilution of exact matches by expansion queries
-  return Array.from(scores.entries())
-    .map(([file, { score, displayPath, title, body, bestRank }]) => {
-      let bonus = 0;
-      if (bestRank === 0) bonus = 0.05;  // Ranked #1 somewhere
-      else if (bestRank <= 2) bonus = 0.02;  // Ranked top-3 somewhere
-      return { file, displayPath, title, body, score: score + bonus };
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
 type OutputOptions = {
   format: OutputFormat;
   full: boolean;
@@ -1789,12 +1733,6 @@ function shortPath(dirpath: string): string {
     return '~' + dirpath.slice(home.length);
   }
   return dirpath;
-}
-
-// Add line numbers to text content
-function addLineNumbers(text: string, startLine: number = 1): string {
-  const lines = text.split('\n');
-  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
 
 function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
@@ -1957,11 +1895,24 @@ function search(query: string, opts: OutputOptions): void {
   outputResults(resultsWithContext, query, opts);
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
-  const db = getDb();
+// Log query expansion as a tree to stderr (CLI progress feedback)
+function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): void {
+  const lines: string[] = [];
+  lines.push(`${c.dim}├─ ${originalQuery}${c.reset}`);
+  for (const q of expanded) {
+    let preview = q.text.replace(/\n/g, ' ');
+    if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+    lines.push(`${c.dim}├─ ${q.type}: ${preview}${c.reset}`);
+  }
+  if (lines.length > 0) {
+    lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
+  }
+  for (const line of lines) process.stderr.write(line + '\n');
+}
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
+async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+  const store = getStore();
+
   if (opts.collection) {
     const coll = getCollectionFromYaml(opts.collection);
     if (!coll) {
@@ -1969,59 +1920,22 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
       closeDb();
       process.exit(1);
     }
-    collectionName = opts.collection;
   }
 
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) {
-    console.error("Vector index not found. Run 'qmd embed' first to create embeddings.");
-    closeDb();
-    return;
-  }
+  checkIndexHealth(store.db);
 
-  // Check index health and warn about issues
-  checkIndexHealth(db);
-
-  // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
-    // Expand query using structured output (no lexical for vector-only search)
-    const queryables = await expandQueryStructured(query, false, opts.context, session);
-
-    // Build list of queries for vector search: original, vec, and hyde
-    const vectorQueries: string[] = [query];
-    for (const q of queryables) {
-      if (q.type === 'vec' || q.type === 'hyde') {
-        if (q.text && q.text !== query) {
-          vectorQueries.push(q.text);
-        }
-      }
-    }
-
-    process.stderr.write(`${c.dim}Searching ${vectorQueries.length} vector queries...${c.reset}\n`);
-
-    // Collect results from all query variations
-    const perQueryLimit = opts.all ? 500 : 20;
-    const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
-
-    // IMPORTANT: Run vector searches sequentially, not with Promise.all.
-    // node-llama-cpp's embedding context hangs when multiple concurrent embed() calls
-    // are made. This is a known limitation of the LlamaEmbeddingContext.
-    // See: https://github.com/tobi/qmd/pull/23
-    for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, session);
-      for (const r of vecResults) {
-        const existing = allResults.get(r.filepath);
-        if (!existing || r.score > existing.score) {
-          allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
-        }
-      }
-    }
-
-    // Sort by max score and limit to requested count
-    const results = Array.from(allResults.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, opts.limit)
-      .map(r => ({ ...r, context: getContextForFile(db, r.file) }));
+  await withLLMSession(async () => {
+    const results = await vectorSearchQuery(store, query, {
+      collection: opts.collection,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0.3,
+      hooks: {
+        onExpand: (original, expanded) => {
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
+        },
+      },
+    });
 
     closeDb();
 
@@ -2029,62 +1943,22 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
       console.log("No results found.");
       return;
     }
-    outputResults(results, query, { ...opts, limit: results.length }); // Already limited
+
+    outputResults(results.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+    })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
-// Expand query using structured output with GBNF grammar
-async function expandQueryStructured(query: string, includeLexical: boolean = true, context?: string, session?: ILLMSession): Promise<Queryable[]> {
-  process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
+async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+  const store = getStore();
 
-  const queryables = session
-    ? await session.expandQuery(query, { includeLexical, context })
-    : await getDefaultLlamaCpp().expandQuery(query, { includeLexical, context });
-
-  // Log the expansion as a tree
-  const lines: string[] = [];
-  const bothLabel = includeLexical ? ' · (lexical+vector)' : ' · (vector)';
-  lines.push(`${c.dim}├─ ${query}${bothLabel}${c.reset}`);
-
-  for (let i = 0; i < queryables.length; i++) {
-    const q = queryables[i];
-    if (!q || q.text === query) continue;
-
-    let textPreview = q.text.replace(/\n/g, ' ');
-    if (textPreview.length > 80) {
-      textPreview = textPreview.substring(0, 77) + '...';
-    }
-
-    const label = q.type === 'lex' ? 'lexical' : (q.type === 'hyde' ? 'hyde' : 'vector');
-    lines.push(`${c.dim}├─ ${textPreview} · (${label})${c.reset}`);
-  }
-
-  // Fix last item to use └─ instead of ├─
-  if (lines.length > 0) {
-    lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
-  }
-
-  for (const line of lines) {
-    process.stderr.write(line + '\n');
-  }
-
-  return queryables;
-}
-
-async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database, session?: ILLMSession): Promise<string[]> {
-  const queryables = await expandQueryStructured(query, true, undefined, session);
-  const queries = new Set<string>([query]);
-  for (const q of queryables) {
-    queries.add(q.text);
-  }
-  return Array.from(queries);
-}
-
-async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
-  const db = getDb();
-
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
   if (opts.collection) {
     const coll = getCollectionFromYaml(opts.collection);
     if (!coll) {
@@ -2092,198 +1966,51 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       closeDb();
       process.exit(1);
     }
-    collectionName = opts.collection;
   }
 
-  // Check index health and warn about issues
-  checkIndexHealth(db);
+  checkIndexHealth(store.db);
 
-  // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
-  let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-
-  // Check if initial results have strong signals (skip expansion if so)
-  // Strong signal = top result is strong AND clearly separated from runner-up.
-  // This avoids skipping expansion when BM25 has lots of mediocre matches.
-  const topScore = initialFts[0]?.score ?? 0;
-  const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0 && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
-
-  // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
-    let ftsQueries: string[] = [query];
-    let vectorQueries: string[] = [query];
-
-    if (hasStrongSignal) {
-      // Strong BM25 signal - skip expensive LLM expansion
-      process.stderr.write(`${c.dim}Strong BM25 signal (${topScore.toFixed(2)}) - skipping expansion${c.reset}\n`);
-      // Still log the "expansion tree" in the same style as vsearch for consistency.
-      {
-        const lines: string[] = [];
-        lines.push(`${c.dim}├─ ${query} · (lexical+vector)${c.reset}`);
-        lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
-        for (const line of lines) process.stderr.write(line + '\n');
-      }
-    } else {
-      // Weak signal - expand query for better recall
-      const queryables = await expandQueryStructured(query, true, opts.context, session);
-
-      for (const q of queryables) {
-        if (q.type === 'lex') {
-          if (q.text && q.text !== query) ftsQueries.push(q.text);
-        } else if (q.type === 'vec' || q.type === 'hyde') {
-          if (q.text && q.text !== query) vectorQueries.push(q.text);
-        }
-      }
-    }
-
-    process.stderr.write(`${c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${c.reset}\n`);
-
-    // Collect ranked result lists for RRF fusion
-    const rankedLists: RankedResult[][] = [];
-
-    // Map to store hash by filepath for final results
-    const hashMap = new Map<string, string>();
-
-    // Run all searches concurrently (FTS + Vector)
-    const searchPromises: Promise<void>[] = [];
-
-    // FTS searches
-    for (const q of ftsQueries) {
-      if (!q) continue;
-      searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) {
-            // Mutex for hashMap is not strictly needed as it's just adding values
-            hashMap.set(r.filepath, r.hash);
-          }
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-      })());
-    }
-
-    // Vector searches (session ensures contexts stay alive)
-    if (hasVectors) {
-      for (const q of vectorQueries) {
-        if (!q) continue;
-        searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        })());
-      }
-    }
-
-    await Promise.all(searchPromises);
-
-    // Apply Reciprocal Rank Fusion to combine all ranked lists
-    // Give 2x weight to original query results (first 2 lists: FTS + vector)
-    const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-    const fused = reciprocalRankFusion(rankedLists, weights);
-    // Hard cap reranking for latency/cost. We rerank per-document (best chunk only).
-    const RERANK_DOC_LIMIT = 40;
-    const candidates = fused.slice(0, RERANK_DOC_LIMIT);
-
-    if (candidates.length === 0) {
-      console.log("No results found.");
-      closeDb();
-      return;
-    }
-
-    // Rerank multiple chunks per document, then aggregate scores
-    // This improves ranking for long documents where keyword-matched chunk isn't always best
-    // We only rerank ONE chunk per document (best chunk by a simple keyword heuristic),
-    // so we never rerank more than RERANK_DOC_LIMIT items.
-    const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
-    const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    for (const cand of candidates) {
-      const chunks = chunkDocument(cand.body);
-      if (chunks.length === 0) continue;
-
-      // Choose best chunk by keyword matches; fall back to first chunk.
-      let bestIdx = 0;
-      let bestScore = -1;
-      for (let i = 0; i < chunks.length; i++) {
-        const chunkLower = chunks[i]!.text.toLowerCase();
-        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-        if (score > bestScore) {
-          bestScore = score;
-          bestIdx = i;
-        }
-      }
-
-      chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text, chunkIdx: bestIdx });
-      docChunkMap.set(cand.file, { chunks, bestIdx });
-    }
-
-    // Rerank selected chunks (with caching). One chunk per doc -> one rerank item per doc.
-    const reranked = await rerank(
-      query,
-      chunksToRerank.map(ch => ({ file: ch.file, text: ch.text })),
-      rerankModel,
-      db,
-      session
-    );
-
-    const aggregatedScores = new Map<string, { score: number; bestChunkIdx: number }>();
-    for (const r of reranked) {
-      const chunkInfo = docChunkMap.get(r.file);
-      aggregatedScores.set(r.file, { score: r.score, bestChunkIdx: chunkInfo?.bestIdx ?? 0 });
-    }
-
-    // Blend RRF position score with aggregated reranker score using position-aware weights
-    // Top retrieval results get more protection from reranker disagreement
-    const candidateMap = new Map(candidates.map(cand => [cand.file, { displayPath: cand.displayPath, title: cand.title, body: cand.body }]));
-    const rrfRankMap = new Map(candidates.map((cand, i) => [cand.file, i + 1])); // 1-indexed rank
-
-    const finalResults = Array.from(aggregatedScores.entries()).map(([file, { score: rerankScore, bestChunkIdx }]) => {
-      const rrfRank = rrfRankMap.get(file) || 30;
-      // Position-aware blending: top retrieval results preserved more
-      // Rank 1-3: 75% RRF, 25% reranker (trust retrieval for exact matches)
-      // Rank 4-10: 60% RRF, 40% reranker
-      // Rank 11+: 40% RRF, 60% reranker (trust reranker for lower-ranked)
-      let rrfWeight: number;
-      if (rrfRank <= 3) {
-        rrfWeight = 0.75;
-      } else if (rrfRank <= 10) {
-        rrfWeight = 0.60;
-      } else {
-        rrfWeight = 0.40;
-      }
-      const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
-      const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
-      const candidate = candidateMap.get(file);
-      // Use the best-scoring chunk's text for the body (better for snippets)
-      const chunkInfo = docChunkMap.get(file);
-      const chunkBody = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0]!.text) : candidate?.body || "";
-      const chunkPos = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.pos || 0) : 0;
-      return {
-        file,
-        displayPath: candidate?.displayPath || "",
-        title: candidate?.title || "",
-        body: chunkBody,
-        chunkPos,
-        score: blendedScore,
-        context: getContextForFile(db, file),
-        hash: hashMap.get(file) || "",
-      };
-    }).sort((a, b) => b.score - a.score);
-
-    // Deduplicate by file (safety net - shouldn't happen but prevents duplicate output)
-    const seenFiles = new Set<string>();
-    const dedupedResults = finalResults.filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
+  await withLLMSession(async () => {
+    const results = await hybridQuery(store, query, {
+      collection: opts.collection,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0,
+      hooks: {
+        onStrongSignal: (score) => {
+          process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+        },
+        onExpand: (original, expanded) => {
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+        },
+        onRerankStart: (chunkCount) => {
+          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+          progress.indeterminate();
+        },
+        onRerankDone: () => {
+          progress.clear();
+        },
+      },
     });
 
     closeDb();
-    outputResults(dedupedResults, query, opts);
+
+    if (results.length === 0) {
+      console.log("No results found.");
+      return;
+    }
+
+    // Map to CLI output format — use bestChunk for snippet display
+    outputResults(results.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.bestChunk,
+      chunkPos: r.bestChunkPos,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+    })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
@@ -2327,6 +2054,10 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // MCP HTTP transport options
+      http: { type: "boolean" },
+      daemon: { type: "boolean" },
+      port: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2390,7 +2121,10 @@ function showHelp(): void {
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
-  console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
+  console.log("  qmd mcp                       - Start MCP server (stdio transport)");
+  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
+  console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
+  console.log("  qmd mcp stop                  - Stop background MCP daemon");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2651,8 +2385,85 @@ if (import.meta.main) {
       break;
 
     case "mcp": {
-      const { startMcpServer } = await import("./mcp.js");
-      await startMcpServer();
+      const sub = cli.args[0]; // stop | status | undefined
+
+      // Cache dir for PID/log files — same dir as the index
+      const cacheDir = Bun.env.XDG_CACHE_HOME
+        ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
+        : resolve(homedir(), ".cache", "qmd");
+      const pidPath = resolve(cacheDir, "mcp.pid");
+
+      // Subcommands take priority over flags
+      if (sub === "stop") {
+        if (!existsSync(pidPath)) {
+          console.log("Not running (no PID file).");
+          process.exit(0);
+        }
+        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
+        try {
+          process.kill(pid, 0); // alive?
+          process.kill(pid, "SIGTERM");
+          unlinkSync(pidPath);
+          console.log(`Stopped QMD MCP server (PID ${pid}).`);
+        } catch {
+          unlinkSync(pidPath);
+          console.log("Cleaned up stale PID file (server was not running).");
+        }
+        process.exit(0);
+      }
+
+      if (cli.values.http) {
+        const port = Number(cli.values.port) || 8181;
+
+        if (cli.values.daemon) {
+          // Guard: check if already running
+          if (existsSync(pidPath)) {
+            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
+            try {
+              process.kill(existingPid, 0); // alive?
+              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
+              process.exit(1);
+            } catch {
+              // Stale PID file — continue
+            }
+          }
+
+          mkdirSync(cacheDir, { recursive: true });
+          const logPath = resolve(cacheDir, "mcp.log");
+          const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
+          const child = Bun.spawn([process.execPath, import.meta.path, "mcp", "--http", "--port", String(port)], {
+            stdout: logFd,
+            stderr: logFd,
+            stdin: "ignore",
+          });
+          child.unref();
+          closeSync(logFd); // parent's copy; child inherited the fd
+
+          writeFileSync(pidPath, String(child.pid));
+          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Logs: ${logPath}`);
+          process.exit(0);
+        }
+
+        // Foreground HTTP mode — remove top-level cursor handlers so the
+        // async cleanup handlers in startMcpHttpServer actually run.
+        process.removeAllListeners("SIGTERM");
+        process.removeAllListeners("SIGINT");
+        const { startMcpHttpServer } = await import("./mcp.js");
+        try {
+          await startMcpHttpServer(port);
+        } catch (e: any) {
+          if (e?.code === "EADDRINUSE") {
+            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            process.exit(1);
+          }
+          throw e;
+        }
+      } else {
+        // Default: stdio transport
+        const { startMcpServer } = await import("./mcp.js");
+        await startMcpServer();
+      }
       break;
     }
 

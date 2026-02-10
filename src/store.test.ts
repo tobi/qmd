@@ -35,6 +35,8 @@ import {
   parseVirtualPath,
   normalizeDocid,
   isDocid,
+  STRONG_SIGNAL_MIN_SCORE,
+  STRONG_SIGNAL_MIN_GAP,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -908,6 +910,96 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  // BM25 IDF requires corpus depth — helper adds non-matching docs so term frequency
+  // differentiation produces meaningful scores (2-doc corpus has near-zero IDF).
+  async function addNoiseDocuments(db: Database, collectionName: string, count = 8) {
+    for (let i = 0; i < count; i++) {
+      await insertTestDocument(db, collectionName, {
+        name: `noise${i}`,
+        title: `Unrelated Topic ${i}`,
+        body: `This document discusses completely different subjects like gardening and cooking ${i}`,
+        displayPath: `test/noise${i}.md`,
+      });
+    }
+  }
+
+  test("searchFTS scores: stronger BM25 match → higher normalized score", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await addNoiseDocuments(store.db, collectionName);
+
+    // "alpha" appears in title (10x weight) + body → strong BM25
+    await insertTestDocument(store.db, collectionName, {
+      name: "strong",
+      title: "Alpha Guide",
+      body: "This is the definitive alpha reference with alpha details and more alpha info",
+      displayPath: "test/strong.md",
+    });
+
+    // "alpha" appears once in body only → weaker BM25
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "General Notes",
+      body: "Some notes that mention alpha in passing among other topics and keywords",
+      displayPath: "test/weak.md",
+    });
+
+    const results = store.searchFTS("alpha", 10);
+    expect(results.length).toBe(2);
+
+    // Verify score direction: stronger match (title + body) should score HIGHER
+    const strongResult = results.find(r => r.displayPath.includes("strong"))!;
+    const weakResult = results.find(r => r.displayPath.includes("weak"))!;
+    expect(strongResult.score).toBeGreaterThan(weakResult.score);
+
+    // Verify scores are in valid (0, 1) range
+    for (const r of results) {
+      expect(r.score).toBeGreaterThan(0);
+      expect(r.score).toBeLessThan(1);
+    }
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS scores: minScore filter keeps strong matches, drops weak", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await addNoiseDocuments(store.db, collectionName);
+
+    // Strong match: keyword in title (10x weight) + repeated in body
+    await insertTestDocument(store.db, collectionName, {
+      name: "strong",
+      title: "Kubernetes Deployment",
+      body: "Kubernetes deployment strategies for kubernetes clusters using kubernetes operators",
+      displayPath: "test/strong.md",
+    });
+
+    // Weak match: keyword appears once in body only
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "Random Notes",
+      body: "Various topics including a brief kubernetes mention among many other unrelated things",
+      displayPath: "test/weak.md",
+    });
+
+    const allResults = store.searchFTS("kubernetes", 10);
+    expect(allResults.length).toBe(2);
+
+    // With a minScore threshold, strong match should survive, weak should be filterable
+    const strongScore = allResults.find(r => r.displayPath.includes("strong"))!.score;
+    const weakScore = allResults.find(r => r.displayPath.includes("weak"))!.score;
+
+    // Find a threshold between them
+    const threshold = (strongScore + weakScore) / 2;
+    const filtered = allResults.filter(r => r.score >= threshold);
+
+    // Strong match survives the filter, weak does not
+    expect(filtered.length).toBe(1);
+    expect(filtered[0]!.displayPath).toContain("strong");
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS ignores inactive documents", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -930,6 +1022,53 @@ describe("FTS Search", () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/test/active.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/active.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS scores: strong signal detection works with correct normalization", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // BM25 IDF needs meaningful corpus depth for strong signal to fire.
+    // 50 noise docs give IDF ≈ log(50/2) ≈ 3.2 — enough for scores above 0.85.
+    await addNoiseDocuments(store.db, collectionName, 50);
+
+    // Dominant: keyword in filepath (10x BM25 weight column) + title + body
+    await insertTestDocument(store.db, collectionName, {
+      name: "dominant",
+      title: "Zephyr Configuration Guide",
+      body: "Complete zephyr configuration guide. Zephyr setup instructions for zephyr deployment.",
+      displayPath: "zephyr/zephyr-guide.md",
+    });
+
+    // Weak: keyword once in body only, longer doc dilutes TF
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "General Notes",
+      body: "Various topics covering many areas of technology and design. " +
+        "One of them might relate to zephyr but mostly about other things entirely. " +
+        "Additional content about databases, networking, security, performance, " +
+        "monitoring, deployment, testing, and documentation practices.",
+      displayPath: "notes/misc.md",
+    });
+
+    const results = store.searchFTS("zephyr", 10);
+    expect(results.length).toBe(2);
+
+    const topScore = results[0]!.score;
+    const secondScore = results[1]!.score;
+
+    // With correct normalization: strong match should be well above threshold
+    expect(topScore).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_SCORE);
+
+    // Gap should exceed threshold when there's a dominant match
+    const gap = topScore - secondScore;
+    expect(gap).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_GAP);
+
+    // Full strong signal check should pass (this was dead code before the fix)
+    const hasStrongSignal = topScore >= STRONG_SIGNAL_MIN_SCORE && gap >= STRONG_SIGNAL_MIN_GAP;
+    expect(hasStrongSignal).toBe(true);
 
     await cleanupTestDb(store);
   });
@@ -1893,27 +2032,32 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
-  test("expandQuery returns original plus expanded queries", async () => {
+  test("expandQuery returns typed expansions (no original query)", async () => {
     const store = await createTestStore();
 
-    const queries = await store.expandQuery("test query");
-    expect(queries).toContain("test query");
-    expect(queries[0]).toBe("test query");
-    // LlamaCpp returns original + variations
-    expect(queries.length).toBeGreaterThanOrEqual(1);
+    const expanded = await store.expandQuery("test query");
+    // Returns ExpandedQuery[] — typed results from LLM, excluding original
+    expect(expanded.length).toBeGreaterThanOrEqual(1);
+    for (const q of expanded) {
+      expect(['lex', 'vec', 'hyde']).toContain(q.type);
+      expect(q.text.length).toBeGreaterThan(0);
+      expect(q.text).not.toBe("test query"); // original excluded
+    }
 
     await cleanupTestDb(store);
   }, 30000);
 
-  test("expandQuery caches results", async () => {
+  test("expandQuery caches results as JSON with types", async () => {
     const store = await createTestStore();
 
-    // First call
+    // First call — hits LLM
     const queries1 = await store.expandQuery("cached query test");
-    // Second call - should hit cache
+    // Second call — hits cache
     const queries2 = await store.expandQuery("cached query test");
 
-    expect(queries1[0]).toBe(queries2[0]);
+    // Cache should preserve full typed structure
+    expect(queries1).toEqual(queries2);
+    expect(queries2[0]?.type).toBeDefined();
 
     await cleanupTestDb(store);
   }, 30000);

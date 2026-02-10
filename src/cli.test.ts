@@ -961,3 +961,239 @@ describe("status and collection list hide filesystem paths", () => {
     expect(stdout).not.toMatch(/Path:\s+\//);
   });
 });
+
+// =============================================================================
+// MCP HTTP Daemon Lifecycle
+// =============================================================================
+
+describe("mcp http daemon", () => {
+  let daemonTestDir: string;
+  let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
+  let daemonDbPath: string;
+  let daemonConfigDir: string;
+
+  // Track spawned PIDs for cleanup
+  const spawnedPids: number[] = [];
+
+  /** Get path to PID file inside the test cache dir */
+  function pidPath(): string {
+    return join(daemonCacheDir, "qmd", "mcp.pid");
+  }
+
+  /** Run qmd with test-isolated env (cache, db, config) */
+  async function runDaemonQmd(
+    args: string[],
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    return runQmd(args, {
+      dbPath: daemonDbPath,
+      configDir: daemonConfigDir,
+      env: { XDG_CACHE_HOME: daemonCacheDir },
+    });
+  }
+
+  /** Spawn a foreground HTTP server (non-blocking) and return the process */
+  function spawnHttpServer(port: number): ReturnType<typeof Bun.spawn> {
+    const proc = Bun.spawn(["bun", qmdScript, "mcp", "--http", "--port", String(port)], {
+      cwd: fixturesDir,
+      env: {
+        ...process.env,
+        INDEX_PATH: daemonDbPath,
+        QMD_CONFIG_DIR: daemonConfigDir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    spawnedPids.push(proc.pid);
+    return proc;
+  }
+
+  /** Wait for HTTP server to become ready */
+  async function waitForServer(port: number, timeoutMs = 5000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`http://localhost:${port}/health`);
+        if (res.ok) return true;
+      } catch { /* not ready yet */ }
+      await Bun.sleep(200);
+    }
+    return false;
+  }
+
+  /** Pick a random high port unlikely to conflict */
+  function randomPort(): number {
+    return 10000 + Math.floor(Math.random() * 50000);
+  }
+
+  beforeAll(async () => {
+    daemonTestDir = await mkdtemp(join(tmpdir(), "qmd-daemon-test-"));
+    daemonCacheDir = join(daemonTestDir, "cache");
+    daemonDbPath = join(daemonTestDir, "test.sqlite");
+    daemonConfigDir = join(daemonTestDir, "config");
+
+    await mkdir(join(daemonCacheDir, "qmd"), { recursive: true });
+    await mkdir(daemonConfigDir, { recursive: true });
+    await writeFile(join(daemonConfigDir, "index.yml"), "collections: {}\n");
+  });
+
+  afterAll(async () => {
+    // Kill any leftover spawned processes
+    for (const pid of spawnedPids) {
+      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+    }
+    // Also clean up via PID file if present
+    try {
+      const { readFileSync, existsSync, unlinkSync } = require("fs");
+      const pf = pidPath();
+      if (existsSync(pf)) {
+        const pid = parseInt(readFileSync(pf, "utf-8").trim());
+        try { process.kill(pid, "SIGTERM"); } catch {}
+        unlinkSync(pf);
+      }
+    } catch {}
+
+    await rm(daemonTestDir, { recursive: true, force: true });
+  });
+
+  // -------------------------------------------------------------------------
+  // Foreground HTTP
+  // -------------------------------------------------------------------------
+
+  test("foreground HTTP server starts and responds to health check", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port);
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://localhost:${port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("ok");
+    } finally {
+      proc.kill("SIGTERM");
+      await proc.exited;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Daemon lifecycle
+  // -------------------------------------------------------------------------
+
+  test("--daemon writes PID file and starts server", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+    // PID file should exist
+    const { existsSync, readFileSync } = require("fs");
+    expect(existsSync(pidPath())).toBe(true);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    // Server should be reachable
+    const ready = await waitForServer(port);
+    expect(ready).toBe(true);
+
+    // Clean up
+    process.kill(pid, "SIGTERM");
+    await Bun.sleep(500);
+    try { require("fs").unlinkSync(pidPath()); } catch {}
+  });
+
+  test("stop kills daemon and removes PID file", async () => {
+    const port = randomPort();
+    // Start daemon
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+
+    const { readFileSync } = require("fs");
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    await waitForServer(port);
+
+    // Stop it
+    const { stdout: stopOut, exitCode: stopCode } = await runDaemonQmd(["mcp", "stop"]);
+    expect(stopCode).toBe(0);
+    expect(stopOut).toContain("Stopped");
+
+    // PID file should be gone
+    expect(require("fs").existsSync(pidPath())).toBe(false);
+
+    // Process should be dead
+    await Bun.sleep(500);
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  test("stop handles dead PID gracefully (cleans stale file)", async () => {
+    // Write a PID file pointing to a dead process
+    const { writeFileSync } = require("fs");
+    writeFileSync(pidPath(), "999999999");
+
+    const { stdout, exitCode } = await runDaemonQmd(["mcp", "stop"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("stale");
+
+    // PID file should be cleaned up
+    expect(require("fs").existsSync(pidPath())).toBe(false);
+  });
+
+  test("--daemon rejects if already running", async () => {
+    const port = randomPort();
+    // Start first daemon
+    const { exitCode: firstCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(firstCode).toBe(0);
+
+    const { readFileSync } = require("fs");
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    await waitForServer(port);
+
+    // Try to start second daemon — should fail
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port + 1),
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Already running");
+
+    // Clean up first daemon
+    process.kill(pid, "SIGTERM");
+    await Bun.sleep(500);
+    try { require("fs").unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--daemon cleans stale PID file and starts fresh", async () => {
+    // Write a stale PID file
+    const { writeFileSync, readFileSync } = require("fs");
+    writeFileSync(pidPath(), "999999999");
+
+    const port = randomPort();
+    const { exitCode, stdout } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    expect(pid).not.toBe(999999999);
+
+    // Clean up
+    const ready = await waitForServer(port);
+    expect(ready).toBe(true);
+    process.kill(pid, "SIGTERM");
+    await Bun.sleep(500);
+    try { require("fs").unlinkSync(pidPath()); } catch {}
+  });
+});

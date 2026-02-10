@@ -47,7 +47,7 @@ Fast BM25 keyword search.
 - `limit` (optional): Number of results (default: 5)
 - `minScore` (optional): Minimum relevance score
 
-### qmd_vsearch
+### qmd_vector_search
 Semantic vector search for conceptual similarity.
 
 **Parameters:**
@@ -56,7 +56,7 @@ Semantic vector search for conceptual similarity.
 - `limit` (optional): Number of results (default: 5)
 - `minScore` (optional): Minimum relevance score
 
-### qmd_query
+### qmd_deep_search
 Hybrid search combining BM25, vector search, and LLM re-ranking.
 
 **Parameters:**
@@ -98,7 +98,7 @@ Get index health and collection information.
 - Ensure embeddings are generated: `qmd embed`
 
 ### Slow searches
-- For faster results, use `qmd_search` instead of `qmd_query`
+- For faster results, use `qmd_search` instead of `qmd_deep_search`
 - The first search may be slow while models load (~3GB)
 - Subsequent searches are much faster
 

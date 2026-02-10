@@ -65,8 +65,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 
 **Tools exposed:**
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vsearch` - Semantic vector search (supports collection filter)
-- `qmd_query` - Hybrid search with reranking (supports collection filter)
+- `qmd_vector_search` - Semantic vector search (supports collection filter)
+- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
 - `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
@@ -103,6 +103,29 @@ Or configure MCP manually in `~/.claude/settings.json`:
   }
 }
 ```
+
+#### HTTP Transport
+
+By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:
+
+```sh
+# Foreground (Ctrl-C to stop)
+qmd mcp --http                    # localhost:8181
+qmd mcp --http --port 8080        # custom port
+
+# Background daemon
+qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
+qmd mcp stop                      # stop via PID file
+qmd status                        # shows "MCP: running (PID ...)" when active
+```
+
+The HTTP server exposes two endpoints:
+- `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `GET /health` — liveness check with uptime
+
+LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+
+Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 ## Architecture
 
