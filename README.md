@@ -65,8 +65,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 
 **Tools exposed:**
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vsearch` - Semantic vector search (supports collection filter)
-- `qmd_query` - Hybrid search with reranking (supports collection filter)
+- `qmd_vector_search` - Semantic vector search (supports collection filter)
+- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
 - `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info

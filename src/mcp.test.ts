@@ -291,10 +291,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_vsearch (Vector)
+  // Tool: qmd_vector_search (Vector)
   // ===========================================================================
 
-  describe("qmd_vsearch tool", () => {
+  describe("qmd_vector_search tool", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -317,10 +317,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_query (Hybrid)
+  // Tool: qmd_deep_search (Deep search)
   // ===========================================================================
 
-  describe("qmd_query tool", () => {
+  describe("qmd_deep_search tool", () => {
     test("expands query with typed variations", async () => {
       const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Returns ExpandedQuery[] — typed expansions, original excluded
@@ -359,7 +359,7 @@ describe("MCP Server", () => {
     });
 
     test("full hybrid search pipeline", async () => {
-      // Simulate full qmd_query flow with type-routed queries
+      // Simulate full qmd_deep_search flow with type-routed queries
       const query = "meeting notes";
       const expanded = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
 
@@ -731,47 +731,6 @@ describe("MCP Server", () => {
       expect(doc).not.toBeNull();
       expect(doc?.display_path).toBe("External Podcast/2023 April - Interview.md");
       expect(doc?.body).toContain("Podcast Episode");
-    });
-  });
-
-  // ===========================================================================
-  // Prompt: query
-  // ===========================================================================
-
-  describe("query prompt", () => {
-    test("returns usage guide", () => {
-      // The prompt content is static, just verify the structure
-      const promptContent = `# QMD - Quick Markdown Search
-
-QMD is your on-device search engine for markdown knowledge bases.`;
-
-      expect(promptContent).toContain("QMD");
-      expect(promptContent).toContain("search");
-    });
-
-    test("describes all available tools", () => {
-      const toolNames = [
-        "qmd_search",
-        "qmd_vsearch",
-        "qmd_query",
-        "qmd_get",
-        "qmd_multi_get",
-        "qmd_status",
-      ];
-
-      // Verify these are documented in the prompt
-      const promptGuide = `
-### 1. qmd_search (Fast keyword search)
-### 2. qmd_vsearch (Semantic search)
-### 3. qmd_query (Hybrid search - highest quality)
-### 4. qmd_get (Retrieve document)
-### 5. qmd_multi_get (Retrieve multiple documents)
-### 6. qmd_status (Index info)
-      `;
-
-      for (const tool of toolNames) {
-        expect(promptGuide).toContain(tool);
-      }
     });
   });
 

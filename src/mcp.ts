@@ -120,10 +120,10 @@ function buildInstructions(store: Store): string {
   // --- When to use which tool (escalation ladder) ---
   // Tool schemas describe parameters; instructions describe strategy.
   lines.push("");
-  lines.push("Search (escalate as needed):");
-  lines.push("  1. `search` — keyword lookup (~30ms). Start here.");
-  lines.push("  2. `vsearch` — semantic search (~2s). For conceptual/\"how do I\" queries or when keywords don't match.");
-  lines.push("  3. `query` — highest quality (~10s). Keyword + semantic + LLM reranking.");
+  lines.push("Search:");
+  lines.push("  - `search` (~30ms) — keyword and exact phrase matching.");
+  lines.push("  - `vector_search` (~2s) — meaning-based, finds adjacent concepts even when vocabulary differs.");
+  lines.push("  - `deep_search` (~10s) — auto-expands the query into variations, searches each by keyword and meaning, reranks for top hits.");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -220,100 +220,14 @@ function createMcpServer(store: Store): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // Prompt: query guide
-  // ---------------------------------------------------------------------------
-
-  server.registerPrompt(
-    "query",
-    {
-      title: "QMD Query Guide",
-      description: "How to effectively search your knowledge base with QMD",
-    },
-    () => ({
-      messages: [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text: `# QMD - Quick Markdown Search
-
-QMD is your on-device search engine for markdown knowledge bases. Use it to find information across your notes, documents, and meeting transcripts.
-
-## Available Tools
-
-### 1. search (Fast keyword search)
-Best for: Finding documents with specific keywords or phrases.
-- Uses BM25 full-text search
-- Fast, no LLM required
-- Good for exact matches
-- Use \`collection\` parameter to filter to a specific collection
-
-### 2. vsearch (Semantic search)
-Best for: Finding conceptually related content even without exact keyword matches.
-- Uses vector embeddings
-- Understands meaning and context
-- Good for "how do I..." or conceptual queries
-- Use \`collection\` parameter to filter to a specific collection
-
-### 3. query (Hybrid search - highest quality)
-Best for: Important searches where you want the best results.
-- Combines keyword + semantic search
-- Expands your query with variations
-- Re-ranks results with LLM
-- Slower but most accurate
-- Use \`collection\` parameter to filter to a specific collection
-
-### 4. get (Retrieve document)
-Best for: Getting the full content of a single document you found.
-- Use the file path from search results
-- Supports line ranges: \`file.md:100\` or fromLine/maxLines parameters
-- Suggests similar files if not found
-
-### 5. multi_get (Retrieve multiple documents)
-Best for: Getting content from multiple files at once.
-- Use glob patterns: \`journals/2025-05*.md\`
-- Or comma-separated: \`file1.md, file2.md\`
-- Skips files over maxBytes (default 10KB) - use get for large files
-
-### 6. status (Index info)
-Shows collection info, document counts, and embedding status.
-
-## Resources
-
-You can also access documents directly via the \`qmd://\` URI scheme:
-- List all documents: \`resources/list\`
-- Read a document: \`resources/read\` with uri \`qmd://path/to/file.md\`
-
-## Search Strategy
-
-1. **Start with search** for quick keyword lookups
-2. **Use vsearch** when keywords aren't working or for conceptual queries
-3. **Use query** for important searches or when you need high confidence
-4. **Use get** to retrieve a single full document
-5. **Use multi_get** to batch retrieve multiple related files
-
-## Tips
-
-- Use \`minScore: 0.5\` to filter low-relevance results
-- Use \`collection: "notes"\` to search only in a specific collection
-- Check the "Context" field - it describes what kind of content the file contains
-- File paths are relative to their collection (e.g., \`pages/meeting.md\`)
-- For glob patterns, match on display_path (e.g., \`journals/2025-*.md\`)`,
-          },
-        },
-      ],
-    })
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_search (BM25 full-text)
+  // Tool: qmd_search (keyword)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
     "search",
     {
-      title: "Search (BM25)",
-      description: "Fast keyword-based full-text search using BM25. Best for finding documents with specific words or phrases.",
+      title: "Keyword Search",
+      description: "Search by keyword. Finds documents containing exact words and phrases in the query.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Search query - keywords or phrases to find"),
@@ -348,14 +262,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_vsearch (Vector semantic search)
+  // Tool: qmd_vector_search (Vector semantic search)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
-    "vsearch",
+    "vector_search",
     {
-      title: "Vector Search (Semantic)",
-      description: "Semantic similarity search using vector embeddings. Finds conceptually related content even without exact keyword matches. Requires embeddings (run 'qmd embed' first).",
+      title: "Vector Search",
+      description: "Search by meaning. Finds relevant documents even when they use different words than the query — handles synonyms, paraphrases, and related concepts.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
@@ -398,14 +312,14 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_query (Hybrid with reranking)
+  // Tool: qmd_deep_search (Deep search with expansion + reranking)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
-    "query",
+    "deep_search",
     {
-      title: "Hybrid Query (Best Quality)",
-      description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
+      title: "Deep Search",
+      description: "Deep search. Auto-expands the query into variations, searches each by keyword and meaning, and reranks for top hits across all results.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
