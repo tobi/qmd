@@ -37,6 +37,7 @@ import {
   isDocid,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
+  getEmbedBreakdown,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -2623,5 +2624,61 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+describe("getEmbedBreakdown", () => {
+  let store: Store;
+
+  beforeEach(async () => {
+    store = await createTestStore();
+  });
+
+  afterEach(async () => {
+    await cleanupTestDb(store);
+  });
+
+  test("all docs need embedding when under size limit", async () => {
+    await insertTestDocument(store.db, "col", { name: "a", body: "short" });
+    await insertTestDocument(store.db, "col", { name: "b", body: "also short" });
+    const result = getEmbedBreakdown(store.db, 1_000_000);
+    expect(result.needsEmbedding).toBe(2);
+    expect(result.tooLarge).toBe(0);
+  });
+
+  test("all docs too large when over size limit", async () => {
+    await insertTestDocument(store.db, "col", { name: "a", body: "some content here" });
+    await insertTestDocument(store.db, "col", { name: "b", body: "more content here" });
+    const result = getEmbedBreakdown(store.db, 1); // 1 byte limit
+    expect(result.needsEmbedding).toBe(0);
+    expect(result.tooLarge).toBe(2);
+  });
+
+  test("mixed sizes split correctly", async () => {
+    const small = "hi";
+    const large = "x".repeat(500);
+    await insertTestDocument(store.db, "col", { name: "small", body: small });
+    await insertTestDocument(store.db, "col", { name: "large", body: large });
+    const result = getEmbedBreakdown(store.db, 100);
+    expect(result.needsEmbedding).toBe(1);
+    expect(result.tooLarge).toBe(1);
+  });
+
+  test("already embedded docs are excluded", async () => {
+    const body = "embedded content";
+    const hash = await hashContent(body);
+    await insertTestDocument(store.db, "col", { name: "emb", body, hash });
+    // Simulate existing embedding
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', datetime('now'))`).run(hash);
+    const result = getEmbedBreakdown(store.db, 1_000_000);
+    expect(result.needsEmbedding).toBe(0);
+    expect(result.tooLarge).toBe(0);
+  });
+
+  test("inactive docs are excluded", async () => {
+    await insertTestDocument(store.db, "col", { name: "inactive", body: "content", active: 0 });
+    const result = getEmbedBreakdown(store.db, 1_000_000);
+    expect(result.needsEmbedding).toBe(0);
+    expect(result.tooLarge).toBe(0);
   });
 });

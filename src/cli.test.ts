@@ -1197,3 +1197,55 @@ describe("mcp http daemon", () => {
     try { require("fs").unlinkSync(pidPath()); } catch {}
   });
 });
+
+describe("CLI Embed File Size Limit", () => {
+  test("status shows skipped count when files exceed size limit", async () => {
+    const env = await createIsolatedTestEnv("sizelimit");
+    await runQmd(["collection", "add", "."], { ...env });
+    const { stdout, exitCode } = await runQmd(["status"], {
+      ...env,
+      env: { QMD_MAX_EMBED_FILE_BYTES: "1" },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Skipped");
+    expect(stdout).toContain("exceed");
+  });
+
+  test("status shows no skipped line when files are under default limit", async () => {
+    const env = await createIsolatedTestEnv("sizelimit-default");
+    await runQmd(["collection", "add", "."], { ...env });
+    const { stdout, exitCode } = await runQmd(["status"], { ...env });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("Skipped");
+  });
+
+  test("embed skips files exceeding size limit", async () => {
+    const env = await createIsolatedTestEnv("embed-skip");
+    await runQmd(["collection", "add", "."], { ...env });
+    const { stdout, stderr, exitCode } = await runQmd(["embed"], {
+      ...env,
+      env: { QMD_MAX_EMBED_FILE_BYTES: "1" },
+    });
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("Skipping");
+    expect(stdout).toContain("skipped");
+    expect(stdout).toContain("No non-empty documents to embed");
+  });
+
+  test("embed --no-size-limit does not skip files", async () => {
+    const env = await createIsolatedTestEnv("embed-nolimit");
+    await runQmd(["collection", "add", "."], { ...env });
+    const { stderr } = await runQmd(["embed", "--no-size-limit"], {
+      ...env,
+      env: { QMD_MAX_EMBED_FILE_BYTES: "1" },
+    });
+    // With --no-size-limit, no files should be skipped (even with tiny env limit)
+    expect(stderr).not.toContain("Skipping");
+  });
+
+  test("help text mentions --no-size-limit", async () => {
+    const { stdout, exitCode } = await runQmd(["--help"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("--no-size-limit");
+  });
+});
