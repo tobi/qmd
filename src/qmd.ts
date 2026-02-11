@@ -2496,13 +2496,19 @@ if (import.meta.main) {
       break;
     }
 
+    case "repl": {
+      const { startRepl } = await import("./repl.js");
+      await startRepl();
+      break;
+    }
+
     default:
       console.error(`Unknown command: ${cli.command}`);
       console.error("Run 'qmd --help' for usage.");
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
+  if (cli.command !== "mcp" && cli.command !== "repl") {
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }
