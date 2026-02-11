@@ -48,6 +48,7 @@ export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+export const DEFAULT_MAX_EMBED_FILE_BYTES = 5 * 1024 * 1024; // 5MB
 
 // Chunking: 800 tokens per chunk with 15% overlap
 export const CHUNK_SIZE_TOKENS = 800;
@@ -911,6 +912,19 @@ export function getHashesNeedingEmbedding(db: Database): number {
     WHERE d.active = 1 AND v.hash IS NULL
   `).get() as { count: number };
   return result.count;
+}
+
+export function getEmbedBreakdown(db: Database, maxBytes: number): { needsEmbedding: number; tooLarge: number } {
+  const result = db.prepare(`
+    SELECT
+      COUNT(DISTINCT CASE WHEN LENGTH(c.doc) <= ? THEN d.hash END) as needs_embedding,
+      COUNT(DISTINCT CASE WHEN LENGTH(c.doc) > ? THEN d.hash END) as too_large
+    FROM documents d
+    JOIN content c ON d.hash = c.hash
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    WHERE d.active = 1 AND v.hash IS NULL
+  `).get(maxBytes, maxBytes) as { needs_embedding: number; too_large: number };
+  return { needsEmbedding: result.needs_embedding, tooLarge: result.too_large };
 }
 
 export type IndexHealthInfo = {
