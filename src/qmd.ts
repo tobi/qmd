@@ -1703,6 +1703,7 @@ type OutputOptions = {
   collection?: string;  // Filter by collection name (pwd suffix match)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
+  noExpand?: boolean;    // Skip query expansion (use original query only)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1925,17 +1926,27 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    const results = await vectorSearchQuery(store, query, {
-      collection: opts.collection,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
-      hooks: {
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
+    const originalExpandQuery = store.expandQuery;
+    if (opts.noExpand) {
+      store.expandQuery = async () => [];
+    }
+
+    let results: Awaited<ReturnType<typeof vectorSearchQuery>>;
+    try {
+      results = await vectorSearchQuery(store, query, {
+        collection: opts.collection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0.3,
+        hooks: {
+          onExpand: (original, expanded) => {
+            logExpansionTree(original, expanded);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
+          },
         },
-      },
-    });
+      });
+    } finally {
+      store.expandQuery = originalExpandQuery;
+    }
 
     closeDb();
 
@@ -1971,27 +1982,37 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    const results = await hybridQuery(store, query, {
-      collection: opts.collection,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0,
-      hooks: {
-        onStrongSignal: (score) => {
-          process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+    const originalExpandQuery = store.expandQuery;
+    if (opts.noExpand) {
+      store.expandQuery = async () => [];
+    }
+
+    let results: Awaited<ReturnType<typeof hybridQuery>>;
+    try {
+      results = await hybridQuery(store, query, {
+        collection: opts.collection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onStrongSignal: (score) => {
+            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+          },
+          onExpand: (original, expanded) => {
+            logExpansionTree(original, expanded);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+            progress.indeterminate();
+          },
+          onRerankDone: () => {
+            progress.clear();
+          },
         },
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
-        },
-        onRerankStart: (chunkCount) => {
-          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
-          progress.indeterminate();
-        },
-        onRerankDone: () => {
-          progress.clear();
-        },
-      },
-    });
+      });
+    } finally {
+      store.expandQuery = originalExpandQuery;
+    }
 
     closeDb();
 
@@ -2027,6 +2048,9 @@ function parseCLI() {
         type: "string",
       },
       "no-lex": {
+        type: "boolean",
+      },
+      "no-expand": {
         type: "boolean",
       },
       help: { type: "boolean", short: "h" },
@@ -2091,6 +2115,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    noExpand: !!values["no-expand"],
   };
 
   return {
@@ -2119,8 +2144,8 @@ function showHelp(): void {
   console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
-  console.log("  qmd vsearch <query>           - Vector similarity search");
-  console.log("  qmd query <query>             - Combined search with query expansion + reranking");
+  console.log("  qmd vsearch [--no-expand] <query>  - Vector similarity search");
+  console.log("  qmd query [--no-expand] <query>    - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
@@ -2141,6 +2166,7 @@ function showHelp(): void {
   console.log("  --md                       - Markdown output");
   console.log("  --xml                      - XML output");
   console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("  --no-expand                - Disable query expansion (use original query only)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -2366,7 +2392,7 @@ if (import.meta.main) {
 
     case "vsearch":
       if (!cli.query) {
-        console.error("Usage: qmd vsearch [options] <query>");
+        console.error("Usage: qmd vsearch [options] [--no-expand] <query>");
         process.exit(1);
       }
       // Default min-score for vector search is 0.3
@@ -2378,7 +2404,7 @@ if (import.meta.main) {
 
     case "query":
       if (!cli.query) {
-        console.error("Usage: qmd query [options] <query>");
+        console.error("Usage: qmd query [options] [--no-expand] <query>");
         process.exit(1);
       }
       await querySearch(cli.query, cli.opts);
