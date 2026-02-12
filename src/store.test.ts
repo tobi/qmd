@@ -378,6 +378,11 @@ describe("handelize", () => {
     expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
   });
 
+  test("handles symbol-only route filenames", () => {
+    expect(handelize("routes/api/auth/$.ts")).toBe("routes/api/auth/$.ts");
+    expect(handelize("app/routes/$id.tsx")).toBe("app/routes/$id.tsx");
+  });
+
   test("filters out empty segments", () => {
     expect(handelize("a//b/c.md")).toBe("a/b/c.md");
     expect(handelize("/a/b/")).toBe("a/b");
