@@ -110,6 +110,16 @@ describe("Path utilities - Cross-platform support", () => {
       expect(isAbsolutePath("/z/")).toBe(true);
     });
 
+    test("S3 URLs", () => {
+      expect(isAbsolutePath("s3://bucket/key")).toBe(true);
+      expect(isAbsolutePath("s3://bucket")).toBe(true);
+      expect(isAbsolutePath("s3://bucket/path/to/file.md")).toBe(true);
+      expect(isAbsolutePath("s3://my-bucket/docs/")).toBe(true);
+      // Not S3 URLs
+      expect(isAbsolutePath("s3:bucket")).toBe(false);
+      expect(isAbsolutePath("s3/bucket")).toBe(false);
+    });
+
     test("Edge cases", () => {
       expect(isAbsolutePath("")).toBe(false);
       expect(isAbsolutePath("C:")).toBe(true); // Drive letter only

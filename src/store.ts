@@ -98,6 +98,11 @@ export function homedir(): string {
 export function isAbsolutePath(path: string): boolean {
   if (!path) return false;
   
+  // S3 URL (s3://bucket/key)
+  if (path.startsWith('s3://')) {
+    return true;
+  }
+  
   // Unix absolute path
   if (path.startsWith('/')) {
     // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
