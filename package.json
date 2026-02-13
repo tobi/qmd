@@ -18,11 +18,11 @@
     "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.1",
-    "node-llama-cpp": "^3.14.5",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "node-llama-cpp": "^3.15.1",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
-    "zod": "^4.2.1"
+    "zod": "^4.3.6"
   },
   "optionalDependencies": {
     "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
