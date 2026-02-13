@@ -4,7 +4,7 @@
   "description": "Quick Markdown Search - Full-text and vector search for markdown files",
   "type": "module",
   "bin": {
-    "qmd": "./qmd"
+    "qmd": "./src/qmd.ts"
   },
   "scripts": {
     "test": "bun test",

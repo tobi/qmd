@@ -8,6 +8,8 @@ import {
   getRealPath,
   homedir,
   resolve,
+  normalizePathSeparators,
+  isAbsolutePath,
   enableProductionMode,
   searchFTS,
   extractSnippet,
@@ -202,16 +204,17 @@ function computeDisplayPath(
   existingPaths: Set<string>
 ): string {
   // Get path relative to collection (include collection dir name)
-  const collectionDir = collectionPath.replace(/\/$/, '');
+  const collectionDir = normalizePathSeparators(collectionPath).replace(/\/$/, '');
   const collectionName = collectionDir.split('/').pop() || '';
+  const normalizedFilepath = normalizePathSeparators(filepath);
 
   let relativePath: string;
-  if (filepath.startsWith(collectionDir + '/')) {
+  if (normalizedFilepath.startsWith(collectionDir + '/')) {
     // filepath is under collection: use collection name + relative path
-    relativePath = collectionName + filepath.slice(collectionDir.length);
+    relativePath = collectionName + normalizedFilepath.slice(collectionDir.length);
   } else {
     // Fallback: just use the filepath
-    relativePath = filepath;
+    relativePath = normalizedFilepath;
   }
 
   const parts = relativePath.split('/').filter(p => p.length > 0);
@@ -393,7 +396,10 @@ async function updateCollections(): Promise<void> {
     if (yamlCol?.update) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
-        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
+        const shellCmd = process.platform === "win32"
+          ? ["cmd", "/c", yamlCol.update]
+          : ["/usr/bin/env", "bash", "-c", yamlCol.update];
+        const proc = Bun.spawn(shellCmd, {
           cwd: col.pwd,
           stdout: "pipe",
           stderr: "pipe",
@@ -440,7 +446,7 @@ async function updateCollections(): Promise<void> {
  * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
  */
 function detectCollectionFromPath(db: Database, fsPath: string): { collectionName: string; relativePath: string } | null {
-  const realPath = getRealPath(fsPath);
+  const realPath = normalizePathSeparators(getRealPath(fsPath));
 
   // Find collections that this path is under from YAML
   const allCollections = yamlListCollections();
@@ -448,9 +454,10 @@ function detectCollectionFromPath(db: Database, fsPath: string): { collectionNam
   // Find longest matching path
   let bestMatch: { name: string; path: string } | null = null;
   for (const coll of allCollections) {
-    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
-      if (!bestMatch || coll.path.length > bestMatch.path.length) {
-        bestMatch = { name: coll.name, path: coll.path };
+    const collPath = normalizePathSeparators(coll.path);
+    if (realPath.startsWith(collPath + '/') || realPath === collPath) {
+      if (!bestMatch || collPath.length > bestMatch.path.length) {
+        bestMatch = { name: coll.name, path: collPath };
       }
     }
   }
@@ -489,7 +496,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('qmd://')) {
+  } else if (!isAbsolutePath(fsPath) && !fsPath.startsWith('qmd://')) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -601,7 +608,7 @@ function contextRemove(pathArg: string): void {
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/')) {
+  } else if (!isAbsolutePath(fsPath)) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -742,8 +749,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   } else {
     // Try to interpret as collection/path format first (before filesystem path)
     // If path is relative (no / or ~ prefix), check if first component is a collection name
-    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
-      const parts = inputPath.split('/');
+    if (!isAbsolutePath(inputPath) && !inputPath.startsWith('~')) {
+      const parts = normalizePathSeparators(inputPath).split('/');
       if (parts.length >= 2) {
         const possibleCollection = parts[0];
         const possiblePath = parts.slice(1).join('/');
@@ -788,7 +795,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       // Expand ~ to home directory
       if (fsPath.startsWith('~/')) {
         fsPath = homedir() + fsPath.slice(1);
-      } else if (!fsPath.startsWith('/')) {
+      } else if (!isAbsolutePath(fsPath)) {
         // Relative path - resolve from current directory
         fsPath = resolve(getPwd(), fsPath);
       }
@@ -809,7 +816,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
 
       // Fuzzy match by filename (last component of path)
       if (!doc) {
-        const filename = inputPath.split('/').pop() || inputPath;
+        const filename = normalizePathSeparators(inputPath).split('/').pop() || inputPath;
         doc = db.prepare(`
           SELECT d.collection as collectionName, d.path, content.doc as body
           FROM documents d
@@ -1147,7 +1154,7 @@ function listFiles(pathArg?: string): void {
     pathPrefix = parsed.path;
   } else {
     // Just collection name or collection/path
-    const parts = pathArg.split('/');
+    const parts = normalizePathSeparators(pathArg).split('/');
     collectionName = parts[0] || '';
     if (parts.length > 1) {
       pathPrefix = parts.slice(1).join('/');
@@ -1268,7 +1275,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   // If name not provided, generate from pwd basename
   let collName = name;
   if (!collName) {
-    const parts = pwd.split('/').filter(Boolean);
+    const parts = normalizePathSeparators(pwd).split('/').filter(Boolean);
     collName = parts[parts.length - 1] || 'root';
   }
 
