@@ -2118,9 +2118,9 @@ function showHelp(): void {
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
   console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
-  console.log("  qmd search <query>            - Full-text search (BM25)");
-  console.log("  qmd vsearch <query>           - Vector similarity search");
-  console.log("  qmd query <query>             - Combined search with query expansion + reranking");
+  console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
+  console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
+  console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
@@ -2365,6 +2365,7 @@ if (import.meta.main) {
       break;
 
     case "vsearch":
+    case "vector-search": // undocumented alias
       if (!cli.query) {
         console.error("Usage: qmd vsearch [options] <query>");
         process.exit(1);
@@ -2377,6 +2378,7 @@ if (import.meta.main) {
       break;
 
     case "query":
+    case "deep-search": // undocumented alias
       if (!cli.query) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);

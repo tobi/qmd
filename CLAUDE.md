@@ -19,9 +19,9 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
-qmd search <query>                # BM25 full-text search
-qmd vsearch <query>               # Vector similarity search
-qmd query <query>                 # Hybrid search with reranking (best quality)
+qmd query <query>                 # Search with query expansion + reranking (recommended)
+qmd search <query>                # Full-text keyword search (BM25, no LLM)
+qmd vsearch <query>               # Vector similarity search (no reranking)
 qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
