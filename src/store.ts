@@ -13,7 +13,8 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
-import { realpathSync, statSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -42,7 +43,7 @@ import {
 // Configuration
 // =============================================================================
 
-const HOME = Bun.env.HOME || "/tmp";
+const HOME = Bun.env.HOME || Bun.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
@@ -275,7 +276,7 @@ export function getDefaultDbPath(indexName: string = "index"): string {
 
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
+  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
   return resolve(qmdCacheDir, `${indexName}.sqlite`);
 }
 
@@ -462,14 +463,26 @@ function initializeDatabase(db: Database): void {
   try {
     sqliteVec.load(db);
   } catch (err) {
-    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
+    // On Windows, sqlite-vec may fail to resolve the native DLL when running
+    // from outside the project directory. Fall back to loading it directly
+    // from this project's node_modules using an absolute path.
+    if (process.platform === "win32") {
+      try {
+        const scriptDir = resolve(fileURLToPath(import.meta.url), "..");
+        const vecDll = resolve(scriptDir, "..", "node_modules", "sqlite-vec-windows-x64", "vec0");
+        db.loadExtension(vecDll);
+      } catch (fallbackErr) {
+        throw err; // throw original error if fallback also fails
+      }
+    } else if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
       throw new Error(
         "SQLite build does not support dynamic extension loading. " +
         "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
         "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
       );
+    } else {
+      throw err;
     }
-    throw err;
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
