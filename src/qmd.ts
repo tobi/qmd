@@ -2125,6 +2125,7 @@ function showHelp(): void {
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
   console.log("  qmd mcp stop                  - Stop background MCP daemon");
+  console.log("  qmd web [--port N]            - Start web UI server (default port 3100)");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2465,6 +2466,21 @@ if (import.meta.main) {
         // Default: stdio transport
         const { startMcpServer } = await import("./mcp.js");
         await startMcpServer();
+      }
+      break;
+    }
+
+    case "web": {
+      const port = Number(cli.values.port) || 3100;
+      const { startWebServer } = await import("./web.js");
+      try {
+        await startWebServer(port);
+      } catch (e: any) {
+        if (e?.code === "EADDRINUSE") {
+          console.error(`Port ${port} already in use. Try a different port with --port.`);
+          process.exit(1);
+        }
+        throw e;
       }
       break;
     }
