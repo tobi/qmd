@@ -1366,7 +1366,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   progress.indeterminate();
   const glob = new Glob(globPattern);
   const files: string[] = [];
-  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
+  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: false })) {
     // Skip node_modules, hidden folders (.*), and other common excludes
     const parts = file.split("/");
     const shouldSkip = parts.some(part =>
