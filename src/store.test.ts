@@ -8,6 +8,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
+import * as sqliteVec from "sqlite-vec";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import YAML from "yaml";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
+  verifySqliteVecLoaded,
   getDefaultDbPath,
   homedir,
   resolve,
@@ -450,6 +452,25 @@ describe("Store Creation", () => {
     const result = store.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
     expect(result.journal_mode).toBe("wal");
     await cleanupTestDb(store);
+  });
+
+  test("verifySqliteVecLoaded throws when sqlite-vec is not loaded", () => {
+    const db = new Database(":memory:");
+    try {
+      expect(() => verifySqliteVecLoaded(db)).toThrow("sqlite-vec extension is unavailable");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("verifySqliteVecLoaded succeeds when sqlite-vec is loaded", () => {
+    const db = new Database(":memory:");
+    try {
+      sqliteVec.load(db);
+      expect(() => verifySqliteVecLoaded(db)).not.toThrow();
+    } finally {
+      db.close();
+    }
   });
 
   test("store.close closes the database connection", async () => {
