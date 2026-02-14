@@ -2378,6 +2378,41 @@ describe("Content-Addressable Storage", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("re-indexing a previously deactivated path reactivates instead of violating UNIQUE", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const oldContent = "# First Version";
+    const oldHash = await hashContent(oldContent);
+    store.insertContent(oldHash, oldContent, now);
+    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, now, now);
+
+    // Simulate file removal during update pass.
+    store.deactivateDocument(collectionName, "docs/foo.md");
+    expect(store.findActiveDocument(collectionName, "docs/foo.md")).toBeNull();
+
+    // Simulate file coming back in a later update pass.
+    const newContent = "# Second Version";
+    const newHash = await hashContent(newContent);
+    store.insertContent(newHash, newContent, now);
+
+    expect(() => {
+      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, now, now);
+    }).not.toThrow();
+
+    const rows = store.db.prepare(`
+      SELECT id, hash, active FROM documents
+      WHERE collection = ? AND path = ?
+    `).all(collectionName, "docs/foo.md") as { id: number; hash: string; active: number }[];
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.active).toBe(1);
+    expect(rows[0]!.hash).toBe(newHash);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================

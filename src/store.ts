@@ -1118,6 +1118,11 @@ export function insertDocument(
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(collection, path) DO UPDATE SET
+      title = excluded.title,
+      hash = excluded.hash,
+      modified_at = excluded.modified_at,
+      active = 1
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
 }
 
