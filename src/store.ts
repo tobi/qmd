@@ -458,17 +458,46 @@ function setSQLiteFromBrewPrefixEnv(): void {
 
 setSQLiteFromBrewPrefixEnv();
 
+function createSqliteVecUnavailableError(reason: string): Error {
+  return new Error(
+    "sqlite-vec extension is unavailable. " +
+    `${reason}. ` +
+    "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
+    "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
+  );
+}
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+export function verifySqliteVecLoaded(db: Database): void {
+  try {
+    const row = db.prepare(`SELECT vec_version() AS version`).get() as { version?: string } | null;
+    if (!row?.version || typeof row.version !== "string") {
+      throw new Error("vec_version() returned no version");
+    }
+  } catch (err) {
+    const message = getErrorMessage(err);
+    throw createSqliteVecUnavailableError(`sqlite-vec probe failed (${message})`);
+  }
+}
+
 function initializeDatabase(db: Database): void {
   try {
     sqliteVec.load(db);
+    verifySqliteVecLoaded(db);
   } catch (err) {
-    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
-      throw new Error(
-        "SQLite build does not support dynamic extension loading. " +
-        "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
-        "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
-      );
+    const message = getErrorMessage(err);
+
+    if (message.includes("does not support dynamic extension loading")) {
+      throw createSqliteVecUnavailableError("SQLite build does not support dynamic extension loading");
     }
+
+    if (message.includes("sqlite-vec extension is unavailable")) {
+      throw err;
+    }
+
     throw err;
   }
   db.exec("PRAGMA journal_mode = WAL");
