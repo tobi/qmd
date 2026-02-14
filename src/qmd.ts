@@ -2030,6 +2030,7 @@ function parseCLI() {
         type: "boolean",
       },
       help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2155,9 +2156,31 @@ function showHelp(): void {
   console.log(`Index: ${getDbPath()}`);
 }
 
+async function showVersion(): Promise<void> {
+  const scriptDir = import.meta.dir;
+  const pkgPath = resolve(scriptDir, "..", "package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+
+  let commit = "";
+  try {
+    const result = await $`git -C ${scriptDir} rev-parse --short HEAD`.quiet();
+    commit = result.text().trim();
+  } catch {
+    // Not a git repo or git not available
+  }
+
+  const versionStr = commit ? `${pkg.version} (${commit})` : pkg.version;
+  console.log(`qmd ${versionStr}`);
+}
+
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
   const cli = parseCLI();
+
+  if (cli.values.version) {
+    await showVersion();
+    process.exit(0);
+  }
 
   if (!cli.command || cli.values.help) {
     showHelp();
