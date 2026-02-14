@@ -798,12 +798,11 @@ export function handelize(path: string): string {
     throw new Error('handelize: path cannot be empty');
   }
 
-  // Check for paths that are just extensions or only dots/special chars
-  // A valid path must have at least one letter or digit (including Unicode)
+  // Allow route-style "$" filenames while still rejecting paths with no usable content.
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}]/u.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}$]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
@@ -822,14 +821,14 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}]+/gu, '-')  // Replace non-letter/digit chars with dash
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
       } else {
         // For directories, just clean normally
         return segment
-          .replace(/[^\p{L}\p{N}]+/gu, '-')
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')
           .replace(/^-+|-+$/g, '');
       }
     })
