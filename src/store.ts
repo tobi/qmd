@@ -580,6 +580,51 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  // ── CJK trigram FTS table ──────────────────────────────────────────────
+  // The unicode61 tokenizer cannot segment CJK text (no spaces between
+  // characters), so keyword searches for Chinese/Japanese/Korean fail.
+  // A secondary trigram-tokenized table enables substring matching for CJK.
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts_trigram USING fts5(
+      filepath, title, body,
+      tokenize='trigram'
+    )
+  `);
+
+  // Triggers: keep trigram FTS in sync with documents table
+  db.exec(`CREATE TRIGGER IF NOT EXISTS documents_ai_trigram AFTER INSERT ON documents
+    WHEN new.active = 1 BEGIN
+      INSERT INTO documents_fts_trigram(rowid, filepath, title, body)
+      SELECT new.id, new.collection || '/' || new.path, new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END`);
+
+  db.exec(`CREATE TRIGGER IF NOT EXISTS documents_ad_trigram AFTER DELETE ON documents BEGIN
+    DELETE FROM documents_fts_trigram WHERE rowid = old.id;
+  END`);
+
+  db.exec(`CREATE TRIGGER IF NOT EXISTS documents_au_trigram AFTER UPDATE ON documents BEGIN
+    DELETE FROM documents_fts_trigram WHERE rowid = old.id AND new.active = 0;
+    INSERT OR REPLACE INTO documents_fts_trigram(rowid, filepath, title, body)
+    SELECT new.id, new.collection || '/' || new.path, new.title,
+      (SELECT doc FROM content WHERE hash = new.hash)
+    WHERE new.active = 1;
+  END`);
+
+  // One-time backfill: populate trigram table from existing documents.
+  // Uses INSERT OR IGNORE + NOT IN for idempotent, resumable backfill (B5 fix).
+  const docCount = (db.prepare(`SELECT count(*) as n FROM documents WHERE active = 1`).get() as { n: number }).n;
+  if (docCount > 0) {
+    const trigramCount = (db.prepare(`SELECT count(*) as n FROM documents_fts_trigram`).get() as { n: number }).n;
+    if (trigramCount < docCount) {
+      db.exec(`INSERT OR IGNORE INTO documents_fts_trigram(rowid, filepath, title, body)
+        SELECT d.id, d.collection || '/' || d.path, d.title, c.doc
+        FROM documents d JOIN content c ON d.hash = c.hash
+        WHERE d.active = 1 AND d.id NOT IN (SELECT rowid FROM documents_fts_trigram)`);
+    }
+  }
 }
 
 
@@ -640,8 +685,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionNames?: string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionNames?: string[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -723,8 +768,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchFTS: (query: string, limit?: number, collectionNames?: string[]) => searchFTS(db, query, limit, collectionNames),
+    searchVec: (query: string, model: string, limit?: number, collectionNames?: string[]) => searchVec(db, query, model, limit, collectionNames),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -1860,11 +1905,30 @@ function buildFTS5Query(query: string): string | null {
     .map(t => sanitizeFTS5Term(t))
     .filter(t => t.length > 0);
   if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  if (terms.length === 1) return `"${terms[0]!.replace(/"/g, '""')}"*`;
+  return terms.map(t => `"${t.replace(/"/g, '""')}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+// ── CJK detection ───────────────────────────────────────────────────────
+// Covers: CJK Unified + Ext A/B, Hiragana, Katakana, Hangul (W1 fix)
+const CJKH_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u{20000}-\u{2a6df}]/u;
+const CJKH_RUN_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u{20000}-\u{2a6df}]+/gu;
+
+function hasCJK(text: string): boolean {
+  return CJKH_RE.test(text);
+}
+
+/** Return length of the longest consecutive CJK/Hiragana/Katakana/Hangul run. */
+function longestCJKRun(text: string): number {
+  let max = 0;
+  for (const m of text.matchAll(CJKH_RUN_RE)) {
+    const len = [...m[0]].length; // count codepoints, not UTF-16 code units
+    if (len > max) max = len;
+  }
+  return max;
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionNames?: string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1883,12 +1947,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+  if (collectionNames && collectionNames.length > 0) {
+    const placeholders = collectionNames.map(() => '?').join(', ');
+    sql += ` AND d.collection IN (${placeholders})`;
+    params.push(...collectionNames);
   }
 
   // bm25 lower is better; sort ascending.
@@ -1896,35 +1958,163 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
-  return rows.map(row => {
-    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
-    // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
-    // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
-    // Monotonic and query-independent — no per-query normalization needed.
-    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
-    return {
-      filepath: row.filepath,
-      displayPath: row.display_path,
-      title: row.title,
-      hash: row.hash,
-      docid: getDocid(row.hash),
-      collectionName,
-      modifiedAt: "",  // Not available in FTS query
-      bodyLength: row.body.length,
-      body: row.body,
-      context: getContextForFile(db, row.filepath),
-      score,
-      source: "fts" as const,
-    };
-  });
+  let results = rows.map(row => mapFTSRow(db, row));
+
+  // ── CJK fallback ────────────────────────────────────────────────────
+  // unicode61 tokenizer cannot segment CJK text (no spaces between chars).
+  // Strategy (layered, English queries skip entirely):
+  //   Layer 1: trigram FTS — fast, works for CJK runs of ≥3 codepoints
+  //   Layer 2: LIKE scan  — covers 1-2 char CJK terms (e.g. "认证")
+  if (hasCJK(query) && results.length < limit) {
+    // Strip everything except letters, digits, whitespace (W3 fix: drop apostrophe)
+    const sanitized = query.replace(/[^\p{L}\p{N}\s]/gu, '').trim();
+    if (sanitized.length > 0) {
+      const existingIds = new Set(results.map(r => r.hash));
+      const remaining = limit - results.length;
+      const cjkLen = longestCJKRun(sanitized);
+      // Split into terms for per-term matching (B3/B4 fix)
+      const terms = sanitized.split(/\s+/).filter(t => t.length > 0);
+
+      // ── Layer 1: trigram FTS (CJK runs ≥ 3 codepoints) ──────────
+      if (cjkLen >= 3) {
+        const trigramTableExists = db.prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts_trigram'`
+        ).get();
+        if (trigramTableExists) {
+          // B3 fix: split into per-term trigram queries joined with AND,
+          // instead of wrapping entire query in quotes (which forces exact phrase)
+          const trigramTerms = terms
+            .filter(t => longestCJKRun(t) >= 3 || !hasCJK(t))
+            .map(t => `"${t.replace(/"/g, '')}"`);
+          const trigramQuery = trigramTerms.length > 0
+            ? trigramTerms.join(' AND ')
+            : `"${sanitized.replace(/"/g, '')}"`;
+
+          try {
+            let trigramSql = `
+              SELECT
+                'qmd://' || d.collection || '/' || d.path as filepath,
+                d.collection || '/' || d.path as display_path,
+                d.title,
+                content.doc as body,
+                d.hash,
+                rank as bm25_score
+              FROM documents_fts_trigram t
+              JOIN documents d ON d.id = t.rowid
+              JOIN content ON content.hash = d.hash
+              WHERE documents_fts_trigram MATCH ? AND d.active = 1
+            `;
+            const trigramParams: (string | number)[] = [trigramQuery];
+
+            if (collectionNames && collectionNames.length > 0) {
+              const triColPlaceholders = collectionNames.map(() => '?').join(', ');
+              trigramSql += ` AND d.collection IN (${triColPlaceholders})`;
+              trigramParams.push(...collectionNames);
+            }
+            trigramSql += ` ORDER BY rank ASC LIMIT ?`;
+            trigramParams.push(remaining + existingIds.size);
+
+            const trigramRows = db.prepare(trigramSql).all(...trigramParams) as {
+              filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number;
+            }[];
+
+            for (const row of trigramRows) {
+              if (existingIds.has(row.hash)) continue;
+              if (results.length >= limit) break;
+              existingIds.add(row.hash);
+              const mapped = mapFTSRow(db, row);
+              mapped.score *= 0.9; // discount vs unicode61 matches
+              results.push(mapped);
+            }
+          } catch {
+            // FTS5 parse error — silently fall through to LIKE (W3 safety)
+          }
+        }
+      }
+
+      // ── Layer 2: LIKE scan (short CJK terms, 1-2 codepoints) ────
+      // FTS5 trigram needs ≥3 codepoints per run. Most Chinese words are
+      // 2 chars, so we fall back to per-term LIKE.
+      // B4 fix: split terms and AND them, instead of searching entire string.
+      if (results.length < limit && cjkLen < 3) {
+        const likeTerms = terms.filter(t => t.length > 0);
+        if (likeTerms.length > 0) {
+          const conditions = likeTerms.map(() => `(c.doc LIKE ? OR d.title LIKE ?)`).join(' AND ');
+          let likeSql = `
+            SELECT
+              'qmd://' || d.collection || '/' || d.path as filepath,
+              d.collection || '/' || d.path as display_path,
+              d.title,
+              c.doc as body,
+              d.hash,
+              -1.0 as bm25_score
+            FROM documents d
+            JOIN content c ON c.hash = d.hash
+            WHERE d.active = 1 AND ${conditions}
+          `;
+          const likeParams: (string | number)[] = [];
+          for (const term of likeTerms) {
+            const escaped = term.replace(/[%_\\]/g, '\\$&');
+            const pattern = `%${escaped}%`;
+            likeParams.push(pattern, pattern);
+          }
+
+          if (collectionNames && collectionNames.length > 0) {
+            const likeColPlaceholders = collectionNames.map(() => '?').join(', ');
+            likeSql += ` AND d.collection IN (${likeColPlaceholders})`;
+            likeParams.push(...collectionNames);
+          }
+          likeSql += ` LIMIT ?`;
+          likeParams.push(remaining + existingIds.size);
+
+          const likeRows = db.prepare(likeSql).all(...likeParams) as {
+            filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number;
+          }[];
+
+          for (const row of likeRows) {
+            if (existingIds.has(row.hash)) continue;
+            if (results.length >= limit) break;
+            existingIds.add(row.hash);
+            const mapped = mapFTSRow(db, row);
+            mapped.score *= 0.8; // discount vs trigram matches
+            results.push(mapped);
+          }
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+function mapFTSRow(
+  db: Database,
+  row: { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number },
+): SearchResult {
+  const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+  // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
+  const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+  return {
+    filepath: row.filepath,
+    displayPath: row.display_path,
+    title: row.title,
+    hash: row.hash,
+    docid: getDocid(row.hash),
+    collectionName,
+    modifiedAt: "",  // Not available in FTS query
+    bodyLength: row.body.length,
+    body: row.body,
+    context: getContextForFile(db, row.filepath),
+    score,
+    source: "fts" as const,
+  };
 }
 
 // =============================================================================
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionNames?: string[], session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -1967,9 +2157,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+  if (collectionNames && collectionNames.length > 0) {
+    const colPlaceholders = collectionNames.map(() => '?').join(', ');
+    docSql += ` AND d.collection IN (${colPlaceholders})`;
+    params.push(...collectionNames);
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -2639,7 +2830,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collections?: string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -2679,8 +2870,9 @@ export async function hybridQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const collection = options?.collection;
+  const collections = options?.collections;
   const hooks = options?.hooks;
+  const collectionSet = collections && collections.length > 0 ? new Set(collections) : null;
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
@@ -2689,8 +2881,8 @@ export async function hybridQuery(
   ).get();
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
-  const initialFts = store.searchFTS(query, 20)
-    .filter(r => !collection || r.collectionName === collection);
+  const initialFts = store.searchFTS(query, 20, collections)
+    .filter(r => !collectionSet || collectionSet.has(r.collectionName));
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = initialFts.length > 0
@@ -2720,7 +2912,7 @@ export async function hybridQuery(
   // Vector searches run sequentially — node-llama-cpp's embed context
   // hangs on concurrent embed() calls (known limitation).
   if (hasVectors) {
-    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, collection);
+    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, collections);
     if (vecResults.length > 0) {
       for (const r of vecResults) docidMap.set(r.filepath, r.docid);
       rankedLists.push(vecResults.map(r => ({
@@ -2734,8 +2926,8 @@ export async function hybridQuery(
   // This restores the CLI's query-type-aware routing that was lost in the initial refactor.
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.text, 20)
-        .filter(r => !collection || r.collectionName === collection);
+      const ftsResults = store.searchFTS(q.text, 20, collections)
+        .filter(r => !collectionSet || collectionSet.has(r.collectionName));
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -2746,7 +2938,7 @@ export async function hybridQuery(
     } else {
       // vec or hyde → vector search only
       if (hasVectors) {
-        const vecResults = await store.searchVec(q.text, DEFAULT_EMBED_MODEL, 20, collection);
+        const vecResults = await store.searchVec(q.text, DEFAULT_EMBED_MODEL, 20, collections);
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -2841,7 +3033,7 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
-  collection?: string;
+  collections?: string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   hooks?: Pick<SearchHooks, 'onExpand'>;
@@ -2873,7 +3065,7 @@ export async function vectorSearchQuery(
 ): Promise<VectorSearchResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
-  const collection = options?.collection;
+  const collections = options?.collections;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -2889,7 +3081,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collections);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
