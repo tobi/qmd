@@ -6,6 +6,7 @@
 
 import {
   getLlama,
+  getLlamaGpuTypes,
   resolveModelFile,
   LlamaChatSession,
   LlamaLogLevel,
@@ -490,26 +491,30 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Auto-detect GPU: try cuda, then vulkan, then metal, then CPU fallback
-      let llama: Llama | null = null;
-      for (const gpu of ["cuda", "vulkan", "metal"] as const) {
+      // Detect available GPU types and use the best one.
+      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+      // (likely a binary/build config issue in node-llama-cpp).
+      const gpuTypes = await getLlamaGpuTypes();
+      // Prefer CUDA > Metal > Vulkan > CPU
+      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+
+      let llama: Llama;
+      if (preferred) {
         try {
-          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
-          break;
+          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
         } catch {
-          // GPU type not available, try next
+          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+          process.stderr.write(
+            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+          );
         }
-      }
-      if (!llama) {
+      } else {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+      }
+
+      if (!llama.gpu) {
         process.stderr.write(
-          "QMD Warning: no GPU acceleration available, running models on CPU (this will be slow).\n" +
-          "Run 'qmd status' for device info. Install CUDA/Vulkan/Metal support for better performance.\n"
-        );
-      } else if (!llama.supportsGpuOffloading) {
-        process.stderr.write(
-          "QMD Warning: GPU detected but offloading not supported, models will run on CPU.\n" +
-          "Run 'qmd status' for device info.\n"
+          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
         );
       }
       this.llama = llama;
@@ -683,24 +688,37 @@ export class LlamaCpp implements LLM {
    * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
    * Each context has its own sequence, so they can evaluate independently.
    *
-   * Uses contextSize 1024 instead of auto (40960) — reranking chunks are ~800
-   * tokens max, so 1024 is plenty. This drops VRAM from 11.6 GB to 711 MB per context.
+   * Tuning choices:
+   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
+   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
+   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
    */
-  private static readonly RERANK_CONTEXT_SIZE = 1024;
+  // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
+  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
+  // Use 2048 for safety margin. Still 17× less than auto (40960).
+  private static readonly RERANK_CONTEXT_SIZE = 2048;
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      // Rerank contexts are ~711 MB each at contextSize 1024
-      const n = await this.computeParallelism(750);
+      // ~960 MB per context with flash attention at contextSize 2048
+      const n = await this.computeParallelism(1000);
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            flashAttention: true,
           }));
         } catch {
           if (this.rerankContexts.length === 0) {
-            throw new Error("Failed to create any rerank context");
+            // Flash attention might not be supported — retry without it
+            try {
+              this.rerankContexts.push(await model.createRankingContext({
+                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+              }));
+            } catch {
+              throw new Error("Failed to create any rerank context");
+            }
           }
           break;
         }
