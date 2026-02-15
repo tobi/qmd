@@ -911,8 +911,8 @@ describe("FTS Search", () => {
     const allResults = store.searchFTS("searchable", 10);
     expect(allResults).toHaveLength(2);
 
-    // Filter by collection name (collectionId is now treated as collection name string)
-    const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
+    // Filter by collection name
+    const filtered = store.searchFTS("searchable", 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 

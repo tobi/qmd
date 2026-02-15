@@ -237,9 +237,7 @@ function createMcpServer(store: Store): McpServer {
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Note: Collection filtering is now done post-search since collections are managed in YAML
-      const results = store.searchFTS(query, limit || 10)
-        .filter(r => !collection || r.collectionName === collection);
+      const results = store.searchFTS(query, limit || 10, collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => {
