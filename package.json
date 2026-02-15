@@ -4,7 +4,7 @@
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "bin": {
-    "qmd": "./qmd"
+    "qmd": "qmd"
   },
   "files": [
     "src/**/*.ts",
@@ -76,5 +76,6 @@
     "local-ai",
     "llm"
   ],
+  "author": "Tobi Lutke <tobi@lutke.com>",
   "license": "MIT"
 }

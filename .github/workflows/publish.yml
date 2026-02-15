@@ -10,7 +10,6 @@ jobs:
 
     permissions:
       contents: write
-      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +29,9 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - run: npm publish --provenance --access public
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         env:
