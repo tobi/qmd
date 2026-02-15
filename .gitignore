@@ -8,6 +8,7 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
+result
 !skills/**/*.md
 !finetune/*.md
 finetune/outputs/
