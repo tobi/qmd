@@ -13,14 +13,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        bun-version: ["latest", "1.1.0"]
+        node-version: ["22", "23"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
         with:
-          bun-version: ${{ matrix.bun-version }}
+          node-version: ${{ matrix.node-version }}
 
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
@@ -30,6 +30,17 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sqlite
 
-      - run: bun install
+      - run: npm install
 
-      - run: bun test
+      - name: Unit tests
+        run: npx vitest run --reporter=verbose src/*.test.ts
+
+      - name: Model tests
+        run: npx vitest run --reporter=verbose src/models/*.test.ts
+        env:
+          CI: true
+
+      - name: Integration tests
+        run: npx vitest run --reporter=verbose src/integration/*.test.ts
+        env:
+          CI: true
