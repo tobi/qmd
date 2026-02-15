@@ -11,9 +11,10 @@
  *   const store = createStore();
  */
 
-import { Database } from "bun:sqlite";
-import { Glob } from "bun";
-import { realpathSync, statSync } from "node:fs";
+import Database from "better-sqlite3";
+import picomatch from "picomatch";
+import { createHash } from "crypto";
+import { realpathSync, statSync, mkdirSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -42,7 +43,7 @@ import {
 // Configuration
 // =============================================================================
 
-const HOME = Bun.env.HOME || "/tmp";
+const HOME = process.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
@@ -190,7 +191,7 @@ export function resolve(...paths: string[]): string {
     }
   } else {
     // Start with PWD or cwd, then append the first relative path
-    const pwd = normalizePathSeparators(Bun.env.PWD || process.cwd());
+    const pwd = normalizePathSeparators(process.env.PWD || process.cwd());
     
     // Extract Windows drive from PWD if present
     if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
@@ -261,8 +262,8 @@ export function enableProductionMode(): void {
 
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
-  if (Bun.env.INDEX_PATH) {
-    return Bun.env.INDEX_PATH;
+  if (process.env.INDEX_PATH) {
+    return process.env.INDEX_PATH;
   }
 
   // In non-production mode (tests), require explicit path
@@ -273,9 +274,9 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
-  const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
+  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
   return resolve(qmdCacheDir, `${indexName}.sqlite`);
 }
 
@@ -430,33 +431,6 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-function setSQLiteFromBrewPrefixEnv(): void {
-  const candidates: string[] = [];
-
-  if (process.platform === "darwin") {
-    // Use BREW_PREFIX for non-standard Homebrew installs (common on corporate Macs).
-    const brewPrefix = Bun.env.BREW_PREFIX || Bun.env.HOMEBREW_PREFIX;
-    if (brewPrefix) {
-      // Homebrew can place SQLite in opt/sqlite (keg-only) or directly under the prefix.
-      candidates.push(`${brewPrefix}/opt/sqlite/lib/libsqlite3.dylib`);
-      candidates.push(`${brewPrefix}/lib/libsqlite3.dylib`);
-    } else {
-      candidates.push("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib");
-      candidates.push("/usr/local/opt/sqlite/lib/libsqlite3.dylib");
-    }
-  }
-
-  for (const candidate of candidates) {
-    try {
-      if (statSync(candidate).size > 0) {
-        Database.setCustomSQLite(candidate);
-        return;
-      }
-    } catch { }
-  }
-}
-
-setSQLiteFromBrewPrefixEnv();
 
 function createSqliteVecUnavailableError(reason: string): Error {
   return new Error(
@@ -966,7 +940,7 @@ export function getIndexHealth(db: Database): IndexHealthInfo {
 // =============================================================================
 
 export function getCacheKey(url: string, body: object): string {
-  const hash = new Bun.CryptoHasher("sha256");
+  const hash = createHash("sha256");
   hash.update(url);
   hash.update(JSON.stringify(body));
   return hash.digest("hex");
@@ -1082,7 +1056,7 @@ export function vacuumDatabase(db: Database): void {
 // =============================================================================
 
 export async function hashContent(content: string): Promise<string> {
-  const hash = new Bun.CryptoHasher("sha256");
+  const hash = createHash("sha256");
   hash.update(content);
   return hash.digest("hex");
 }
@@ -1163,10 +1137,11 @@ export function findActiveDocument(
   collectionName: string,
   path: string
 ): { id: number; hash: string; title: string } | null {
-  return db.prepare(`
+  const row = db.prepare(`
     SELECT id, hash, title FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | null;
+  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  return row ?? null;
 }
 
 /**
@@ -1477,9 +1452,9 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     WHERE d.active = 1
   `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
 
-  const glob = new Glob(pattern);
+  const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => glob.match(f.virtual_path) || glob.match(f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display

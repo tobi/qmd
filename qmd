@@ -2,13 +2,13 @@
 # qmd - Quick Markdown Search
 set -euo pipefail
 
-# Find bun - prefer PATH, fallback to known locations
-find_bun() {
-  # First: check if bun is in PATH and modern enough
-  if command -v bun &>/dev/null; then
-    local ver=$(bun --version 2>/dev/null || echo "0")
-    if [[ "$ver" =~ ^1\. ]]; then
-      command -v bun
+# Find node - prefer PATH, fallback to known locations
+find_node() {
+  if command -v node &>/dev/null; then
+    local ver=$(node --version 2>/dev/null | sed 's/^v//' || echo "0")
+    local major="${ver%%.*}"
+    if [[ "$major" -ge 22 ]]; then
+      command -v node
       return 0
     fi
   fi
@@ -16,23 +16,14 @@ find_bun() {
   # Fallback: derive paths (need HOME)
   : "${HOME:=$(eval echo ~)}"
 
-  # If running from .bun tree, use that bun
-  if [[ "${BASH_SOURCE[0]}" == */.bun/* ]]; then
-    local bun_home="${BASH_SOURCE[0]%%/.bun/*}/.bun"
-    if [[ -x "$bun_home/bin/bun" ]]; then
-      echo "$bun_home/bin/bun"
-      return 0
-    fi
-  fi
-
   # Check known locations
   local candidates=(
-    "$HOME/.local/share/mise/installs/bun/latest/bin/bun"
-    "$HOME/.local/share/mise/shims/bun"
-    "$HOME/.asdf/shims/bun"
-    "/opt/homebrew/bin/bun"
-    "/usr/local/bin/bun"
-    "$HOME/.bun/bin/bun"
+    "$HOME/.local/share/mise/installs/node/latest/bin/node"
+    "$HOME/.local/share/mise/shims/node"
+    "$HOME/.asdf/shims/node"
+    "/opt/homebrew/bin/node"
+    "/usr/local/bin/node"
+    "$HOME/.nvm/current/bin/node"
   )
   for c in "${candidates[@]}"; do
     [[ -x "$c" ]] && { echo "$c"; return 0; }
@@ -41,7 +32,7 @@ find_bun() {
   return 1
 }
 
-BUN=$(find_bun) || { echo "Error: bun not found. Install from https://bun.sh" >&2; exit 1; }
+NODE=$(find_node) || { echo "Error: node (>=22) not found. Install from https://nodejs.org" >&2; exit 1; }
 
 # Resolve symlinks to find script location
 SOURCE="${BASH_SOURCE[0]}"
@@ -52,4 +43,4 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-exec "$BUN" "$SCRIPT_DIR/src/qmd.ts" "$@"
+exec "$NODE" --import tsx "$SCRIPT_DIR/src/qmd.ts" "$@"

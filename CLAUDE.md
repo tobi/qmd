@@ -122,6 +122,23 @@ bun src/qmd.ts <command>   # Run from source
 bun link               # Install globally as 'qmd'
 ```
 
+## Test Layout
+
+- `src/*.test.ts` = unit tests
+- `src/models/*.test.ts` = tests that require model/runtime setup
+- `src/integration/*.test.ts` = integration tests (CLI subprocesses, daemon/server behavior)
+
+### Run Order
+
+```sh
+npx vitest run --reporter=verbose src/*.test.ts
+npx vitest run --reporter=verbose src/models/*.test.ts
+npx vitest run --reporter=verbose src/integration/*.test.ts
+```
+
+Use this order for faster feedback:
+`unit -> models -> integration`.
+
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)

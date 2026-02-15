@@ -6,14 +6,14 @@
  * LLM operations use LlamaCpp with local GGUF models (node-llama-cpp).
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { Database } from "bun:sqlite";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { disposeDefaultLlamaCpp } from "../llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -43,8 +43,8 @@ import {
   type DocumentResult,
   type SearchResult,
   type RankedResult,
-} from "./store.js";
-import type { CollectionConfig } from "./collections.js";
+} from "../store.js";
+import type { CollectionConfig } from "../collections.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -248,7 +248,7 @@ afterAll(async () => {
 describe("Path Utilities", () => {
   test("homedir returns HOME environment variable", () => {
     const result = homedir();
-    expect(result).toBe(Bun.env.HOME || "/tmp");
+    expect(result).toBe(process.env.HOME || "/tmp");
   });
 
   test("resolve handles absolute paths", () => {
@@ -257,7 +257,7 @@ describe("Path Utilities", () => {
   });
 
   test("resolve handles relative paths", () => {
-    const pwd = Bun.env.PWD || process.cwd();
+    const pwd = process.env.PWD || process.cwd();
     expect(resolve("foo")).toBe(`${pwd}/foo`);
     expect(resolve("foo", "bar")).toBe(`${pwd}/foo/bar`);
   });

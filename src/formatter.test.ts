@@ -4,7 +4,7 @@
  * Run with: bun test formatter.test.ts
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect } from "vitest";
 import {
   // Search result formatters
   searchResultsToJson,

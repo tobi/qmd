@@ -10,11 +10,14 @@
  * 3. Hybrid (RRF) - combined lexical + vector with rank fusion
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import Database from "bun:sqlite";
+import Database from "better-sqlite3";
+import { createHash } from "crypto";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
 
 // Set INDEX_PATH before importing store to prevent using global index
 const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-"));
@@ -31,8 +34,8 @@ import {
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
-} from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "./llm";
+} from "../store";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -106,13 +109,13 @@ describe("BM25 Search (FTS)", () => {
     db = store.db;
 
     // Load and index eval documents
-    const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "../../test/eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {
       const content = readFileSync(join(evalDocsDir, file), "utf-8");
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
-      const hash = Bun.hash(content).toString(16).slice(0, 12);
+      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
       const now = new Date().toISOString();
 
       insertContent(db, hash, content, now);
@@ -178,12 +181,12 @@ describe("Vector Search", () => {
     const llm = getDefaultLlamaCpp();
     store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
 
-    const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "../../test/eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {
       const content = readFileSync(join(evalDocsDir, file), "utf-8");
-      const hash = Bun.hash(content).toString(16).slice(0, 12);
+      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
 
       // Chunk and embed
