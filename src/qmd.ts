@@ -1,6 +1,8 @@
-#!/usr/bin/env bun
-import { Database } from "bun:sqlite";
-import { Glob, $ } from "bun";
+import Database from "better-sqlite3";
+import fastGlob from "fast-glob";
+import { execSync, spawn as nodeSpawn } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname, join as pathJoin } from "path";
 import { parseArgs } from "util";
 import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
@@ -279,8 +281,8 @@ async function showStatus(): Promise<void> {
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
   // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = Bun.env.XDG_CACHE_HOME
-    ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
+  const mcpCacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
     : resolve(homedir(), ".cache", "qmd");
   const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
   if (existsSync(mcpPidPath)) {
@@ -423,15 +425,19 @@ async function updateCollections(): Promise<void> {
     if (yamlCol?.update) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
-        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
+        const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
           cwd: col.pwd,
-          stdout: "pipe",
-          stderr: "pipe",
+          stdio: ["ignore", "pipe", "pipe"],
         });
 
-        const output = await new Response(proc.stdout).text();
-        const errorOutput = await new Response(proc.stderr).text();
-        const exitCode = await proc.exited;
+        const [output, errorOutput, exitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
+          let out = "";
+          let err = "";
+          proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+          proc.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+          proc.on("error", reject);
+          proc.on("close", (code) => resolve([out, err, code ?? 1]));
+        });
 
         if (output.trim()) {
           console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
@@ -1394,20 +1400,18 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const glob = new Glob(globPattern);
-  const files: string[] = [];
-  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: false })) {
-    // Skip node_modules, hidden folders (.*), and other common excludes
+  const allFiles: string[] = await fastGlob(globPattern, {
+    cwd: resolvedPwd,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+    ignore: excludeDirs.map(d => `**/${d}/**`),
+  });
+  // Filter hidden files/folders (dot: false handles top-level but not nested)
+  const files = allFiles.filter(file => {
     const parts = file.split("/");
-    const shouldSkip = parts.some(part =>
-      part === "node_modules" ||
-      part.startsWith(".") ||
-      excludeDirs.includes(part)
-    );
-    if (!shouldSkip) {
-      files.push(file);
-    }
-  }
+    return !parts.some(part => part.startsWith("."));
+  });
 
   const total = files.length;
   if (total === 0) {
@@ -2046,7 +2050,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
-    args: Bun.argv.slice(2), // Skip bun and script path
+    args: process.argv.slice(2), // Skip node and script path
     options: {
       // Global options
       index: {
@@ -2186,14 +2190,13 @@ function showHelp(): void {
 }
 
 async function showVersion(): Promise<void> {
-  const scriptDir = import.meta.dir;
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
   const pkgPath = resolve(scriptDir, "..", "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   let commit = "";
   try {
-    const result = await $`git -C ${scriptDir} rev-parse --short HEAD`.quiet();
-    commit = result.text().trim();
+    commit = execSync(`git -C ${scriptDir} rev-parse --short HEAD`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch {
     // Not a git repo or git not available
   }
@@ -2203,7 +2206,7 @@ async function showVersion(): Promise<void> {
 }
 
 // Main CLI - only run if this is the main module
-if (import.meta.main) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts")) {
   const cli = parseCLI();
 
   if (cli.values.version) {
@@ -2442,8 +2445,8 @@ if (import.meta.main) {
       const sub = cli.args[0]; // stop | status | undefined
 
       // Cache dir for PID/log files — same dir as the index
-      const cacheDir = Bun.env.XDG_CACHE_HOME
-        ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
+      const cacheDir = process.env.XDG_CACHE_HOME
+        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
         : resolve(homedir(), ".cache", "qmd");
       const pidPath = resolve(cacheDir, "mcp.pid");
 
@@ -2485,10 +2488,10 @@ if (import.meta.main) {
           mkdirSync(cacheDir, { recursive: true });
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const child = Bun.spawn([process.execPath, import.meta.path, "mcp", "--http", "--port", String(port)], {
-            stdout: logFd,
-            stderr: logFd,
-            stdin: "ignore",
+          const tsxLoader = pathJoin(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "tsx", "dist", "esm", "index.mjs");
+          const child = nodeSpawn(process.execPath, ["--import", tsxLoader, fileURLToPath(import.meta.url), "mcp", "--http", "--port", String(port)], {
+            stdio: ["ignore", logFd, logFd],
+            detached: true,
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
@@ -2561,4 +2564,4 @@ if (import.meta.main) {
     process.exit(0);
   }
 
-} // end if (import.meta.main)
+} // end if (main module)

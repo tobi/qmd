@@ -10,7 +10,7 @@
  * Run with: bun test store-paths.test.ts
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import {
   isAbsolutePath,
   normalizePathSeparators,
@@ -27,26 +27,26 @@ let originalProcessCwd: () => string;
 
 beforeEach(() => {
   // Save original environment
-  originalPWD = Bun.env.PWD;
+  originalPWD = process.env.PWD;
   originalProcessCwd = process.cwd;
 });
 
 afterEach(() => {
   // Restore original environment
   if (originalPWD !== undefined) {
-    Bun.env.PWD = originalPWD;
+    process.env.PWD = originalPWD;
   } else {
-    delete Bun.env.PWD;
+    delete process.env.PWD;
   }
   process.cwd = originalProcessCwd;
 });
 
 /**
  * Mock the current working directory for testing.
- * Sets both Bun.env.PWD and process.cwd() to simulate different environments.
+ * Sets both process.env.PWD and process.cwd() to simulate different environments.
  */
 function mockPWD(path: string): void {
-  Bun.env.PWD = path;
+  process.env.PWD = path;
   process.cwd = () => path;
 }
 

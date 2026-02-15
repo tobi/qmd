@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -17,7 +17,7 @@ import {
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
-} from "./llm.js";
+} from "../llm.js";
 
 // =============================================================================
 // Singleton Tests (no model loading required)

@@ -5,10 +5,14 @@
  * These tests spawn actual qmd processes to verify end-to-end functionality.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { existsSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import { spawn } from "child_process";
+import { setTimeout as sleep } from "timers/promises";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -18,8 +22,18 @@ let fixturesDir: string;
 let testCounter = 0; // Unique counter for each test run
 
 // Get the directory where this test file lives (same as qmd.ts)
-const qmdDir = import.meta.dir;
-const qmdScript = join(qmdDir, "qmd.ts");
+const qmdDir = dirname(fileURLToPath(import.meta.url));
+const qmdSrcDir = join(qmdDir, "..");
+const projectRoot = join(qmdSrcDir, "..");
+const qmdScript = join(qmdSrcDir, "qmd.ts");
+// Resolve tsx binary from project's node_modules (not cwd-dependent)
+const tsxBin = (() => {
+  const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
+  if (existsSync(candidate)) {
+    return candidate;
+  }
+  return join(process.cwd(), "node_modules", ".bin", "tsx");
+})();
 
 // Helper to run qmd command with test database
 async function runQmd(
@@ -29,7 +43,7 @@ async function runQmd(
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
   const configDir = options.configDir || testConfigDir;
-  const proc = Bun.spawn(["bun", qmdScript, ...args], {
+  const proc = spawn(tsxBin, [qmdScript, ...args], {
     cwd: workingDir,
     env: {
       ...process.env,
@@ -38,13 +52,27 @@ async function runQmd(
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
       ...options.env,
     },
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
+  const stdoutPromise = new Promise<string>((resolve, reject) => {
+    let data = "";
+    proc.stdout?.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+    proc.once("error", reject);
+    proc.stdout?.once("end", () => resolve(data));
+  });
+  const stderrPromise = new Promise<string>((resolve, reject) => {
+    let data = "";
+    proc.stderr?.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+    proc.once("error", reject);
+    proc.stderr?.once("end", () => resolve(data));
+  });
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.on("close", (code) => resolve(code ?? 1));
+  });
+  const stdout = await stdoutPromise;
+  const stderr = await stderrPromise;
 
   return { stdout, stderr, exitCode };
 }
@@ -438,8 +466,7 @@ describe("CLI Error Handling", () => {
     expect(exitCode).toBe(0);
 
     // The custom database should exist
-    const file = Bun.file(customDbPath);
-    expect(await file.exists()).toBe(true);
+    expect(existsSync(customDbPath)).toBe(true);
   });
 });
 
@@ -992,18 +1019,17 @@ describe("mcp http daemon", () => {
   }
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
-  function spawnHttpServer(port: number): ReturnType<typeof Bun.spawn> {
-    const proc = Bun.spawn(["bun", qmdScript, "mcp", "--http", "--port", String(port)], {
+  function spawnHttpServer(port: number): import("child_process").ChildProcess {
+    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
       cwd: fixturesDir,
       env: {
         ...process.env,
         INDEX_PATH: daemonDbPath,
         QMD_CONFIG_DIR: daemonConfigDir,
       },
-      stdout: "pipe",
-      stderr: "pipe",
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    spawnedPids.push(proc.pid);
+    if (proc.pid) spawnedPids.push(proc.pid);
     return proc;
   }
 
@@ -1015,7 +1041,7 @@ describe("mcp http daemon", () => {
         const res = await fetch(`http://localhost:${port}/health`);
         if (res.ok) return true;
       } catch { /* not ready yet */ }
-      await Bun.sleep(200);
+      await sleep(200);
     }
     return false;
   }
@@ -1073,7 +1099,7 @@ describe("mcp http daemon", () => {
       expect(body.status).toBe("ok");
     } finally {
       proc.kill("SIGTERM");
-      await proc.exited;
+      await new Promise(r => proc.on("close", r));
     }
   });
 
@@ -1102,7 +1128,7 @@ describe("mcp http daemon", () => {
 
     // Clean up
     process.kill(pid, "SIGTERM");
-    await Bun.sleep(500);
+    await sleep(500);
     try { require("fs").unlinkSync(pidPath()); } catch {}
   });
 
@@ -1129,7 +1155,7 @@ describe("mcp http daemon", () => {
     expect(require("fs").existsSync(pidPath())).toBe(false);
 
     // Process should be dead
-    await Bun.sleep(500);
+    await sleep(500);
     expect(() => process.kill(pid, 0)).toThrow();
   });
 
@@ -1169,7 +1195,7 @@ describe("mcp http daemon", () => {
 
     // Clean up first daemon
     process.kill(pid, "SIGTERM");
-    await Bun.sleep(500);
+    await sleep(500);
     try { require("fs").unlinkSync(pidPath()); } catch {}
   });
 
@@ -1193,7 +1219,7 @@ describe("mcp http daemon", () => {
     const ready = await waitForServer(port);
     expect(ready).toBe(true);
     process.kill(pid, "SIGTERM");
-    await Bun.sleep(500);
+    await sleep(500);
     try { require("fs").unlinkSync(pidPath()); } catch {}
   });
 });
