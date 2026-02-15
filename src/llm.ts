@@ -491,32 +491,48 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const VALID_DEVICES = ["cpu", "cuda", "metal", "vulkan"] as const;
+      type Device = (typeof VALID_DEVICES)[number];
+      const deviceEnv = process.env.QMD_DEVICE?.toLowerCase().trim();
 
       let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+
+      if (deviceEnv) {
+        // Explicit device override via QMD_DEVICE
+        if (!VALID_DEVICES.includes(deviceEnv as Device)) {
+          throw new Error(
+            `QMD_DEVICE="${process.env.QMD_DEVICE}" is not valid. Valid options: ${VALID_DEVICES.join(", ")}`
           );
         }
+        const gpu = deviceEnv === "cpu" ? false : (deviceEnv as "cuda" | "metal" | "vulkan");
+        llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
       } else {
-        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        // Auto-detect: prefer CUDA > Metal > Vulkan > CPU.
+        // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+        // (likely a binary/build config issue in node-llama-cpp).
+        const gpuTypes = await getLlamaGpuTypes();
+        const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+
+        if (preferred) {
+          try {
+            llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          } catch {
+            llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+            process.stderr.write(
+              `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            );
+          }
+        } else {
+          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        }
+
+        if (!llama.gpu) {
+          process.stderr.write(
+            "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+          );
+        }
       }
 
-      if (!llama.gpu) {
-        process.stderr.write(
-          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
-        );
-      }
       this.llama = llama;
     }
     return this.llama;
@@ -571,15 +587,10 @@ export class LlamaCpp implements LLM {
   private async computeParallelism(perContextMB: number): Promise<number> {
     const llama = await this.ensureLlama();
 
+    // GPU: single context — multiple contexts risk VRAM fragmentation and
+    // synchronization issues with little measurable throughput gain.
     if (llama.gpu) {
-      try {
-        const vram = await llama.getVramState();
-        const freeMB = vram.free / (1024 * 1024);
-        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        return Math.max(1, Math.min(8, maxByVram));
-      } catch {
-        return 2;
-      }
+      return 1;
     }
 
     // CPU: split cores across contexts. At least 4 threads per context.
@@ -1096,6 +1107,14 @@ export class LlamaCpp implements LLM {
       vram,
       cpuCores: llama.cpuMathCores,
     };
+  }
+
+  /**
+   * Get current context counts (for diagnostics/benchmarking).
+   * Returns 0 for contexts that haven't been lazily created yet.
+   */
+  getContextCounts(): { embed: number; rerank: number } {
+    return { embed: this.embedContexts.length, rerank: this.rerankContexts.length };
   }
 
   async dispose(): Promise<void> {
