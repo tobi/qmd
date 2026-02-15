@@ -59,7 +59,7 @@ describe("LlamaCpp.modelExists", () => {
 // Integration Tests (require actual models)
 // =============================================================================
 
-describe("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
 
@@ -390,7 +390,7 @@ describe("LlamaCpp Integration", () => {
 // Session Management Tests
 // =============================================================================
 
-describe("LLM Session Management", () => {
+describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
   describe("withLLMSession", () => {
     test("session provides access to LLM operations", async () => {
       const result = await withLLMSession(async (session) => {

@@ -294,7 +294,7 @@ describe("MCP Server", () => {
   // Tool: qmd_vector_search (Vector)
   // ===========================================================================
 
-  describe("qmd_vector_search tool", () => {
+  describe.skipIf(!!process.env.CI)("qmd_vector_search tool", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -320,7 +320,7 @@ describe("MCP Server", () => {
   // Tool: qmd_deep_search (Deep search)
   // ===========================================================================
 
-  describe("qmd_deep_search tool", () => {
+  describe.skipIf(!!process.env.CI)("qmd_deep_search tool", () => {
     test("expands query with typed variations", async () => {
       const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Returns ExpandedQuery[] — typed expansions, original excluded
