@@ -354,7 +354,7 @@ const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
-  private embedContext: LlamaEmbeddingContext | null = null;
+  private embedContexts: LlamaEmbeddingContext[] = [];
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
@@ -366,7 +366,6 @@ export class LlamaCpp implements LLM {
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
-  private embedContextCreatePromise: Promise<LlamaEmbeddingContext> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -423,7 +422,7 @@ export class LlamaCpp implements LLM {
    * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
    */
   private hasLoadedContexts(): boolean {
-    return !!(this.embedContext || this.rerankContexts.length > 0);
+    return !!(this.embedContexts.length > 0 || this.rerankContexts.length > 0);
   }
 
   /**
@@ -445,10 +444,10 @@ export class LlamaCpp implements LLM {
     }
 
     // Dispose contexts first
-    if (this.embedContext) {
-      await this.embedContext.dispose();
-      this.embedContext = null;
+    for (const ctx of this.embedContexts) {
+      await ctx.dispose();
     }
+    this.embedContexts = [];
     for (const ctx of this.rerankContexts) {
       await ctx.dispose();
     }
@@ -557,34 +556,69 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Load embedding context (lazy). Context can be disposed and recreated without reloading the model.
+   * Compute how many parallel contexts to create based on available VRAM.
+   * Conservative: uses at most 25% of free VRAM for contexts, capped at 8.
+   */
+  private async computeParallelism(perContextMB: number): Promise<number> {
+    const llama = await this.ensureLlama();
+    if (!llama.gpu) return 1; // CPU: no benefit from multiple contexts
+
+    try {
+      const vram = await llama.getVramState();
+      const freeMB = vram.free / (1024 * 1024);
+      // Use at most 25% of free VRAM, min 1, max 8
+      const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
+      return Math.max(1, Math.min(8, maxByVram));
+    } catch {
+      return 2; // Conservative fallback
+    }
+  }
+
+  /**
+   * Load embedding contexts (lazy). Creates multiple for parallel embedding.
    * Uses promise guard to prevent concurrent context creation race condition.
    */
-  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
-    if (!this.embedContext) {
-      // If context creation is already in progress, wait for it
-      if (this.embedContextCreatePromise) {
-        return await this.embedContextCreatePromise;
-      }
+  private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
 
-      // Start context creation and store promise so concurrent calls wait
-      this.embedContextCreatePromise = (async () => {
-        const model = await this.ensureEmbedModel();
-        const context = await model.createEmbeddingContext();
-        this.embedContext = context;
-        return context;
-      })();
-
-      try {
-        const context = await this.embedContextCreatePromise;
-        this.touchActivity();
-        return context;
-      } finally {
-        this.embedContextCreatePromise = null;
-      }
+  private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
+    if (this.embedContexts.length > 0) {
+      this.touchActivity();
+      return this.embedContexts;
     }
-    this.touchActivity();
-    return this.embedContext;
+
+    if (this.embedContextsCreatePromise) {
+      return await this.embedContextsCreatePromise;
+    }
+
+    this.embedContextsCreatePromise = (async () => {
+      const model = await this.ensureEmbedModel();
+      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
+      const n = await this.computeParallelism(150);
+      for (let i = 0; i < n; i++) {
+        try {
+          this.embedContexts.push(await model.createEmbeddingContext());
+        } catch {
+          if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
+          break;
+        }
+      }
+      this.touchActivity();
+      return this.embedContexts;
+    })();
+
+    try {
+      return await this.embedContextsCreatePromise;
+    } finally {
+      this.embedContextsCreatePromise = null;
+    }
+  }
+
+  /**
+   * Get a single embed context (for single-embed calls). Uses first from pool.
+   */
+  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
+    const contexts = await this.ensureEmbedContexts();
+    return contexts[0]!;
   }
 
   /**
@@ -648,21 +682,24 @@ export class LlamaCpp implements LLM {
   /**
    * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
    * Each context has its own sequence, so they can evaluate independently.
+   *
+   * Uses contextSize 1024 instead of auto (40960) — reranking chunks are ~800
+   * tokens max, so 1024 is plenty. This drops VRAM from 11.6 GB to 711 MB per context.
    */
-  private static readonly RERANK_PARALLEL_CONTEXTS = 4;
+  private static readonly RERANK_CONTEXT_SIZE = 1024;
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      const n = LlamaCpp.RERANK_PARALLEL_CONTEXTS;
-      // Create contexts sequentially to avoid VRAM allocation races
+      // Rerank contexts are ~711 MB each at contextSize 1024
+      const n = await this.computeParallelism(750);
       for (let i = 0; i < n; i++) {
         try {
-          this.rerankContexts.push(await model.createRankingContext());
+          this.rerankContexts.push(await model.createRankingContext({
+            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+          }));
         } catch {
-          // VRAM exhausted — use however many we got
           if (this.rerankContexts.length === 0) {
-            // Must have at least one
             throw new Error("Failed to create any rerank context");
           }
           break;
@@ -741,26 +778,51 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
-      const context = await this.ensureEmbedContext();
+      const contexts = await this.ensureEmbedContexts();
+      const n = contexts.length;
 
-      // node-llama-cpp handles batching internally when we make parallel requests
-      const embeddings = await Promise.all(
-        texts.map(async (text) => {
+      if (n === 1) {
+        // Single context: sequential (no point splitting)
+        const context = contexts[0]!;
+        const embeddings = [];
+        for (const text of texts) {
           try {
             const embedding = await context.getEmbeddingFor(text);
-            this.touchActivity();  // Keep-alive during slow batches
-            return {
-              embedding: Array.from(embedding.vector),
-              model: this.embedModelUri,
-            };
+            this.touchActivity();
+            embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
-            return null;
+            embeddings.push(null);
           }
+        }
+        return embeddings;
+      }
+
+      // Multiple contexts: split texts across contexts for parallel evaluation
+      const chunkSize = Math.ceil(texts.length / n);
+      const chunks = Array.from({ length: n }, (_, i) =>
+        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+      );
+
+      const chunkResults = await Promise.all(
+        chunks.map(async (chunk, i) => {
+          const ctx = contexts[i]!;
+          const results: (EmbeddingResult | null)[] = [];
+          for (const text of chunk) {
+            try {
+              const embedding = await ctx.getEmbeddingFor(text);
+              this.touchActivity();
+              results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+            } catch (err) {
+              console.error("Embedding error for text:", err);
+              results.push(null);
+            }
+          }
+          return results;
         })
       );
 
-      return embeddings;
+      return chunkResults.flat();
     } catch (error) {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
@@ -1015,7 +1077,7 @@ export class LlamaCpp implements LLM {
     }
 
     // Clear references
-    this.embedContext = null;
+    this.embedContexts = [];
     this.rerankContexts = [];
     this.embedModel = null;
     this.generateModel = null;
@@ -1024,7 +1086,7 @@ export class LlamaCpp implements LLM {
 
     // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
-    this.embedContextCreatePromise = null;
+    this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }
