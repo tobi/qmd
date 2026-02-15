@@ -561,22 +561,42 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Compute how many parallel contexts to create based on available VRAM.
-   * Conservative: uses at most 25% of free VRAM for contexts, capped at 8.
+   * Compute how many parallel contexts to create.
+   *
+   * GPU: constrained by VRAM (25% of free, capped at 8).
+   * CPU: constrained by cores. Splitting threads across contexts enables
+   *      true parallelism (each context runs on its own cores). Use at most
+   *      half the math cores, with at least 4 threads per context.
    */
   private async computeParallelism(perContextMB: number): Promise<number> {
     const llama = await this.ensureLlama();
-    if (!llama.gpu) return 1; // CPU: no benefit from multiple contexts
 
-    try {
-      const vram = await llama.getVramState();
-      const freeMB = vram.free / (1024 * 1024);
-      // Use at most 25% of free VRAM, min 1, max 8
-      const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-      return Math.max(1, Math.min(8, maxByVram));
-    } catch {
-      return 2; // Conservative fallback
+    if (llama.gpu) {
+      try {
+        const vram = await llama.getVramState();
+        const freeMB = vram.free / (1024 * 1024);
+        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
+        return Math.max(1, Math.min(8, maxByVram));
+      } catch {
+        return 2;
+      }
     }
+
+    // CPU: split cores across contexts. At least 4 threads per context.
+    const cores = llama.cpuMathCores || 4;
+    const maxContexts = Math.floor(cores / 4);
+    return Math.max(1, Math.min(4, maxContexts));
+  }
+
+  /**
+   * Get the number of threads each context should use, given N parallel contexts.
+   * Splits available math cores evenly across contexts.
+   */
+  private async threadsPerContext(parallelism: number): Promise<number> {
+    const llama = await this.ensureLlama();
+    if (llama.gpu) return 0; // GPU: let the library decide
+    const cores = llama.cpuMathCores || 4;
+    return Math.max(1, Math.floor(cores / parallelism));
   }
 
   /**
@@ -599,9 +619,12 @@ export class LlamaCpp implements LLM {
       const model = await this.ensureEmbedModel();
       // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
       const n = await this.computeParallelism(150);
+      const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
-          this.embedContexts.push(await model.createEmbeddingContext());
+          this.embedContexts.push(await model.createEmbeddingContext({
+            ...(threads > 0 ? { threads } : {}),
+          }));
         } catch {
           if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
           break;
@@ -703,11 +726,13 @@ export class LlamaCpp implements LLM {
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
       const n = await this.computeParallelism(1000);
+      const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
             flashAttention: true,
+            ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
           if (this.rerankContexts.length === 0) {
@@ -715,6 +740,7 @@ export class LlamaCpp implements LLM {
             try {
               this.rerankContexts.push(await model.createRankingContext({
                 contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+                ...(threads > 0 ? { threads } : {}),
               }));
             } catch {
               throw new Error("Failed to create any rerank context");

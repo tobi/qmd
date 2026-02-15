@@ -108,18 +108,23 @@ async function benchmarkConfig(
   const vramBefore = llama.gpu ? await llama.getVramState() : null;
   const rssBefore = getMemUsage().rss;
 
-  // Create contexts
+  // Create contexts. On CPU, split threads evenly across contexts.
+  const cpuThreads = !llama.gpu ? Math.floor(llama.cpuMathCores / parallelism) : 0;
   const contexts = [];
   for (let i = 0; i < parallelism; i++) {
     try {
       contexts.push(await model.createRankingContext({
         contextSize: CONTEXT_SIZE,
         flashAttention: flash,
+        ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
       }));
     } catch {
       if (contexts.length === 0) {
         // Try without flash
-        contexts.push(await model.createRankingContext({ contextSize: CONTEXT_SIZE }));
+        contexts.push(await model.createRankingContext({
+          contextSize: CONTEXT_SIZE,
+          ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
+        }));
       }
       break;
     }
@@ -253,8 +258,11 @@ async function main() {
 
   for (const p of PARALLEL_CONFIGS) {
     if (!llama.gpu && p > 1) {
-      console.log(`\n  [${p} ctx] skipped (CPU — no benefit from parallelism)`);
-      continue;
+      // CPU: only test if we have enough cores (at least 4 per context)
+      if (llama.cpuMathCores < p * 4) {
+        console.log(`\n  [${p} ctx] skipped (need ${p * 4} cores, have ${llama.cpuMathCores})`);
+        continue;
+      }
     }
 
     // Test with flash attention
