@@ -1,6 +1,8 @@
 # QMD - Query Markup Documents
 
-Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
+**Development:** Use Bun for package management and testing (`bun install`, `bun test`).
+
+**Runtime:** qmd requires Node.js >=22 at runtime. The published CLI wrapper uses Node.js with tsx to execute the TypeScript source, due to native dependencies (better-sqlite3) that are incompatible with Bun.
 
 ## Commands
 
@@ -156,5 +158,6 @@ Use this order for faster feedback:
 
 ## Do NOT compile
 
-- Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
-- The `qmd` file is a shell script that runs `bun src/qmd.ts` - do not replace it
+- Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec integration
+- The `qmd` file is a shell script that executes `node --import tsx src/qmd.ts` - do not replace it
+- tsx is resolved from the package's own node_modules tree to ensure reliable runtime execution
