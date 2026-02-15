@@ -4,6 +4,8 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
+![QMD Architecture](assets/qmd-architecture.png)
+
 ## Quick Start
 
 ```sh
