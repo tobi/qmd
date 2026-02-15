@@ -8,7 +8,7 @@ import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { tmpdir } from "os";
-import Database from "better-sqlite3";
+import type { Database } from "./db.js";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 

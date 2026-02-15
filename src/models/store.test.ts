@@ -7,8 +7,8 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import Database from "better-sqlite3";
-import * as sqliteVec from "sqlite-vec";
+import { openDatabase, loadSqliteVec } from "../db.js";
+import type { Database } from "../db.js";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -431,7 +431,8 @@ describe("Store Creation", () => {
   test("createStore creates a new store with custom path", async () => {
     const store = await createTestStore();
     expect(store.dbPath).toBe(testDbPath);
-    expect(store.db).toBeInstanceOf(Database);
+    expect(store.db).toBeDefined();
+    expect(typeof store.db.exec).toBe("function");
     await cleanupTestDb(store);
   });
 
@@ -461,7 +462,7 @@ describe("Store Creation", () => {
   });
 
   test("verifySqliteVecLoaded throws when sqlite-vec is not loaded", () => {
-    const db = new Database(":memory:");
+    const db = openDatabase(":memory:");
     try {
       expect(() => verifySqliteVecLoaded(db)).toThrow("sqlite-vec extension is unavailable");
     } finally {
@@ -470,9 +471,9 @@ describe("Store Creation", () => {
   });
 
   test("verifySqliteVecLoaded succeeds when sqlite-vec is loaded", () => {
-    const db = new Database(":memory:");
+    const db = openDatabase(":memory:");
     try {
-      sqliteVec.load(db);
+      loadSqliteVec(db);
       expect(() => verifySqliteVecLoaded(db)).not.toThrow();
     } finally {
       db.close();

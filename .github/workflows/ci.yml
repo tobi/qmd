@@ -7,7 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  test-node:
+    name: Node ${{ matrix.node-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,3 +45,48 @@ jobs:
         run: npx vitest run --reporter=verbose src/integration/*.test.ts
         env:
           CI: true
+
+  test-bun:
+    name: Bun (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install SQLite (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install SQLite (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+
+      - run: bun install
+
+      - name: Unit tests
+        run: bun test --preload ./src/test-preload.ts src/*.test.ts
+        env:
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
+
+      - name: Model tests
+        run: bun test --preload ./src/test-preload.ts src/models/*.test.ts
+        env:
+          CI: true
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
+
+      - name: Integration tests
+        run: bun test --preload ./src/test-preload.ts src/integration/*.test.ts
+        env:
+          CI: true
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu

@@ -6,8 +6,8 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import Database from "better-sqlite3";
-import * as sqliteVec from "sqlite-vec";
+import { openDatabase, loadSqliteVec } from "../db.js";
+import type { Database } from "../db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../llm";
@@ -31,7 +31,7 @@ afterAll(async () => {
 });
 
 function initTestDatabase(db: Database): void {
-  sqliteVec.load(db);
+  loadSqliteVec(db);
   db.exec("PRAGMA journal_mode = WAL");
 
   // Content-addressable storage - the source of truth for document content
@@ -226,7 +226,7 @@ describe("MCP Server", () => {
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
-    testDb = new Database(testDbPath);
+    testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
   });
@@ -306,7 +306,7 @@ describe("MCP Server", () => {
     });
 
     test("returns empty when no vector table exists", async () => {
-      const emptyDb = new Database(":memory:");
+      const emptyDb = openDatabase(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
 
@@ -880,7 +880,7 @@ describe("MCP HTTP Transport", () => {
   beforeAll(async () => {
     // Create isolated test database with seeded data
     httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
-    const db = new Database(httpTestDbPath);
+    const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);
     db.close();

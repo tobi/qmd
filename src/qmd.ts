@@ -1,4 +1,5 @@
-import Database from "better-sqlite3";
+import { openDatabase } from "./db.js";
+import type { Database } from "./db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
