@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "0.9.0",
+  "version": "0.9.9",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "bin": {
@@ -15,15 +15,26 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "bun test --preload ./src/test-preload.ts",
-    "qmd": "bun src/qmd.ts",
-    "index": "bun src/qmd.ts index",
-    "vector": "bun src/qmd.ts vector",
-    "search": "bun src/qmd.ts search",
-    "vsearch": "bun src/qmd.ts vsearch",
-    "rerank": "bun src/qmd.ts rerank",
-    "link": "bun link",
-    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp",
+    "test": "vitest run",
+    "test:unit": "vitest run --reporter=verbose src/*.test.ts",
+    "test:models": "vitest run --reporter=verbose src/models/*.test.ts",
+    "test:integration": "vitest run --reporter=verbose src/integration/*.test.ts",
+    "test:unit:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/*.test.ts",
+    "test:models:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/models/*.test.ts",
+    "test:integration:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/integration/*.test.ts",
+    "test:unit:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/*.test.ts",
+    "test:models:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/models/*.test.ts",
+    "test:integration:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/integration/*.test.ts",
+    "test:ci:bun": "npm run test:unit:bun && npm run test:models:bun && npm run test:integration:bun",
+    "test:ci:node": "npm run test:unit:node && npm run test:models:node && npm run test:integration:node",
+    "test:ci": "npm run test:unit && npm run test:models && npm run test:integration",
+    "qmd": "tsx src/qmd.ts",
+    "index": "tsx src/qmd.ts index",
+    "vector": "tsx src/qmd.ts vector",
+    "search": "tsx src/qmd.ts search",
+    "vsearch": "tsx src/qmd.ts vsearch",
+    "rerank": "tsx src/qmd.ts rerank",
+    "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
     "release": "./scripts/release.sh"
   },
   "publishConfig": {
@@ -39,7 +50,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "better-sqlite3": "^11.0.0",
+    "fast-glob": "^3.3.0",
     "node-llama-cpp": "^3.14.5",
+    "picomatch": "^4.0.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
     "zod": "^4.2.1"
@@ -51,13 +65,15 @@
     "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/better-sqlite3": "^7.6.0",
+    "tsx": "^4.0.0",
+    "vitest": "^3.0.0"
   },
   "peerDependencies": {
     "typescript": "^5.9.3"
   },
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=22.0.0"
   },
   "keywords": [
     "markdown",

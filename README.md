@@ -9,8 +9,14 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 ## Quick Start
 
 ```sh
-# Install globally
+# Install globally (Node or Bun)
+npm install -g @tobilu/qmd
+# or
 bun install -g @tobilu/qmd
+
+# Or run directly
+npx @tobilu/qmd ...
+bunx @tobilu/qmd ...
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
@@ -231,6 +237,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### System Requirements
 
+- **Node.js** >= 22
 - **Bun** >= 1.0.0
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
@@ -252,18 +259,18 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 ## Installation
 
 ```sh
+npm install -g @tobilu/qmd
+# or
 bun install -g @tobilu/qmd
 ```
-
-Make sure `~/.bun/bin` is in your PATH.
 
 ### Development
 
 ```sh
 git clone https://github.com/tobi/qmd
 cd qmd
-bun install
-bun link
+npm install
+npm link
 ```
 
 ## Usage

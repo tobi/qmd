@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * QMD MCP Server - Model Context Protocol server for QMD
  *
@@ -8,6 +7,8 @@
  * Follows MCP spec 2025-06-18 for proper response types.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport }
@@ -147,7 +148,7 @@ function buildInstructions(store: Store): string {
  */
 function createMcpServer(store: Store): McpServer {
   const server = new McpServer(
-    { name: "qmd", version: "1.0.0" },
+    { name: "qmd", version: "0.9.9" },
     { instructions: buildInstructions(store) },
   );
 
@@ -237,9 +238,7 @@ function createMcpServer(store: Store): McpServer {
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Note: Collection filtering is now done post-search since collections are managed in YAML
-      const results = store.searchFTS(query, limit || 10)
-        .filter(r => !collection || r.collectionName === collection);
+      const results = store.searchFTS(query, limit || 10, collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => {
@@ -541,7 +540,7 @@ export async function startMcpServer(): Promise<void> {
 // =============================================================================
 
 export type HttpServerHandle = {
-  httpServer: ReturnType<typeof Bun.serve>;
+  httpServer: import("http").Server;
   port: number;
   stop: () => Promise<void>;
 };
@@ -588,47 +587,79 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     if (!quiet) console.error(msg);
   }
 
-  const httpServer = Bun.serve({
-    port,
-    hostname: "localhost",
-    async fetch(req) {
-      const reqStart = Date.now();
-      const pathname = new URL(req.url).pathname;
+  // Helper to collect request body
+  async function collectBody(req: IncomingMessage): Promise<string> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks).toString();
+  }
 
-      if (pathname === "/health" && req.method === "GET") {
-        const res = Response.json({
-          status: "ok",
-          uptime: Math.floor((Date.now() - startTime) / 1000),
-        });
+  const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
+    const reqStart = Date.now();
+    const pathname = nodeReq.url || "/";
+
+    try {
+      if (pathname === "/health" && nodeReq.method === "GET") {
+        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
-        return res;
+        return;
       }
 
-      if (pathname === "/mcp" && req.method === "POST") {
-        const body = await req.json();
+      if (pathname === "/mcp" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const body = JSON.parse(rawBody);
         const label = describeRequest(body);
-        const res = await transport.handleRequest(req, { parsedBody: body });
+        const url = `http://localhost:${port}${pathname}`;
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(nodeReq.headers)) {
+          if (typeof v === "string") headers[k] = v;
+        }
+        const request = new Request(url, { method: "POST", headers, body: rawBody });
+        const response = await transport.handleRequest(request, { parsedBody: body });
+        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+        nodeRes.end(Buffer.from(await response.arrayBuffer()));
         log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
-        return res;
+        return;
       }
 
-      // Pass other methods (GET, DELETE) to transport for protocol handling
       if (pathname === "/mcp") {
-        return transport.handleRequest(req);
+        const url = `http://localhost:${port}${pathname}`;
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(nodeReq.headers)) {
+          if (typeof v === "string") headers[k] = v;
+        }
+        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
+        const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
+        const response = await transport.handleRequest(request);
+        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        return;
       }
 
-      return new Response("Not Found", { status: 404 });
-    },
+      nodeRes.writeHead(404);
+      nodeRes.end("Not Found");
+    } catch (err) {
+      console.error("HTTP handler error:", err);
+      nodeRes.writeHead(500);
+      nodeRes.end("Internal Server Error");
+    }
   });
 
-  const actualPort = httpServer.port;
+  await new Promise<void>((resolve, reject) => {
+    httpServer.on("error", reject);
+    httpServer.listen(port, "localhost", () => resolve());
+  });
+
+  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
 
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     await transport.close();
-    httpServer.stop();
+    httpServer.close();
     store.close();
     await disposeDefaultLlamaCpp();
   };
@@ -649,6 +680,6 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 }
 
 // Run if this is the main module
-if (import.meta.main) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/mcp.ts")) {
   startMcpServer().catch(console.error);
 }
