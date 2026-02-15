@@ -10,7 +10,7 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 
 ```sh
 # Install globally
-bun install -g https://github.com/tobi/qmd
+bun install -g @tobi/qmd
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
@@ -252,7 +252,7 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 ## Installation
 
 ```sh
-bun install -g github:tobi/qmd
+bun install -g @tobi/qmd
 ```
 
 Make sure `~/.bun/bin` is in your PATH.

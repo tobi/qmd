@@ -1,13 +1,15 @@
 node_modules/
+.npmrc
 *.sqlite
 .DS_Store
 archive/
 texts/
 .cursor/
-.github/
+.github/copilot/
 *.md
 !README.md
 !CLAUDE.md
+!CHANGELOG.md
 !skills/**/*.md
 !finetune/*.md
 finetune/outputs/

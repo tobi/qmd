@@ -1,11 +1,19 @@
 {
-  "name": "qmd",
-  "version": "1.0.0",
-  "description": "Quick Markdown Search - Full-text and vector search for markdown files",
+  "name": "@tobi/qmd",
+  "version": "0.9.0",
+  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "bin": {
     "qmd": "./qmd"
   },
+  "files": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!src/test-preload.ts",
+    "qmd",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "test": "bun test --preload ./src/test-preload.ts",
     "qmd": "bun src/qmd.ts",
@@ -15,7 +23,19 @@
     "vsearch": "bun src/qmd.ts vsearch",
     "rerank": "bun src/qmd.ts rerank",
     "link": "bun link",
-    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
+    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp",
+    "release": "./scripts/release.sh"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tobi/qmd.git"
+  },
+  "homepage": "https://github.com/tobi/qmd#readme",
+  "bugs": {
+    "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
@@ -43,11 +63,18 @@
     "markdown",
     "search",
     "fts",
+    "full-text-search",
     "vector",
+    "semantic-search",
     "sqlite",
     "bm25",
     "embeddings",
-    "ollama"
+    "rag",
+    "mcp",
+    "reranking",
+    "knowledge-base",
+    "local-ai",
+    "llm"
   ],
   "license": "MIT"
 }
