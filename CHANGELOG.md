@@ -31,3 +31,4 @@ Initial public release.
 - Bun UTF-8 path corruption workaround
 
 [0.9.0]: https://github.com/tobi/qmd/releases/tag/v0.9.0
+

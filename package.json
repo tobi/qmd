@@ -1,5 +1,5 @@
 {
-  "name": "@tobi/qmd",
+  "name": "@tobilu/qmd",
   "version": "0.9.0",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
