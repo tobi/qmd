@@ -1654,14 +1654,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
-  // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
-  return term.replace(/[^\w']/g, '').trim();
+  // Use Unicode-aware pattern to preserve CJK and other non-ASCII word characters
+  return term.replace(/[^\p{L}\p{N}']/gu, '').trim();
 }
 
 // Build FTS5 query: phrase-aware with fallback to individual terms
 function buildFTS5Query(query: string): string {
   // Sanitize the full query for phrase matching
-  const sanitizedQuery = query.replace(/[^\w\s']/g, '').trim();
+  const sanitizedQuery = query.replace(/[^\p{L}\p{N}\s']/gu, '').trim();
 
   const terms = query
     .split(/\s+/)
@@ -1700,10 +1700,17 @@ type OutputOptions = {
   limit: number;
   minScore: number;
   all?: boolean;
-  collection?: string;  // Filter by collection name (pwd suffix match)
+  collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
 };
+
+/** Normalize collection filter: undefined if empty, string[] otherwise */
+function normalizeCollectionFilter(raw?: string | string[]): string[] | undefined {
+  if (!raw) return undefined;
+  const names = Array.isArray(raw) ? raw : [raw];
+  return names.length > 0 ? names : undefined;
+}
 
 // Highlight query terms in text (skip short words < 3 chars)
 function highlightTerms(text: string, query: string): string {
@@ -1857,22 +1864,24 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
+  // Validate collection filter(s) if specified
+  let collectionNames: string[] | undefined;
   if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
+    const names = Array.isArray(opts.collection) ? opts.collection : [opts.collection];
+    for (const name of names) {
+      const coll = getCollectionFromYaml(name);
+      if (!coll) {
+        console.error(`Collection not found: ${name}`);
+        closeDb();
+        process.exit(1);
+      }
     }
-    collectionName = opts.collection;
+    collectionNames = names;
   }
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-  const results = searchFTS(db, query, fetchLimit, collectionName as any);
+  const results = searchFTS(db, query, fetchLimit, collectionNames);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1913,12 +1922,15 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
+  const collectionNames = normalizeCollectionFilter(opts.collection);
+  if (collectionNames) {
+    for (const name of collectionNames) {
+      const coll = getCollectionFromYaml(name);
+      if (!coll) {
+        console.error(`Collection not found: ${name}`);
+        closeDb();
+        process.exit(1);
+      }
     }
   }
 
@@ -1926,7 +1938,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   await withLLMSession(async () => {
     const results = await vectorSearchQuery(store, query, {
-      collection: opts.collection,
+      collections: collectionNames,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -1959,12 +1971,15 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
+  const collectionNames = normalizeCollectionFilter(opts.collection);
+  if (collectionNames) {
+    for (const name of collectionNames) {
+      const coll = getCollectionFromYaml(name);
+      if (!coll) {
+        console.error(`Collection not found: ${name}`);
+        closeDb();
+        process.exit(1);
+      }
     }
   }
 
@@ -1972,7 +1987,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   await withLLMSession(async () => {
     const results = await hybridQuery(store, query, {
-      collection: opts.collection,
+      collections: collectionNames,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0,
       hooks: {
@@ -2041,7 +2056,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
-      collection: { type: "string", short: "c" },  // Filter by collection
+      collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
