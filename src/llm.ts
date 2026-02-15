@@ -491,7 +491,29 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      // Auto-detect GPU: try cuda, then vulkan, then metal, then CPU fallback
+      let llama: Llama | null = null;
+      for (const gpu of ["cuda", "vulkan", "metal"] as const) {
+        try {
+          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+          break;
+        } catch {
+          // GPU type not available, try next
+        }
+      }
+      if (!llama) {
+        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        process.stderr.write(
+          "QMD Warning: no GPU acceleration available, running models on CPU (this will be slow).\n" +
+          "Run 'qmd status' for device info. Install CUDA/Vulkan/Metal support for better performance.\n"
+        );
+      } else if (!llama.supportsGpuOffloading) {
+        process.stderr.write(
+          "QMD Warning: GPU detected but offloading not supported, models will run on CPU.\n" +
+          "Run 'qmd status' for device info.\n"
+        );
+      }
+      this.llama = llama;
     }
     return this.llama;
   }
@@ -906,6 +928,35 @@ export class LlamaCpp implements LLM {
     return {
       results,
       model: this.rerankModelUri,
+    };
+  }
+
+  /**
+   * Get device/GPU info for status display.
+   * Initializes llama if not already done.
+   */
+  async getDeviceInfo(): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }> {
+    const llama = await this.ensureLlama();
+    const gpuDevices = await llama.getGpuDeviceNames();
+    let vram: { total: number; used: number; free: number } | undefined;
+    if (llama.gpu) {
+      try {
+        const state = await llama.getVramState();
+        vram = { total: state.total, used: state.used, free: state.free };
+      } catch { /* no vram info */ }
+    }
+    return {
+      gpu: llama.gpu,
+      gpuOffloading: llama.supportsGpuOffloading,
+      gpuDevices,
+      vram,
+      cpuCores: llama.cpuMathCores,
     };
   }
 

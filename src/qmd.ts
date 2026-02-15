@@ -65,7 +65,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -249,7 +249,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-function showStatus(): void {
+async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
 
@@ -360,6 +360,36 @@ function showStatus(): void {
     }
   } else {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+  }
+
+  // Device / GPU info
+  try {
+    const llm = getDefaultLlamaCpp();
+    const device = await llm.getDeviceInfo();
+    console.log(`\n${c.bold}Device${c.reset}`);
+    if (device.gpu) {
+      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+      if (device.gpuDevices.length > 0) {
+        // Deduplicate and count GPUs
+        const counts = new Map<string, number>();
+        for (const name of device.gpuDevices) {
+          counts.set(name, (counts.get(name) || 0) + 1);
+        }
+        const deviceStr = Array.from(counts.entries())
+          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+          .join(', ');
+        console.log(`  Devices:  ${deviceStr}`);
+      }
+      if (device.vram) {
+        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      }
+    } else {
+      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+    }
+    console.log(`  CPU:      ${device.cpuCores} math cores`);
+  } catch {
+    // Don't fail status if LLM init fails
   }
 
   closeDb();
@@ -2347,7 +2377,7 @@ if (import.meta.main) {
     }
 
     case "status":
-      showStatus();
+      await showStatus();
       break;
 
     case "update":
