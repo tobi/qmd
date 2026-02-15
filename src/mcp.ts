@@ -534,6 +534,8 @@ export async function startMcpServer(): Promise<void> {
   const server = createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Informational log to stderr (not stdout, which is used for MCP messages)
+  console.info("QMD MCP server ready on stdio (PID %d)", process.pid);
 }
 
 // =============================================================================
