@@ -21,6 +21,7 @@ import {
   isDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
+  getEmbedBreakdown,
   getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
@@ -62,6 +63,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  DEFAULT_MAX_EMBED_FILE_BYTES,
   createStore,
   getDefaultDbPath,
 } from "./store.js";
@@ -269,7 +271,8 @@ function showStatus(): void {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const maxEmbedSize = getMaxEmbedFileBytes();
+  const { needsEmbedding, tooLarge } = getEmbedBreakdown(db, maxEmbedSize);
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -300,6 +303,9 @@ function showStatus(): void {
   console.log(`  Vectors:  ${vectorCount.count} embedded`);
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
+  }
+  if (tooLarge > 0) {
+    console.log(`  ${c.dim}Skipped:  ${tooLarge} exceed ${formatBytes(maxEmbedSize)} size limit${c.reset}`);
   }
   if (mostRecent.latest) {
     const lastUpdate = new Date(mostRecent.latest);
@@ -1482,7 +1488,20 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+export function getMaxEmbedFileBytes(): number {
+  const env = process.env.QMD_MAX_EMBED_FILE_BYTES;
+  if (!env) return DEFAULT_MAX_EMBED_FILE_BYTES;
+  const parsed = Number(env);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `${c.yellow}Warning: Invalid QMD_MAX_EMBED_FILE_BYTES="${env}", using default ${formatBytes(DEFAULT_MAX_EMBED_FILE_BYTES)}${c.reset}\n`
+    );
+    return DEFAULT_MAX_EMBED_FILE_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
+async function vectorIndex({ model = DEFAULT_EMBED_MODEL, force = false, noSizeLimit = false }: { model?: string; force?: boolean; noSizeLimit?: boolean } = {}): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -1507,11 +1526,22 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   let multiChunkDocs = 0;
 
   // Chunk all documents using actual token counts
+  const maxEmbedSize = noSizeLimit ? Infinity : getMaxEmbedFileBytes();
+  let skippedFiles = 0;
+
   process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
   for (const item of hashesToEmbed) {
-    const encoder = new TextEncoder();
-    const bodyBytes = encoder.encode(item.body).length;
+    const bodyBytes = Buffer.byteLength(item.body, 'utf8');
     if (bodyBytes === 0) continue; // Skip empty
+
+    // Content size limit check
+    if (bodyBytes > maxEmbedSize) {
+      process.stderr.write(
+        `${c.yellow}Skipping ${item.path} (${formatBytes(bodyBytes)} exceeds ${formatBytes(maxEmbedSize)} limit)${c.reset}\n`
+      );
+      skippedFiles++;
+      continue;
+    }
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
@@ -1527,10 +1557,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         seq,
         pos: chunks[seq]!.pos,
         tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
+        bytes: Buffer.byteLength(chunks[seq]!.text, 'utf8'),
         displayName,
       });
     }
+  }
+
+  if (skippedFiles > 0) {
+    console.log(`${c.yellow}${skippedFiles} file(s) skipped (exceeded ${formatBytes(maxEmbedSize)} file size limit). Use --no-size-limit to include all files.${c.reset}`);
   }
 
   if (allChunks.length === 0) {
@@ -1541,7 +1575,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
   const totalChunks = allChunks.length;
-  const totalDocs = hashesToEmbed.length;
+  const totalDocs = hashesToEmbed.length - skippedFiles;
 
   console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
   if (multiChunkDocs > 0) {
@@ -2047,6 +2081,7 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      "no-size-limit": { type: "boolean" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2117,7 +2152,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
+  console.log("  qmd embed [-f] [--no-size-limit]  - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
@@ -2147,6 +2182,10 @@ function showHelp(): void {
   console.log("  -l <num>                   - Maximum lines per file");
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
+  console.log("");
+  console.log("Embed options:");
+  console.log("  -f, --force                - Force re-index all embeddings");
+  console.log("  --no-size-limit            - Embed all files regardless of size (default limit: 5MB)");
   console.log("");
   console.log("Models (auto-downloaded from HuggingFace):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
@@ -2356,7 +2395,7 @@ if (import.meta.main) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      await vectorIndex({ force: !!cli.values.force, noSizeLimit: !!cli.values["no-size-limit"] });
       break;
 
     case "pull": {
