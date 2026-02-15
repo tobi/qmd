@@ -555,6 +555,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const mcpServer = createMcpServer(store);
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
+    sessionIdGenerator: () => crypto.randomUUID(),
   });
   await mcpServer.connect(transport);
 
