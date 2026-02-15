@@ -152,7 +152,7 @@ describe("BM25 Search (FTS)", () => {
 // Vector Search Tests - Requires embedding model
 // =============================================================================
 
-describe("Vector Search", () => {
+describe.skipIf(!!process.env.CI)("Vector Search", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasEmbeddings = false;
@@ -264,7 +264,7 @@ describe("Vector Search", () => {
 // Hybrid Search (RRF) Tests - Combines BM25 + Vector
 // =============================================================================
 
-describe("Hybrid Search (RRF)", () => {
+describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasVectors = false;

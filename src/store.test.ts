@@ -636,7 +636,7 @@ describe("Document Chunking", () => {
   });
 });
 
-describe("Token-based Chunking", () => {
+describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
   test("chunkDocumentByTokens returns single chunk for small documents", async () => {
     const content = "This is a small document.";
     const chunks = await chunkDocumentByTokens(content, 900, 135);
@@ -2245,7 +2245,7 @@ describe("Integration", () => {
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
-describe("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
