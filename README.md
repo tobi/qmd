@@ -195,11 +195,11 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 ### Search Backends
 
-| Backend | Raw Score | Conversion | Range |
-|---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
-| **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| Backend        | Raw Score        | Conversion           | Range      |
+| -------------- | ---------------- | -------------------- | ---------- |
+| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)`    | 0 to ~25+  |
+| **Vector**     | Cosine distance  | `1 / (1 + distance)` | 0.0 to 1.0 |
+| **Reranker**   | LLM 0-10 rating  | `score / 10`         | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
@@ -220,12 +220,12 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### Score Interpretation
 
-| Score | Meaning |
-|-------|---------|
-| 0.8 - 1.0 | Highly relevant |
+| Score     | Meaning             |
+| --------- | ------------------- |
+| 0.8 - 1.0 | Highly relevant     |
 | 0.5 - 0.8 | Moderately relevant |
-| 0.2 - 0.5 | Somewhat relevant |
-| 0.0 - 0.2 | Low relevance |
+| 0.2 - 0.5 | Somewhat relevant   |
+| 0.0 - 0.2 | Low relevance       |
 
 ## Requirements
 
@@ -241,10 +241,10 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 QMD uses three local GGUF models (auto-downloaded on first use):
 
-| Model | Purpose | Size |
-|-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
-| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
+| Model                             | Purpose                      | Size   |
+| --------------------------------- | ---------------------------- | ------ |
+| `embeddinggemma-300M-Q8_0`        | Vector embeddings            | ~300MB |
+| `qwen3-reranker-0.6b-q8_0`        | Re-ranking                   | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
@@ -264,6 +264,62 @@ git clone https://github.com/tobi/qmd
 cd qmd
 bun install
 bun link
+```
+
+## Docker Deployment
+
+Run QMD in a containerized environment to keep your system clean.
+
+### Configuration
+
+Create a `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to configure your directories and user ID:
+
+```ini
+# Path to your Obsidian vault or markdown notes (mounted to /vault)
+OBSIDIAN_VAULT_PATH=/path/to/your/notes
+
+# Path where QMD will store index and models (mounted to /data)
+QMD_DATA_PATH=./qmd-data
+
+# Your user ID (run `id -u`)
+UID=1000
+GID=1000
+```
+
+### Build and Run
+
+Build the image and start the container:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+### Executing Commands
+
+Running commands inside the container:
+
+```bash
+# Add your mounted collection
+docker compose run --rm qmd collection add /vault --name notes
+
+# Generate embeddings
+docker compose run --rm qmd embed
+
+# Search
+docker compose run --rm qmd search "project timeline"
+```
+
+Alternatively, use `docker exec` on the running container:
+
+```bash
+docker exec -it qmd-engine qmd search "API"
 ```
 
 ## Usage
@@ -478,8 +534,8 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
+| Variable         | Default    | Description              |
+| ---------------- | ---------- | ------------------------ |
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 
 ## How It Works
