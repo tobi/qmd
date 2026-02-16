@@ -31,8 +31,9 @@ type OpenAIEmbeddingResponse = {
   data?: Array<{ embedding?: number[] }>;
 };
 
-type CohereRerankResponse = {
+type RerankResponse = {
   results?: Array<{ index?: number; relevance_score?: number }>;
+  data?: Array<{ index?: number; relevance_score?: number }>;
 };
 
 type OpenAIChatResponse = {
@@ -143,6 +144,15 @@ export class ApiLLM implements LLM {
       throw new Error(`ApiLLM.${method} is not implemented without fallback backend`);
     }
     return this.fallbackLLM;
+  }
+
+  private usesVoyageRerankApi(): boolean {
+    try {
+      const hostname = new URL(this.rerankBaseUrl).hostname.toLowerCase();
+      return hostname === "api.voyageai.com" || hostname.endsWith(".voyageai.com");
+    } catch {
+      return this.rerankBaseUrl.toLowerCase().includes("voyageai.com");
+    }
   }
 
   private isLikelyLocalModel(model: string): boolean {
@@ -273,7 +283,7 @@ export class ApiLLM implements LLM {
     options?: { model?: string; strictJson?: boolean }
   ): Promise<string> {
     if (!this.chatApiKey) {
-      throw new Error("ApiLLM chat error: missing API key (set QMD_CHAT_API_KEY or OPENAI_API_KEY)");
+      throw new Error("ApiLLM chat error: missing API key (set QMD_CHAT_API_KEY)");
     }
     const model = options?.model || this.chatModel;
     const strictJson = options?.strictJson ?? this.strictJsonOutput;
@@ -310,7 +320,7 @@ export class ApiLLM implements LLM {
 
   private async requestEmbeddings(texts: string[], modelOverride?: string): Promise<OpenAIEmbeddingResponse | null> {
     if (!this.embedApiKey) {
-      console.error("ApiLLM embedding error: missing API key (set QMD_EMBED_API_KEY or OPENAI_API_KEY)");
+      console.error("ApiLLM embedding error: missing API key (set QMD_EMBED_API_KEY)");
       return null;
     }
 
@@ -428,7 +438,7 @@ export class ApiLLM implements LLM {
 
   async rerank(query: string, documents: RerankDocument[], options: RerankOptions = {}): Promise<RerankResult> {
     if (!this.rerankApiKey) {
-      throw new Error("ApiLLM rerank error: missing API key (set QMD_RERANK_API_KEY or COHERE_API_KEY)");
+      throw new Error("ApiLLM rerank error: missing API key (set QMD_RERANK_API_KEY)");
     }
     if (documents.length === 0) {
       return { results: [], model: this.resolveModel(options.model, this.rerankModel) };
@@ -436,7 +446,8 @@ export class ApiLLM implements LLM {
 
     const model = this.resolveModel(options.model, this.rerankModel);
 
-    let response: CohereRerankResponse;
+    let response: RerankResponse;
+    const topCountField = this.usesVoyageRerankApi() ? "top_k" : "top_n";
     try {
       const resp = await fetch(`${this.rerankBaseUrl}/rerank`, {
         method: "POST",
@@ -445,25 +456,31 @@ export class ApiLLM implements LLM {
           model,
           query,
           documents: documents.map((doc) => doc.text),
-          top_n: documents.length,
+          [topCountField]: documents.length,
         }),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
         throw new Error(`ApiLLM rerank error: ${resp.status} ${resp.statusText} ${body}`.trim());
       }
-      response = await resp.json() as CohereRerankResponse;
+      response = await resp.json() as RerankResponse;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`ApiLLM rerank request failed: ${detail}`);
     }
 
-    if (!Array.isArray(response.results)) {
-      throw new Error("ApiLLM rerank error: invalid response (missing results array)");
+    const responseResults = Array.isArray(response.results)
+      ? response.results
+      : Array.isArray(response.data)
+        ? response.data
+        : null;
+
+    if (!Array.isArray(responseResults)) {
+      throw new Error("ApiLLM rerank error: invalid response (missing results/data array)");
     }
 
     const scoreByIndex = new Map<number, number>();
-    for (const item of response.results) {
+    for (const item of responseResults) {
       if (typeof item.index !== "number" || typeof item.relevance_score !== "number") continue;
       scoreByIndex.set(item.index, item.relevance_score);
     }

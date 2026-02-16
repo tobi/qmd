@@ -158,6 +158,53 @@ describe("ApiLLM (contract)", () => {
     });
   });
 
+  test("rerank sends Voyage-compatible top_k and accepts data response shape", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            { index: 0, relevance_score: 0.12 },
+            { index: 1, relevance_score: 0.95 },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const llm = new ApiLLM({
+      rerankBaseUrl: "https://api.voyageai.com/v1",
+      rerankApiKey: "voyage-key",
+      rerankModel: "rerank-2.5-lite",
+    });
+
+    const result = await llm.rerank(
+      "capital of france",
+      [
+        { file: "a.md", text: "Berlin is the capital of Germany." },
+        { file: "b.md", text: "Paris is the capital of France." },
+      ]
+    );
+
+    expect(result.model).toBe("rerank-2.5-lite");
+    expect(result.results).toEqual([
+      { file: "b.md", score: 0.95, index: 1 },
+      { file: "a.md", score: 0.12, index: 0 },
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.voyageai.com/v1/rerank");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      model: "rerank-2.5-lite",
+      query: "capital of france",
+      documents: [
+        "Berlin is the capital of Germany.",
+        "Paris is the capital of France.",
+      ],
+      top_k: 2,
+    });
+  });
+
   test("rerank throws and avoids fetch when rerank API key is missing", async () => {
     process.env.QMD_EMBED_API_KEY = "";
     process.env.QMD_RERANK_API_KEY = "";
