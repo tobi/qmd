@@ -4,9 +4,13 @@ import { ApiLLM } from "../src/api.js";
 describe("ApiLLM (contract)", () => {
   const fetchMock = vi.fn();
   const originalFetch = globalThis.fetch;
-  const originalQmdApiKey = process.env.QMD_API_KEY;
+  const originalQmdEmbedApiKey = process.env.QMD_EMBED_API_KEY;
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
-  const originalQmdApiRerankKey = process.env.QMD_API_RERANK_KEY;
+  const originalQmdChatApiKey = process.env.QMD_CHAT_API_KEY;
+  const originalQmdChatStrictJsonOutput = process.env.QMD_CHAT_STRICT_JSON_OUTPUT;
+  const originalOpenAiChatModel = process.env.OPENAI_CHAT_MODEL;
+  const originalQmdChatModel = process.env.QMD_CHAT_MODEL;
+  const originalQmdRerankApiKey = process.env.QMD_RERANK_API_KEY;
   const originalCohereApiKey = process.env.COHERE_API_KEY;
 
   beforeEach(() => {
@@ -16,9 +20,13 @@ describe("ApiLLM (contract)", () => {
 
   afterEach(() => {
     (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
-    process.env.QMD_API_KEY = originalQmdApiKey;
+    process.env.QMD_EMBED_API_KEY = originalQmdEmbedApiKey;
     process.env.OPENAI_API_KEY = originalOpenAiApiKey;
-    process.env.QMD_API_RERANK_KEY = originalQmdApiRerankKey;
+    process.env.QMD_CHAT_API_KEY = originalQmdChatApiKey;
+    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = originalQmdChatStrictJsonOutput;
+    process.env.OPENAI_CHAT_MODEL = originalOpenAiChatModel;
+    process.env.QMD_CHAT_MODEL = originalQmdChatModel;
+    process.env.QMD_RERANK_API_KEY = originalQmdRerankApiKey;
     process.env.COHERE_API_KEY = originalCohereApiKey;
   });
 
@@ -86,7 +94,7 @@ describe("ApiLLM (contract)", () => {
   });
 
   test("embed returns null and avoids fetch when API key is missing", async () => {
-    process.env.QMD_API_KEY = "";
+    process.env.QMD_EMBED_API_KEY = "";
     process.env.OPENAI_API_KEY = "";
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -158,9 +166,9 @@ describe("ApiLLM (contract)", () => {
   });
 
   test("rerank throws and avoids fetch when rerank API key is missing", async () => {
-    process.env.QMD_API_KEY = "";
+    process.env.QMD_EMBED_API_KEY = "";
     process.env.OPENAI_API_KEY = "";
-    process.env.QMD_API_RERANK_KEY = "";
+    process.env.QMD_RERANK_API_KEY = "";
     process.env.COHERE_API_KEY = "";
 
     const llm = new ApiLLM({
@@ -174,5 +182,97 @@ describe("ApiLLM (contract)", () => {
       llm.rerank("q", [{ file: "doc.md", text: "t" }])
     ).rejects.toThrow("missing API key");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test("expandQuery accepts line format when strict JSON is disabled (default)", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: "lex: api auth docs\nvec: api authentication guide\nhyde: A guide to API authentication setup",
+            },
+          }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const llm = new ApiLLM({
+      chatBaseUrl: "https://chat.example.test/v1",
+      chatApiKey: "chat-key",
+      chatModel: "gpt-4o-mini",
+    });
+
+    const result = await llm.expandQuery("api auth docs");
+    expect(result).toEqual([
+      { type: "lex", text: "api auth docs" },
+      { type: "vec", text: "api authentication guide" },
+      { type: "hyde", text: "A guide to API authentication setup" },
+    ]);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://chat.example.test/v1/chat/completions");
+    expect(init?.method).toBe("POST");
+    expect(init?.headers).toEqual({
+      "Content-Type": "application/json",
+      "Authorization": "Bearer chat-key",
+    });
+  });
+
+  test("expandQuery uses strict JSON mode from env and parses JSON output", async () => {
+    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = "true";
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: JSON.stringify([
+                { type: "lex", text: "api auth docs" },
+                { type: "vec", text: "api authentication guide" },
+              ]),
+            },
+          }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const llm = new ApiLLM({
+      chatBaseUrl: "https://chat.example.test/v1",
+      chatApiKey: "chat-key",
+      chatModel: "gpt-4o-mini",
+    });
+
+    const result = await llm.expandQuery("api auth docs", { includeLexical: false });
+    expect(result).toEqual([
+      { type: "vec", text: "api authentication guide" },
+    ]);
+  });
+
+  test("expandQuery rejects line output when strict JSON mode is enabled", async () => {
+    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = "true";
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: "vec: api authentication guide",
+            },
+          }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const llm = new ApiLLM({
+      chatBaseUrl: "https://chat.example.test/v1",
+      chatApiKey: "chat-key",
+      chatModel: "gpt-4o-mini",
+    });
+
+    await expect(
+      llm.expandQuery("api auth docs")
+    ).rejects.toThrow("strict JSON output is enabled");
   });
 });
