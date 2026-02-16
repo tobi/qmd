@@ -1748,7 +1748,7 @@ type OutputOptions = {
   limit: number;
   minScore: number;
   all?: boolean;
-  collection?: string;  // Filter by collection name (pwd suffix match)
+  collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
 };
@@ -1902,24 +1902,47 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   }
 }
 
-function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
-
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
+// Resolve -c collection filter: supports single string, array, or undefined.
+// Returns validated collection names (exits on unknown collection).
+function resolveCollectionFilter(raw: string | string[] | undefined): string[] {
+  if (!raw) return [];
+  const names = Array.isArray(raw) ? raw : [raw];
+  const validated: string[] = [];
+  for (const name of names) {
+    const coll = getCollectionFromYaml(name);
     if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
+      console.error(`Collection not found: ${name}`);
       closeDb();
       process.exit(1);
     }
-    collectionName = opts.collection;
+    validated.push(name);
   }
+  return validated;
+}
+
+// Post-filter results to only include files from specified collections.
+function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
+  if (collectionNames.length <= 1) return results;
+  const prefixes = collectionNames.map(n => `qmd://${n}/`);
+  return results.filter(r => {
+    const path = r.filepath || r.file || '';
+    return prefixes.some(p => path.startsWith(p));
+  });
+}
+
+function search(query: string, opts: OutputOptions): void {
+  const db = getDb();
+
+  // Validate collection filter (supports multiple -c flags)
+  const collectionNames = resolveCollectionFilter(opts.collection);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionName);
+  const results = filterByCollections(
+    searchFTS(db, query, fetchLimit, singleCollection),
+    collectionNames
+  );
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1960,20 +1983,15 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
+  // Validate collection filter (supports multiple -c flags)
+  const collectionNames = resolveCollectionFilter(opts.collection);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    const results = await vectorSearchQuery(store, query, {
-      collection: opts.collection,
+    let results = await vectorSearchQuery(store, query, {
+      collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -1983,6 +2001,14 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       },
     });
+
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `qmd://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
 
     closeDb();
 
@@ -2006,20 +2032,15 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
+  // Validate collection filter (supports multiple -c flags)
+  const collectionNames = resolveCollectionFilter(opts.collection);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    const results = await hybridQuery(store, query, {
-      collection: opts.collection,
+    let results = await hybridQuery(store, query, {
+      collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0,
       hooks: {
@@ -2039,6 +2060,14 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         },
       },
     });
+
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `qmd://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
 
     closeDb();
 
@@ -2088,7 +2117,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
-      collection: { type: "string", short: "c" },  // Filter by collection
+      collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2137,7 +2166,7 @@ function parseCLI() {
     limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
-    collection: values.collection as string | undefined,
+    collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
   };
 
