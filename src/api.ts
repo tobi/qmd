@@ -78,8 +78,6 @@ export class ApiLLM implements LLM {
     const normalizedEmbedBaseUrl = (
       config.embedBaseUrl
       || process.env.QMD_EMBED_BASE_URL
-      || process.env.QMD_API_BASE_URL // Legacy alias
-      || process.env.OPENAI_BASE_URL
       || DEFAULT_EMBED_BASE_URL
     ).replace(/\/+$/, "");
     this.embedBaseUrl = normalizedEmbedBaseUrl;
@@ -87,56 +85,40 @@ export class ApiLLM implements LLM {
     this.embedApiKey =
       config.embedApiKey
       || process.env.QMD_EMBED_API_KEY
-      || process.env.QMD_API_KEY // Legacy alias
-      || process.env.OPENAI_API_KEY
       || "";
     this.embedModel =
       config.embedModel
       || process.env.QMD_EMBED_MODEL
-      || process.env.QMD_API_EMBED_MODEL // Legacy alias
-      || process.env.OPENAI_EMBED_MODEL
       || DEFAULT_EMBED_MODEL;
     this.chatBaseUrl = (
       config.chatBaseUrl
       || process.env.QMD_CHAT_BASE_URL
-      || process.env.QMD_API_CHAT_BASE_URL // Legacy alias
-      || process.env.OPENAI_BASE_URL
       || DEFAULT_CHAT_BASE_URL
     ).replace(/\/+$/, "");
     this.chatApiKey =
       config.chatApiKey
       || process.env.QMD_CHAT_API_KEY
-      || process.env.QMD_API_CHAT_KEY // Legacy alias
-      || process.env.OPENAI_API_KEY
       || this.embedApiKey;
     this.chatModel =
       config.chatModel
       || process.env.QMD_CHAT_MODEL
-      || process.env.QMD_API_CHAT_MODEL // Legacy alias
-      || process.env.OPENAI_CHAT_MODEL
       || DEFAULT_CHAT_MODEL;
     this.strictJsonOutput = config.strictJsonOutput ?? this.parseBooleanEnv(
-      process.env.QMD_CHAT_STRICT_JSON_OUTPUT ?? process.env.QMD_API_STRICT_JSON_OUTPUT, // Legacy alias
+      process.env.QMD_CHAT_STRICT_JSON_OUTPUT,
       false
     );
     this.rerankBaseUrl = (
       config.rerankBaseUrl
       || process.env.QMD_RERANK_BASE_URL
-      || process.env.QMD_API_RERANK_BASE_URL // Legacy alias
-      || process.env.COHERE_BASE_URL
-      || (process.env.COHERE_API_KEY ? DEFAULT_RERANK_BASE_URL : normalizedEmbedBaseUrl)
+      || DEFAULT_RERANK_BASE_URL
     ).replace(/\/+$/, "");
     this.rerankApiKey =
       config.rerankApiKey
       || process.env.QMD_RERANK_API_KEY
-      || process.env.QMD_API_RERANK_KEY // Legacy alias
-      || process.env.COHERE_API_KEY
       || this.embedApiKey;
     this.rerankModel =
       config.rerankModel
       || process.env.QMD_RERANK_MODEL
-      || process.env.QMD_API_RERANK_MODEL // Legacy alias
-      || process.env.COHERE_RERANK_MODEL
       || DEFAULT_RERANK_MODEL;
     this.fallbackLLM = config.fallbackLLM;
   }

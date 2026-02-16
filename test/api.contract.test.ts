@@ -5,13 +5,10 @@ describe("ApiLLM (contract)", () => {
   const fetchMock = vi.fn();
   const originalFetch = globalThis.fetch;
   const originalQmdEmbedApiKey = process.env.QMD_EMBED_API_KEY;
-  const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
   const originalQmdChatApiKey = process.env.QMD_CHAT_API_KEY;
   const originalQmdChatStrictJsonOutput = process.env.QMD_CHAT_STRICT_JSON_OUTPUT;
-  const originalOpenAiChatModel = process.env.OPENAI_CHAT_MODEL;
   const originalQmdChatModel = process.env.QMD_CHAT_MODEL;
   const originalQmdRerankApiKey = process.env.QMD_RERANK_API_KEY;
-  const originalCohereApiKey = process.env.COHERE_API_KEY;
 
   beforeEach(() => {
     fetchMock.mockReset();
@@ -21,13 +18,10 @@ describe("ApiLLM (contract)", () => {
   afterEach(() => {
     (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
     process.env.QMD_EMBED_API_KEY = originalQmdEmbedApiKey;
-    process.env.OPENAI_API_KEY = originalOpenAiApiKey;
     process.env.QMD_CHAT_API_KEY = originalQmdChatApiKey;
     process.env.QMD_CHAT_STRICT_JSON_OUTPUT = originalQmdChatStrictJsonOutput;
-    process.env.OPENAI_CHAT_MODEL = originalOpenAiChatModel;
     process.env.QMD_CHAT_MODEL = originalQmdChatModel;
     process.env.QMD_RERANK_API_KEY = originalQmdRerankApiKey;
-    process.env.COHERE_API_KEY = originalCohereApiKey;
   });
 
   test("embed sends OpenAI-compatible /embeddings request, normalizes model, and parses response", async () => {
@@ -95,7 +89,6 @@ describe("ApiLLM (contract)", () => {
 
   test("embed returns null and avoids fetch when API key is missing", async () => {
     process.env.QMD_EMBED_API_KEY = "";
-    process.env.OPENAI_API_KEY = "";
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const llm = new ApiLLM({
@@ -167,9 +160,7 @@ describe("ApiLLM (contract)", () => {
 
   test("rerank throws and avoids fetch when rerank API key is missing", async () => {
     process.env.QMD_EMBED_API_KEY = "";
-    process.env.OPENAI_API_KEY = "";
     process.env.QMD_RERANK_API_KEY = "";
-    process.env.COHERE_API_KEY = "";
 
     const llm = new ApiLLM({
       embedBaseUrl: "https://example.test/v1",
