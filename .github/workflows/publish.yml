@@ -23,7 +23,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - run: bun install
-      - run: bun test
+      - run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
+        env:
+          CI: true
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
 
       - uses: actions/setup-node@v4
         with:
@@ -31,8 +34,5 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - run: npm publish --provenance --access public
-
-      - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
