@@ -12,7 +12,9 @@ let _Database: any;
 let _sqliteVecLoad: (db: any) => void;
 
 if (isBun) {
-  _Database = (await import("bun:sqlite")).Database;
+  // Dynamic string prevents tsc from resolving bun:sqlite on Node.js builds
+  const bunSqlite = "bun:" + "sqlite";
+  _Database = (await import(/* @vite-ignore */ bunSqlite)).Database;
   const { getLoadablePath } = await import("sqlite-vec");
   _sqliteVecLoad = (db: any) => db.loadExtension(getLoadablePath());
 } else {
