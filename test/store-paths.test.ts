@@ -16,7 +16,7 @@ import {
   normalizePathSeparators,
   getRelativePathFromPrefix,
   resolve,
-} from "./store.js";
+} from "../src/store.js";
 
 // =============================================================================
 // Test Utilities

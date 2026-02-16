@@ -27,8 +27,8 @@ import {
   documentToXml,
   formatDocument,
   type MultiGetFile,
-} from "./formatter.js";
-import type { SearchResult, DocumentResult } from "./store.js";
+} from "../src/formatter.js";
+import type { SearchResult, DocumentResult } from "../src/store.js";
 
 // =============================================================================
 // Test Fixtures

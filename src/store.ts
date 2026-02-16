@@ -11,11 +11,11 @@
  *   const store = createStore();
  */
 
-import Database from "better-sqlite3";
+import { openDatabase, loadSqliteVec } from "./db.js";
+import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
-import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -618,22 +618,16 @@ export function verifySqliteVecLoaded(db: Database): void {
   }
 }
 
+let _sqliteVecAvailable: boolean | null = null;
+
 function initializeDatabase(db: Database): void {
   try {
-    sqliteVec.load(db);
+    loadSqliteVec(db);
     verifySqliteVecLoaded(db);
-  } catch (err) {
-    const message = getErrorMessage(err);
-
-    if (message.includes("does not support dynamic extension loading")) {
-      throw createSqliteVecUnavailableError("SQLite build does not support dynamic extension loading");
-    }
-
-    if (message.includes("sqlite-vec extension is unavailable")) {
-      throw err;
-    }
-
-    throw err;
+    _sqliteVecAvailable = true;
+  } catch {
+    // sqlite-vec is optional — vector search won't work but FTS is fine
+    _sqliteVecAvailable = false;
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -747,7 +741,14 @@ function initializeDatabase(db: Database): void {
 }
 
 
+export function isSqliteVecAvailable(): boolean {
+  return _sqliteVecAvailable === true;
+}
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
+  if (!_sqliteVecAvailable) {
+    throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
+  }
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
@@ -845,7 +846,7 @@ export type Store = {
  */
 export function createStore(dbPath?: string): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
-  const db = new Database(resolvedPath);
+  const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
   return {

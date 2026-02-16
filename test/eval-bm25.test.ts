@@ -8,7 +8,7 @@ import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { tmpdir } from "os";
-import Database from "better-sqlite3";
+import type { Database } from "../src/db.js";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 
@@ -17,7 +17,7 @@ import {
   searchFTS,
   insertDocument,
   insertContent,
-} from "./store";
+} from "../src/store";
 
 // Set INDEX_PATH before importing store to prevent using global index
 const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-unit-"));
@@ -92,7 +92,7 @@ describe("BM25 Search (FTS)", () => {
     db = store.db;
 
     // Load and index eval documents
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {

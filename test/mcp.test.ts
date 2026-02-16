@@ -6,16 +6,16 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import Database from "better-sqlite3";
-import * as sqliteVec from "sqlite-vec";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "../collections";
+import type { CollectionConfig } from "../src/collections";
 
 // =============================================================================
 // Test Database Setup
@@ -31,7 +31,7 @@ afterAll(async () => {
 });
 
 function initTestDatabase(db: Database): void {
-  sqliteVec.load(db);
+  loadSqliteVec(db);
   db.exec("PRAGMA journal_mode = WAL");
 
   // Content-addressable storage - the source of truth for document content
@@ -192,8 +192,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "../store";
-import type { RankedResult } from "../store";
+} from "../src/store";
+import type { RankedResult } from "../src/store";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -226,7 +226,7 @@ describe("MCP Server", () => {
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
-    testDb = new Database(testDbPath);
+    testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
   });
@@ -306,7 +306,7 @@ describe("MCP Server", () => {
     });
 
     test("returns empty when no vector table exists", async () => {
-      const emptyDb = new Database(":memory:");
+      const emptyDb = openDatabase(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
 
@@ -649,7 +649,7 @@ describe("MCP Server", () => {
         WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
-      expect(doc).toBeUndefined();
+      expect(doc == null).toBe(true); // bun:sqlite returns null, better-sqlite3 returns undefined
     });
 
     test("includes context in document body", () => {
@@ -865,8 +865,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../mcp";
-import { enableProductionMode } from "../store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp";
+import { enableProductionMode } from "../src/store";
 
 describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
@@ -880,7 +880,7 @@ describe("MCP HTTP Transport", () => {
   beforeAll(async () => {
     // Create isolated test database with seeded data
     httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
-    const db = new Database(httpTestDbPath);
+    const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);
     db.close();
@@ -946,17 +946,28 @@ describe("MCP HTTP Transport", () => {
   // MCP protocol over HTTP
   // ---------------------------------------------------------------------------
 
+  /** Track session ID returned by initialize (MCP Streamable HTTP spec) */
+  let sessionId: string | null = null;
+
   /** Send a JSON-RPC message to /mcp and return the parsed response.
    * MCP Streamable HTTP requires Accept header with both JSON and SSE. */
   async function mcpRequest(body: object): Promise<{ status: number; json: any; contentType: string | null }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
     const res = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-      },
+      headers,
       body: JSON.stringify(body),
     });
+
+    // Capture session ID from initialize responses
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+
     const json = await res.json();
     return { status: res.status, json, contentType: res.headers.get("content-type") };
   }

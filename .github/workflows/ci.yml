@@ -7,20 +7,51 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  test-node:
+    name: Node ${{ matrix.node-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        bun-version: ["latest", "1.1.0"]
+        node-version: ["22", "23"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install SQLite (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install SQLite (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+
+      - run: npm install
+
+      - name: Tests
+        run: npx vitest run --reporter=verbose test/
+        env:
+          CI: true
+
+  test-bun:
+    name: Bun (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: ${{ matrix.bun-version }}
+          bun-version: latest
 
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
@@ -32,4 +63,9 @@ jobs:
 
       - run: bun install
 
-      - run: bun test
+      - name: Tests
+        run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
+        env:
+          CI: true
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu

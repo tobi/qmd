@@ -14,7 +14,8 @@ import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import Database from "better-sqlite3";
+import { openDatabase } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
@@ -34,8 +35,8 @@ import {
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
-} from "../store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../llm";
+} from "../src/store";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -109,7 +110,7 @@ describe("BM25 Search (FTS)", () => {
     db = store.db;
 
     // Load and index eval documents
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "../../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {
@@ -181,7 +182,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     const llm = getDefaultLlamaCpp();
     store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
 
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "../../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {

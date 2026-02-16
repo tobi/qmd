@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "0.9.9",
+  "version": "1.0.0",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "bin": {
@@ -15,19 +15,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "vitest run",
-    "test:unit": "vitest run --reporter=verbose src/*.test.ts",
-    "test:models": "vitest run --reporter=verbose src/models/*.test.ts",
-    "test:integration": "vitest run --reporter=verbose src/integration/*.test.ts",
-    "test:unit:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/*.test.ts",
-    "test:models:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/models/*.test.ts",
-    "test:integration:bun": "bun run vitest run --reporter=verbose --testTimeout=120000 src/integration/*.test.ts",
-    "test:unit:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/*.test.ts",
-    "test:models:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/models/*.test.ts",
-    "test:integration:node": "npx vitest run --reporter=verbose --testTimeout=120000 src/integration/*.test.ts",
-    "test:ci:bun": "npm run test:unit:bun && npm run test:models:bun && npm run test:integration:bun",
-    "test:ci:node": "npm run test:unit:node && npm run test:models:node && npm run test:integration:node",
-    "test:ci": "npm run test:unit && npm run test:models && npm run test:integration",
+    "test": "vitest run --reporter=verbose test/",
     "qmd": "tsx src/qmd.ts",
     "index": "tsx src/qmd.ts index",
     "vector": "tsx src/qmd.ts vector",
