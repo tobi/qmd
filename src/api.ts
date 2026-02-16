@@ -176,29 +176,23 @@ export class ApiLLM implements LLM {
     if (!this.chatApiKey) {
       throw new Error("ApiLLM chat error: missing API key (set QMD_CHAT_API_KEY)");
     }
-    let response: OpenAIChatResponse;
-    try {
-      const payload: Record<string, unknown> = {
-        model: this.chatModel,
-        messages,
-        temperature: 0.2,
-      };
+    const payload: Record<string, unknown> = {
+      model: this.chatModel,
+      messages,
+      temperature: 0.2,
+    };
 
-      const resp = await fetch(`${this.chatBaseUrl}/chat/completions`, {
-        method: "POST",
-        headers: this.getHeaders(this.chatApiKey),
-        body: JSON.stringify(payload),
-      });
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        throw new Error(`ApiLLM chat error: ${resp.status} ${resp.statusText} ${body}`.trim());
-      }
-      response = await resp.json() as OpenAIChatResponse;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`ApiLLM chat request failed: ${detail}`);
+    const resp = await fetch(`${this.chatBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: this.getHeaders(this.chatApiKey),
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`ApiLLM chat error: ${resp.status} ${resp.statusText} ${body}`.trim());
     }
 
+    const response = await resp.json() as OpenAIChatResponse;
     const content = this.extractChatContent(response);
     return content;
   }
@@ -224,13 +218,14 @@ export class ApiLLM implements LLM {
       }
       return await resp.json() as OpenAIEmbeddingResponse;
     } catch (error) {
+      // Local backend seems to return null, so we do as well to keep consistent
       console.error("ApiLLM embedding error:", error);
       return null;
     }
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    void options; // Seems used for model override in local backend, ignoring here
+    void options;  // Seems to be used for model override in local backend, ignoring here
     const response = await this.requestEmbeddings([text]);
     const vector = response?.data?.[0]?.embedding;
     if (!vector || !Array.isArray(vector)) return null;
@@ -249,6 +244,7 @@ export class ApiLLM implements LLM {
       return texts.map(() => null);
     }
 
+    // Keep output index-aligned with inputs; missing/invalid embeddings become null.
     const results: (EmbeddingResult | null)[] = [];
     for (let i = 0; i < texts.length; i++) {
       const vector = response.data[i]?.embedding;
@@ -267,10 +263,12 @@ export class ApiLLM implements LLM {
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     void prompt;
     void options;
+    // generate() doesn't seem to be called from anywhere in the codebase, so we just throw for now
     throw new Error("ApiLLM generate is not implemented for API backend (use QMD_LLM_BACKEND=local)");
   }
 
   async modelExists(model: string): Promise<ModelInfo> {
+    // Used only in local backend tests?
     return { name: model, exists: true };
   }
 
@@ -333,28 +331,22 @@ export class ApiLLM implements LLM {
 
     const model = this.rerankModel;
 
-    let response: RerankResponse;
     const topCountField = this.usesVoyageRerankApi() ? "top_k" : "top_n";
-    try {
-      const resp = await fetch(`${this.rerankBaseUrl}/rerank`, {
-        method: "POST",
-        headers: this.getHeaders(this.rerankApiKey),
-        body: JSON.stringify({
-          model,
-          query,
-          documents: documents.map((doc) => doc.text),
-          [topCountField]: documents.length,
-        }),
-      });
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        throw new Error(`ApiLLM rerank error: ${resp.status} ${resp.statusText} ${body}`.trim());
-      }
-      response = await resp.json() as RerankResponse;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`ApiLLM rerank request failed: ${detail}`);
+    const resp = await fetch(`${this.rerankBaseUrl}/rerank`, {
+      method: "POST",
+      headers: this.getHeaders(this.rerankApiKey),
+      body: JSON.stringify({
+        model,
+        query,
+        documents: documents.map((doc) => doc.text),
+        [topCountField]: documents.length,
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`ApiLLM rerank error: ${resp.status} ${resp.statusText} ${body}`.trim());
     }
+    const response = await resp.json() as RerankResponse;
 
     const responseResults = Array.isArray(response.results)
       ? response.results

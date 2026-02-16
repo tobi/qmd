@@ -292,7 +292,7 @@ describe("ApiLLM (contract)", () => {
 
     await expect(
       llm.expandQuery("api auth docs")
-    ).rejects.toThrow("chat request failed");
+    ).rejects.toThrow("chat error: 503");
   });
 
   test("expandQuery returns empty expansion set when output is not parseable line format", async () => {
