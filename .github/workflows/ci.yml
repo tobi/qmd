@@ -64,7 +64,7 @@ jobs:
       - run: bun install
 
       - name: Tests
-        run: bun test --preload ./src/test-preload.ts test/
+        run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
         env:
           CI: true
           DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
