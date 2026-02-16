@@ -179,9 +179,8 @@ export class ApiLLM implements LLM {
       throw new Error("ApiLLM expandQuery error: empty model output");
     }
 
-    // Try strict JSON shape first: [{ type, text }, ...] or { queries: [...] }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
+    const parseQueryArray = (raw: string): Queryable[] | null => {
+      const parsed = JSON.parse(raw) as unknown;
       const asArray =
         Array.isArray(parsed) ? parsed : (
           typeof parsed === "object"
@@ -190,31 +189,64 @@ export class ApiLLM implements LLM {
             ? (parsed as { queries: unknown[] }).queries
             : null
         );
-      if (asArray) {
-        const queries = asArray
-          .map(item => {
-            if (typeof item !== "object" || item === null) return null;
-            const type = (item as { type?: unknown }).type;
-            const text = (item as { text?: unknown }).text;
-            if (
-              (type === "lex" || type === "vec" || type === "hyde")
-              && typeof text === "string"
-              && text.trim().length > 0
-            ) {
-              return { type: type as QueryType, text: text.trim() };
-            }
-            return null;
-          })
-          .filter((q): q is Queryable => q !== null);
-        if (queries.length > 0) return queries;
+      if (!asArray) return null;
+
+      const queries = asArray
+        .map(item => {
+          if (typeof item !== "object" || item === null) return null;
+          const type = (item as { type?: unknown }).type;
+          const text = (item as { text?: unknown }).text;
+          if (
+            (type === "lex" || type === "vec" || type === "hyde")
+            && typeof text === "string"
+            && text.trim().length > 0
+          ) {
+            return { type: type as QueryType, text: text.trim() };
+          }
+          return null;
+        })
+        .filter((q): q is Queryable => q !== null);
+      return queries.length > 0 ? queries : null;
+    };
+
+    const parseJsonWithWrappers = (raw: string): Queryable[] | null => {
+      const candidates: string[] = [raw];
+
+      const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+      if (fenceMatch?.[1]) {
+        candidates.push(fenceMatch[1].trim());
       }
-    } catch {
-      if (strictJson) {
-        throw new Error("ApiLLM expandQuery error: strict JSON output is enabled, but response was not valid JSON");
+
+      const firstArray = raw.indexOf("[");
+      const lastArray = raw.lastIndexOf("]");
+      if (firstArray !== -1 && lastArray > firstArray) {
+        candidates.push(raw.slice(firstArray, lastArray + 1));
       }
+
+      const firstObject = raw.indexOf("{");
+      const lastObject = raw.lastIndexOf("}");
+      if (firstObject !== -1 && lastObject > firstObject) {
+        candidates.push(raw.slice(firstObject, lastObject + 1));
+      }
+
+      for (const candidate of candidates) {
+        try {
+          const parsed = parseQueryArray(candidate);
+          if (parsed) return parsed;
+        } catch {
+          // Try next candidate
+        }
+      }
+      return null;
+    };
+
+    // Try strict JSON shape first: [{ type, text }, ...] or { queries: [...] }
+    const parsedFromJson = parseJsonWithWrappers(trimmed);
+    if (parsedFromJson) {
+      return parsedFromJson;
     }
     if (strictJson) {
-      throw new Error("ApiLLM expandQuery error: strict JSON output is enabled, but response shape was invalid");
+      throw new Error("ApiLLM expandQuery error: strict JSON output is enabled, but response did not contain valid JSON queries");
     }
 
     // Line format: "lex: ...", "vec: ...", "hyde: ..."
@@ -223,7 +255,7 @@ export class ApiLLM implements LLM {
       .map(line => line.trim())
       .filter(Boolean)
       .map(line => {
-        const match = line.match(/^(lex|vec|hyde)\s*:\s*(.+)$/i);
+        const match = line.match(/^(?:[-*•\d\.\)\s]*)?(lex|vec|hyde)\s*:\s*(.+)$/i);
         if (!match) return null;
         const type = match[1]!.toLowerCase() as QueryType;
         const text = match[2]!.trim();
