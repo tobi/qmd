@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changes
+
+- CLI: `qmd status` now shows models with full HuggingFace links instead of
+  static names in `--help`. Model info is derived from the actual configured
+  URIs so it stays accurate if models change.
+- Release tooling: pre-push hook handles non-interactive shells (CI, editors)
+  gracefully — warnings auto-proceed instead of hanging on a tty prompt.
+  Annotated tags now resolve correctly for CI checks.
+
 ## [1.0.5] - 2026-02-16
 
 The npm package now ships compiled JavaScript instead of raw TypeScript,

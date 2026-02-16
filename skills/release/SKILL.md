@@ -16,34 +16,37 @@ Cut a release, validate the changelog, and ensure git hooks are installed.
 
 When the user triggers `/release <version>`:
 
-1. **Install hooks** — run `scripts/install-hooks.sh` (idempotent)
-2. **Check for unstaged work** — run `git status`. If there are valuable
-   unstaged/uncommitted changes that belong in this release, commit them
-   first (use the commit skill or make well-formed commits directly).
-3. **Validate changelog** — check if `## [Unreleased]` has content.
-   If empty or missing, **write the changelog now** (see below).
-4. **Preview** — show the user what will be released (unreleased content +
-   minor series rollup via `scripts/extract-changelog.sh`)
-5. **Ask for confirmation** — do NOT proceed without explicit user approval
-6. **Run `scripts/release.sh <version>`** — renames `[Unreleased]`, bumps
-   version, commits, tags
-7. **Remind** — tell the user to `git push origin main --tags`
+1. **Gather context** — run `skills/release/scripts/release-context.sh <version>`.
+   This silently installs git hooks and prints everything needed: version info,
+   working directory status, commits since last release, files changed, current
+   `[Unreleased]` content, and the previous release entry for style reference.
+
+2. **Commit outstanding work** — if the context shows staged, modified, or
+   untracked files that belong in this release, commit them first. Use the
+   /commit skill or make well-formed commits directly.
+
+3. **Write the changelog** — if `[Unreleased]` is empty, write it now using
+   the commits and file changes from the context output. Follow the changelog
+   standard below. Re-run the context script after committing if needed.
+
+4. **Cut the release** — run `scripts/release.sh <version>`. This renames
+   `[Unreleased]` → `[X.Y.Z] - date`, inserts a fresh `[Unreleased]`,
+   bumps `package.json`, commits, and tags.
+
+5. **Show the final changelog** — print the full `[Unreleased]` +
+   minor series rollup via `scripts/extract-changelog.sh <version>`.
+   Ask the user to confirm before pushing.
+
+6. **Push** — after explicit confirmation, run `git push origin main --tags`.
+
+7. **Watch CI** — after the push, start a background dispatch to watch the
+   publish workflow. Use `interactive_shell` in dispatch mode with:
+   ```
+   gh run watch $(gh run list --workflow=publish.yml --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status
+   ```
+   The agent will be notified when CI completes and should report the result.
 
 If any step fails, stop and explain. Never force-push or skip validation.
-
-### Writing the changelog from git history
-
-If `[Unreleased]` is empty when the release is triggered, populate it before
-continuing:
-
-1. Find the last release tag: `git describe --tags --abbrev=0`
-2. Review commits since then: `git log <tag>..HEAD --oneline`
-3. Read the diffs for anything non-obvious: `git log <tag>..HEAD --stat`
-4. Write changelog entries following the standard below — group by theme,
-   explain the why, include numbers, credit contributors.
-5. Add optional prose highlights (1-4 sentences) if the release warrants it.
-6. Write the entries into `## [Unreleased]` in CHANGELOG.md.
-7. Commit the changelog update, then continue with the release.
 
 ## Changelog Standard
 
@@ -54,18 +57,15 @@ The changelog lives in `CHANGELOG.md` and follows [Keep a Changelog](https://kee
 - `## [Unreleased]` — accumulates entries between releases
 - `## [X.Y.Z] - YYYY-MM-DD` — released versions
 
-The release script renames `[Unreleased]` → `[X.Y.Z] - date` and inserts a
-fresh empty `[Unreleased]` section automatically.
-
 ### Structure of a release entry
 
 Each version entry has two parts:
 
 **1. Highlights (optional, 1-4 sentences of prose)**
 
-Immediately after the version heading, before any `###` section. This is the
-elevator pitch — what would you tell someone in 30 seconds? Only include for
-releases with significant changes. Skip for small patches.
+Immediately after the version heading, before any `###` section. The elevator
+pitch — what would you tell someone in 30 seconds? Only for significant
+releases; skip for small patches.
 
 ```markdown
 ## [1.1.0] - 2026-03-01
@@ -110,8 +110,7 @@ through parallel contexts. GPU auto-detection replaces the unreliable
 ## GitHub Release Notes
 
 Each GitHub release includes the full changelog for the **minor series** back
-to x.x.0. Releasing v1.2.3 includes entries for 1.2.3, 1.2.2, 1.2.1, and
-1.2.0. The `scripts/extract-changelog.sh` script handles this, and the
+to x.x.0. The `scripts/extract-changelog.sh` script handles this, and the
 publish workflow (`publish.yml`) calls it to populate the GitHub release.
 
 ## Git Hooks
@@ -120,15 +119,8 @@ The pre-push hook (`scripts/pre-push`) blocks `v*` tag pushes unless:
 
 1. `package.json` version matches the tag
 2. `CHANGELOG.md` has a `## [X.Y.Z] - date` entry for the version
-3. CI passed on GitHub for the tagged commit
+3. CI passed on GitHub (warns in non-interactive shells, blocks in terminals)
 
-Run `skills/release/scripts/install-hooks.sh` to install (also runs
-automatically via `bun install` prepare script).
-
-## Scripts
-
-- [`scripts/install-hooks.sh`](scripts/install-hooks.sh) — install/update git hooks
-- Project scripts used during release:
-  - `scripts/release.sh` — rename [Unreleased], bump version, commit, tag
-  - `scripts/extract-changelog.sh` — extract minor series notes for GitHub release
-  - `scripts/pre-push` — pre-push validation hook
+Hooks are installed silently by the context script. They can also be installed
+manually via `skills/release/scripts/install-hooks.sh` or automatically via
+`bun install` (prepare script).

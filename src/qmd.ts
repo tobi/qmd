@@ -365,6 +365,19 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
+  // Models
+  {
+    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+    const hfLink = (uri: string) => {
+      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+      return match ? `https://huggingface.co/${match[1]}` : uri;
+    };
+    console.log(`\n${c.bold}Models${c.reset}`);
+    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+  }
+
   // Device / GPU info
   try {
     const llm = getDefaultLlamaCpp();
@@ -2181,11 +2194,6 @@ function showHelp(): void {
   console.log("  -l <num>                   - Maximum lines per file");
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
-  console.log("");
-  console.log("Models (auto-downloaded from HuggingFace):");
-  console.log("  Embedding: embeddinggemma-300M-Q8_0");
-  console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }

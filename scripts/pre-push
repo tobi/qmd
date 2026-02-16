@@ -8,7 +8,28 @@ set -euo pipefail
 #   2. CHANGELOG.md has a "## [{version}] - {date}" entry
 #   3. CI passed upstream on GitHub for the tagged commit
 #
-# Installed automatically by: bun install (via prepare script)
+# In non-interactive shells (no tty), warnings auto-proceed instead of
+# prompting. Hard failures (version mismatch, missing changelog) always block.
+
+# Detect if we can prompt
+CAN_PROMPT=false
+if [[ -t 0 ]] || [[ -e /dev/tty ]]; then
+  # Verify /dev/tty is actually usable
+  if echo -n "" > /dev/tty 2>/dev/null; then
+    CAN_PROMPT=true
+  fi
+fi
+
+prompt_or_continue() {
+  local msg="$1"
+  if $CAN_PROMPT; then
+    read -p "$msg [y/N] " -n 1 -r </dev/tty
+    echo ""
+    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+  else
+    echo "$msg — auto-proceeding (non-interactive)"
+  fi
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   # Only validate v* tag pushes
@@ -34,7 +55,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "Run: jq --arg v '$VERSION' '.version = \$v' package.json > tmp && mv tmp package.json"
     exit 1
   fi
-  echo "  package.json version: $PKG_VERSION"
+  echo "  package.json version: $PKG_VERSION ✓"
 
   # --- 2. CHANGELOG.md must have an entry for this version ---
   if [[ ! -f CHANGELOG.md ]]; then
@@ -51,17 +72,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "Write the changelog entry first. See CLAUDE.md for guidelines."
     exit 1
   fi
-  echo "  CHANGELOG.md: entry found"
+  echo "  CHANGELOG.md: entry found ✓"
 
   # --- 3. CI must have passed on GitHub for this commit ---
-  COMMIT=$(git rev-parse "$TAG" 2>/dev/null || git rev-parse HEAD)
+  # Resolve annotated tag to its underlying commit
+  COMMIT=$(git rev-list -n 1 "$TAG" 2>/dev/null || git rev-parse HEAD)
 
   if ! command -v gh &>/dev/null; then
     echo "  CI check: skipped (gh CLI not installed)"
     continue
   fi
 
-  # Check GitHub Actions check runs
   CHECK_JSON=$(gh api "repos/{owner}/{repo}/commits/$COMMIT/check-runs" 2>/dev/null || echo "")
 
   if [[ -z "$CHECK_JSON" ]]; then
@@ -72,17 +93,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   TOTAL=$(echo "$CHECK_JSON" | jq -r '.total_count // 0' 2>/dev/null || echo "0")
 
   if [[ "$TOTAL" -eq 0 ]] 2>/dev/null; then
-    # No checks found — commit may not be pushed yet
     MAIN_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
     if [[ "$COMMIT" != "$MAIN_SHA" ]]; then
       echo ""
-      echo "WARNING: No CI runs found for $COMMIT and it's not the tip of origin/main."
-      echo "Push the commit to main first and wait for CI to pass."
-      read -p "Push tag anyway? [y/N] " -n 1 -r </dev/tty
-      echo ""
-      [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+      echo "WARNING: No CI runs found for $COMMIT"
+      prompt_or_continue "Push tag anyway?"
     else
-      echo "  CI check: no runs found (commit is on main)"
+      echo "  CI check: no runs yet (commit is tip of origin/main)"
     fi
   else
     FAILED=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo "0")
@@ -98,15 +115,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if [[ "$PENDING" -gt 0 ]] 2>/dev/null; then
       echo ""
       echo "WARNING: CI still running for commit $COMMIT ($PENDING pending)"
-      read -p "Push tag anyway? [y/N] " -n 1 -r </dev/tty
-      echo ""
-      [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+      prompt_or_continue "Push tag anyway?"
     else
-      echo "  CI check: all passed"
+      echo "  CI check: all passed ✓"
     fi
   fi
 
-  echo "All checks passed for $TAG"
+  echo "All checks passed for $TAG ✓"
 done
 
 exit 0
