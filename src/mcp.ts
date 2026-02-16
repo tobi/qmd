@@ -233,17 +233,18 @@ function createMcpServer(store: Store): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Search query - keywords or phrases to find"),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
+    async ({ query, intent, limit, minScore, collection }) => {
       const results = store.searchFTS(query, limit || 10, collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
+          const { line, snippet } = extractSnippet(r.body || "", query, { maxLen: 300, chunkPos: r.chunkPos, intent });
           return {
             docid: `#${r.docid}`,
             file: r.displayPath,
@@ -273,13 +274,14 @@ function createMcpServer(store: Store): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
+    async ({ query, intent, limit, minScore, collection }) => {
+      const results = await vectorSearchQuery(store, query, { collection, limit, minScore, intent });
 
       if (results.length === 0) {
         // Distinguish "no embeddings" from "no matches" — check if vector table exists
@@ -293,7 +295,7 @@ function createMcpServer(store: Store): McpServer {
       }
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, query, 300);
+        const { line, snippet } = extractSnippet(r.body, query, { maxLen: 300, intent });
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -323,16 +325,17 @@ function createMcpServer(store: Store): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await hybridQuery(store, query, { collection, limit, minScore });
+    async ({ query, intent, limit, minScore, collection }) => {
+      const results = await hybridQuery(store, query, { collection, limit, minScore, intent });
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, query, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, query, { maxLen: 300, intent });
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,

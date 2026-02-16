@@ -1751,6 +1751,7 @@ type OutputOptions = {
   collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
+  intent?: string;       // Optional background context for disambiguation
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1799,7 +1800,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      let snippet = !opts.full ? extractSnippet(row.body, query, { maxLen: 300, chunkPos: row.chunkPos, intent: opts.intent }).snippet : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1826,7 +1827,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, { maxLen: 500, chunkPos: row.chunkPos, intent: opts.intent });
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -1867,7 +1868,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, { maxLen: 500, chunkPos: row.chunkPos, intent: opts.intent }).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1880,7 +1881,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, { maxLen: 500, chunkPos: row.chunkPos, intent: opts.intent }).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1890,7 +1891,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, { maxLen: 500, chunkPos: row.chunkPos, intent: opts.intent });
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content, line);
@@ -1994,6 +1995,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
+      intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2043,6 +2045,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0,
+      intent: opts.intent,
       hooks: {
         onStrongSignal: (score) => {
           process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2121,6 +2124,8 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      // Intent option (for query, vsearch, search)
+      intent: { type: "string" },
       // Embed options
       force: { type: "boolean", short: "f" },
       // Update options
@@ -2168,6 +2173,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
+    intent: values.intent as string | undefined,
   };
 
   return {

@@ -809,8 +809,8 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, intent?: string, model?: string) => Promise<ExpandedQuery[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], intent?: string, model?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -892,8 +892,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, intent?: string, model?: string) => expandQuery(query, intent, model, db),
+    rerank: (query: string, documents: { file: string; text: string }[], intent?: string, model?: string) => rerank(query, documents, intent, model, db),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2201,10 +2201,11 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, intent?: string, model: string = DEFAULT_QUERY_MODEL, db?: Database): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
-  const cached = getCachedResult(db, cacheKey);
+  // Intent is part of the cache key so different intents produce different expansions
+  const cacheKey = getCacheKey("expandQuery", { query, intent: intent || "", model });
+  const cached = db ? getCachedResult(db, cacheKey) : null;
   if (cached) {
     try {
       return JSON.parse(cached) as ExpandedQuery[];
@@ -2215,7 +2216,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2223,7 +2224,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     .filter(r => r.text !== query)
     .map(r => ({ type: r.type, text: r.text }));
 
-  if (expanded.length > 0) {
+  if (expanded.length > 0 && db) {
     setCachedResult(db, cacheKey, JSON.stringify(expanded));
   }
 
@@ -2234,16 +2235,23 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], intent?: string, model: string = DEFAULT_RERANK_MODEL, db?: Database): Promise<{ file: string; score: number }[]> {
+  // When intent is provided, prepend it to the query for the reranker.
+  // Qwen3-Reranker is instruction-aware and was trained with <Instruct> prefixes.
+  // Prepending intent to the query string is the simplest injection strategy
+  // that doesn't require changes to node-llama-cpp's rankAll() API.
+  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
   // Check cache for each document
   // Cache key includes chunk text — different queries can select different chunks
   // from the same file, and the reranker score depends on which chunk was sent.
+  // Intent is part of cache key so different intents produce different scores.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey);
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, chunk: doc.text });
+    const cached = db ? getCachedResult(db, cacheKey) : null;
     if (cached !== null) {
       cachedResults.set(doc.file, parseFloat(cached));
     } else {
@@ -2254,13 +2262,13 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocs.length > 0) {
     const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
     const textByFile = new Map(documents.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
-      setCachedResult(db, cacheKey, result.score.toString());
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+      if (db) setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(result.file, result.score);
     }
   }
@@ -2669,7 +2677,48 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
+/** Intent term weight for chunk selection. Initial value — not tuned. */
+export const INTENT_WEIGHT_CHUNK = 0.5;
+/** Intent term weight for snippet line scoring. Initial value — not tuned. */
+export const INTENT_WEIGHT_SNIPPET = 0.3;
+
+// Common stop words filtered from intent strings before tokenization.
+// Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
+// 2-3 char function words so the length threshold can drop to >1 and let
+// short domain terms (API, SQL, LLM, CPU, CDN, …) survive.
+const INTENT_STOP_WORDS = new Set([
+  // 2-char function words
+  "am", "an", "as", "at", "be", "by", "do", "he", "if",
+  "in", "is", "it", "me", "my", "no", "of", "on", "or", "so",
+  "to", "up", "us", "we",
+  // 3-char function words
+  "all", "and", "any", "are", "but", "can", "did", "for", "get",
+  "has", "her", "him", "his", "how", "its", "let", "may", "not",
+  "our", "out", "the", "too", "was", "who", "why", "you",
+  // 4+ char common words
+  "also", "does", "find", "from", "have", "into", "more", "need",
+  "show", "some", "tell", "that", "them", "this", "want", "what",
+  "when", "will", "with", "your",
+  // Search-context noise
+  "about", "looking", "notes", "search", "where", "which",
+]);
+
+/** Extract intent terms: lowercase, trim surrounding punctuation, >1 char, stop words removed. */
+export function extractIntentTerms(intent: string): string[] {
+  return intent.toLowerCase().split(/\s+/)
+    .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
+}
+
+export interface ExtractSnippetOptions {
+  maxLen?: number;
+  chunkPos?: number;
+  chunkLen?: number;
+  intent?: string;
+}
+
+export function extractSnippet(body: string, query: string, options?: ExtractSnippetOptions): SnippetResult {
+  const { maxLen = 500, chunkPos, chunkLen, intent } = options || {};
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
@@ -2688,6 +2737,9 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  // Intent terms at lower weight — nudge snippet toward intent-relevant
+  // lines without overriding query-term anchoring.
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
@@ -2695,6 +2747,9 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
     let score = 0;
     for (const term of queryTerms) {
       if (lineLower.includes(term)) score++;
+    }
+    for (const term of intentTerms) {
+      if (lineLower.includes(term)) score += INTENT_WEIGHT_SNIPPET;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -2710,7 +2765,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
   if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+    return extractSnippet(body, query, { maxLen, intent });
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
@@ -2776,6 +2831,10 @@ export interface HybridQueryOptions {
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
   hooks?: SearchHooks;
+  /** Optional background context behind the search intent. Used to disambiguate
+   *  the query during query expansion and reranking. Example: query="decision making",
+   *  intent="writing about how engineering teams make architectural decisions". */
+  intent?: string;
 }
 
 export interface HybridQueryResult {
@@ -2813,6 +2872,7 @@ export async function hybridQuery(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
   const hooks = options?.hooks;
+  const intent = options?.intent;
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
@@ -2825,7 +2885,10 @@ export async function hybridQuery(
   const initialFts = store.searchFTS(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0
+  // When intent is provided, always expand — the caller is explicitly saying
+  // "the obvious BM25 match isn't what I want." Skipping expansion defeats the purpose.
+  const hasStrongSignal = !intent
+    && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
@@ -2834,7 +2897,7 @@ export async function hybridQuery(
   // Step 2: Expand query (or skip if strong signal)
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query);
+    : await store.expandQuery(query, intent);
 
   hooks?.onExpand?.(query, expanded);
 
@@ -2912,6 +2975,9 @@ export async function hybridQuery(
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  // Intent terms steer chunk selection toward intent-relevant sections
+  // without overwhelming the query signal.
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
@@ -2924,8 +2990,9 @@ export async function hybridQuery(
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
+      const qScore = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      const iScore = intentTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? INTENT_WEIGHT_CHUNK : 0), 0);
+      if (qScore + iScore > bestScore) { bestScore = qScore + iScore; bestIdx = i; }
     }
 
     chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
@@ -2934,7 +3001,7 @@ export async function hybridQuery(
 
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
-  const reranked = await store.rerank(query, chunksToRerank);
+  const reranked = await store.rerank(query, chunksToRerank, intent);
   hooks?.onRerankDone?.();
 
   // Step 7: Blend RRF position score with reranker score
@@ -2989,6 +3056,8 @@ export interface VectorSearchOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   hooks?: Pick<SearchHooks, 'onExpand'>;
+  /** Optional background context behind the search intent. Passed to query expansion. */
+  intent?: string;
 }
 
 export interface VectorSearchResult {
@@ -3025,7 +3094,7 @@ export async function vectorSearchQuery(
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = await store.expandQuery(query, options?.intent);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded);
 

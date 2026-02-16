@@ -279,7 +279,7 @@ describe("MCP Server", () => {
         title: r.title,
         score: Math.round(r.score * 100) / 100,
         context: getContextForFile(testDb, r.filepath),
-        snippet: extractSnippet(r.body || "", "api", 300, r.chunkPos).snippet,
+        snippet: extractSnippet(r.body || "", "api", { maxLen: 300, chunkPos: r.chunkPos }).snippet,
       }));
       // MCP now returns structuredContent with results array
       expect(filtered.length).toBeGreaterThan(0);
@@ -768,7 +768,7 @@ describe("MCP Server", () => {
 
     test("extracts snippet around matching text", () => {
       const body = "Line 1\nLine 2\nThis is the important line with the keyword\nLine 4\nLine 5";
-      const { line, snippet } = extractSnippet(body, "keyword", 200);
+      const { line, snippet } = extractSnippet(body, "keyword", { maxLen: 200 });
       expect(snippet).toContain("keyword");
       expect(line).toBe(3);
     });
@@ -776,7 +776,7 @@ describe("MCP Server", () => {
     test("handles snippet extraction with chunkPos", () => {
       const body = "A".repeat(1000) + "KEYWORD" + "B".repeat(1000);
       const chunkPos = 1000; // Position of KEYWORD
-      const { snippet } = extractSnippet(body, "keyword", 200, chunkPos);
+      const { snippet } = extractSnippet(body, "keyword", { maxLen: 200, chunkPos });
       expect(snippet).toContain("KEYWORD");
     });
   });
@@ -802,7 +802,7 @@ describe("MCP Server", () => {
         title: r.title,
         score: Math.round(r.score * 100) / 100,
         context: getContextForFile(testDb, r.filepath),
-        snippet: extractSnippet(r.body || "", "readme", 300, r.chunkPos).snippet,
+        snippet: extractSnippet(r.body || "", "readme", { maxLen: 300, chunkPos: r.chunkPos }).snippet,
       }));
 
       expect(structured.length).toBeGreaterThan(0);

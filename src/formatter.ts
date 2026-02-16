@@ -101,7 +101,7 @@ export function searchResultsToJson(
   const output = results.map(row => {
     const bodyStr = row.body || "";
     let body = opts.full ? bodyStr : undefined;
-    let snippet = !opts.full ? extractSnippet(bodyStr, query, 300, row.chunkPos).snippet : undefined;
+    let snippet = !opts.full ? extractSnippet(bodyStr, query, { maxLen: 300, chunkPos: row.chunkPos }).snippet : undefined;
 
     if (opts.lineNumbers) {
       if (body) body = addLineNumbers(body);
@@ -132,7 +132,7 @@ export function searchResultsToCsv(
   const header = "docid,score,file,title,context,line,snippet";
   const rows = results.map(row => {
     const bodyStr = row.body || "";
-    const { line, snippet } = extractSnippet(bodyStr, query, 500, row.chunkPos);
+    const { line, snippet } = extractSnippet(bodyStr, query, { maxLen: 500, chunkPos: row.chunkPos });
     let content = opts.full ? bodyStr : snippet;
     if (opts.lineNumbers && content) {
       content = addLineNumbers(content);
@@ -175,7 +175,7 @@ export function searchResultsToMarkdown(
     if (opts.full) {
       content = bodyStr;
     } else {
-      content = extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
+      content = extractSnippet(bodyStr, query, { maxLen: 500, chunkPos: row.chunkPos }).snippet;
     }
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
@@ -196,7 +196,7 @@ export function searchResultsToXml(
   const items = results.map(row => {
     const titleAttr = row.title ? ` title="${escapeXml(row.title)}"` : "";
     const bodyStr = row.body || "";
-    let content = opts.full ? bodyStr : extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
+    let content = opts.full ? bodyStr : extractSnippet(bodyStr, query, { maxLen: 500, chunkPos: row.chunkPos }).snippet;
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
     }
