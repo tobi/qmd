@@ -60,6 +60,7 @@ import {
   vectorSearchQuery,
   addLineNumbers,
   type ExpandedQuery,
+  type SearchResult,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
@@ -1728,6 +1729,8 @@ function normalizeBM25(score: number): number {
   return 1 / (1 + Math.exp(-(absScore - 5) / 3));
 }
 
+type FieldsLevel = 'minimal' | 'summary' | 'full';
+
 type OutputOptions = {
   format: OutputFormat;
   full: boolean;
@@ -1737,6 +1740,9 @@ type OutputOptions = {
   collection?: string;  // Filter by collection name (pwd suffix match)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
+  maxTokens?: number;    // Estimated token budget (chars/4)
+  fields?: FieldsLevel;  // Output detail level
+  progressive?: boolean; // NDJSON progressive output
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1782,24 +1788,55 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 
   if (opts.format === "json") {
     // JSON output for LLM consumption
-    const output = filtered.map(row => {
+    const maxChars = opts.maxTokens ? opts.maxTokens * 4 : 0;
+    let usedChars = 0;
+    let truncated = false;
+    const output: Record<string, unknown>[] = [];
+
+    for (const row of filtered) {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
-      if (opts.lineNumbers) {
-        if (body) body = addLineNumbers(body);
-        if (snippet) snippet = addLineNumbers(snippet);
+      const fields = opts.fields || 'summary';
+
+      let entry: Record<string, unknown>;
+      if (fields === 'minimal') {
+        entry = {
+          ...(docid && { docid: `#${docid}` }),
+          score: Math.round(row.score * 100) / 100,
+          file: toQmdPath(row.displayPath),
+          title: row.title,
+        };
+      } else {
+        let body = opts.full ? row.body : undefined;
+        let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+        if (opts.lineNumbers) {
+          if (body) body = addLineNumbers(body);
+          if (snippet) snippet = addLineNumbers(snippet);
+        }
+        entry = {
+          ...(docid && { docid: `#${docid}` }),
+          score: Math.round(row.score * 100) / 100,
+          file: toQmdPath(row.displayPath),
+          title: row.title,
+          ...(row.context && { context: row.context }),
+          ...(body && { body }),
+          ...(snippet && { snippet }),
+        };
       }
-      return {
-        ...(docid && { docid: `#${docid}` }),
-        score: Math.round(row.score * 100) / 100,
-        file: toQmdPath(row.displayPath),
-        title: row.title,
-        ...(row.context && { context: row.context }),
-        ...(body && { body }),
-        ...(snippet && { snippet }),
-      };
-    });
+
+      if (maxChars > 0) {
+        const entryChars = JSON.stringify(entry).length;
+        if (usedChars + entryChars > maxChars) {
+          truncated = true;
+          break;
+        }
+        usedChars += entryChars;
+      }
+      output.push(entry);
+    }
+
+    if (truncated) {
+      output.push({ truncated: true });
+    }
     console.log(JSON.stringify(output, null, 2));
   } else if (opts.format === "files") {
     // Simple docid,score,filepath,context output
@@ -2003,6 +2040,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   checkIndexHealth(store.db);
 
+  const isProgressive = opts.progressive && opts.format === 'json';
+
   await withLLMSession(async () => {
     const results = await hybridQuery(store, query, {
       collection: opts.collection,
@@ -2012,6 +2051,18 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         onStrongSignal: (score) => {
           process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
         },
+        onInitialFTS: isProgressive ? (ftsResults: SearchResult[]) => {
+          for (const r of ftsResults) {
+            const line = JSON.stringify({
+              phase: 'bm25',
+              docid: `#${r.docid}`,
+              score: Math.round(r.score * 100) / 100,
+              file: r.filepath,
+              title: r.title,
+            });
+            process.stdout.write(line + '\n');
+          }
+        } : undefined,
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
           process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
@@ -2029,7 +2080,23 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     closeDb();
 
     if (results.length === 0) {
-      console.log("No results found.");
+      if (!isProgressive) console.log("No results found.");
+      return;
+    }
+
+    if (isProgressive) {
+      for (const r of results) {
+        const line = JSON.stringify({
+          phase: 'reranked',
+          docid: `#${r.docid}`,
+          score: Math.round(r.score * 100) / 100,
+          file: r.file,
+          title: r.title,
+          ...(r.context && { context: r.context }),
+          snippet: extractSnippet(r.bestChunk, query, 300, r.bestChunkPos).snippet,
+        });
+        process.stdout.write(line + '\n');
+      }
       return;
     }
 
@@ -2088,6 +2155,9 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      "max-tokens": { type: "string" },  // token budget (chars/4)
+      fields: { type: "string" },  // minimal|summary|full
+      progressive: { type: "boolean" },  // NDJSON progressive output
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2117,14 +2187,21 @@ function parseCLI() {
   const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
   const isAll = !!values.all;
 
+  const fieldsRaw = values.fields as string | undefined;
+  const fieldsLevel: FieldsLevel | undefined = (fieldsRaw === 'minimal' || fieldsRaw === 'summary' || fieldsRaw === 'full')
+    ? fieldsRaw : undefined;
+
   const opts: OutputOptions = {
     format,
-    full: !!values.full,
+    full: !!values.full || fieldsLevel === 'full',
     limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    maxTokens: values["max-tokens"] ? parseInt(String(values["max-tokens"]), 10) || undefined : undefined,
+    fields: fieldsLevel,
+    progressive: !!values.progressive,
   };
 
   return {

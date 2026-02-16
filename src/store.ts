@@ -707,7 +707,9 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers to keep FTS in sync
+  // FTS triggers handle baseline sync for raw SQL (tests, migrations).
+  // Application code additionally calls syncDocumentFTS/syncDocumentFTSById
+  // to replace the trigger-inserted body with expandCompoundTokens(body).
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
@@ -1138,10 +1140,47 @@ export function deleteLLMCache(db: Database): number {
 }
 
 /**
+ * Sync a document's FTS entry by collection + path lookup.
+ * Deletes old entry and re-inserts with expanded compound tokens.
+ */
+function syncDocumentFTS(db: Database, collectionName: string, path: string): void {
+  const doc = db.prepare(
+    `SELECT id, title, hash, active FROM documents WHERE collection = ? AND path = ?`
+  ).get(collectionName, path) as { id: number; title: string; hash: string; active: number } | undefined;
+  if (!doc) return;
+  db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(doc.id);
+  if (doc.active !== 1) return;
+  const content = db.prepare(`SELECT doc FROM content WHERE hash = ?`).get(doc.hash) as { doc: string } | undefined;
+  if (!content) return;
+  db.prepare(
+    `INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`
+  ).run(doc.id, collectionName + '/' + path, doc.title, expandCompoundTokens(content.doc));
+}
+
+/**
+ * Sync a document's FTS entry by document id.
+ */
+function syncDocumentFTSById(db: Database, documentId: number): void {
+  const doc = db.prepare(
+    `SELECT id, collection, path, title, hash, active FROM documents WHERE id = ?`
+  ).get(documentId) as { id: number; collection: string; path: string; title: string; hash: string; active: number } | undefined;
+  if (!doc) return;
+  db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(doc.id);
+  if (doc.active !== 1) return;
+  const content = db.prepare(`SELECT doc FROM content WHERE hash = ?`).get(doc.hash) as { doc: string } | undefined;
+  if (!content) return;
+  db.prepare(
+    `INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`
+  ).run(doc.id, doc.collection + '/' + doc.path, doc.title, expandCompoundTokens(content.doc));
+}
+
+/**
  * Remove inactive document records (active = 0).
  * Returns the number of inactive documents deleted.
  */
 export function deleteInactiveDocuments(db: Database): number {
+  // Remove FTS entries for inactive docs before deleting the rows
+  db.exec(`DELETE FROM documents_fts WHERE rowid IN (SELECT id FROM documents WHERE active = 0)`);
   const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
   return result.changes;
 }
@@ -1254,6 +1293,48 @@ export function extractTitle(content: string, filename: string): string {
   return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
 }
 
+/**
+ * Expand compound tokens (snake_case, camelCase, kebab-case) into constituent
+ * words while preserving the original token. This improves FTS recall for
+ * code-related queries.
+ */
+export function expandCompoundTokens(text: string): string {
+  return text.replace(/[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]/g, (token) => {
+    const parts: string[] = []
+    // snake_case and kebab-case
+    if (token.includes('_') || token.includes('-')) {
+      parts.push(...token.split(/[_-]/).filter(p => p.length > 0))
+    }
+    // camelCase / PascalCase
+    const camelParts = token.replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .split(/\s+/)
+      .filter(p => p.length > 0)
+    if (camelParts.length > 1) {
+      for (const p of camelParts) {
+        if (!parts.includes(p.toLowerCase())) parts.push(p.toLowerCase())
+      }
+    }
+    if (parts.length > 0) {
+      return token + ' ' + parts.join(' ')
+    }
+    return token
+  })
+}
+
+/**
+ * Strip YAML frontmatter (---...---) from markdown content.
+ * Returns the body without frontmatter metadata noise.
+ */
+export function stripFrontmatter(content: string): string {
+  if (!content.startsWith('---')) return content
+  const endIdx = content.indexOf('\n---', 3)
+  if (endIdx === -1) return content
+  // Skip past the closing --- and any immediately following newline
+  const afterFrontmatter = endIdx + 4
+  return content.slice(afterFrontmatter).replace(/^\n/, '')
+}
+
 // =============================================================================
 // Document indexing operations
 // =============================================================================
@@ -1263,8 +1344,9 @@ export function extractTitle(content: string, filename: string): string {
  * Uses INSERT OR IGNORE so duplicate hashes are skipped.
  */
 export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
+  const body = stripFrontmatter(content)
   db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(hash, content, createdAt);
+    .run(hash, body, createdAt);
 }
 
 /**
@@ -1288,6 +1370,7 @@ export function insertDocument(
       modified_at = excluded.modified_at,
       active = 1
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  syncDocumentFTS(db, collectionName, path);
 }
 
 /**
@@ -1316,6 +1399,7 @@ export function updateDocumentTitle(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
     .run(title, modifiedAt, documentId);
+  syncDocumentFTSById(db, documentId);
 }
 
 /**
@@ -1331,14 +1415,21 @@ export function updateDocument(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(title, hash, modifiedAt, documentId);
+  syncDocumentFTSById(db, documentId);
 }
 
 /**
  * Deactivate a document (mark as inactive but don't delete).
  */
 export function deactivateDocument(db: Database, collectionName: string, path: string): void {
+  const doc = db.prepare(
+    `SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1`
+  ).get(collectionName, path) as { id: number } | undefined;
   db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
     .run(collectionName, path);
+  if (doc) {
+    db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(doc.id);
+  }
 }
 
 /**
@@ -1986,19 +2077,17 @@ function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
 }
 
-function buildFTS5Query(query: string): string | null {
+function buildFTS5Query(query: string, mode: 'and' | 'or' = 'and'): string | null {
   const terms = query.split(/\s+/)
     .map(t => sanitizeFTS5Term(t))
     .filter(t => t.length > 0);
   if (terms.length === 0) return null;
   if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  const joiner = mode === 'or' ? ' OR ' : ' AND '
+  return terms.map(t => `"${t}"*`).join(joiner);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
-  if (!ftsQuery) return [];
-
+function runFTSQuery(db: Database, ftsQuery: string, limit: number, collectionName?: string): SearchResult[] {
   let sql = `
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
@@ -2025,11 +2114,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
   return rows.map(row => {
-    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
-    // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
-    // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
-    // Monotonic and query-independent — no per-query normalization needed.
+    const collName = row.filepath.split('//')[1]?.split('/')[0] || "";
     const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
     return {
       filepath: row.filepath,
@@ -2037,8 +2122,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       title: row.title,
       hash: row.hash,
       docid: getDocid(row.hash),
-      collectionName,
-      modifiedAt: "",  // Not available in FTS query
+      collectionName: collName,
+      modifiedAt: "",
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
@@ -2046,6 +2131,32 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       source: "fts" as const,
     };
   });
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+  const ftsQuery = buildFTS5Query(query, 'and');
+  if (!ftsQuery) return [];
+
+  const andResults = runFTSQuery(db, ftsQuery, limit, collectionName);
+
+  // Auto-fallback: if AND query returns < 3 results and query has multiple terms,
+  // retry with OR and merge results (AND matches preferred)
+  const terms = query.split(/\s+/).filter(t => sanitizeFTS5Term(t).length > 0);
+  if (andResults.length < 3 && terms.length > 1) {
+    const orQuery = buildFTS5Query(query, 'or');
+    if (orQuery) {
+      const orResults = runFTSQuery(db, orQuery, limit, collectionName);
+      const seen = new Set(andResults.map(r => r.filepath));
+      for (const r of orResults) {
+        if (!seen.has(r.filepath)) {
+          andResults.push(r);
+          seen.add(r.filepath);
+        }
+      }
+    }
+  }
+
+  return andResults.slice(0, limit);
 }
 
 // =============================================================================
@@ -2761,6 +2872,8 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 export interface SearchHooks {
   /** BM25 probe found strong signal — expansion will be skipped */
   onStrongSignal?: (topScore: number) => void;
+  /** Initial FTS results available (before expansion/reranking) */
+  onInitialFTS?: (results: SearchResult[]) => void;
   /** Query expansion complete. Empty array = strong signal skip (no expansion). */
   onExpand?: (original: string, expanded: ExpandedQuery[]) => void;
   /** Reranking is about to start */
@@ -2829,6 +2942,7 @@ export async function hybridQuery(
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
+  hooks?.onInitialFTS?.(initialFts);
 
   // Step 2: Expand query (or skip if strong signal)
   const expanded = hasStrongSignal
