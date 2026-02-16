@@ -127,28 +127,13 @@ export class ApiLLM implements LLM {
   }
 
   private usesVoyageRerankApi(): boolean {
+    // Voyage uses different result shape, if we support more providers maybe add env var selector
     try {
       const hostname = new URL(this.rerankBaseUrl).hostname.toLowerCase();
       return hostname === "api.voyageai.com" || hostname.endsWith(".voyageai.com");
     } catch {
       return this.rerankBaseUrl.toLowerCase().includes("voyageai.com");
     }
-  }
-
-  private isLikelyLocalModel(model: string): boolean {
-    const lower = model.toLowerCase();
-    return (
-      model.startsWith("hf:")
-      || lower.includes(".gguf")
-      || lower === "embeddinggemma"
-      || lower.includes("qwen3-reranker")
-      || lower.startsWith("expedientfalcon/")
-    );
-  }
-
-  private resolveModel(modelOverride: string | undefined, configuredModel: string): string {
-    if (!modelOverride) return configuredModel;
-    return this.isLikelyLocalModel(modelOverride) ? configuredModel : modelOverride;
   }
 
   private extractChatContent(response: OpenAIChatResponse): string {
@@ -186,18 +171,15 @@ export class ApiLLM implements LLM {
   }
 
   private async requestChatCompletions(
-    messages: Array<{ role: "system" | "user"; content: string }>,
-    options?: { model?: string }
+    messages: Array<{ role: "system" | "user"; content: string }>
   ): Promise<string> {
     if (!this.chatApiKey) {
       throw new Error("ApiLLM chat error: missing API key (set QMD_CHAT_API_KEY)");
     }
-    const model = options?.model || this.chatModel;
-
     let response: OpenAIChatResponse;
     try {
       const payload: Record<string, unknown> = {
-        model,
+        model: this.chatModel,
         messages,
         temperature: 0.2,
       };
@@ -221,18 +203,17 @@ export class ApiLLM implements LLM {
     return content;
   }
 
-  private async requestEmbeddings(texts: string[], modelOverride?: string): Promise<OpenAIEmbeddingResponse | null> {
+  private async requestEmbeddings(texts: string[]): Promise<OpenAIEmbeddingResponse | null> {
     if (!this.embedApiKey) {
       throw new Error("ApiLLM embedding error: missing API key (set QMD_EMBED_API_KEY)");
     }
 
-    const model = this.resolveModel(modelOverride, this.embedModel);
     try {
       const resp = await fetch(`${this.embedBaseUrl}/embeddings`, {
         method: "POST",
         headers: this.getHeaders(this.embedApiKey),
         body: JSON.stringify({
-          model,
+          model: this.embedModel,
           input: texts,
         }),
       });
@@ -249,14 +230,14 @@ export class ApiLLM implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    const model = this.resolveModel(options.model, this.embedModel);
-    const response = await this.requestEmbeddings([text], model);
+    void options; // Seems used for model override in local backend, ignoring here
+    const response = await this.requestEmbeddings([text]);
     const vector = response?.data?.[0]?.embedding;
     if (!vector || !Array.isArray(vector)) return null;
 
     return {
       embedding: vector,
-      model,
+      model: this.embedModel,
     };
   }
 
@@ -316,13 +297,10 @@ export class ApiLLM implements LLM {
       `Allowed types: ${allowedTypesList}.`,
     ].filter(Boolean).join("\n");
 
-    const content = await this.requestChatCompletions(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      { model: this.chatModel }
-    );
+    const content = await this.requestChatCompletions([
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ]);
 
     if (!content.trim()) {
       return [];
@@ -345,14 +323,15 @@ export class ApiLLM implements LLM {
   }
 
   async rerank(query: string, documents: RerankDocument[], options: RerankOptions = {}): Promise<RerankResult> {
+    void options; // Seems used for model override in local backend, ignoring here
     if (!this.rerankApiKey) {
       throw new Error("ApiLLM rerank error: missing API key (set QMD_RERANK_API_KEY)");
     }
     if (documents.length === 0) {
-      return { results: [], model: this.resolveModel(options.model, this.rerankModel) };
+      return { results: [], model: this.rerankModel };
     }
 
-    const model = this.resolveModel(options.model, this.rerankModel);
+    const model = this.rerankModel;
 
     let response: RerankResponse;
     const topCountField = this.usesVoyageRerankApi() ? "top_k" : "top_n";

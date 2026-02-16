@@ -22,7 +22,7 @@ describe("ApiLLM (contract)", () => {
     process.env.QMD_RERANK_API_KEY = originalQmdRerankApiKey;
   });
 
-  test("embed sends OpenAI-compatible /embeddings request, normalizes model, and parses response", async () => {
+  test("embed sends OpenAI-compatible /embeddings request, ignores per-call model override, and parses response", async () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -38,7 +38,7 @@ describe("ApiLLM (contract)", () => {
       embedModel: "test-embed-model",
     });
 
-    const result = await llm.embed("hello", { model: "embeddinggemma" });
+    const result = await llm.embed("hello", { model: "override-embed-model" });
 
     expect(result).not.toBeNull();
     expect(result?.embedding).toEqual([0.1, 0.2, 0.3]);
@@ -109,7 +109,7 @@ describe("ApiLLM (contract)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  test("rerank sends Cohere-compatible /rerank request and maps response by index", async () => {
+  test("rerank sends Cohere-compatible /rerank request, ignores per-call model override, and maps response by index", async () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -136,7 +136,7 @@ describe("ApiLLM (contract)", () => {
         { file: "a.md", text: "Berlin is the capital of Germany." },
         { file: "b.md", text: "Paris is the capital of France." },
       ],
-      { model: "ExpedientFalcon/qwen3-reranker:0.6b-q8_0" }
+      { model: "override-rerank-model" }
     );
 
     expect(result.model).toBe("rerank-v3.5");
