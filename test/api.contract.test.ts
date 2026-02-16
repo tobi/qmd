@@ -85,9 +85,8 @@ describe("ApiLLM (contract)", () => {
     expect(results[2]?.embedding).toEqual([3, 4]);
   });
 
-  test("embed returns null and avoids fetch when API key is missing", async () => {
+  test("embed throws and avoids fetch when API key is missing", async () => {
     process.env.QMD_EMBED_API_KEY = "";
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const llm = new ApiLLM({
       embedBaseUrl: "https://example.test/v1",
@@ -95,10 +94,10 @@ describe("ApiLLM (contract)", () => {
       embedModel: "test-embed-model",
     });
 
-    const result = await llm.embed("hello");
-    expect(result).toBeNull();
+    await expect(
+      llm.embed("hello")
+    ).rejects.toThrow("missing API key");
     expect(fetchMock).not.toHaveBeenCalled();
-    consoleErrorSpy.mockRestore();
   });
 
   test("generate fails explicitly for API backend", async () => {
@@ -265,7 +264,38 @@ describe("ApiLLM (contract)", () => {
     });
   });
 
-  test("expandQuery rejects JSON-only output", async () => {
+  test("expandQuery throws and avoids fetch when chat API key is missing", async () => {
+    process.env.QMD_CHAT_API_KEY = "";
+
+    const llm = new ApiLLM({
+      chatBaseUrl: "https://chat.example.test/v1",
+      chatApiKey: "",
+      chatModel: "gpt-4o-mini",
+    });
+
+    await expect(
+      llm.expandQuery("api auth docs")
+    ).rejects.toThrow("missing API key");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test("expandQuery throws on chat request failure", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("upstream error", { status: 503, statusText: "Service Unavailable" })
+    );
+
+    const llm = new ApiLLM({
+      chatBaseUrl: "https://chat.example.test/v1",
+      chatApiKey: "chat-key",
+      chatModel: "gpt-4o-mini",
+    });
+
+    await expect(
+      llm.expandQuery("api auth docs")
+    ).rejects.toThrow("chat request failed");
+  });
+
+  test("expandQuery returns empty expansion set when output is not parseable line format", async () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -288,8 +318,10 @@ describe("ApiLLM (contract)", () => {
       chatModel: "gpt-4o-mini",
     });
 
-    await expect(
-      llm.expandQuery("api auth docs")
-    ).rejects.toThrow("could not parse query expansions");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await llm.expandQuery("api auth docs");
+    expect(result).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
   });
 });

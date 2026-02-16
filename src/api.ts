@@ -3,6 +3,9 @@
  *
  * Current phase: embeddings (/v1/embeddings), query expansion (/v1/chat/completions),
  * and rerank (/v1/rerank).
+ * Query expansion currently prompts model for line-format output ("lex|vec|hyde: ..."),
+ * but does not use constrained output. Possibly upgrade to structured output.
+ * This path works in current provider-gated tests but is not extensively battle-tested yet.
  * Text generation is intentionally unsupported in this backend for now.
  */
 
@@ -72,13 +75,12 @@ export class ApiLLM implements LLM {
   private readonly rerankModel: string;
 
   constructor(config: ApiLLMConfig = {}) {
-    const normalizedEmbedBaseUrl = (
+    // Embedding API config
+    this.embedBaseUrl = (
       config.embedBaseUrl
       || process.env.QMD_EMBED_BASE_URL
       || DEFAULT_EMBED_BASE_URL
     ).replace(/\/+$/, "");
-    this.embedBaseUrl = normalizedEmbedBaseUrl;
-
     this.embedApiKey =
       config.embedApiKey
       || process.env.QMD_EMBED_API_KEY
@@ -87,6 +89,7 @@ export class ApiLLM implements LLM {
       config.embedModel
       || process.env.QMD_EMBED_MODEL
       || DEFAULT_EMBED_MODEL;
+      // Chat API config
     this.chatBaseUrl = (
       config.chatBaseUrl
       || process.env.QMD_CHAT_BASE_URL
@@ -100,6 +103,7 @@ export class ApiLLM implements LLM {
       config.chatModel
       || process.env.QMD_CHAT_MODEL
       || DEFAULT_CHAT_MODEL;
+    // Rerank API config
     this.rerankBaseUrl = (
       config.rerankBaseUrl
       || process.env.QMD_RERANK_BASE_URL
@@ -161,9 +165,7 @@ export class ApiLLM implements LLM {
 
   private parseExpandedQueries(content: string): Queryable[] {
     const trimmed = content.trim();
-    if (!trimmed) {
-      throw new Error("ApiLLM expandQuery error: empty model output");
-    }
+    if (!trimmed) return [];
 
     // Line format: "lex: ...", "vec: ...", "hyde: ..."
     const fromLines = trimmed
@@ -180,8 +182,7 @@ export class ApiLLM implements LLM {
       })
       .filter((q): q is Queryable => q !== null);
 
-    if (fromLines.length > 0) return fromLines;
-    throw new Error("ApiLLM expandQuery error: could not parse query expansions");
+    return fromLines;
   }
 
   private async requestChatCompletions(
@@ -217,16 +218,12 @@ export class ApiLLM implements LLM {
     }
 
     const content = this.extractChatContent(response);
-    if (!content.trim()) {
-      throw new Error("ApiLLM chat error: empty response content");
-    }
     return content;
   }
 
   private async requestEmbeddings(texts: string[], modelOverride?: string): Promise<OpenAIEmbeddingResponse | null> {
     if (!this.embedApiKey) {
-      console.error("ApiLLM embedding error: missing API key (set QMD_EMBED_API_KEY)");
-      return null;
+      throw new Error("ApiLLM embedding error: missing API key (set QMD_EMBED_API_KEY)");
     }
 
     const model = this.resolveModel(modelOverride, this.embedModel);
@@ -298,15 +295,17 @@ export class ApiLLM implements LLM {
 
   async expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]> {
     const includeLexical = options?.includeLexical ?? true;
-    const formatInstruction = "Return one query per line in format: type: text, where type is lex, vec, or hyde.";
+    const searchScope = includeLexical ? "lexical and semantic" : "semantic";
+    const allowedTypes = includeLexical ? "lex, vec, or hyde" : "vec or hyde";
+    const allowedTypesList = includeLexical ? "lex, vec, hyde" : "vec, hyde";
     const lexicalInstruction = includeLexical
       ? "Include at least one lex query."
       : "Do not include any lex queries.";
 
     const systemPrompt = [
       "You expand search queries for hybrid retrieval.",
-      "Produce useful variations for lexical and semantic search.",
-      formatInstruction,
+      `Produce useful variations for ${searchScope} search.`,
+      `Return one query per line in format: type: text, where type is ${allowedTypes}.`,
     ].join(" ");
 
     const userPrompt = [
@@ -314,7 +313,7 @@ export class ApiLLM implements LLM {
       options?.context ? `Context: ${options.context}` : "",
       lexicalInstruction,
       "Return 2-4 total items. Keep each text concise and relevant.",
-      "Allowed types: lex, vec, hyde.",
+      `Allowed types: ${allowedTypesList}.`,
     ].filter(Boolean).join("\n");
 
     const content = await this.requestChatCompletions(
@@ -325,6 +324,10 @@ export class ApiLLM implements LLM {
       { model: this.chatModel }
     );
 
+    if (!content.trim()) {
+      return [];
+    }
+
     const parsed = this.parseExpandedQueries(content);
     const filteredByLex = includeLexical ? parsed : parsed.filter(q => q.type !== "lex");
     const deduped = Array.from(new Map(
@@ -334,10 +337,11 @@ export class ApiLLM implements LLM {
         .map(q => [`${q.type}|${q.text.toLowerCase()}`, q] as const)
     ).values());
 
-    if (deduped.length === 0) {
-      throw new Error("ApiLLM expandQuery error: no valid expansions produced");
+    if (deduped.length > 0) {
+      return deduped;
     }
-    return deduped;
+    console.warn("ApiLLM expandQuery warning: no valid expansions produced; returning empty expansion set");
+    return [];
   }
 
   async rerank(query: string, documents: RerankDocument[], options: RerankOptions = {}): Promise<RerankResult> {
