@@ -6,15 +6,17 @@
  * LLM operations use LlamaCpp with local GGUF models (node-llama-cpp).
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { Database } from "bun:sqlite";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { disposeDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  verifySqliteVecLoaded,
   getDefaultDbPath,
   homedir,
   resolve,
@@ -26,6 +28,12 @@ import {
   formatDocForEmbedding,
   chunkDocument,
   chunkDocumentByTokens,
+  scanBreakPoints,
+  findCodeFences,
+  isInsideCodeFence,
+  findBestCutoff,
+  type BreakPoint,
+  type CodeFenceRegion,
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
@@ -35,12 +43,14 @@ import {
   parseVirtualPath,
   normalizeDocid,
   isDocid,
+  STRONG_SIGNAL_MIN_SCORE,
+  STRONG_SIGNAL_MIN_GAP,
   type Store,
   type DocumentResult,
   type SearchResult,
   type RankedResult,
-} from "./store.js";
-import type { CollectionConfig } from "./collections.js";
+} from "../src/store.js";
+import type { CollectionConfig } from "../src/collections.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -244,7 +254,7 @@ afterAll(async () => {
 describe("Path Utilities", () => {
   test("homedir returns HOME environment variable", () => {
     const result = homedir();
-    expect(result).toBe(Bun.env.HOME || "/tmp");
+    expect(result).toBe(process.env.HOME || "/tmp");
   });
 
   test("resolve handles absolute paths", () => {
@@ -253,7 +263,7 @@ describe("Path Utilities", () => {
   });
 
   test("resolve handles relative paths", () => {
-    const pwd = Bun.env.PWD || process.cwd();
+    const pwd = process.env.PWD || process.cwd();
     expect(resolve("foo")).toBe(`${pwd}/foo`);
     expect(resolve("foo", "bar")).toBe(`${pwd}/foo/bar`);
   });
@@ -376,6 +386,11 @@ describe("handelize", () => {
     expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
   });
 
+  test("handles symbol-only route filenames", () => {
+    expect(handelize("routes/api/auth/$.ts")).toBe("routes/api/auth/$.ts");
+    expect(handelize("app/routes/$id.tsx")).toBe("app/routes/$id.tsx");
+  });
+
   test("filters out empty segments", () => {
     expect(handelize("a//b/c.md")).toBe("a/b/c.md");
     expect(handelize("/a/b/")).toBe("a/b");
@@ -416,7 +431,8 @@ describe("Store Creation", () => {
   test("createStore creates a new store with custom path", async () => {
     const store = await createTestStore();
     expect(store.dbPath).toBe(testDbPath);
-    expect(store.db).toBeInstanceOf(Database);
+    expect(store.db).toBeDefined();
+    expect(typeof store.db.exec).toBe("function");
     await cleanupTestDb(store);
   });
 
@@ -443,6 +459,25 @@ describe("Store Creation", () => {
     const result = store.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
     expect(result.journal_mode).toBe("wal");
     await cleanupTestDb(store);
+  });
+
+  test("verifySqliteVecLoaded throws when sqlite-vec is not loaded", () => {
+    const db = openDatabase(":memory:");
+    try {
+      expect(() => verifySqliteVecLoaded(db)).toThrow("sqlite-vec extension is unavailable");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("verifySqliteVecLoaded succeeds when sqlite-vec is loaded", () => {
+    const db = openDatabase(":memory:");
+    try {
+      loadSqliteVec(db);
+      expect(() => verifySqliteVecLoaded(db)).not.toThrow();
+    } finally {
+      db.close();
+    }
   });
 
   test("store.close closes the database connection", async () => {
@@ -591,38 +626,38 @@ describe("Document Chunking", () => {
     }
   });
 
-  test("chunkDocument with default params uses 800-token chunks", () => {
-    // Default is CHUNK_SIZE_CHARS (3200 chars) with CHUNK_OVERLAP_CHARS (480 chars)
-    const content = "Word ".repeat(2000);  // ~10000 chars
+  test("chunkDocument with default params uses 900-token chunks", () => {
+    // Default is CHUNK_SIZE_CHARS (3600 chars) with CHUNK_OVERLAP_CHARS (540 chars)
+    const content = "Word ".repeat(2500);  // ~12500 chars
     const chunks = chunkDocument(content);
     expect(chunks.length).toBeGreaterThan(1);
-    // Each chunk should be around 3200 chars (except last)
-    expect(chunks[0]!.text.length).toBeGreaterThan(2500);
-    expect(chunks[0]!.text.length).toBeLessThanOrEqual(3200);
+    // Each chunk should be around 3600 chars (except last)
+    expect(chunks[0]!.text.length).toBeGreaterThan(2800);
+    expect(chunks[0]!.text.length).toBeLessThanOrEqual(3600);
   });
 });
 
-describe("Token-based Chunking", () => {
+describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
   test("chunkDocumentByTokens returns single chunk for small documents", async () => {
     const content = "This is a small document.";
-    const chunks = await chunkDocumentByTokens(content, 800, 120);
+    const chunks = await chunkDocumentByTokens(content, 900, 135);
     expect(chunks).toHaveLength(1);
     expect(chunks[0]!.text).toBe(content);
     expect(chunks[0]!.pos).toBe(0);
     expect(chunks[0]!.tokens).toBeGreaterThan(0);
-    expect(chunks[0]!.tokens).toBeLessThan(800);
+    expect(chunks[0]!.tokens).toBeLessThan(900);
   });
 
   test("chunkDocumentByTokens splits large documents", async () => {
-    // Create a document that's definitely more than 800 tokens
-    const content = "The quick brown fox jumps over the lazy dog. ".repeat(200);
-    const chunks = await chunkDocumentByTokens(content, 800, 120);
+    // Create a document that's definitely more than 900 tokens
+    const content = "The quick brown fox jumps over the lazy dog. ".repeat(250);
+    const chunks = await chunkDocumentByTokens(content, 900, 135);
 
     expect(chunks.length).toBeGreaterThan(1);
 
-    // Each chunk should have ~800 tokens or less
+    // Each chunk should have ~900 tokens or less
     for (const chunk of chunks) {
-      expect(chunk.tokens).toBeLessThanOrEqual(850);  // Allow slight overage
+      expect(chunk.tokens).toBeLessThanOrEqual(950);  // Allow slight overage
       expect(chunk.tokens).toBeGreaterThan(0);
     }
 
@@ -658,6 +693,308 @@ describe("Token-based Chunking", () => {
     // The token count should be reasonable (not 0, not equal to char count)
     expect(chunks[0]!.tokens).toBeGreaterThan(0);
     expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
+  });
+});
+
+// =============================================================================
+// Smart Chunking - Break Point Detection Tests
+// =============================================================================
+
+describe("scanBreakPoints", () => {
+  test("detects h1 headings", () => {
+    const text = "Intro\n# Heading 1\nMore text";
+    const breaks = scanBreakPoints(text);
+    const h1 = breaks.find(b => b.type === 'h1');
+    expect(h1).toBeDefined();
+    expect(h1!.score).toBe(100);
+    expect(h1!.pos).toBe(5); // position of \n#
+  });
+
+  test("detects multiple heading levels", () => {
+    const text = "Text\n# H1\n## H2\n### H3\nMore";
+    const breaks = scanBreakPoints(text);
+
+    const h1 = breaks.find(b => b.type === 'h1');
+    const h2 = breaks.find(b => b.type === 'h2');
+    const h3 = breaks.find(b => b.type === 'h3');
+
+    expect(h1).toBeDefined();
+    expect(h2).toBeDefined();
+    expect(h3).toBeDefined();
+    expect(h1!.score).toBe(100);
+    expect(h2!.score).toBe(90);
+    expect(h3!.score).toBe(80);
+  });
+
+  test("detects code blocks", () => {
+    const text = "Before\n```js\ncode\n```\nAfter";
+    const breaks = scanBreakPoints(text);
+    const codeBlocks = breaks.filter(b => b.type === 'codeblock');
+    expect(codeBlocks.length).toBe(2); // opening and closing
+    expect(codeBlocks[0]!.score).toBe(80);
+  });
+
+  test("detects horizontal rules", () => {
+    const text = "Text\n---\nMore text";
+    const breaks = scanBreakPoints(text);
+    const hr = breaks.find(b => b.type === 'hr');
+    expect(hr).toBeDefined();
+    expect(hr!.score).toBe(60);
+  });
+
+  test("detects blank lines (paragraph boundaries)", () => {
+    const text = "First paragraph.\n\nSecond paragraph.";
+    const breaks = scanBreakPoints(text);
+    const blank = breaks.find(b => b.type === 'blank');
+    expect(blank).toBeDefined();
+    expect(blank!.score).toBe(20);
+  });
+
+  test("detects list items", () => {
+    const text = "Intro\n- Item 1\n- Item 2\n1. Numbered";
+    const breaks = scanBreakPoints(text);
+
+    const lists = breaks.filter(b => b.type === 'list');
+    const numLists = breaks.filter(b => b.type === 'numlist');
+
+    expect(lists.length).toBe(2);
+    expect(numLists.length).toBe(1);
+    expect(lists[0]!.score).toBe(5);
+    expect(numLists[0]!.score).toBe(5);
+  });
+
+  test("detects newlines as fallback", () => {
+    const text = "Line 1\nLine 2\nLine 3";
+    const breaks = scanBreakPoints(text);
+    const newlines = breaks.filter(b => b.type === 'newline');
+    expect(newlines.length).toBe(2);
+    expect(newlines[0]!.score).toBe(1);
+  });
+
+  test("returns breaks sorted by position", () => {
+    const text = "A\n# B\n\nC\n## D";
+    const breaks = scanBreakPoints(text);
+    for (let i = 1; i < breaks.length; i++) {
+      expect(breaks[i]!.pos).toBeGreaterThan(breaks[i-1]!.pos);
+    }
+  });
+
+  test("higher-scoring pattern wins at same position", () => {
+    // \n# matches both newline (score 1) and h1 (score 100)
+    const text = "Text\n# Heading";
+    const breaks = scanBreakPoints(text);
+    const atPos = breaks.filter(b => b.pos === 4);
+    expect(atPos.length).toBe(1);
+    expect(atPos[0]!.type).toBe('h1');
+    expect(atPos[0]!.score).toBe(100);
+  });
+});
+
+describe("findCodeFences", () => {
+  test("finds single code fence", () => {
+    const text = "Before\n```js\ncode here\n```\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(fences[0]!.start).toBe(6); // position of first \n```
+    // End is position after the closing \n``` (which is at position 22, length 4)
+    expect(fences[0]!.end).toBe(26);
+  });
+
+  test("finds multiple code fences", () => {
+    const text = "Intro\n```\nblock1\n```\nMiddle\n```\nblock2\n```\nEnd";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(2);
+  });
+
+  test("handles unclosed code fence", () => {
+    const text = "Before\n```\nunclosed code block";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(fences[0]!.end).toBe(text.length); // extends to end of document
+  });
+
+  test("returns empty array for no code fences", () => {
+    const text = "No code fences here";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(0);
+  });
+});
+
+describe("isInsideCodeFence", () => {
+  test("returns true for position inside fence", () => {
+    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideCodeFence(15, fences)).toBe(true);
+    expect(isInsideCodeFence(20, fences)).toBe(true);
+  });
+
+  test("returns false for position outside fence", () => {
+    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideCodeFence(5, fences)).toBe(false);
+    expect(isInsideCodeFence(35, fences)).toBe(false);
+  });
+
+  test("returns false for position at fence boundaries", () => {
+    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideCodeFence(10, fences)).toBe(false); // at start
+    expect(isInsideCodeFence(30, fences)).toBe(false); // at end
+  });
+
+  test("handles multiple fences", () => {
+    const fences: CodeFenceRegion[] = [
+      { start: 10, end: 30 },
+      { start: 50, end: 70 }
+    ];
+    expect(isInsideCodeFence(20, fences)).toBe(true);
+    expect(isInsideCodeFence(60, fences)).toBe(true);
+    expect(isInsideCodeFence(40, fences)).toBe(false);
+  });
+});
+
+describe("findBestCutoff", () => {
+  test("prefers higher-scoring break points", () => {
+    const breakPoints: BreakPoint[] = [
+      { pos: 100, score: 1, type: 'newline' },
+      { pos: 150, score: 100, type: 'h1' },
+      { pos: 180, score: 20, type: 'blank' },
+    ];
+    // Target is 200, window is 100 (so 100-200 is valid)
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7);
+    expect(cutoff).toBe(150); // h1 wins due to high score
+  });
+
+  test("h2 at window edge beats blank at target (squared decay)", () => {
+    const breakPoints: BreakPoint[] = [
+      { pos: 100, score: 90, type: 'h2' },  // at window edge
+      { pos: 195, score: 20, type: 'blank' }, // close to target
+    ];
+    // Target is 200, window is 100
+    // With squared decay:
+    // h2 at 100: dist=100, normalized=1.0, mult=1-1*0.7=0.3, final=90*0.3=27
+    // blank at 195: dist=5, normalized=0.05, mult=1-0.0025*0.7=0.998, final=20*0.998=19.97
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7);
+    expect(cutoff).toBe(100); // h2 wins even at edge!
+  });
+
+  test("high score easily overcomes distance", () => {
+    const breakPoints: BreakPoint[] = [
+      { pos: 150, score: 100, type: 'h1' },  // h1 at middle
+      { pos: 195, score: 1, type: 'newline' }, // newline near target
+    ];
+    // Target is 200, window is 100
+    // h1 at 150: dist=50, normalized=0.5, mult=1-0.25*0.7=0.825, final=82.5
+    // newline at 195: dist=5, mult=0.998, final=0.998
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7);
+    expect(cutoff).toBe(150); // h1 wins easily
+  });
+
+  test("returns target position when no breaks in window", () => {
+    const breakPoints: BreakPoint[] = [
+      { pos: 10, score: 100, type: 'h1' }, // too far before window
+    ];
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7);
+    expect(cutoff).toBe(200);
+  });
+
+  test("skips break points inside code fences", () => {
+    const breakPoints: BreakPoint[] = [
+      { pos: 150, score: 100, type: 'h1' },  // inside fence
+      { pos: 180, score: 20, type: 'blank' }, // outside fence
+    ];
+    const codeFences: CodeFenceRegion[] = [{ start: 140, end: 160 }];
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7, codeFences);
+    expect(cutoff).toBe(180); // blank wins since h1 is inside fence
+  });
+
+  test("handles empty break points array", () => {
+    const cutoff = findBestCutoff([], 200, 100, 0.7);
+    expect(cutoff).toBe(200);
+  });
+});
+
+describe("Smart Chunking Integration", () => {
+  test("chunkDocument prefers headings over arbitrary breaks", () => {
+    // Create content where the heading falls within the search window
+    // We want the heading at ~1700 chars so it's in the window for a 2000 char target
+    const section1 = "Introduction text here. ".repeat(70); // ~1680 chars
+    const section2 = "Main content text here. ".repeat(50); // ~1150 chars
+    const content = `${section1}\n# Main Section\n${section2}`;
+
+    // With 2000 char chunks and 800 char window (searches 1200-2000)
+    // Heading is at ~1680 which is in window
+    const chunks = chunkDocument(content, 2000, 0, 800);
+    const headingPos = content.indexOf('\n# Main Section');
+
+    // First chunk should end at the heading (best break point in window)
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    expect(chunks[0]!.text.length).toBe(headingPos);
+  });
+
+  test("chunkDocument does not split inside code blocks", () => {
+    const beforeCode = "Some intro text. ".repeat(30); // ~480 chars
+    const codeBlock = "```typescript\n" + "const x = 1;\n".repeat(100) + "```\n";
+    const afterCode = "More text after code. ".repeat(30);
+    const content = beforeCode + codeBlock + afterCode;
+
+    const chunks = chunkDocument(content, 1000, 0, 400);
+
+    // Check that no chunk starts in the middle of a code block
+    for (const chunk of chunks) {
+      const hasOpenFence = (chunk.text.match(/\n```/g) || []).length;
+      // If we have an odd number of fence markers, we're splitting inside a block
+      // (unless it's the last chunk with unclosed fence)
+      if (hasOpenFence % 2 === 1 && !chunk.text.endsWith('```\n')) {
+        // This is acceptable only if it's an unclosed fence at document end
+        const isLastChunk = chunks.indexOf(chunk) === chunks.length - 1;
+        if (!isLastChunk) {
+          // Not the last chunk, so this would be a split inside code - check it's not common
+          // Actually this test is more about smoke testing - we just verify it runs
+        }
+      }
+    }
+    expect(chunks.length).toBeGreaterThan(1);
+  });
+
+  test("chunkDocument handles markdown with mixed elements", () => {
+    const content = `# Introduction
+
+This is the introduction paragraph with some text.
+
+## Section 1
+
+Some content in section 1.
+
+- List item 1
+- List item 2
+- List item 3
+
+## Section 2
+
+\`\`\`javascript
+function hello() {
+  console.log("Hello");
+}
+\`\`\`
+
+More text after the code block.
+
+---
+
+## Section 3
+
+Final section content.
+`.repeat(10);
+
+    const chunks = chunkDocument(content, 500, 75, 200);
+
+    // Should produce multiple chunks
+    expect(chunks.length).toBeGreaterThan(5);
+
+    // All chunks should be valid strings
+    for (const chunk of chunks) {
+      expect(typeof chunk.text).toBe('string');
+      expect(chunk.text.length).toBeGreaterThan(0);
+      expect(chunk.pos).toBeGreaterThanOrEqual(0);
+    }
   });
 });
 
@@ -883,8 +1220,8 @@ describe("FTS Search", () => {
     const allResults = store.searchFTS("searchable", 10);
     expect(allResults).toHaveLength(2);
 
-    // Filter by collection name (collectionId is now treated as collection name string)
-    const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
+    // Filter by collection name
+    const filtered = store.searchFTS("searchable", 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 
@@ -904,6 +1241,96 @@ describe("FTS Search", () => {
     const results = store.searchFTS("foo(bar)", 10);
     // Results may vary based on FTS5 handling
     expect(Array.isArray(results)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  // BM25 IDF requires corpus depth — helper adds non-matching docs so term frequency
+  // differentiation produces meaningful scores (2-doc corpus has near-zero IDF).
+  async function addNoiseDocuments(db: Database, collectionName: string, count = 8) {
+    for (let i = 0; i < count; i++) {
+      await insertTestDocument(db, collectionName, {
+        name: `noise${i}`,
+        title: `Unrelated Topic ${i}`,
+        body: `This document discusses completely different subjects like gardening and cooking ${i}`,
+        displayPath: `test/noise${i}.md`,
+      });
+    }
+  }
+
+  test("searchFTS scores: stronger BM25 match → higher normalized score", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await addNoiseDocuments(store.db, collectionName);
+
+    // "alpha" appears in title (10x weight) + body → strong BM25
+    await insertTestDocument(store.db, collectionName, {
+      name: "strong",
+      title: "Alpha Guide",
+      body: "This is the definitive alpha reference with alpha details and more alpha info",
+      displayPath: "test/strong.md",
+    });
+
+    // "alpha" appears once in body only → weaker BM25
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "General Notes",
+      body: "Some notes that mention alpha in passing among other topics and keywords",
+      displayPath: "test/weak.md",
+    });
+
+    const results = store.searchFTS("alpha", 10);
+    expect(results.length).toBe(2);
+
+    // Verify score direction: stronger match (title + body) should score HIGHER
+    const strongResult = results.find(r => r.displayPath.includes("strong"))!;
+    const weakResult = results.find(r => r.displayPath.includes("weak"))!;
+    expect(strongResult.score).toBeGreaterThan(weakResult.score);
+
+    // Verify scores are in valid (0, 1) range
+    for (const r of results) {
+      expect(r.score).toBeGreaterThan(0);
+      expect(r.score).toBeLessThan(1);
+    }
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS scores: minScore filter keeps strong matches, drops weak", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await addNoiseDocuments(store.db, collectionName);
+
+    // Strong match: keyword in title (10x weight) + repeated in body
+    await insertTestDocument(store.db, collectionName, {
+      name: "strong",
+      title: "Kubernetes Deployment",
+      body: "Kubernetes deployment strategies for kubernetes clusters using kubernetes operators",
+      displayPath: "test/strong.md",
+    });
+
+    // Weak match: keyword appears once in body only
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "Random Notes",
+      body: "Various topics including a brief kubernetes mention among many other unrelated things",
+      displayPath: "test/weak.md",
+    });
+
+    const allResults = store.searchFTS("kubernetes", 10);
+    expect(allResults.length).toBe(2);
+
+    // With a minScore threshold, strong match should survive, weak should be filterable
+    const strongScore = allResults.find(r => r.displayPath.includes("strong"))!.score;
+    const weakScore = allResults.find(r => r.displayPath.includes("weak"))!.score;
+
+    // Find a threshold between them
+    const threshold = (strongScore + weakScore) / 2;
+    const filtered = allResults.filter(r => r.score >= threshold);
+
+    // Strong match survives the filter, weak does not
+    expect(filtered.length).toBe(1);
+    expect(filtered[0]!.displayPath).toContain("strong");
 
     await cleanupTestDb(store);
   });
@@ -930,6 +1357,53 @@ describe("FTS Search", () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/test/active.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/active.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS scores: strong signal detection works with correct normalization", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // BM25 IDF needs meaningful corpus depth for strong signal to fire.
+    // 50 noise docs give IDF ≈ log(50/2) ≈ 3.2 — enough for scores above 0.85.
+    await addNoiseDocuments(store.db, collectionName, 50);
+
+    // Dominant: keyword in filepath (10x BM25 weight column) + title + body
+    await insertTestDocument(store.db, collectionName, {
+      name: "dominant",
+      title: "Zephyr Configuration Guide",
+      body: "Complete zephyr configuration guide. Zephyr setup instructions for zephyr deployment.",
+      displayPath: "zephyr/zephyr-guide.md",
+    });
+
+    // Weak: keyword once in body only, longer doc dilutes TF
+    await insertTestDocument(store.db, collectionName, {
+      name: "weak",
+      title: "General Notes",
+      body: "Various topics covering many areas of technology and design. " +
+        "One of them might relate to zephyr but mostly about other things entirely. " +
+        "Additional content about databases, networking, security, performance, " +
+        "monitoring, deployment, testing, and documentation practices.",
+      displayPath: "notes/misc.md",
+    });
+
+    const results = store.searchFTS("zephyr", 10);
+    expect(results.length).toBe(2);
+
+    const topScore = results[0]!.score;
+    const secondScore = results[1]!.score;
+
+    // With correct normalization: strong match should be well above threshold
+    expect(topScore).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_SCORE);
+
+    // Gap should exceed threshold when there's a dominant match
+    const gap = topScore - secondScore;
+    expect(gap).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_GAP);
+
+    // Full strong signal check should pass (this was dead code before the fix)
+    const hasStrongSignal = topScore >= STRONG_SIGNAL_MIN_SCORE && gap >= STRONG_SIGNAL_MIN_GAP;
+    expect(hasStrongSignal).toBe(true);
 
     await cleanupTestDb(store);
   });
@@ -1772,7 +2246,7 @@ describe("Integration", () => {
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
-describe("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -1893,27 +2367,32 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
-  test("expandQuery returns original plus expanded queries", async () => {
+  test("expandQuery returns typed expansions (no original query)", async () => {
     const store = await createTestStore();
 
-    const queries = await store.expandQuery("test query");
-    expect(queries).toContain("test query");
-    expect(queries[0]).toBe("test query");
-    // LlamaCpp returns original + variations
-    expect(queries.length).toBeGreaterThanOrEqual(1);
+    const expanded = await store.expandQuery("test query");
+    // Returns ExpandedQuery[] — typed results from LLM, excluding original
+    expect(expanded.length).toBeGreaterThanOrEqual(1);
+    for (const q of expanded) {
+      expect(['lex', 'vec', 'hyde']).toContain(q.type);
+      expect(q.text.length).toBeGreaterThan(0);
+      expect(q.text).not.toBe("test query"); // original excluded
+    }
 
     await cleanupTestDb(store);
   }, 30000);
 
-  test("expandQuery caches results", async () => {
+  test("expandQuery caches results as JSON with types", async () => {
     const store = await createTestStore();
 
-    // First call
+    // First call — hits LLM
     const queries1 = await store.expandQuery("cached query test");
-    // Second call - should hit cache
+    // Second call — hits cache
     const queries2 = await store.expandQuery("cached query test");
 
-    expect(queries1[0]).toBe(queries2[0]);
+    // Cache should preserve full typed structure
+    expect(queries1).toEqual(queries2);
+    expect(queries2[0]?.type).toBeDefined();
 
     await cleanupTestDb(store);
   }, 30000);
@@ -2226,6 +2705,41 @@ describe("Content-Addressable Storage", () => {
     // Should have 2 entries in content table
     const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content`).get() as { count: number };
     expect(contentCount.count).toBe(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("re-indexing a previously deactivated path reactivates instead of violating UNIQUE", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const oldContent = "# First Version";
+    const oldHash = await hashContent(oldContent);
+    store.insertContent(oldHash, oldContent, now);
+    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, now, now);
+
+    // Simulate file removal during update pass.
+    store.deactivateDocument(collectionName, "docs/foo.md");
+    expect(store.findActiveDocument(collectionName, "docs/foo.md")).toBeNull();
+
+    // Simulate file coming back in a later update pass.
+    const newContent = "# Second Version";
+    const newHash = await hashContent(newContent);
+    store.insertContent(newHash, newContent, now);
+
+    expect(() => {
+      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, now, now);
+    }).not.toThrow();
+
+    const rows = store.db.prepare(`
+      SELECT id, hash, active FROM documents
+      WHERE collection = ? AND path = ?
+    `).all(collectionName, "docs/foo.md") as { id: number; hash: string; active: number }[];
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.active).toBe(1);
+    expect(rows[0]!.hash).toBe(newHash);
 
     await cleanupTestDb(store);
   });

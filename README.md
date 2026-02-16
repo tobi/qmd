@@ -4,11 +4,21 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
+![QMD Architecture](assets/qmd-architecture.png)
+
+You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
+
 ## Quick Start
 
 ```sh
-# Install globally with Bun
-bun install -g https://github.com/tobi/qmd
+# Install globally (Node or Bun)
+npm install -g @tobilu/qmd
+# or
+bun install -g @tobilu/qmd
+
+# Or run directly
+npx @tobilu/qmd ...
+bunx @tobilu/qmd ...
 
 # Or with Nix Flakes
 nix profile install github:tobi/qmd
@@ -18,7 +28,7 @@ qmd collection add ~/notes --name notes
 qmd collection add ~/Documents/meetings --name meetings
 qmd collection add ~/work/docs --name docs
 
-# Add context to help with search results
+# Add context to help with search results, each piece of context will be returned when matching sub documents are returned. This works as a tree. This is the key feature of QMD as it allows LLMs to make much better contextual choices when selecting documents. Don't sleep on it!
 qmd context add qmd://notes "Personal notes and ideas"
 qmd context add qmd://meetings "Meeting transcripts and notes"
 qmd context add qmd://docs "Work documentation"
@@ -68,8 +78,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 
 **Tools exposed:**
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vsearch` - Semantic vector search (supports collection filter)
-- `qmd_query` - Hybrid search with reranking (supports collection filter)
+- `qmd_vector_search` - Semantic vector search (supports collection filter)
+- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
 - `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
@@ -106,6 +116,29 @@ Or configure MCP manually in `~/.claude/settings.json`:
   }
 }
 ```
+
+#### HTTP Transport
+
+By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:
+
+```sh
+# Foreground (Ctrl-C to stop)
+qmd mcp --http                    # localhost:8181
+qmd mcp --http --port 8080        # custom port
+
+# Background daemon
+qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
+qmd mcp stop                      # stop via PID file
+qmd status                        # shows "MCP: running (PID ...)" when active
+```
+
+The HTTP server exposes two endpoints:
+- `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `GET /health` — liveness check with uptime
+
+LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+
+Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 ## Architecture
 
@@ -209,6 +242,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### System Requirements
 
+- **Node.js** >= 22
 - **Bun** >= 1.0.0
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
@@ -232,18 +266,18 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 ### With Bun
 
 ```sh
-bun install -g github:tobi/qmd
+npm install -g @tobilu/qmd
+# or
+bun install -g @tobilu/qmd
 ```
-
-Make sure `~/.bun/bin` is in your PATH.
 
 ### Development
 
 ```sh
 git clone https://github.com/tobi/qmd
 cd qmd
-bun install
-bun link
+npm install
+npm link
 ```
 
 ### With Nix Flakes
@@ -282,7 +316,7 @@ qmd ls notes/subfolder
 ### Generate Vector Embeddings
 
 ```sh
-# Embed all indexed documents (800 tokens/chunk, 15% overlap)
+# Embed all indexed documents (900 tokens/chunk, 15% overlap)
 qmd embed
 
 # Force re-embed everything
@@ -459,7 +493,7 @@ collections     -- Indexed directories with name and glob patterns
 path_contexts   -- Context descriptions by virtual path (qmd://...)
 documents       -- Markdown content with metadata and docid (6-char hash)
 documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos, 800 tokens each)
+content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
@@ -489,17 +523,48 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 
 ### Embedding Flow
 
-Documents are chunked into 800-token pieces with 15% overlap:
+Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Chunk (800 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                    "title | text"        embedBatch()
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
+                │                           "title | text"        embedBatch()
                 │
                 └─► Chunks stored with:
                     - hash: document hash
                     - seq: chunk sequence (0, 1, 2...)
                     - pos: character position in original
 ```
+
+### Smart Chunking
+
+Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to find natural markdown break points. This keeps semantic units (sections, paragraphs, code blocks) together.
+
+**Break Point Scores:**
+
+| Pattern | Score | Description |
+|---------|-------|-------------|
+| `# Heading` | 100 | H1 - major section |
+| `## Heading` | 90 | H2 - subsection |
+| `### Heading` | 80 | H3 |
+| `#### Heading` | 70 | H4 |
+| `##### Heading` | 60 | H5 |
+| `###### Heading` | 50 | H6 |
+| ` ``` ` | 80 | Code block boundary |
+| `---` / `***` | 60 | Horizontal rule |
+| Blank line | 20 | Paragraph boundary |
+| `- item` / `1. item` | 5 | List item |
+| Line break | 1 | Minimal break |
+
+**Algorithm:**
+
+1. Scan document for all break points with scores
+2. When approaching the 900-token target, search a 200-token window before the cutoff
+3. Score each break point: `finalScore = baseScore × (1 - (distance/window)² × 0.7)`
+4. Cut at the highest-scoring break point
+
+The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target (score 1), but a closer heading wins over a distant one.
+
+**Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the chunk size, it's kept whole when possible.
 
 ### Query Flow (Hybrid)
 

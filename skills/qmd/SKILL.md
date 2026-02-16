@@ -142,8 +142,8 @@ This plugin configures the qmd MCP server automatically. When available, prefer 
 | MCP Tool | Equivalent CLI | Purpose |
 |----------|---------------|---------|
 | `qmd_search` | `qmd search` | Fast BM25 keyword search |
-| `qmd_vsearch` | `qmd vsearch` | Semantic vector search |
-| `qmd_query` | `qmd query` | Hybrid search with reranking |
+| `qmd_vector_search` | `qmd vsearch` | Semantic vector search |
+| `qmd_deep_search` | `qmd query` | Deep search with expansion and reranking |
 | `qmd_get` | `qmd get` | Retrieve document by path or docid |
 | `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
 | `qmd_status` | `qmd status` | Index health and collection info |

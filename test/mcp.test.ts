@@ -5,17 +5,17 @@
  * Uses mocked Ollama responses and a test database.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import { Database } from "bun:sqlite";
-import * as sqliteVec from "sqlite-vec";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "./collections";
+import type { CollectionConfig } from "../src/collections";
 
 // =============================================================================
 // Test Database Setup
@@ -31,7 +31,7 @@ afterAll(async () => {
 });
 
 function initTestDatabase(db: Database): void {
-  sqliteVec.load(db);
+  loadSqliteVec(db);
   db.exec("PRAGMA journal_mode = WAL");
 
   // Content-addressable storage - the source of truth for document content
@@ -192,8 +192,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "./store";
-import type { RankedResult } from "./store";
+} from "../src/store";
+import type { RankedResult } from "../src/store";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -226,7 +226,7 @@ describe("MCP Server", () => {
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
     testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
-    testDb = new Database(testDbPath);
+    testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
   });
@@ -291,10 +291,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_vsearch (Vector)
+  // Tool: qmd_vector_search (Vector)
   // ===========================================================================
 
-  describe("qmd_vsearch tool", () => {
+  describe.skipIf(!!process.env.CI)("qmd_vector_search tool", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -306,7 +306,7 @@ describe("MCP Server", () => {
     });
 
     test("returns empty when no vector table exists", async () => {
-      const emptyDb = new Database(":memory:");
+      const emptyDb = openDatabase(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
 
@@ -317,15 +317,18 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_query (Hybrid)
+  // Tool: qmd_deep_search (Deep search)
   // ===========================================================================
 
-  describe("qmd_query tool", () => {
-    test("expands query with variations", async () => {
-      const queries = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
-      // Always returns at least the original query, may have more if generation succeeds
-      expect(queries.length).toBeGreaterThanOrEqual(1);
-      expect(queries[0]).toBe("api documentation");
+  describe.skipIf(!!process.env.CI)("qmd_deep_search tool", () => {
+    test("expands query with typed variations", async () => {
+      const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
+      // Returns ExpandedQuery[] — typed expansions, original excluded
+      expect(expanded.length).toBeGreaterThanOrEqual(1);
+      for (const q of expanded) {
+        expect(['lex', 'vec', 'hyde']).toContain(q.type);
+        expect(q.text.length).toBeGreaterThan(0);
+      }
     }, 30000); // 30s timeout for model loading
 
     test("performs RRF fusion on multiple result lists", () => {
@@ -356,22 +359,33 @@ describe("MCP Server", () => {
     });
 
     test("full hybrid search pipeline", async () => {
-      // Simulate full qmd_query flow
+      // Simulate full qmd_deep_search flow with type-routed queries
       const query = "meeting notes";
-      const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
+      const expanded = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
 
       const rankedLists: RankedResult[][] = [];
-      for (const q of queries) {
-        const ftsResults = searchFTS(testDb, q, 20);
-        if (ftsResults.length > 0) {
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath,
-            displayPath: r.displayPath,
-            title: r.title,
-            body: r.body || "",
-            score: r.score,
-          })));
+
+      // Original query → FTS (probe)
+      const probeFts = searchFTS(testDb, query, 20);
+      if (probeFts.length > 0) {
+        rankedLists.push(probeFts.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+      }
+
+      // Expanded queries → route by type: lex→FTS, vec/hyde skipped (no vectors in test)
+      for (const q of expanded) {
+        if (q.type === 'lex') {
+          const ftsResults = searchFTS(testDb, q.text, 20);
+          if (ftsResults.length > 0) {
+            rankedLists.push(ftsResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+          }
         }
+        // vec/hyde would go to searchVec — not available in this unit test
       }
 
       expect(rankedLists.length).toBeGreaterThan(0);
@@ -635,7 +649,7 @@ describe("MCP Server", () => {
         WHERE d.path = ? AND d.active = 1
       `).get(path) as { filepath: string; display_path: string; body: string } | null;
 
-      expect(doc).toBeNull();
+      expect(doc == null).toBe(true); // bun:sqlite returns null, better-sqlite3 returns undefined
     });
 
     test("includes context in document body", () => {
@@ -717,47 +731,6 @@ describe("MCP Server", () => {
       expect(doc).not.toBeNull();
       expect(doc?.display_path).toBe("External Podcast/2023 April - Interview.md");
       expect(doc?.body).toContain("Podcast Episode");
-    });
-  });
-
-  // ===========================================================================
-  // Prompt: query
-  // ===========================================================================
-
-  describe("query prompt", () => {
-    test("returns usage guide", () => {
-      // The prompt content is static, just verify the structure
-      const promptContent = `# QMD - Quick Markdown Search
-
-QMD is your on-device search engine for markdown knowledge bases.`;
-
-      expect(promptContent).toContain("QMD");
-      expect(promptContent).toContain("search");
-    });
-
-    test("describes all available tools", () => {
-      const toolNames = [
-        "qmd_search",
-        "qmd_vsearch",
-        "qmd_query",
-        "qmd_get",
-        "qmd_multi_get",
-        "qmd_status",
-      ];
-
-      // Verify these are documented in the prompt
-      const promptGuide = `
-### 1. qmd_search (Fast keyword search)
-### 2. qmd_vsearch (Semantic search)
-### 3. qmd_query (Hybrid search - highest quality)
-### 4. qmd_get (Retrieve document)
-### 5. qmd_multi_get (Retrieve multiple documents)
-### 6. qmd_status (Index info)
-      `;
-
-      for (const tool of toolNames) {
-        expect(promptGuide).toContain(tool);
-      }
     });
   });
 
@@ -885,5 +858,188 @@ QMD is your on-device search engine for markdown knowledge bases.`;
         expect(typeof col.documents).toBe("number");
       }
     });
+  });
+});
+
+// =============================================================================
+// HTTP Transport Tests
+// =============================================================================
+
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp";
+import { enableProductionMode } from "../src/store";
+
+describe("MCP HTTP Transport", () => {
+  let handle: HttpServerHandle;
+  let baseUrl: string;
+  let httpTestDbPath: string;
+  let httpTestConfigDir: string;
+  // Stash original env to restore after tests
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  beforeAll(async () => {
+    // Create isolated test database with seeded data
+    httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
+    const db = openDatabase(httpTestDbPath);
+    initTestDatabase(db);
+    seedTestData(db);
+    db.close();
+
+    // Create isolated YAML config
+    const configPrefix = join(tmpdir(), `qmd-mcp-http-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    httpTestConfigDir = await mkdtemp(configPrefix);
+    const testConfig: CollectionConfig = {
+      collections: {
+        docs: {
+          path: "/test/docs",
+          pattern: "**/*.md",
+        }
+      }
+    };
+    await writeFile(join(httpTestConfigDir, "index.yml"), YAML.stringify(testConfig));
+
+    // Point createStore() at our test DB
+    process.env.INDEX_PATH = httpTestDbPath;
+    process.env.QMD_CONFIG_DIR = httpTestConfigDir;
+
+    handle = await startMcpHttpServer(0, { quiet: true }); // OS-assigned ephemeral port
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    await handle.stop();
+
+    // Restore env
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    // Clean up test files
+    try { require("fs").unlinkSync(httpTestDbPath); } catch {}
+    try {
+      const files = await readdir(httpTestConfigDir);
+      for (const f of files) await unlink(join(httpTestConfigDir, f));
+      await rmdir(httpTestConfigDir);
+    } catch {}
+  });
+
+  // ---------------------------------------------------------------------------
+  // Health & routing
+  // ---------------------------------------------------------------------------
+
+  test("GET /health returns 200 with status and uptime", async () => {
+    const res = await fetch(`${baseUrl}/health`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(typeof body.uptime).toBe("number");
+  });
+
+  test("GET /other returns 404", async () => {
+    const res = await fetch(`${baseUrl}/other`);
+    expect(res.status).toBe(404);
+  });
+
+  // ---------------------------------------------------------------------------
+  // MCP protocol over HTTP
+  // ---------------------------------------------------------------------------
+
+  /** Track session ID returned by initialize (MCP Streamable HTTP spec) */
+  let sessionId: string | null = null;
+
+  /** Send a JSON-RPC message to /mcp and return the parsed response.
+   * MCP Streamable HTTP requires Accept header with both JSON and SSE. */
+  async function mcpRequest(body: object): Promise<{ status: number; json: any; contentType: string | null }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    // Capture session ID from initialize responses
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+
+    const json = await res.json();
+    return { status: res.status, json, contentType: res.headers.get("content-type") };
+  }
+
+  test("POST /mcp initialize returns 200 JSON (not SSE)", async () => {
+    const { status, json, contentType } = await mcpRequest({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "test-client", version: "1.0.0" },
+      },
+    });
+    expect(status).toBe(200);
+    expect(contentType).toContain("application/json");
+    expect(json.jsonrpc).toBe("2.0");
+    expect(json.id).toBe(1);
+    expect(json.result.serverInfo.name).toBe("qmd");
+  });
+
+  test("POST /mcp tools/list returns registered tools", async () => {
+    // Initialize first (required by MCP protocol)
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json, contentType } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/list", params: {},
+    });
+    expect(status).toBe(200);
+    expect(contentType).toContain("application/json");
+
+    const toolNames = json.result.tools.map((t: any) => t.name);
+    expect(toolNames).toContain("search");
+    expect(toolNames).toContain("get");
+    expect(toolNames).toContain("status");
+  });
+
+  test("POST /mcp tools/call search returns results", async () => {
+    // Initialize
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "search", arguments: { query: "readme" } },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    // Should have content array with text results
+    expect(json.result.content.length).toBeGreaterThan(0);
+    expect(json.result.content[0].type).toBe("text");
+  });
+
+  test("POST /mcp tools/call get returns document", async () => {
+    // Initialize
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "get", arguments: { path: "readme.md" } },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.content.length).toBeGreaterThan(0);
   });
 });

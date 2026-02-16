@@ -180,7 +180,8 @@ export function searchResultsToMarkdown(
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
     }
-    return `---\n# ${heading}\n\n**docid:** \`#${row.docid}\`\n\n${content}\n`;
+    const contextLine = row.context ? `**context:** ${row.context}\n` : "";
+    return `---\n# ${heading}\n\n**docid:** \`#${row.docid}\`\n${contextLine}\n${content}\n`;
   }).join("\n");
 }
 
@@ -199,7 +200,8 @@ export function searchResultsToXml(
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
     }
-    return `<file docid="#${row.docid}" name="${escapeXml(row.displayPath)}"${titleAttr}>\n${escapeXml(content)}\n</file>`;
+    const contextAttr = row.context ? ` context="${escapeXml(row.context)}"` : "";
+    return `<file docid="#${row.docid}" name="${escapeXml(row.displayPath)}"${titleAttr}${contextAttr}>\n${escapeXml(content)}\n</file>`;
   });
   return items.join("\n\n");
 }

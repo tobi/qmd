@@ -10,11 +10,15 @@
  * 3. Hybrid (RRF) - combined lexical + vector with rank fusion
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import Database from "bun:sqlite";
+import { openDatabase } from "../src/db.js";
+import type { Database } from "../src/db.js";
+import { createHash } from "crypto";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
 
 // Set INDEX_PATH before importing store to prevent using global index
 const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-"));
@@ -31,8 +35,8 @@ import {
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
-} from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "./llm";
+} from "../src/store";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -106,13 +110,13 @@ describe("BM25 Search (FTS)", () => {
     db = store.db;
 
     // Load and index eval documents
-    const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {
       const content = readFileSync(join(evalDocsDir, file), "utf-8");
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
-      const hash = Bun.hash(content).toString(16).slice(0, 12);
+      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
       const now = new Date().toISOString();
 
       insertContent(db, hash, content, now);
@@ -152,7 +156,7 @@ describe("BM25 Search (FTS)", () => {
 // Vector Search Tests - Requires embedding model
 // =============================================================================
 
-describe("Vector Search", () => {
+describe.skipIf(!!process.env.CI)("Vector Search", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasEmbeddings = false;
@@ -178,12 +182,12 @@ describe("Vector Search", () => {
     const llm = getDefaultLlamaCpp();
     store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
 
-    const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
+    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
 
     for (const file of files) {
       const content = readFileSync(join(evalDocsDir, file), "utf-8");
-      const hash = Bun.hash(content).toString(16).slice(0, 12);
+      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
 
       // Chunk and embed
@@ -264,7 +268,7 @@ describe("Vector Search", () => {
 // Hybrid Search (RRF) Tests - Combines BM25 + Vector
 // =============================================================================
 
-describe("Hybrid Search (RRF)", () => {
+describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasVectors = false;
