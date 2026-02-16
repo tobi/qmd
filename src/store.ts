@@ -17,8 +17,8 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -2245,7 +2245,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await getDefaultLLM().embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2310,8 +2310,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = getDefaultLLM();
+  // Note: current local backend uses a configured default model; `model` may be ignored.
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2348,9 +2348,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents using the configured LLM backend
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
@@ -2984,7 +2984,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();

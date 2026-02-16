@@ -299,6 +299,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -1402,6 +1407,14 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
+ * Get the default LLM backend instance.
+ * Currently this is LlamaCpp; kept as a separate seam for future backends.
+ */
+export function getDefaultLLM(): LLM {
+  return getDefaultLlamaCpp();
+}
+
+/**
  * Set a custom default LlamaCpp instance (useful for testing)
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
@@ -1417,4 +1430,12 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+/**
+ * Dispose the default LLM backend instance.
+ * Currently aliases LlamaCpp disposal.
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  await disposeDefaultLlamaCpp();
 }
