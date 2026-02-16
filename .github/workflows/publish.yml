@@ -33,6 +33,23 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      - run: npm run build
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=$(./scripts/extract-changelog.sh "$VERSION")
+          # Write to file for gh release (avoids quoting issues)
+          echo "$NOTES" > /tmp/release-notes.md
+
+      - name: Create GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

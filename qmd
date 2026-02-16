@@ -43,4 +43,4 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-exec "$NODE" --import tsx "$SCRIPT_DIR/src/qmd.ts" "$@"
+exec "$NODE" "$SCRIPT_DIR/dist/qmd.js" "$@"

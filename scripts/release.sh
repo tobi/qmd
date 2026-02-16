@@ -2,6 +2,11 @@
 set -euo pipefail
 
 # QMD Release Script
+#
+# Renames the [Unreleased] section in CHANGELOG.md to the new version,
+# bumps package.json, commits, and creates a tag. The actual publish
+# happens via GitHub Actions when the tag is pushed.
+#
 # Usage: ./scripts/release.sh [patch|minor|major|<version>]
 # Examples:
 #   ./scripts/release.sh patch     # 0.9.0 -> 0.9.1
@@ -41,74 +46,60 @@ bump_version() {
 }
 
 NEW=$(bump_version "$CURRENT" "$BUMP")
+DATE=$(date +%Y-%m-%d)
 echo "New version:     $NEW"
 echo ""
 
-# Confirm
+# --- Validate CHANGELOG.md ---
+
+if [[ ! -f CHANGELOG.md ]]; then
+  echo "Error: CHANGELOG.md not found" >&2
+  exit 1
+fi
+
+# The [Unreleased] section must have content
+if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+  echo "Error: no [Unreleased] section in CHANGELOG.md" >&2
+  echo "" >&2
+  echo "Add your changes under an [Unreleased] heading first:" >&2
+  echo "" >&2
+  echo "  ## [Unreleased]" >&2
+  echo "" >&2
+  echo "  ### Changes" >&2
+  echo "  - Your change here" >&2
+  exit 1
+fi
+
+# --- Preview release notes ---
+
+echo "--- Release notes (will appear on GitHub) ---"
+./scripts/extract-changelog.sh "$NEW"
+echo "--- End ---"
+echo ""
+
+# --- Confirm ---
+
 read -p "Release v$NEW? [y/N] " -n 1 -r
 echo ""
 [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
 
-# Gather commits since last tag (or all if no tags)
-LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-if [[ -n "$LAST_TAG" ]]; then
-  RANGE="$LAST_TAG..HEAD"
-else
-  RANGE="HEAD"
-fi
+# --- Rename [Unreleased] -> [X.Y.Z] - date, add fresh [Unreleased] ---
 
-echo ""
-echo "Commits since ${LAST_TAG:-beginning}:"
-git log "$RANGE" --oneline --no-decorate
-echo ""
+sed -i '' "s/^## \[Unreleased\].*/## [$NEW] - $DATE/" CHANGELOG.md
 
-# Generate changelog entry
-DATE=$(date +%Y-%m-%d)
-ENTRY="## [$NEW] - $DATE"$'\n'$'\n'
+# Insert a new empty [Unreleased] section after the header
+awk '
+  /^## \['"$NEW"'\]/ && !done {
+    print "## [Unreleased]\n"
+    done = 1
+  }
+  { print }
+' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
 
-# Collect conventional commits
-FEATS=$(git log "$RANGE" --oneline --no-decorate --grep="^feat" | sed 's/^[a-f0-9]* feat[:(]/- /' | sed 's/)$//' || true)
-FIXES=$(git log "$RANGE" --oneline --no-decorate --grep="^fix" | sed 's/^[a-f0-9]* fix[:(]/- /' | sed 's/)$//' || true)
-OTHER=$(git log "$RANGE" --oneline --no-decorate --grep="^feat" --grep="^fix" --grep="^docs" --grep="^chore" --grep="^refactor" --invert-grep | sed 's/^[a-f0-9]* /- /' || true)
+# --- Bump version and commit ---
 
-if [[ -n "$FEATS" ]]; then
-  ENTRY+="### Features"$'\n'$'\n'"$FEATS"$'\n'$'\n'
-fi
-if [[ -n "$FIXES" ]]; then
-  ENTRY+="### Fixes"$'\n'$'\n'"$FIXES"$'\n'$'\n'
-fi
-if [[ -n "$OTHER" ]]; then
-  ENTRY+="### Other"$'\n'$'\n'"$OTHER"$'\n'$'\n'
-fi
-
-# Add link reference
-LINK="[$NEW]: https://github.com/tobi/qmd/compare/v$CURRENT...v$NEW"
-
-# Show what will be added
-echo "--- Changelog entry ---"
-echo "$ENTRY"
-echo "$LINK"
-echo "--- End ---"
-echo ""
-read -p "Looks good? [y/N] " -n 1 -r
-echo ""
-[[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-
-# Update package.json version
 jq --arg v "$NEW" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
 
-# Prepend changelog entry (after the header line)
-if [[ -f CHANGELOG.md ]]; then
-  # Insert after "# Changelog" header and any blank lines
-  awk -v entry="$ENTRY$LINK" '
-    /^# Changelog/ { print; getline; print; print ""; print entry; print ""; next }
-    { print }
-  ' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
-else
-  echo "# Changelog"$'\n'$'\n'"$ENTRY$LINK" > CHANGELOG.md
-fi
-
-# Commit and tag
 git add package.json CHANGELOG.md
 git commit -m "release: v$NEW"
 git tag -a "v$NEW" -m "v$NEW"
@@ -116,9 +107,6 @@ git tag -a "v$NEW" -m "v$NEW"
 echo ""
 echo "Created commit and tag v$NEW"
 echo ""
-echo "Next steps:"
-echo "  git push origin main --tags   # push to GitHub"
-echo "  npm publish                   # publish to npm"
+echo "Next: push to trigger the publish workflow"
 echo ""
-echo "Or both at once:"
-echo "  git push origin main --tags && npm publish"
+echo "  git push origin main --tags"

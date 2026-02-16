@@ -6,6 +6,8 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
+You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
+
 ## Quick Start
 
 ```sh
@@ -23,7 +25,7 @@ qmd collection add ~/notes --name notes
 qmd collection add ~/Documents/meetings --name meetings
 qmd collection add ~/work/docs --name docs
 
-# Add context to help with search results
+# Add context to help with search results, each piece of context will be returned when matching sub documents are returned. This works as a tree. This is the key feature of QMD as it allows LLMs to make much better contextual choices when selecting documents. Don't sleep on it!
 qmd context add qmd://notes "Personal notes and ideas"
 qmd context add qmd://meetings "Meeting transcripts and notes"
 qmd context add qmd://docs "Work documentation"

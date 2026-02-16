@@ -682,6 +682,6 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 }
 
 // Run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/mcp.ts")) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/mcp.ts") || process.argv[1]?.endsWith("/mcp.js")) {
   startMcpServer().catch(console.error);
 }

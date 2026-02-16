@@ -149,4 +149,17 @@ bun test --preload ./src/test-preload.ts test/
 ## Do NOT compile
 
 - Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
-- The `qmd` file is a shell script that runs `bun src/qmd.ts` - do not replace it
+- The `qmd` file is a shell script that runs compiled JS from `dist/` - do not replace it
+- `npm run build` compiles TypeScript to `dist/` via `tsc -p tsconfig.build.json`
+
+## Releasing
+
+Use `/release <version>` to cut a release. Full changelog standards,
+release workflow, and git hook setup are documented in the
+[release skill](skills/release/SKILL.md).
+
+Key points:
+- Add changelog entries under `## [Unreleased]` **as you make changes**
+- The release script renames `[Unreleased]` → `[X.Y.Z] - date` at release time
+- Credit external PRs with `#NNN (thanks @username)`
+- GitHub releases roll up the full minor series (e.g. 1.2.0 through 1.2.3)

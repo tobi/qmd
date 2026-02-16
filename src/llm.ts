@@ -494,6 +494,7 @@ export class LlamaCpp implements LLM {
       // Detect available GPU types and use the best one.
       // We can't rely on gpu:"auto" — it returns false even when CUDA is available
       // (likely a binary/build config issue in node-llama-cpp).
+      // @ts-expect-error node-llama-cpp API compat
       const gpuTypes = await getLlamaGpuTypes();
       // Prefer CUDA > Metal > Vulkan > CPU
       const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
@@ -733,7 +734,7 @@ export class LlamaCpp implements LLM {
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
             flashAttention: true,
             ...(threads > 0 ? { threads } : {}),
-          }));
+          } as any));
         } catch {
           if (this.rerankContexts.length === 0) {
             // Flash attention might not be supported — retry without it
@@ -828,7 +829,7 @@ export class LlamaCpp implements LLM {
       if (n === 1) {
         // Single context: sequential (no point splitting)
         const context = contexts[0]!;
-        const embeddings = [];
+        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
           try {
             const embedding = await context.getEmbeddingFor(text);

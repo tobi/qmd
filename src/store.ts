@@ -23,7 +23,7 @@ import {
   formatDocForEmbedding,
   type RerankDocument,
   type ILLMSession,
-} from "./llm";
+} from "./llm.js";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -37,7 +37,7 @@ import {
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
-} from "./collections";
+} from "./collections.js";
 
 // =============================================================================
 // Configuration

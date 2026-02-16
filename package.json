@@ -7,14 +7,14 @@
     "qmd": "qmd"
   },
   "files": [
-    "src/**/*.ts",
-    "!src/**/*.test.ts",
-    "!src/test-preload.ts",
+    "dist/",
     "qmd",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
+    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --reporter=verbose test/",
     "qmd": "tsx src/qmd.ts",
     "index": "tsx src/qmd.ts index",

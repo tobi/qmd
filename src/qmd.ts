@@ -2207,7 +2207,7 @@ async function showVersion(): Promise<void> {
 }
 
 // Main CLI - only run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts")) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts") || process.argv[1]?.endsWith("/qmd.js")) {
   const cli = parseCLI();
 
   if (cli.values.version) {
@@ -2489,8 +2489,11 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           mkdirSync(cacheDir, { recursive: true });
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const tsxLoader = pathJoin(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "tsx", "dist", "esm", "index.mjs");
-          const child = nodeSpawn(process.execPath, ["--import", tsxLoader, fileURLToPath(import.meta.url), "mcp", "--http", "--port", String(port)], {
+          const selfPath = fileURLToPath(import.meta.url);
+          const spawnArgs = selfPath.endsWith(".ts")
+            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
+            : [selfPath, "mcp", "--http", "--port", String(port)];
+          const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
           });

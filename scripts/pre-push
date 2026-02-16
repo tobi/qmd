@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-push hook: validates v* tag pushes before they reach the remote.
+#
+# Checks:
+#   1. package.json version matches the tag
+#   2. CHANGELOG.md has a "## [{version}] - {date}" entry
+#   3. CI passed upstream on GitHub for the tagged commit
+#
+# Installed automatically by: bun install (via prepare script)
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Only validate v* tag pushes
+  if [[ "$local_ref" != refs/tags/v* ]]; then
+    continue
+  fi
+
+  # Skip tag deletions
+  if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
+    continue
+  fi
+
+  TAG="${local_ref#refs/tags/}"
+  VERSION="${TAG#v}"
+
+  echo "Validating release $TAG..."
+
+  # --- 1. package.json version must match the tag ---
+  PKG_VERSION=$(jq -r .version package.json)
+  if [[ "$PKG_VERSION" != "$VERSION" ]]; then
+    echo ""
+    echo "ABORT: package.json version is $PKG_VERSION but tag is $TAG"
+    echo "Run: jq --arg v '$VERSION' '.version = \$v' package.json > tmp && mv tmp package.json"
+    exit 1
+  fi
+  echo "  package.json version: $PKG_VERSION"
+
+  # --- 2. CHANGELOG.md must have an entry for this version ---
+  if [[ ! -f CHANGELOG.md ]]; then
+    echo ""
+    echo "ABORT: CHANGELOG.md not found"
+    exit 1
+  fi
+
+  if ! grep -q "^## \[$VERSION\] - " CHANGELOG.md; then
+    echo ""
+    echo "ABORT: CHANGELOG.md has no entry for this release"
+    echo "Expected heading: ## [$VERSION] - $(date +%Y-%m-%d)"
+    echo ""
+    echo "Write the changelog entry first. See CLAUDE.md for guidelines."
+    exit 1
+  fi
+  echo "  CHANGELOG.md: entry found"
+
+  # --- 3. CI must have passed on GitHub for this commit ---
+  COMMIT=$(git rev-parse "$TAG" 2>/dev/null || git rev-parse HEAD)
+
+  if ! command -v gh &>/dev/null; then
+    echo "  CI check: skipped (gh CLI not installed)"
+    continue
+  fi
+
+  # Check GitHub Actions check runs
+  CHECK_JSON=$(gh api "repos/{owner}/{repo}/commits/$COMMIT/check-runs" 2>/dev/null || echo "")
+
+  if [[ -z "$CHECK_JSON" ]]; then
+    echo "  CI check: skipped (could not reach GitHub API)"
+    continue
+  fi
+
+  TOTAL=$(echo "$CHECK_JSON" | jq -r '.total_count // 0' 2>/dev/null || echo "0")
+
+  if [[ "$TOTAL" -eq 0 ]] 2>/dev/null; then
+    # No checks found — commit may not be pushed yet
+    MAIN_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
+    if [[ "$COMMIT" != "$MAIN_SHA" ]]; then
+      echo ""
+      echo "WARNING: No CI runs found for $COMMIT and it's not the tip of origin/main."
+      echo "Push the commit to main first and wait for CI to pass."
+      read -p "Push tag anyway? [y/N] " -n 1 -r </dev/tty
+      echo ""
+      [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+      echo "  CI check: no runs found (commit is on main)"
+    fi
+  else
+    FAILED=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo "0")
+    PENDING=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.status != "completed")] | length' 2>/dev/null || echo "0")
+
+    if [[ "$FAILED" -gt 0 ]] 2>/dev/null; then
+      echo ""
+      echo "ABORT: CI failed for commit $COMMIT"
+      echo "Check: https://github.com/tobi/qmd/commit/$COMMIT"
+      exit 1
+    fi
+
+    if [[ "$PENDING" -gt 0 ]] 2>/dev/null; then
+      echo ""
+      echo "WARNING: CI still running for commit $COMMIT ($PENDING pending)"
+      read -p "Push tag anyway? [y/N] " -n 1 -r </dev/tty
+      echo ""
+      [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+      echo "  CI check: all passed"
+    fi
+  fi
+
+  echo "All checks passed for $TAG"
+done
+
+exit 0
