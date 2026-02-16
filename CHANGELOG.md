@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-02-16
+
 ### Changes
 
 - CLI: `qmd status` now shows models with full HuggingFace links instead of
