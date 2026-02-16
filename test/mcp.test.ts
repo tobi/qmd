@@ -946,17 +946,28 @@ describe("MCP HTTP Transport", () => {
   // MCP protocol over HTTP
   // ---------------------------------------------------------------------------
 
+  /** Track session ID returned by initialize (MCP Streamable HTTP spec) */
+  let sessionId: string | null = null;
+
   /** Send a JSON-RPC message to /mcp and return the parsed response.
    * MCP Streamable HTTP requires Accept header with both JSON and SSE. */
   async function mcpRequest(body: object): Promise<{ status: number; json: any; contentType: string | null }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
     const res = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-      },
+      headers,
       body: JSON.stringify(body),
     });
+
+    // Capture session ID from initialize responses
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+
     const json = await res.json();
     return { status: res.status, json, contentType: res.headers.get("content-type") };
   }

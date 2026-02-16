@@ -21,11 +21,10 @@ let testConfigDir: string;
 let fixturesDir: string;
 let testCounter = 0; // Unique counter for each test run
 
-// Get the directory where this test file lives (same as qmd.ts)
-const qmdDir = dirname(fileURLToPath(import.meta.url));
-const qmdSrcDir = join(qmdDir, "..");
-const projectRoot = join(qmdSrcDir, "..");
-const qmdScript = join(qmdSrcDir, "qmd.ts");
+// Get the directory where this test file lives
+const thisDir = dirname(fileURLToPath(import.meta.url));
+const projectRoot = join(thisDir, "..");
+const qmdScript = join(projectRoot, "src", "qmd.ts");
 // Resolve tsx binary from project's node_modules (not cwd-dependent)
 const tsxBin = (() => {
   const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
