@@ -51,7 +51,6 @@ export type ApiLLMConfig = {
   chatBaseUrl?: string;
   chatApiKey?: string;
   chatModel?: string;
-  strictJsonOutput?: boolean;
   rerankBaseUrl?: string;
   rerankApiKey?: string;
   rerankModel?: string;
@@ -68,7 +67,6 @@ export class ApiLLM implements LLM {
   private readonly chatBaseUrl: string;
   private readonly chatApiKey: string;
   private readonly chatModel: string;
-  private readonly strictJsonOutput: boolean;
   private readonly rerankBaseUrl: string;
   private readonly rerankApiKey: string;
   private readonly rerankModel: string;
@@ -102,10 +100,6 @@ export class ApiLLM implements LLM {
       config.chatModel
       || process.env.QMD_CHAT_MODEL
       || DEFAULT_CHAT_MODEL;
-    this.strictJsonOutput = config.strictJsonOutput ?? this.parseBooleanEnv(
-      process.env.QMD_CHAT_STRICT_JSON_OUTPUT,
-      false
-    );
     this.rerankBaseUrl = (
       config.rerankBaseUrl
       || process.env.QMD_RERANK_BASE_URL
@@ -119,14 +113,6 @@ export class ApiLLM implements LLM {
       config.rerankModel
       || process.env.QMD_RERANK_MODEL
       || DEFAULT_RERANK_MODEL;
-  }
-
-  private parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
-    if (value === undefined) return fallback;
-    const normalized = value.trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(normalized)) return true;
-    if (["0", "false", "no", "off"].includes(normalized)) return false;
-    return fallback;
   }
 
   private getHeaders(apiKey: string): Record<string, string> {
@@ -173,80 +159,10 @@ export class ApiLLM implements LLM {
     return "";
   }
 
-  private parseExpandedQueries(content: string, strictJson: boolean): Queryable[] {
+  private parseExpandedQueries(content: string): Queryable[] {
     const trimmed = content.trim();
     if (!trimmed) {
       throw new Error("ApiLLM expandQuery error: empty model output");
-    }
-
-    const parseQueryArray = (raw: string): Queryable[] | null => {
-      const parsed = JSON.parse(raw) as unknown;
-      const asArray =
-        Array.isArray(parsed) ? parsed : (
-          typeof parsed === "object"
-          && parsed !== null
-          && Array.isArray((parsed as { queries?: unknown }).queries)
-            ? (parsed as { queries: unknown[] }).queries
-            : null
-        );
-      if (!asArray) return null;
-
-      const queries = asArray
-        .map(item => {
-          if (typeof item !== "object" || item === null) return null;
-          const type = (item as { type?: unknown }).type;
-          const text = (item as { text?: unknown }).text;
-          if (
-            (type === "lex" || type === "vec" || type === "hyde")
-            && typeof text === "string"
-            && text.trim().length > 0
-          ) {
-            return { type: type as QueryType, text: text.trim() };
-          }
-          return null;
-        })
-        .filter((q): q is Queryable => q !== null);
-      return queries.length > 0 ? queries : null;
-    };
-
-    const parseJsonWithWrappers = (raw: string): Queryable[] | null => {
-      const candidates: string[] = [raw];
-
-      const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-      if (fenceMatch?.[1]) {
-        candidates.push(fenceMatch[1].trim());
-      }
-
-      const firstArray = raw.indexOf("[");
-      const lastArray = raw.lastIndexOf("]");
-      if (firstArray !== -1 && lastArray > firstArray) {
-        candidates.push(raw.slice(firstArray, lastArray + 1));
-      }
-
-      const firstObject = raw.indexOf("{");
-      const lastObject = raw.lastIndexOf("}");
-      if (firstObject !== -1 && lastObject > firstObject) {
-        candidates.push(raw.slice(firstObject, lastObject + 1));
-      }
-
-      for (const candidate of candidates) {
-        try {
-          const parsed = parseQueryArray(candidate);
-          if (parsed) return parsed;
-        } catch {
-          // Try next candidate
-        }
-      }
-      return null;
-    };
-
-    // Try strict JSON shape first: [{ type, text }, ...] or { queries: [...] }
-    const parsedFromJson = parseJsonWithWrappers(trimmed);
-    if (parsedFromJson) {
-      return parsedFromJson;
-    }
-    if (strictJson) {
-      throw new Error("ApiLLM expandQuery error: strict JSON output is enabled, but response did not contain valid JSON queries");
     }
 
     // Line format: "lex: ...", "vec: ...", "hyde: ..."
@@ -270,13 +186,12 @@ export class ApiLLM implements LLM {
 
   private async requestChatCompletions(
     messages: Array<{ role: "system" | "user"; content: string }>,
-    options?: { model?: string; strictJson?: boolean }
+    options?: { model?: string }
   ): Promise<string> {
     if (!this.chatApiKey) {
       throw new Error("ApiLLM chat error: missing API key (set QMD_CHAT_API_KEY)");
     }
     const model = options?.model || this.chatModel;
-    const strictJson = options?.strictJson ?? this.strictJsonOutput;
 
     let response: OpenAIChatResponse;
     try {
@@ -383,10 +298,7 @@ export class ApiLLM implements LLM {
 
   async expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]> {
     const includeLexical = options?.includeLexical ?? true;
-    const strictJson = this.strictJsonOutput;
-    const formatInstruction = strictJson
-      ? "Return ONLY valid JSON as an array of objects: [{\"type\":\"lex|vec|hyde\",\"text\":\"...\"}, ...]. No markdown."
-      : "Return one query per line in format: type: text, where type is lex, vec, or hyde.";
+    const formatInstruction = "Return one query per line in format: type: text, where type is lex, vec, or hyde.";
     const lexicalInstruction = includeLexical
       ? "Include at least one lex query."
       : "Do not include any lex queries.";
@@ -410,10 +322,10 @@ export class ApiLLM implements LLM {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { model: this.chatModel, strictJson }
+      { model: this.chatModel }
     );
 
-    const parsed = this.parseExpandedQueries(content, strictJson);
+    const parsed = this.parseExpandedQueries(content);
     const filteredByLex = includeLexical ? parsed : parsed.filter(q => q.type !== "lex");
     const deduped = Array.from(new Map(
       filteredByLex

@@ -6,7 +6,6 @@ describe("ApiLLM (contract)", () => {
   const originalFetch = globalThis.fetch;
   const originalQmdEmbedApiKey = process.env.QMD_EMBED_API_KEY;
   const originalQmdChatApiKey = process.env.QMD_CHAT_API_KEY;
-  const originalQmdChatStrictJsonOutput = process.env.QMD_CHAT_STRICT_JSON_OUTPUT;
   const originalQmdChatModel = process.env.QMD_CHAT_MODEL;
   const originalQmdRerankApiKey = process.env.QMD_RERANK_API_KEY;
 
@@ -19,7 +18,6 @@ describe("ApiLLM (contract)", () => {
     (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
     process.env.QMD_EMBED_API_KEY = originalQmdEmbedApiKey;
     process.env.QMD_CHAT_API_KEY = originalQmdChatApiKey;
-    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = originalQmdChatStrictJsonOutput;
     process.env.QMD_CHAT_MODEL = originalQmdChatModel;
     process.env.QMD_RERANK_API_KEY = originalQmdRerankApiKey;
   });
@@ -231,7 +229,7 @@ describe("ApiLLM (contract)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  test("expandQuery accepts line format when strict JSON is disabled (default)", async () => {
+  test("expandQuery accepts line format output", async () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -267,8 +265,7 @@ describe("ApiLLM (contract)", () => {
     });
   });
 
-  test("expandQuery uses strict JSON mode from env and parses JSON output", async () => {
-    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = "true";
+  test("expandQuery rejects JSON-only output", async () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -291,35 +288,8 @@ describe("ApiLLM (contract)", () => {
       chatModel: "gpt-4o-mini",
     });
 
-    const result = await llm.expandQuery("api auth docs", { includeLexical: false });
-    expect(result).toEqual([
-      { type: "vec", text: "api authentication guide" },
-    ]);
-  });
-
-  test("expandQuery rejects line output when strict JSON mode is enabled", async () => {
-    process.env.QMD_CHAT_STRICT_JSON_OUTPUT = "true";
-    fetchMock.mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          choices: [{
-            message: {
-              content: "vec: api authentication guide",
-            },
-          }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      )
-    );
-
-    const llm = new ApiLLM({
-      chatBaseUrl: "https://chat.example.test/v1",
-      chatApiKey: "chat-key",
-      chatModel: "gpt-4o-mini",
-    });
-
     await expect(
       llm.expandQuery("api auth docs")
-    ).rejects.toThrow("strict JSON output is enabled");
+    ).rejects.toThrow("could not parse query expansions");
   });
 });

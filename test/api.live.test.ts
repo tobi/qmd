@@ -69,34 +69,17 @@ describe("ApiLLM Embeddings (live)", () => {
 
 describe("ApiLLM Query Expansion (live)", () => {
   for (const provider of chatProviders) {
-    test.skipIf(!provider.key)(`${provider.name} chat completions expands query with non-strict output mode`, async () => {
+    test.skipIf(!provider.key)(`${provider.name} chat completions expands query with line output mode`, async () => {
       const llm = new ApiLLM({
         chatBaseUrl: provider.baseUrl,
         chatApiKey: provider.key,
         chatModel: provider.chatModel,
-        strictJsonOutput: false,
       });
 
       const result = await llm.expandQuery("how to authenticate API requests");
       expect(result.length).toBeGreaterThanOrEqual(1);
       for (const item of result) {
         expect(["lex", "vec", "hyde"]).toContain(item.type);
-        expect(item.text.length).toBeGreaterThan(0);
-      }
-    }, 30000);
-
-    test.skipIf(!provider.key)(`${provider.name} chat completions expands query with strict JSON output mode`, async () => {
-      const llm = new ApiLLM({
-        chatBaseUrl: provider.baseUrl,
-        chatApiKey: provider.key,
-        chatModel: provider.chatModel,
-        strictJsonOutput: true,
-      });
-
-      const result = await llm.expandQuery("how to authenticate API requests", { includeLexical: false });
-      expect(result.length).toBeGreaterThanOrEqual(1);
-      for (const item of result) {
-        expect(["vec", "hyde"]).toContain(item.type);
         expect(item.text.length).toBeGreaterThan(0);
       }
     }, 30000);
