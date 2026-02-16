@@ -8,28 +8,7 @@ set -euo pipefail
 #   2. CHANGELOG.md has a "## [{version}] - {date}" entry
 #   3. CI passed upstream on GitHub for the tagged commit
 #
-# In non-interactive shells (no tty), warnings auto-proceed instead of
-# prompting. Hard failures (version mismatch, missing changelog) always block.
-
-# Detect if we can prompt
-CAN_PROMPT=false
-if [[ -t 0 ]] || [[ -e /dev/tty ]]; then
-  # Verify /dev/tty is actually usable
-  if echo -n "" > /dev/tty 2>/dev/null; then
-    CAN_PROMPT=true
-  fi
-fi
-
-prompt_or_continue() {
-  local msg="$1"
-  if $CAN_PROMPT; then
-    read -p "$msg [y/N] " -n 1 -r </dev/tty
-    echo ""
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
-  else
-    echo "$msg — auto-proceeding (non-interactive)"
-  fi
-}
+# All failures block the push and write to stderr.
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   # Only validate v* tag pushes
@@ -45,83 +24,70 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   TAG="${local_ref#refs/tags/}"
   VERSION="${TAG#v}"
 
-  echo "Validating release $TAG..."
+  echo >&2 "Validating release $TAG..."
 
   # --- 1. package.json version must match the tag ---
   PKG_VERSION=$(jq -r .version package.json)
   if [[ "$PKG_VERSION" != "$VERSION" ]]; then
-    echo ""
-    echo "ABORT: package.json version is $PKG_VERSION but tag is $TAG"
-    echo "Run: jq --arg v '$VERSION' '.version = \$v' package.json > tmp && mv tmp package.json"
+    echo >&2 "ABORT: package.json version is $PKG_VERSION but tag is $TAG"
+    echo >&2 "Run: jq --arg v '$VERSION' '.version = \$v' package.json > tmp && mv tmp package.json"
     exit 1
   fi
-  echo "  package.json version: $PKG_VERSION ✓"
+  echo >&2 "  package.json: $PKG_VERSION ✓"
 
   # --- 2. CHANGELOG.md must have an entry for this version ---
   if [[ ! -f CHANGELOG.md ]]; then
-    echo ""
-    echo "ABORT: CHANGELOG.md not found"
+    echo >&2 "ABORT: CHANGELOG.md not found"
     exit 1
   fi
 
   if ! grep -q "^## \[$VERSION\] - " CHANGELOG.md; then
-    echo ""
-    echo "ABORT: CHANGELOG.md has no entry for this release"
-    echo "Expected heading: ## [$VERSION] - $(date +%Y-%m-%d)"
-    echo ""
-    echo "Write the changelog entry first. See CLAUDE.md for guidelines."
+    echo >&2 "ABORT: CHANGELOG.md has no entry for [$VERSION]"
+    echo >&2 "Expected: ## [$VERSION] - $(date +%Y-%m-%d)"
     exit 1
   fi
-  echo "  CHANGELOG.md: entry found ✓"
+  echo >&2 "  CHANGELOG.md: [$VERSION] ✓"
 
   # --- 3. CI must have passed on GitHub for this commit ---
   # Resolve annotated tag to its underlying commit
   COMMIT=$(git rev-list -n 1 "$TAG" 2>/dev/null || git rev-parse HEAD)
 
   if ! command -v gh &>/dev/null; then
-    echo "  CI check: skipped (gh CLI not installed)"
+    echo >&2 "  CI: skipped (no gh CLI)"
     continue
   fi
 
   CHECK_JSON=$(gh api "repos/{owner}/{repo}/commits/$COMMIT/check-runs" 2>/dev/null || echo "")
 
   if [[ -z "$CHECK_JSON" ]]; then
-    echo "  CI check: skipped (could not reach GitHub API)"
+    echo >&2 "  CI: skipped (GitHub API unreachable)"
     continue
   fi
 
   TOTAL=$(echo "$CHECK_JSON" | jq -r '.total_count // 0' 2>/dev/null || echo "0")
 
   if [[ "$TOTAL" -eq 0 ]] 2>/dev/null; then
-    MAIN_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
-    if [[ "$COMMIT" != "$MAIN_SHA" ]]; then
-      echo ""
-      echo "WARNING: No CI runs found for $COMMIT"
-      prompt_or_continue "Push tag anyway?"
-    else
-      echo "  CI check: no runs yet (commit is tip of origin/main)"
-    fi
+    echo >&2 "  CI: no runs found (push commit to main first and wait for CI)"
   else
     FAILED=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo "0")
     PENDING=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.status != "completed")] | length' 2>/dev/null || echo "0")
 
     if [[ "$FAILED" -gt 0 ]] 2>/dev/null; then
-      echo ""
-      echo "ABORT: CI failed for commit $COMMIT"
-      echo "Check: https://github.com/tobi/qmd/commit/$COMMIT"
+      echo >&2 "ABORT: CI failed for $COMMIT"
+      echo >&2 "https://github.com/tobi/qmd/commit/$COMMIT"
       exit 1
     fi
 
     if [[ "$PENDING" -gt 0 ]] 2>/dev/null; then
-      echo ""
-      echo "WARNING: CI still running for commit $COMMIT ($PENDING pending)"
-      prompt_or_continue "Push tag anyway?"
-    else
-      echo "  CI check: all passed ✓"
+      echo >&2 "ABORT: CI still running ($PENDING pending)"
+      echo >&2 "Wait for CI to finish, then push again."
+      exit 1
     fi
+
+    echo >&2 "  CI: passed ✓"
   fi
 
-  echo "All checks passed for $TAG ✓"
+  echo >&2 "All checks passed for $TAG ✓"
 done
 
 exit 0
