@@ -8,6 +8,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -553,6 +554,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const store = createStore();
   const mcpServer = createMcpServer(store);
   const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
     enableJsonResponse: true,
   });
   await mcpServer.connect(transport);
