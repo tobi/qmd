@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-02-16
+
 The npm package now ships compiled JavaScript instead of raw TypeScript,
 removing the `tsx` runtime dependency. A new `/release` skill automates the
 full release workflow with changelog validation and git hook enforcement.
