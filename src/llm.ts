@@ -18,6 +18,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { ApiLLM } from "./api.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -1395,6 +1396,7 @@ export function canUnloadLLM(): boolean {
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultApiLLM: ApiLLM | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
@@ -1411,7 +1413,18 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  * Currently this is LlamaCpp; kept as a separate seam for future backends.
  */
 export function getDefaultLLM(): LLM {
-  return getDefaultLlamaCpp();
+  const backend = (process.env.QMD_LLM_BACKEND || "local").toLowerCase();
+  if (backend !== "api") {
+    return getDefaultLlamaCpp();
+  }
+
+  if (!defaultApiLLM) {
+    defaultApiLLM = new ApiLLM({
+      // During phased rollout, non-embedding methods can delegate to local backend.
+      fallbackLLM: getDefaultLlamaCpp(),
+    });
+  }
+  return defaultApiLLM;
 }
 
 /**
@@ -1419,6 +1432,8 @@ export function getDefaultLLM(): LLM {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+  // Clear API wrapper so it can rebuild with the new fallback instance.
+  defaultApiLLM = null;
 }
 
 /**
@@ -1437,5 +1452,9 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
  * Currently aliases LlamaCpp disposal.
  */
 export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultApiLLM) {
+    await defaultApiLLM.dispose();
+    defaultApiLLM = null;
+  }
   await disposeDefaultLlamaCpp();
 }
