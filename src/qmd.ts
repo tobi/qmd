@@ -2,7 +2,7 @@
 import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
-import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import { readFileSync, readdirSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
   getPwd,
   getRealPath,
@@ -1365,19 +1365,49 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.indeterminate();
   const glob = new Glob(globPattern);
+  const excludeSet = new Set([...excludeDirs, "node_modules"]);
   const files: string[] = [];
-  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
-    // Skip node_modules, hidden folders (.*), and other common excludes
-    const parts = file.split("/");
-    const shouldSkip = parts.some(part =>
-      part === "node_modules" ||
-      part.startsWith(".") ||
-      excludeDirs.includes(part)
-    );
-    if (!shouldSkip) {
-      files.push(file);
+
+  // Walk directories manually to skip excluded dirs BEFORE descending into them.
+  // Bun's Glob.scan() traverses into node_modules/etc before the filter runs,
+  // which causes OOM kills on large monorepos with millions of files.
+  function walkDir(dir: string, relPrefix: string): void {
+    let entries: ReturnType<typeof readdirSync>;
+    try {
+      entries = readdirSync(resolve(resolvedPwd, dir), { withFileTypes: true });
+    } catch {
+      return; // Permission denied, broken symlink, etc.
+    }
+    for (const entry of entries) {
+      const name = entry.name;
+      // Skip excluded directories and hidden directories before descending
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        if (excludeSet.has(name) || name.startsWith(".")) continue;
+        // For symlinks, check if they point to a directory
+        if (entry.isSymbolicLink()) {
+          try {
+            const target = statSync(resolve(resolvedPwd, dir, name));
+            if (!target.isDirectory()) {
+              // Symlink to a file — check if it matches
+              const relPath = relPrefix ? `${relPrefix}/${name}` : name;
+              if (glob.match(relPath)) files.push(relPath);
+              continue;
+            }
+          } catch {
+            continue; // Broken symlink
+          }
+        }
+        walkDir(dir ? `${dir}/${name}` : name, relPrefix ? `${relPrefix}/${name}` : name);
+      } else if (entry.isFile()) {
+        const relPath = relPrefix ? `${relPrefix}/${name}` : name;
+        if (glob.match(relPath)) {
+          files.push(relPath);
+        }
+      }
     }
   }
+
+  walkDir("", "");
 
   const total = files.length;
   if (total === 0) {
