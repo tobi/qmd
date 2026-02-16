@@ -103,6 +103,15 @@ describe("ApiLLM (contract)", () => {
     consoleErrorSpy.mockRestore();
   });
 
+  test("generate fails explicitly for API backend", async () => {
+    const llm = new ApiLLM({});
+
+    await expect(
+      llm.generate("hello")
+    ).rejects.toThrow("not implemented for API backend");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   test("rerank sends Cohere-compatible /rerank request and maps response by index", async () => {
     fetchMock.mockResolvedValue(
       new Response(

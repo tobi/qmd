@@ -3,7 +3,7 @@
  *
  * Current phase: embeddings (/v1/embeddings), query expansion (/v1/chat/completions),
  * and rerank (/v1/rerank).
- * Text generation can delegate to a fallback backend.
+ * Text generation is intentionally unsupported in this backend for now.
  */
 
 import type {
@@ -55,12 +55,11 @@ export type ApiLLMConfig = {
   rerankBaseUrl?: string;
   rerankApiKey?: string;
   rerankModel?: string;
-  fallbackLLM?: LLM;
 };
 
 /**
  * API-backed LLM implementation.
- * Embeddings/query-expansion/reranking are remote; text generation can fallback.
+ * Embeddings/query-expansion/reranking are remote; text generation is unsupported.
  */
 export class ApiLLM implements LLM {
   private readonly embedBaseUrl: string;
@@ -73,7 +72,6 @@ export class ApiLLM implements LLM {
   private readonly rerankBaseUrl: string;
   private readonly rerankApiKey: string;
   private readonly rerankModel: string;
-  private readonly fallbackLLM?: LLM;
 
   constructor(config: ApiLLMConfig = {}) {
     const normalizedEmbedBaseUrl = (
@@ -121,7 +119,6 @@ export class ApiLLM implements LLM {
       config.rerankModel
       || process.env.QMD_RERANK_MODEL
       || DEFAULT_RERANK_MODEL;
-    this.fallbackLLM = config.fallbackLLM;
   }
 
   private parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
@@ -137,13 +134,6 @@ export class ApiLLM implements LLM {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
     };
-  }
-
-  private getFallback(method: string): LLM {
-    if (!this.fallbackLLM) {
-      throw new Error(`ApiLLM.${method} is not implemented without fallback backend`);
-    }
-    return this.fallbackLLM;
   }
 
   private usesVoyageRerankApi(): boolean {
@@ -382,7 +372,9 @@ export class ApiLLM implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
-    return this.getFallback("generate").generate(prompt, options);
+    void prompt;
+    void options;
+    throw new Error("ApiLLM generate is not implemented for API backend (use QMD_LLM_BACKEND=local)");
   }
 
   async modelExists(model: string): Promise<ModelInfo> {
