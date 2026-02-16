@@ -6,16 +6,16 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { openDatabase, loadSqliteVec } from "../db.js";
-import type { Database } from "../db.js";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "../collections";
+import type { CollectionConfig } from "../src/collections";
 
 // =============================================================================
 // Test Database Setup
@@ -192,8 +192,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "../store";
-import type { RankedResult } from "../store";
+} from "../src/store";
+import type { RankedResult } from "../src/store";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -865,8 +865,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../mcp";
-import { enableProductionMode } from "../store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp";
+import { enableProductionMode } from "../src/store";
 
 describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;

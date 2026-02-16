@@ -33,16 +33,8 @@ jobs:
 
       - run: npm install
 
-      - name: Unit tests
-        run: npx vitest run --reporter=verbose src/*.test.ts
-
-      - name: Model tests
-        run: npx vitest run --reporter=verbose src/models/*.test.ts
-        env:
-          CI: true
-
-      - name: Integration tests
-        run: npx vitest run --reporter=verbose src/integration/*.test.ts
+      - name: Tests
+        run: npx vitest run --reporter=verbose test/
         env:
           CI: true
 
@@ -71,21 +63,8 @@ jobs:
 
       - run: bun install
 
-      - name: Unit tests
-        run: bun test --preload ./src/test-preload.ts src/*.test.ts
-        env:
-          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
-          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
-
-      - name: Model tests
-        run: bun test --preload ./src/test-preload.ts src/models/*.test.ts
-        env:
-          CI: true
-          DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
-          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
-
-      - name: Integration tests
-        run: bun test --preload ./src/test-preload.ts src/integration/*.test.ts
+      - name: Tests
+        run: bun test --preload ./src/test-preload.ts test/
         env:
           CI: true
           DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib

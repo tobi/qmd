@@ -7,13 +7,13 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { openDatabase, loadSqliteVec } from "../db.js";
-import type { Database } from "../db.js";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "../llm.js";
+import { disposeDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -49,8 +49,8 @@ import {
   type DocumentResult,
   type SearchResult,
   type RankedResult,
-} from "../store.js";
-import type { CollectionConfig } from "../collections.js";
+} from "../src/store.js";
+import type { CollectionConfig } from "../src/collections.js";
 
 // =============================================================================
 // LlamaCpp Setup

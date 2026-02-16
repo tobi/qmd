@@ -17,7 +17,7 @@ import {
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
-} from "../llm.js";
+} from "../src/llm.js";
 
 // =============================================================================
 // Singleton Tests (no model loading required)
