@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+The npm package now ships compiled JavaScript instead of raw TypeScript,
+removing the `tsx` runtime dependency. A new `/release` skill automates the
+full release workflow with changelog validation and git hook enforcement.
+
+### Changes
+
+- Build: compile TypeScript to `dist/` via `tsc` so the npm package no longer
+  requires `tsx` at runtime. The `qmd` shell wrapper now runs `dist/qmd.js`
+  directly.
+- Release tooling: new `/release` skill that manages the full release
+  lifecycle — validates changelog, installs git hooks, previews release notes,
+  and cuts the release. Auto-populates `[Unreleased]` from git history when
+  empty.
+- Release tooling: `scripts/extract-changelog.sh` extracts cumulative notes
+  for the full minor series (e.g. 1.0.0 through 1.0.5) for GitHub releases.
+  Includes `[Unreleased]` content in previews.
+- Release tooling: `scripts/release.sh` renames `[Unreleased]` to a versioned
+  heading and inserts a fresh empty `[Unreleased]` section automatically.
+- Release tooling: pre-push git hook blocks `v*` tag pushes unless
+  `package.json` version matches the tag, a changelog entry exists, and CI
+  passed on GitHub.
+- Publish workflow: GitHub Actions now builds TypeScript, creates a GitHub
+  release with cumulative notes extracted from the changelog, and publishes
+  to npm with provenance.
+
 ## [1.0.0] - 2026-02-15
 
 QMD now runs on both Node.js and Bun, with up to 2.7x faster reranking
