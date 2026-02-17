@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest";
 import { ApiLLM } from "../src/api.js";
 
+/**
+ * Live API tests (provider-gated by env vars).
+ * Required keys: OPENAI_API_KEY, OPENROUTER_API_KEY, COHERE_API_KEY, VOYAGE_API_KEY.
+ * Tests for a provider are skipped when that provider key is not set.
+ */
 const embeddingProviders = [
   {
     name: "OpenAI",
