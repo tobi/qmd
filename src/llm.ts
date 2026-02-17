@@ -19,6 +19,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { ApiLLM } from "./api.js";
+import { PassthroughLLMSession } from "./llm-session.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -1362,8 +1363,7 @@ let defaultSessionManager: LLMSessionManager | null = null;
 /**
  * Get the session manager for the default LlamaCpp instance.
  */
-function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
+function getSessionManager(llm: LlamaCpp = getDefaultLlamaCpp()): LLMSessionManager {
   if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
@@ -1388,13 +1388,27 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
-  const session = new LLMSession(manager, options);
+  const llm = getDefaultLLM();
 
-  try {
-    return await fn(session);
-  } finally {
-    session.release();
+  if (llm instanceof LlamaCpp) {
+    const manager = getSessionManager(llm);
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  } else {
+    const session = new PassthroughLLMSession(
+      llm,
+      options,
+      (message?: string) => new SessionReleasedError(message)
+    );
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
   }
 }
 

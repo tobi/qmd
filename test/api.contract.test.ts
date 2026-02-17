@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ApiLLM } from "../src/api.js";
+import { canUnloadLLM, withLLMSession } from "../src/llm.js";
 
 describe("ApiLLM (contract)", () => {
   const fetchMock = vi.fn();
@@ -8,6 +9,7 @@ describe("ApiLLM (contract)", () => {
   const originalQmdChatApiKey = process.env.QMD_CHAT_API_KEY;
   const originalQmdChatModel = process.env.QMD_CHAT_MODEL;
   const originalQmdRerankApiKey = process.env.QMD_RERANK_API_KEY;
+  const originalQmdLlmBackend = process.env.QMD_LLM_BACKEND;
 
   beforeEach(() => {
     fetchMock.mockReset();
@@ -20,6 +22,7 @@ describe("ApiLLM (contract)", () => {
     process.env.QMD_CHAT_API_KEY = originalQmdChatApiKey;
     process.env.QMD_CHAT_MODEL = originalQmdChatModel;
     process.env.QMD_RERANK_API_KEY = originalQmdRerankApiKey;
+    process.env.QMD_LLM_BACKEND = originalQmdLlmBackend;
   });
 
   test("embed sends OpenAI-compatible /embeddings request, ignores per-call model override, and parses response", async () => {
@@ -323,5 +326,19 @@ describe("ApiLLM (contract)", () => {
     expect(result).toEqual([]);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     warnSpy.mockRestore();
+  });
+
+  test("withLLMSession does not acquire local unload lock when backend is api", async () => {
+    process.env.QMD_LLM_BACKEND = "api";
+
+    const unloadBefore = canUnloadLLM();
+    expect(unloadBefore).toBe(true);
+
+    await withLLMSession(async (session) => {
+      expect(session.isValid).toBe(true);
+      expect(canUnloadLLM()).toBe(true);
+    }, { maxDuration: 1000, name: "api-contract-session" });
+
+    expect(canUnloadLLM()).toBe(true);
   });
 });
