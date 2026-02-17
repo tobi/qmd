@@ -17,7 +17,6 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  getDefaultLlamaCpp,
   getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -1427,7 +1426,7 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -1437,13 +1436,23 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  const charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+
+  // API backend doesn't expose tokenizer APIs; keep chunking approximate and avoid local model init.
+  if (!llm.canTokenize?.() || !llm.tokenize) {
+    return charChunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / avgCharsPerToken)),
+    }));
+  }
+  const tokenize = llm.tokenize.bind(llm);
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
 
   for (const chunk of charChunks) {
-    const tokens = await llm.tokenize(chunk.text);
+    const tokens = await tokenize(chunk.text);
 
     if (tokens.length <= maxTokens) {
       results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
@@ -1456,7 +1465,7 @@ export async function chunkDocumentByTokens(
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
       for (const subChunk of subChunks) {
-        const subTokens = await llm.tokenize(subChunk.text);
+        const subTokens = await tokenize(subChunk.text);
         results.push({
           text: subChunk.text,
           pos: chunk.pos + subChunk.pos,

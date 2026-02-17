@@ -327,6 +327,18 @@ export interface LLM {
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
 
   /**
+   * Whether this backend supports tokenizer access.
+   * API backends may return false and omit tokenize().
+   */
+  canTokenize?(): boolean;
+
+  /**
+   * Tokenize text when tokenizer access is available.
+   * API backend doesn't currently expose tokenization.
+   */
+  tokenize?(text: string): Promise<readonly unknown[]>;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;
@@ -770,6 +782,10 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
   // Tokenization
   // ==========================================================================
+
+  canTokenize(): boolean {
+    return true;
+  }
 
   /**
    * Tokenize text using the embedding model's tokenizer

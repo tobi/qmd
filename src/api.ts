@@ -170,6 +170,10 @@ export class ApiLLM implements LLM {
     return fromLines;
   }
 
+  canTokenize(): boolean {
+    return false;
+  }
+
   private async requestChatCompletions(
     messages: Array<{ role: "system" | "user"; content: string }>
   ): Promise<string> {
