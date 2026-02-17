@@ -120,7 +120,16 @@ function getDbPath(): string {
 }
 
 function setIndexName(name: string | null): void {
-  storeDbPathOverride = name ? getDefaultDbPath(name) : undefined;
+  let normalizedName = name;
+  // Normalize relative paths to prevent malformed database paths
+  if (name && name.includes('/')) {
+    const { resolve } = require('path');
+    const { cwd } = require('process');
+    const absolutePath = resolve(cwd(), name);
+    // Replace path separators with underscores to create a valid filename
+    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  }
+  storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
 }
@@ -1959,7 +1968,11 @@ function search(query: string, opts: OutputOptions): void {
   closeDb();
 
   if (resultsWithContext.length === 0) {
-    console.log("No results found.");
+    if (opts.format === "json") {
+      console.log("[]");
+    } else {
+      console.log("No results found.");
+    }
     return;
   }
   outputResults(resultsWithContext, query, opts);
@@ -2013,7 +2026,11 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     closeDb();
 
     if (results.length === 0) {
-      console.log("No results found.");
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
       return;
     }
 
@@ -2072,7 +2089,11 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     closeDb();
 
     if (results.length === 0) {
-      console.log("No results found.");
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
       return;
     }
 
