@@ -102,7 +102,8 @@ function buildInstructions(store: Store): string {
   // --- What's searchable? ---
   if (status.collections.length > 0) {
     lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
+    lines.push("Collections — when the user's request maps to a specific collection, always");
+    lines.push("set the `collection` parameter to filter. This reduces noise and improves relevance.");
     for (const col of status.collections) {
       const collConfig = getCollection(col.name);
       const rootCtx = collConfig?.context?.[""] || collConfig?.context?.["/"];
