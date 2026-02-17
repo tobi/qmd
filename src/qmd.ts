@@ -1154,7 +1154,7 @@ function listFiles(pathArg?: string): void {
     const yamlCollections = yamlListCollections();
 
     if (yamlCollections.length === 0) {
-      console.log("No collections found. Run 'qmd add .' to index files.");
+      console.log("No collections found. Run 'qmd collection add .' to index files.");
       closeDb();
       return;
     }
@@ -1293,7 +1293,7 @@ function collectionList(): void {
   const collections = listCollections(db);
 
   if (collections.length === 0) {
-    console.log("No collections found. Run 'qmd add .' to create one.");
+    console.log("No collections found. Run 'qmd collection add .' to create one.");
     closeDb();
     return;
   }
