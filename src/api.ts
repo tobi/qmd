@@ -98,7 +98,7 @@ export class ApiLLM implements LLM {
     this.chatApiKey =
       config.chatApiKey
       || process.env.QMD_CHAT_API_KEY
-      || this.embedApiKey;
+      || "";
     this.chatModel =
       config.chatModel
       || process.env.QMD_CHAT_MODEL
@@ -112,7 +112,7 @@ export class ApiLLM implements LLM {
     this.rerankApiKey =
       config.rerankApiKey
       || process.env.QMD_RERANK_API_KEY
-      || this.embedApiKey;
+      || "";
     this.rerankModel =
       config.rerankModel
       || process.env.QMD_RERANK_MODEL
