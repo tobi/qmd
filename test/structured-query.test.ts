@@ -213,8 +213,16 @@ describe("StructuredQuery type contracts", () => {
 // hybridQuery routing integration tests
 //
 // Uses real SQLite FTS (no vector index) to verify routing without needing
-// LLM models for embedding. expandQuery is spied/mocked to verify call behavior.
+// LLM models. Both expandQuery and rerank are mocked — these tests verify
+// routing decisions (which functions are called), not search quality.
 // =============================================================================
+
+/** Mock rerank to pass through inputs with descending scores (no LLM needed). */
+function mockRerank(store: Store): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(store, "rerank").mockImplementation(
+    async (_query, docs) => docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1 }))
+  );
+}
 
 describe("hybridQuery routing", () => {
   test("structured query with keywords skips LLM expansion", async () => {
@@ -225,6 +233,7 @@ describe("hybridQuery routing", () => {
     await addDoc(store, coll, "Team Health", "Team health is about trust and psychological safety");
 
     const expandSpy = vi.spyOn(store, "expandQuery");
+    const rerankSpy = mockRerank(store);
 
     const results = await hybridQuery(store, {
       text: "performance",
@@ -239,6 +248,7 @@ describe("hybridQuery routing", () => {
     expect(results.some(r => r.title === "Web Vitals")).toBe(true);
 
     expandSpy.mockRestore();
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -252,6 +262,7 @@ describe("hybridQuery routing", () => {
     const expandSpy = vi.spyOn(store, "expandQuery").mockResolvedValue([
       { type: "lex", text: "quick fox" },
     ]);
+    const rerankSpy = mockRerank(store);
 
     await hybridQuery(store, "fox", { limit: 5 });
 
@@ -259,6 +270,7 @@ describe("hybridQuery routing", () => {
     expect(expandSpy).toHaveBeenCalledWith("fox", undefined);
 
     expandSpy.mockRestore();
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -269,6 +281,7 @@ describe("hybridQuery routing", () => {
     await addDoc(store, coll, "Scaling", "Database sharding enables horizontal scaling");
 
     const expandSpy = vi.spyOn(store, "expandQuery");
+    const rerankSpy = mockRerank(store);
 
     // passage alone should trigger caller-expansion path
     const results = await hybridQuery(store, {
@@ -282,6 +295,7 @@ describe("hybridQuery routing", () => {
     expect(results.length).toBeGreaterThan(0);
 
     expandSpy.mockRestore();
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -292,6 +306,7 @@ describe("hybridQuery routing", () => {
     await addDoc(store, coll, "Test Doc", "Some content for testing");
 
     const expandSpy = vi.spyOn(store, "expandQuery").mockResolvedValue([]);
+    const rerankSpy = mockRerank(store);
 
     // Empty arrays + empty passage = no caller expansions after normalization
     await hybridQuery(store, {
@@ -305,6 +320,7 @@ describe("hybridQuery routing", () => {
     expect(expandSpy).toHaveBeenCalled();
 
     expandSpy.mockRestore();
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -316,6 +332,7 @@ describe("hybridQuery routing", () => {
 
     const onExpand = vi.fn();
     vi.spyOn(store, "expandQuery");
+    const rerankSpy = mockRerank(store);
 
     await hybridQuery(store, {
       text: "performance",
@@ -324,6 +341,7 @@ describe("hybridQuery routing", () => {
 
     expect(onExpand).not.toHaveBeenCalled();
 
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -338,6 +356,7 @@ describe("hybridQuery routing", () => {
       { type: "lex", text: "metrics benchmarks" },
       { type: "vec", text: "performance measurement" },
     ]);
+    const rerankSpy = mockRerank(store);
 
     await hybridQuery(store, "performance", { limit: 5, hooks: { onExpand } });
 
@@ -346,6 +365,7 @@ describe("hybridQuery routing", () => {
       { type: "vec", text: "performance measurement" },
     ]);
 
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -358,6 +378,7 @@ describe("hybridQuery routing", () => {
     await addDoc(store, coll, "Team Trust", "Building trust in engineering teams requires candor");
 
     vi.spyOn(store, "expandQuery");
+    const rerankSpy = mockRerank(store);
 
     const results = await hybridQuery(store, {
       text: "performance",
@@ -368,6 +389,7 @@ describe("hybridQuery routing", () => {
     const titles = results.map(r => r.title);
     expect(titles).toContain("TTFB Guide");
 
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 
@@ -378,6 +400,7 @@ describe("hybridQuery routing", () => {
     await addDoc(store, coll, "Exact Match", "A very specific unique term zephyr appears here zephyr zephyr");
 
     const expandSpy = vi.spyOn(store, "expandQuery");
+    const rerankSpy = mockRerank(store);
 
     // Structured query with intent — strong signal should be disabled
     // (callerExpansions = true already disables it, but test the combination)
@@ -389,6 +412,7 @@ describe("hybridQuery routing", () => {
     expect(expandSpy).not.toHaveBeenCalled();
 
     expandSpy.mockRestore();
+    rerankSpy.mockRestore();
     await cleanup(store);
   });
 });
