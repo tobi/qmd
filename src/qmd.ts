@@ -61,6 +61,7 @@ import {
   vectorSearchQuery,
   addLineNumbers,
   type ExpandedQuery,
+  type StructuredQuery,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
@@ -1752,6 +1753,10 @@ type OutputOptions = {
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
   intent?: string;       // Optional background context for disambiguation
+  // Structured query options — bypass LLM expansion
+  keywords?: string;     // comma-separated keyword variants
+  concepts?: string;     // comma-separated semantic phrases
+  passage?: string;      // hypothetical document passage
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2040,8 +2045,18 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   checkIndexHealth(store.db);
 
+  // Build structured query when caller provides expansion flags
+  const sq: string | StructuredQuery = (opts.keywords || opts.concepts || opts.passage)
+    ? {
+        text: query,
+        ...(opts.keywords && { keywords: opts.keywords.split(",").map(s => s.trim()).filter(Boolean) }),
+        ...(opts.concepts && { concepts: opts.concepts.split(",").map(s => s.trim()).filter(Boolean) }),
+        ...(opts.passage && { passage: opts.passage }),
+      }
+    : query;
+
   await withLLMSession(async () => {
-    let results = await hybridQuery(store, query, {
+    let results = await hybridQuery(store, sq, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0,
@@ -2126,6 +2141,10 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Intent option (for query, vsearch, search)
       intent: { type: "string" },
+      // Structured query options (for query/deep-search — bypasses LLM expansion)
+      keywords: { type: "string" },    // comma-separated keyword variants
+      concepts: { type: "string" },    // comma-separated semantic phrases
+      passage: { type: "string" },     // hypothetical document passage
       // Embed options
       force: { type: "boolean", short: "f" },
       // Update options
@@ -2174,6 +2193,9 @@ function parseCLI() {
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
     intent: values.intent as string | undefined,
+    keywords: values.keywords as string | undefined,
+    concepts: values.concepts as string | undefined,
+    passage: values.passage as string | undefined,
   };
 
   return {

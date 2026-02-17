@@ -240,6 +240,37 @@ export type ExpandedQuery = {
 };
 
 // =============================================================================
+// Structured query — caller-provided expansions that bypass LLM expansion
+// =============================================================================
+
+/** Structured query with optional caller-provided search expansions.
+ *  When any expansion field is present, LLM expansion is skipped entirely. */
+export interface StructuredQuery {
+  text: string;              // the query itself (always required)
+  keywords?: string[];       // → FTS (BM25) — replaces lex expansion
+  concepts?: string[];       // → embedding + vector search — replaces vec expansion
+  passage?: string;          // → embedding + vector search — replaces hyde expansion
+}
+
+/** Normalize query input: string becomes { text } object.
+ *  Strips empty expansion fields so hasCallerExpansions correctly
+ *  detects "no expansions provided" even when fields are present but empty. */
+export function normalizeQuery(query: string | StructuredQuery): StructuredQuery {
+  if (typeof query === 'string') return { text: query };
+  return {
+    text: query.text,
+    ...(query.keywords?.length && { keywords: query.keywords }),
+    ...(query.concepts?.length && { concepts: query.concepts }),
+    ...(query.passage && { passage: query.passage }),
+  };
+}
+
+/** True when the caller provided any expansion field (keywords, concepts, or passage). */
+export function hasCallerExpansions(q: StructuredQuery): boolean {
+  return !!((q.keywords && q.keywords.length > 0) || (q.concepts && q.concepts.length > 0) || q.passage);
+}
+
+// =============================================================================
 // Path utilities
 // =============================================================================
 
@@ -2279,6 +2310,15 @@ export async function rerank(query: string, documents: { file: string; text: str
     .sort((a, b) => b.score - a.score);
 }
 
+/** Convert SearchResult[] → RankedResult[] and populate docid map as side effect. */
+function toRankedList(results: SearchResult[], docidMap: Map<string, string>): RankedResult[] {
+  for (const r of results) docidMap.set(r.filepath, r.docid);
+  return results.map(r => ({
+    file: r.filepath, displayPath: r.displayPath,
+    title: r.title, body: r.body || "", score: r.score,
+  }));
+}
+
 // =============================================================================
 // Reciprocal Rank Fusion
 // =============================================================================
@@ -2864,7 +2904,7 @@ export interface HybridQueryResult {
  */
 export async function hybridQuery(
   store: Store,
-  query: string,
+  query: string | StructuredQuery,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
   const limit = options?.limit ?? 10;
@@ -2874,99 +2914,101 @@ export async function hybridQuery(
   const hooks = options?.hooks;
   const intent = options?.intent;
 
+  // Normalize: string → { text }, object passes through
+  const sq = normalizeQuery(query);
+  const callerExpansions = hasCallerExpansions(sq);
+
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
-  // Step 1: BM25 probe — strong signal skips expensive LLM expansion
-  // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  // Step 1: BM25 probe — strong signal skips expensive LLM expansion.
+  // Disabled when intent or caller expansions are present — the caller
+  // is explicitly saying "I know what I want, don't take shortcuts."
+  const initialFts = store.searchFTS(sq.text, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
-  // When intent is provided, always expand — the caller is explicitly saying
-  // "the obvious BM25 match isn't what I want." Skipping expansion defeats the purpose.
-  const hasStrongSignal = !intent
+  const hasStrongSignal = !intent && !callerExpansions
     && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
-  // Step 2: Expand query (or skip if strong signal)
-  const expanded = hasStrongSignal
-    ? []
-    : await store.expandQuery(query, intent);
+  // Step 2: Build search variants — either from caller or from LLM expansion.
+  // When caller provides keywords/concepts/passage, skip LLM entirely.
+  const expanded: ExpandedQuery[] = callerExpansions
+    ? [] // Caller owns expansion — don't run LLM
+    : hasStrongSignal
+      ? []
+      : await store.expandQuery(sq.text, intent);
 
-  hooks?.onExpand?.(query, expanded);
+  // Only fire onExpand when LLM expansion actually ran — caller expansions
+  // bypass the LLM and strong signal skips it, so there's nothing to observe.
+  if (!callerExpansions && expanded.length > 0) hooks?.onExpand?.(sq.text, expanded);
+
+  // Track which ranked lists represent the original query (FTS + vec).
+  // These get 2x RRF weight because the original query is the strongest
+  // relevance signal — expansions are supplementary.
+  const primaryIndices = new Set<number>();
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
-    for (const r of initialFts) docidMap.set(r.filepath, r.docid);
-    rankedLists.push(initialFts.map(r => ({
-      file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
-    })));
+    primaryIndices.add(rankedLists.length);
+    rankedLists.push(toRankedList(initialFts, docidMap));
   }
 
-  // Step 3: Route searches by query type
-  //
-  // Strategy: run all FTS queries immediately (they're sync/instant), then
-  // batch-embed all vector queries in one embedBatch() call, then run
-  // sqlite-vec lookups with pre-computed embeddings.
+  // Step 3: Route searches — FTS for keyword terms, vector for semantic queries.
+  // Source differs by path: caller-provided fields OR LLM expansion variants.
+  // Both paths produce ranked lists that feed into the same RRF fusion.
 
-  // 3a: Run FTS for all lex expansions right away (no LLM needed)
-  for (const q of expanded) {
-    if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.text, 20, collection);
-      if (ftsResults.length > 0) {
-        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(ftsResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
-      }
+  // 3a: FTS for keyword variants (caller keywords or LLM lex expansions)
+  const ftsTerms: string[] = callerExpansions
+    ? (sq.keywords || [])
+    : expanded.filter(q => q.type === 'lex').map(q => q.text);
+
+  for (const term of ftsTerms) {
+    const ftsResults = store.searchFTS(term, 20, collection);
+    if (ftsResults.length > 0) {
+      rankedLists.push(toRankedList(ftsResults, docidMap));
     }
   }
 
-  // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
+  // 3b: Vector search — original query (primary, 2x weight) + expansion variants
   if (hasVectors) {
-    const vecQueries: { text: string; isOriginal: boolean }[] = [
-      { text: query, isOriginal: true },
-    ];
-    for (const q of expanded) {
-      if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.text, isOriginal: false });
+    const vecTexts: string[] = [sq.text]; // index 0 = original query (primary)
+    if (callerExpansions) {
+      for (const c of sq.concepts || []) vecTexts.push(c);
+      if (sq.passage) vecTexts.push(sq.passage);
+    } else {
+      for (const q of expanded) {
+        if (q.type === 'vec' || q.type === 'hyde') vecTexts.push(q.text);
       }
     }
 
-    // Batch embed all vector queries in a single call
     const llm = getDefaultLlamaCpp();
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(vecTexts.map(formatQueryForEmbedding));
 
-    // Run sqlite-vec lookups with pre-computed embeddings
-    for (let i = 0; i < vecQueries.length; i++) {
+    for (let i = 0; i < vecTexts.length; i++) {
       const embedding = embeddings[i]?.embedding;
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecTexts[i]!, DEFAULT_EMBED_MODEL, 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
-        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(vecResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
+        if (i === 0) primaryIndices.add(rankedLists.length);
+        rankedLists.push(toRankedList(vecResults, docidMap));
       }
     }
   }
 
-  // Step 4: RRF fusion — first 2 lists (original FTS + first vec) get 2x weight
-  const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+  // Step 4: RRF fusion — original query lists (FTS + vec) get 2x weight,
+  // expansion variants (keywords, concepts, passage, lex, vec, hyde) get 1x.
+  const weights = rankedLists.map((_, i) => primaryIndices.has(i) ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const candidates = fused.slice(0, candidateLimit);
 
@@ -2974,7 +3016,7 @@ export async function hybridQuery(
 
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const queryTerms = sq.text.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   // Intent terms steer chunk selection toward intent-relevant sections
   // without overwhelming the query signal.
   const intentTerms = intent ? extractIntentTerms(intent) : [];
@@ -3001,7 +3043,7 @@ export async function hybridQuery(
 
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
-  const reranked = await store.rerank(query, chunksToRerank, intent);
+  const reranked = await store.rerank(sq.text, chunksToRerank, intent);
   hooks?.onRerankDone?.();
 
   // Step 7: Blend RRF position score with reranker score
