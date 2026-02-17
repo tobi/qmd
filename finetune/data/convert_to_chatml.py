@@ -6,10 +6,22 @@ import json
 import random
 from pathlib import Path
 
+
+def reorder_hyde_first(output_items):
+    """Reorder output items to put hyde first, then lex, then vec."""
+    hyde_items = [item for item in output_items if item[0] == "hyde"]
+    lex_items = [item for item in output_items if item[0] == "lex"]
+    vec_items = [item for item in output_items if item[0] == "vec"]
+    return hyde_items + lex_items + vec_items
+
+
 def convert_entry(entry):
     """Convert a single QMD entry to ChatML format."""
     query = entry["query"]
     output_items = entry["output"]
+    
+    # Reorder: hyde first, then lex, then vec
+    output_items = reorder_hyde_first(output_items)
     
     # Build the assistant response
     assistant_lines = []
@@ -32,9 +44,12 @@ def convert_entry(entry):
     
     return {"text": chatml_text}
 
+
 def main():
-    input_file = Path("~/src/github.com/tobi/qmd/finetune/data/qmd_expansion_v3.jsonl").expanduser()
-    output_dir = Path("~/src/github.com/tobi/qmd/finetune/data/train-lfm2").expanduser()
+    # Use paths relative to this script's location
+    script_dir = Path(__file__).parent
+    input_file = script_dir / "qmd_expansion_v3.jsonl"
+    output_dir = script_dir / "train-lfm2"
     
     # Load all data
     print(f"Loading data from {input_file}...")

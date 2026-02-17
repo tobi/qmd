@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+
 def verify_chatml_format(text):
     """Verify that the text follows proper ChatML format."""
     issues = []
@@ -42,6 +43,13 @@ def verify_chatml_format(text):
             issues.append("Missing vec: entries")
         if not has_hyde:
             issues.append("Missing hyde: entries")
+        
+        # Validate hyde-first ordering
+        lines = content.strip().split("\n")
+        if lines:
+            first_line = lines[0].strip()
+            if not first_line.startswith("hyde:"):
+                issues.append("Hyde not first (expected hyde-first ordering)")
     
     return issues
 
@@ -105,7 +113,9 @@ def analyze_file(filepath):
         print(f"  Avg: {sum(assistant_lengths) / len(assistant_lengths):.1f} chars")
 
 def main():
-    data_dir = Path("~/src/github.com/tobi/qmd/finetune/data/train-lfm2").expanduser()
+    # Use paths relative to this script's location
+    script_dir = Path(__file__).parent
+    data_dir = script_dir / "train-lfm2"
     
     # Analyze both train and validation sets
     analyze_file(data_dir / "train.jsonl")
