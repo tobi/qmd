@@ -411,7 +411,7 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(pullFirst: boolean = false): Promise<void> {
   const db = getDb();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
@@ -433,6 +433,65 @@ async function updateCollections(): Promise<void> {
     const col = collections[i];
     if (!col) continue;
     console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+
+    if (pullFirst) {
+      let isGitRepo = false;
+      try {
+        const insideWorkTree = execSync("git rev-parse --is-inside-work-tree", {
+          cwd: col.pwd,
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf-8",
+        }).trim();
+        isGitRepo = insideWorkTree === "true";
+      } catch {
+        isGitRepo = false;
+      }
+
+      if (!isGitRepo) {
+        console.log(`${c.dim}    Skipping git pull: not a git repository${c.reset}`);
+      } else {
+        let hasUpstream = true;
+        try {
+          execSync("git rev-parse --abbrev-ref --symbolic-full-name @{u}", {
+            cwd: col.pwd,
+            stdio: ["ignore", "pipe", "ignore"],
+            encoding: "utf-8",
+          }).trim();
+        } catch {
+          hasUpstream = false;
+        }
+
+        if (!hasUpstream) {
+          console.log(`${c.dim}    Skipping git pull: no upstream tracking branch${c.reset}`);
+        } else {
+          console.log(`${c.dim}    Running git pull --ff-only${c.reset}`);
+          try {
+            const output = execSync("git pull --ff-only", {
+              cwd: col.pwd,
+              stdio: ["ignore", "pipe", "pipe"],
+              encoding: "utf-8",
+            });
+            if (output.trim()) {
+              console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
+            }
+          } catch (err: any) {
+            const output = err?.stdout ? String(err.stdout).trim() : "";
+            const errorOutput = err?.stderr ? String(err.stderr).trim() : "";
+
+            if (output) {
+              console.log(output.split('\n').map((l: string) => `    ${l}`).join('\n'));
+            }
+            if (errorOutput) {
+              console.log(errorOutput.split('\n').map((l: string) => `    ${l}`).join('\n'));
+            }
+
+            const exitCode = typeof err?.status === "number" ? err.status : 1;
+            console.log(`${c.yellow}✗ Git pull failed with exit code ${exitCode}${c.reset}`);
+            process.exit(exitCode);
+          }
+        }
+      }
+    }
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
@@ -2422,7 +2481,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(!!cli.values.pull);
       break;
 
     case "embed":
