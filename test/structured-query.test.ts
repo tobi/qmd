@@ -30,12 +30,21 @@ import type { CollectionConfig } from "../src/collections";
 // =============================================================================
 
 let testDir: string;
+let savedConfigDir: string | undefined;
 
 beforeAll(async () => {
   testDir = await mkdtemp(join(tmpdir(), "qmd-structured-test-"));
+  savedConfigDir = process.env.QMD_CONFIG_DIR;
 });
 
 afterAll(async () => {
+  // Restore env var — bun test runs all files in one process, so deleting
+  // QMD_CONFIG_DIR would clobber other test suites that set it.
+  if (savedConfigDir !== undefined) {
+    process.env.QMD_CONFIG_DIR = savedConfigDir;
+  } else {
+    delete process.env.QMD_CONFIG_DIR;
+  }
   try {
     const { rm } = await import("node:fs/promises");
     await rm(testDir, { recursive: true, force: true });
@@ -78,7 +87,6 @@ async function addDoc(
 async function cleanup(store: Store): Promise<void> {
   store.close();
   try { await unlink(store.dbPath); } catch { /* ignore */ }
-  delete process.env.QMD_CONFIG_DIR;
 }
 
 // =============================================================================
