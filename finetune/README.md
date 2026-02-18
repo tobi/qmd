@@ -297,3 +297,42 @@ deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubri
 |-------|--------------|-----------------|
 | SFT | 92.0% | 30/30 |
 | GRPO | 91.7% | 30/30 |
+
+## Alternative Base Models
+
+### LiquidAI LFM2 (Experimental)
+
+[LFM2](https://www.liquid.ai/blog/liquid-foundation-models-v2-our-second-series-of-generative-ai-models) 
+is a hybrid architecture from Liquid AI optimized for on-device inference. It uses
+a novel combination of convolutions and attention that achieves 2x faster decode
+and prefill speed compared to standard transformers.
+
+**Why LFM2 for query expansion:**
+- **Faster inference**: Lower latency for real-time search applications
+- **Memory efficient**: Smaller memory footprint than equivalent transformers
+- **Edge-optimized**: Can run on mobile devices and embedded systems
+- **Good at agentic tasks**: LiquidAI recommends LFM2 for RAG and data extraction
+
+**Training with LFM2:**
+
+```bash
+# SFT with LFM2-1.2B base model
+uv run train.py sft --config configs/sft_lfm2.yaml
+
+# Evaluate the trained model
+uv run eval.py --model outputs/sft-lfm2
+
+# Convert to GGUF for deployment
+uv run convert_gguf.py --base LiquidAI/LFM2-1.2B \
+                       --sft outputs/sft-lfm2 \
+                       --output tobil/qmd-query-expansion-lfm2-gguf
+```
+
+**Key differences from Qwen3:**
+- Different LoRA target modules: `q_proj, k_proj, v_proj, out_proj, in_proj, w1, w2, w3`
+- Recommended generation parameters: `temp=0.3, min_p=0.15, repetition_penalty=1.05`
+- Requires transformers >= 4.55.0 for architecture support
+
+**Pre-trained GGUF models:**
+- Base: `hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf` (~731 MB)
+- Instruct: `hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf` (~731 MB)
