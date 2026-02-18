@@ -75,7 +75,15 @@ import {
   getVectorScopeGuardMessage,
   setApiEmbeddingScopeFromCurrentEnv,
 } from "./vector-scope-guard.js";
-import { disposeDefaultLLM, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLLM, getDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import {
+  DEFAULT_API_CHAT_BASE_URL,
+  DEFAULT_API_CHAT_MODEL,
+  DEFAULT_API_EMBED_BASE_URL,
+  DEFAULT_API_EMBED_MODEL,
+  DEFAULT_API_RERANK_BASE_URL,
+  DEFAULT_API_RERANK_MODEL,
+} from "./api-defaults.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -389,43 +397,62 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    const backend = process.env.QMD_LLM_BACKEND?.trim().toLowerCase() || "local";
+    if (backend === "api") {
+      const embedBaseUrl = (process.env.QMD_EMBED_BASE_URL || DEFAULT_API_EMBED_BASE_URL).replace(/\/+$/, "");
+      const embedModel = process.env.QMD_EMBED_MODEL || DEFAULT_API_EMBED_MODEL;
+      const chatBaseUrl = (process.env.QMD_CHAT_BASE_URL || DEFAULT_API_CHAT_BASE_URL).replace(/\/+$/, "");
+      const chatModel = process.env.QMD_CHAT_MODEL || DEFAULT_API_CHAT_MODEL;
+      const rerankBaseUrl = (process.env.QMD_RERANK_BASE_URL || DEFAULT_API_RERANK_BASE_URL).replace(/\/+$/, "");
+      const rerankModel = process.env.QMD_RERANK_MODEL || DEFAULT_API_RERANK_MODEL;
+
+      console.log(`  Embedding:   ${embedModel} ${c.dim}(${embedBaseUrl})${c.reset}`);
+      console.log(`  Chat:        ${chatModel} ${c.dim}(${chatBaseUrl})${c.reset}`);
+      console.log(`  Reranking:   ${rerankModel} ${c.dim}(${rerankBaseUrl})${c.reset}`);
+    } else {
+      // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+      const hfLink = (uri: string) => {
+        const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+        return match ? `https://huggingface.co/${match[1]}` : uri;
+      };
+      console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+      console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+      console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    }
   }
 
   // Device / GPU info
   try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+    const llm = getDefaultLLM();
+    if (llm instanceof LlamaCpp) {
+      const device = await llm.getDeviceInfo();
+      console.log(`\n${c.bold}Device${c.reset}`);
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
     } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`\n${c.bold}Device${c.reset}`);
+      console.log(`  ${c.dim}Backend is API mode; local device probe skipped.${c.reset}`);
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
   } catch {
     // Don't fail status if LLM init fails
   }
