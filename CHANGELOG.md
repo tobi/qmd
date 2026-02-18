@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Changes
+
+- LLM: add LiquidAI LFM2-1.2B as an alternative base model for query
+  expansion fine-tuning. LFM2's hybrid architecture (convolutions + attention)
+  is 2x faster at decode/prefill vs standard transformers — good fit for
+  on-device inference.
+- CLI: support multiple `-c` flags to search across several collections at
+  once (e.g. `qmd search -c notes -c journals "query"`). #191 (thanks
+  @openclaw)
+
+### Fixes
+
+- Return empty JSON array `[]` instead of no output when `--json` search
+  finds no results.
+- Resolve relative paths passed to `--index` so they don't produce malformed
+  config entries.
+- Respect `XDG_CONFIG_HOME` for collection config path instead of always
+  using `~/.config`. #190 (thanks @openclaw)
+- CLI: empty-collection hint now shows the correct `collection add` command.
+  #200 (thanks @vincentkoc)
+
 ## [1.0.6] - 2026-02-16
 
 ### Changes
