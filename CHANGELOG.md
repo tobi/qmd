@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-02-18
+
 ### Changes
 
 - LLM: add LiquidAI LFM2-1.2B as an alternative base model for query
