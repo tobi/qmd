@@ -2123,9 +2123,6 @@ function parseCLI() {
       context: {
         type: "string",
       },
-      "no-lex": {
-        type: "boolean",
-      },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
       // Search options
