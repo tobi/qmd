@@ -27,9 +27,23 @@ def parse_output_text(text: str) -> list[list[str]]:
     return items
 
 
-def output_items_to_text(items: Iterable[Iterable[str]]) -> str:
-    """Render output list pairs to prefixed text lines."""
-    lines = []
+def reorder_hyde_first(items: list[list[str]]) -> list[list[str]]:
+    """Reorder items to put hyde first, then lex, then vec."""
+    hyde_items = [item for item in items if item and item[0] == "hyde"]
+    lex_items = [item for item in items if item and item[0] == "lex"]
+    vec_items = [item for item in items if item and item[0] == "vec"]
+    return hyde_items + lex_items + vec_items
+
+
+def output_items_to_text(items: Iterable[Iterable[str]], hyde_first: bool = True) -> str:
+    """Render output list pairs to prefixed text lines.
+    
+    Args:
+        items: Iterable of [type, text] pairs
+        hyde_first: If True, reorder to put hyde first (default)
+    """
+    # First normalize to list
+    normalized = []
     for item in items:
         if not item:
             continue
@@ -44,12 +58,23 @@ def output_items_to_text(items: Iterable[Iterable[str]]) -> str:
         text = str(text).strip()
         if not text:
             continue
-        lines.append(f"{kind}: {text}")
+        normalized.append([kind, text])
+    
+    # Apply hyde-first ordering if requested
+    if hyde_first:
+        normalized = reorder_hyde_first(normalized)
+    
+    lines = [f"{kind}: {text}" for kind, text in normalized]
     return "\n".join(lines)
 
 
-def normalize_output_items(items: Iterable[Iterable[str]]) -> list[list[str]]:
-    """Normalize output list pairs (filter invalid, trim whitespace)."""
+def normalize_output_items(items: Iterable[Iterable[str]], hyde_first: bool = True) -> list[list[str]]:
+    """Normalize output list pairs (filter invalid, trim whitespace, reorder).
+    
+    Args:
+        items: Iterable of [type, text] pairs
+        hyde_first: If True, reorder to put hyde first (default)
+    """
     normalized: list[list[str]] = []
     for item in items:
         if not item:
@@ -66,6 +91,11 @@ def normalize_output_items(items: Iterable[Iterable[str]]) -> list[list[str]]:
         if not text:
             continue
         normalized.append([kind, text])
+    
+    # Apply hyde-first ordering if requested
+    if hyde_first:
+        normalized = reorder_hyde_first(normalized)
+    
     return normalized
 
 
