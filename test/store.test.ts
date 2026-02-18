@@ -1746,7 +1746,7 @@ describe("Document Retrieval", () => {
 describe("Snippet Extraction", () => {
   test("extractSnippet finds query terms", () => {
     const body = "First line.\nSecond line with keyword.\nThird line.\nFourth line.";
-    const { line, snippet } = extractSnippet(body, "keyword", 500);
+    const { line, snippet } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     expect(line).toBe(2); // Line 2 contains "keyword"
     expect(snippet).toContain("keyword");
@@ -1754,7 +1754,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet includes context lines", () => {
     const body = "Line 1\nLine 2\nLine 3 has keyword\nLine 4\nLine 5";
-    const { snippet } = extractSnippet(body, "keyword", 500);
+    const { snippet } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     expect(snippet).toContain("Line 2"); // Context before
     expect(snippet).toContain("Line 3 has keyword");
@@ -1763,7 +1763,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet respects maxLen for content", () => {
     const body = "A".repeat(1000);
-    const result = extractSnippet(body, "query", 100);
+    const result = extractSnippet(body, "query", { maxLen: 100 });
 
     // Snippet includes header + content, content should be truncated
     expect(result.snippet).toContain("@@"); // Has diff header
@@ -1774,13 +1774,13 @@ describe("Snippet Extraction", () => {
     const body = "First section...\n".repeat(50) + "Target keyword here\n" + "More content...".repeat(50);
     const chunkPos = body.indexOf("Target keyword");
 
-    const { snippet } = extractSnippet(body, "Target", 200, chunkPos);
+    const { snippet } = extractSnippet(body, "Target", { maxLen: 200, chunkPos });
     expect(snippet).toContain("Target keyword");
   });
 
   test("extractSnippet returns beginning when no match", () => {
     const body = "First line\nSecond line\nThird line";
-    const { line, snippet } = extractSnippet(body, "nonexistent", 500);
+    const { line, snippet } = extractSnippet(body, "nonexistent", { maxLen: 500 });
 
     expect(line).toBe(1);
     expect(snippet).toContain("First line");
@@ -1788,7 +1788,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet includes diff-style header", () => {
     const body = "Line 1\nLine 2\nLine 3 has keyword\nLine 4\nLine 5";
-    const { snippet, linesBefore, linesAfter, snippetLines } = extractSnippet(body, "keyword", 500);
+    const { snippet, linesBefore, linesAfter, snippetLines } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     // Header should show line position and context info
     expect(snippet).toMatch(/^@@ -\d+,\d+ @@ \(\d+ before, \d+ after\)/);
@@ -1799,7 +1799,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet calculates linesBefore and linesAfter correctly", () => {
     const body = "L1\nL2\nL3\nL4 match\nL5\nL6\nL7\nL8\nL9\nL10";
-    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "match", 500);
+    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "match", { maxLen: 500 });
 
     expect(line).toBe(4); // "L4 match" is line 4
     expect(linesBefore).toBe(2); // L1, L2 before snippet (snippet starts at L3)
@@ -1809,7 +1809,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet header format matches diff style", () => {
     const body = "A\nB\nC keyword\nD\nE\nF\nG\nH";
-    const { snippet } = extractSnippet(body, "keyword", 500);
+    const { snippet } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     // Should start with @@ -line,count @@ (N before, M after)
     const headerMatch = snippet.match(/^@@ -(\d+),(\d+) @@ \((\d+) before, (\d+) after\)/);
@@ -1824,7 +1824,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet at document start shows 0 before", () => {
     const body = "First line keyword\nSecond\nThird\nFourth\nFifth";
-    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "keyword", 500);
+    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     expect(line).toBe(1);         // Keyword on first line
     expect(linesBefore).toBe(0);  // Nothing before
@@ -1834,7 +1834,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet at document end shows 0 after", () => {
     const body = "First\nSecond\nThird\nFourth\nFifth keyword";
-    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "keyword", 500);
+    const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     expect(line).toBe(5);         // Keyword on last line
     expect(linesBefore).toBe(3);  // First, Second, Third before snippet
@@ -1844,7 +1844,7 @@ describe("Snippet Extraction", () => {
 
   test("extractSnippet with single line document", () => {
     const body = "Single line with keyword";
-    const { linesBefore, linesAfter, snippetLines, snippet } = extractSnippet(body, "keyword", 500);
+    const { linesBefore, linesAfter, snippetLines, snippet } = extractSnippet(body, "keyword", { maxLen: 500 });
 
     expect(linesBefore).toBe(0);
     expect(linesAfter).toBe(0);
@@ -1859,7 +1859,7 @@ describe("Snippet Extraction", () => {
     const body = padding + "Target keyword here\nMore content\nEven more";
     const chunkPos = padding.length; // Position of "Target keyword"
 
-    const { line, linesBefore, linesAfter } = extractSnippet(body, "keyword", 200, chunkPos);
+    const { line, linesBefore, linesAfter } = extractSnippet(body, "keyword", { maxLen: 200, chunkPos });
 
     expect(line).toBe(51); // "Target keyword" is line 51
     expect(linesBefore).toBeGreaterThan(40); // Many lines before

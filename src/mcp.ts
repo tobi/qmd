@@ -21,6 +21,7 @@ import {
   addLineNumbers,
   hybridQuery,
   vectorSearchQuery,
+  normalizeQuery,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { Store } from "./store.js";
@@ -101,7 +102,8 @@ function buildInstructions(store: Store): string {
   // --- What's searchable? ---
   if (status.collections.length > 0) {
     lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
+    lines.push("Collections — when the user's request maps to a specific collection, always");
+    lines.push("set the `collection` parameter to filter. This reduces noise and improves relevance.");
     for (const col of status.collections) {
       const collConfig = getCollection(col.name);
       const rootCtx = collConfig?.context?.[""] || collConfig?.context?.["/"];
@@ -125,7 +127,14 @@ function buildInstructions(store: Store): string {
   lines.push("Search:");
   lines.push("  - `search` (~30ms) — keyword and exact phrase matching.");
   lines.push("  - `vector_search` (~2s) — meaning-based, finds adjacent concepts even when vocabulary differs.");
-  lines.push("  - `deep_search` (~10s) — auto-expands the query into variations, searches each by keyword and meaning, reranks for top hits.");
+  lines.push("  - `deep_search` — hybrid search with reranking. You are the query expander —");
+  lines.push("    generate all three expansion fields to replace the built-in LLM expansion:");
+  lines.push("      query: `{ text, keywords, concepts, passage }`");
+  lines.push("      `keywords`: BM25 search terms and synonyms (e.g. [\"TTFB\", \"core web vitals\"])");
+  lines.push("      `concepts`: semantic phrases for embedding search (e.g. [\"frontend rendering optimization\"])");
+  lines.push("      `passage`: a paragraph written as if it were the ideal matching document");
+  lines.push("    Fallback: pass query as a plain string for automatic expansion (~10s slower).");
+  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -233,17 +242,18 @@ function createMcpServer(store: Store): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Search query - keywords or phrases to find"),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
+    async ({ query, intent, limit, minScore, collection }) => {
       const results = store.searchFTS(query, limit || 10, collection);
       const filtered: SearchResultItem[] = results
         .filter(r => r.score >= (minScore || 0))
         .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
+          const { line, snippet } = extractSnippet(r.body || "", query, { maxLen: 300, chunkPos: r.chunkPos, intent });
           return {
             docid: `#${r.docid}`,
             file: r.displayPath,
@@ -273,13 +283,14 @@ function createMcpServer(store: Store): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
+    async ({ query, intent, limit, minScore, collection }) => {
+      const results = await vectorSearchQuery(store, query, { collection, limit, minScore, intent });
 
       if (results.length === 0) {
         // Distinguish "no embeddings" from "no matches" — check if vector table exists
@@ -293,7 +304,7 @@ function createMcpServer(store: Store): McpServer {
       }
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, query, 300);
+        const { line, snippet } = extractSnippet(r.body, query, { maxLen: 300, intent });
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -319,20 +330,33 @@ function createMcpServer(store: Store): McpServer {
     "deep_search",
     {
       title: "Deep Search",
-      description: "Deep search. Auto-expands the query into variations, searches each by keyword and meaning, and reranks for top hits across all results.",
+      description: "Deep search with reranking. Prefer query as object with keywords/concepts/passage for best results. Fallback: pass as string for automatic expansion.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
+        query: z.union([
+          z.string(),
+          z.object({
+            text: z.string().describe("The search query"),
+            keywords: z.array(z.string()).optional()
+              .describe("BM25 keyword variants for exact term matching"),
+            concepts: z.array(z.string()).optional()
+              .describe("Semantic phrases matched by meaning, not exact words"),
+            passage: z.string().min(1).optional()
+              .describe("Hypothetical document passage or paragraph resembling a matching document"),
+          }),
+        ]).describe("Prefer object with text/keywords/concepts/passage for best results. Fallback: pass as string for automatic expansion."),
+        intent: z.string().optional().describe("Optional background context — when the query is ambiguous, describe the intended interpretation. Omit for precise queries."),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
         collection: z.string().optional().describe("Filter to a specific collection by name"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await hybridQuery(store, query, { collection, limit, minScore });
+    async ({ query, intent, limit, minScore, collection }) => {
+      const sq = normalizeQuery(query);
+      const results = await hybridQuery(store, sq, { collection, limit, minScore, intent });
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, query, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, sq.text, { maxLen: 300, intent });
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -344,7 +368,7 @@ function createMcpServer(store: Store): McpServer {
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        content: [{ type: "text", text: formatSearchSummary(filtered, sq.text) }],
         structuredContent: { results: filtered },
       };
     }

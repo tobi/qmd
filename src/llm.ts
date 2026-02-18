@@ -939,7 +939,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { intent?: string, context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -948,6 +948,7 @@ export class LlamaCpp implements LLM {
 
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
+    const intent = options.intent;
 
     const grammar = await llama.createGrammar({
       grammar: `
@@ -958,7 +959,11 @@ export class LlamaCpp implements LLM {
       `
     });
 
-    const prompt = `/no_think Expand this search query: ${query}`;
+    // When intent is provided, include it as background context so the LLM
+    // generates expansions that are better aligned with the caller's goal.
+    const prompt = intent
+      ? `/no_think Context: ${intent}\nExpand this search query: ${query}`
+      : `/no_think Expand this search query: ${query}`;
 
     // Create fresh context for each call
     const genContext = await this.generateModel!.createContext();
