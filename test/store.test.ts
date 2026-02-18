@@ -1228,6 +1228,39 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS filters by multiple collection names", async () => {
+    const store = await createTestStore();
+    const collection1 = await createTestCollection({ pwd: "/path/one", glob: "**/*.md", name: "one" });
+    const collection2 = await createTestCollection({ pwd: "/path/two", glob: "**/*.md", name: "two" });
+    const collection3 = await createTestCollection({ pwd: "/path/three", glob: "**/*.md", name: "three" });
+
+    await insertTestDocument(store.db, collection1, {
+      name: "doc1",
+      body: "searchable content",
+      displayPath: "doc1.md",
+    });
+
+    await insertTestDocument(store.db, collection2, {
+      name: "doc2",
+      body: "searchable content",
+      displayPath: "doc2.md",
+    });
+
+    await insertTestDocument(store.db, collection3, {
+      name: "doc3",
+      body: "searchable content",
+      displayPath: "doc3.md",
+    });
+
+    const filtered = store.searchFTS("searchable", 10, [collection1, collection2]);
+    expect(filtered).toHaveLength(2);
+    expect(filtered.every(r => r.collectionName === collection1 || r.collectionName === collection2)).toBe(true);
+    expect(filtered.some(r => r.collectionName === collection1)).toBe(true);
+    expect(filtered.some(r => r.collectionName === collection2)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS handles special characters in query", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

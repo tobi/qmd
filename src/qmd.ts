@@ -1924,16 +1924,6 @@ function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults
   return validated;
 }
 
-// Post-filter results to only include files from specified collections.
-function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
-  if (collectionNames.length <= 1) return results;
-  const prefixes = collectionNames.map(n => `qmd://${n}/`);
-  return results.filter(r => {
-    const path = r.filepath || r.file || '';
-    return prefixes.some(p => path.startsWith(p));
-  });
-}
-
 /**
  * Parse structured search query syntax.
  * Lines starting with lex:, vec:, or hyde: are routed directly.
@@ -1991,21 +1981,16 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
 
   return searches.length > 0 ? searches : null;
 }
-
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
   // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  const results = searchFTS(db, query, fetchLimit, collectionFilter);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2051,15 +2036,14 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+    const results = await vectorSearchQuery(store, query, {
+      collection: collectionFilter,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -2069,14 +2053,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       },
     });
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
 
     closeDb();
 
@@ -2105,9 +2081,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
@@ -2131,7 +2106,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
+        collections: collectionFilter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {
@@ -2154,7 +2129,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     } else {
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
-        collection: singleCollection,
+        collection: collectionFilter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {
@@ -2184,14 +2159,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
-      });
-    }
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
       });
     }
 
