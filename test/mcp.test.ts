@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
+import { setConfigIndexName } from "../src/collections";
 
 // =============================================================================
 // Test Database Setup
@@ -205,6 +206,9 @@ describe("MCP Server", () => {
     // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
     // Use shared singleton to avoid creating multiple instances with separate GPU resources
     getDefaultLlamaCpp();
+
+    // Reset index name in case another test file mutated it (bun test shares process)
+    setConfigIndexName("index");
 
     // Set up test config directory
     const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);

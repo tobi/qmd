@@ -23,6 +23,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Reset index name to default (prevents leaking into other test files under bun test)
+  setConfigIndexName("index");
   for (const [key, val] of Object.entries(savedEnv)) {
     if (val === undefined) {
       delete process.env[key];
