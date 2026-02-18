@@ -37,6 +37,7 @@ import {
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
 } from "./collections.js";
+import { getVectorScopeGuardMessage } from "./vector-scope-guard.js";
 
 // =============================================================================
 // Configuration
@@ -671,6 +672,14 @@ function initializeDatabase(db: Database): void {
       hash TEXT PRIMARY KEY,
       result TEXT NOT NULL,
       created_at TEXT NOT NULL
+    )
+  `);
+
+  // API embedding scope metadata (used to guard mixed local/API vector usage).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS api_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )
   `);
 
@@ -2160,6 +2169,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // =============================================================================
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2920,6 +2934,11 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -3133,6 +3152,11 @@ export async function vectorSearchQuery(
   query: string,
   options?: VectorSearchOptions
 ): Promise<VectorSearchResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;

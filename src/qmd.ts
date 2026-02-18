@@ -70,6 +70,11 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
+import {
+  clearApiEmbeddingScope,
+  getVectorScopeGuardMessage,
+  setApiEmbeddingScopeFromCurrentEnv,
+} from "./vector-scope-guard.js";
 import { disposeDefaultLLM, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
@@ -1533,11 +1538,23 @@ function renderProgressBar(percent: number, width: number = 30): string {
 async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
+  const backend = process.env.QMD_LLM_BACKEND?.trim().toLowerCase() || "local";
+  const isApiBackend = backend === "api";
+
+  if (!force) {
+    const guardMessage = getVectorScopeGuardMessage(db);
+    if (guardMessage) {
+      throw new Error(guardMessage);
+    }
+  }
 
   // If force, clear all vectors
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     clearAllEmbeddings(db);
+    if (!isApiBackend) {
+      clearApiEmbeddingScope(db);
+    }
   }
 
   // Find unique hashes that need embedding (from active documents)
@@ -1615,6 +1632,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
     ensureVecTable(db, firstResult.embedding.length);
+    if (isApiBackend) {
+      setApiEmbeddingScopeFromCurrentEnv(db);
+    }
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
