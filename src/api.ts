@@ -22,13 +22,14 @@ import type {
   RerankOptions,
   RerankResult,
 } from "./llm.js";
-
-const DEFAULT_EMBED_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_EMBED_MODEL = "text-embedding-3-small";
-const DEFAULT_CHAT_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_CHAT_MODEL = "gpt-4o-mini";
-const DEFAULT_RERANK_BASE_URL = "https://api.cohere.com/v1";
-const DEFAULT_RERANK_MODEL = "rerank-v3.5";
+import {
+  DEFAULT_API_CHAT_BASE_URL,
+  DEFAULT_API_CHAT_MODEL,
+  DEFAULT_API_EMBED_BASE_URL,
+  DEFAULT_API_EMBED_MODEL,
+  DEFAULT_API_RERANK_BASE_URL,
+  DEFAULT_API_RERANK_MODEL,
+} from "./api-defaults.js";
 
 type OpenAIEmbeddingResponse = {
   data?: Array<{ embedding?: number[] }>;
@@ -79,7 +80,7 @@ export class ApiLLM implements LLM {
     this.embedBaseUrl = (
       config.embedBaseUrl
       || process.env.QMD_EMBED_BASE_URL
-      || DEFAULT_EMBED_BASE_URL
+      || DEFAULT_API_EMBED_BASE_URL
     ).replace(/\/+$/, "");
     this.embedApiKey =
       config.embedApiKey
@@ -88,12 +89,12 @@ export class ApiLLM implements LLM {
     this.embedModel =
       config.embedModel
       || process.env.QMD_EMBED_MODEL
-      || DEFAULT_EMBED_MODEL;
+      || DEFAULT_API_EMBED_MODEL;
       // Chat API config
     this.chatBaseUrl = (
       config.chatBaseUrl
       || process.env.QMD_CHAT_BASE_URL
-      || DEFAULT_CHAT_BASE_URL
+      || DEFAULT_API_CHAT_BASE_URL
     ).replace(/\/+$/, "");
     this.chatApiKey =
       config.chatApiKey
@@ -102,12 +103,12 @@ export class ApiLLM implements LLM {
     this.chatModel =
       config.chatModel
       || process.env.QMD_CHAT_MODEL
-      || DEFAULT_CHAT_MODEL;
+      || DEFAULT_API_CHAT_MODEL;
     // Rerank API config
     this.rerankBaseUrl = (
       config.rerankBaseUrl
       || process.env.QMD_RERANK_BASE_URL
-      || DEFAULT_RERANK_BASE_URL
+      || DEFAULT_API_RERANK_BASE_URL
     ).replace(/\/+$/, "");
     this.rerankApiKey =
       config.rerankApiKey
@@ -116,7 +117,7 @@ export class ApiLLM implements LLM {
     this.rerankModel =
       config.rerankModel
       || process.env.QMD_RERANK_MODEL
-      || DEFAULT_RERANK_MODEL;
+      || DEFAULT_API_RERANK_MODEL;
   }
 
   private getHeaders(apiKey: string): Record<string, string> {
