@@ -473,12 +473,13 @@ qmd cleanup
 
 Index stored in: `~/.cache/qmd/index.sqlite`
 
+Collections and path contexts are stored in YAML config (default): `~/.config/qmd/index.yml`
+
 ### Schema
 
 ```sql
-collections     -- Indexed directories with name and glob patterns
-path_contexts   -- Context descriptions by virtual path (qmd://...)
 documents       -- Markdown content with metadata and docid (6-char hash)
+content         -- Content-addressed markdown bodies (hash -> full document)
 documents_fts   -- FTS5 full-text index
 content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
