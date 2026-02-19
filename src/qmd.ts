@@ -81,6 +81,7 @@ import {
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
+  getDefaultCollectionNames,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
   setGlobalContext,
@@ -254,6 +255,11 @@ function formatTimeAgo(date: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
 }
 
 function formatBytes(bytes: number): string {
@@ -1901,7 +1907,6 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {
-    const { getDefaultCollectionNames } = require("./collections.js");
     return getDefaultCollectionNames();
   }
   if (!raw) return [];
@@ -2130,12 +2135,19 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}\n`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
+          },
           onRerankStart: (chunkCount) => {
             process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
             progress.indeterminate();
           },
-          onRerankDone: () => {
+          onRerankDone: (ms) => {
             progress.clear();
+            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
           },
         },
       });
@@ -2149,16 +2161,26 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
           },
-          onExpand: (original, expanded) => {
+          onExpandStart: () => {
+            process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
+          },
+          onExpand: (original, expanded, ms) => {
             logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+            process.stderr.write(`${c.dim}  (${formatMs(ms)}) → searching ${expanded.length + 1} queries${c.reset}\n`);
+          },
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}\n`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
           },
           onRerankStart: (chunkCount) => {
             process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
             progress.indeterminate();
           },
-          onRerankDone: () => {
+          onRerankDone: (ms) => {
             progress.clear();
+            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
           },
         },
       });

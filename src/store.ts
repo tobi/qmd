@@ -2848,12 +2848,18 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 export interface SearchHooks {
   /** BM25 probe found strong signal — expansion will be skipped */
   onStrongSignal?: (topScore: number) => void;
-  /** Query expansion complete. Empty array = strong signal skip (no expansion). */
-  onExpand?: (original: string, expanded: ExpandedQuery[]) => void;
+  /** Query expansion starting */
+  onExpandStart?: () => void;
+  /** Query expansion complete. Empty array = strong signal skip. elapsedMs = time taken. */
+  onExpand?: (original: string, expanded: ExpandedQuery[], elapsedMs: number) => void;
+  /** Embedding starting (vec/hyde queries) */
+  onEmbedStart?: (count: number) => void;
+  /** Embedding complete */
+  onEmbedDone?: (elapsedMs: number) => void;
   /** Reranking is about to start */
   onRerankStart?: (chunkCount: number) => void;
   /** Reranking finished */
-  onRerankDone?: () => void;
+  onRerankDone?: (elapsedMs: number) => void;
 }
 
 export interface HybridQueryOptions {
@@ -2918,11 +2924,13 @@ export async function hybridQuery(
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
   // Step 2: Expand query (or skip if strong signal)
+  hooks?.onExpandStart?.();
+  const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
 
-  hooks?.onExpand?.(query, expanded);
+  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -2967,7 +2975,10 @@ export async function hybridQuery(
     // Batch embed all vector queries in a single call
     const llm = getDefaultLlamaCpp();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    hooks?.onEmbedStart?.(textsToEmbed.length);
+    const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
+    hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -3020,8 +3031,9 @@ export async function hybridQuery(
 
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart = Date.now();
   const reranked = await store.rerank(query, chunksToRerank);
-  hooks?.onRerankDone?.();
+  hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
@@ -3111,9 +3123,10 @@ export async function vectorSearchQuery(
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
+  const expandStart = Date.now();
   const allExpanded = await store.expandQuery(query);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
-  options?.hooks?.onExpand?.(query, vecExpanded);
+  options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
@@ -3260,7 +3273,10 @@ export async function structuredSearch(
     if (vecSearches.length > 0) {
       const llm = getDefaultLlamaCpp();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      hooks?.onEmbedStart?.(textsToEmbed.length);
+      const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -3292,7 +3308,7 @@ export async function structuredSearch(
 
   if (candidates.length === 0) return [];
 
-  hooks?.onExpand?.("", []); // Signal no expansion (pre-expanded)
+  hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
@@ -3322,8 +3338,9 @@ export async function structuredSearch(
 
   // Step 5: Rerank chunks
   hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart2 = Date.now();
   const reranked = await store.rerank(primaryQuery, chunksToRerank);
-  hooks?.onRerankDone?.();
+  hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
