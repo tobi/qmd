@@ -32,10 +32,27 @@ export interface Collection {
 }
 
 /**
+ * Embedding format determines how queries and documents are prefixed before embedding.
+ * - "embeddinggemma": task: search result | query: {q} / title: {t} | text: {d}
+ * - "nomic": search_query: {q} / search_document: {d}
+ * - "raw": no prefix, pass text as-is (works for bge-m3 and most modern models)
+ */
+export type EmbedFormat = "embeddinggemma" | "nomic" | "raw";
+
+export interface ModelConfig {
+  embed?: string;         // HuggingFace URI for embedding model (e.g., "hf:user/repo/file.gguf")
+  embed_format?: EmbedFormat;  // Embedding format type (default: auto-detect from model name)
+  rerank?: string;        // HuggingFace URI for reranking model
+  generate?: string;      // HuggingFace URI for generation/query-expansion model
+  cache_dir?: string;     // Custom model cache directory (default: ~/.cache/qmd/models)
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
+  models?: ModelConfig;                       // Optional model overrides
   collections: Record<string, Collection>;    // Collection name -> config
 }
 

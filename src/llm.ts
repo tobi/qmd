@@ -18,25 +18,76 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { loadConfig, type ModelConfig, type EmbedFormat } from "./collections";
 
 // =============================================================================
 // Embedding Formatting Functions
 // =============================================================================
 
 /**
+ * Auto-detect embedding format from model URI.
+ * Returns the appropriate format based on known model naming patterns.
+ */
+export function detectEmbedFormat(modelUri: string): EmbedFormat {
+  const lower = modelUri.toLowerCase();
+  if (lower.includes("embeddinggemma")) return "embeddinggemma";
+  if (lower.includes("nomic")) return "nomic";
+  // bge-m3, gte, and most modern models work best with raw text
+  return "raw";
+}
+
+// Cached embed format (resolved once from config)
+let _cachedEmbedFormat: EmbedFormat | null = null;
+
+/**
+ * Get the current embedding format (from config or auto-detected).
+ */
+export function getEmbedFormat(): EmbedFormat {
+  if (_cachedEmbedFormat) return _cachedEmbedFormat;
+  const mc = loadModelConfig();
+  _cachedEmbedFormat = mc.embedFormat;
+  return _cachedEmbedFormat;
+}
+
+/**
+ * Reset the cached embed format (call when config changes).
+ */
+export function resetEmbedFormatCache(): void {
+  _cachedEmbedFormat = null;
+}
+
+/**
  * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
+ * Applies model-specific prefixes based on the configured embed format.
  */
 export function formatQueryForEmbedding(query: string): string {
-  return `task: search result | query: ${query}`;
+  const fmt = getEmbedFormat();
+  switch (fmt) {
+    case "embeddinggemma":
+      return `task: search result | query: ${query}`;
+    case "nomic":
+      return `search_query: ${query}`;
+    case "raw":
+    default:
+      return query;
+  }
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * Applies model-specific prefixes based on the configured embed format.
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
-  return `title: ${title || "none"} | text: ${text}`;
+  const fmt = getEmbedFormat();
+  switch (fmt) {
+    case "embeddinggemma":
+      return `title: ${title || "none"} | text: ${text}`;
+    case "nomic":
+      return `search_document: ${title ? title + " " : ""}${text}`;
+    case "raw":
+    default:
+      return title ? `${title}\n${text}` : text;
+  }
 }
 
 // =============================================================================
@@ -196,6 +247,43 @@ const MODEL_CACHE_DIR = xdgCacheHome
   ? join(xdgCacheHome, "qmd", "models")
   : join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
+
+/**
+ * Load model configuration from the YAML config file.
+ * Returns resolved URIs (user overrides merged with defaults).
+ */
+export function loadModelConfig(): { embed: string; rerank: string; generate: string; cacheDir: string; embedFormat: EmbedFormat } {
+  try {
+    const config = loadConfig();
+    const models = config.models || {};
+    const embedUri = models.embed || DEFAULT_EMBED_MODEL;
+    return {
+      embed: embedUri,
+      rerank: models.rerank || DEFAULT_RERANK_MODEL,
+      generate: models.generate || DEFAULT_GENERATE_MODEL,
+      cacheDir: models.cache_dir || MODEL_CACHE_DIR,
+      embedFormat: models.embed_format || detectEmbedFormat(embedUri),
+    };
+  } catch {
+    // If config loading fails, fall back to defaults
+    return {
+      embed: DEFAULT_EMBED_MODEL,
+      rerank: DEFAULT_RERANK_MODEL,
+      generate: DEFAULT_GENERATE_MODEL,
+      cacheDir: MODEL_CACHE_DIR,
+      embedFormat: detectEmbedFormat(DEFAULT_EMBED_MODEL),
+    };
+  }
+}
+
+/**
+ * Get a human-readable short name from a model URI.
+ * e.g., "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf" → "embeddinggemma-300M-Q8_0"
+ */
+export function modelDisplayName(uri: string): string {
+  const filename = uri.split("/").pop() || uri;
+  return filename.replace(/\.gguf$/i, "");
+}
 
 export type PullResult = {
   model: string;
@@ -1382,9 +1470,19 @@ let defaultLlamaCpp: LlamaCpp | null = null;
 /**
  * Get the default LlamaCpp instance (creates one if needed)
  */
+/**
+ * Get the default LlamaCpp instance (creates one if needed).
+ * Reads model overrides from ~/.config/qmd/index.yml → models section.
+ */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const modelConfig = loadModelConfig();
+    defaultLlamaCpp = new LlamaCpp({
+      embedModel: modelConfig.embed,
+      generateModel: modelConfig.generate,
+      rerankModel: modelConfig.rerank,
+      modelCacheDir: modelConfig.cacheDir,
+    });
   }
   return defaultLlamaCpp;
 }

@@ -4,6 +4,14 @@
 # This file defines all collections and their contexts.
 # You can manually edit this file - changes take effect immediately.
 
+# Model overrides (optional - defaults work well for most use cases)
+# models:
+#   embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
+#   embed_format: "embeddinggemma"  # auto-detected from model name if omitted
+#   rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
+#   generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+#   cache_dir: "~/.cache/qmd/models"
+
 # Global context applied to all collections
 # Use this for universal search instructions or patterns
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
