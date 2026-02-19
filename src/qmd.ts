@@ -431,7 +431,8 @@ async function showStatus(): Promise<void> {
     const names = collectionsWithoutContext.map(c => c.name).slice(0, 3).join(', ');
     const more = collectionsWithoutContext.length > 3 ? ` +${collectionsWithoutContext.length - 3} more` : '';
     tips.push(`Add context to collections for better search results: ${names}${more}`);
-    tips.push(`  ${c.dim}qmd context add qmd://<name>/ "Description..."${c.reset}`);
+    tips.push(`  ${c.dim}qmd context add qmd://<name>/ "What this collection contains"${c.reset}`);
+    tips.push(`  ${c.dim}qmd context add qmd://<name>/meeting-notes "Weekly team meeting notes"${c.reset}`);
   }
 
   // Check for collections without update commands
@@ -443,7 +444,7 @@ async function showStatus(): Promise<void> {
     const names = collectionsWithoutUpdate.map(c => c.name).slice(0, 3).join(', ');
     const more = collectionsWithoutUpdate.length > 3 ? ` +${collectionsWithoutUpdate.length - 3} more` : '';
     tips.push(`Add update commands to keep collections fresh: ${names}${more}`);
-    tips.push(`  ${c.dim}qmd collection update-cmd <name> 'git pull'${c.reset}`);
+    tips.push(`  ${c.dim}qmd collection update-cmd <name> 'git stash && git pull --rebase --ff-only && git stash pop'${c.reset}`);
   }
 
   if (tips.length > 0) {
