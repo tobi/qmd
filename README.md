@@ -258,6 +258,27 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
+### OpenAI Embeddings (Optional)
+
+As an alternative to local embedding models, you can use OpenAI's API for faster, more reliable embeddings:
+
+```yaml
+# ~/.config/qmd/index.yml
+embedding:
+  provider: openai
+  openai:
+    api_key: sk-...  # Optional, falls back to OPENAI_API_KEY env var
+    model: text-embedding-3-small  # Optional, this is the default
+```
+
+Benefits:
+- **~10x faster** than local CPU inference
+- **No GPU required** - works on any machine
+- **More reliable** - no local model loading issues
+- **Cost:** ~$0.02 per 1M tokens (very cheap)
+
+When using OpenAI embeddings, query expansion and reranking are skipped to avoid loading local models.
+
 ## Installation
 
 ```sh

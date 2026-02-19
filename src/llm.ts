@@ -299,6 +299,16 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in a batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -392,6 +402,13 @@ export class LlamaCpp implements LLM {
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string {
+    return this.embedModelUri;
   }
 
   /**
@@ -1401,4 +1418,61 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// OpenAI Embedding Support
+// =============================================================================
+
+import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
+
+/**
+ * Embedding provider configuration
+ */
+export type EmbeddingProvider = 'local' | 'openai';
+
+export type EmbeddingConfig = {
+  provider: EmbeddingProvider;
+  openai?: OpenAIConfig;
+};
+
+// Default embedding config: use local llama-cpp
+let embeddingConfig: EmbeddingConfig = { provider: 'local' };
+let openAIEmbedding: OpenAIEmbedding | null = null;
+
+/**
+ * Set the embedding configuration. Call before using embeddings.
+ */
+export function setEmbeddingConfig(config: EmbeddingConfig): void {
+  embeddingConfig = config;
+  // Reset OpenAI instance if config changes
+  openAIEmbedding = null;
+}
+
+/**
+ * Get the current embedding configuration
+ */
+export function getEmbeddingConfig(): EmbeddingConfig {
+  return embeddingConfig;
+}
+
+/**
+ * Check if using OpenAI for embeddings
+ */
+export function isUsingOpenAI(): boolean {
+  return embeddingConfig.provider === 'openai';
+}
+
+/**
+ * Get the appropriate LLM for embeddings based on config.
+ * Returns OpenAI embedding client if configured, otherwise local LlamaCpp.
+ */
+export function getDefaultEmbeddingLLM(): LLM {
+  if (embeddingConfig.provider === 'openai') {
+    if (!openAIEmbedding) {
+      openAIEmbedding = new OpenAIEmbedding(embeddingConfig.openai);
+    }
+    return openAIEmbedding;
+  }
+  return getDefaultLlamaCpp();
 }
