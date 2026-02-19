@@ -23,7 +23,8 @@
     "vsearch": "tsx src/qmd.ts vsearch",
     "rerank": "tsx src/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "postinstall": "bun2nix -o bun.nix"
   },
   "publishConfig": {
     "access": "public"
@@ -54,6 +55,8 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
+    "@types/bun": "latest",
+    "bun2nix": "latest",
     "tsx": "^4.0.0",
     "vitest": "^3.0.0"
   },

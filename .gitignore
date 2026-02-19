@@ -10,6 +10,7 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
+result
 !CHANGELOG.md
 !skills/**/*.md
 !finetune/*.md
