@@ -1,147 +1,102 @@
 # QMD MCP Server Setup
 
-## Quick Start
+## Install
 
-1. **Install QMD**
-   ```bash
-   npm install -g @tobilu/qmd
-   ```
+```bash
+npm install -g @tobilu/qmd
+qmd collection add ~/path/to/markdown --name myknowledge
+qmd embed
+```
 
-2. **Configure your client** (see below)
+## Configure MCP Client
 
-3. **Index your content**
-   ```bash
-   qmd collection add ~/path/to/markdown --name myknowledge
-   qmd embed  # Generate embeddings for semantic search
-   ```
-
-## Client Configuration
-
-### Claude Code
-
-Add to `~/.claude/settings.json`:
-
+**Claude Code** (`~/.claude/settings.json`):
 ```json
 {
   "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
+    "qmd": { "command": "qmd", "args": ["mcp"] }
   }
 }
 ```
 
-### Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
+    "qmd": { "command": "qmd", "args": ["mcp"] }
   }
 }
 ```
 
-### OpenClaw
-
-Add to `~/.openclaw/openclaw.json`:
-
+**OpenClaw** (`~/.openclaw/openclaw.json`):
 ```json
 {
   "mcp": {
     "servers": {
-      "qmd": {
-        "command": "qmd",
-        "args": ["mcp"]
-      }
+      "qmd": { "command": "qmd", "args": ["mcp"] }
     }
   }
 }
 ```
 
-### HTTP Mode (for remote/multi-client)
+## HTTP Mode
 
 ```bash
-# Start HTTP server (default port 8181)
-qmd mcp --http
-
-# Or as a background daemon
-qmd mcp --http --daemon
-
-# Stop daemon
-qmd mcp stop
+qmd mcp --http              # Port 8181
+qmd mcp --http --daemon     # Background
+qmd mcp stop                # Stop daemon
 ```
 
-## MCP Tools
+## Tools
 
-### structured_search ⭐ Recommended
+### structured_search
 
-Execute pre-expanded search queries. **Use this** — you're a capable LLM that generates better query expansions than the local model.
+Search with pre-expanded queries.
 
 ```json
 {
   "searches": [
-    { "type": "lex", "query": "keyword phrases here" },
+    { "type": "lex", "query": "keyword phrases" },
     { "type": "vec", "query": "natural language question" },
-    { "type": "hyde", "query": "A hypothetical answer passage..." }
+    { "type": "hyde", "query": "hypothetical answer passage..." }
   ],
   "limit": 10,
-  "collection": "optional-filter",
+  "collection": "optional",
   "minScore": 0.0
 }
 ```
 
-**Search types:**
-- `lex` — BM25 keyword search. Short phrases, 2-5 terms.
-- `vec` — Vector similarity. Write a natural language *question*.
-- `hyde` — Vector similarity. Write a hypothetical *answer* (50-100 words).
-
-Both `vec` and `hyde` use vector search — the difference is what you write.
+| Type | Method | Input |
+|------|--------|-------|
+| `lex` | BM25 | Keywords (2-5 terms) |
+| `vec` | Vector | Question |
+| `hyde` | Vector | Answer passage (50-100 words) |
 
 ### get
 
-Retrieve a document by path or docid.
+Retrieve document by path or `#docid`.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Param | Type | Description |
+|-------|------|-------------|
 | `path` | string | File path or `#docid` |
-| `full` | boolean? | Return full content |
-| `lineNumbers` | boolean? | Add line numbers |
+| `full` | bool? | Return full content |
+| `lineNumbers` | bool? | Add line numbers |
 
 ### multi_get
 
-Retrieve multiple documents by glob or list.
+Retrieve multiple documents.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `pattern` | string | Glob pattern or comma-separated paths/docids |
-| `maxBytes` | number? | Skip files larger than this (default: 10KB) |
+| Param | Type | Description |
+|-------|------|-------------|
+| `pattern` | string | Glob or comma-separated list |
+| `maxBytes` | number? | Skip large files (default 10KB) |
 
 ### status
 
-Get index health and collection info. No parameters.
+Index health and collections. No params.
 
 ## Troubleshooting
 
-**MCP server not starting**
-- Check qmd is in PATH: `which qmd`
-- Run manually to see errors: `qmd mcp`
-- Verify bun installed: `bun --version`
-
-**No results / empty index**
-- Check collections: `qmd collection list`
-- Verify status: `qmd status`
-- Generate embeddings: `qmd embed`
-
-**Slow first search**
-- Normal — models load on first use (~3GB)
-- Subsequent searches are fast
-
-**structured_search not found**
-- Update QMD: `npm install -g @tobilu/qmd`
-- Requires v1.0.8+
+- **Not starting**: `which qmd`, `qmd mcp` manually
+- **No results**: `qmd collection list`, `qmd embed`
+- **Slow first search**: Normal, models loading (~3GB)

@@ -1,161 +1,75 @@
 ---
 name: qmd
-description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
+description: Search markdown knowledge bases, notes, and documentation using QMD. Use when users ask to search notes, find documents, or look up information.
 license: MIT
 compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
-  version: "1.2.0"
+  version: "1.3.0"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
 # QMD - Quick Markdown Search
 
-QMD is a local, on-device search engine for markdown content. It indexes your notes, meeting transcripts, documentation, and knowledge bases for fast retrieval.
+Local search engine for markdown content. Indexes notes, docs, and knowledge bases.
 
-## QMD Status
+## Status
 
-!`qmd status 2>/dev/null || echo "Not installed. See installation instructions below."`
+!`qmd status 2>/dev/null || echo "Not installed: npm install -g @tobilu/qmd"`
 
-## Installation
+## MCP Search — `structured_search`
 
-### Install QMD
-
-```bash
-npm install -g @tobilu/qmd
-```
-
-### Configure MCP Server
-
-**Claude Code** — add to `~/.claude/settings.json`:
-```json
-{
-  "mcpServers": {
-    "qmd": { "command": "qmd", "args": ["mcp"] }
-  }
-}
-```
-
-**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "qmd": { "command": "qmd", "args": ["mcp"] }
-  }
-}
-```
-
-**OpenClaw** — add to `~/.openclaw/openclaw.json` under `mcp.servers`:
-```json
-{
-  "mcp": {
-    "servers": {
-      "qmd": { "command": "qmd", "args": ["mcp"] }
-    }
-  }
-}
-```
-
-### Index Your Content
-
-```bash
-# Add a collection (indexes all markdown files)
-qmd collection add ~/Documents/notes --name notes
-
-# Generate embeddings for semantic search
-qmd embed
-
-# Check status
-qmd status
-```
-
-## Search Strategy — Use `structured_search`
-
-**You are a capable LLM.** Use `structured_search` instead of `deep_search` — you generate better query expansions than the local model.
-
-### How structured_search Works
-
-You provide 2-4 sub-searches, each with a type:
-
-| Type | Search Method | What to Write |
-|------|---------------|---------------|
-| `lex` | BM25 keyword | Short keyword phrases — exact terms, names, identifiers |
-| `vec` | Vector similarity | Natural language question — what you're asking |
-| `hyde` | Vector similarity | Hypothetical answer — what the result looks like (50-100 words) |
-
-Both `vec` and `hyde` use vector similarity search. The difference is input format:
-- **vec**: Write a *question* ("what is X?")
-- **hyde**: Write a *hypothetical answer* ("X is a concept that...")
-
-### Example: Finding CAP Theorem Docs
+Pass 1-4 sub-queries with type `lex`, `vec`, or `hyde`:
 
 ```json
 {
   "searches": [
-    { "type": "lex", "query": "CAP theorem consistency availability partition" },
-    { "type": "vec", "query": "distributed systems tradeoff between data consistency and availability" },
-    { "type": "hyde", "query": "The CAP theorem proves that a distributed system cannot simultaneously provide consistency, availability, and partition tolerance. You must choose two." }
-  ],
-  "limit": 10
+    { "type": "lex", "query": "CAP theorem consistency" },
+    { "type": "vec", "query": "tradeoff between consistency and availability" }
+  ]
 }
 ```
 
-### Guidelines for Query Expansion
+| Type | Method | What to Write |
+|------|--------|---------------|
+| `lex` | BM25 keywords | Short phrases — exact terms, names, code |
+| `vec` | Vector search | Natural language question |
+| `hyde` | Vector search | Hypothetical answer (50-100 words) |
 
-1. **lex queries**: 2-5 keyword terms. Include synonyms and related terms.
-2. **vec queries**: Full natural language questions. Be specific.
-3. **hyde queries**: 50-100 words. Write what the answer *looks like*, not the question.
-4. **Order matters**: First search gets 2x weight in fusion.
+**Tips:**
+- Quick lookup → single `lex` query
+- Don't know exact terms → use `vec`
+- Best results → combine `lex` + `vec` (+ `hyde` for complex topics)
+- First query gets 2x weight
 
-### When to Use Each Search Type
+## MCP Tools
 
-| Situation | Approach |
-|-----------|----------|
-| Know exact terms (names, code, acronyms) | Start with `lex` |
-| Conceptual search, don't know vocabulary | Lead with `vec` |
-| Complex topic, want best recall | Use all three types |
-| Quick lookup | Single `lex` query is fine |
+| Tool | Use |
+|------|-----|
+| `structured_search` | Search with lex/vec/hyde queries |
+| `get` | Retrieve doc by path or `#docid` |
+| `multi_get` | Retrieve multiple docs by glob/list |
+| `status` | Index health and collections |
 
-## MCP Tools Reference
-
-| Tool | Speed | Use Case |
-|------|-------|----------|
-| `structured_search` | ~5s | Search with lex/vec/hyde queries |
-| `get` | instant | Retrieve doc by path or `#docid` |
-| `multi_get` | instant | Retrieve multiple docs |
-| `status` | instant | Index health |
-
-## CLI Fallback
-
-If MCP isn't configured, use the CLI:
+## CLI
 
 ```bash
-# Keyword search
-qmd search "your query" -n 10
-
-# Semantic search  
-qmd vsearch "your query"
-
-# Hybrid with re-ranking (auto-expands)
-qmd query "your query"
-
-# Retrieve document
-qmd get "#abc123" --full
+qmd search "keywords"           # BM25 keyword search
+qmd vsearch "question"          # Vector similarity
+qmd query "question"            # Auto-expand + rerank
+qmd query $'lex: X\nvec: Y'     # Structured (same as MCP)
+qmd get "#abc123"               # Retrieve by docid
 ```
 
-## Score Interpretation
+## Setup
 
-| Score | Meaning |
-|-------|---------|
-| 0.8+ | Highly relevant — show to user |
-| 0.5-0.8 | Moderately relevant — include if few results |
-| 0.2-0.5 | Weak match — only if user wants more |
-| <0.2 | Skip |
+```bash
+npm install -g @tobilu/qmd
+qmd collection add ~/notes --name notes
+qmd embed                       # Generate embeddings
+```
 
-## Workflow Example
-
-1. **Check collections**: `qmd status` or `status` tool
-2. **Search with structured_search**: Generate lex + vec + hyde queries
-3. **Review results**: Check scores and snippets
-4. **Retrieve full docs**: Use `get` with `#docid` from results
-5. **Iterate**: Refine queries based on what you find
+MCP config for Claude Code (`~/.claude/settings.json`):
+```json
+{ "mcpServers": { "qmd": { "command": "qmd", "args": ["mcp"] } } }
+```
