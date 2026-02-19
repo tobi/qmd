@@ -11,54 +11,87 @@ allowed-tools: Bash(qmd:*), mcp__qmd__*
 
 # QMD - Quick Markdown Search
 
-Local search engine for markdown content. Indexes notes, docs, and knowledge bases.
+Local search engine for markdown content.
 
 ## Status
 
 !`qmd status 2>/dev/null || echo "Not installed: npm install -g @tobilu/qmd"`
 
-## MCP Search — `structured_search`
-
-Pass 1-4 sub-queries with type `lex`, `vec`, or `hyde`:
+## MCP: `structured_search`
 
 ```json
 {
   "searches": [
     { "type": "lex", "query": "CAP theorem consistency" },
     { "type": "vec", "query": "tradeoff between consistency and availability" }
-  ]
+  ],
+  "collections": ["notes", "docs"],
+  "limit": 10
 }
 ```
 
-| Type | Method | What to Write |
-|------|--------|---------------|
-| `lex` | BM25 keywords | Short phrases — exact terms, names, code |
-| `vec` | Vector search | Natural language question |
-| `hyde` | Vector search | Hypothetical answer (50-100 words) |
+### Search Types
 
-**Tips:**
-- Quick lookup → single `lex` query
-- Don't know exact terms → use `vec`
-- Best results → combine `lex` + `vec` (+ `hyde` for complex topics)
-- First query gets 2x weight
+| Type | Method | Input |
+|------|--------|-------|
+| `lex` | BM25 | Keywords — exact terms, names, code |
+| `vec` | Vector | Question — natural language |
+| `hyde` | Vector | Answer — hypothetical result (50-100 words) |
 
-## MCP Tools
+### Writing Good Queries
+
+**lex (keyword)**
+- 2-5 terms, no filler words
+- Include synonyms: `"auth authentication login"`
+- Use exact names: `"PostgreSQL connection pool"`
+- Code identifiers work: `"handleError async"`
+
+**vec (semantic)**
+- Full natural language question
+- Be specific: `"how does the rate limiter handle burst traffic"` not `"rate limiting"`
+- Include context: `"in the payment service, how are refunds processed"`
+
+**hyde (hypothetical document)**
+- Write 50-100 words of what the *answer* looks like
+- Use the vocabulary you expect in the result
+- Example: `"The rate limiter uses a sliding window algorithm with a 60-second window. When a client exceeds 100 requests per minute, subsequent requests return 429 Too Many Requests until the window resets."`
+
+### Combining Types
+
+| Goal | Approach |
+|------|----------|
+| Know exact terms | `lex` only |
+| Don't know vocabulary | `vec` only |
+| Best recall | `lex` + `vec` |
+| Complex topic | `lex` + `vec` + `hyde` |
+
+First query gets 2x weight in fusion — put your best guess first.
+
+### Collection Filtering
+
+```json
+{ "collection": "docs" }           // Single collection
+{ "collections": ["docs", "notes"] }  // Multiple (OR)
+```
+
+Omit both to search all collections.
+
+## Other MCP Tools
 
 | Tool | Use |
 |------|-----|
-| `structured_search` | Search with lex/vec/hyde queries |
 | `get` | Retrieve doc by path or `#docid` |
-| `multi_get` | Retrieve multiple docs by glob/list |
-| `status` | Index health and collections |
+| `multi_get` | Retrieve multiple by glob/list |
+| `status` | Collections and health |
 
 ## CLI
 
 ```bash
-qmd search "keywords"           # BM25 keyword search
-qmd vsearch "question"          # Vector similarity
-qmd query "question"            # Auto-expand + rerank
-qmd query $'lex: X\nvec: Y'     # Structured (same as MCP)
-qmd get "#abc123"               # Retrieve by docid
+qmd query "question"              # Auto-expand + rerank
+qmd query $'lex: X\nvec: Y'       # Structured
+qmd search "keywords"             # BM25 only
+qmd vsearch "question"            # Vector only
+qmd get "#abc123"                 # By docid
 ```
 
 ## Setup
@@ -66,10 +99,5 @@ qmd get "#abc123"               # Retrieve by docid
 ```bash
 npm install -g @tobilu/qmd
 qmd collection add ~/notes --name notes
-qmd embed                       # Generate embeddings
-```
-
-MCP config for Claude Code (`~/.claude/settings.json`):
-```json
-{ "mcpServers": { "qmd": { "command": "qmd", "args": ["mcp"] } } }
+qmd embed
 ```

@@ -261,11 +261,11 @@ function createMcpServer(store: Store): McpServer {
         ),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-        intent: z.string().optional().describe("(Future) Domain intent hint, e.g., 'distributed systems', 'startup finances'"),
+        collection: z.string().optional().describe("Filter to a single collection by name"),
+        collections: z.array(z.string()).optional().describe("Filter to multiple collections (OR match)"),
       },
     },
-    async ({ searches, limit, minScore, collection, intent }) => {
+    async ({ searches, limit, minScore, collection, collections }) => {
       // Map to internal format
       const subSearches: StructuredSubSearch[] = searches.map(s => ({
         type: s.type,
@@ -274,9 +274,9 @@ function createMcpServer(store: Store): McpServer {
 
       const results = await structuredSearch(store, subSearches, {
         collection,
+        collections,
         limit,
         minScore,
-        intent,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -582,9 +582,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
         const results = await structuredSearch(store, subSearches, {
           collection: params.collection,
+          collections: params.collections,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
-          intent: params.intent,
         });
 
         // Use first lex or vec query for snippet extraction

@@ -3072,7 +3072,8 @@ export interface StructuredSubSearch {
 }
 
 export interface StructuredSearchOptions {
-  collection?: string;
+  collection?: string;      // Single collection filter
+  collections?: string[];   // Multiple collections filter (OR)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -3107,8 +3108,11 @@ export async function structuredSearch(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const collection = options?.collection;
   const hooks = options?.hooks;
+
+  // Normalize collection filter to array (undefined = all collections)
+  const collections: string[] | undefined = options?.collections
+    ?? (options?.collection ? [options.collection] : undefined);
 
   if (searches.length === 0) return [];
 
@@ -3118,16 +3122,21 @@ export async function structuredSearch(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
+  // Helper to run search across collections (or all if undefined)
+  const collectionList = collections ?? [undefined]; // undefined = all collections
+
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
-      const ftsResults = store.searchFTS(search.query, 20, collection);
-      if (ftsResults.length > 0) {
-        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(ftsResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
+      for (const coll of collectionList) {
+        const ftsResults = store.searchFTS(search.query, 20, coll);
+        if (ftsResults.length > 0) {
+          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(ftsResults.map(r => ({
+            file: r.filepath, displayPath: r.displayPath,
+            title: r.title, body: r.body || "", score: r.score,
+          })));
+        }
       }
     }
   }
@@ -3144,16 +3153,18 @@ export async function structuredSearch(
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
-        const vecResults = await store.searchVec(
-          vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, collection,
-          undefined, embedding
-        );
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
+        for (const coll of collectionList) {
+          const vecResults = await store.searchVec(
+            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            undefined, embedding
+          );
+          if (vecResults.length > 0) {
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+          }
         }
       }
     }
