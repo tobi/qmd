@@ -2,7 +2,7 @@
 name: qmd
 description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
 license: MIT
-compatibility: Requires qmd CLI or MCP server. Install via `bun install -g https://github.com/tobi/qmd`.
+compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
   version: "1.2.0"
@@ -22,11 +22,7 @@ QMD is a local, on-device search engine for markdown content. It indexes your no
 ### Install QMD
 
 ```bash
-# Install globally with bun
-bun install -g https://github.com/tobi/qmd
-
-# Or with npm
-npm install -g https://github.com/tobi/qmd
+npm install -g @tobilu/qmd
 ```
 
 ### Configure MCP Server
@@ -81,11 +77,15 @@ qmd status
 
 You provide 2-4 sub-searches, each with a type:
 
-| Type | Purpose | Example |
-|------|---------|---------|
-| `lex` | BM25 keywords — exact terms, names, identifiers | `"CAP theorem consistency"` |
-| `vec` | Semantic — natural language questions | `"what is the tradeoff between consistency and availability"` |
-| `hyde` | Hypothetical document — what the answer looks like | `"The CAP theorem states that distributed systems can only guarantee two of three properties..."` |
+| Type | Search Method | What to Write |
+|------|---------------|---------------|
+| `lex` | BM25 keyword | Short keyword phrases — exact terms, names, identifiers |
+| `vec` | Vector similarity | Natural language question — what you're asking |
+| `hyde` | Vector similarity | Hypothetical answer — what the result looks like (50-100 words) |
+
+Both `vec` and `hyde` use vector similarity search. The difference is input format:
+- **vec**: Write a *question* ("what is X?")
+- **hyde**: Write a *hypothetical answer* ("X is a concept that...")
 
 ### Example: Finding CAP Theorem Docs
 

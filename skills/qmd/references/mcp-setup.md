@@ -4,8 +4,7 @@
 
 1. **Install QMD**
    ```bash
-   bun install -g https://github.com/tobi/qmd
-   # or: npm install -g https://github.com/tobi/qmd
+   npm install -g @tobilu/qmd
    ```
 
 2. **Configure your client** (see below)
@@ -99,8 +98,10 @@ Execute pre-expanded search queries. **Use this** — you're a capable LLM that 
 
 **Search types:**
 - `lex` — BM25 keyword search. Short phrases, 2-5 terms.
-- `vec` — Semantic vector search. Natural language questions.
-- `hyde` — Hypothetical document. Write what the answer looks like (50-100 words).
+- `vec` — Vector similarity. Write a natural language *question*.
+- `hyde` — Vector similarity. Write a hypothetical *answer* (50-100 words).
+
+Both `vec` and `hyde` use vector search — the difference is what you write.
 
 ### search
 
@@ -175,5 +176,5 @@ Get index health and collection info. No parameters.
 - Subsequent searches are fast
 
 **structured_search not found**
-- Update QMD: `bun install -g https://github.com/tobi/qmd`
-- Requires v1.0.7+
+- Update QMD: `npm install -g @tobilu/qmd`
+- Requires v1.0.8+
