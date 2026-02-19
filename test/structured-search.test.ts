@@ -348,3 +348,104 @@ describe("lex query syntax", () => {
     });
   });
 });
+
+// =============================================================================
+// buildFTS5Query Tests (lex parser)
+// =============================================================================
+
+describe("buildFTS5Query (lex parser)", () => {
+  // Mirror the function for unit testing
+  function sanitizeFTS5Term(term: string): string {
+    return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+  }
+
+  function buildFTS5Query(query: string): string | null {
+    const positive: string[] = [];
+    const negative: string[] = [];
+    let i = 0;
+    const s = query.trim();
+
+    while (i < s.length) {
+      while (i < s.length && /\s/.test(s[i]!)) i++;
+      if (i >= s.length) break;
+      const negated = s[i] === '-';
+      if (negated) i++;
+
+      if (s[i] === '"') {
+        const start = i + 1; i++;
+        while (i < s.length && s[i] !== '"') i++;
+        const phrase = s.slice(start, i).trim();
+        i++;
+        if (phrase.length > 0) {
+          const sanitized = phrase.split(/\s+/).map((t: string) => sanitizeFTS5Term(t)).filter((t: string) => t).join(' ');
+          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
+        }
+      } else {
+        const start = i;
+        while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
+        const term = s.slice(start, i);
+        const sanitized = sanitizeFTS5Term(term);
+        if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
+      }
+    }
+
+    if (positive.length === 0 && negative.length === 0) return null;
+    if (positive.length === 0) return null;
+
+    let result = positive.join(' AND ');
+    for (const neg of negative) result = `${result} NOT ${neg}`;
+    return result;
+  }
+
+  test("plain terms → prefix match with AND", () => {
+    expect(buildFTS5Query("foo bar")).toBe('"foo"* AND "bar"*');
+  });
+
+  test("single term", () => {
+    expect(buildFTS5Query("performance")).toBe('"performance"*');
+  });
+
+  test("quoted phrase → exact match (no prefix)", () => {
+    expect(buildFTS5Query('"machine learning"')).toBe('"machine learning"');
+  });
+
+  test("quoted phrase with mixed case sanitized", () => {
+    expect(buildFTS5Query('"C++ performance"')).toBe('"c performance"');
+  });
+
+  test("negation of term", () => {
+    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
+  });
+
+  test("negation of phrase", () => {
+    expect(buildFTS5Query('performance -"sports athlete"')).toBe('"performance"* NOT "sports athlete"');
+  });
+
+  test("multiple negations", () => {
+    expect(buildFTS5Query("performance -sports -athlete")).toBe('"performance"* NOT "sports"* NOT "athlete"*');
+  });
+
+  test("quoted positive + negation", () => {
+    expect(buildFTS5Query('"machine learning" -sports -athlete')).toBe('"machine learning" NOT "sports"* NOT "athlete"*');
+  });
+
+  test("intent-aware C++ performance example", () => {
+    const result = buildFTS5Query('"C++ performance" optimization -sports -athlete');
+    expect(result).toContain('NOT "sports"*');
+    expect(result).toContain('NOT "athlete"*');
+    expect(result).toContain('"optimization"*');
+  });
+
+  test("only negations with no positives → null (can't search)", () => {
+    expect(buildFTS5Query("-sports -athlete")).toBeNull();
+  });
+
+  test("empty string → null", () => {
+    expect(buildFTS5Query("")).toBeNull();
+    expect(buildFTS5Query("   ")).toBeNull();
+  });
+
+  test("special chars in terms stripped", () => {
+    expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+  });
+});

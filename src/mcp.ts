@@ -230,29 +230,79 @@ function createMcpServer(store: Store): McpServer {
 
   const subSearchSchema = z.object({
     type: z.enum(['lex', 'vec', 'hyde', 'expand']).describe(
-      "Query type: 'lex' = BM25 keywords, 'vec' = semantic question, " +
-      "'hyde' = hypothetical answer, 'expand' = auto-expand via LLM (max 1)"
+      "lex = BM25 keywords (supports \"phrase\" and -negation), " +
+      "vec = semantic question, hyde = hypothetical answer passage, " +
+      "expand = auto-expand via LLM (max 1 per query)"
     ),
-    query: z.string().describe("The query text"),
+    query: z.string().describe(
+      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
+      "For vec: natural language question. For hyde: 50-100 word answer passage."
+    ),
   });
 
   server.registerTool(
     "query",
     {
       title: "Query",
-      description: `Search the knowledge base with typed sub-queries.
+      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
 
-**Query types:**
-- \`lex\`: BM25 keyword search. Supports "exact phrase" and -negation.
-- \`vec\`: Semantic vector search. Natural language questions.
-- \`hyde\`: Hypothetical document. Write what the answer looks like (50-100 words).
-- \`expand\`: Auto-expand via local LLM. Max one per query.
+## Query Types
 
-**Examples:**
-- Quick lookup: [{ type: "lex", query: "CAP theorem" }]
-- Semantic: [{ type: "vec", query: "consistency vs availability tradeoff" }]
-- Best results: [{ type: "lex", query: "CAP" }, { type: "vec", query: "distributed systems consistency" }]
-- Auto-expand: [{ type: "expand", query: "how does rate limiting work" }]`,
+**lex** — BM25 keyword search. Fast, exact, no LLM needed.
+Full lex syntax:
+- \`term\` — prefix match ("perf" matches "performance")
+- \`"exact phrase"\` — phrase must appear verbatim
+- \`-term\` or \`-"phrase"\` — exclude documents containing this
+
+Good lex examples:
+- \`"connection pool" timeout -redis\`
+- \`"machine learning" -sports -athlete\`
+- \`handleError async typescript\`
+
+**vec** — Semantic vector search. Write a natural language question. Finds documents by meaning, not exact words.
+- \`how does the rate limiter handle burst traffic?\`
+- \`what is the tradeoff between consistency and availability?\`
+
+**hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
+- \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
+
+**expand** — Auto-expand via local LLM. Generates lex+vec+hyde variations automatically. Max one per query. Useful when you don't know the exact terms.
+
+## Strategy
+
+Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
+
+| Goal | Approach |
+|------|----------|
+| Know exact term/name | \`lex\` only |
+| Concept search | \`vec\` only |
+| Best recall | \`lex\` + \`vec\` |
+| Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
+| Unknown vocabulary | \`expand\` |
+
+## Examples
+
+Simple lookup:
+\`\`\`json
+[{ "type": "lex", "query": "CAP theorem" }]
+\`\`\`
+
+Best recall on a technical topic:
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"connection pool\\" timeout -redis" },
+  { "type": "vec", "query": "why do database connections time out under load" },
+  { "type": "hyde", "query": "Connection pool exhaustion occurs when all connections are in use and new requests must wait. This typically happens under high concurrency when queries run longer than expected." }
+]
+\`\`\`
+
+Intent-aware lex (C++ performance, not sports):
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
+  { "type": "vec", "query": "how to optimize C++ program performance" }
+]
+\`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         searches: z.array(subSearchSchema).min(1).max(10).describe(
