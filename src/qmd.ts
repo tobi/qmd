@@ -1,9 +1,6 @@
-import { openDatabase } from "./db.js";
-import type { Database } from "./db.js";
-import fastGlob from "fast-glob";
-import { execSync, spawn as nodeSpawn } from "child_process";
-import { fileURLToPath } from "url";
-import { dirname, join as pathJoin } from "path";
+#!/usr/bin/env bun
+import { Database } from "bun:sqlite";
+import { Glob } from "bun";
 import { parseArgs } from "util";
 import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
@@ -69,15 +66,15 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
-} from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+} from "./store";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm";
 import {
   formatSearchResults,
   formatDocuments,
   escapeXml,
   escapeCSV,
   type OutputFormat,
-} from "./formatter.js";
+} from "./formatter";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -86,7 +83,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
-} from "./collections.js";
+} from "./collections";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -450,19 +447,15 @@ async function updateCollections(): Promise<void> {
     if (yamlCol?.update) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
-        const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
+        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
           cwd: col.pwd,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdout: "pipe",
+          stderr: "pipe",
         });
 
-        const [output, errorOutput, exitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
-          let out = "";
-          let err = "";
-          proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
-          proc.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
-          proc.on("error", reject);
-          proc.on("close", (code) => resolve([out, err, code ?? 1]));
-        });
+        const output = await new Response(proc.stdout).text();
+        const errorOutput = await new Response(proc.stderr).text();
+        const exitCode = await proc.exited;
 
         if (output.trim()) {
           console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
@@ -1425,18 +1418,20 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const allFiles: string[] = await fastGlob(globPattern, {
-    cwd: resolvedPwd,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: excludeDirs.map(d => `**/${d}/**`),
-  });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
-  const files = allFiles.filter(file => {
+  const glob = new Glob(globPattern);
+  const files: string[] = [];
+  for await (const file of glob.scan({ cwd: resolvedPwd, onlyFiles: true, followSymlinks: true })) {
+    // Skip node_modules, hidden folders (.*), and other common excludes
     const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
+    const shouldSkip = parts.some(part =>
+      part === "node_modules" ||
+      part.startsWith(".") ||
+      excludeDirs.includes(part)
+    );
+    if (!shouldSkip) {
+      files.push(file);
+    }
+  }
 
   const total = files.length;
   if (total === 0) {
@@ -2214,7 +2209,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
-    args: process.argv.slice(2), // Skip node and script path
+    args: Bun.argv.slice(2), // Skip bun and script path
     options: {
       // Global options
       index: {
@@ -2354,23 +2349,14 @@ function showHelp(): void {
 }
 
 async function showVersion(): Promise<void> {
-  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const scriptDir = import.meta.dir;
   const pkgPath = resolve(scriptDir, "..", "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-
-  let commit = "";
-  try {
-    commit = execSync(`git -C ${scriptDir} rev-parse --short HEAD`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch {
-    // Not a git repo or git not available
-  }
-
-  const versionStr = commit ? `${pkg.version} (${commit})` : pkg.version;
-  console.log(`qmd ${versionStr}`);
+  console.log(`qmd ${pkg.version}`);
 }
 
 // Main CLI - only run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts") || process.argv[1]?.endsWith("/qmd.js")) {
+if (import.meta.main) {
   const cli = parseCLI();
 
   if (cli.values.version) {
@@ -2652,16 +2638,14 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           mkdirSync(cacheDir, { recursive: true });
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const selfPath = fileURLToPath(import.meta.url);
-          const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
-          const child = nodeSpawn(process.execPath, spawnArgs, {
-            stdio: ["ignore", logFd, logFd],
-            detached: true,
+          const selfPath = import.meta.path;
+          const spawnArgs = ["bun", selfPath, "mcp", "--http", "--port", String(port)];
+          const child = Bun.spawn(spawnArgs, {
+            stdout: Bun.file(logPath),
+            stderr: Bun.file(logPath),
+            stdin: "ignore",
           });
           child.unref();
-          closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
           console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
