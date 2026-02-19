@@ -17,8 +17,9 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
+  getDefaultLLMProvider,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -1427,6 +1428,16 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (getDefaultLLMProvider() !== "local") {
+    // Remote providers do not expose tokenizer APIs; fall back to char chunking.
+    const approxChunks = chunkDocument(content, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS);
+    return approxChunks.map(chunk => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+    }));
+  }
+
   const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
@@ -2232,9 +2243,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const provider = getDefaultLLMProvider();
+  const options = provider === "local"
+    ? { model, isQuery }
+    : { isQuery };
   const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    ? await session.embed(formattedText, options)
+    : await getDefaultLLM().embed(formattedText, options);
   return result?.embedding || null;
 }
 
@@ -2288,8 +2303,9 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+  const provider = getDefaultLLMProvider();
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", { query, model, provider });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2299,8 +2315,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = getDefaultLLM();
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2321,6 +2336,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // =============================================================================
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+  const provider = getDefaultLLMProvider();
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
@@ -2328,7 +2344,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Cache key includes chunk text — different queries can select different chunks
   // from the same file, and the reranker score depends on which chunk was sent.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, provider, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey);
     if (cached !== null) {
       cachedResults.set(doc.file, parseFloat(cached));
@@ -2337,15 +2353,16 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents using configured LLM provider
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const llm = getDefaultLLM();
+    const rerankOptions = provider === "local" ? { model } : {};
+    const rerankResult = await llm.rerank(query, uncachedDocs, rerankOptions);
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
     const textByFile = new Map(documents.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, provider, chunk: textByFile.get(result.file) || "" });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(result.file, result.score);
     }

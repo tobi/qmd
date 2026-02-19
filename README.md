@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking. By default it runs locally via node-llama-cpp with GGUF models, with optional OpenRouter-backed inference.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -257,6 +257,37 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
+
+### OpenRouter Mode (Optional)
+
+QMD defaults to `local` inference. To use OpenRouter for embeddings, query expansion, and reranking:
+
+```sh
+export QMD_LLM_PROVIDER=openrouter
+export QMD_OPENROUTER_API_KEY="sk-or-..."
+```
+
+When OpenRouter mode is active, QMD prints a single remote-inference notice per process.
+
+You can also store the key in a file (default path):
+
+```sh
+mkdir -p ~/.config/qmd
+chmod 700 ~/.config/qmd
+printf '%s\n' 'sk-or-...' > ~/.config/qmd/openrouter.key
+chmod 600 ~/.config/qmd/openrouter.key
+export QMD_LLM_PROVIDER=openrouter
+```
+
+Supported key env vars:
+- `QMD_OPENROUTER_API_KEY` (preferred)
+- `OPENROUTER_API_KEY`
+- `QMD_OPENROUTER_API_KEY_FILE` (custom key file path)
+
+Optional model overrides:
+- `QMD_OPENROUTER_EMBED_MODEL`
+- `QMD_OPENROUTER_GENERATE_MODEL`
+- `QMD_OPENROUTER_RERANK_MODEL`
 
 ## Installation
 
