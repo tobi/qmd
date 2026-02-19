@@ -42,7 +42,6 @@ Local search engine for markdown content.
 
 **lex (keyword)**
 - 2-5 terms, no filler words
-- Include synonyms: `auth OR authentication`
 - Exact phrase: `"connection pool"` (quoted)
 - Exclude terms: `performance -sports` (minus prefix)
 - Code identifiers work: `handleError async`
@@ -75,9 +74,8 @@ First query gets 2x weight in fusion — put your best guess first.
 | `term` | Prefix match | `perf` matches "performance" |
 | `"phrase"` | Exact phrase | `"rate limiter"` |
 | `-term` | Exclude | `performance -sports` |
-| `OR` | Either term | `auth OR authentication` |
 
-Note: `-term` and `OR` only work in lex queries, not vec/hyde.
+Note: `-term` only works in lex queries, not vec/hyde.
 
 ### Collection Filtering
 

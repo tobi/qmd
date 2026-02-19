@@ -340,9 +340,6 @@ describe("lex query syntax", () => {
       expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
     });
 
-    test("rejects OR operator", () => {
-      expect(validateSemanticQuery("auth OR authentication")).toContain("OR");
-    });
 
     test("accepts hyde-style hypothetical answers", () => {
       expect(validateSemanticQuery(
