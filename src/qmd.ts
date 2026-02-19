@@ -2136,18 +2136,18 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         hooks: {
           onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}\n`);
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
           },
           onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
           onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
             progress.indeterminate();
           },
           onRerankDone: (ms) => {
             progress.clear();
-            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
       });
@@ -2162,25 +2162,26 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
           },
           onExpandStart: () => {
-            process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
+            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
           },
           onExpand: (original, expanded, ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
             logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}  (${formatMs(ms)}) → searching ${expanded.length + 1} queries${c.reset}\n`);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
           },
           onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}\n`);
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
           },
           onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
           onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
             progress.indeterminate();
           },
           onRerankDone: (ms) => {
             progress.clear();
-            process.stderr.write(`${c.dim}  (${formatMs(ms)})${c.reset}\n`);
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
       });
