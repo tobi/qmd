@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- CLI: return format-safe empty outputs for `search`, `vsearch`, and `query`
+  when no results are found (or when `--min-score` filters all results):
+  `[]` for `--json`, CSV header-only for `--csv`, `<results></results>` for
+  `--xml`, and empty output for `--md`/`--files`. #183
+
 ## [1.0.8] - 2026-02-19
 
 QMD now speaks in **query documents** — structured multi-line queries where each line is typed (`lex:`, `vec:`, `hyde:`, `expand:`), combining keyword precision with semantic recall. A single plain query still works exactly as before. AI agents using the MCP tool get significantly richer search capability: lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical.
@@ -358,4 +365,3 @@ notes, journals, and meeting transcripts.
 [Unreleased]: https://github.com/tobi/qmd/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/tobi/qmd/releases/tag/v1.0.0
 [0.9.0]: https://github.com/tobi/qmd/compare/v0.8.0...v0.9.0
-
