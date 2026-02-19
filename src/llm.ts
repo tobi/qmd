@@ -190,7 +190,11 @@ export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
 // Local model cache directory
-const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
+// Respect XDG_CACHE_HOME per XDG Base Directory Specification
+const xdgCacheHome = process.env.XDG_CACHE_HOME;
+const MODEL_CACHE_DIR = xdgCacheHome
+  ? join(xdgCacheHome, "qmd", "models")
+  : join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
 
 export type PullResult = {
