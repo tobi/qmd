@@ -560,8 +560,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       // REST endpoint: POST /search — structured search without MCP protocol
-      // REST endpoint: POST /query — structured search without MCP protocol
-      if (pathname === "/query" && nodeReq.method === "POST") {
+      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
+      if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
         const params = JSON.parse(rawBody);
         
