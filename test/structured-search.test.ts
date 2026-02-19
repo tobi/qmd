@@ -318,3 +318,36 @@ describe("structuredSearch", () => {
     }
   });
 });
+
+// =============================================================================
+// FTS Query Syntax Tests
+// =============================================================================
+
+describe("lex query syntax", () => {
+  // Note: These test via CLI behavior since buildFTS5Query is not exported
+
+  describe("validateSemanticQuery", () => {
+    // Import the validation function
+    const { validateSemanticQuery } = require("../src/store.js");
+
+    test("accepts plain natural language", () => {
+      expect(validateSemanticQuery("how does error handling work")).toBeNull();
+      expect(validateSemanticQuery("what is the CAP theorem")).toBeNull();
+    });
+
+    test("rejects negation syntax", () => {
+      expect(validateSemanticQuery("performance -sports")).toContain("Negation");
+      expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
+    });
+
+    test("rejects OR operator", () => {
+      expect(validateSemanticQuery("auth OR authentication")).toContain("OR");
+    });
+
+    test("accepts hyde-style hypothetical answers", () => {
+      expect(validateSemanticQuery(
+        "The CAP theorem states that a distributed system cannot simultaneously provide consistency, availability, and partition tolerance."
+      )).toBeNull();
+    });
+  });
+});

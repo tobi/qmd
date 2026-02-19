@@ -42,9 +42,10 @@ Local search engine for markdown content.
 
 **lex (keyword)**
 - 2-5 terms, no filler words
-- Include synonyms: `"auth authentication login"`
-- Use exact names: `"PostgreSQL connection pool"`
-- Code identifiers work: `"handleError async"`
+- Include synonyms: `auth OR authentication`
+- Exact phrase: `"connection pool"` (quoted)
+- Exclude terms: `performance -sports` (minus prefix)
+- Code identifiers work: `handleError async`
 
 **vec (semantic)**
 - Full natural language question
@@ -66,6 +67,17 @@ Local search engine for markdown content.
 | Complex topic | `lex` + `vec` + `hyde` |
 
 First query gets 2x weight in fusion — put your best guess first.
+
+### Lex Query Syntax
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `term` | Prefix match | `perf` matches "performance" |
+| `"phrase"` | Exact phrase | `"rate limiter"` |
+| `-term` | Exclude | `performance -sports` |
+| `OR` | Either term | `auth OR authentication` |
+
+Note: `-term` and `OR` only work in lex queries, not vec/hyde.
 
 ### Collection Filtering
 

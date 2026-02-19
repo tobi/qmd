@@ -1987,13 +1987,140 @@ function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
 }
 
+/**
+ * Parse lex query syntax into FTS5 query.
+ *
+ * Supports:
+ * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
+ * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - OR: term1 OR term2 (case-insensitive)
+ * - Plain terms: term → "term"* (prefix match)
+ *
+ * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
+ * So `-term` only works when there are also positive terms.
+ *
+ * Examples:
+ *   performance -sports     → "performance"* NOT "sports"*
+ *   "machine learning"      → "machine learning"
+ *   auth OR authentication  → ("auth"* OR "authentication"*)
+ */
 function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t.length > 0);
-  if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  const positive: string[] = [];
+  const negative: string[] = [];
+  const orGroups: string[][] = [[]]; // Track OR groupings
+  let currentOrGroup = 0;
+
+  let i = 0;
+  const s = query.trim();
+
+  while (i < s.length) {
+    // Skip whitespace
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    if (i >= s.length) break;
+
+    // Check for negation prefix
+    const negated = s[i] === '-';
+    if (negated) i++;
+
+    // Check for quoted phrase
+    if (s[i] === '"') {
+      const start = i + 1;
+      i++;
+      while (i < s.length && s[i] !== '"') i++;
+      const phrase = s.slice(start, i).trim();
+      i++; // skip closing quote
+      if (phrase.length > 0) {
+        const sanitized = phrase.split(/\s+/).map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+            orGroups[currentOrGroup]!.push(ftsPhrase);
+          }
+        }
+      }
+    } else {
+      // Plain term (until whitespace or quote)
+      const start = i;
+      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
+      const term = s.slice(start, i);
+
+      // Check for OR operator
+      if (term.toUpperCase() === 'OR') {
+        // Start new OR group
+        currentOrGroup++;
+        orGroups.push([]);
+      } else if (term.toUpperCase() === 'AND' || term.toUpperCase() === 'NOT') {
+        // AND is implicit, NOT should use - prefix
+        continue;
+      } else {
+        const sanitized = sanitizeFTS5Term(term);
+        if (sanitized) {
+          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          if (negated) {
+            negative.push(ftsTerm);
+          } else {
+            positive.push(ftsTerm);
+            orGroups[currentOrGroup]!.push(ftsTerm);
+          }
+        }
+      }
+    }
+  }
+
+  if (positive.length === 0 && negative.length === 0) return null;
+
+  // If only negative terms, we can't search (FTS5 NOT is binary)
+  if (positive.length === 0) {
+    // Fall back to searching without negation
+    return null;
+  }
+
+  // Build the positive part with OR groups
+  let result: string;
+  if (orGroups.length > 1 && orGroups.some(g => g.length > 0)) {
+    // Has OR groups - build (a OR b) AND c structure
+    const orParts = orGroups.filter(g => g.length > 0).map(g =>
+      g.length === 1 ? g[0]! : `(${g.join(' OR ')})`
+    );
+    result = orParts.join(' AND ');
+  } else {
+    // Simple AND of all positive terms
+    result = positive.join(' AND ');
+  }
+
+  // Add NOT clause for negative terms (FTS5: positive NOT negative)
+  if (negative.length > 0) {
+    // FTS5 NOT only works with single term on right side, chain them
+    for (const neg of negative) {
+      result = `${result} NOT ${neg}`;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Validate that a vec/hyde query doesn't use lex-only syntax.
+ * Returns error message if invalid, null if valid.
+ */
+export function validateSemanticQuery(query: string): string | null {
+  // Check for negation syntax
+  if (/-\w/.test(query) || /-"/.test(query)) {
+    return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
+  }
+  // Check for quoted exact phrases (semantic search doesn't do exact matching)
+  if (/"[^"]+"\s*$/.test(query.trim()) || /^"[^"]+"/.test(query.trim())) {
+    // Single quoted phrase is the whole query - that's fine for hyde
+    // But warn if it looks like they expect exact matching
+  }
+  // Check for OR operator (semantic search doesn't support boolean logic)
+  if (/\bOR\b/i.test(query)) {
+    return 'OR operator is not supported in vec/hyde queries. Use multiple lex queries or rephrase.';
+  }
+  return null;
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
@@ -3115,6 +3242,16 @@ export async function structuredSearch(
     ?? (options?.collection ? [options.collection] : undefined);
 
   if (searches.length === 0) return [];
+
+  // Validate semantic queries don't use lex-only syntax
+  for (const search of searches) {
+    if (search.type === 'vec' || search.type === 'hyde') {
+      const error = validateSemanticQuery(search.query);
+      if (error) {
+        throw new Error(`Invalid ${search.type} query: ${error}`);
+      }
+    }
+  }
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
