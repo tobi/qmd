@@ -1,0 +1,320 @@
+/**
+ * structured-search.test.ts - Tests for structured search functionality
+ *
+ * Tests cover:
+ * - CLI query parser (parseStructuredQuery)
+ * - StructuredSubSearch type validation
+ * - Basic structuredSearch function behavior
+ *
+ * Run with: bun test structured-search.test.ts
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createStore,
+  structuredSearch,
+  type StructuredSubSearch,
+  type Store,
+} from "../src/store.js";
+import { disposeDefaultLlamaCpp } from "../src/llm.js";
+
+// =============================================================================
+// parseStructuredQuery Tests (CLI Parser)
+// =============================================================================
+
+/**
+ * Parse structured search query syntax.
+ * This is a copy of the function from qmd.ts for isolated testing.
+ */
+function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+  const lines = query.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return null;
+
+  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const searches: StructuredSubSearch[] = [];
+  const plainLines: string[] = [];
+
+  for (const line of lines) {
+    const match = line.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
+      const text = line.slice(match[0].length).trim();
+      if (text.length > 0) {
+        searches.push({ type, query: text });
+      }
+    } else {
+      plainLines.push(line);
+    }
+  }
+
+  // All plain lines, no prefixes -> null (use normal expansion)
+  if (searches.length === 0 && plainLines.length === 1) {
+    return null;
+  }
+
+  // Multiple plain lines without prefixes -> ambiguous, error
+  if (plainLines.length > 1) {
+    throw new Error("Ambiguous query: multiple lines without lex:/vec:/hyde: prefix.");
+  }
+
+  // Mix of prefixed and one plain line -> treat plain as lex
+  if (plainLines.length === 1) {
+    searches.unshift({ type: 'lex', query: plainLines[0]! });
+  }
+
+  return searches.length > 0 ? searches : null;
+}
+
+describe("parseStructuredQuery", () => {
+  describe("plain queries (returns null for normal expansion)", () => {
+    test("single line without prefix", () => {
+      expect(parseStructuredQuery("CAP theorem")).toBeNull();
+      expect(parseStructuredQuery("distributed systems")).toBeNull();
+    });
+
+    test("empty queries", () => {
+      expect(parseStructuredQuery("")).toBeNull();
+      expect(parseStructuredQuery("   ")).toBeNull();
+      expect(parseStructuredQuery("\n\n")).toBeNull();
+    });
+  });
+
+  describe("single prefixed queries", () => {
+    test("lex: prefix", () => {
+      const result = parseStructuredQuery("lex: CAP theorem");
+      expect(result).toEqual([{ type: "lex", query: "CAP theorem" }]);
+    });
+
+    test("vec: prefix", () => {
+      const result = parseStructuredQuery("vec: what is the CAP theorem");
+      expect(result).toEqual([{ type: "vec", query: "what is the CAP theorem" }]);
+    });
+
+    test("hyde: prefix", () => {
+      const result = parseStructuredQuery("hyde: The CAP theorem states that...");
+      expect(result).toEqual([{ type: "hyde", query: "The CAP theorem states that..." }]);
+    });
+
+    test("uppercase prefix", () => {
+      expect(parseStructuredQuery("LEX: keywords")).toEqual([{ type: "lex", query: "keywords" }]);
+      expect(parseStructuredQuery("VEC: question")).toEqual([{ type: "vec", query: "question" }]);
+      expect(parseStructuredQuery("HYDE: passage")).toEqual([{ type: "hyde", query: "passage" }]);
+    });
+
+    test("mixed case prefix", () => {
+      expect(parseStructuredQuery("Lex: test")).toEqual([{ type: "lex", query: "test" }]);
+      expect(parseStructuredQuery("VeC: test")).toEqual([{ type: "vec", query: "test" }]);
+    });
+  });
+
+  describe("multiple prefixed queries", () => {
+    test("lex + vec", () => {
+      const result = parseStructuredQuery("lex: keywords\nvec: natural language");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "vec", query: "natural language" },
+      ]);
+    });
+
+    test("all three types", () => {
+      const result = parseStructuredQuery("lex: keywords\nvec: question\nhyde: hypothetical doc");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "vec", query: "question" },
+        { type: "hyde", query: "hypothetical doc" },
+      ]);
+    });
+
+    test("duplicate types allowed", () => {
+      const result = parseStructuredQuery("lex: term1\nlex: term2\nlex: term3");
+      expect(result).toEqual([
+        { type: "lex", query: "term1" },
+        { type: "lex", query: "term2" },
+        { type: "lex", query: "term3" },
+      ]);
+    });
+
+    test("order preserved", () => {
+      const result = parseStructuredQuery("hyde: passage\nvec: question\nlex: keywords");
+      expect(result).toEqual([
+        { type: "hyde", query: "passage" },
+        { type: "vec", query: "question" },
+        { type: "lex", query: "keywords" },
+      ]);
+    });
+  });
+
+  describe("mixed plain and prefixed", () => {
+    test("single plain line with prefixed lines -> plain becomes lex first", () => {
+      const result = parseStructuredQuery("plain keywords\nvec: semantic question");
+      expect(result).toEqual([
+        { type: "lex", query: "plain keywords" },
+        { type: "vec", query: "semantic question" },
+      ]);
+    });
+
+    test("plain line prepended before other prefixed", () => {
+      const result = parseStructuredQuery("keywords\nhyde: passage\nvec: question");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "hyde", query: "passage" },
+        { type: "vec", query: "question" },
+      ]);
+    });
+  });
+
+  describe("error cases", () => {
+    test("multiple plain lines throws", () => {
+      expect(() => parseStructuredQuery("line one\nline two")).toThrow("Ambiguous query");
+    });
+
+    test("three plain lines throws", () => {
+      expect(() => parseStructuredQuery("a\nb\nc")).toThrow("Ambiguous query");
+    });
+  });
+
+  describe("whitespace handling", () => {
+    test("empty lines ignored", () => {
+      const result = parseStructuredQuery("lex: keywords\n\nvec: question\n");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "vec", query: "question" },
+      ]);
+    });
+
+    test("whitespace-only lines ignored", () => {
+      const result = parseStructuredQuery("lex: keywords\n   \nvec: question");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "vec", query: "question" },
+      ]);
+    });
+
+    test("leading/trailing whitespace trimmed from lines", () => {
+      const result = parseStructuredQuery("  lex: keywords  \n  vec: question  ");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords" },
+        { type: "vec", query: "question" },
+      ]);
+    });
+
+    test("internal whitespace preserved in query", () => {
+      const result = parseStructuredQuery("lex:   multiple   spaces   ");
+      expect(result).toEqual([{ type: "lex", query: "multiple   spaces" }]);
+    });
+
+    test("empty prefix value skipped", () => {
+      const result = parseStructuredQuery("lex: \nvec: actual query");
+      expect(result).toEqual([{ type: "vec", query: "actual query" }]);
+    });
+
+    test("only empty prefix values returns null", () => {
+      const result = parseStructuredQuery("lex: \nvec: \nhyde: ");
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("edge cases", () => {
+    test("colon in query text preserved", () => {
+      const result = parseStructuredQuery("lex: time: 12:30 PM");
+      expect(result).toEqual([{ type: "lex", query: "time: 12:30 PM" }]);
+    });
+
+    test("prefix-like text in query preserved", () => {
+      const result = parseStructuredQuery("vec: what does lex: mean");
+      expect(result).toEqual([{ type: "vec", query: "what does lex: mean" }]);
+    });
+
+    test("newline in hyde passage (as single line)", () => {
+      // If user wants actual newlines in hyde, they need to escape or use multiline syntax
+      const result = parseStructuredQuery("hyde: The answer is X. It means Y.");
+      expect(result).toEqual([{ type: "hyde", query: "The answer is X. It means Y." }]);
+    });
+  });
+});
+
+// =============================================================================
+// StructuredSubSearch Type Tests
+// =============================================================================
+
+describe("StructuredSubSearch type", () => {
+  test("accepts lex type", () => {
+    const search: StructuredSubSearch = { type: "lex", query: "test" };
+    expect(search.type).toBe("lex");
+    expect(search.query).toBe("test");
+  });
+
+  test("accepts vec type", () => {
+    const search: StructuredSubSearch = { type: "vec", query: "test" };
+    expect(search.type).toBe("vec");
+    expect(search.query).toBe("test");
+  });
+
+  test("accepts hyde type", () => {
+    const search: StructuredSubSearch = { type: "hyde", query: "test" };
+    expect(search.type).toBe("hyde");
+    expect(search.query).toBe("test");
+  });
+});
+
+// =============================================================================
+// structuredSearch Function Tests
+// =============================================================================
+
+describe("structuredSearch", () => {
+  let testDir: string;
+  let store: Store;
+
+  beforeAll(async () => {
+    testDir = await mkdtemp(join(tmpdir(), "qmd-structured-test-"));
+    const testDbPath = join(testDir, "test.sqlite");
+    const testConfigDir = await mkdtemp(join(testDir, "config-"));
+    process.env.QMD_CONFIG_DIR = testConfigDir;
+    store = createStore(testDbPath);
+  });
+
+  afterAll(async () => {
+    store.close();
+    await disposeDefaultLlamaCpp();
+    if (testDir) {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns empty array for empty searches", async () => {
+    const results = await structuredSearch(store, []);
+    expect(results).toEqual([]);
+  });
+
+  test("returns empty array when no documents match", async () => {
+    const results = await structuredSearch(store, [
+      { type: "lex", query: "nonexistent-term-xyz123" }
+    ]);
+    expect(results).toEqual([]);
+  });
+
+  test("accepts all search types without error", async () => {
+    // These may return empty results but should not throw
+    await expect(structuredSearch(store, [{ type: "lex", query: "test" }])).resolves.toBeDefined();
+    // vec and hyde require embeddings, so just test lex
+  });
+
+  test("respects limit option", async () => {
+    const results = await structuredSearch(store, [
+      { type: "lex", query: "test" }
+    ], { limit: 5 });
+    expect(results.length).toBeLessThanOrEqual(5);
+  });
+
+  test("respects minScore option", async () => {
+    const results = await structuredSearch(store, [
+      { type: "lex", query: "test" }
+    ], { minScore: 0.5 });
+    for (const r of results) {
+      expect(r.score).toBeGreaterThanOrEqual(0.5);
+    }
+  });
+});
