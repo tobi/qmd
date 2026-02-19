@@ -82,11 +82,11 @@ Note: `-term` and `OR` only work in lex queries, not vec/hyde.
 ### Collection Filtering
 
 ```json
-{ "collection": "docs" }           // Single collection
-{ "collections": ["docs", "notes"] }  // Multiple (OR)
+{ "collections": ["docs"] }              // Single
+{ "collections": ["docs", "notes"] }     // Multiple (OR)
 ```
 
-Omit both to search all collections.
+Omit to search all collections.
 
 ## Other MCP Tools
 

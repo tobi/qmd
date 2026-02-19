@@ -2135,7 +2135,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collection: singleCollection,
+        collections: singleCollection ? [singleCollection] : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {

@@ -261,11 +261,10 @@ function createMcpServer(store: Store): McpServer {
         ),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a single collection by name"),
-        collections: z.array(z.string()).optional().describe("Filter to multiple collections (OR match)"),
+        collections: z.array(z.string()).optional().describe("Filter to specific collections (OR match)"),
       },
     },
-    async ({ searches, limit, minScore, collection, collections }) => {
+    async ({ searches, limit, minScore, collections }) => {
       // Map to internal format
       const subSearches: StructuredSubSearch[] = searches.map(s => ({
         type: s.type,
@@ -273,7 +272,6 @@ function createMcpServer(store: Store): McpServer {
       }));
 
       const results = await structuredSearch(store, subSearches, {
-        collection,
         collections,
         limit,
         minScore,
@@ -581,7 +579,6 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         }));
 
         const results = await structuredSearch(store, subSearches, {
-          collection: params.collection,
           collections: params.collections,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
