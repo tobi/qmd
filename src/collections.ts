@@ -75,16 +75,7 @@ let currentIndexName: string = "index";
  * Config file will be ~/.config/qmd/{indexName}.yml
  */
 export function setConfigIndexName(name: string): void {
-  // Resolve relative paths to absolute paths and sanitize for use as filename
-  if (name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
-  } else {
-    currentIndexName = name;
-  }
+  currentIndexName = name;
 }
 
 function getConfigDir(): string {
