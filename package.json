@@ -1,47 +1,25 @@
 {
-  "name": "@tobilu/qmd",
-  "version": "1.0.7",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "name": "qmd",
+  "version": "1.0.7-rui.1",
+  "description": "Query Markup Documents - On-device hybrid search for markdown files",
   "type": "module",
   "bin": {
-    "qmd": "qmd"
+    "qmd": "./qmd"
   },
-  "files": [
-    "dist/",
-    "qmd",
-    "LICENSE",
-    "CHANGELOG.md"
-  ],
   "scripts": {
-    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run --reporter=verbose test/",
-    "qmd": "tsx src/qmd.ts",
-    "index": "tsx src/qmd.ts index",
-    "vector": "tsx src/qmd.ts vector",
-    "search": "tsx src/qmd.ts search",
-    "vsearch": "tsx src/qmd.ts vsearch",
-    "rerank": "tsx src/qmd.ts rerank",
-    "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
-    "release": "./scripts/release.sh"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
-  },
-  "homepage": "https://github.com/tobi/qmd#readme",
-  "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "test": "bun test",
+    "qmd": "bun src/qmd.ts",
+    "index": "bun src/qmd.ts index",
+    "vector": "bun src/qmd.ts vector",
+    "search": "bun src/qmd.ts search",
+    "vsearch": "bun src/qmd.ts vsearch",
+    "rerank": "bun src/qmd.ts rerank",
+    "link": "bun link",
+    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
-    "better-sqlite3": "^11.0.0",
-    "fast-glob": "^3.3.0",
     "node-llama-cpp": "^3.14.5",
-    "picomatch": "^4.0.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
     "zod": "^4.2.1"
@@ -53,15 +31,13 @@
     "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
-    "tsx": "^4.0.0",
-    "vitest": "^3.0.0"
+    "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "bun": ">=1.0.0"
   },
   "keywords": [
     "markdown",
@@ -80,6 +56,5 @@
     "local-ai",
     "llm"
   ],
-  "author": "Tobi Lutke <tobi@lutke.com>",
   "license": "MIT"
 }

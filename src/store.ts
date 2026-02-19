@@ -11,11 +11,10 @@
  *   const store = createStore();
  */
 
-import { openDatabase, loadSqliteVec } from "./db.js";
-import type { Database } from "./db.js";
-import picomatch from "picomatch";
-import { createHash } from "crypto";
+import { Database } from "bun:sqlite";
+import { Glob } from "bun";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
+import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -23,7 +22,7 @@ import {
   formatDocForEmbedding,
   type RerankDocument,
   type ILLMSession,
-} from "./llm.js";
+} from "./llm";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -37,13 +36,13 @@ import {
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
-} from "./collections.js";
+} from "./collections";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || "/tmp";
+const HOME = Bun.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
@@ -620,12 +619,48 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
+/**
+ * On macOS, Bun's built-in SQLite may not support dynamic extension loading.
+ * Point it at a Homebrew-provided libsqlite3 that does.
+ */
+function setSQLiteFromBrewPrefixEnv(): void {
+  const candidates: string[] = [];
+
+  if (process.platform === "darwin") {
+    const brewPrefix = Bun.env.BREW_PREFIX || Bun.env.HOMEBREW_PREFIX;
+    if (brewPrefix) {
+      candidates.push(`${brewPrefix}/opt/sqlite/lib/libsqlite3.dylib`);
+      candidates.push(`${brewPrefix}/lib/libsqlite3.dylib`);
+    } else {
+      candidates.push("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib");
+      candidates.push("/usr/local/opt/sqlite/lib/libsqlite3.dylib");
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).size > 0) {
+        Database.setCustomSQLite(candidate);
+        return;
+      }
+    } catch { }
+  }
+}
+
+setSQLiteFromBrewPrefixEnv();
+
 function initializeDatabase(db: Database): void {
   try {
-    loadSqliteVec(db);
-    verifySqliteVecLoaded(db);
+    sqliteVec.load(db);
     _sqliteVecAvailable = true;
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
+      throw new Error(
+        "SQLite build does not support dynamic extension loading. " +
+        "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
+        "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
+      );
+    }
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
   }
@@ -846,7 +881,7 @@ export type Store = {
  */
 export function createStore(dbPath?: string): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
-  const db = openDatabase(resolvedPath);
+  const db = new Database(resolvedPath);
   initializeDatabase(db);
 
   return {
@@ -1102,7 +1137,7 @@ export function getIndexHealth(db: Database): IndexHealthInfo {
 // =============================================================================
 
 export function getCacheKey(url: string, body: object): string {
-  const hash = createHash("sha256");
+  const hash = new Bun.CryptoHasher("sha256");
   hash.update(url);
   hash.update(JSON.stringify(body));
   return hash.digest("hex");
@@ -1218,7 +1253,7 @@ export function vacuumDatabase(db: Database): void {
 // =============================================================================
 
 export async function hashContent(content: string): Promise<string> {
-  const hash = createHash("sha256");
+  const hash = new Bun.CryptoHasher("sha256");
   hash.update(content);
   return hash.digest("hex");
 }
@@ -1576,9 +1611,9 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     WHERE d.active = 1
   `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
 
-  const isMatch = picomatch(pattern);
+  const glob = new Glob(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
+    .filter(f => glob.match(f.virtual_path) || glob.match(f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display

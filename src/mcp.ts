@@ -21,10 +21,10 @@ import {
   addLineNumbers,
   structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
-} from "./store.js";
-import type { Store, StructuredSubSearch } from "./store.js";
-import { getCollection, getGlobalContext } from "./collections.js";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+} from "./store";
+import type { Store, StructuredSubSearch } from "./store";
+import { getCollection, getGlobalContext } from "./collections";
+import { disposeDefaultLlamaCpp } from "./llm";
 
 // =============================================================================
 // Types for structured content
