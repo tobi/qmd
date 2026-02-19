@@ -21,9 +21,10 @@ import {
   addLineNumbers,
   hybridQuery,
   vectorSearchQuery,
+  structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { Store } from "./store.js";
+import type { Store, StructuredSubSearch } from "./store.js";
 import { getCollection, getGlobalContext } from "./collections.js";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 
@@ -123,9 +124,15 @@ function buildInstructions(store: Store): string {
   // Tool schemas describe parameters; instructions describe strategy.
   lines.push("");
   lines.push("Search:");
-  lines.push("  - `search` (~30ms) — keyword and exact phrase matching.");
-  lines.push("  - `vector_search` (~2s) — meaning-based, finds adjacent concepts even when vocabulary differs.");
-  lines.push("  - `deep_search` (~10s) — auto-expands the query into variations, searches each by keyword and meaning, reranks for top hits.");
+  lines.push("  - `search` (~30ms) — BM25 keyword matching. Fast, exact terms.");
+  lines.push("  - `vector_search` (~2s) — semantic search. Finds synonyms and related concepts.");
+  lines.push("  - `deep_search` (~10s) — auto-expands query + reranks. Use when you don't know the exact terms.");
+  lines.push("  - `structured_search` (~5s) — YOU provide the query variations. Best for complex/nuanced queries.");
+  lines.push("");
+  lines.push("For structured_search, pass 2-4 sub-searches:");
+  lines.push("  - type:'lex' for keyword phrases (BM25)");
+  lines.push("  - type:'vec' for semantic questions");
+  lines.push("  - type:'hyde' for hypothetical answer snippets");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -345,6 +352,85 @@ function createMcpServer(store: Store): McpServer {
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        structuredContent: { results: filtered },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: qmd_structured_search (Pre-expanded queries from LLM)
+  // ---------------------------------------------------------------------------
+
+  const subSearchSchema = z.object({
+    type: z.enum(['lex', 'vec', 'hyde']).describe(
+      "Search type: 'lex' = BM25 keyword search (exact terms, fast), " +
+      "'vec' = semantic vector search (meaning-based, finds synonyms/paraphrases), " +
+      "'hyde' = hypothetical document (imagine what the answer looks like)"
+    ),
+    query: z.string().describe("The search query text"),
+  });
+
+  server.registerTool(
+    "structured_search",
+    {
+      title: "Structured Search",
+      description: `Execute pre-expanded search queries. Skips internal query expansion — you provide the search variations directly.
+
+**When to use:** You're an LLM that can generate better query expansions than a small local model. Pass 2-4 sub-searches for best results.
+
+**Search types:**
+- \`lex\`: BM25 keyword search. Use short keyword phrases (2-5 terms). Good for exact terms, names, code identifiers.
+- \`vec\`: Semantic vector search. Use natural language questions or descriptions. Finds documents with similar meaning even when vocabulary differs.
+- \`hyde\`: Hypothetical document. Write a short passage (~50-100 words) that looks like what you're searching for. Powerful for finding conceptually similar content.
+
+**Example:** To find CAP theorem docs, pass:
+- { type: "lex", query: "CAP theorem consistency availability" }
+- { type: "vec", query: "what is the tradeoff between data consistency and system availability in distributed systems" }
+- { type: "hyde", query: "The CAP theorem states that a distributed system can only guarantee two of three properties: Consistency, Availability, and Partition tolerance." }`,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        searches: z.array(subSearchSchema).min(1).max(10).describe(
+          "Array of sub-searches to execute. Order matters — first search gets higher weight in fusion."
+        ),
+        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
+        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
+        collection: z.string().optional().describe("Filter to a specific collection by name"),
+        intent: z.string().optional().describe("(Future) Domain intent hint, e.g., 'distributed systems', 'startup finances'"),
+      },
+    },
+    async ({ searches, limit, minScore, collection, intent }) => {
+      // Map to internal format
+      const subSearches: StructuredSubSearch[] = searches.map(s => ({
+        type: s.type,
+        query: s.query,
+      }));
+
+      const results = await structuredSearch(store, subSearches, {
+        collection,
+        limit,
+        minScore,
+        intent,
+      });
+
+      // Use first lex or vec query for snippet extraction
+      const primaryQuery = searches.find(s => s.type === 'lex')?.query
+        || searches.find(s => s.type === 'vec')?.query
+        || searches[0]?.query || "";
+
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+        return {
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          snippet: addLineNumbers(snippet, line),
+        };
+      });
+
+      return {
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
         structuredContent: { results: filtered },
       };
     }
@@ -606,6 +692,54 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: POST /search — structured search without MCP protocol
+      if (pathname === "/search" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const params = JSON.parse(rawBody);
+        
+        // Validate required fields
+        if (!params.searches || !Array.isArray(params.searches)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          return;
+        }
+
+        // Map to internal format
+        const subSearches: StructuredSubSearch[] = params.searches.map((s: any) => ({
+          type: s.type as 'lex' | 'vec' | 'hyde',
+          query: String(s.query || ""),
+        }));
+
+        const results = await structuredSearch(store, subSearches, {
+          collection: params.collection,
+          limit: params.limit ?? 10,
+          minScore: params.minScore ?? 0,
+          intent: params.intent,
+        });
+
+        // Use first lex or vec query for snippet extraction
+        const primaryQuery = params.searches.find((s: any) => s.type === 'lex')?.query
+          || params.searches.find((s: any) => s.type === 'vec')?.query
+          || params.searches[0]?.query || "";
+
+        const formatted = results.map(r => {
+          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: r.context,
+            snippet: addLineNumbers(snippet, line),
+          };
+        });
+
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results: formatted }));
+        log(`${ts()} POST /search ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 
