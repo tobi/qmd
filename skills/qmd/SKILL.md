@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
-  version: "1.3.0"
+  version: "2.0.0"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
@@ -17,7 +17,7 @@ Local search engine for markdown content.
 
 !`qmd status 2>/dev/null || echo "Not installed: npm install -g @tobilu/qmd"`
 
-## MCP: `structured_search`
+## MCP: `query`
 
 ```json
 {
@@ -25,18 +25,19 @@ Local search engine for markdown content.
     { "type": "lex", "query": "CAP theorem consistency" },
     { "type": "vec", "query": "tradeoff between consistency and availability" }
   ],
-  "collections": ["notes", "docs"],
+  "collections": ["docs"],
   "limit": 10
 }
 ```
 
-### Search Types
+### Query Types
 
 | Type | Method | Input |
 |------|--------|-------|
 | `lex` | BM25 | Keywords — exact terms, names, code |
 | `vec` | Vector | Question — natural language |
 | `hyde` | Vector | Answer — hypothetical result (50-100 words) |
+| `expand` | LLM | Auto-expand via local model (max 1 per query) |
 
 ### Writing Good Queries
 
@@ -48,20 +49,24 @@ Local search engine for markdown content.
 
 **vec (semantic)**
 - Full natural language question
-- Be specific: `"how does the rate limiter handle burst traffic"` not `"rate limiting"`
+- Be specific: `"how does the rate limiter handle burst traffic"`
 - Include context: `"in the payment service, how are refunds processed"`
 
 **hyde (hypothetical document)**
 - Write 50-100 words of what the *answer* looks like
 - Use the vocabulary you expect in the result
-- Example: `"The rate limiter uses a sliding window algorithm with a 60-second window. When a client exceeds 100 requests per minute, subsequent requests return 429 Too Many Requests until the window resets."`
+
+**expand (auto-expand)**
+- Let the local LLM generate lex/vec/hyde variations
+- Good when you don't know exact terms
+- Max one expand: per query
 
 ### Combining Types
 
 | Goal | Approach |
 |------|----------|
 | Know exact terms | `lex` only |
-| Don't know vocabulary | `vec` only |
+| Don't know vocabulary | `vec` or `expand` |
 | Best recall | `lex` + `vec` |
 | Complex topic | `lex` + `vec` + `hyde` |
 
@@ -99,9 +104,17 @@ Omit to search all collections.
 ```bash
 qmd query "question"              # Auto-expand + rerank
 qmd query $'lex: X\nvec: Y'       # Structured
-qmd search "keywords"             # BM25 only
-qmd vsearch "question"            # Vector only
+qmd query $'expand: question'     # Explicit expand
+qmd search "keywords"             # BM25 only (no LLM)
 qmd get "#abc123"                 # By docid
+```
+
+## HTTP API
+
+```bash
+curl -X POST http://localhost:8181/query \
+  -H "Content-Type: application/json" \
+  -d '{"searches": [{"type": "lex", "query": "test"}]}'
 ```
 
 ## Setup

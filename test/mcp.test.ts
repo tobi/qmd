@@ -1008,12 +1008,12 @@ describe("MCP HTTP Transport", () => {
     expect(contentType).toContain("application/json");
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toContain("structured_search");
+    expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
   });
 
-  test("POST /mcp tools/call structured_search returns results", async () => {
+  test("POST /mcp tools/call query returns results", async () => {
     // Initialize
     await mcpRequest({
       jsonrpc: "2.0", id: 1, method: "initialize",
@@ -1022,7 +1022,7 @@ describe("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "structured_search", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
