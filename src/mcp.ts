@@ -23,7 +23,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { Store, StructuredSubSearch } from "./store.js";
-import { getCollection, getGlobalContext } from "./collections.js";
+import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
@@ -270,8 +270,11 @@ function createMcpServer(store: Store): McpServer {
         query: s.query,
       }));
 
+      // Use default collections if none specified
+      const effectiveCollections = collections ?? getDefaultCollectionNames();
+
       const results = await structuredSearch(store, subSearches, {
-        collections,
+        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
       });
@@ -578,8 +581,11 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           query: String(s.query || ""),
         }));
 
+        // Use default collections if none specified
+        const effectiveCollections = params.collections ?? getDefaultCollectionNames();
+
         const results = await structuredSearch(store, subSearches, {
-          collections: params.collections,
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
         });

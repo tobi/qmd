@@ -25,10 +25,11 @@ export type ContextMap = Record<string, string>;
  * A single collection configuration
  */
 export interface Collection {
-  path: string;           // Absolute path to index
-  pattern: string;        // Glob pattern (e.g., "**/*.md")
-  context?: ContextMap;   // Optional context definitions
-  update?: string;        // Optional bash command to run during qmd update
+  path: string;              // Absolute path to index
+  pattern: string;           // Glob pattern (e.g., "**/*.md")
+  context?: ContextMap;      // Optional context definitions
+  update?: string;           // Optional bash command to run during qmd update
+  includeByDefault?: boolean; // Include in queries by default (default: true)
 }
 
 /**
@@ -167,6 +168,52 @@ export function listCollections(): NamedCollection[] {
     name,
     ...collection,
   }));
+}
+
+/**
+ * Get collections that are included by default in queries
+ */
+export function getDefaultCollections(): NamedCollection[] {
+  return listCollections().filter(c => c.includeByDefault !== false);
+}
+
+/**
+ * Get collection names that are included by default
+ */
+export function getDefaultCollectionNames(): string[] {
+  return getDefaultCollections().map(c => c.name);
+}
+
+/**
+ * Update a collection's settings
+ */
+export function updateCollectionSettings(
+  name: string,
+  settings: { update?: string | null; includeByDefault?: boolean }
+): boolean {
+  const config = loadConfig();
+  const collection = config.collections[name];
+  if (!collection) return false;
+
+  if (settings.update !== undefined) {
+    if (settings.update === null) {
+      delete collection.update;
+    } else {
+      collection.update = settings.update;
+    }
+  }
+
+  if (settings.includeByDefault !== undefined) {
+    if (settings.includeByDefault === true) {
+      // true is default, remove the field
+      delete collection.includeByDefault;
+    } else {
+      collection.includeByDefault = settings.includeByDefault;
+    }
+  }
+
+  saveConfig(config);
+  return true;
 }
 
 /**

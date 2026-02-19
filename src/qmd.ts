@@ -1314,8 +1314,13 @@ function collectionList(): void {
   for (const coll of collections) {
     const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
     const timeAgo = formatTimeAgo(updatedAt);
+    
+    // Get YAML config to check includeByDefault
+    const yamlColl = getCollectionFromYaml(coll.name);
+    const excluded = yamlColl?.includeByDefault === false;
+    const excludeTag = excluded ? ` ${c.yellow}[excluded]${c.reset}` : '';
 
-    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
@@ -1915,7 +1920,12 @@ function outputResults(results: { file: string; displayPath: string; title: stri
 
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
-function resolveCollectionFilter(raw: string | string[] | undefined): string[] {
+function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+  // If no filter specified and useDefaults is true, use default collections
+  if (!raw && useDefaults) {
+    const { getDefaultCollectionNames } = require("./collections.js");
+    return getDefaultCollectionNames();
+  }
   if (!raw) return [];
   const names = Array.isArray(raw) ? raw : [raw];
   const validated: string[] = [];
@@ -2003,7 +2013,8 @@ function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
   // Validate collection filter (supports multiple -c flags)
-  const collectionNames = resolveCollectionFilter(opts.collection);
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
@@ -2057,7 +2068,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
-  const collectionNames = resolveCollectionFilter(opts.collection);
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
@@ -2110,7 +2122,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
-  const collectionNames = resolveCollectionFilter(opts.collection);
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
@@ -2535,9 +2548,102 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           break;
         }
 
+        case "set-update":
+        case "update-cmd": {
+          const name = cli.args[1];
+          const cmd = cli.args.slice(2).join(' ') || null;
+          if (!name) {
+            console.error("Usage: qmd collection update-cmd <name> [command]");
+            console.error("  Set the command to run before indexing (e.g., 'git pull')");
+            console.error("  Omit command to clear it");
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          updateCollectionSettings(name, { update: cmd });
+          if (cmd) {
+            console.log(`✓ Set update command for '${name}': ${cmd}`);
+          } else {
+            console.log(`✓ Cleared update command for '${name}'`);
+          }
+          break;
+        }
+
+        case "include":
+        case "exclude": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error(`Usage: qmd collection ${subcommand} <name>`);
+            console.error(`  ${subcommand === 'include' ? 'Include' : 'Exclude'} collection in default queries`);
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          const include = subcommand === 'include';
+          updateCollectionSettings(name, { includeByDefault: include });
+          console.log(`✓ Collection '${name}' ${include ? 'included in' : 'excluded from'} default queries`);
+          break;
+        }
+
+        case "show":
+        case "info": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error("Usage: qmd collection show <name>");
+            process.exit(1);
+          }
+          const { getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          console.log(`Collection: ${name}`);
+          console.log(`  Path:     ${col.path}`);
+          console.log(`  Pattern:  ${col.pattern}`);
+          console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.update) {
+            console.log(`  Update:   ${col.update}`);
+          }
+          if (col.context) {
+            const ctxCount = Object.keys(col.context).length;
+            console.log(`  Contexts: ${ctxCount}`);
+          }
+          break;
+        }
+
+        case "help":
+        case undefined: {
+          console.log("Usage: qmd collection <command> [options]");
+          console.log("");
+          console.log("Commands:");
+          console.log("  list                      List all collections");
+          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  remove <name>             Remove a collection");
+          console.log("  rename <old> <new>        Rename a collection");
+          console.log("  show <name>               Show collection details");
+          console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
+          console.log("  include <name>            Include in default queries");
+          console.log("  exclude <name>            Exclude from default queries");
+          console.log("");
+          console.log("Examples:");
+          console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection update-cmd brain 'git pull'");
+          console.log("  qmd collection exclude archive");
+          process.exit(0);
+        }
+
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
-          console.error("Available: list, add, remove, rename");
+          console.error("Run 'qmd collection help' for usage");
           process.exit(1);
       }
       break;
