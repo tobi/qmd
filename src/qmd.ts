@@ -59,8 +59,10 @@ import {
   handelize,
   hybridQuery,
   vectorSearchQuery,
+  structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
+  type StructuredSubSearch,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
@@ -1939,6 +1941,64 @@ function filterByCollections<T extends { filepath?: string; file?: string }>(res
   });
 }
 
+/**
+ * Parse structured search query syntax.
+ * Lines starting with lex:, vec:, or hyde: are routed directly.
+ * Plain lines without prefix go through query expansion.
+ * 
+ * Returns null if this is a plain query (single line, no prefix).
+ * Returns StructuredSubSearch[] if structured syntax detected.
+ * Throws if multiple plain lines (ambiguous).
+ * 
+ * Examples:
+ *   "CAP theorem"                    -> null (plain query, use expansion)
+ *   "lex: CAP theorem"               -> [{ type: 'lex', query: 'CAP theorem' }]
+ *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
+ *   "CAP\nconsistency"               -> throws (multiple plain lines)
+ */
+function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+  const lines = query.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return null;
+
+  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const searches: StructuredSubSearch[] = [];
+  const plainLines: string[] = [];
+
+  for (const line of lines) {
+    const match = line.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
+      const text = line.slice(match[0].length).trim();
+      if (text.length > 0) {
+        searches.push({ type, query: text });
+      }
+    } else {
+      plainLines.push(line);
+    }
+  }
+
+  // All plain lines, no prefixes -> null (use normal expansion)
+  if (searches.length === 0 && plainLines.length === 1) {
+    return null;
+  }
+
+  // Multiple plain lines without prefixes -> ambiguous, error
+  if (plainLines.length > 1) {
+    throw new Error(
+      `Ambiguous query: multiple lines without lex:/vec:/hyde: prefix.\n` +
+      `Either use a single line (for query expansion) or prefix each line.\n` +
+      `Example:\n  lex: keyword terms\n  vec: natural language question\n  hyde: hypothetical answer passage`
+    );
+  }
+
+  // Mix of prefixed and one plain line -> treat plain as lex
+  if (plainLines.length === 1) {
+    searches.unshift({ type: 'lex', query: plainLines[0]! });
+  }
+
+  return searches.length > 0 ? searches : null;
+}
+
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
@@ -2055,28 +2115,63 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   checkIndexHealth(store.db);
 
+  // Check for structured query syntax (lex:/vec:/hyde: prefixes)
+  const structuredQueries = parseStructuredQuery(query);
+
   await withLLMSession(async () => {
-    let results = await hybridQuery(store, query, {
-      collection: singleCollection,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0,
-      hooks: {
-        onStrongSignal: (score) => {
-          process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+    let results;
+
+    if (structuredQueries) {
+      // Structured search — user provided their own query expansions
+      const typeLabels = structuredQueries.map(s => s.type).join('+');
+      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+      
+      // Log each sub-query
+      for (const s of structuredQueries) {
+        let preview = s.query.replace(/\n/g, ' ');
+        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+      }
+      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+
+      results = await structuredSearch(store, structuredQueries, {
+        collection: singleCollection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+            progress.indeterminate();
+          },
+          onRerankDone: () => {
+            progress.clear();
+          },
         },
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+      });
+    } else {
+      // Standard hybrid query with automatic expansion
+      results = await hybridQuery(store, query, {
+        collection: singleCollection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onStrongSignal: (score) => {
+            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+          },
+          onExpand: (original, expanded) => {
+            logExpansionTree(original, expanded);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
+            progress.indeterminate();
+          },
+          onRerankDone: () => {
+            progress.clear();
+          },
         },
-        onRerankStart: (chunkCount) => {
-          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
-          progress.indeterminate();
-        },
-        onRerankDone: () => {
-          progress.clear();
-        },
-      },
-    });
+      });
+    }
 
     // Post-filter for multi-collection
     if (collectionNames.length > 1) {
@@ -2097,6 +2192,11 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       return;
     }
 
+    // Use first lex/vec query for output context, or original query
+    const displayQuery = structuredQueries
+      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
+      : query;
+
     // Map to CLI output format — use bestChunk for snippet display
     outputResults(results.map(r => ({
       file: r.file,
@@ -2107,7 +2207,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
-    })), query, { ...opts, limit: results.length });
+    })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
@@ -2214,6 +2314,7 @@ function showHelp(): void {
   console.log("  qmd embed [-f]                - Create vector embeddings (900 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
+  console.log("  qmd query 'lex:..\\nvec:...'   - Structured search (you provide lex/vec/hyde queries)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
@@ -2236,6 +2337,13 @@ function showHelp(): void {
   console.log("  --md                       - Markdown output");
   console.log("  --xml                      - XML output");
   console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("");
+  console.log("Structured queries (qmd query):");
+  console.log("  Prefix lines with lex:, vec:, or hyde: to skip automatic expansion.");
+  console.log("  lex:  BM25 keyword search (exact terms)");
+  console.log("  vec:  Vector similarity (natural language question)");
+  console.log("  hyde: Vector similarity (hypothetical answer passage)");
+  console.log("  Example: qmd query $'lex: CAP theorem\\nvec: consistency vs availability tradeoff'");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");

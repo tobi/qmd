@@ -2,10 +2,10 @@
 name: qmd
 description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
 license: MIT
-compatibility: Requires qmd CLI or MCP server. Install via `bun install -g https://github.com/tobi/qmd`.
+compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
-  version: "1.1.1"
+  version: "1.2.0"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
@@ -15,137 +15,150 @@ QMD is a local, on-device search engine for markdown content. It indexes your no
 
 ## QMD Status
 
-!`qmd status 2>/dev/null || echo "Not installed. Run: bun install -g https://github.com/tobi/qmd"`
+!`qmd status 2>/dev/null || echo "Not installed. See installation instructions below."`
 
-## When to Use This Skill
+## Installation
 
-- User asks to search their notes, documents, or knowledge base
-- User needs to find information in their markdown files
-- User wants to retrieve specific documents or search across collections
-- User asks "what did I write about X" or "find my notes on Y"
-- User needs semantic search (conceptual similarity) not just keyword matching
-- User mentions meeting notes, transcripts, or documentation lookup
-
-## Search Commands
-
-Choose the right search mode for the task:
-
-| Command | Use When | Speed |
-|---------|----------|-------|
-| `qmd search` | Exact keyword matches needed | Fast |
-| `qmd vsearch` | Keywords aren't working, need conceptual matches | Medium |
-| `qmd query` | Best results needed, speed not critical | Slower |
+### Install QMD
 
 ```bash
-# Fast keyword search (BM25)
-qmd search "your query"
+npm install -g @tobilu/qmd
+```
 
-# Semantic vector search (finds conceptually similar content)
+### Configure MCP Server
+
+**Claude Code** — add to `~/.claude/settings.json`:
+```json
+{
+  "mcpServers": {
+    "qmd": { "command": "qmd", "args": ["mcp"] }
+  }
+}
+```
+
+**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "qmd": { "command": "qmd", "args": ["mcp"] }
+  }
+}
+```
+
+**OpenClaw** — add to `~/.openclaw/openclaw.json` under `mcp.servers`:
+```json
+{
+  "mcp": {
+    "servers": {
+      "qmd": { "command": "qmd", "args": ["mcp"] }
+    }
+  }
+}
+```
+
+### Index Your Content
+
+```bash
+# Add a collection (indexes all markdown files)
+qmd collection add ~/Documents/notes --name notes
+
+# Generate embeddings for semantic search
+qmd embed
+
+# Check status
+qmd status
+```
+
+## Search Strategy — Use `structured_search`
+
+**You are a capable LLM.** Use `structured_search` instead of `deep_search` — you generate better query expansions than the local model.
+
+### How structured_search Works
+
+You provide 2-4 sub-searches, each with a type:
+
+| Type | Search Method | What to Write |
+|------|---------------|---------------|
+| `lex` | BM25 keyword | Short keyword phrases — exact terms, names, identifiers |
+| `vec` | Vector similarity | Natural language question — what you're asking |
+| `hyde` | Vector similarity | Hypothetical answer — what the result looks like (50-100 words) |
+
+Both `vec` and `hyde` use vector similarity search. The difference is input format:
+- **vec**: Write a *question* ("what is X?")
+- **hyde**: Write a *hypothetical answer* ("X is a concept that...")
+
+### Example: Finding CAP Theorem Docs
+
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "CAP theorem consistency availability partition" },
+    { "type": "vec", "query": "distributed systems tradeoff between data consistency and availability" },
+    { "type": "hyde", "query": "The CAP theorem proves that a distributed system cannot simultaneously provide consistency, availability, and partition tolerance. You must choose two." }
+  ],
+  "limit": 10
+}
+```
+
+### Guidelines for Query Expansion
+
+1. **lex queries**: 2-5 keyword terms. Include synonyms and related terms.
+2. **vec queries**: Full natural language questions. Be specific.
+3. **hyde queries**: 50-100 words. Write what the answer *looks like*, not the question.
+4. **Order matters**: First search gets 2x weight in fusion.
+
+### When to Use Each Search Type
+
+| Situation | Approach |
+|-----------|----------|
+| Know exact terms (names, code, acronyms) | Start with `lex` |
+| Conceptual search, don't know vocabulary | Lead with `vec` |
+| Complex topic, want best recall | Use all three types |
+| Quick lookup | Single `lex` query is fine |
+
+## MCP Tools Reference
+
+| Tool | Speed | Use Case |
+|------|-------|----------|
+| `structured_search` | ~5s | **Recommended** — you provide query expansions |
+| `search` | ~30ms | Fast keyword lookup (BM25) |
+| `vector_search` | ~2s | Semantic similarity |
+| `deep_search` | ~10s | Auto-expands query (uses small local model) |
+| `get` | instant | Retrieve doc by path or `#docid` |
+| `multi_get` | instant | Retrieve multiple docs |
+| `status` | instant | Index health |
+
+## CLI Fallback
+
+If MCP isn't configured, use the CLI:
+
+```bash
+# Keyword search
+qmd search "your query" -n 10
+
+# Semantic search  
 qmd vsearch "your query"
 
-# Hybrid search with re-ranking (best quality)
+# Hybrid with re-ranking (auto-expands)
 qmd query "your query"
-```
 
-## Common Options
-
-```bash
--n <num>                 # Number of results (default: 5)
--c, --collection <name>  # Restrict to specific collection
---all                    # Return all matches
---min-score <num>        # Minimum score threshold (0.0-1.0)
---full                   # Show full document content
---json                   # JSON output for processing
---files                  # List files with scores
---line-numbers           # Add line numbers to output
-```
-
-## Document Retrieval
-
-```bash
-# Get document by path
-qmd get "collection/path/to/doc.md"
-
-# Get document by docid (shown in search results as #abc123)
-qmd get "#abc123"
-
-# Get with line numbers for code review
-qmd get "docs/api.md" --line-numbers
-
-# Get multiple documents by glob pattern
-qmd multi-get "docs/*.md"
-
-# Get multiple documents by list
-qmd multi-get "doc1.md, doc2.md, #abc123"
-```
-
-## Index Management
-
-```bash
-# Check index status and available collections
-qmd status
-
-# List all collections
-qmd collection list
-
-# List files in a collection
-qmd ls <collection-name>
-
-# Update index (re-scan files for changes)
-qmd update
+# Retrieve document
+qmd get "#abc123" --full
 ```
 
 ## Score Interpretation
 
-| Score | Meaning | Action |
-|-------|---------|--------|
-| 0.8 - 1.0 | Highly relevant | Show to user |
-| 0.5 - 0.8 | Moderately relevant | Include if few results |
-| 0.2 - 0.5 | Somewhat relevant | Only if user wants more |
-| 0.0 - 0.2 | Low relevance | Usually skip |
+| Score | Meaning |
+|-------|---------|
+| 0.8+ | Highly relevant — show to user |
+| 0.5-0.8 | Moderately relevant — include if few results |
+| 0.2-0.5 | Weak match — only if user wants more |
+| <0.2 | Skip |
 
-## Recommended Workflow
+## Workflow Example
 
-1. **Check what's available**: `qmd status`
-2. **Start with keyword search**: `qmd search "topic" -n 10`
-3. **Try semantic if needed**: `qmd vsearch "describe the concept"`
-4. **Use hybrid for best results**: `qmd query "question" --min-score 0.4`
-5. **Retrieve full documents**: `qmd get "#docid" --full`
-
-## Example: Finding Meeting Notes
-
-```bash
-# Search for meetings about a topic
-qmd search "quarterly review" -c meetings -n 5
-
-# Get semantic matches
-qmd vsearch "performance discussion" -c meetings
-
-# Retrieve the full meeting notes
-qmd get "#abc123" --full
-```
-
-## Example: Research Across All Notes
-
-```bash
-# Hybrid search for best results
-qmd query "authentication implementation" --min-score 0.3 --json
-
-# Get all relevant files for deeper analysis
-qmd query "auth flow" --all --files --min-score 0.4
-```
-
-## MCP Server Integration
-
-This plugin configures the qmd MCP server automatically. When available, prefer MCP tools over Bash for tighter integration:
-
-| MCP Tool | Equivalent CLI | Purpose |
-|----------|---------------|---------|
-| `qmd_search` | `qmd search` | Fast BM25 keyword search |
-| `qmd_vector_search` | `qmd vsearch` | Semantic vector search |
-| `qmd_deep_search` | `qmd query` | Deep search with expansion and reranking |
-| `qmd_get` | `qmd get` | Retrieve document by path or docid |
-| `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
-| `qmd_status` | `qmd status` | Index health and collection info |
-
-For manual MCP setup without the plugin, see [references/mcp-setup.md](references/mcp-setup.md).
+1. **Check collections**: `qmd status` or `status` tool
+2. **Search with structured_search**: Generate lex + vec + hyde queries
+3. **Review results**: Check scores and snippets
+4. **Retrieve full docs**: Use `get` with `#docid` from results
+5. **Iterate**: Refine queries based on what you find
