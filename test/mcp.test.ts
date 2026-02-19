@@ -257,7 +257,7 @@ describe("MCP Server", () => {
   // Tool: qmd_search (BM25)
   // ===========================================================================
 
-  describe("qmd_search tool", () => {
+  describe("searchFTS (BM25 keyword search)", () => {
     test("returns results for matching query", () => {
       const results = searchFTS(testDb, "readme", 10);
       expect(results.length).toBeGreaterThan(0);
@@ -295,10 +295,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_vector_search (Vector)
+  // searchVec (Vector similarity search)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("qmd_vector_search tool", () => {
+  describe.skipIf(!!process.env.CI)("searchVec (vector similarity)", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -321,10 +321,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_deep_search (Deep search)
+  // hybridQuery (query expansion + reranking)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("qmd_deep_search tool", () => {
+  describe.skipIf(!!process.env.CI)("hybridQuery (expansion + reranking)", () => {
     test("expands query with typed variations", async () => {
       const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Returns ExpandedQuery[] — typed expansions, original excluded
@@ -1008,12 +1008,12 @@ describe("MCP HTTP Transport", () => {
     expect(contentType).toContain("application/json");
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toContain("search");
+    expect(toolNames).toContain("structured_search");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
   });
 
-  test("POST /mcp tools/call search returns results", async () => {
+  test("POST /mcp tools/call structured_search returns results", async () => {
     // Initialize
     await mcpRequest({
       jsonrpc: "2.0", id: 1, method: "initialize",
@@ -1022,7 +1022,7 @@ describe("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "search", arguments: { query: "readme" } },
+      params: { name: "structured_search", arguments: { searches: [{ type: "lex", query: "readme" }] } },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();

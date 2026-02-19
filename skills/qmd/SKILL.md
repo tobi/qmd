@@ -120,10 +120,7 @@ Both `vec` and `hyde` use vector similarity search. The difference is input form
 
 | Tool | Speed | Use Case |
 |------|-------|----------|
-| `structured_search` | ~5s | **Recommended** — you provide query expansions |
-| `search` | ~30ms | Fast keyword lookup (BM25) |
-| `vector_search` | ~2s | Semantic similarity |
-| `deep_search` | ~10s | Auto-expands query (uses small local model) |
+| `structured_search` | ~5s | Search with lex/vec/hyde queries |
 | `get` | instant | Retrieve doc by path or `#docid` |
 | `multi_get` | instant | Retrieve multiple docs |
 | `status` | instant | Index health |

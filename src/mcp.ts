@@ -19,8 +19,6 @@ import {
   createStore,
   extractSnippet,
   addLineNumbers,
-  hybridQuery,
-  vectorSearchQuery,
   structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
@@ -114,25 +112,23 @@ function buildInstructions(store: Store): string {
   // --- Capability gaps ---
   if (!status.hasVectorIndex) {
     lines.push("");
-    lines.push("Note: No vector embeddings. Only `search` (BM25) is available.");
+    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
   } else if (status.needsEmbedding > 0) {
     lines.push("");
     lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
   }
 
-  // --- When to use which tool (escalation ladder) ---
-  // Tool schemas describe parameters; instructions describe strategy.
+  // --- Search tool ---
   lines.push("");
-  lines.push("Search:");
-  lines.push("  - `search` (~30ms) — BM25 keyword matching. Fast, exact terms.");
-  lines.push("  - `vector_search` (~2s) — semantic search. Finds synonyms and related concepts.");
-  lines.push("  - `deep_search` (~10s) — auto-expands query + reranks. Use when you don't know the exact terms.");
-  lines.push("  - `structured_search` (~5s) — YOU provide the query variations. Best for complex/nuanced queries.");
+  lines.push("Search: Use `structured_search` with 1-4 sub-queries:");
+  lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
+  lines.push("  - type:'vec' — semantic vector search (meaning-based)");
+  lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
   lines.push("");
-  lines.push("For structured_search, pass 2-4 sub-searches:");
-  lines.push("  - type:'lex' for keyword phrases (BM25)");
-  lines.push("  - type:'vec' for semantic questions");
-  lines.push("  - type:'hyde' for hypothetical answer snippets");
+  lines.push("Examples:");
+  lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
+  lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
+  lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -229,136 +225,7 @@ function createMcpServer(store: Store): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_search (keyword)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "search",
-    {
-      title: "Keyword Search",
-      description: "Search by keyword. Finds documents containing exact words and phrases in the query.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        query: z.string().describe("Search query - keywords or phrases to find"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const results = store.searchFTS(query, limit || 10, collection);
-      const filtered: SearchResultItem[] = results
-        .filter(r => r.score >= (minScore || 0))
-        .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.filepath),
-            snippet: addLineNumbers(snippet, line),  // Default to line numbers
-          };
-        });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_vector_search (Vector semantic search)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "vector_search",
-    {
-      title: "Vector Search",
-      description: "Search by meaning. Finds relevant documents even when they use different words than the query — handles synonyms, paraphrases, and related concepts.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
-
-      if (results.length === 0) {
-        // Distinguish "no embeddings" from "no matches" — check if vector table exists
-        const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-        if (!tableExists) {
-          return {
-            content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
-            isError: true,
-          };
-        }
-      }
-
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, query, 300);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_deep_search (Deep search with expansion + reranking)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "deep_search",
-    {
-      title: "Deep Search",
-      description: "Deep search. Auto-expands the query into variations, searches each by keyword and meaning, and reranks for top hits across all results.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await hybridQuery(store, query, { collection, limit, minScore });
-
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, query, 300);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_structured_search (Pre-expanded queries from LLM)
+  // Tool: structured_search (Primary search tool)
   // ---------------------------------------------------------------------------
 
   const subSearchSchema = z.object({

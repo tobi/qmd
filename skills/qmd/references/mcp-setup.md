@@ -103,39 +103,6 @@ Execute pre-expanded search queries. **Use this** — you're a capable LLM that 
 
 Both `vec` and `hyde` use vector search — the difference is what you write.
 
-### search
-
-Fast BM25 keyword search (~30ms).
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | string | Search query |
-| `collection` | string? | Filter by collection |
-| `limit` | number? | Max results (default: 5) |
-| `minScore` | number? | Min relevance 0-1 |
-
-### vector_search
-
-Semantic similarity search (~2s).
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | string | Natural language query |
-| `collection` | string? | Filter by collection |
-| `limit` | number? | Max results (default: 5) |
-| `minScore` | number? | Min relevance 0-1 |
-
-### deep_search
-
-Hybrid search with automatic query expansion (~10s). Uses a small local model to expand your query. **Prefer `structured_search`** — you generate better expansions.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | string | Search query |
-| `collection` | string? | Filter by collection |
-| `limit` | number? | Max results (default: 5) |
-| `minScore` | number? | Min relevance 0-1 |
-
 ### get
 
 Retrieve a document by path or docid.
