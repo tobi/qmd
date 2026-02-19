@@ -24,7 +24,7 @@ import {
 } from "./store.js";
 import type { Store, StructuredSubSearch } from "./store.js";
 import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { disposeDefaultLLM } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -717,7 +717,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     await transport.close();
     httpServer.close();
     store.close();
-    await disposeDefaultLlamaCpp();
+    await disposeDefaultLLM();
   };
 
   process.on("SIGTERM", async () => {
