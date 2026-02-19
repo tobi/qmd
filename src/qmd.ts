@@ -419,6 +419,40 @@ async function showStatus(): Promise<void> {
     // Don't fail status if LLM init fails
   }
 
+  // Tips section
+  const tips: string[] = [];
+
+  // Check for collections without context
+  const collectionsWithoutContext = collections.filter(col => {
+    const contexts = contextsByCollection.get(col.name) || [];
+    return contexts.length === 0;
+  });
+  if (collectionsWithoutContext.length > 0) {
+    const names = collectionsWithoutContext.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutContext.length > 3 ? ` +${collectionsWithoutContext.length - 3} more` : '';
+    tips.push(`Add context to collections for better search results: ${names}${more}`);
+    tips.push(`  ${c.dim}qmd context add qmd://<name>/ "Description..."${c.reset}`);
+  }
+
+  // Check for collections without update commands
+  const collectionsWithoutUpdate = collections.filter(col => {
+    const yamlCol = getCollectionFromYaml(col.name);
+    return !yamlCol?.update;
+  });
+  if (collectionsWithoutUpdate.length > 0 && collections.length > 1) {
+    const names = collectionsWithoutUpdate.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutUpdate.length > 3 ? ` +${collectionsWithoutUpdate.length - 3} more` : '';
+    tips.push(`Add update commands to keep collections fresh: ${names}${more}`);
+    tips.push(`  ${c.dim}qmd collection update-cmd <name> 'git pull'${c.reset}`);
+  }
+
+  if (tips.length > 0) {
+    console.log(`\n${c.bold}Tips${c.reset}`);
+    for (const tip of tips) {
+      console.log(`  ${tip}`);
+    }
+  }
+
   closeDb();
 }
 
