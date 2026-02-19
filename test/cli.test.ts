@@ -76,6 +76,40 @@ async function runQmd(
   return { stdout, stderr, exitCode };
 }
 
+async function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: Record<string, string> = {}
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const proc = spawn(command, args, {
+    cwd,
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const stdoutPromise = new Promise<string>((resolve, reject) => {
+    let data = "";
+    proc.stdout?.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+    proc.once("error", reject);
+    proc.stdout?.once("end", () => resolve(data));
+  });
+  const stderrPromise = new Promise<string>((resolve, reject) => {
+    let data = "";
+    proc.stderr?.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+    proc.once("error", reject);
+    proc.stderr?.once("end", () => resolve(data));
+  });
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.on("close", (code) => resolve(code ?? 1));
+  });
+  const stdout = await stdoutPromise;
+  const stderr = await stderrPromise;
+
+  return { stdout, stderr, exitCode };
+}
+
 // Get a fresh database path for isolated tests
 function getFreshDbPath(): string {
   testCounter++;
@@ -394,6 +428,46 @@ describe("CLI Update Command", () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
+  });
+
+  test("supports --pull and skips repos without upstream", async () => {
+    const env = await createIsolatedTestEnv("update-pull");
+    const repoDir = join(testDir, `update-pull-repo-${Date.now()}`);
+    await mkdir(repoDir, { recursive: true });
+    await writeFile(join(repoDir, "README.md"), "# pull test\n");
+
+    const init = await runCommand("git", ["init"], repoDir);
+    expect(init.exitCode).toBe(0);
+
+    const add = await runCommand("git", ["add", "."], repoDir);
+    expect(add.exitCode).toBe(0);
+
+    const commit = await runCommand(
+      "git",
+      ["commit", "-m", "initial commit"],
+      repoDir,
+      {
+        GIT_AUTHOR_NAME: "QMD Test",
+        GIT_AUTHOR_EMAIL: "qmd-test@example.com",
+        GIT_COMMITTER_NAME: "QMD Test",
+        GIT_COMMITTER_EMAIL: "qmd-test@example.com",
+      }
+    );
+    expect(commit.exitCode).toBe(0);
+
+    const addCollection = await runQmd(
+      ["collection", "add", repoDir, "--name", "pull-test"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(addCollection.exitCode).toBe(0);
+
+    const { stdout, exitCode } = await runQmd(
+      ["update", "--pull"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Skipping git pull: no upstream tracking branch");
   });
 });
 
