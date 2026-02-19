@@ -685,63 +685,6 @@ function contextRemove(pathArg: string): void {
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
 }
 
-function contextCheck(): void {
-  const db = getDb();
-
-  // Get collections without any context
-  const collectionsWithoutContext = getCollectionsWithoutContext(db);
-
-  // Get all collections to check for missing path contexts
-  const allCollections = listCollections(db);
-
-  if (collectionsWithoutContext.length === 0 && allCollections.length > 0) {
-    // Check if all collections have contexts
-    console.log(`\n${c.green}✓${c.reset} ${c.bold}All collections have context configured${c.reset}\n`);
-  }
-
-  if (collectionsWithoutContext.length > 0) {
-    console.log(`\n${c.yellow}Collections without any context:${c.reset}\n`);
-
-    for (const coll of collectionsWithoutContext) {
-      console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(${coll.doc_count} documents)${c.reset}`);
-      console.log(`  ${c.dim}Suggestion: qmd context add qmd://${coll.name}/ "Description of ${coll.name}"${c.reset}\n`);
-    }
-  }
-
-  // Check for top-level paths without context within collections that DO have context
-  const collectionsWithContext = allCollections.filter(c =>
-    c && !collectionsWithoutContext.some(cwc => cwc.name === c.name)
-  );
-
-  let hasPathSuggestions = false;
-
-  for (const coll of collectionsWithContext) {
-    if (!coll) continue;
-    const missingPaths = getTopLevelPathsWithoutContext(db, coll.name);
-
-    if (missingPaths.length > 0) {
-      if (!hasPathSuggestions) {
-        console.log(`${c.yellow}Top-level directories without context:${c.reset}\n`);
-        hasPathSuggestions = true;
-      }
-
-      console.log(`${c.cyan}${coll.name}${c.reset}`);
-      for (const path of missingPaths) {
-        console.log(`  ${path}`);
-        console.log(`    ${c.dim}Suggestion: qmd context add qmd://${coll.name}/${path} "Description of ${path}"${c.reset}`);
-      }
-      console.log('');
-    }
-  }
-
-  if (collectionsWithoutContext.length === 0 && !hasPathSuggestions) {
-    console.log(`${c.dim}All collections and major paths have context configured.${c.reset}`);
-    console.log(`${c.dim}Use 'qmd context list' to see all configured contexts.${c.reset}\n`);
-  }
-
-  closeDb();
-}
-
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
   const db = getDb();
 
@@ -2400,13 +2343,12 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
     case "context": {
       const subcommand = cli.args[0];
       if (!subcommand) {
-        console.error("Usage: qmd context <add|list|check|rm>");
+        console.error("Usage: qmd context <add|list|rm>");
         console.error("");
         console.error("Commands:");
         console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
         console.error("  qmd context add / \"text\"       - Add global context to all collections");
         console.error("  qmd context list                - List all contexts");
-        console.error("  qmd context check               - Check for missing contexts");
         console.error("  qmd context rm <path>           - Remove context");
         process.exit(1);
       }
@@ -2454,11 +2396,6 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           break;
         }
 
-        case "check": {
-          contextCheck();
-          break;
-        }
-
         case "rm":
         case "remove": {
           if (cli.args.length < 2 || !cli.args[1]) {
@@ -2474,7 +2411,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
 
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
-          console.error("Available: add, list, check, rm");
+          console.error("Available: add, list, rm");
           process.exit(1);
       }
       break;
