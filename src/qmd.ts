@@ -1960,14 +1960,14 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
   const lines = query.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   if (lines.length === 0) return null;
 
-  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const prefixRe = /^(lex|vec|hyde|expand):\s*/i;
   const searches: StructuredSubSearch[] = [];
   const plainLines: string[] = [];
 
   for (const line of lines) {
     const match = line.match(prefixRe);
     if (match) {
-      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde' | 'expand';
       const text = line.slice(match[0].length).trim();
       if (text.length > 0) {
         searches.push({ type, query: text });

@@ -3151,8 +3151,8 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSubSearch {
-  /** Search type: 'lex' for BM25 keywords, 'vec' for semantic, 'hyde' for hypothetical document */
-  type: 'lex' | 'vec' | 'hyde';
+  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical, 'expand' for LLM expansion */
+  type: 'lex' | 'vec' | 'hyde' | 'expand';
   /** The search query text */
   query: string;
 }
@@ -3199,7 +3199,11 @@ export async function structuredSearch(
 
   if (searches.length === 0) return [];
 
-  // Validate semantic queries don't use lex-only syntax
+  // Validate: max one expand query, semantic queries don't use lex syntax
+  const expandSearches = searches.filter(s => s.type === 'expand');
+  if (expandSearches.length > 1) {
+    throw new Error('Maximum one expand: query per document');
+  }
   for (const search of searches) {
     if (search.type === 'vec' || search.type === 'hyde') {
       const error = validateSemanticQuery(search.query);
@@ -3208,6 +3212,22 @@ export async function structuredSearch(
       }
     }
   }
+
+  // Process expand: queries by calling the query expansion model
+  let processedSearches = searches.filter(s => s.type !== 'expand');
+  if (expandSearches.length > 0) {
+    const expandQuery = expandSearches[0]!.query;
+    const expanded = await store.expandQuery(expandQuery);
+    // Add expanded queries (lex, vec, hyde from the model)
+    for (const exp of expanded) {
+      processedSearches.push({ type: exp.type as 'lex' | 'vec' | 'hyde', query: exp.text });
+    }
+    // Also add original as lex for strong signal matching
+    processedSearches.unshift({ type: 'lex', query: expandQuery });
+  }
+
+  // Use processed searches from here on
+  searches = processedSearches;
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid

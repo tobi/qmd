@@ -120,7 +120,7 @@ function buildInstructions(store: Store): string {
 
   // --- Search tool ---
   lines.push("");
-  lines.push("Search: Use `structured_search` with 1-4 sub-queries:");
+  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde/expand):");
   lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
@@ -225,43 +225,42 @@ function createMcpServer(store: Store): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: structured_search (Primary search tool)
+  // Tool: query (Primary search tool)
   // ---------------------------------------------------------------------------
 
   const subSearchSchema = z.object({
-    type: z.enum(['lex', 'vec', 'hyde']).describe(
-      "Search type: 'lex' = BM25 keyword search (exact terms, fast), " +
-      "'vec' = semantic vector search (meaning-based, finds synonyms/paraphrases), " +
-      "'hyde' = hypothetical document (imagine what the answer looks like)"
+    type: z.enum(['lex', 'vec', 'hyde', 'expand']).describe(
+      "Query type: 'lex' = BM25 keywords, 'vec' = semantic question, " +
+      "'hyde' = hypothetical answer, 'expand' = auto-expand via LLM (max 1)"
     ),
-    query: z.string().describe("The search query text"),
+    query: z.string().describe("The query text"),
   });
 
   server.registerTool(
-    "structured_search",
+    "query",
     {
-      title: "Structured Search",
-      description: `Execute pre-expanded search queries. Skips internal query expansion — you provide the search variations directly.
+      title: "Query",
+      description: `Search the knowledge base with typed sub-queries.
 
-**When to use:** You're an LLM that can generate better query expansions than a small local model. Pass 2-4 sub-searches for best results.
+**Query types:**
+- \`lex\`: BM25 keyword search. Supports "exact phrase" and -negation.
+- \`vec\`: Semantic vector search. Natural language questions.
+- \`hyde\`: Hypothetical document. Write what the answer looks like (50-100 words).
+- \`expand\`: Auto-expand via local LLM. Max one per query.
 
-**Search types:**
-- \`lex\`: BM25 keyword search. Use short keyword phrases (2-5 terms). Good for exact terms, names, code identifiers.
-- \`vec\`: Semantic vector search. Use natural language questions or descriptions. Finds documents with similar meaning even when vocabulary differs.
-- \`hyde\`: Hypothetical document. Write a short passage (~50-100 words) that looks like what you're searching for. Powerful for finding conceptually similar content.
-
-**Example:** To find CAP theorem docs, pass:
-- { type: "lex", query: "CAP theorem consistency availability" }
-- { type: "vec", query: "what is the tradeoff between data consistency and system availability in distributed systems" }
-- { type: "hyde", query: "The CAP theorem states that a distributed system can only guarantee two of three properties: Consistency, Availability, and Partition tolerance." }`,
+**Examples:**
+- Quick lookup: [{ type: "lex", query: "CAP theorem" }]
+- Semantic: [{ type: "vec", query: "consistency vs availability tradeoff" }]
+- Best results: [{ type: "lex", query: "CAP" }, { type: "vec", query: "distributed systems consistency" }]
+- Auto-expand: [{ type: "expand", query: "how does rate limiting work" }]`,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Array of sub-searches to execute. Order matters — first search gets higher weight in fusion."
+          "Sub-queries to execute. First gets 2x weight. Max one expand: per query."
         ),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collections: z.array(z.string()).optional().describe("Filter to specific collections (OR match)"),
+        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
       },
     },
     async ({ searches, limit, minScore, collections }) => {
@@ -561,7 +560,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       // REST endpoint: POST /search — structured search without MCP protocol
-      if (pathname === "/search" && nodeReq.method === "POST") {
+      // REST endpoint: POST /query — structured search without MCP protocol
+      if (pathname === "/query" && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
         const params = JSON.parse(rawBody);
         
@@ -603,7 +603,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /search ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 
