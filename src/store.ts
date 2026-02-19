@@ -3249,6 +3249,11 @@ export async function structuredSearch(
   searches: StructuredSubSearch[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -3306,7 +3311,7 @@ export async function structuredSearch(
   if (hasVectors) {
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
+      const llm = getDefaultLLM();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();

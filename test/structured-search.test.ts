@@ -22,6 +22,10 @@ import {
   type Store,
 } from "../src/store.js";
 import { disposeDefaultLlamaCpp } from "../src/llm.js";
+import {
+  clearApiEmbeddingScope,
+  setApiEmbeddingScopeFromCurrentEnv,
+} from "../src/vector-scope-guard.js";
 
 // =============================================================================
 // parseStructuredQuery Tests (CLI Parser)
@@ -344,6 +348,34 @@ describe("structuredSearch", () => {
     await expect(structuredSearch(store, [
       { type: "lex", query: "\"unfinished phrase", line: 2 }
     ])).rejects.toThrow(/unmatched double quote/);
+  });
+
+  test("applies API scope guard on structured query path", async () => {
+    const originalBackend = process.env.QMD_LLM_BACKEND;
+    const originalEmbedBaseUrl = process.env.QMD_EMBED_BASE_URL;
+    const originalEmbedModel = process.env.QMD_EMBED_MODEL;
+
+    try {
+      process.env.QMD_LLM_BACKEND = "api";
+      process.env.QMD_EMBED_BASE_URL = "https://api.openai.com/v1";
+      process.env.QMD_EMBED_MODEL = "text-embedding-3-small";
+      setApiEmbeddingScopeFromCurrentEnv(store.db);
+
+      process.env.QMD_LLM_BACKEND = "local";
+      await expect(structuredSearch(store, [{ type: "lex", query: "test" }]))
+        .rejects.toThrow("current backend is local");
+    } finally {
+      clearApiEmbeddingScope(store.db);
+
+      if (originalBackend === undefined) delete process.env.QMD_LLM_BACKEND;
+      else process.env.QMD_LLM_BACKEND = originalBackend;
+
+      if (originalEmbedBaseUrl === undefined) delete process.env.QMD_EMBED_BASE_URL;
+      else process.env.QMD_EMBED_BASE_URL = originalEmbedBaseUrl;
+
+      if (originalEmbedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = originalEmbedModel;
+    }
   });
 });
 
