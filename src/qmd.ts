@@ -2267,6 +2267,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2332,7 +2333,7 @@ function showHelp(): void {
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
-  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
+  console.log("  qmd mcp --http [--host ADDR] [--port N] - Start MCP server (HTTP transport)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
   console.log("  qmd mcp stop                  - Stop background MCP daemon");
   console.log("");
@@ -2736,6 +2737,17 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        let host = (cli.values.host as string) || undefined;
+
+        // Validate --host input: reject values containing scheme or path
+        if (host && (host.includes("://") || host.includes("/"))) {
+          console.error(`Invalid --host value: "${host}". Provide a hostname or IP address, not a URL.`);
+          process.exit(1);
+        }
+        // Normalize bracketed IPv6 input: [::1] → ::1 (prevents double-bracketing in URL formatting)
+        if (host?.startsWith("[") && host.endsWith("]")) {
+          host = host.slice(1, -1);
+        }
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -2757,6 +2769,9 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
+          if (host) {
+            spawnArgs.push("--host", host);
+          }
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -2765,7 +2780,9 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          const displayHost = host ?? "localhost";
+          const displayUrlHost = displayHost.includes(":") ? `[${displayHost}]` : displayHost;
+          console.log(`Started on http://${displayUrlHost}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -2776,10 +2793,10 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("./mcp.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { host });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            console.error(`Port ${port} already in use on ${host ?? "localhost"}. Try a different port with --port.`);
             process.exit(1);
           }
           throw e;

@@ -1047,3 +1047,217 @@ describe("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+// =============================================================================
+// Host binding tests
+// =============================================================================
+
+describe("host binding", () => {
+  let hostTestDbPath: string;
+  let hostTestConfigDir: string;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  beforeAll(async () => {
+    hostTestDbPath = `/tmp/qmd-mcp-host-test-${Date.now()}.sqlite`;
+    const db = openDatabase(hostTestDbPath);
+    initTestDatabase(db);
+    db.close();
+
+    const configPrefix = join(tmpdir(), `qmd-mcp-host-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    hostTestConfigDir = await mkdtemp(configPrefix);
+    const testConfig: CollectionConfig = { collections: { docs: { path: "/test/docs", pattern: "**/*.md" } } };
+    await writeFile(join(hostTestConfigDir, "index.yml"), YAML.stringify(testConfig));
+
+    process.env.INDEX_PATH = hostTestDbPath;
+    process.env.QMD_CONFIG_DIR = hostTestConfigDir;
+  });
+
+  afterAll(async () => {
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+    try { require("fs").unlinkSync(hostTestDbPath); } catch {}
+    try {
+      const files = await readdir(hostTestConfigDir);
+      for (const f of files) await unlink(join(hostTestConfigDir, f));
+      await rmdir(hostTestConfigDir);
+    } catch {}
+  });
+
+  test("default host: server is reachable via localhost", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true });
+    try {
+      const res = await fetch(`http://localhost:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("host option: server binds to specified address", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("host option: server reports correct bound address", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const addr = handle.httpServer.address() as import("net").AddressInfo;
+      expect(addr.address).toBe("127.0.0.1");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("host option: MCP protocol works on custom host", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("host option: bracketed IPv6 input is normalized", async () => {
+    // Simulates --host [::1] — brackets should be stripped before bind
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "[::1]" });
+    try {
+      const addr = handle.httpServer.address() as import("net").AddressInfo;
+      // Should bind to ::1 (without brackets), not "[::1]"
+      expect(addr.address).toBe("::1");
+      // Verify reachability via bracketed URL notation
+      const res = await fetch(`http://[::1]:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
+
+// =============================================================================
+// Daemon --host forwarding (integration tests)
+// =============================================================================
+
+import { spawn, execSync } from "node:child_process";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+
+const thisDir = dirname(fileURLToPath(import.meta.url));
+
+describe("daemon --host forwarding", () => {
+  const qmdScript = resolve(thisDir, "..", "src", "qmd.ts");
+  const tsxBin = resolve(thisDir, "..", "node_modules", ".bin", "tsx");
+
+  // Isolated state dirs — prevents `mcp stop` from touching real user daemons
+  let daemonCacheDir: string;
+  let daemonConfigDir: string;
+  let testEnv: Record<string, string>;
+  let daemonPid: number | undefined;
+
+  beforeAll(() => {
+    daemonCacheDir = mkdtempSync(join(tmpdir(), "qmd-test-cache-"));
+    daemonConfigDir = mkdtempSync(join(tmpdir(), "qmd-test-config-"));
+    testEnv = {
+      ...process.env,
+      XDG_CACHE_HOME: daemonCacheDir,
+      QMD_CONFIG_DIR: daemonConfigDir,
+    } as Record<string, string>;
+  });
+
+  afterAll(() => {
+    // Kill daemon if still running
+    if (daemonPid) {
+      try { process.kill(daemonPid, "SIGTERM"); } catch {}
+    }
+    // Also try `mcp stop` with isolated env as safety net
+    try {
+      execSync(`"${tsxBin}" "${qmdScript}" mcp stop`, {
+        env: testEnv,
+        timeout: 5000,
+        stdio: "ignore",
+      });
+    } catch {}
+    // Clean up temp dirs
+    rmSync(daemonCacheDir, { recursive: true, force: true });
+    rmSync(daemonConfigDir, { recursive: true, force: true });
+  });
+
+  test("daemon spawn forwards --host to child process", async () => {
+    const port = 19876 + Math.floor(Math.random() * 1000);
+
+    const child = spawn(tsxBin, [
+      qmdScript, "mcp", "--http", "--daemon",
+      "--host", "127.0.0.1", "--port", String(port),
+    ], {
+      env: testEnv,
+      stdio: "pipe",
+    });
+
+    // Wait for spawn to complete (daemon detaches immediately)
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+
+    // Read PID from isolated PID file for cleanup
+    const pidPath = join(daemonCacheDir, "qmd", "mcp.pid");
+    if (existsSync(pidPath)) {
+      daemonPid = parseInt(readFileSync(pidPath, "utf-8").trim());
+    }
+
+    // Poll health endpoint until ready (robust for CI / loaded machines)
+    const deadline = Date.now() + 10000;
+    let healthy = false;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`);
+        if (res.status === 200) { healthy = true; break; }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    expect(healthy).toBe(true);
+  }, 15000);
+
+  test("invalid --host value exits with error", async () => {
+    const child = spawn(tsxBin, [
+      qmdScript, "mcp", "--http", "--host", "http://127.0.0.1",
+    ], {
+      env: testEnv,
+      stdio: "pipe",
+    });
+
+    let stderr = "";
+    child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    const exitCode = await new Promise<number | null>((resolve) =>
+      child.on("close", (code) => resolve(code))
+    );
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Invalid --host value");
+    expect(stderr).toContain("not a URL");
+  });
+});
