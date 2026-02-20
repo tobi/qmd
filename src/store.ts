@@ -16,6 +16,7 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
+import { homedir as osHomedir } from "node:os";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -43,7 +44,7 @@ import {
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || "/tmp";
+const HOME = osHomedir();
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
