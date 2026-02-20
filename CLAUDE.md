@@ -9,10 +9,13 @@ qmd collection add . --name <n>   # Create/index collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
+qmd collection show <name>        # Show collection details
+qmd collection update-cmd <n> cmd # Set pre-update command (e.g. 'git pull')
+qmd collection include <name>     # Include in default queries
+qmd collection exclude <name>     # Exclude from default queries
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
-qmd context check                 # Check for collections/paths missing context
 qmd context rm <path>             # Remove context
 qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
@@ -69,9 +72,6 @@ qmd context add qmd://journals/2024 "Journal entries from 2024"
 
 # List all contexts
 qmd context list
-
-# Check for collections or paths without context
-qmd context check
 
 # Remove context
 qmd context rm qmd://journals/2024
@@ -135,7 +135,7 @@ bun test --preload ./src/test-preload.ts test/
 
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (qmd-query-expansion-1.7B)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 

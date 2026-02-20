@@ -106,24 +106,16 @@ This generates lex, vec, and hyde variations automatically. Useful when you don'
 
 ## MCP/HTTP API
 
-The `query` tool accepts a query document:
-
-```json
-{
-  "q": "lex: CAP theorem\nvec: consistency vs availability",
-  "collections": ["docs"],
-  "limit": 10
-}
-```
-
-Or structured format:
+The `query` tool accepts a structured format:
 
 ```json
 {
   "searches": [
     { "type": "lex", "query": "CAP theorem" },
     { "type": "vec", "query": "consistency vs availability" }
-  ]
+  ],
+  "collections": ["docs"],
+  "limit": 10
 }
 ```
 
