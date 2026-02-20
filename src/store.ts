@@ -805,8 +805,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -888,8 +888,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string | string[]) => searchFTS(db, query, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -2082,9 +2082,36 @@ export function validateSemanticQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+function normalizeCollectionFilter(collectionName?: string | string[]): string[] {
+  if (!collectionName) return [];
+  const names = Array.isArray(collectionName) ? collectionName : [collectionName];
+  return names.filter((name): name is string => typeof name === "string" && name.length > 0);
+}
+
+function appendCollectionFilterSql(
+  sql: string,
+  params: (string | number | Float32Array)[],
+  collectionNames: string[],
+): string {
+  if (collectionNames.length === 0) return sql;
+
+  if (collectionNames.length === 1) {
+    sql += ` AND d.collection = ?`;
+    params.push(collectionNames[0]!);
+    return sql;
+  }
+
+  const placeholders = collectionNames.map(() => "?").join(",");
+  sql += ` AND d.collection IN (${placeholders})`;
+  params.push(...collectionNames);
+  return sql;
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
+
+  const collectionNames = normalizeCollectionFilter(collectionName);
 
   let sql = `
     SELECT
@@ -2099,12 +2126,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
+  const params: (string | number | Float32Array)[] = [ftsQuery];
 
-  if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
-  }
+  sql = appendCollectionFilterSql(sql, params, collectionNames);
 
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
@@ -2139,24 +2163,51 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
 
+  const collectionNames = normalizeCollectionFilter(collectionName);
+
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
 
+  // Precompute eligible chunk ids for collection filtering so the top-k vector query
+  // itself is collection-scoped (avoids false-empty post-filter behavior).
+  let eligibleHashSeqs: string[] | null = null;
+  if (collectionNames.length > 0) {
+    const collectionPlaceholders = collectionNames.map(() => '?').join(',');
+    const eligibleRows = db.prepare(`
+      SELECT DISTINCT cv.hash || '_' || cv.seq as hash_seq
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash
+      WHERE d.active = 1 AND d.collection IN (${collectionPlaceholders})
+    `).all(...collectionNames) as { hash_seq: string }[];
+
+    eligibleHashSeqs = eligibleRows.map(r => r.hash_seq);
+    if (eligibleHashSeqs.length === 0) return [];
+  }
+
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
+  let vecSql = `
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `;
+  const vecParams: (Float32Array | number | string)[] = [new Float32Array(embedding), limit * 3];
+
+  if (eligibleHashSeqs && eligibleHashSeqs.length > 0) {
+    const hashSeqPlaceholders = eligibleHashSeqs.map(() => '?').join(',');
+    vecSql += ` AND hash_seq IN (${hashSeqPlaceholders})`;
+    vecParams.push(...eligibleHashSeqs);
+  }
+
+  const vecResults = db.prepare(vecSql).all(...vecParams) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -2180,12 +2231,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: (string | number | Float32Array)[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
-  }
+  docSql = appendCollectionFilterSql(docSql, params, collectionNames);
 
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
@@ -2863,7 +2911,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collection?: string | string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -3083,7 +3131,7 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
-  collection?: string;
+  collection?: string | string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   hooks?: Pick<SearchHooks, 'onExpand'>;

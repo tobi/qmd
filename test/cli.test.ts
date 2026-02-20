@@ -5,7 +5,7 @@
  * These tests spawn actual qmd processes to verify end-to-end functionality.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { tmpdir } from "os";
@@ -522,6 +522,99 @@ describe("CLI Search with Collection Filter", () => {
       console.log("stderr:", stderr);
     }
     expect(exitCode).toBe(0);
+  });
+});
+
+describe("CLI Multi-Collection Filter Regression", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let localRoot: string;
+
+  beforeEach(async () => {
+    const env = await createIsolatedTestEnv("multi-collection");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    localRoot = await mkdtemp(join(testDir, "multi-collection-fixtures-"));
+    const noisyDir = join(localRoot, "noisy");
+    const targetADir = join(localRoot, "target-a");
+    const targetBDir = join(localRoot, "target-b");
+
+    await mkdir(noisyDir, { recursive: true });
+    await mkdir(targetADir, { recursive: true });
+    await mkdir(targetBDir, { recursive: true });
+
+    const noisyBody = Array.from({ length: 40 }, () => "dominator dominator dominator").join("\n");
+    for (let i = 0; i < 80; i++) {
+      await writeFile(
+        join(noisyDir, `noise-${i}.md`),
+        `# dominator dominator ${i}\n\n${noisyBody}\n`
+      );
+    }
+
+    await writeFile(
+      join(targetADir, "hit-a.md"),
+      "# A target document\n\nContains dominator once."
+    );
+    await writeFile(
+      join(targetBDir, "hit-b.md"),
+      "# B target document\n\nContains dominator once."
+    );
+
+    await runQmd(["collection", "add", noisyDir, "--name", "noisy", "--mask", "**/*.md"], {
+      cwd: localRoot,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    await runQmd(["collection", "add", targetADir, "--name", "target-a", "--mask", "**/*.md"], {
+      cwd: localRoot,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    await runQmd(["collection", "add", targetBDir, "--name", "target-b", "--mask", "**/*.md"], {
+      cwd: localRoot,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+  });
+
+  afterEach(async () => {
+    if (localRoot) {
+      await rm(localRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("search with repeated -c filters before top-k ranking", async () => {
+    const { stdout, stderr, exitCode } = await runQmd([
+      "search",
+      "--json",
+      "-n",
+      "10",
+      "-c",
+      "target-a",
+      "-c",
+      "target-b",
+      "dominator",
+    ], {
+      cwd: localRoot,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+
+    if (exitCode !== 0) {
+      console.log("Multi-collection search failed:");
+      console.log("stdout:", stdout);
+      console.log("stderr:", stderr);
+    }
+
+    expect(exitCode).toBe(0);
+
+    const parsed = JSON.parse(stdout) as Array<{ file: string }>;
+    const files = parsed.map(row => row.file);
+
+    expect(files.some(f => f.startsWith("qmd://target-a/"))).toBe(true);
+    expect(files.some(f => f.startsWith("qmd://target-b/"))).toBe(true);
+    expect(files.some(f => f.startsWith("qmd://noisy/"))).toBe(false);
   });
 });
 
