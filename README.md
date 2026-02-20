@@ -74,9 +74,7 @@ qmd get "docs/api-reference.md" --full
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vector_search` - Semantic vector search (supports collection filter)
-- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
+- `qmd_query` - Search with typed sub-queries (lex/vec/hyde/expand)
 - `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
@@ -129,8 +127,9 @@ qmd mcp stop                      # stop via PID file
 qmd status                        # shows "MCP: running (PID ...)" when active
 ```
 
-The HTTP server exposes two endpoints:
+Endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `POST /query` — REST structured search (alias: `/search`)
 - `GET /health` — liveness check with uptime
 
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
@@ -180,14 +179,14 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
                           │   RRF Fusion + Bonus  │
                           │  Original query: ×2   │
                           │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
+                          │     Top 40 Kept       │
                           └───────────┬───────────┘
                                       │
                                       ▼
                           ┌───────────────────────┐
                           │    LLM Re-ranking     │
                           │  (qwen3-reranker)     │
-                          │  Yes/No + logprobs    │
+                          │  rankAll() scores     │
                           └───────────┬───────────┘
                                       │
                                       ▼
@@ -207,7 +206,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 |---------|-----------|------------|-------|
 | **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
 | **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| **Reranker** | `rankAll()` score | Used directly | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
@@ -217,8 +216,8 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 2. **Parallel Retrieval**: Each query searches both FTS and vector indexes
 3. **RRF Fusion**: Combine all result lists using `score = Σ(1/(k+rank+1))` where k=60
 4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
-5. **Top-K Selection**: Take top 30 candidates for reranking
-6. **Re-ranking**: LLM scores each document (yes/no with logprobs confidence)
+5. **Top-K Selection**: Take top 40 candidates for reranking
+6. **Re-ranking**: Cross-encoder scores each document via `rankAll()`
 7. **Position-Aware Blending**:
    - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
    - RRF rank 4-10: 60% retrieval, 40% reranker
@@ -476,20 +475,23 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 ### Schema
 
 ```sql
-collections     -- Indexed directories with name and glob patterns
-path_contexts   -- Context descriptions by virtual path (qmd://...)
-documents       -- Markdown content with metadata and docid (6-char hash)
+content         -- Content-addressable storage (hash PK, doc, created_at)
+documents       -- File metadata (collection, path, title, hash FK to content)
 documents_fts   -- FTS5 full-text index
 content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
 
+Collections and contexts are managed in `~/.config/qmd/index.yml`, not SQLite.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `XDG_CACHE_HOME` | `~/.cache` | Cache directory (SQLite index) |
+| `XDG_CONFIG_HOME` | `~/.config` | Config directory (index.yml) |
+| `NO_COLOR` | *(unset)* | Disable terminal colors when set |
 
 ## How It Works
 
@@ -575,11 +577,11 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
          Top-rank bonus: +0.05/#1, +0.02/#2-3
                 │
                 ▼
-         Top 30 candidates
+         Top 40 candidates
                 │
                 ▼
          LLM Re-ranking
-         (yes/no + logprob confidence)
+         (cross-encoder via rankAll())
                 │
                 ▼
          Position-Aware Blend
@@ -613,11 +615,11 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 
 ### Qwen3-Reranker
 
-Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+Uses node-llama-cpp's `createRankingContext()` and `rankAll()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
 
-### Qwen3 (Query Expansion)
+### Query Expansion (Fine-tuned)
 
-Used for generating query variations via `LlamaChatSession`.
+`qmd-query-expansion-1.7B` generates query variations via `LlamaChatSession`. Fine-tuned from Qwen3-1.7B.
 
 ## License
 

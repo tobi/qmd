@@ -49,7 +49,7 @@ qmd mcp stop                # Stop daemon
 
 ## Tools
 
-### structured_search
+### query
 
 Search with pre-expanded queries.
 
@@ -61,7 +61,7 @@ Search with pre-expanded queries.
     { "type": "hyde", "query": "hypothetical answer passage..." }
   ],
   "limit": 10,
-  "collection": "optional",
+  "collections": ["optional"],
   "minScore": 0.0
 }
 ```
@@ -71,6 +71,7 @@ Search with pre-expanded queries.
 | `lex` | BM25 | Keywords (2-5 terms) |
 | `vec` | Vector | Question |
 | `hyde` | Vector | Answer passage (50-100 words) |
+| `expand` | LLM | Auto-expand (max 1 per query) |
 
 ### get
 
@@ -78,8 +79,9 @@ Retrieve document by path or `#docid`.
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `path` | string | File path or `#docid` |
-| `full` | bool? | Return full content |
+| `file` | string | File path or `#docid` |
+| `fromLine` | number? | Start from line (1-indexed) |
+| `maxLines` | number? | Max lines to return |
 | `lineNumbers` | bool? | Add line numbers |
 
 ### multi_get
@@ -89,7 +91,9 @@ Retrieve multiple documents.
 | Param | Type | Description |
 |-------|------|-------------|
 | `pattern` | string | Glob or comma-separated list |
+| `maxLines` | number? | Max lines per file |
 | `maxBytes` | number? | Skip large files (default 10KB) |
+| `lineNumbers` | bool? | Add line numbers |
 
 ### status
 
