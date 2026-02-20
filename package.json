@@ -13,7 +13,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
+    "prepare": "[ -d dist ] || tsc -p tsconfig.build.json; [ -d dist ] || { echo 'dist/ missing — run: npm run build' >&2; exit 1; }; [ -d .git ] && ./scripts/install-hooks.sh || true",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --reporter=verbose test/",
     "qmd": "tsx src/qmd.ts",
@@ -55,10 +55,8 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "tsx": "^4.0.0",
+    "typescript": "^5.9.3",
     "vitest": "^3.0.0"
-  },
-  "peerDependencies": {
-    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=22.0.0"
