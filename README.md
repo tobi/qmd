@@ -122,6 +122,7 @@ By default, QMD's MCP server uses stdio (launched as a subprocess by each client
 # Foreground (Ctrl-C to stop)
 qmd mcp --http                    # localhost:8181
 qmd mcp --http --port 8080        # custom port
+qmd mcp --http --host 127.0.0.1   # explicit IPv4 bind (useful for Docker/Colima)
 
 # Background daemon
 qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid

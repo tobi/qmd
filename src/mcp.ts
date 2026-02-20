@@ -551,9 +551,9 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Binds to the specified host (default: "localhost"). Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
   const store = createStore();
   const mcpServer = createMcpServer(store);
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -564,6 +564,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
+
+  // Normalize bracketed IPv6 input from direct API callers: "[::1]" → "::1"
+  const rawHost = options?.host ?? "localhost";
+  const bindHost = (rawHost.startsWith("[") && rawHost.endsWith("]")) ? rawHost.slice(1, -1) : rawHost;
+  // IPv6 addresses must be bracketed in URLs: http://[::1]:8181 not http://::1:8181
+  const urlHost = bindHost.includes(":") ? `[${bindHost}]` : bindHost;
+  let listeningPort = port; // updated to actualPort inside listen callback
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -667,7 +674,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         const rawBody = await collectBody(nodeReq);
         const body = JSON.parse(rawBody);
         const label = describeRequest(body);
-        const url = `http://localhost:${port}${pathname}`;
+        const url = `http://${urlHost}:${listeningPort}${pathname}`;
         const headers: Record<string, string> = {};
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
@@ -681,7 +688,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       if (pathname === "/mcp") {
-        const url = `http://localhost:${port}${pathname}`;
+        const url = `http://${urlHost}:${listeningPort}${pathname}`;
         const headers: Record<string, string> = {};
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
@@ -705,10 +712,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, bindHost, () => {
+      listeningPort = (httpServer.address() as import("net").AddressInfo).port;
+      resolve();
+    });
   });
 
-  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
+  const actualPort = listeningPort;
 
   let stopping = false;
   const stop = async () => {
@@ -731,7 +741,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${urlHost}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 
