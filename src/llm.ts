@@ -725,8 +725,10 @@ export class LlamaCpp implements LLM {
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
-  // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Use 8192 to handle edge cases where chunks (especially code or non-ASCII
+  // text) exceed expected token counts. VRAM cost is modest (~4 GB with flash
+  // attention). Still 5× less than auto (40960).
+  private static readonly RERANK_CONTEXT_SIZE = 8192;
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
@@ -1038,8 +1040,20 @@ export class LlamaCpp implements LLM {
       textToDoc.set(doc.text, { file: doc.file, index });
     });
 
-    // Extract just the text for ranking
-    const texts = documents.map((doc) => doc.text);
+    // Extract just the text for ranking, truncating any that would exceed
+    // the reranker context size. The Qwen3 template adds ~200 tokens of
+    // overhead (system prompt, tags, etc.) plus the query itself.
+    const overheadTokens = 200 + Math.ceil(query.length / 4);
+    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - overheadTokens;
+    // chars/4 is a conservative token-count estimate
+    const maxDocChars = maxDocTokens * 4;
+
+    const texts = documents.map((doc) => {
+      if (doc.text.length > maxDocChars) {
+        return doc.text.slice(0, maxDocChars);
+      }
+      return doc.text;
+    });
 
     // Split documents across contexts for parallel evaluation.
     // Each context has its own sequence with a lock, so parallelism comes
