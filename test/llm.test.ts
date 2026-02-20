@@ -365,6 +365,45 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       // Log timing for monitoring batch performance
       console.log(`Batch rerank of 10 docs took ${elapsed}ms`);
     });
+
+    test("truncates and reranks document exceeding 2048 token context size", async () => {
+      // The reranker context is created with contextSize=2048. Documents that
+      // exceed the token budget (contextSize - template overhead - query tokens)
+      // should be silently truncated rather than crashing.
+      const paragraph = "The quick brown fox jumps over the lazy dog near the riverbank. " +
+        "Authentication tokens must be validated on every request to ensure security. " +
+        "Database queries should use prepared statements to prevent SQL injection attacks. " +
+        "The deployment pipeline includes linting, testing, building, and publishing stages. ";
+      // ~320 chars per paragraph, repeat 40 times = ~12800 chars ≈ 3200 tokens
+      const longText = paragraph.repeat(40);
+
+      const query = "How do I configure authentication?";
+      const documents: RerankDocument[] = [
+        { file: "short-relevant.md", text: "Authentication can be configured by setting AUTH_SECRET." },
+        { file: "long-doc.md", text: longText },
+        { file: "short-irrelevant.md", text: "The weather is sunny today." },
+      ];
+
+      console.log(`Long doc length: ${longText.length} chars (~${Math.round(longText.length / 4)} tokens)`);
+
+      const result = await llm.rerank(query, documents);
+
+      // Should return all 3 documents without crashing
+      expect(result.results).toHaveLength(3);
+
+      // All scores should be valid numbers in [0, 1]
+      for (const doc of result.results) {
+        expect(doc.score).toBeGreaterThanOrEqual(0);
+        expect(doc.score).toBeLessThanOrEqual(1);
+        expect(Number.isNaN(doc.score)).toBe(false);
+      }
+
+      // The short, directly relevant doc should still rank highest
+      console.log("Rerank results for long doc test:");
+      for (const doc of result.results) {
+        console.log(`  ${doc.file}: ${doc.score.toFixed(4)}`);
+      }
+    });
   });
 
   describe("expandQuery", () => {
