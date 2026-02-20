@@ -502,8 +502,20 @@ export class LlamaCpp implements LLM {
       // (likely a binary/build config issue in node-llama-cpp).
       // @ts-expect-error node-llama-cpp API compat
       const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+
+      // QMD_GPU: override GPU backend. Values: cuda, metal, vulkan, false/off/0
+      const gpuOverride = process.env.QMD_GPU?.toLowerCase();
+      const forceCpu = gpuOverride === "false" || gpuOverride === "0" || gpuOverride === "off";
+
+      let preferred: "cuda" | "metal" | "vulkan" | undefined;
+      if (forceCpu) {
+        preferred = undefined;
+      } else if (gpuOverride && (["cuda", "metal", "vulkan"] as const).some(g => g === gpuOverride)) {
+        preferred = gpuOverride as "cuda" | "metal" | "vulkan";
+      } else {
+        // Prefer CUDA > Metal > Vulkan > CPU
+        preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      }
 
       let llama: Llama;
       if (preferred) {
