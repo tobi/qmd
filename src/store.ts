@@ -259,7 +259,7 @@ export function homedir(): string {
  */
 export function isAbsolutePath(path: string): boolean {
   if (!path) return false;
-  
+
   // Unix absolute path
   if (path.startsWith('/')) {
     // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
@@ -273,12 +273,12 @@ export function isAbsolutePath(path: string): boolean {
     // Any other path starting with / is Unix absolute
     return true;
   }
-  
+
   // Windows native path: C:\ or C:/ (any letter A-Z)
   if (path.length >= 2 && /[a-zA-Z]/.test(path[0]!) && path[1] === ':') {
     return true;
   }
-  
+
   return false;
 }
 
@@ -300,25 +300,25 @@ export function getRelativePathFromPrefix(path: string, prefix: string): string 
   if (!prefix) {
     return null;
   }
-  
+
   const normalizedPath = normalizePathSeparators(path);
   const normalizedPrefix = normalizePathSeparators(prefix);
-  
+
   // Ensure prefix ends with / for proper matching
-  const prefixWithSlash = !normalizedPrefix.endsWith('/') 
-    ? normalizedPrefix + '/' 
+  const prefixWithSlash = !normalizedPrefix.endsWith('/')
+    ? normalizedPrefix + '/'
     : normalizedPrefix;
-  
+
   // Exact match
   if (normalizedPath === normalizedPrefix) {
     return '';
   }
-  
+
   // Check if path starts with prefix
   if (normalizedPath.startsWith(prefixWithSlash)) {
     return normalizedPath.slice(prefixWithSlash.length);
   }
-  
+
   return null;
 }
 
@@ -326,18 +326,18 @@ export function resolve(...paths: string[]): string {
   if (paths.length === 0) {
     throw new Error("resolve: at least one path segment is required");
   }
-  
+
   // Normalize all paths to use forward slashes
   const normalizedPaths = paths.map(normalizePathSeparators);
-  
+
   let result = '';
   let windowsDrive = '';
-  
+
   // Check if first path is absolute
   const firstPath = normalizedPaths[0]!;
   if (isAbsolutePath(firstPath)) {
     result = firstPath;
-    
+
     // Extract Windows drive letter if present
     if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
       windowsDrive = firstPath.slice(0, 2);
@@ -353,7 +353,7 @@ export function resolve(...paths: string[]): string {
   } else {
     // Start with PWD or cwd, then append the first relative path
     const pwd = normalizePathSeparators(process.env.PWD || process.cwd());
-    
+
     // Extract Windows drive from PWD if present
     if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
       windowsDrive = pwd.slice(0, 2);
@@ -362,14 +362,14 @@ export function resolve(...paths: string[]): string {
       result = pwd + '/' + firstPath;
     }
   }
-  
+
   // Process remaining paths
   for (let i = 1; i < normalizedPaths.length; i++) {
     const p = normalizedPaths[i]!;
     if (isAbsolutePath(p)) {
       // Absolute path replaces everything
       result = p;
-      
+
       // Update Windows drive if present
       if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
         windowsDrive = p.slice(0, 2);
@@ -391,7 +391,7 @@ export function resolve(...paths: string[]): string {
       result = result + '/' + p;
     }
   }
-  
+
   // Normalize . and .. components
   const parts = result.split('/').filter(Boolean);
   const normalized: string[] = [];
@@ -402,15 +402,15 @@ export function resolve(...paths: string[]): string {
       normalized.push(part);
     }
   }
-  
+
   // Build final path
   const finalPath = '/' + normalized.join('/');
-  
+
   // Prepend Windows drive if present
   if (windowsDrive) {
     return windowsDrive + finalPath;
   }
-  
+
   return finalPath;
 }
 
@@ -805,8 +805,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -888,8 +888,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string | string[]) => searchFTS(db, query, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -1503,7 +1503,7 @@ export function normalizeDocid(docid: string): string {
 
   // Strip surrounding quotes (single or double)
   if ((normalized.startsWith('"') && normalized.endsWith('"')) ||
-      (normalized.startsWith("'") && normalized.endsWith("'"))) {
+    (normalized.startsWith("'") && normalized.endsWith("'"))) {
     normalized = normalized.slice(1, -1);
   }
 
@@ -2082,7 +2082,7 @@ export function validateSemanticQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -2102,8 +2102,19 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const params: (string | number)[] = [ftsQuery];
 
   if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
+    if (Array.isArray(collectionName)) {
+      if (collectionName.length > 0) {
+        const placeholders = collectionName.map(() => '?').join(',');
+        sql += ` AND d.collection IN (${placeholders})`;
+        params.push(...collectionName);
+      } else {
+        // Empty array means no collections matched (false-safe)
+        return [];
+      }
+    } else {
+      sql += ` AND d.collection = ?`;
+      params.push(String(collectionName));
+    }
   }
 
   // bm25 lower is better; sort ascending.
@@ -2139,7 +2150,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2183,8 +2194,18 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const params: string[] = [...hashSeqs];
 
   if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+    if (Array.isArray(collectionName)) {
+      if (collectionName.length > 0) {
+        const collPlaceholders = collectionName.map(() => '?').join(',');
+        docSql += ` AND d.collection IN (${collPlaceholders})`;
+        params.push(...collectionName);
+      } else {
+        return [];
+      }
+    } else {
+      docSql += ` AND d.collection = ?`;
+      params.push(collectionName);
+    }
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -2863,7 +2884,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collection?: string | string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -3171,7 +3192,7 @@ export interface StructuredSubSearch {
 }
 
 export interface StructuredSearchOptions {
-  collections?: string[];   // Filter to specific collections (OR match)
+  collection?: string | string[];   // Filter to specific collections (OR match)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -3208,7 +3229,11 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const hooks = options?.hooks;
 
-  const collections = options?.collections;
+  const collections = Array.isArray(options?.collection)
+    ? options?.collection
+    : options?.collection
+      ? [options?.collection]
+      : undefined;
 
   if (searches.length === 0) return [];
 

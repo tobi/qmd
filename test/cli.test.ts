@@ -522,6 +522,42 @@ describe("CLI Search with Collection Filter", () => {
       console.log("stderr:", stderr);
     }
     expect(exitCode).toBe(0);
+    // Should contain meeting from notes
+    expect(stdout.toLowerCase()).toContain("meeting");
+    // Should not contain unrelated files
+    expect(stdout.toLowerCase()).not.toContain("api docs");
+  });
+
+  test("filters search by multiple collection names", async () => {
+    // Add a file in the second collection structure that matches the same query
+    await runQmd(["collection", "add", ".", "--name", "mixed", "--mask", "notes/ideas.md"], { dbPath: localDbPath });
+
+    // Both 'notes' and 'mixed' exist but 'docs' doesn't have the word 'meeting'
+    const { stdout, stderr, exitCode } = await runQmd([
+      "search",
+      "-c",
+      "notes",
+      "-c",
+      "docs", // Include one where it won't be found
+      "meeting",
+    ], { dbPath: localDbPath });
+
+    expect(exitCode).toBe(0);
+    // The query should STILL return the match from notes despite 'docs' having no match
+    expect(stdout.toLowerCase()).toContain("meeting");
+
+    const { stdout: stdoutEmptyRef, exitCode: exitCodeEmptyRef } = await runQmd([
+      "search",
+      "-c",
+      "notes",
+      "-c",
+      "nonexistent_collection",
+      "meeting",
+    ], { dbPath: localDbPath });
+
+    expect(exitCodeEmptyRef).toBe(0);
+    // The query should function smoothly even with nonexistent collections as long as valid ones are requested
+    expect(stdoutEmptyRef.toLowerCase()).toContain("meeting");
   });
 });
 
@@ -1072,10 +1108,10 @@ describe("mcp http daemon", () => {
       const pf = pidPath();
       if (existsSync(pf)) {
         const pid = parseInt(readFileSync(pf, "utf-8").trim());
-        try { process.kill(pid, "SIGTERM"); } catch {}
+        try { process.kill(pid, "SIGTERM"); } catch { }
         unlinkSync(pf);
       }
-    } catch {}
+    } catch { }
 
     await rm(daemonTestDir, { recursive: true, force: true });
   });
@@ -1128,7 +1164,7 @@ describe("mcp http daemon", () => {
     // Clean up
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { require("fs").unlinkSync(pidPath()); } catch { }
   });
 
   test("stop kills daemon and removes PID file", async () => {
@@ -1195,7 +1231,7 @@ describe("mcp http daemon", () => {
     // Clean up first daemon
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { require("fs").unlinkSync(pidPath()); } catch { }
   });
 
   test("--daemon cleans stale PID file and starts fresh", async () => {
@@ -1219,6 +1255,6 @@ describe("mcp http daemon", () => {
     expect(ready).toBe(true);
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { require("fs").unlinkSync(pidPath()); } catch { }
   });
 });
