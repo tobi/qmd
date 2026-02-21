@@ -366,6 +366,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
+--explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
@@ -427,6 +428,9 @@ qmd search --md --full "error handling"
 
 # JSON output for scripting
 qmd query --json "quarterly reports"
+
+# Inspect how each result was scored (RRF + rerank blend)
+qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
