@@ -2,13 +2,15 @@
 
 ## [Unreleased]
 
-## [1.0.8] - 2026-02-19
+## [1.1.0] - 2026-02-20
 
-QMD now speaks in **query documents** — structured multi-line queries where each line is typed (`lex:`, `vec:`, `hyde:`, `expand:`), combining keyword precision with semantic recall. A single plain query still works exactly as before. AI agents using the MCP tool get significantly richer search capability: lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical.
+QMD now speaks in **query documents** — structured multi-line queries where each line is typed (`lex:`, `vec:`, `hyde:`, `expand:`), combining keyword precision with semantic recall. A single plain query still works exactly as before. Lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical. The formal query grammar is documented in `docs/SYNTAX.md`.
+
+The npm package now uses the standard `#!/usr/bin/env node` bin convention, replacing the custom bash wrapper. This fixes native module ABI mismatches when installed via bun and works on any platform with node >= 22 on PATH.
 
 ### Changes
 
-- **Query document format**: multi-line queries with typed sub-queries (`lex:`, `vec:`, `hyde:`, `expand:`). Plain queries remain the default (`expand:` implicit). First sub-query gets 2× fusion weight — put your strongest signal first.
+- **Query document format**: multi-line queries with typed sub-queries (`lex:`, `vec:`, `hyde:`, `expand:`). Plain queries remain the default (`expand:` implicit). First sub-query gets 2× fusion weight — put your strongest signal first. Formal grammar in `docs/SYNTAX.md`.
 - **Lex syntax**: full BM25 operator support. `"exact phrase"` for verbatim matching; `-term` and `-"phrase"` for exclusions. Essential for disambiguation when a term is overloaded across domains (e.g. `performance -sports -athlete`).
 - **`expand:` type**: explicit auto-expansion via local LLM. Max one per query document. Identical to the prior default behavior for plain queries.
 - **MCP `query` tool** (renamed from `structured_search`): rewrote the tool description to fully teach AI agents the query document format, lex syntax, and combination strategy. Includes worked examples with intent-aware lex.
@@ -18,6 +20,7 @@ QMD now speaks in **query documents** — structured multi-line queries where ea
 - **Collection `update-cmd`**: attach a shell command that runs before every `qmd update` (e.g. `git stash && git pull --rebase --ff-only && git stash pop`). CLI: `qmd collection update-cmd <name> '<cmd>'`.
 - **`qmd status` tips**: shows actionable tips when collections lack context descriptions or update commands.
 - **`qmd collection` subcommands**: `show`, `update-cmd`, `include`, `exclude`. Bare `qmd collection` now prints help.
+- **Packaging**: replaced custom bash wrapper with standard `#!/usr/bin/env node` shebang on `dist/qmd.js`. Fixes native module ABI mismatches when installed via bun, and works on any platform where node >= 22 is on PATH.
 - **Removed MCP tools** `search`, `vector_search`, `deep_search` — all superseded by `query`.
 - **Removed** `qmd context check` command.
 - **CLI timing**: each LLM step (expand, embed, rerank) prints elapsed time inline (`Expanding query... (4.2s)`).
@@ -26,6 +29,7 @@ QMD now speaks in **query documents** — structured multi-line queries where ea
 
 - `qmd collection list` shows `[excluded]` tag for collections with `includeByDefault: false`.
 - Default searches now respect `includeByDefault` — excluded collections are skipped unless explicitly named.
+- Fix main module detection when installed globally via npm/bun (symlink resolution).
 
 ## [1.0.7] - 2026-02-18
 
