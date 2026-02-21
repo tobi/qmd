@@ -4,17 +4,16 @@
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "bin": {
-    "qmd": "qmd"
+    "qmd": "dist/qmd.js"
   },
   "files": [
     "dist/",
-    "qmd",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/qmd.js > dist/qmd.tmp && mv dist/qmd.tmp dist/qmd.js && chmod +x dist/qmd.js",
     "test": "vitest run --reporter=verbose test/",
     "qmd": "tsx src/qmd.ts",
     "index": "tsx src/qmd.ts index",

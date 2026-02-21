@@ -7,7 +7,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -1068,7 +1068,6 @@ describe("mcp http daemon", () => {
     }
     // Also clean up via PID file if present
     try {
-      const { readFileSync, existsSync, unlinkSync } = require("fs");
       const pf = pidPath();
       if (existsSync(pf)) {
         const pid = parseInt(readFileSync(pf, "utf-8").trim());
@@ -1115,7 +1114,6 @@ describe("mcp http daemon", () => {
     expect(stdout).toContain(`http://localhost:${port}/mcp`);
 
     // PID file should exist
-    const { existsSync, readFileSync } = require("fs");
     expect(existsSync(pidPath())).toBe(true);
 
     const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
@@ -1128,7 +1126,7 @@ describe("mcp http daemon", () => {
     // Clean up
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { unlinkSync(pidPath()); } catch {}
   });
 
   test("stop kills daemon and removes PID file", async () => {
@@ -1139,7 +1137,6 @@ describe("mcp http daemon", () => {
     ]);
     expect(startCode).toBe(0);
 
-    const { readFileSync } = require("fs");
     const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
     spawnedPids.push(pid);
 
@@ -1151,7 +1148,7 @@ describe("mcp http daemon", () => {
     expect(stopOut).toContain("Stopped");
 
     // PID file should be gone
-    expect(require("fs").existsSync(pidPath())).toBe(false);
+    expect(existsSync(pidPath())).toBe(false);
 
     // Process should be dead
     await sleep(500);
@@ -1160,7 +1157,6 @@ describe("mcp http daemon", () => {
 
   test("stop handles dead PID gracefully (cleans stale file)", async () => {
     // Write a PID file pointing to a dead process
-    const { writeFileSync } = require("fs");
     writeFileSync(pidPath(), "999999999");
 
     const { stdout, exitCode } = await runDaemonQmd(["mcp", "stop"]);
@@ -1168,7 +1164,7 @@ describe("mcp http daemon", () => {
     expect(stdout).toContain("stale");
 
     // PID file should be cleaned up
-    expect(require("fs").existsSync(pidPath())).toBe(false);
+    expect(existsSync(pidPath())).toBe(false);
   });
 
   test("--daemon rejects if already running", async () => {
@@ -1179,7 +1175,6 @@ describe("mcp http daemon", () => {
     ]);
     expect(firstCode).toBe(0);
 
-    const { readFileSync } = require("fs");
     const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
     spawnedPids.push(pid);
 
@@ -1195,12 +1190,11 @@ describe("mcp http daemon", () => {
     // Clean up first daemon
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { unlinkSync(pidPath()); } catch {}
   });
 
   test("--daemon cleans stale PID file and starts fresh", async () => {
     // Write a stale PID file
-    const { writeFileSync, readFileSync } = require("fs");
     writeFileSync(pidPath(), "999999999");
 
     const port = randomPort();
@@ -1219,6 +1213,6 @@ describe("mcp http daemon", () => {
     expect(ready).toBe(true);
     process.kill(pid, "SIGTERM");
     await sleep(500);
-    try { require("fs").unlinkSync(pidPath()); } catch {}
+    try { unlinkSync(pidPath()); } catch {}
   });
 });

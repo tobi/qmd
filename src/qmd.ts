@@ -5,7 +5,7 @@ import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join as pathJoin } from "path";
 import { parseArgs } from "util";
-import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
   getPwd,
   getRealPath,
@@ -2384,7 +2384,13 @@ async function showVersion(): Promise<void> {
 }
 
 // Main CLI - only run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts") || process.argv[1]?.endsWith("/qmd.js")) {
+const __filename = fileURLToPath(import.meta.url);
+const argv1 = process.argv[1];
+const isMain = argv1 === __filename
+  || argv1?.endsWith("/qmd.ts")
+  || argv1?.endsWith("/qmd.js")
+  || (argv1 != null && realpathSync(argv1) === __filename);
+if (isMain) {
   const cli = parseCLI();
 
   if (cli.values.version) {

@@ -1,0 +1,21 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      curl ca-certificates bash git build-essential python3 libatomic1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install mise
+ENV MISE_YES=1
+RUN curl https://mise.run | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Pre-install node and bun
+RUN mise use -g node@latest bun@latest
+
+# Copy the packed tarball and test script
+COPY tobilu-qmd-*.tgz /tmp/
+COPY smoke-install-test.sh /tmp/
+RUN chmod +x /tmp/smoke-install-test.sh
+
+CMD ["/tmp/smoke-install-test.sh"]
