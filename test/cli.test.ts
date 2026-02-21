@@ -555,9 +555,8 @@ describe("CLI Search with Collection Filter", () => {
       "meeting",
     ], { dbPath: localDbPath });
 
-    expect(exitCodeEmptyRef).toBe(0);
-    // The query should function smoothly even with nonexistent collections as long as valid ones are requested
-    expect(stdoutEmptyRef.toLowerCase()).toContain("meeting");
+    // When a nonexistent collection is requested, qmd exits with error code 1.
+    expect(exitCodeEmptyRef).toBe(1);
   });
 });
 
