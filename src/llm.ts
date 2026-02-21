@@ -14,6 +14,7 @@ import {
   type LlamaModel,
   type LlamaEmbeddingContext,
   type Token as LlamaToken,
+  type LlamaGpuType,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
@@ -497,26 +498,71 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const isTruthyEnv = (value?: string): boolean => {
+        if (!value) return false;
+        const normalized = value.trim().toLowerCase();
+        return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+      };
 
-      let llama: Llama;
-      if (preferred) {
+      const summarizeError = (error: unknown): string => {
+        const message = error instanceof Error ? error.message : String(error);
+        const firstLine = message.split(/\r?\n/)[0]?.trim() || "unknown error";
+        return firstLine.length > 140 ? `${firstLine.slice(0, 137)}...` : firstLine;
+      };
+
+      const forceCpu = isTruthyEnv(process.env.QMD_FORCE_CPU) || isTruthyEnv(process.env.FORCE_CPU);
+      // Try backends in capability order: CUDA (fastest on NVIDIA), Metal (Apple Silicon),
+      // then Vulkan as a universal fallback. This ensures users with working CUDA/Metal
+      // always get the best backend, while older cards or broken CUDA installs gracefully
+      // fall through to Vulkan rather than dropping straight to CPU.
+      const preferredGpuOrder = ["cuda", "metal", "vulkan"] as const;
+
+      let orderedGpuTypes: LlamaGpuType[] = [];
+      if (!forceCpu) {
+        // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+        // (likely a binary/build config issue in node-llama-cpp).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rawGpuTypes: any[] = await (getLlamaGpuTypes as any)();
+        const availableGpuTypes: LlamaGpuType[] = Array.isArray(rawGpuTypes)
+          ? [...new Set(rawGpuTypes.filter((g): g is LlamaGpuType => typeof g === "string" && g.length > 0))]
+          : [];
+        const orderedByPref: LlamaGpuType[] = preferredGpuOrder
+          .filter(g => availableGpuTypes.includes(g as LlamaGpuType))
+          .map(g => g as LlamaGpuType);
+        const remaining: LlamaGpuType[] = availableGpuTypes.filter(
+          g => !preferredGpuOrder.includes(g as typeof preferredGpuOrder[number])
+        );
+        orderedGpuTypes = [...orderedByPref, ...remaining];
+      }
+
+      const attemptedGpuBackends: LlamaGpuType[] = [];
+      const gpuErrors: string[] = [];
+      let llama: Llama | null = null;
+
+      for (const gpuType of orderedGpuTypes) {
+        attemptedGpuBackends.push(gpuType);
         try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
+          const candidate = await getLlama({ gpu: gpuType, logLevel: LlamaLogLevel.error });
+          if (candidate.gpu) {
+            llama = candidate;
+            break;
+          }
+          gpuErrors.push(`${gpuType}: initialized without GPU`);
+        } catch (error) {
+          gpuErrors.push(`${gpuType}: ${summarizeError(error)}`);
         }
-      } else {
+      }
+
+      if (!llama) {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+      }
+
+      if (forceCpu) {
+        process.stderr.write("QMD Warning: GPU disabled via QMD_FORCE_CPU/FORCE_CPU. Running on CPU.\n");
+      } else if (!llama.gpu && attemptedGpuBackends.length > 0 && gpuErrors.length > 0) {
+        process.stderr.write(
+          `QMD Warning: GPU backends failed (${gpuErrors.join("; ")}). Tried: ${attemptedGpuBackends.join(", ")}.\n`
+        );
       }
 
       if (!llama.gpu) {
