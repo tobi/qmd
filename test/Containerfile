@@ -13,9 +13,17 @@ ENV PATH="/root/.local/bin:$PATH"
 # Pre-install node and bun
 RUN mise use -g node@latest bun@latest
 
-# Copy the packed tarball and test script
+# Copy the packed tarball and install via both package managers
 COPY tobilu-qmd-*.tgz /tmp/
-COPY smoke-install-test.sh /tmp/
-RUN chmod +x /tmp/smoke-install-test.sh
+RUN mise exec node@latest -- npm install -g /tmp/tobilu-qmd-*.tgz
+RUN mise exec bun@latest -- bun install -g /tmp/tobilu-qmd-*.tgz
 
-CMD ["/tmp/smoke-install-test.sh"]
+# Copy test project (src + test + configs) and install deps
+COPY test-src/ /opt/qmd/
+RUN cd /opt/qmd && mise exec node@latest -- npm install 2>/dev/null
+RUN cd /opt/qmd && mise exec bun@latest -- bun install 2>/dev/null || true
+
+# Put everything on PATH
+ENV PATH="/root/.bun/bin:/root/.local/share/mise/shims:/root/.local/bin:$PATH"
+
+CMD ["bash"]
