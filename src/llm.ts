@@ -498,10 +498,10 @@ export class LlamaCpp implements LLM {
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
       // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
+      // Use "supported" to only return GPU types with actual drivers/libraries
+      // installed, rather than the default which returns all valid types for the
+      // platform (e.g. "cuda" on any Linux box even without NVIDIA hardware).
+      const gpuTypes = await getLlamaGpuTypes("supported");
       // Prefer CUDA > Metal > Vulkan > CPU
       const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
 
