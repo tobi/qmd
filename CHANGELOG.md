@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Query: add `--explain` for `qmd query` to expose retrieval score traces
+  in JSON and CLI output. Includes backend scores (FTS/vector), per-list
+  RRF contributions, top-rank bonus, reranker score, and final blended score.
+
 ## [1.0.8] - 2026-02-19
 
 QMD now speaks in **query documents** — structured multi-line queries where each line is typed (`lex:`, `vec:`, `hyde:`, `expand:`), combining keyword precision with semantic recall. A single plain query still works exactly as before. AI agents using the MCP tool get significantly richer search capability: lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical.
@@ -358,4 +364,3 @@ notes, journals, and meeting transcripts.
 [Unreleased]: https://github.com/tobi/qmd/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/tobi/qmd/releases/tag/v1.0.0
 [0.9.0]: https://github.com/tobi/qmd/compare/v0.8.0...v0.9.0
-
