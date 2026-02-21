@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Query: add `--explain` for `qmd query` to expose retrieval score traces
+  in JSON and CLI output. Includes backend scores (FTS/vector), per-list
+  RRF contributions, top-rank bonus, reranker score, and final blended score.
+
 ## [1.1.1] - 2026-03-06
 
 ### Fixes

@@ -62,6 +62,7 @@ import {
   structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
+  type HybridQueryExplain,
   type StructuredSubSearch,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -1767,6 +1768,7 @@ type OutputOptions = {
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
+  explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
 };
@@ -1790,6 +1792,10 @@ function formatScore(score: number): string {
   if (score >= 0.7) return `${c.green}${pct}%${c.reset}`;
   if (score >= 0.4) return `${c.yellow}${pct}%${c.reset}`;
   return `${c.dim}${pct}%${c.reset}`;
+}
+
+function formatExplainNumber(value: number): string {
+  return value.toFixed(4);
 }
 
 // Shorten directory path for display - relative to $HOME (used for context paths, not documents)
@@ -1828,7 +1834,20 @@ function printEmptySearchResults(format: OutputFormat, reason: EmptySearchReason
   console.log("No results found.");
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+type OutputRow = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  score: number;
+  context?: string | null;
+  chunkPos?: number;
+  hash?: string;
+  docid?: string;
+  explain?: HybridQueryExplain;
+};
+
+function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1857,6 +1876,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         ...(row.context && { context: row.context }),
         ...(body && { body }),
         ...(snippet && { snippet }),
+        ...(opts.explain && row.explain && { explain: row.explain }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -1896,6 +1916,28 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       // Line 4: Score
       const score = formatScore(row.score);
       console.log(`Score: ${c.bold}${score}${c.reset}`);
+      if (opts.explain && row.explain) {
+        const explain = row.explain;
+        const ftsScores = explain.ftsScores.length > 0
+          ? explain.ftsScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const vecScores = explain.vectorScores.length > 0
+          ? explain.vectorScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const contribSummary = explain.rrf.contributions
+          .slice()
+          .sort((a, b) => b.rrfContribution - a.rrfContribution)
+          .slice(0, 3)
+          .map(c => `${c.source}/${c.queryType}#${c.rank}:${formatExplainNumber(c.rrfContribution)}`)
+          .join(" | ");
+
+        console.log(`${c.dim}Explain: fts=[${ftsScores}] vec=[${vecScores}]${c.reset}`);
+        console.log(`${c.dim}  RRF: total=${formatExplainNumber(explain.rrf.totalScore)} base=${formatExplainNumber(explain.rrf.baseScore)} bonus=${formatExplainNumber(explain.rrf.topRankBonus)} rank=${explain.rrf.rank}${c.reset}`);
+        console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
+        if (contribSummary.length > 0) {
+          console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
+        }
+      }
       console.log();
 
       // Snippet with highlighting (diff-style header included)
@@ -2179,6 +2221,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
+        explain: !!opts.explain,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2203,6 +2246,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
+        explain: !!opts.explain,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2263,6 +2307,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
@@ -2292,6 +2337,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
+      explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
@@ -2346,6 +2392,7 @@ function parseCLI() {
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
+    explain: !!values.explain,
   };
 
   return {
@@ -2449,6 +2496,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --line-numbers             - Include line numbers in output");
+  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
