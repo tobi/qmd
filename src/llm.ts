@@ -497,26 +497,33 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
+      // Detect available GPU types and use the best supported one.
       // We can't rely on gpu:"auto" — it returns false even when CUDA is available
       // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const gpuTypes = await getLlamaGpuTypes("supported");
+      const preferredOrder = ["cuda", "metal", "vulkan"] as const;
+      const available = preferredOrder.filter(g => gpuTypes.includes(g));
 
-      let llama: Llama;
-      if (preferred) {
+      let llama: Llama | null = null;
+      const failed: string[] = [];
+      for (const gpu of available) {
         try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+          break;
         } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+          failed.push(gpu);
+        }
+      }
+      if (!llama) {
+        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        if (failed.length > 0) {
           process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            `QMD Warning: GPU init failed for ${failed.join(", ")}. Falling back to CPU.\n`
           );
         }
-      } else {
-        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+      }
+      if (!llama) {
+        throw new Error("Failed to initialize llama backend");
       }
 
       if (!llama.gpu) {

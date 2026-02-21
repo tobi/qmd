@@ -193,22 +193,28 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════════════\n");
 
   // Detect GPU
-  const gpuTypes = await getLlamaGpuTypes();
-  const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+  const gpuTypes = await getLlamaGpuTypes("supported");
+  const preferredOrder = ["cuda", "metal", "vulkan"] as const;
+  const available = preferredOrder.filter(g => gpuTypes.includes(g));
 
-  let llama: Llama;
+  let llama: Llama | null = null;
   let gpuLabel: string;
-  if (preferred) {
+  const failed: string[] = [];
+  for (const gpu of available) {
     try {
-      llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-      gpuLabel = `${preferred}`;
+      llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+      gpuLabel = gpu;
+      break;
     } catch {
-      llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-      gpuLabel = "cpu (gpu init failed)";
+      failed.push(gpu);
     }
-  } else {
+  }
+  if (!llama) {
     llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-    gpuLabel = "cpu";
+    gpuLabel = failed.length > 0 ? "cpu (gpu init failed)" : "cpu";
+  }
+  if (!llama) {
+    throw new Error("Failed to initialize llama backend");
   }
 
   // System info
