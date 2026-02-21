@@ -24,7 +24,12 @@
 
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bun pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.bun
+            pkgs.cmake
+            pkgs.makeWrapper
+            pkgs.nodejs_22
+          ];
 
           buildInputs = [ pkgs.sqlite ];
 
@@ -43,6 +48,8 @@
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/qmd.ts" \
+              --prefix PATH : ${pkgs.cmake}/bin \
+              --prefix PATH : ${pkgs.nodejs_22}/bin \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
               --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
           '';
@@ -69,6 +76,9 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.bun
+            pkgs.cmake
+            pkgs.makeWrapper
+            pkgs.nodejs_22
             sqliteWithExtensions
           ];
 
