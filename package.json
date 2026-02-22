@@ -40,7 +40,7 @@
     "@modelcontextprotocol/sdk": "^1.25.1",
     "better-sqlite3": "^11.0.0",
     "fast-glob": "^3.3.0",
-    "node-llama-cpp": "^3.14.5",
+    "node-llama-cpp": "^3.16.0",
     "picomatch": "^4.0.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",

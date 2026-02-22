@@ -17,3 +17,5 @@ texts/
 finetune/outputs/
 finetune/data/train/
 .claude/
+.direnv/
+.envrc
