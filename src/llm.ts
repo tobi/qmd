@@ -24,18 +24,33 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // =============================================================================
 
 /**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
+ * Check whether a model URI refers to a Jina v5 embedding model.
  */
-export function formatQueryForEmbedding(query: string): string {
+export function isJinaV5Model(modelUri: string): boolean {
+  return modelUri.includes("jina-embeddings-v5");
+}
+
+/**
+ * Format a query for embedding.
+ * EmbeddingGemma uses nomic-style: "task: search result | query: {query}"
+ * Jina v5 uses prefix format: "Query: {query}"
+ */
+export function formatQueryForEmbedding(query: string, modelUri?: string): string {
+  if (modelUri && isJinaV5Model(modelUri)) {
+    return `Query: ${query}`;
+  }
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * EmbeddingGemma uses nomic-style: "title: {title} | text: {content}"
+ * Jina v5 uses prefix format: "Document: {content}"
  */
-export function formatDocForEmbedding(text: string, title?: string): string {
+export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  if (modelUri && isJinaV5Model(modelUri)) {
+    return title ? `Document: ${title} ${text}` : `Document: ${text}`;
+  }
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -178,6 +193,12 @@ const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+
+// Alternative embedding models:
+// Jina Embeddings v5 - task-targeted distillation, multilingual, longer context
+// Uses "Query: " / "Document: " prefix format (not nomic-style task/title format)
+export const JINA_V5_NANO_EMBED_MODEL = "hf:jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF/v5-nano-retrieval-Q8_0.gguf";
+export const JINA_V5_SMALL_EMBED_MODEL = "hf:jinaai/jina-embeddings-v5-text-small-retrieval-GGUF/v5-small-retrieval-Q8_0.gguf";
 
 // Alternative generation models for query expansion:
 // LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
@@ -392,6 +413,13 @@ export class LlamaCpp implements LLM {
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  /**
+   * Get the configured embedding model URI.
+   */
+  getEmbedModelUri(): string {
+    return this.embedModelUri;
   }
 
   /**
