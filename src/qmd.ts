@@ -1298,7 +1298,7 @@ function collectionList(): void {
   for (const coll of collections) {
     const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
     const timeAgo = formatTimeAgo(updatedAt);
-    
+
     // Get YAML config to check includeByDefault
     const yamlColl = getCollectionFromYaml(coll.name);
     const excluded = yamlColl?.includeByDefault === false;
@@ -1998,14 +1998,11 @@ function search(query: string, opts: OutputOptions): void {
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const effectiveCollections = collectionNames.length > 0 ? collectionNames : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  const results = searchFTS(db, query, fetchLimit, effectiveCollections);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2053,13 +2050,13 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const effectiveCollections = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+      collection: effectiveCollections,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -2069,14 +2066,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       },
     });
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
 
     closeDb();
 
@@ -2107,7 +2096,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const effectiveCollections = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
@@ -2121,7 +2110,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       // Structured search — user provided their own query expansions
       const typeLabels = structuredQueries.map(s => s.type).join('+');
       process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      
+
       // Log each sub-query
       for (const s of structuredQueries) {
         let preview = s.query.replace(/\n/g, ' ');
@@ -2131,7 +2120,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
+        collection: effectiveCollections,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {
@@ -2154,7 +2143,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     } else {
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
-        collection: singleCollection,
+        collection: effectiveCollections,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         hooks: {
@@ -2184,14 +2173,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
-      });
-    }
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
       });
     }
 
