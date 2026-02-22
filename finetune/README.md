@@ -47,7 +47,8 @@ uv run eval.py tobil/qmd-query-expansion-1.7B
 uv run convert_gguf.py --size 1.7B
 
 # NOTE: GRPO is currently experimental and moved to finetune/experiments/grpo
-# if you want to run it manually, use uv run python experiments/grpo/grpo.py
+# if you want to run it manually, use:
+#   cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ### Local training (if you have a GPU)
@@ -56,7 +57,7 @@ uv run convert_gguf.py --size 1.7B
 uv run train.py sft  --config configs/sft.yaml
 
 # Experimental GRPO
-uv run train.py grpo --config experiments/grpo/grpo.yaml
+cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ### Monitoring HF Jobs
@@ -138,7 +139,7 @@ It is not part of the default production path for this repository.
 
 ```bash
 # Optional experimental GRPO run
-uv run train.py grpo --config experiments/grpo/grpo.yaml
+cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ## Evaluation

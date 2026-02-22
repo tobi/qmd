@@ -83,11 +83,8 @@ hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 ### Stage 2: (Experimental) GRPO
 
 ```bash
-# Local (optional; experimental)
-uv run train.py grpo --config experiments/grpo/grpo.yaml
-
 # Experimental script
-HF_TOKEN=${HF_TOKEN} uv run experiments/grpo/grpo.py
+cd finetune && HF_TOKEN=${HF_TOKEN} uv run python experiments/grpo/grpo.py
 ```
 
 ### HuggingFace Jobs
