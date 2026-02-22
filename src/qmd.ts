@@ -1609,7 +1609,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (!firstChunk) {
       throw new Error("No chunks available to embed");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+    const embedModelUri = getDefaultLlamaCpp().getEmbedModelUri();
+    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
     const firstResult = await session.embed(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1628,7 +1629,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const batch = allChunks.slice(batchStart, batchEnd);
 
       // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
       try {
         // Batch embed all texts at once
@@ -1652,7 +1653,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         // If batch fails, try individual embeddings as fallback
         for (const chunk of batch) {
           try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
             const result = await session.embed(text);
             if (result) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);

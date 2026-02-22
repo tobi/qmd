@@ -252,9 +252,18 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
+| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
+
+**Alternative embedding models** (configure via `LlamaCppConfig.embedModel`):
+
+| Model | Params | Dimensions | Max Tokens | MTEB-EN | MMTEB | Size (Q8) |
+|-------|--------|------------|------------|---------|-------|-----------|
+| `jina-embeddings-v5-text-nano` | 239M | 768 | 8,192 | 71.0 | 65.5 | ~250MB |
+| `jina-embeddings-v5-text-small` | 677M | 1,024 | 32,768 | 71.7 | 67.0 | ~710MB |
+
+Jina v5 models use `Query: ` / `Document: ` task prefixes (auto-detected when configured).
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
@@ -599,16 +608,30 @@ Models are configured in `src/llm.ts` as HuggingFace URIs:
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+
+// Alternative: Jina Embeddings v5 (multilingual, longer context, higher quality)
+const JINA_V5_NANO  = "hf:jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF/v5-nano-retrieval-Q8_0.gguf";
+const JINA_V5_SMALL = "hf:jinaai/jina-embeddings-v5-text-small-retrieval-GGUF/v5-small-retrieval-Q8_0.gguf";
 ```
 
-### EmbeddingGemma Prompt Format
+### Embedding Prompt Formats
 
+**EmbeddingGemma** (default):
 ```
 // For queries
 "task: search result | query: {query}"
 
 // For documents
 "title: {title} | text: {content}"
+```
+
+**Jina v5** (auto-detected when configured):
+```
+// For queries
+"Query: {query}"
+
+// For documents
+"Document: {content}"
 ```
 
 ### Qwen3-Reranker

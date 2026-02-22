@@ -21,6 +21,7 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  isJinaV5Model,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -1352,7 +1353,7 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
-export { formatQueryForEmbedding, formatDocForEmbedding };
+export { formatQueryForEmbedding, formatDocForEmbedding, isJinaV5Model };
 
 export function chunkDocument(
   content: string,
@@ -2231,7 +2232,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const embedModelUri = getDefaultLlamaCpp().getEmbedModelUri();
+  const formattedText = isQuery ? formatQueryForEmbedding(text, embedModelUri) : formatDocForEmbedding(text, undefined, embedModelUri);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
@@ -2974,7 +2976,8 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getDefaultLlamaCpp();
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const embedModelUri = llm.getEmbedModelUri();
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModelUri));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
@@ -3272,7 +3275,8 @@ export async function structuredSearch(
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
       const llm = getDefaultLlamaCpp();
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const embedModelUri = llm.getEmbedModelUri();
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModelUri));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
