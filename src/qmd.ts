@@ -1950,46 +1950,53 @@ function filterByCollections<T extends { filepath?: string; file?: string }>(res
  *   "CAP\nconsistency"               -> throws (multiple plain lines)
  */
 function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
-  const lines = query.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-  if (lines.length === 0) return null;
+  const rawLines = query.split('\n').map((line, idx) => ({
+    raw: line,
+    trimmed: line.trim(),
+    number: idx + 1,
+  })).filter(line => line.trimmed.length > 0);
 
-  const prefixRe = /^(lex|vec|hyde|expand):\s*/i;
-  const searches: StructuredSubSearch[] = [];
-  const plainLines: string[] = [];
+  if (rawLines.length === 0) return null;
 
-  for (const line of lines) {
-    const match = line.match(prefixRe);
-    if (match) {
-      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde' | 'expand';
-      const text = line.slice(match[0].length).trim();
-      if (text.length > 0) {
-        searches.push({ type, query: text });
+  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const expandRe = /^expand:\s*/i;
+  const typed: StructuredSubSearch[] = [];
+
+  for (const line of rawLines) {
+    if (expandRe.test(line.trimmed)) {
+      if (rawLines.length > 1) {
+        throw new Error(`Line ${line.number} starts with expand:, but query documents cannot mix expand with typed lines. Submit a single expand query instead.`);
       }
-    } else {
-      plainLines.push(line);
+      const text = line.trimmed.replace(expandRe, '').trim();
+      if (!text) {
+        throw new Error('expand: query must include text.');
+      }
+      return null; // treat as standalone expand query
     }
+
+    const match = line.trimmed.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
+      const text = line.trimmed.slice(match[0].length).trim();
+      if (!text) {
+        throw new Error(`Line ${line.number} (${type}:) must include text.`);
+      }
+      if (/\r|\n/.test(text)) {
+        throw new Error(`Line ${line.number} (${type}:) contains a newline. Keep each query on a single line.`);
+      }
+      typed.push({ type, query: text, line: line.number });
+      continue;
+    }
+
+    if (rawLines.length === 1) {
+      // Single plain line -> implicit expand
+      return null;
+    }
+
+    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde: prefix. Each line in a query document must start with one.`);
   }
 
-  // All plain lines, no prefixes -> null (use normal expansion)
-  if (searches.length === 0 && plainLines.length === 1) {
-    return null;
-  }
-
-  // Multiple plain lines without prefixes -> ambiguous, error
-  if (plainLines.length > 1) {
-    throw new Error(
-      `Ambiguous query: multiple lines without lex:/vec:/hyde: prefix.\n` +
-      `Either use a single line (for query expansion) or prefix each line.\n` +
-      `Example:\n  lex: keyword terms\n  vec: natural language question\n  hyde: hypothetical answer passage`
-    );
-  }
-
-  // Mix of prefixed and one plain line -> treat plain as lex
-  if (plainLines.length === 1) {
-    searches.unshift({ type: 'lex', query: plainLines[0]! });
-  }
-
-  return searches.length > 0 ? searches : null;
+  return typed.length > 0 ? typed : null;
 }
 
 function search(query: string, opts: OutputOptions): void {
@@ -2239,6 +2246,7 @@ function parseCLI() {
       },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
+      skill: { type: "boolean" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2311,58 +2319,104 @@ function parseCLI() {
   };
 }
 
+function showSkill(): void {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const relativePath = pathJoin("skills", "qmd", "SKILL.md");
+  const skillPath = pathJoin(scriptDir, "..", relativePath);
+
+  console.log(`QMD Skill (${relativePath})`);
+  console.log(`Location: ${skillPath}`);
+  console.log("");
+
+  if (!existsSync(skillPath)) {
+    console.error("SKILL.md not found. If you built from source, ensure skills/qmd/SKILL.md exists.");
+    return;
+  }
+
+  const content = readFileSync(skillPath, "utf-8");
+  process.stdout.write(content.endsWith("\n") ? content : content + "\n");
+}
+
 function showHelp(): void {
+  console.log("qmd — Quick Markdown Search");
+  console.log("");
   console.log("Usage:");
-  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create/index collection");
-  console.log("  qmd collection list           - List all collections with details");
-  console.log("  qmd collection remove <name>  - Remove a collection by name");
-  console.log("  qmd collection rename <old> <new>  - Rename a collection");
-  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
-  console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
-  console.log("  qmd context list              - List all contexts");
-  console.log("  qmd context rm <path>         - Remove context");
-  console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
-  console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
-  console.log("  qmd status                    - Show index status and collections");
-  console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (900 tokens/chunk, 15% overlap)");
-  console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
-  console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
-  console.log("  qmd query 'lex:..\\nvec:...'   - Structured search (you provide lex/vec/hyde queries)");
-  console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
-  console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
-  console.log("  qmd mcp                       - Start MCP server (stdio transport)");
-  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
-  console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
-  console.log("  qmd mcp stop                  - Stop background MCP daemon");
+  console.log("  qmd <command> [options]");
+  console.log("");
+  console.log("Primary commands:");
+  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
+  console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
+  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
+  console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
+  console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
+  console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("");
+  console.log("Collections & context:");
+  console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
+  console.log("  qmd context add/list/rm                      - Attach human-written summaries");
+  console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
+  console.log("");
+  console.log("Maintenance:");
+  console.log("  qmd status                    - View index + collection health");
+  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("Query syntax (qmd query):");
+  console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
+  console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
+  console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
+  console.log("");
+  const grammar = [
+    `query          = expand_query | query_document ;`,
+    `expand_query   = text | explicit_expand ;`,
+    `explicit_expand= "expand:" text ;`,
+    `query_document = { typed_line } ;`,
+    `typed_line     = type ":" text newline ;`,
+    `type           = "lex" | "vec" | "hyde" ;`,
+    `text           = quoted_phrase | plain_text ;`,
+    `quoted_phrase  = '"' { character } '"' ;`,
+    `plain_text     = { character } ;`,
+    `newline        = "\\n" ;`,
+  ];
+  console.log("  Grammar:");
+  for (const line of grammar) {
+    console.log(`    ${line}`);
+  }
+  console.log("");
+  console.log("  Examples:");
+  console.log("    qmd query \"how does auth work\"                # single-line → implicit expand");
+  console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
+  console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
+  console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
+  console.log("");
+  console.log("  Constraints:");
+  console.log("    - Standalone expand queries cannot mix with typed lines.");
+  console.log("    - Query documents allow only lex:, vec:, or hyde: prefixes.");
+  console.log("    - Each typed line must be single-line text with balanced quotes.");
+  console.log("");
+  console.log("AI agents & integrations:");
+  console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
+  console.log("  - `qmd --skill` prints the packaged skills/qmd/SKILL.md (path + contents).");
+  console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
-  console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  --index <name>             - Use a named index (default: index)");
   console.log("");
   console.log("Search options:");
-  console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
-  console.log("  --all                      - Return all matches (use with --min-score to filter)");
+  console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
+  console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  --line-numbers             - Add line numbers to output");
-  console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
-  console.log("  --json                     - JSON output with snippets (default: 20 results)");
-  console.log("  --csv                      - CSV output with snippets");
-  console.log("  --md                       - Markdown output");
-  console.log("  --xml                      - XML output");
-  console.log("  -c, --collection <name>    - Filter results to a specific collection");
-  console.log("");
-  console.log("Structured queries (qmd query):");
-  console.log("  Prefix lines with lex:, vec:, or hyde: to skip automatic expansion.");
-  console.log("  lex:  BM25 keyword search (exact terms)");
-  console.log("  vec:  Vector similarity (natural language question)");
-  console.log("  hyde: Vector similarity (hypothetical answer passage)");
-  console.log("  Example: qmd query $'lex: CAP theorem\\nvec: consistency vs availability tradeoff'");
+  console.log("  --line-numbers             - Include line numbers in output");
+  console.log("  --files | --json | --csv | --md | --xml  - Output format");
+  console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
-  console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
+  console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2395,6 +2449,11 @@ if (isMain) {
 
   if (cli.values.version) {
     await showVersion();
+    process.exit(0);
+  }
+
+  if (cli.values.skill) {
+    showSkill();
     process.exit(0);
   }
 
