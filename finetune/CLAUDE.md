@@ -18,6 +18,22 @@ vec: another semantic variation
 - `lex:` lines for BM25 keyword search (1-3 lines, short keywords)
 - `vec:` lines for vector similarity search (1-3 lines, natural language)
 
+## Training Data Format
+
+**There is exactly one JSONL format.** Every file in `data/*.jsonl` must match the strict Pydantic schema in `dataset/schema.py`:
+
+```json
+{"query": "auth config", "output": [["hyde", "..."], ["lex", "..."], ["vec", "..."]]}
+```
+
+- `query`: non-empty string
+- `output`: list of `[type, text]` pairs where type is `"lex"`, `"vec"`, or `"hyde"`
+- Extra metadata fields (`category`, `intent`, `is_short`) are allowed but ignored
+
+The schema is enforced by `dataset/schema.py:TrainingExample` (Pydantic model). All data loading goes through `load_examples()` which fails loudly on invalid data. No format alternatives, no legacy fallbacks.
+
+**All `.jsonl` files in `data/` are concatenated and deduplicated for training runs.** The prepared train/val files in `data/train/` are ephemeral build artifacts.
+
 ## HuggingFace Repositories
 
 | Repository | Purpose |
@@ -33,72 +49,34 @@ vec: another semantic variation
 - Only push when eval scores improve over current deployed model
 - Always include eval results in model card when pushing
 
-## Training Data
-
-All JSONL files in `data/` are training data:
-
-```
-data/
-├── qmd_expansion_v2.jsonl
-├── qmd_expansion_handcrafted_only.jsonl
-├── qmd_only_sampled.jsonl
-├── qmd_only_variants.jsonl
-└── ... any additional .jsonl files
-```
-
-**All `.jsonl` files in `data/` should be concatenated for training runs.**
-
-Each JSONL line: `{"input": "query", "output": "hyde:...\nlex:...\nvec:..."}`
-
-## Data Generation Tools
+## Dataset Tools
 
 | Script | Purpose |
 |--------|---------|
-| `dataset/generate_data.py` | Generate via Claude API (high quality) |
-| `dataset/generate_data_offline.py` | Transform from HuggingFace datasets |
-| `dataset/prepare_data.py` | Format for Qwen3 chat template |
-| `dataset/clean_data.py` | Detect and fix technical term issues |
-| `generate_only_variants.py` | Generate `/only:lex` and `/only:vec` variants |
-
-## Local Training Output
-
-All training outputs go to `outputs/` (gitignored):
-
-```
-outputs/
-├── sft/           # SFT checkpoint
-└── grpo/          # GRPO checkpoint
-```
+| `dataset/schema.py` | Pydantic `TrainingExample` model + `load_examples()` |
+| `dataset/prepare_data.py` | Load via schema, apply Qwen3 chat template, dedup, split |
+| `dataset/validate_schema.py` | Validate all JSONL files against schema |
+| `dataset/score_data.py` | Score all examples using reward.py |
+| `dataset/analyze_data.py` | Analyze distribution and quality |
 
 ## Training Pipeline
 
 Always use **Qwen3-1.7B** as the base model unless explicitly stated otherwise.
 
-Training can run **locally** (requires CUDA GPU) or via **HuggingFace Jobs** (cloud GPU, no local hardware needed).
-
 ### Stage 0: Prepare Data
 
-Raw data in `data/*.jsonl` must be converted to Qwen3 chat format before training:
-
 ```bash
-# Process all JSONL files in data/
 uv run dataset/prepare_data.py
-# Creates: data/train/train.jsonl, data/train/val.jsonl
-
-# Or process a specific file
-uv run dataset/prepare_data.py --input data/qmd_expansion_v2.jsonl
+# Creates: data/train/train.jsonl, data/train/val.jsonl (ephemeral)
 ```
-
-This applies the Qwen3 chat template, deduplicates, and splits into train/val sets.
 
 ### Stage 1: SFT
 
 ```bash
 # Local (requires CUDA)
 uv run train.py sft --config configs/sft.yaml
-# Output: outputs/sft/
 
-# Cloud (HuggingFace Jobs - no local GPU needed)
+# Cloud (HuggingFace Jobs)
 hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 ```
 
@@ -107,15 +85,12 @@ hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 ```bash
 # Local (requires CUDA)
 uv run train.py grpo --config configs/grpo.yaml
-# Output: outputs/grpo/
 
-# Cloud (HuggingFace Jobs - no local GPU needed)
+# Cloud (HuggingFace Jobs)
 hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 4h jobs/grpo.py
 ```
 
 ### HuggingFace Jobs
-
-If no local CUDA device is available, use `hf jobs` to run training in the cloud:
 
 ```bash
 hf jobs ps                    # List running jobs
@@ -124,18 +99,11 @@ hf jobs inspect <job-id>      # Check status
 hf jobs cancel <job-id>       # Cancel a job
 ```
 
-The `jobs/` directory contains self-contained scripts that include all dependencies inline.
-
 ### Evaluation
 
 ```bash
-# Eval local model
 uv run eval.py --model ./outputs/grpo
-
-# Eval HuggingFace model
 uv run eval.py --model tobil/qmd-query-expansion-1.7B
-
-# Save eval results to file
 uv run eval.py --model ./outputs/grpo -o eval_results.json
 ```
 
@@ -144,27 +112,26 @@ uv run eval.py --model ./outputs/grpo -o eval_results.json
 `reward.py` is the single source of truth for scoring:
 
 ```bash
-# Self-test the reward function
-uv run reward.py
+uv run reward.py   # Self-test
 ```
 
 See `SCORING.md` for the full rubric.
 
-## Deployment Rules
+## Experiments
 
-**Never upload without eval.** Every model push must include eval results.
+Experimental training configurations live in `experiments/`:
 
-### Checklist
+```
+experiments/
+├── lfm2/          # LiquidAI LFM2-1.2B (hybrid architecture, faster inference)
+│   ├── sft_lfm2.yaml
+│   └── sft_lfm2.py
+└── gepa/          # DSPy-based prompt optimization (GEPA)
+    ├── dspy_gepa.py
+    └── ...
+```
 
-1. Train SFT on all `data/*.jsonl` → `outputs/sft/`
-2. Train GRPO on top of SFT → `outputs/grpo/`
-3. **Run eval on local model**: `uv run eval.py --model ./outputs/grpo -o eval_results.json`
-4. Compare against current deployed model's eval
-5. If eval improves:
-   - Push to `tobil/qmd-query-expansion-1.7B`
-   - **Include eval output in the model card / commit message**
-6. Convert to GGUF and update `tobil/qmd-query-expansion-1.7B-gguf`
-7. Update `src/llm.ts` DEFAULT_GENERATE_MODEL if repo name changed
+These are not part of the main training pipeline.
 
 ## Key Files
 
@@ -176,10 +143,12 @@ finetune/
 ├── convert_gguf.py    # GGUF conversion
 ├── SCORING.md         # Detailed scoring rubric
 ├── CLAUDE.md          # This file
-├── data/              # All training JSONL files
-├── outputs/           # Local training outputs (gitignored)
-├── dataset/           # Data generation scripts
+├── Justfile           # Common commands
+├── data/              # All training JSONL files (strict schema)
+├── dataset/           # Schema + data tools (Pydantic-based)
 ├── jobs/              # Self-contained HuggingFace Jobs scripts
 ├── configs/           # Training configs (sft.yaml, grpo.yaml)
-└── evals/             # Test queries and results
+├── evals/             # Test queries
+├── experiments/       # Experimental configs (LFM2, GEPA)
+└── outputs/           # Local training outputs (gitignored)
 ```

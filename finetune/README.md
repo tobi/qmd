@@ -92,20 +92,19 @@ finetune/
 │   ├── sft.py         # Self-contained SFT for HuggingFace Jobs
 │   ├── grpo.py        # Self-contained GRPO for HuggingFace Jobs
 │   ├── eval.py        # Self-contained eval for HuggingFace Jobs
-│   ├── eval_common.py # Shared eval utilities
-│   └── quantize.py    # GGUF quantization for HuggingFace Jobs
+│   └── eval_common.py # Shared eval utilities
 ├── configs/
 │   ├── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
 │   └── grpo.yaml      # GRPO hyperparameters for Qwen3-1.7B
 ├── evals/
 │   └── queries.txt    # 31 test queries across 8 categories
-├── data/
-│   └── qmd_expansion_v2.jsonl  # Source training data (1,000 high-quality examples)
+├── data/              # Training JSONL files (all concatenated for training)
 ├── dataset/
-│   ├── generate_data.py         # Generate data via Claude API
-│   ├── generate_data_offline.py # Generate from existing HF dataset
-│   ├── prepare_data.py          # Format for Qwen3 chat template
-│   └── clean_data.py            # Detect technical term misinterpretations
+│   ├── prepare_data.py     # Format for Qwen3 chat template, dedup, split
+│   ├── schema.py           # Parse/normalize output format
+│   ├── validate_schema.py  # Validate JSONL against schema
+│   ├── score_data.py       # Score all examples using reward.py
+│   └── analyze_data.py     # Analyze distribution and quality
 ├── SCORING.md         # Detailed scoring rubric reference
 └── README.md          # This file
 ```
@@ -122,7 +121,7 @@ Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 | Method | LoRA (rank 16, alpha 32) |
 | Target modules | All projection layers (q/k/v/o/gate/up/down) |
 | Dataset | ~2,290 examples (train split) |
-| Effective batch size | 16 (4 × 4 gradient accumulation) |
+| Effective batch size | 16 (4 x 4 gradient accumulation) |
 | Epochs | 5 |
 | Learning rate | 2e-4 (cosine schedule) |
 
@@ -173,9 +172,6 @@ uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -v
 
 # Save detailed scores to JSON
 uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -o scores.json
-
-# Score an existing JSONL file (backwards compat with old run.py output)
-uv run eval.py --score-only evals/results_old.jsonl
 ```
 
 ## Reward Function
@@ -212,9 +208,6 @@ quantized GGUF files for deployment:
 # Use preset for 1.7B
 uv run convert_gguf.py --size 1.7B
 
-# Use preset for 4B
-uv run convert_gguf.py --size 4B
-
 # Custom models
 uv run convert_gguf.py --base Qwen/Qwen3-1.7B \
                        --sft tobil/qmd-query-expansion-1.7B-sft \
@@ -235,26 +228,19 @@ ollama run qmd-expand
 
 ## Data Pipeline
 
-The training data (1,000 examples in `data/qmd_expansion_v2.jsonl`) was generated
-from two sources and cleaned for quality. To regenerate:
+All JSONL files in `data/` are concatenated for training. To prepare for training:
 
 ```bash
-# Generate from existing HuggingFace dataset (bulk, no API needed)
-uv run dataset/generate_data_offline.py
-
-# Generate via Claude API (higher quality, needs ANTHROPIC_API_KEY)
-uv run dataset/generate_data.py --count 100
-
-# Detect and fix technical term misinterpretations
-uv run dataset/clean_data.py
-
-# Format for Qwen3 chat template, add short-query augmentation, split train/val
+# Format for Qwen3 chat template, deduplicate, split train/val
 uv run dataset/prepare_data.py
+
+# Validate data quality
+just validate
 ```
 
 ## Architecture Notes
 
-The two-stage training approach (SFT → GRPO) is standard for structured-output models:
+The two-stage training approach (SFT -> GRPO) is standard for structured-output models:
 
 1. **SFT** establishes format compliance and basic query understanding. It uses
    a large LoRA (rank 16, all projection layers) because it needs to learn a
@@ -297,42 +283,3 @@ deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubri
 |-------|--------------|-----------------|
 | SFT | 92.0% | 30/30 |
 | GRPO | 91.7% | 30/30 |
-
-## Alternative Base Models
-
-### LiquidAI LFM2 (Experimental)
-
-[LFM2](https://www.liquid.ai/blog/liquid-foundation-models-v2-our-second-series-of-generative-ai-models) 
-is a hybrid architecture from Liquid AI optimized for on-device inference. It uses
-a novel combination of convolutions and attention that achieves 2x faster decode
-and prefill speed compared to standard transformers.
-
-**Why LFM2 for query expansion:**
-- **Faster inference**: Lower latency for real-time search applications
-- **Memory efficient**: Smaller memory footprint than equivalent transformers
-- **Edge-optimized**: Can run on mobile devices and embedded systems
-- **Good at agentic tasks**: LiquidAI recommends LFM2 for RAG and data extraction
-
-**Training with LFM2:**
-
-```bash
-# SFT with LFM2-1.2B base model
-uv run train.py sft --config configs/sft_lfm2.yaml
-
-# Evaluate the trained model
-uv run eval.py --model outputs/sft-lfm2
-
-# Convert to GGUF for deployment
-uv run convert_gguf.py --base LiquidAI/LFM2-1.2B \
-                       --sft outputs/sft-lfm2 \
-                       --output tobil/qmd-query-expansion-lfm2-gguf
-```
-
-**Key differences from Qwen3:**
-- Different LoRA target modules: `q_proj, k_proj, v_proj, out_proj, in_proj, w1, w2, w3`
-- Recommended generation parameters: `temp=0.3, min_p=0.15, repetition_penalty=1.05`
-- Requires transformers >= 4.55.0 for architecture support
-
-**Pre-trained GGUF models:**
-- Base: `hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf` (~731 MB)
-- Instruct: `hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf` (~731 MB)
