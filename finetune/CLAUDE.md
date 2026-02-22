@@ -38,11 +38,11 @@ The schema is enforced by `dataset/schema.py:TrainingExample` (Pydantic model). 
 
 | Repository | Purpose |
 |------------|---------|
-| `tobil/qmd-query-expansion-1.7B` | Final merged model (SFT + GRPO) |
+| `tobil/qmd-query-expansion-1.7B` | Final merged model (SFT baseline) |
 | `tobil/qmd-query-expansion-1.7B-gguf` | GGUF quantized versions for deployment |
 | `tobil/qmd-query-expansion-1.7B-sft` | SFT adapter checkpoint (intermediate) |
-| `tobil/qmd-query-expansion-1.7B-grpo` | GRPO adapter checkpoint (intermediate) |
 | `tobil/qmd-query-expansion-train` | Prepared training dataset |
+| `tobil/qmd-query-expansion-1.7B-grpo` | Experimental GRPO adapter (optional) |
 
 **Rules:**
 - No versioned repos (`-v1`, `-v2`, `-v4`, etc.) - update in place
@@ -80,14 +80,14 @@ uv run train.py sft --config configs/sft.yaml
 hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 ```
 
-### Stage 2: GRPO
+### Stage 2: (Experimental) GRPO
 
 ```bash
-# Local (requires CUDA)
-uv run train.py grpo --config configs/grpo.yaml
+# Local (optional; experimental)
+uv run train.py grpo --config experiments/grpo/grpo.yaml
 
-# Cloud (HuggingFace Jobs)
-hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 4h jobs/grpo.py
+# Experimental script
+HF_TOKEN=${HF_TOKEN} uv run experiments/grpo/grpo.py
 ```
 
 ### HuggingFace Jobs
@@ -102,9 +102,9 @@ hf jobs cancel <job-id>       # Cancel a job
 ### Evaluation
 
 ```bash
-uv run eval.py --model ./outputs/grpo
-uv run eval.py --model tobil/qmd-query-expansion-1.7B
-uv run eval.py --model ./outputs/grpo -o eval_results.json
+uv run eval.py ./outputs/sft
+uv run eval.py tobil/qmd-query-expansion-1.7B
+uv run eval.py ./outputs/sft -o eval_results.json
 ```
 
 ## Quality Scoring
@@ -126,6 +126,9 @@ experiments/
 ├── lfm2/          # LiquidAI LFM2-1.2B (hybrid architecture, faster inference)
 │   ├── sft_lfm2.yaml
 │   └── sft_lfm2.py
+├── grpo/          # Experimental GRPO recipe and config
+│   ├── grpo.py
+│   └── grpo.yaml
 └── gepa/          # DSPy-based prompt optimization (GEPA)
     ├── dspy_gepa.py
     └── ...
@@ -138,7 +141,7 @@ These are not part of the main training pipeline.
 ```
 finetune/
 ├── reward.py          # Scoring function (single source of truth)
-├── train.py           # Unified SFT + GRPO training
+├── train.py           # SFT training entrypoint
 ├── eval.py            # Generate and score expansions
 ├── convert_gguf.py    # GGUF conversion
 ├── SCORING.md         # Detailed scoring rubric
@@ -147,8 +150,8 @@ finetune/
 ├── data/              # All training JSONL files (strict schema)
 ├── dataset/           # Schema + data tools (Pydantic-based)
 ├── jobs/              # Self-contained HuggingFace Jobs scripts
-├── configs/           # Training configs (sft.yaml, grpo.yaml)
+├── configs/           # Training configs (sft.yaml)
 ├── evals/             # Test queries
-├── experiments/       # Experimental configs (LFM2, GEPA)
+├── experiments/       # Experimental configs (LFM2, GEPA, GRPO)
 └── outputs/           # Local training outputs (gitignored)
 ```

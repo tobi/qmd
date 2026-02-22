@@ -26,6 +26,9 @@ train-local:
     HF_TOKEN=${HF_TOKEN} uv run torchrun --standalone --nproc_per_node auto \
       train.py sft --config configs/sft_local.yaml |& tee /tmp/qmd-sft-train.log
 
-grpo-local:
-    CUDA_VISIBLE_DEVICES=1,2,3 HF_TOKEN=${HF_TOKEN} uv run torchrun --standalone --nproc_per_node 3 \
-      train.py grpo --config configs/grpo.yaml |& tee /tmp/qmd-grpo-train.log
+# Experimental GRPO training is in finetune/experiments/grpo and not part of
+# the default pipeline.
+#
+# grpo-local:
+#   HF_TOKEN=${HF_TOKEN} uv run train.py grpo --config experiments/grpo/grpo.yaml |& tee /tmp/qmd-grpo-train.log
+

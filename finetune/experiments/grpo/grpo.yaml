@@ -1,7 +1,7 @@
 # GRPO Training Config for QMD Query Expansion
 # Target: Qwen3-1.7B, trained on top of merged SFT weights
 #
-# Usage: uv run train.py grpo --config configs/grpo.yaml
+# Usage: uv run train.py grpo --config experiments/grpo/grpo.yaml
 #
 # The reward function (reward.py) scores expansions on format compliance,
 # diversity, hyde quality, content quality, and named entity preservation.

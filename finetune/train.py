@@ -18,14 +18,14 @@
 """
 Unified training script for QMD query expansion models.
 
-Supports two stages:
+Primary pipeline is SFT-only:
   sft  - Supervised fine-tuning on labeled examples
-  grpo - Group Relative Policy Optimization (RL) on top of merged SFT weights
+
+GRPO was moved to `experiments/grpo/` and is not part of the main training
+pipeline by default.
 
 Usage:
     uv run train.py sft  --config configs/sft.yaml
-    uv run train.py grpo --config configs/grpo.yaml
-    uv run train.py grpo --config configs/grpo.yaml --dry-run
 """
 
 import argparse
@@ -412,6 +412,15 @@ def cmd_sft(args):
 
 def cmd_grpo(args):
     """Run GRPO reinforcement learning on top of merged SFT weights."""
+    print(
+        "GRPO is not part of the main training pipeline and has been moved to `experiments/grpo/`."
+    )
+    print("To run experimental GRPO, use:")
+    print("  cd finetune && uv run python experiments/grpo/grpo.py")
+    print("Or, if you have local config wiring ready:")
+    print("  uv run train.py grpo --config experiments/grpo/grpo.yaml")
+    return
+
     import torch
     import torch.distributed as dist
     import os
@@ -645,8 +654,6 @@ def main():
         epilog="""
 Examples:
   uv run train.py sft  --config configs/sft.yaml
-  uv run train.py grpo --config configs/grpo.yaml
-  uv run train.py grpo --config configs/grpo.yaml --dry-run
         """,
     )
     sub = parser.add_subparsers(dest="stage", required=True)
@@ -657,7 +664,10 @@ Examples:
         "--dry-run", action="store_true", help="Print config and exit"
     )
 
-    grpo_parser = sub.add_parser("grpo", help="GRPO reinforcement learning")
+    grpo_parser = sub.add_parser(
+        "grpo",
+        help="Experimental: GRPO reinforcement learning (moved to experiments/grpo/)",
+    )
     grpo_parser.add_argument("--config", required=True, help="Path to GRPO config YAML")
     grpo_parser.add_argument(
         "--dry-run", action="store_true", help="Print config, test reward, and exit"
