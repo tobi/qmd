@@ -48,10 +48,17 @@ def format_for_training(ex: TrainingExample) -> dict:
     tokenizer = get_tokenizer()
     output_text = output_items_to_text(ex.output)
 
+    user_prompt = f"/no_think Expand this search query: {ex.query}"
+    if ex.intent:
+        user_prompt = (
+            f"/no_think Expand this search query: {ex.query}\n"
+            f"Query intent: {ex.intent.strip()}"
+        )
+
     messages = [
         {
             "role": "user",
-            "content": f"/no_think Expand this search query: {ex.query}",
+            "content": user_prompt,
         },
         {"role": "assistant", "content": output_text},
     ]
@@ -165,6 +172,7 @@ def main():
         "train_samples": len(train_data),
         "val_samples": len(val_data),
         "short_query_pct": round(100 * short_final / len(all_examples), 1),
+        "columns": ["text", "messages"],
     }
     with open(output_dir / "dataset_info.json", "w") as f:
         json.dump(dataset_info, f, indent=2)

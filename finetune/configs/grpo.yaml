@@ -30,6 +30,10 @@ training:
   learning_rate: 0.0000005
   max_grad_norm: 0.5
   max_steps: 200
+  # Save checkpoints every 30 minutes
+  save_interval_minutes: 30
+  # Fallback time-step save cadence if needed (not used for wall-clock mode)
+  save_steps: 50
 
 grpo:
   num_generations: 4
