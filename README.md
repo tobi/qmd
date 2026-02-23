@@ -74,12 +74,10 @@ qmd get "docs/api-reference.md" --full
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vector_search` - Semantic vector search (supports collection filter)
-- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
-- `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
-- `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
-- `qmd_status` - Index health and collection info
+- `query` - Search with sub-queries (lex=BM25, vec=semantic, hyde=hypothetical document). Combine types for best recall.
+- `get` - Retrieve document by path or docid (with fuzzy matching suggestions)
+- `multi_get` - Retrieve multiple documents by glob pattern, list, or docids
+- `status` - Index health and collection info
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
