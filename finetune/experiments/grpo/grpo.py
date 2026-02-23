@@ -14,8 +14,10 @@
 """
 GRPO training for QMD query expansion (Qwen3-1.7B).
 
-Runs on top of merged SFT weights. Self-contained for HuggingFace Jobs:
-    hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 4h jobs/grpo.py
+Experimental recipe run on top of merged SFT weights. Self-contained runner:
+    uv run experiments/grpo/grpo.py
+
+(If using HF Jobs, run this script as the job entrypoint.)
 """
 
 import os
@@ -42,7 +44,7 @@ if not os.path.exists(_eval_common_path):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eval_common import QMDRewardFunction, run_eval
 
-# --- Config (inlined from configs/grpo.yaml) ---
+# --- Config (inlined from experiments/grpo/grpo.yaml) ---
 BASE_MODEL = "Qwen/Qwen3-1.7B"
 SFT_MODEL = "tobil/qmd-query-expansion-1.7B-sft"
 OUTPUT_MODEL = "tobil/qmd-query-expansion-1.7B-grpo"

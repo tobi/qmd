@@ -6,6 +6,7 @@
  */
 
 import { describe, test, expect } from "vitest";
+import { parseArgs } from "node:util";
 
 // Reproduce the filterByCollections logic from qmd.ts for testing
 // (the function is private in qmd.ts)
@@ -108,7 +109,6 @@ describe("resolveCollectionFilter input normalization", () => {
 describe("collection option type from parseArgs", () => {
   // Verify that parseArgs with `multiple: true` produces string[]
   test("parseArgs multiple:true produces array for repeated flags", () => {
-    const { parseArgs } = require("node:util");
     const { values } = parseArgs({
       args: ["-c", "docs", "-c", "notes"],
       options: {
@@ -120,7 +120,6 @@ describe("collection option type from parseArgs", () => {
   });
 
   test("parseArgs multiple:true produces array for single flag", () => {
-    const { parseArgs } = require("node:util");
     const { values } = parseArgs({
       args: ["-c", "docs"],
       options: {
@@ -132,7 +131,6 @@ describe("collection option type from parseArgs", () => {
   });
 
   test("parseArgs multiple:true produces undefined when flag absent", () => {
-    const { parseArgs } = require("node:util");
     const { values } = parseArgs({
       args: [],
       options: {

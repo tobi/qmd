@@ -47,6 +47,30 @@ how to implement caching with redis in nodejs
 best practices for api rate limiting
 setting up ci cd pipeline with github actions
 
+# Personal entity preservation (issue #247: entity stripping)
+# Model MUST preserve person names in lex and vec output
+meeting with Bob about C++
+Sarah's presentation on Q4 goals
+email from Dave about the deployment issue
+notes from the Project Atlas kickoff
+feedback from the Horizon team retro
+conversation with Lisa about the design mockups
+
+# Quoted phrases (issue #247: lex phrase syntax)
+# Model should use "quoted phrases" for multi-word proper nouns in lex
+natural language processing transformers
+monte carlo simulation finance
+cross site scripting prevention
+visual studio code extensions
+principal component analysis dimensionality reduction
+
+# Negation / disambiguation (issue #247: lex negation syntax)
+# Model should use -term to exclude related-but-wrong results in lex
+rust ownership and borrowing
+java stream api filtering
+apple silicon mac development
+python web scraping beautiful soup
+
 # /only: mode tests - should output ONLY the requested type
 auth /only:lex
 React hooks tutorial /only:lex

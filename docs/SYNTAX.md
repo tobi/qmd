@@ -5,9 +5,12 @@ QMD queries are structured documents with typed sub-queries. Each line specifies
 ## Grammar
 
 ```ebnf
-query_document = { line } ;
-line           = [ type ":" ] text newline ;
-type           = "lex" | "vec" | "hyde" | "expand" ;
+query          = expand_query | query_document ;
+expand_query   = text | explicit_expand ;
+explicit_expand= "expand:" text ;
+query_document = { typed_line } ;
+typed_line     = type ":" text newline ;
+type           = "lex" | "vec" | "hyde" ;
 text           = quoted_phrase | plain_text ;
 quoted_phrase  = '"' { character } '"' ;
 plain_text     = { character } ;
@@ -21,14 +24,13 @@ newline        = "\n" ;
 | `lex` | BM25 | Keyword search with exact matching |
 | `vec` | Vector | Semantic similarity search |
 | `hyde` | Vector | Hypothetical document embedding |
-| `expand` | LLM | Auto-expand into lex/vec/hyde via local model |
 
 ## Default Behavior
 
-A query without any type prefix is treated as `expand:` — it gets passed to the query expansion model which generates lex, vec, and hyde variations automatically.
+A QMD query is either a single expand query or a multi-line query document. Any single-line query with no prefix is treated as an expand query and passed to the expansion model, which emits lex, vec, and hyde variants automatically.
 
 ```
-# These are equivalent:
+# These are equivalent and cannot be combined with typed lines:
 how does authentication work
 expand: how does authentication work
 ```
@@ -89,17 +91,20 @@ hyde: The API implements rate limiting using a token bucket algorithm...
 
 ## Expand Queries
 
-Use `expand:` to leverage the local query expansion model. Limited to one per query document.
+An expand query stands alone; it's not mixed with typed lines. You can either rely on the default untyped form or add the explicit `expand:` prefix:
 
 ```
 expand: error handling best practices
+# equivalent
+error handling best practices
 ```
 
-This generates lex, vec, and hyde variations automatically. Useful when you don't know the exact terms.
+Both forms call the local query expansion model, which generates lex, vec, and hyde variations automatically.
 
 ## Constraints
 
-- Maximum one `expand:` query per document
+- Top-level query must be either a standalone expand query or a multi-line document
+- Query documents allow only `lex`, `vec`, and `hyde` typed lines (no `expand:` inside)
 - `lex` syntax (`-term`, `"phrase"`) only works in lex queries
 - Empty lines are ignored
 - Leading/trailing whitespace is trimmed
