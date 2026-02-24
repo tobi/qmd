@@ -307,10 +307,13 @@ Intent-aware lex (C++ performance, not sports):
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        candidateLimit: z.number().optional().describe(
+          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+        ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
       },
     },
-    async ({ searches, limit, minScore, collections }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections }) => {
       // Map to internal format
       const subSearches: StructuredSubSearch[] = searches.map(s => ({
         type: s.type,
@@ -324,6 +327,7 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -635,6 +639,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
         });
 
         // Use first lex or vec query for snippet extraction
