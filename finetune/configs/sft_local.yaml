@@ -21,6 +21,10 @@ training:
   warmup_ratio: 0.03
   lr_scheduler: "cosine"
   ddp_find_unused_parameters: false
+  # Save checkpoints every 30 minutes
+  save_interval_minutes: 30
+  # Fallback time-step save cadence if needed (not used for wall-clock mode)
+  save_steps: 200
 
 lora:
   rank: 16

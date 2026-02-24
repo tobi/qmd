@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate JSONL files against the QMD training schema."""
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pydantic>=2.0"]
+# ///
+"""Validate JSONL files against the strict QMD training schema."""
 
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from dataset.schema import VALID_OUTPUT_TYPES
+from dataset.schema import TrainingExample
 
 
 def validate_file(path: Path) -> tuple[int, int]:
@@ -29,31 +33,11 @@ def validate_file(path: Path) -> tuple[int, int]:
                 errors += 1
                 continue
 
-            query = obj.get("query")
-            output = obj.get("output")
-
-            if not isinstance(query, str) or not query.strip():
-                print(f"{path}:{line_num}: missing/invalid query")
+            try:
+                TrainingExample.model_validate(obj)
+            except Exception as e:
+                print(f"{path}:{line_num}: {e}")
                 errors += 1
-                continue
-
-            if not isinstance(output, list):
-                print(f"{path}:{line_num}: output must be a list")
-                errors += 1
-                continue
-
-            for idx, item in enumerate(output):
-                if not isinstance(item, list) or len(item) != 2:
-                    print(f"{path}:{line_num}: output[{idx}] must be [type, text]")
-                    errors += 1
-                    continue
-                kind, text = item
-                if kind not in VALID_OUTPUT_TYPES:
-                    print(f"{path}:{line_num}: invalid output type '{kind}'")
-                    errors += 1
-                if not isinstance(text, str) or not text.strip():
-                    print(f"{path}:{line_num}: empty output text")
-                    errors += 1
 
     return total, errors
 

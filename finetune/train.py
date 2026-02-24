@@ -18,23 +18,25 @@
 """
 Unified training script for QMD query expansion models.
 
-Supports two stages:
+Primary pipeline is SFT-only:
   sft  - Supervised fine-tuning on labeled examples
-  grpo - Group Relative Policy Optimization (RL) on top of merged SFT weights
+
+GRPO was moved to `experiments/grpo/` and is not part of the main training
+pipeline by default.
 
 Usage:
     uv run train.py sft  --config configs/sft.yaml
-    uv run train.py grpo --config configs/grpo.yaml
-    uv run train.py grpo --config configs/grpo.yaml --dry-run
 """
 
 import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
+from transformers import TrainerCallback
 
 
 def export_gguf(model, tokenizer, output_dir: str, model_name: str):
@@ -156,6 +158,24 @@ def export_gguf(model, tokenizer, output_dir: str, model_name: str):
     print(f"GGUF files saved to: {gguf_dir}")
 
 
+class TimedSaveCallback(TrainerCallback):
+    """Trigger periodic checkpoint saves based on elapsed wall-clock time."""
+
+    def __init__(self, interval_minutes: float):
+        self.interval_seconds = float(interval_minutes) * 60.0
+        self.last_save_time = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not getattr(state, "is_world_process_zero", False):
+            return control
+
+        now = time.time()
+        if now - self.last_save_time >= self.interval_seconds:
+            control.should_save = True
+            self.last_save_time = now
+        return control
+
+
 def run_eval(model_path: str) -> float | None:
     """Run eval.py on the trained model and return average score."""
     print("\n" + "=" * 60)
@@ -188,9 +208,7 @@ def run_eval(model_path: str) -> float | None:
 def cmd_sft(args):
     """Run supervised fine-tuning."""
     import torch
-    import os
     from datasets import load_dataset
-    import torch
     import torch.distributed as dist
     from peft import LoraConfig
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -276,6 +294,22 @@ def cmd_sft(args):
             "{time}", now.strftime("%H:%M")
         )
 
+    save_interval_minutes = cfg["training"].get("save_interval_minutes")
+    save_steps = cfg["training"].get("save_steps", 200)
+    save_total_limit = cfg["training"].get("save_total_limit", 2)
+    if save_interval_minutes:
+        # Prefer wall-clock checkpointing (for long jobs / preemption safety)
+        save_steps = max(save_steps, 10_000_000)
+
+    callbacks = []
+    if save_interval_minutes:
+        try:
+            interval_value = float(save_interval_minutes)
+        except (TypeError, ValueError):
+            interval_value = None
+        if interval_value and interval_value > 0:
+            callbacks.append(TimedSaveCallback(interval_value))
+
     config = SFTConfig(
         output_dir=output_dir,
         push_to_hub=push_to_hub,
@@ -288,10 +322,10 @@ def cmd_sft(args):
         max_length=cfg["training"]["max_length"],
         logging_steps=10,
         save_strategy="steps",
-        save_steps=200,
-        save_total_limit=2,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         eval_strategy="steps",
-        eval_steps=200,
+        eval_steps=cfg["training"].get("eval_steps", 200),
         warmup_ratio=cfg["training"]["warmup_ratio"],
         lr_scheduler_type=cfg["training"]["lr_scheduler"],
         ddp_find_unused_parameters=cfg["training"].get(
@@ -329,6 +363,7 @@ def cmd_sft(args):
         args=config,
         peft_config=peft_config,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
 
     print("Starting SFT training...")
@@ -377,7 +412,15 @@ def cmd_sft(args):
 
 def cmd_grpo(args):
     """Run GRPO reinforcement learning on top of merged SFT weights."""
+    print(
+        "GRPO is not part of the main training pipeline and has been moved to `experiments/grpo/`."
+    )
+    print("To run experimental GRPO, use:")
+    print("  cd finetune && uv run python experiments/grpo/grpo.py")
+    return
+
     import torch
+    import torch.distributed as dist
     import os
     from datasets import load_dataset
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -494,6 +537,7 @@ def cmd_grpo(args):
         task_type="CAUSAL_LM",
         target_modules=cfg["lora"]["target_modules"],
         modules_to_save=["embed_tokens", "lm_head"],  # Critical for special tokens
+        ensure_weight_tying=True,
     )
     model = get_peft_model(model, grpo_lora_config)
     model.print_trainable_parameters()
@@ -510,6 +554,24 @@ def cmd_grpo(args):
     if isinstance(learning_rate, str):
         learning_rate = float(learning_rate)
 
+    save_interval_minutes = cfg["training"].get("save_interval_minutes")
+    save_steps = cfg["training"].get("save_steps", 200)
+    save_total_limit = cfg["training"].get("save_total_limit", 2)
+    save_strategy = cfg["training"].get("save_strategy", "epoch")
+    if save_interval_minutes:
+        # Prefer wall-clock checkpointing (for long jobs / preemption safety)
+        save_steps = max(save_steps, 10_000_000)
+        save_strategy = "steps"
+
+    callbacks = []
+    if save_interval_minutes:
+        try:
+            interval_value = float(save_interval_minutes)
+        except (TypeError, ValueError):
+            interval_value = None
+        if interval_value and interval_value > 0:
+            callbacks.append(TimedSaveCallback(interval_value))
+
     config = GRPOConfig(
         output_dir=output_dir,
         push_to_hub=push_to_hub,
@@ -524,7 +586,9 @@ def cmd_grpo(args):
         max_grad_norm=cfg["training"]["max_grad_norm"],
         max_steps=cfg["training"].get("max_steps", -1),
         logging_steps=10,
-        save_strategy="epoch",
+        save_strategy=save_strategy,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         bf16=True,
         skip_memory_metrics=True,
         report_to=report_to,
@@ -539,10 +603,17 @@ def cmd_grpo(args):
         args=config,
         train_dataset=dataset,
         reward_funcs=[QMDRewardFunction()],
+        callbacks=callbacks,
     )
 
     print("Starting GRPO training...")
     trainer.train()
+
+    is_main = os.environ.get("RANK", "0") == "0"
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if not is_main:
+        return
 
     if push_to_hub:
         print("Pushing to Hub...")
@@ -581,8 +652,6 @@ def main():
         epilog="""
 Examples:
   uv run train.py sft  --config configs/sft.yaml
-  uv run train.py grpo --config configs/grpo.yaml
-  uv run train.py grpo --config configs/grpo.yaml --dry-run
         """,
     )
     sub = parser.add_subparsers(dest="stage", required=True)
@@ -593,19 +662,9 @@ Examples:
         "--dry-run", action="store_true", help="Print config and exit"
     )
 
-    grpo_parser = sub.add_parser("grpo", help="GRPO reinforcement learning")
-    grpo_parser.add_argument("--config", required=True, help="Path to GRPO config YAML")
-    grpo_parser.add_argument(
-        "--dry-run", action="store_true", help="Print config, test reward, and exit"
-    )
-
     args = parser.parse_args()
 
-    if args.stage == "sft":
-        cmd_sft(args)
-    elif args.stage == "grpo":
-        cmd_grpo(args)
-
+    cmd_sft(args)
 
 if __name__ == "__main__":
     main()

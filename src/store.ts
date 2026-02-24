@@ -2082,6 +2082,17 @@ export function validateSemanticQuery(query: string): string | null {
   return null;
 }
 
+export function validateLexQuery(query: string): string | null {
+  if (/[\r\n]/.test(query)) {
+    return 'Lex queries must be a single line. Remove newline characters or split into separate lex: lines.';
+  }
+  const quoteCount = (query.match(/"/g) ?? []).length;
+  if (quoteCount % 2 === 1) {
+    return 'Lex query has an unmatched double quote ("). Add the closing quote or remove it.';
+  }
+  return null;
+}
+
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -3164,10 +3175,12 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSubSearch {
-  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical, 'expand' for LLM expansion */
-  type: 'lex' | 'vec' | 'hyde' | 'expand';
+  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical */
+  type: 'lex' | 'vec' | 'hyde';
   /** The search query text */
   query: string;
+  /** Optional line number for error reporting (CLI parser) */
+  line?: number;
 }
 
 export interface StructuredSearchOptions {
@@ -3212,35 +3225,24 @@ export async function structuredSearch(
 
   if (searches.length === 0) return [];
 
-  // Validate: max one expand query, semantic queries don't use lex syntax
-  const expandSearches = searches.filter(s => s.type === 'expand');
-  if (expandSearches.length > 1) {
-    throw new Error('Maximum one expand: query per document');
-  }
+  // Validate queries before executing
   for (const search of searches) {
-    if (search.type === 'vec' || search.type === 'hyde') {
+    const location = search.line ? `Line ${search.line}` : 'Structured search';
+    if (/[\r\n]/.test(search.query)) {
+      throw new Error(`${location} (${search.type}): queries must be single-line. Remove newline characters.`);
+    }
+    if (search.type === 'lex') {
+      const error = validateLexQuery(search.query);
+      if (error) {
+        throw new Error(`${location} (lex): ${error}`);
+      }
+    } else if (search.type === 'vec' || search.type === 'hyde') {
       const error = validateSemanticQuery(search.query);
       if (error) {
-        throw new Error(`Invalid ${search.type} query: ${error}`);
+        throw new Error(`${location} (${search.type}): ${error}`);
       }
     }
   }
-
-  // Process expand: queries by calling the query expansion model
-  let processedSearches = searches.filter(s => s.type !== 'expand');
-  if (expandSearches.length > 0) {
-    const expandQuery = expandSearches[0]!.query;
-    const expanded = await store.expandQuery(expandQuery);
-    // Add expanded queries (lex, vec, hyde from the model)
-    for (const exp of expanded) {
-      processedSearches.push({ type: exp.type as 'lex' | 'vec' | 'hyde', query: exp.text });
-    }
-    // Also add original as lex for strong signal matching
-    processedSearches.unshift({ type: 'lex', query: expandQuery });
-  }
-
-  // Use processed searches from here on
-  searches = processedSearches;
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid

@@ -12,14 +12,15 @@ Minimal QMD query expansion evaluator.
 
 Usage:
     uv run eval.py ./outputs/sft
-    uv run eval.py tobil/qmd-query-expansion-1.7B --queries evals/queries.txt
+    uv run eval.py ./outputs/sft --queries evals/queries.txt
+
+By default, query file defaults to evals/queries.txt and runs all queries unless --max-queries is set.
 """
 
 import argparse
 import json
 import re
 import sys
-import os
 from pathlib import Path
 
 # Import reward scoring
@@ -27,18 +28,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reward import score_expansion_detailed
 
 
-QUERIES = [
-    "how to configure authentication",
-    "docker compose networking",
-    "auth",
-    "who is TDS motorsports",
-    "React hooks tutorial",
-    "recent news about Shopify",
-    "how to implement caching with redis in nodejs",
-    "auth /only:lex",
-    "kubernetes pod deployment /only:vec",
-    "AWS Lambda cold start /only:hyde",
-]
+
+DEFAULT_QUERY_FILE = Path(__file__).parent / "evals" / "queries.txt"
 
 
 def load_model(model_path: str):
@@ -127,7 +118,11 @@ def generate_batch(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate QMD model")
     parser.add_argument("model", help="Model path (local or HF)")
-    parser.add_argument("--queries", help="Queries file (one per line)")
+    parser.add_argument(
+        "--queries",
+        default=str(DEFAULT_QUERY_FILE),
+        help="Queries file (one per line) [default: evals/queries.txt]",
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -154,11 +149,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load queries
-    queries = QUERIES
-    if args.queries:
-        with open(args.queries) as f:
-            queries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    # Load queries (default to full evals/queries.txt)
+    query_file = Path(args.queries)
+    if not query_file.exists():
+        raise FileNotFoundError(f"Queries file not found: {query_file}")
+    with query_file.open(encoding="utf-8") as f:
+        queries = [
+            l.strip() for l in f if l.strip() and not l.strip().startswith("#")
+        ]
 
     if args.max_queries and args.max_queries > 0:
         queries = queries[: args.max_queries]

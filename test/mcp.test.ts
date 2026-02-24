@@ -11,6 +11,7 @@ import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -238,7 +239,7 @@ describe("MCP Server", () => {
   afterAll(async () => {
     testDb.close();
     try {
-      require("fs").unlinkSync(testDbPath);
+      unlinkSync(testDbPath);
     } catch {}
 
     // Clean up test config directory
@@ -920,7 +921,7 @@ describe("MCP HTTP Transport", () => {
     else delete process.env.QMD_CONFIG_DIR;
 
     // Clean up test files
-    try { require("fs").unlinkSync(httpTestDbPath); } catch {}
+    try { unlinkSync(httpTestDbPath); } catch {}
     try {
       const files = await readdir(httpTestConfigDir);
       for (const f of files) await unlink(join(httpTestConfigDir, f));

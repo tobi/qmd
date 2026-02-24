@@ -16,7 +16,7 @@ dependencies = [
   "gguf",
   "sentencepiece",
   "nvidia-ml-py",
-  "dspy-ai>=3.1.2",
+  "pydantic>=2.0",
 ]
 
 [dependency-groups]

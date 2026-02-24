@@ -39,6 +39,31 @@ KEY_TERM_STOPWORDS = frozenset({
     'what', 'is', 'how', 'to', 'the', 'a', 'an', 'in', 'on', 'for', 'of',
     'and', 'or', 'with', 'my', 'your', 'do', 'does', 'can', 'i', 'me', 'we',
     'who', 'where', 'when', 'why', 'which', 'find', 'get', 'show', 'tell',
+    'about', 'from', 'into', 'between', 'through', 'during', 'after',
+    'before', 'like', 'than', 'then', 'that', 'this', 'their', 'its',
+    'was', 'were', 'has', 'had', 'been', 'being', 'have', 'not', 'but',
+    'just', 'also', 'very', 'so', 'if', 'at', 'by', 'up', 'out', 'all',
+    'some', 'any', 'no', 'each', 'every', 'both', 'few', 'more', 'most',
+    'other', 'only', 'same', 'such', 'here', 'there', 'asked', 'said',
+    'notes', 'meeting', 'email', 'discussion', 'conversation', 'call',
+})
+
+# Words that commonly start queries but aren't named entities.
+# Used for position-0 entity detection to avoid false positives.
+QUERY_VERB_STOPWORDS = frozenset({
+    'configure', 'setup', 'install', 'build', 'create', 'make', 'run',
+    'start', 'stop', 'check', 'test', 'debug', 'fix', 'update', 'change',
+    'add', 'remove', 'delete', 'use', 'using', 'need', 'want', 'should',
+    'would', 'could', 'help', 'please', 'best', 'good', 'new', 'old',
+    'latest', 'recent', 'setting', 'settings', 'compare', 'comparing',
+    'implement', 'implementing', 'deploy', 'deploying', 'migrate',
+    'migrating', 'optimize', 'optimizing', 'understand', 'understanding',
+    'explain', 'list', 'describe', 'define', 'convert', 'connecting',
+    'performance', 'overview', 'introduction', 'tutorial', 'example',
+    'difference', 'between', 'about', 'review', 'resolve', 'resolving',
+    'troubleshoot', 'troubleshooting', 'monitor', 'monitoring', 'manage',
+    'managing', 'enable', 'disable', 'set', 'write', 'read', 'search',
+    'possible', 'common', 'typical', 'recommended', 'alternative',
 })
 
 GENERIC_LEX_PHRASES = frozenset({
@@ -111,9 +136,12 @@ def clean_model_output(text: str) -> tuple[str, bool]:
 def extract_named_entities(query: str) -> set:
     """Extract named entities using heuristics.
 
-    Detects: ALL-CAPS acronyms (TDS, API), capitalized proper nouns (React),
+    Detects: ALL-CAPS acronyms (TDS, API), capitalized proper nouns (React, Bob),
     technical terms with special chars (node.js, C++), CamelCase (JavaScript),
     and compound names (TDS motorsports -> both words).
+
+    Position-0 words are also detected as entities if they are capitalized and
+    not common query-starting verbs (e.g. "Bob asked about deploy" -> "bob").
     """
     entities = set()
     words = query.split()
@@ -127,18 +155,29 @@ def extract_named_entities(query: str) -> set:
 
         is_entity = False
 
+        # ALL-CAPS acronyms: TDS, API, GPU, AWS
         if clean.isupper() and len(clean) >= 2:
             entities.add(clean.lower())
             is_entity = True
-        elif i > 0 and clean[0].isupper() and clean.lower() not in KEY_TERM_STOPWORDS:
-            entities.add(clean.lower())
-            is_entity = True
+        # Capitalized proper nouns (any position, including first word)
+        elif clean[0].isupper() and clean.lower() not in KEY_TERM_STOPWORDS:
+            if i > 0:
+                # Non-first words: always treat as entity
+                entities.add(clean.lower())
+                is_entity = True
+            elif clean.lower() not in QUERY_VERB_STOPWORDS:
+                # First word: also entity if not a common query verb
+                entities.add(clean.lower())
+                is_entity = True
+        # Technical terms with special chars: node.js, C++, .NET
         elif any(c in clean for c in '.+-#@') and len(clean) >= 2:
             entities.add(clean.lower())
             is_entity = True
+        # CamelCase: JavaScript, TypeScript
         elif len(clean) > 1 and any(c.isupper() for c in clean[1:]) and clean[0].isupper():
             entities.add(clean.lower())
             is_entity = True
+        # Compound names: word following an entity (TDS motorsports)
         elif prev_was_entity and clean.lower() not in KEY_TERM_STOPWORDS:
             entities.add(clean.lower())
             is_entity = True
@@ -454,6 +493,9 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
             hyde_score += 5
         hyde_score += max(0, 5 - word_repetition_penalty(hyde_text))
 
+    # --- Extract entities (used by both quality and entity sections) ---
+    entities = extract_named_entities(query)
+
     # --- Quality (0-20) ---
     quality_score = 5  # base relevance
     if parsed["lex"] and parsed["vec"]:
@@ -475,10 +517,18 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
         else:
             deductions.append("lex missing key terms")
 
+    # Bonus: lex uses quoted phrases for multi-word entities (+3)
+    if entities and parsed["lex"]:
+        multi_word_entities = [e for e in entities if " " in e or len(e) > 6]
+        if multi_word_entities:
+            lex_joined = " ".join(parsed["lex"])
+            if '"' in lex_joined:
+                quality_score += 3
+
     # --- Entity Preservation (-45 to +20) ---
     entity_score = 0
-    entities = extract_named_entities(query)
     if entities and parsed["lex"]:
+        # Per-line check: do lex lines contain entities?
         with_entities = sum(1 for l in parsed["lex"] if lex_preserves_entities(l, entities))
         if with_entities == len(parsed["lex"]):
             entity_score += 15
@@ -487,6 +537,14 @@ def score_expansion_detailed(query: str, expansion: str) -> dict:
         else:
             entity_score -= 30
             deductions.append(f"lex missing entities: {entities}")
+
+        # Per-entity coverage: is each entity mentioned somewhere in lex+vec?
+        all_output = " ".join(parsed["lex"] + parsed["vec"]).lower()
+        missing_entities = {e for e in entities if e not in all_output}
+        if missing_entities:
+            penalty = len(missing_entities) * 20
+            entity_score -= penalty
+            deductions.append(f"entities dropped: {missing_entities}")
 
         generic_count = sum(1 for l in parsed["lex"] if lex_is_generic(l))
         if generic_count:
@@ -592,6 +650,11 @@ if __name__ == "__main__":
         ("how to use React hooks", "lex: React hooks tutorial\nlex: useEffect useState\nvec: how to use React hooks in functional components"),
         ("auth", "<think>Let me think...</think>\nlex: auth"),
         ("auth", "lex: auth\nThis is some explanation\nvec: more"),
+        # Personal entity tests (issue #247: entity stripping)
+        ("meeting with Bob about C++", 'lex: Bob "C++" meeting\nlex: Bob C++ discussion notes\nvec: meeting notes with Bob about C++ programming'),
+        ("meeting with Bob about C++", "lex: c++ meetings\nvec: programming meeting notes"),  # BAD: Bob is gone
+        # Quoted phrases bonus
+        ("python memory leak debugging", 'lex: "memory leak" python -java\nlex: tracemalloc profiler\nvec: how to find memory leaks in Python'),
         # "/only:" mode tests (slash prefix)
         ("auth /only:lex", "lex: auth setup\nlex: authentication config\nlex: login credentials"),
         ("auth /only:lex", "lex: auth setup\nvec: how to configure authentication"),  # should fail - has vec
