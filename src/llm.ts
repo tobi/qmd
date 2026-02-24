@@ -497,25 +497,33 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+      // Detect available GPU types and try each in preference order.
+      //
+      // We can't rely on gpu:"auto" — it returns false even when GPUs are available
       // (likely a binary/build config issue in node-llama-cpp).
+      //
+      // getLlamaGpuTypes() can report GPU types that fail to initialize at runtime
+      // (e.g. "cuda" is reported on systems with no CUDA toolkit installed, because
+      // the prebuilt binary metadata advertises it). We iterate all available types
+      // so that e.g. a Vulkan-capable system isn't forced to CPU just because CUDA
+      // failed first.
       // @ts-expect-error node-llama-cpp API compat
       const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const gpuPriority = (["cuda", "metal", "vulkan"] as const).filter(g => gpuTypes.includes(g));
 
-      let llama: Llama;
-      if (preferred) {
+      let llama: Llama | undefined;
+      for (const gpu of gpuPriority) {
         try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+          break;
         } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
           process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            `QMD Warning: ${gpu} reported available but failed to initialize.\n`
           );
         }
-      } else {
+      }
+
+      if (!llama) {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
       }
 
