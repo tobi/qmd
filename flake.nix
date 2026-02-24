@@ -24,7 +24,13 @@
 
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bun pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.bun
+            pkgs.makeWrapper
+            pkgs.python3  # needed by node-gyp to compile better-sqlite3
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
+          ];
 
           buildInputs = [ pkgs.sqlite ];
 

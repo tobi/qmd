@@ -61,24 +61,29 @@ vec: authentication configuration options
 | Lex lines are keyword-focused (shorter) | +5 | -2 if lex is longer than vec |
 | Vec lines are natural language (complete phrases) | +5 | -2 if vec is just keywords |
 
-### 5. Named Entity Preservation (0-20 points, CRITICAL)
+### 5. Named Entity Preservation (-65 to +20 points, CRITICAL)
 
-Named entities are proper nouns, brand names, technical terms, and acronyms that MUST appear in lex queries. This prevents generic expansions that lose the specific topic.
+Named entities are proper nouns, brand names, personal names, technical terms, and acronyms that MUST appear in lex queries. This prevents generic expansions that lose the specific topic.
+
+**Two-level checking:**
 
 | Criterion | Points | Deduction |
 |-----------|--------|-----------|
-| All lex lines contain at least one entity | +15 | - |
-| Some lex lines contain entities | +5 | - |
-| NO lex lines contain entities | - | **-30 HEAVY PENALTY** |
+| **Per-line**: All lex lines contain at least one entity | +15 | - |
+| **Per-line**: Some lex lines contain entities | +5 | - |
+| **Per-line**: NO lex lines contain entities | - | **-30 HEAVY PENALTY** |
+| **Per-entity**: Entity completely absent from all lex+vec | - | **-20 per dropped entity** |
 | Generic filler phrases in lex | - | -15 per phrase |
 | Entities also in vec lines | +5 | - |
 
 **Named Entity Detection:**
 - All-caps acronyms: `TDS`, `API`, `GPU`, `AWS`
-- Capitalized proper nouns: `React`, `Docker`, `Kubernetes`
+- Capitalized proper nouns (any position): `React`, `Docker`, `Bob`, `Sarah`
+- Personal names at query start: `Bob asked about deploy` → `Bob` is an entity
 - Technical terms: `node.js`, `C++`, `.NET`
 - CamelCase: `JavaScript`, `TypeScript`
 - Compound names: `TDS motorsports` → both words are entities
+- Project names: `Project Atlas`, `Horizon team`
 
 **Generic Filler Phrases (BANNED in lex):**
 - "find information about"
@@ -88,14 +93,41 @@ Named entities are proper nouns, brand names, technical terms, and acronyms that
 
 **Examples:**
 
-| Query | Bad Lex (Score: 0.30) | Good Lex (Score: 1.00) |
-|-------|----------------------|------------------------|
+| Query | Bad Lex | Good Lex |
+|-------|---------|----------|
 | `who is TDS motorsports` | `lex: find information about` | `lex: TDS motorsports history` |
 | | `lex: company details` | `lex: TDS motorsports founders` |
+| `meeting with Bob about C++` | `lex: c++ meetings` | `lex: Bob "C++" meeting` |
+| | `vec: programming meeting notes` | `vec: meeting notes with Bob about C++` |
 | `how to use React hooks` | `lex: programming tutorial` | `lex: React hooks tutorial` |
 | | `lex: how to code` | `lex: useEffect useState hooks` |
 
-**Key Rule**: If a query mentions a specific entity (brand, product, technology), EVERY lex line should include that entity or a direct variation of it.
+**Key Rule**: If a query mentions a specific entity (person, brand, product, technology, project name), that entity MUST appear somewhere in the lex+vec output. Dropping a person's name is especially costly.
+
+### 6. Lex Phrase Quoting (bonus, +3 points)
+
+When a query contains multi-word technical terms or proper nouns, lex output should use quoted phrases for exact matching in BM25.
+
+| Criterion | Points |
+|-----------|--------|
+| Uses `"quoted phrases"` in lex when query has multi-word entities | +3 |
+
+**When to quote:**
+- Multi-word proper nouns: `"New York"`, `"Monte Carlo"`
+- Specific technical terms: `"machine learning"`, `"rate limit"`
+- Exact compound terms: `"connection pool"`, `"merge conflict"`
+
+**When to use negation (`-term`):**
+- Disambiguating terms: `rust -corrosion`, `java -coffee`, `apple -fruit`
+- Excluding related-but-wrong topics: `"machine learning" -"deep learning"`
+- Narrowing scope: `docker -kubernetes`, `python -snake`
+
+**Example:**
+```
+Query: python memory leak debugging
+Good lex: "memory leak" python -java -javascript
+Good lex: tracemalloc "garbage collector" profiler
+```
 
 ## Score Calculation
 

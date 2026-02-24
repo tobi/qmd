@@ -120,7 +120,7 @@ function buildInstructions(store: Store): string {
 
   // --- Search tool ---
   lines.push("");
-  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde/expand):");
+  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde):");
   lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
@@ -229,10 +229,9 @@ function createMcpServer(store: Store): McpServer {
   // ---------------------------------------------------------------------------
 
   const subSearchSchema = z.object({
-    type: z.enum(['lex', 'vec', 'hyde', 'expand']).describe(
-      "lex = BM25 keywords (supports \"phrase\" and -negation), " +
-      "vec = semantic question, hyde = hypothetical answer passage, " +
-      "expand = auto-expand via LLM (max 1 per query)"
+    type: z.enum(['lex', 'vec', 'hyde']).describe(
+      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
+      "vec = semantic question; hyde = hypothetical answer passage"
     ),
     query: z.string().describe(
       "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
@@ -266,8 +265,6 @@ Good lex examples:
 **hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
 - \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
 
-**expand** — Auto-expand via local LLM. Generates lex+vec+hyde variations automatically. Max one per query. Useful when you don't know the exact terms.
-
 ## Strategy
 
 Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
@@ -278,7 +275,7 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
 | Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | \`expand\` |
+| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
 
 ## Examples
 
@@ -306,7 +303,7 @@ Intent-aware lex (C++ performance, not sports):
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Sub-queries to execute. First gets 2x weight. Max one expand: per query."
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
