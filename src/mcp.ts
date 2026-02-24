@@ -552,10 +552,35 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
   const store = createStore();
-  const mcpServer = createMcpServer(store);
   
-  // Track sessions: sessionId -> transport
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+  // Track sessions: sessionId -> {transport, mcpServer, lastActivity}
+  const sessions = new Map<string, {
+    transport: WebStandardStreamableHTTPServerTransport;
+    mcpServer: McpServer;
+    lastActivity: number;
+  }>();
+  
+  // Session cleanup: max 100 sessions, 30min idle timeout
+  const MAX_SESSIONS = 100;
+  const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+  
+  function cleanupSessions(): void {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [sid, session] of sessions.entries()) {
+      if (now - session.lastActivity > SESSION_TTL_MS) {
+        sessions.delete(sid);
+        session.transport.close().catch(() => {});
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      log(`${ts()} Cleaned up ${cleaned} idle session(s), ${sessions.size} remaining`);
+    }
+  }
+  
+  // Periodic cleanup every 5 minutes
+  const cleanupInterval = setInterval(cleanupSessions, 5 * 60 * 1000);
   
   // Helper to check if request is an initialize request
   function isInitializeRequest(body: any): boolean {
@@ -664,6 +689,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       if (pathname === "/mcp") {
+        // Only POST requests have a body to parse
+        if (nodeReq.method !== "POST") {
+          nodeRes.writeHead(405, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message: "Method not allowed" }, id: null }));
+          return;
+        }
+
         const rawBody = await collectBody(nodeReq);
         const body = JSON.parse(rawBody);
         const label = describeRequest(body);
@@ -677,11 +709,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         
         // Check if this is an existing session
         if (sessionId && sessions.has(sessionId)) {
-          // Reuse existing transport for this session
-          const existingTransport = sessions.get(sessionId)!;
+          // Reuse existing transport and update activity
+          const session = sessions.get(sessionId)!;
+          session.lastActivity = Date.now();
           const request = new Request(url, { method: nodeReq.method || "POST", headers, body: rawBody });
           // Pass parsedBody to avoid the transport trying to read the body stream
-          const response = await existingTransport.handleRequest(request, { parsedBody: body });
+          const response = await session.transport.handleRequest(request, { parsedBody: body });
           nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
           nodeRes.end(Buffer.from(await response.arrayBuffer()));
           log(`${ts()} POST /mcp ${label} [existing session: ${sessionId.slice(0, 8)}...] (${Date.now() - reqStart}ms)`);
@@ -690,34 +723,62 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         
         // Check if this is a new initialize request (no session, or session not found)
         if (isInitializeRequest(body)) {
+          // Enforce max sessions limit (remove oldest if at capacity)
+          if (sessions.size >= MAX_SESSIONS) {
+            const oldestSid = sessions.keys().next().value;
+            if (oldestSid) {
+              const oldest = sessions.get(oldestSid)!;
+              sessions.delete(oldestSid);
+              oldest.transport.close().catch(() => {});
+              log(`${ts()} Evicted oldest session ${oldestSid.slice(0, 8)}... (max sessions reached)`);
+            }
+          }
+
+          // Create fresh MCP server for this session
+          const sessionMcpServer = createMcpServer(store);
+          let sessionId: string | undefined;
+
           // Create new transport for this session
           const newTransport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             enableJsonResponse: true,
             onsessioninitialized: (sid) => {
-              sessions.set(sid, newTransport);
+              sessionId = sid;
+              sessions.set(sid, {
+                transport: newTransport,
+                mcpServer: sessionMcpServer,
+                lastActivity: Date.now(),
+              });
               log(`${ts()} Session initialized: ${sid.slice(0, 8)}...`);
             },
           });
-          
+
           // Set up cleanup when transport closes
           newTransport.onclose = () => {
-            const sid = newTransport.sessionId;
-            if (sid && sessions.has(sid)) {
-              sessions.delete(sid);
-              log(`${ts()} Session closed: ${sid.slice(0, 8)}...`);
+            if (sessionId && sessions.has(sessionId)) {
+              sessions.delete(sessionId);
+              log(`${ts()} Session closed: ${sessionId.slice(0, 8)}...`);
             }
           };
-          
-          // Connect to MCP server
-          await mcpServer.connect(newTransport);
-          
-          // Handle the request
-          const request = new Request(url, { method: "POST", headers, body: rawBody });
-          const response = await newTransport.handleRequest(request, { parsedBody: body });
-          nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-          nodeRes.end(Buffer.from(await response.arrayBuffer()));
-          log(`${ts()} POST /mcp ${label} [new session] (${Date.now() - reqStart}ms)`);
+
+          // Connect and handle request with proper error handling
+          try {
+            await sessionMcpServer.connect(newTransport);
+
+            // Handle the request
+            const request = new Request(url, { method: "POST", headers, body: rawBody });
+            const response = await newTransport.handleRequest(request, { parsedBody: body });
+            nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+            nodeRes.end(Buffer.from(await response.arrayBuffer()));
+            log(`${ts()} POST /mcp ${label} [new session] (${Date.now() - reqStart}ms)`);
+          } catch (err) {
+            // Clean up on initialization failure
+            await newTransport.close().catch(() => {});
+            if (sessionId && sessions.has(sessionId)) {
+              sessions.delete(sessionId);
+            }
+            throw err;
+          }
           return;
         }
         
@@ -754,9 +815,10 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    clearInterval(cleanupInterval);
     // Close all session transports
-    for (const [sessionId, sessionTransport] of sessions.entries()) {
-      await sessionTransport.close();
+    for (const [sessionId, session] of sessions.entries()) {
+      await session.transport.close().catch(() => {});
       sessions.delete(sessionId);
     }
     httpServer.close();
