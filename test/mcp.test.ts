@@ -1048,3 +1048,78 @@ describe("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+describe("MCP HTTP host binding", () => {
+  let hostTestDbPath: string;
+  let hostTestConfigDir: string;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  beforeAll(async () => {
+    hostTestDbPath = `/tmp/qmd-mcp-host-test-${Date.now()}.sqlite`;
+    const db = openDatabase(hostTestDbPath);
+    initTestDatabase(db);
+    db.close();
+
+    const configPrefix = join(tmpdir(), `qmd-mcp-host-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    hostTestConfigDir = await mkdtemp(configPrefix);
+    const testConfig: CollectionConfig = {
+      collections: {
+        docs: {
+          path: "/test/docs",
+          pattern: "**/*.md",
+        },
+      },
+    };
+    await writeFile(join(hostTestConfigDir, "index.yml"), YAML.stringify(testConfig));
+
+    process.env.INDEX_PATH = hostTestDbPath;
+    process.env.QMD_CONFIG_DIR = hostTestConfigDir;
+  });
+
+  afterAll(async () => {
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    try { unlinkSync(hostTestDbPath); } catch {}
+    try {
+      const files = await readdir(hostTestConfigDir);
+      for (const f of files) await unlink(join(hostTestConfigDir, f));
+      await rmdir(hostTestConfigDir);
+    } catch {}
+  });
+
+  test("host option binds to explicit IPv4 address", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("host option normalizes bracketed IPv6 input", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "[::1]" });
+    try {
+      const addr = handle.httpServer.address() as import("net").AddressInfo;
+      expect(addr.address).toBe("::1");
+      const res = await fetch(`http://[::1]:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("empty host falls back to localhost", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "   " });
+    try {
+      const res = await fetch(`http://localhost:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
