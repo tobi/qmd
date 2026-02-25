@@ -386,7 +386,7 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
+    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -627,10 +627,12 @@ export class LlamaCpp implements LLM {
       // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
       const n = await this.computeParallelism(150);
       const threads = await this.threadsPerContext(n);
+      const envCtxSize = process.env.QMD_EMBED_CTX_SIZE ? parseInt(process.env.QMD_EMBED_CTX_SIZE) : undefined;
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             ...(threads > 0 ? { threads } : {}),
+            ...(envCtxSize ? { contextSize: envCtxSize } : {}),
           }));
         } catch {
           if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
