@@ -2814,6 +2814,7 @@ if (isMain) {
           }
           host = normalizeMcpHost(rawHost).bindHost;
         }
+        const normalizedHost = normalizeMcpHost(host);
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -2846,8 +2847,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          const { displayHost } = normalizeMcpHost(host);
-          console.log(`Started on http://${displayHost}:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${normalizedHost.displayHost}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -2861,8 +2861,7 @@ if (isMain) {
           await startMcpHttpServer(port, { host });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
-            const { bindHost } = normalizeMcpHost(host);
-            console.error(`Port ${port} already in use on ${bindHost}. Try a different port with --port.`);
+            console.error(`Port ${port} already in use on ${normalizedHost.bindHost}. Try a different port with --port.`);
             process.exit(1);
           }
           throw e;
