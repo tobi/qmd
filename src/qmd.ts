@@ -2805,7 +2805,11 @@ if (isMain) {
         const port = Number(cli.values.port) || 8181;
         let host: string | undefined;
         if (cli.values.host !== undefined) {
-          const rawHost = String(cli.values.host);
+          if (typeof cli.values.host !== "string") {
+            console.error(`Invalid --host value: "--host" requires a hostname or IP address argument.`);
+            process.exit(1);
+          }
+          const rawHost = cli.values.host;
           try {
             validateMcpHostInput(rawHost);
           } catch (err) {

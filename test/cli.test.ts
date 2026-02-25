@@ -1176,6 +1176,31 @@ describe("mcp http daemon", () => {
     expect(stderr).toContain("not a URL");
   });
 
+  test("--host without a value exits with error", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--host");
+    expect(stderr).toMatch(/requires/i);
+  });
+
+  test("--host with value stolen by next flag exits with error", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "--daemon",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Invalid --host value");
+  });
+
+  test("--host with host:port pattern exits with error", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "localhost:8181",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Invalid --host value");
+  });
+
   test("stop kills daemon and removes PID file", async () => {
     const port = randomPort();
     // Start daemon

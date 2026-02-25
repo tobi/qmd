@@ -1,3 +1,5 @@
+import { isIP } from "net";
+
 export type NormalizedMcpHost = {
   bindHost: string;
   displayHost: string;
@@ -11,6 +13,19 @@ export function validateMcpHostInput(rawHost: string): void {
   const value = rawHost.trim();
   if (value.includes("://") || value.includes("/")) {
     throw new Error(`Invalid --host value: "${rawHost}". Provide a hostname or IP address, not a URL.`);
+  }
+  if (value.startsWith("-")) {
+    throw new Error(`Invalid --host value: "${rawHost}". "--host" requires a hostname or IP address argument.`);
+  }
+  // Reject host:port patterns (e.g. "localhost:8181", "[::1]:8080")
+  // but allow bare IPv6 (e.g. "::1", "2001:db8::1") and bracketed IPv6 ("[::1]")
+  const inner = value.startsWith("[") && value.endsWith("]")
+    ? value.slice(1, -1).trim()
+    : value;
+  if (inner.includes(":") && isIP(inner) === 0) {
+    throw new Error(
+      `Invalid --host value: "${rawHost}". Use --host and --port separately (e.g., --host localhost --port 8181).`,
+    );
   }
 }
 
