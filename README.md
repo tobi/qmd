@@ -619,6 +619,23 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 
 Used for generating query variations via `LlamaChatSession`.
 
+## Shell Completion
+
+### Bash
+
+```sh
+# Activate for current session
+source completions/qmd.bash
+
+# Install permanently (user)
+cp completions/qmd.bash ~/.local/share/bash-completion/completions/qmd
+
+# Or system-wide
+sudo cp completions/qmd.bash /etc/bash_completion.d/qmd
+```
+
+Completes commands, subcommands, options, and collection names dynamically.
+
 ## License
 
 MIT
