@@ -100,6 +100,11 @@ awk '
 
 jq --arg v "$NEW" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
 
+# Build dist/ so git-based installs work (npm install github:tobi/qmd#vX.Y.Z)
+echo "Building dist/..."
+npm run build
+git add -f dist/
+
 git add package.json CHANGELOG.md
 git commit -m "release: v$NEW"
 git tag -a "v$NEW" -m "v$NEW"
