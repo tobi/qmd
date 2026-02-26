@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Jina Embeddings v5 support**: two alternative embedding models available via `LlamaCppConfig.embedModel`:
+  - `jina-embeddings-v5-text-nano` (239M params, 768 dim, 8K tokens, MTEB-EN 71.0, MMTEB 65.5)
+  - `jina-embeddings-v5-text-small` (677M params, 1024 dim, 32K tokens, MTEB-EN 71.7, MMTEB 67.0)
+- Model-aware prompt formatting: `formatQueryForEmbedding` and `formatDocForEmbedding` auto-detect Jina v5 models and apply the correct `Query:` / `Document:` prefix format
+- `LlamaCpp.getEmbedModelUri()` public getter for the configured embedding model URI
+- `isJinaV5Model()` utility function exported from `llm.ts`
+
 ## [1.1.0] - 2026-02-20
 
 QMD now speaks in **query documents** — structured multi-line queries where every line is typed (`lex:`, `vec:`, `hyde:`), combining keyword precision with semantic recall. A single plain query still works exactly as before (it's treated as an implicit `expand:` and auto-expanded by the LLM). Lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical. The formal query grammar is documented in `docs/SYNTAX.md`.
