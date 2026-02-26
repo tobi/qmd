@@ -500,8 +500,15 @@ export class LlamaCpp implements LLM {
       // Detect available GPU types and use the best one.
       // We can't rely on gpu:"auto" — it returns false even when CUDA is available
       // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
+      // Allow explicit override via NODE_LLAMA_CPP_GPU env var for AMD GPUs
+      const envGpu = process.env.NODE_LLAMA_CPP_GPU as "cuda" | "metal" | "vulkan" | undefined;
+      let gpuTypes: string[] = [];
+      if (envGpu && ["cuda", "metal", "vulkan"].includes(envGpu)) {
+        gpuTypes = [envGpu];
+      } else {
+        // @ts-expect-error node-llama-cpp API compat
+        gpuTypes = await getLlamaGpuTypes();
+      }
       // Prefer CUDA > Metal > Vulkan > CPU
       const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
 
