@@ -1751,6 +1751,7 @@ type OutputOptions = {
   collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
+  candidateLimit?: number;  // Max candidates to rerank (default: 40)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2141,6 +2142,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collections: singleCollection ? [singleCollection] : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2164,6 +2166,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collection: singleCollection,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2271,6 +2274,8 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // Query options
+      "candidate-limit": { type: "string", short: "C" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2308,6 +2313,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
+    candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
   };
 
   return {
@@ -2409,6 +2415,7 @@ function showHelp(): void {
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
+  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
