@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Bump `better-sqlite3` from `^11.0.0` to `^12.4.5` to fix installation on Node 25 (Node 25 prebuilds and V8 API compatibility added in better-sqlite3 v12.4.5)
+
 ## [1.1.0] - 2026-02-20
 
 QMD now speaks in **query documents** — structured multi-line queries where every line is typed (`lex:`, `vec:`, `hyde:`), combining keyword precision with semantic recall. A single plain query still works exactly as before (it's treated as an implicit `expand:` and auto-expanded by the LLM). Lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical. The formal query grammar is documented in `docs/SYNTAX.md`.
