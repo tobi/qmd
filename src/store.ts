@@ -17,8 +17,7 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -38,6 +37,7 @@ import {
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
 } from "./collections.js";
+import { getVectorScopeGuardMessage } from "./vector-scope-guard.js";
 
 // =============================================================================
 // Configuration
@@ -672,6 +672,14 @@ function initializeDatabase(db: Database): void {
       hash TEXT PRIMARY KEY,
       result TEXT NOT NULL,
       created_at TEXT NOT NULL
+    )
+  `);
+
+  // API embedding scope metadata (used to guard mixed local/API vector usage).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS api_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )
   `);
 
@@ -1427,7 +1435,7 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -1437,13 +1445,23 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  const charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+
+  // API backend doesn't expose tokenizer APIs; keep chunking approximate and avoid local model init.
+  if (!llm.canTokenize?.() || !llm.tokenize) {
+    return charChunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / avgCharsPerToken)),
+    }));
+  }
+  const tokenize = llm.tokenize.bind(llm);
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
 
   for (const chunk of charChunks) {
-    const tokens = await llm.tokenize(chunk.text);
+    const tokens = await tokenize(chunk.text);
 
     if (tokens.length <= maxTokens) {
       results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
@@ -1456,7 +1474,7 @@ export async function chunkDocumentByTokens(
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
       for (const subChunk of subChunks) {
-        const subTokens = await llm.tokenize(subChunk.text);
+        const subTokens = await tokenize(subChunk.text);
         results.push({
           text: subChunk.text,
           pos: chunk.pos + subChunk.pos,
@@ -2151,6 +2169,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // =============================================================================
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2245,7 +2268,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await getDefaultLLM().embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2310,8 +2333,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = getDefaultLLM();
+  // Note: current local backend uses a configured default model; `model` may be ignored.
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2348,9 +2371,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents using the configured LLM backend
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
@@ -2911,6 +2934,11 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -2984,7 +3012,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -3124,6 +3152,11 @@ export async function vectorSearchQuery(
   query: string,
   options?: VectorSearchOptions
 ): Promise<VectorSearchResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
@@ -3216,6 +3249,11 @@ export async function structuredSearch(
   searches: StructuredSubSearch[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  const guardMessage = getVectorScopeGuardMessage(store.db);
+  if (guardMessage) {
+    throw new Error(guardMessage);
+  }
+
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -3273,7 +3311,7 @@ export async function structuredSearch(
   if (hasVectors) {
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
+      const llm = getDefaultLLM();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();

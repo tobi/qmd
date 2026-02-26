@@ -18,6 +18,8 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { ApiLLM } from "./api.js";
+import { PassthroughLLMSession } from "./llm-session.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -299,6 +301,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -319,6 +326,18 @@ export interface LLM {
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Whether this backend supports tokenizer access.
+   * API backends may return false and omit tokenize().
+   */
+  canTokenize?(): boolean;
+
+  /**
+   * Tokenize text when tokenizer access is available.
+   * API backend doesn't currently expose tokenization.
+   */
+  tokenize?(text: string): Promise<readonly unknown[]>;
 
   /**
    * Dispose of resources
@@ -764,6 +783,10 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
   // Tokenization
   // ==========================================================================
+
+  canTokenize(): boolean {
+    return true;
+  }
 
   /**
    * Tokenize text using the embedding model's tokenizer
@@ -1340,8 +1363,7 @@ let defaultSessionManager: LLMSessionManager | null = null;
 /**
  * Get the session manager for the default LlamaCpp instance.
  */
-function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
+function getSessionManager(llm: LlamaCpp = getDefaultLlamaCpp()): LLMSessionManager {
   if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
@@ -1366,13 +1388,27 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
-  const session = new LLMSession(manager, options);
+  const llm = getDefaultLLM();
 
-  try {
-    return await fn(session);
-  } finally {
-    session.release();
+  if (llm instanceof LlamaCpp) {
+    const manager = getSessionManager(llm);
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  } else {
+    const session = new PassthroughLLMSession(
+      llm,
+      options,
+      (message?: string) => new SessionReleasedError(message)
+    );
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
   }
 }
 
@@ -1390,6 +1426,7 @@ export function canUnloadLLM(): boolean {
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultApiLLM: ApiLLM | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
@@ -1402,10 +1439,34 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
+ * Get the default LLM backend instance.
+ * Selects local or API backend based on QMD_LLM_BACKEND.
+ */
+export function getDefaultLLM(): LLM {
+  const backend = process.env.QMD_LLM_BACKEND?.trim().toLowerCase() || "local";
+  if (backend === "local") {
+    return getDefaultLlamaCpp();
+  }
+
+  if (backend === "api") {
+    if (!defaultApiLLM) {
+      defaultApiLLM = new ApiLLM();
+    }
+    return defaultApiLLM;
+  }
+
+  throw new Error(
+    `Invalid QMD_LLM_BACKEND="${process.env.QMD_LLM_BACKEND}". Expected "local" or "api".`
+  );
+}
+
+/**
  * Set a custom default LlamaCpp instance (useful for testing)
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+  // Function appears unused - clearing defaultApiLLM probably right thing to do anyway?
+  defaultApiLLM = null;
 }
 
 /**
@@ -1417,4 +1478,16 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+/**
+ * Dispose the default LLM backend instance.
+ * Currently aliases LlamaCpp disposal.
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultApiLLM) {
+    await defaultApiLLM.dispose();
+    defaultApiLLM = null;
+  }
+  await disposeDefaultLlamaCpp();
 }

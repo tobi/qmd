@@ -15,6 +15,7 @@ import {
   normalizeDocid,
   isDocid,
   handelize,
+  chunkDocumentByTokens,
 } from "../src/store";
 
 // =============================================================================
@@ -201,5 +202,27 @@ describe("handelize", () => {
     expect(isDocid("#123456")).toBe(true);
     expect(isDocid("bad-id")).toBe(false);
     expect(isDocid("12345")).toBe(false);
+  });
+});
+
+describe("Token Chunking Fallback", () => {
+  test("chunkDocumentByTokens uses char-based fallback when backend cannot tokenize", async () => {
+    const originalBackend = process.env.QMD_LLM_BACKEND;
+    process.env.QMD_LLM_BACKEND = "api";
+
+    try {
+      const content = "This is a document sentence. ".repeat(400);
+      const chunks = await chunkDocumentByTokens(content, 120, 18, 40);
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.tokens).toBeGreaterThan(0);
+      }
+    } finally {
+      if (originalBackend === undefined) {
+        delete process.env.QMD_LLM_BACKEND;
+      } else {
+        process.env.QMD_LLM_BACKEND = originalBackend;
+      }
+    }
   });
 });
