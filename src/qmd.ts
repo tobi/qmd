@@ -1444,7 +1444,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = readFileSync(filepath, "utf-8");
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch (err: any) {
+      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+      processed++;
+      progress.set((processed / total) * 100);
+      continue;
+    }
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
