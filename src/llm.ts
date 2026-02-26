@@ -502,20 +502,27 @@ export class LlamaCpp implements LLM {
       // (likely a binary/build config issue in node-llama-cpp).
       // @ts-expect-error node-llama-cpp API compat
       const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      // Prefer Vulkan > Metal > CUDA > CPU.
+      // Vulkan is cross-vendor and works on AMD/Intel; CUDA requires NVIDIA.
+      // On systems with ROCm installed, getLlamaGpuTypes() may report "cuda"
+      // as available (ROCm ships a HIP/CUDA compatibility layer) but then fail
+      // to initialise at runtime. Trying each candidate in order and continuing
+      // on failure ensures we reach Vulkan rather than falling back to CPU.
+      const preferenceOrder = ["vulkan", "metal", "cuda"] as const;
+      const candidates = preferenceOrder.filter(g => gpuTypes.includes(g));
 
-      let llama: Llama;
-      if (preferred) {
+      let llama: Llama | undefined;
+      for (const gpu of candidates) {
         try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+          break;
         } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
           process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            `QMD Warning: ${gpu} reported available but failed to initialise. Trying next...\n`
           );
         }
-      } else {
+      }
+      if (!llama) {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
       }
 
