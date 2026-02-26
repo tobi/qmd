@@ -165,19 +165,20 @@ const cursor = {
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
-// Terminal progress bar using OSC 9;4 escape sequence
+// Terminal progress bar using OSC 9;4 escape sequence (TTY only)
+const isTTY = process.stderr.isTTY;
 const progress = {
   set(percent: number) {
-    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
   },
   clear() {
-    process.stderr.write(`\x1b]9;4;0\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;0\x07`);
   },
   indeterminate() {
-    process.stderr.write(`\x1b]9;4;3\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;3\x07`);
   },
   error() {
-    process.stderr.write(`\x1b]9;4;2\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;2\x07`);
   },
 };
 
@@ -1491,7 +1492,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const rate = processed / elapsed;
     const remaining = (total - processed) / rate;
     const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
   }
 
   // Deactivate documents in this collection that no longer exist
@@ -1682,7 +1683,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const eta = elapsed > 2 ? formatETA(etaSec) : "...";
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
-      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
     }
 
     progress.clear();
