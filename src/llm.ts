@@ -1386,17 +1386,173 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
+// Remote LLM Implementation (for GPU servers via llama-server HTTP API)
+// =============================================================================
+
+/**
+ * Remote LLM that calls a llama-server instance via HTTP.
+ * Enable by setting QMD_REMOTE_URL environment variable.
+ *
+ * Supports all methods needed for `qmd embed`: embed, embedBatch, tokenize,
+ * detokenize, countTokens. Other methods are stubbed.
+ *
+ * Usage:
+ *   # Start llama-server on GPU machine:
+ *   llama-server -m embeddinggemma-300M-Q8_0.gguf --embedding --port 8080
+ *
+ *   # SSH tunnel + run:
+ *   ssh -L 8080:localhost:8080 ubuntu@gpu-host -N &
+ *   QMD_REMOTE_URL=http://localhost:8080 qmd embed
+ */
+class RemoteLLM implements LLM {
+  private baseUrl: string;
+  /** Cache last tokenized content for local detokenize (avoids remote round-trips during chunking) */
+  private lastTokenizedContent: string | null = null;
+  private lastTokenizedCharsPerToken: number = 2;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+  }
+
+  /** Fetch with timeout and retry for transient failures */
+  private async fetchWithRetry(url: string, init: RequestInit, retries = 5, timeoutMs = 30000): Promise<Response> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const res = await fetch(url, { ...init, signal: controller.signal });
+        clearTimeout(timer);
+        return res;
+      } catch (err: any) {
+        const isLastAttempt = attempt === retries;
+        const errMsg = err?.message || err?.code || String(err);
+        if (!isLastAttempt) {
+          // Exponential backoff: 1s, 2s, 4s, 8s
+          const delay = 1000 * Math.pow(2, attempt - 1);
+          console.error(`Remote fetch retry ${attempt}/${retries} (${errMsg}), waiting ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          throw err;
+        }
+      }
+    }
+    throw new Error('unreachable');
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      // Sanitize: strip lone surrogates that break llama-server's JSON parser
+      const sanitized = text.replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+      const res = await this.fetchWithRetry(`${this.baseUrl}/v1/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: sanitized }),
+      }, 3, 60000);
+      if (!res.ok) throw new Error(`Remote embed failed: ${res.status} ${res.statusText}`);
+      const data = await res.json() as any;
+      return { embedding: data.data[0].embedding, model: 'remote' };
+    } catch (err) {
+      console.error('Remote embed error:', err);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    try {
+      // Sanitize: strip lone surrogates that break llama-server's JSON parser
+      const sanitized = texts.map(t => t.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+      const res = await this.fetchWithRetry(`${this.baseUrl}/v1/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: sanitized }),
+      }, 3, 120000);
+      if (!res.ok) throw new Error(`Remote embedBatch failed: ${res.status} ${res.statusText}`);
+      const data = await res.json() as any;
+      return data.data.map((d: any) => ({ embedding: d.embedding, model: 'remote' }));
+    } catch (err) {
+      // Batch failed — retry each item individually to isolate bad items
+      console.error('Remote embedBatch error, retrying individually:', err);
+      return Promise.all(texts.map(t => this.embed(t)));
+    }
+  }
+
+  /**
+   * Local tokenization approximation — avoids thousands of HTTP round-trips during chunking.
+   * Uses ~2 chars/token heuristic (conservative for code/Unicode-heavy content).
+   * Returns fake token IDs (sequential integers) since they're only used for counting/slicing.
+   * Caches the content so detokenize can reconstruct text from token positions.
+   */
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    // Cache for detokenize reconstruction
+    this.lastTokenizedContent = text;
+    const charsPerToken = 2;  // Conservative: stays under model's 2048-token context for code/Unicode-heavy content
+    this.lastTokenizedCharsPerToken = charsPerToken;
+    const approxTokenCount = Math.ceil(text.length / charsPerToken);
+    const tokens = Array.from({ length: approxTokenCount }, (_, i) => i) as unknown as LlamaToken[];
+    return tokens;
+  }
+
+  /**
+   * Reconstruct text from fake token IDs using cached content.
+   * Token ID i maps to content[i*charsPerToken .. (i+1)*charsPerToken].
+   */
+  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    if (!this.lastTokenizedContent || tokens.length === 0) return '';
+    const ids = tokens as unknown as number[];
+    const start = ids[0] * this.lastTokenizedCharsPerToken;
+    const end = (ids[ids.length - 1] + 1) * this.lastTokenizedCharsPerToken;
+    return this.lastTokenizedContent.slice(start, Math.min(end, this.lastTokenizedContent.length));
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return Math.ceil(text.length / 2);
+  }
+
+  // --- Stub methods (not needed for embedding workflow) ---
+
+  async generate(): Promise<GenerateResult | null> { return null; }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    return { name: model, exists: true };
+  }
+
+  async expandQuery(query: string): Promise<Queryable[]> {
+    return [{ type: 'lex', text: query }];
+  }
+
+  async rerank(query: string, documents: RerankDocument[]): Promise<RerankResult> {
+    return {
+      results: documents.map((d, i) => ({ file: d.file, score: 1 - i * 0.01, index: i })),
+      model: 'remote-passthrough',
+    };
+  }
+
+  async dispose(): Promise<void> { /* no-op */ }
+}
+
+// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed).
+ *
+ * If QMD_REMOTE_URL is set, returns a RemoteLLM that calls a remote llama-server
+ * instead of loading models locally. This enables GPU-accelerated embedding via
+ * SSH tunnel to a GPU cloud instance.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const remoteUrl = process.env.QMD_REMOTE_URL;
+    if (remoteUrl) {
+      console.log(`Using remote LLM server: ${remoteUrl}`);
+      defaultLlamaCpp = new RemoteLLM(remoteUrl) as any;
+    } else {
+      defaultLlamaCpp = new LlamaCpp();
+    }
   }
   return defaultLlamaCpp;
 }

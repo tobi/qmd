@@ -2287,9 +2287,12 @@ export function insertEmbedding(
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  // vec0 virtual tables don't support INSERT OR REPLACE, so delete first if exists
+  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
   const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
+  deleteVecStmt.run(hashSeq);
   insertVecStmt.run(hashSeq, embedding);
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
 }
