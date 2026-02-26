@@ -42,9 +42,10 @@ qmd embed
 ## HTTP Mode
 
 ```bash
-qmd mcp --http              # Port 8181
-qmd mcp --http --daemon     # Background
-qmd mcp stop                # Stop daemon
+qmd mcp --http                       # Port 8181
+qmd mcp --http --host 127.0.0.1      # Explicit IPv4 (for Docker/Colima)
+qmd mcp --http --daemon              # Background
+qmd mcp stop                         # Stop daemon
 ```
 
 ## Tools

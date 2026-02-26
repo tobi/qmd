@@ -88,6 +88,7 @@ import {
   listAllContexts,
   setConfigIndexName,
 } from "./collections.js";
+import { normalizeMcpHost, validateMcpHostInput } from "./mcp-host.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -2275,6 +2276,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2399,7 +2401,7 @@ function showHelp(): void {
   console.log("AI agents & integrations:");
   console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
   console.log("  - `qmd --skill` prints the packaged skills/qmd/SKILL.md (path + contents).");
-  console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
+  console.log("  - Advanced: `qmd mcp --http [--host ADDR] [--port N]` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
@@ -2801,6 +2803,22 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        let host: string | undefined;
+        if (cli.values.host !== undefined) {
+          if (typeof cli.values.host !== "string") {
+            console.error(`Invalid --host value: "--host" requires a hostname or IP address argument.`);
+            process.exit(1);
+          }
+          const rawHost = cli.values.host;
+          try {
+            validateMcpHostInput(rawHost);
+          } catch (err) {
+            console.error(String((err as Error).message || err));
+            process.exit(1);
+          }
+          host = normalizeMcpHost(rawHost).bindHost;
+        }
+        const normalizedHost = normalizeMcpHost(host);
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -2822,6 +2840,9 @@ if (isMain) {
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
+          if (host !== undefined) {
+            spawnArgs.push("--host", host);
+          }
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -2830,7 +2851,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${normalizedHost.displayHost}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -2841,10 +2862,10 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("./mcp.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { host });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            console.error(`Port ${port} already in use on ${normalizedHost.bindHost}. Try a different port with --port.`);
             process.exit(1);
           }
           throw e;
