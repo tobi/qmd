@@ -1,0 +1,16 @@
+# Modelfile for qmd-query-expand
+# Usage: ollama create qmd-query-expand -f exports/qmd-query-expand.Modelfile
+#
+# Requires: qmd-query-expand-q4_k_m.gguf in same directory
+# Generate with: python convert.py --quantize q4_k_m
+
+FROM ./qmd-query-expand-q4_k_m.gguf
+
+TEMPLATE """<|im_start|>user
+/no_think Expand this search query: {{.Prompt}}<|im_end|>
+<|im_start|>assistant
+"""
+
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+PARAMETER stop "<|im_end|>"

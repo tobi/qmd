@@ -1,0 +1,21 @@
+# SFT Training Config for QMD Query Expansion (Apple Silicon)
+
+model:
+  base: "Qwen/Qwen3-1.7B"
+  output: "qmd-query-expansion-1.7B-sft"
+
+dataset:
+  name: "tobil/qmd-query-expansion-train-v2"
+  text_field: "text"
+  eval_split: 0.1
+
+training:
+  batch_size: 4
+  iters: 3000
+  learning_rate: 2e-4
+  max_length: 512
+  grad_accumulation_steps: 4
+
+lora:
+  num_layers: 16
+  rank: 16
