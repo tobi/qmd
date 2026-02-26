@@ -49,7 +49,7 @@ qmd mcp stop                # Stop daemon
 
 ## Tools
 
-### structured_search
+### query
 
 Search with pre-expanded queries.
 
@@ -61,7 +61,7 @@ Search with pre-expanded queries.
     { "type": "hyde", "query": "hypothetical answer passage..." }
   ],
   "limit": 10,
-  "collection": "optional",
+  "collections": ["optional-collection-name"],
   "minScore": 0.0
 }
 ```
@@ -78,9 +78,10 @@ Retrieve document by path or `#docid`.
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `path` | string | File path or `#docid` |
-| `full` | bool? | Return full content |
-| `lineNumbers` | bool? | Add line numbers |
+| `file` | string | File path or `#docid` (e.g., `pages/meeting.md`, `#abc123`, or `pages/meeting.md:100`) |
+| `fromLine` | number? | Start from this line number (1-indexed) |
+| `maxLines` | number? | Maximum number of lines to return |
+| `lineNumbers` | bool? | Add line numbers to output |
 
 ### multi_get
 
@@ -89,7 +90,9 @@ Retrieve multiple documents.
 | Param | Type | Description |
 |-------|------|-------------|
 | `pattern` | string | Glob or comma-separated list |
+| `maxLines` | number? | Maximum lines per file |
 | `maxBytes` | number? | Skip large files (default 10KB) |
+| `lineNumbers` | bool? | Add line numbers to output |
 
 ### status
 
