@@ -6,7 +6,7 @@
 	},
 	"plugins": [
 		{
-			"name": "qmd",
+			"name": "qmd-search",
 			"source": "./",
 			"description": "Search and retrieve documents from local markdown files.",
 			"version": "0.1.0",
