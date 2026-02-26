@@ -1783,11 +1783,38 @@ function shortPath(dirpath: string): string {
   return dirpath;
 }
 
+type EmptySearchReason = "no_results" | "min_score";
+
+// Emit format-safe empty output for search commands.
+function printEmptySearchResults(format: OutputFormat, reason: EmptySearchReason = "no_results"): void {
+  if (format === "json") {
+    console.log("[]");
+    return;
+  }
+  if (format === "csv") {
+    console.log("docid,score,file,title,context,line,snippet");
+    return;
+  }
+  if (format === "xml") {
+    console.log("<results></results>");
+    return;
+  }
+  if (format === "md" || format === "files") {
+    return;
+  }
+
+  if (reason === "min_score") {
+    console.log("No results found above minimum score threshold.");
+    return;
+  }
+  console.log("No results found.");
+}
+
 function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
-    console.log("No results found above minimum score threshold.");
+    printEmptySearchResults(opts.format, "min_score");
     return;
   }
 
@@ -2029,11 +2056,7 @@ function search(query: string, opts: OutputOptions): void {
   closeDb();
 
   if (resultsWithContext.length === 0) {
-    if (opts.format === "json") {
-      console.log("[]");
-    } else {
-      console.log("No results found.");
-    }
+    printEmptySearchResults(opts.format);
     return;
   }
   outputResults(resultsWithContext, query, opts);
@@ -2088,11 +2111,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
@@ -2205,11 +2224,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
