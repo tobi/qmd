@@ -11,11 +11,13 @@ import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
+import { setConfigIndexName } from "../src/collections";
 
 // =============================================================================
 // Test Database Setup
@@ -206,6 +208,9 @@ describe("MCP Server", () => {
     // Use shared singleton to avoid creating multiple instances with separate GPU resources
     getDefaultLlamaCpp();
 
+    // Reset index name in case another test file mutated it (bun test shares process)
+    setConfigIndexName("index");
+
     // Set up test config directory
     const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     testConfigDir = await mkdtemp(configPrefix);
@@ -234,7 +239,7 @@ describe("MCP Server", () => {
   afterAll(async () => {
     testDb.close();
     try {
-      require("fs").unlinkSync(testDbPath);
+      unlinkSync(testDbPath);
     } catch {}
 
     // Clean up test config directory
@@ -253,7 +258,7 @@ describe("MCP Server", () => {
   // Tool: qmd_search (BM25)
   // ===========================================================================
 
-  describe("qmd_search tool", () => {
+  describe("searchFTS (BM25 keyword search)", () => {
     test("returns results for matching query", () => {
       const results = searchFTS(testDb, "readme", 10);
       expect(results.length).toBeGreaterThan(0);
@@ -291,10 +296,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_vector_search (Vector)
+  // searchVec (Vector similarity search)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("qmd_vector_search tool", () => {
+  describe.skipIf(!!process.env.CI)("searchVec (vector similarity)", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -317,10 +322,10 @@ describe("MCP Server", () => {
   });
 
   // ===========================================================================
-  // Tool: qmd_deep_search (Deep search)
+  // hybridQuery (query expansion + reranking)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("qmd_deep_search tool", () => {
+  describe.skipIf(!!process.env.CI)("hybridQuery (expansion + reranking)", () => {
     test("expands query with typed variations", async () => {
       const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Returns ExpandedQuery[] — typed expansions, original excluded
@@ -916,7 +921,7 @@ describe("MCP HTTP Transport", () => {
     else delete process.env.QMD_CONFIG_DIR;
 
     // Clean up test files
-    try { require("fs").unlinkSync(httpTestDbPath); } catch {}
+    try { unlinkSync(httpTestDbPath); } catch {}
     try {
       const files = await readdir(httpTestConfigDir);
       for (const f of files) await unlink(join(httpTestConfigDir, f));
@@ -1004,12 +1009,12 @@ describe("MCP HTTP Transport", () => {
     expect(contentType).toContain("application/json");
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toContain("search");
+    expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
   });
 
-  test("POST /mcp tools/call search returns results", async () => {
+  test("POST /mcp tools/call query returns results", async () => {
     // Initialize
     await mcpRequest({
       jsonrpc: "2.0", id: 1, method: "initialize",
@@ -1018,7 +1023,7 @@ describe("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "search", arguments: { query: "readme" } },
+      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();

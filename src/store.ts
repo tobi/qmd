@@ -2003,13 +2003,110 @@ function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
 }
 
+/**
+ * Parse lex query syntax into FTS5 query.
+ *
+ * Supports:
+ * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
+ * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - Plain terms: term → "term"* (prefix match)
+ *
+ * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
+ * So `-term` only works when there are also positive terms.
+ *
+ * Examples:
+ *   performance -sports     → "performance"* NOT "sports"*
+ *   "machine learning"      → "machine learning"
+ */
 function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t.length > 0);
-  if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  const positive: string[] = [];
+  const negative: string[] = [];
+
+  let i = 0;
+  const s = query.trim();
+
+  while (i < s.length) {
+    // Skip whitespace
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    if (i >= s.length) break;
+
+    // Check for negation prefix
+    const negated = s[i] === '-';
+    if (negated) i++;
+
+    // Check for quoted phrase
+    if (s[i] === '"') {
+      const start = i + 1;
+      i++;
+      while (i < s.length && s[i] !== '"') i++;
+      const phrase = s.slice(start, i).trim();
+      i++; // skip closing quote
+      if (phrase.length > 0) {
+        const sanitized = phrase.split(/\s+/).map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+          }
+        }
+      }
+    } else {
+      // Plain term (until whitespace or quote)
+      const start = i;
+      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
+      const term = s.slice(start, i);
+
+      const sanitized = sanitizeFTS5Term(term);
+      if (sanitized) {
+        const ftsTerm = `"${sanitized}"*`;  // Prefix match
+        if (negated) {
+          negative.push(ftsTerm);
+        } else {
+          positive.push(ftsTerm);
+        }
+      }
+    }
+  }
+
+  if (positive.length === 0 && negative.length === 0) return null;
+
+  // If only negative terms, we can't search (FTS5 NOT is binary)
+  if (positive.length === 0) return null;
+
+  // Join positive terms with AND
+  let result = positive.join(' AND ');
+
+  // Add NOT clause for negative terms
+  for (const neg of negative) {
+    result = `${result} NOT ${neg}`;
+  }
+
+  return result;
+}
+
+/**
+ * Validate that a vec/hyde query doesn't use lex-only syntax.
+ * Returns error message if invalid, null if valid.
+ */
+export function validateSemanticQuery(query: string): string | null {
+  // Check for negation syntax
+  if (/-\w/.test(query) || /-"/.test(query)) {
+    return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
+  }
+  return null;
+}
+
+export function validateLexQuery(query: string): string | null {
+  if (/[\r\n]/.test(query)) {
+    return 'Lex queries must be a single line. Remove newline characters or split into separate lex: lines.';
+  }
+  const quoteCount = (query.match(/"/g) ?? []).length;
+  if (quoteCount % 2 === 1) {
+    return 'Lex query has an unmatched double quote ("). Add the closing quote or remove it.';
+  }
+  return null;
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
@@ -2778,12 +2875,18 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 export interface SearchHooks {
   /** BM25 probe found strong signal — expansion will be skipped */
   onStrongSignal?: (topScore: number) => void;
-  /** Query expansion complete. Empty array = strong signal skip (no expansion). */
-  onExpand?: (original: string, expanded: ExpandedQuery[]) => void;
+  /** Query expansion starting */
+  onExpandStart?: () => void;
+  /** Query expansion complete. Empty array = strong signal skip. elapsedMs = time taken. */
+  onExpand?: (original: string, expanded: ExpandedQuery[], elapsedMs: number) => void;
+  /** Embedding starting (vec/hyde queries) */
+  onEmbedStart?: (count: number) => void;
+  /** Embedding complete */
+  onEmbedDone?: (elapsedMs: number) => void;
   /** Reranking is about to start */
   onRerankStart?: (chunkCount: number) => void;
   /** Reranking finished */
-  onRerankDone?: () => void;
+  onRerankDone?: (elapsedMs: number) => void;
 }
 
 export interface HybridQueryOptions {
@@ -2848,11 +2951,13 @@ export async function hybridQuery(
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
   // Step 2: Expand query (or skip if strong signal)
+  hooks?.onExpandStart?.();
+  const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
 
-  hooks?.onExpand?.(query, expanded);
+  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -2897,7 +3002,10 @@ export async function hybridQuery(
     // Batch embed all vector queries in a single call
     const llm = getDefaultLlamaCpp();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    hooks?.onEmbedStart?.(textsToEmbed.length);
+    const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
+    hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -2950,8 +3058,9 @@ export async function hybridQuery(
 
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart = Date.now();
   const reranked = await store.rerank(query, chunksToRerank);
-  hooks?.onRerankDone?.();
+  hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
@@ -3041,9 +3150,10 @@ export async function vectorSearchQuery(
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
+  const expandStart = Date.now();
   const allExpanded = await store.expandQuery(query);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
-  options?.hooks?.onExpand?.(query, vecExpanded);
+  options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
@@ -3068,6 +3178,230 @@ export async function vectorSearchQuery(
 
   return Array.from(allResults.values())
     .sort((a, b) => b.score - a.score)
+    .filter(r => r.score >= minScore)
+    .slice(0, limit);
+}
+
+// =============================================================================
+// Structured search — pre-expanded queries from LLM
+// =============================================================================
+
+/**
+ * A single sub-search in a structured search request.
+ * Matches the format used in QMD training data.
+ */
+export interface StructuredSubSearch {
+  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical */
+  type: 'lex' | 'vec' | 'hyde';
+  /** The search query text */
+  query: string;
+  /** Optional line number for error reporting (CLI parser) */
+  line?: number;
+}
+
+export interface StructuredSearchOptions {
+  collections?: string[];   // Filter to specific collections (OR match)
+  limit?: number;           // default 10
+  minScore?: number;        // default 0
+  candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
+  /** Future: domain intent hint for routing/boosting */
+  intent?: string;
+  hooks?: SearchHooks;
+}
+
+/**
+ * Structured search: execute pre-expanded queries without LLM query expansion.
+ *
+ * Designed for LLM callers (MCP/HTTP) that generate their own query expansions.
+ * Skips the internal expandQuery() step — goes directly to:
+ *
+ * Pipeline:
+ * 1. Route searches: lex→FTS, vec/hyde→vector (batch embed)
+ * 2. RRF fusion across all result lists
+ * 3. Chunk documents + keyword-best-chunk selection
+ * 4. Rerank on chunks
+ * 5. Position-aware score blending
+ * 6. Dedup, filter, slice
+ *
+ * This is the recommended endpoint for capable LLMs — they can generate
+ * better query variations than our small local model, especially for
+ * domain-specific or nuanced queries.
+ */
+export async function structuredSearch(
+  store: Store,
+  searches: StructuredSubSearch[],
+  options?: StructuredSearchOptions
+): Promise<HybridQueryResult[]> {
+  const limit = options?.limit ?? 10;
+  const minScore = options?.minScore ?? 0;
+  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const hooks = options?.hooks;
+
+  const collections = options?.collections;
+
+  if (searches.length === 0) return [];
+
+  // Validate queries before executing
+  for (const search of searches) {
+    const location = search.line ? `Line ${search.line}` : 'Structured search';
+    if (/[\r\n]/.test(search.query)) {
+      throw new Error(`${location} (${search.type}): queries must be single-line. Remove newline characters.`);
+    }
+    if (search.type === 'lex') {
+      const error = validateLexQuery(search.query);
+      if (error) {
+        throw new Error(`${location} (lex): ${error}`);
+      }
+    } else if (search.type === 'vec' || search.type === 'hyde') {
+      const error = validateSemanticQuery(search.query);
+      if (error) {
+        throw new Error(`${location} (${search.type}): ${error}`);
+      }
+    }
+  }
+
+  const rankedLists: RankedResult[][] = [];
+  const docidMap = new Map<string, string>(); // filepath -> docid
+  const hasVectors = !!store.db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+  ).get();
+
+  // Helper to run search across collections (or all if undefined)
+  const collectionList = collections ?? [undefined]; // undefined = all collections
+
+  // Step 1: Run FTS for all lex searches (sync, instant)
+  for (const search of searches) {
+    if (search.type === 'lex') {
+      for (const coll of collectionList) {
+        const ftsResults = store.searchFTS(search.query, 20, coll);
+        if (ftsResults.length > 0) {
+          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(ftsResults.map(r => ({
+            file: r.filepath, displayPath: r.displayPath,
+            title: r.title, body: r.body || "", score: r.score,
+          })));
+        }
+      }
+    }
+  }
+
+  // Step 2: Batch embed and run vector searches for vec/hyde
+  if (hasVectors) {
+    const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
+    if (vecSearches.length > 0) {
+      const llm = getDefaultLlamaCpp();
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      hooks?.onEmbedStart?.(textsToEmbed.length);
+      const embedStart = Date.now();
+      const embeddings = await llm.embedBatch(textsToEmbed);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
+
+      for (let i = 0; i < vecSearches.length; i++) {
+        const embedding = embeddings[i]?.embedding;
+        if (!embedding) continue;
+
+        for (const coll of collectionList) {
+          const vecResults = await store.searchVec(
+            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            undefined, embedding
+          );
+          if (vecResults.length > 0) {
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+          }
+        }
+      }
+    }
+  }
+
+  if (rankedLists.length === 0) return [];
+
+  // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
+  const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
+  const fused = reciprocalRankFusion(rankedLists, weights);
+  const candidates = fused.slice(0, candidateLimit);
+
+  if (candidates.length === 0) return [];
+
+  hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+
+  // Step 4: Chunk documents, pick best chunk per doc for reranking
+  // Use first lex query as the "query" for keyword matching, or first vec if no lex
+  const primaryQuery = searches.find(s => s.type === 'lex')?.query
+    || searches.find(s => s.type === 'vec')?.query
+    || searches[0]?.query || "";
+  const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const chunksToRerank: { file: string; text: string }[] = [];
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+
+  for (const cand of candidates) {
+    const chunks = chunkDocument(cand.body);
+    if (chunks.length === 0) continue;
+
+    // Pick chunk with most keyword overlap
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkLower = chunks[i]!.text.toLowerCase();
+      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      if (score > bestScore) { bestScore = score; bestIdx = i; }
+    }
+
+    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
+    docChunkMap.set(cand.file, { chunks, bestIdx });
+  }
+
+  // Step 5: Rerank chunks
+  hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart2 = Date.now();
+  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  hooks?.onRerankDone?.(Date.now() - rerankStart2);
+
+  // Step 6: Blend RRF position score with reranker score
+  const candidateMap = new Map(candidates.map(c => [c.file, {
+    displayPath: c.displayPath, title: c.title, body: c.body,
+  }]));
+  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+
+  const blended = reranked.map(r => {
+    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+    let rrfWeight: number;
+    if (rrfRank <= 3) rrfWeight = 0.75;
+    else if (rrfRank <= 10) rrfWeight = 0.60;
+    else rrfWeight = 0.40;
+    const rrfScore = 1 / rrfRank;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+
+    const candidate = candidateMap.get(r.file);
+    const chunkInfo = docChunkMap.get(r.file);
+    const bestIdx = chunkInfo?.bestIdx ?? 0;
+    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
+    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+
+    return {
+      file: r.file,
+      displayPath: candidate?.displayPath || "",
+      title: candidate?.title || "",
+      body: candidate?.body || "",
+      bestChunk,
+      bestChunkPos,
+      score: blendedScore,
+      context: store.getContextForFile(r.file),
+      docid: docidMap.get(r.file) || "",
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  // Step 7: Dedup by file
+  const seenFiles = new Set<string>();
+  return blended
+    .filter(r => {
+      if (seenFiles.has(r.file)) return false;
+      seenFiles.add(r.file);
+      return true;
+    })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }

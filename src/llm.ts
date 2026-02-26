@@ -179,6 +179,12 @@ const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-re
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
+// Alternative generation models for query expansion:
+// LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
+// Use these as base for fine-tuning with configs/sft_lfm2.yaml
+export const LFM2_GENERATE_MODEL = "hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf";
+export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf";
+
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
@@ -1016,6 +1022,9 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  // Qwen3 reranker chat template overhead (system prompt, tags, separators)
+  private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+
   async rerank(
     query: string,
     documents: RerankDocument[],
@@ -1025,15 +1034,28 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     const contexts = await this.ensureRerankContexts();
+    const model = await this.ensureRerankModel();
+
+    // Truncate documents that would exceed the rerank context size.
+    // Budget = contextSize - template overhead - query tokens
+    const queryTokens = model.tokenize(query).length;
+    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+
+    const truncatedDocs = documents.map((doc) => {
+      const tokens = model.tokenize(doc.text);
+      if (tokens.length <= maxDocTokens) return doc;
+      const truncatedText = model.detokenize(tokens.slice(0, maxDocTokens));
+      return { ...doc, text: truncatedText };
+    });
 
     // Build a map from document text to original indices (for lookup after sorting)
     const textToDoc = new Map<string, { file: string; index: number }>();
-    documents.forEach((doc, index) => {
+    truncatedDocs.forEach((doc, index) => {
       textToDoc.set(doc.text, { file: doc.file, index });
     });
 
     // Extract just the text for ranking
-    const texts = documents.map((doc) => doc.text);
+    const texts = truncatedDocs.map((doc) => doc.text);
 
     // Split documents across contexts for parallel evaluation.
     // Each context has its own sequence with a lock, so parallelism comes

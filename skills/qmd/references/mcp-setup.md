@@ -1,112 +1,102 @@
 # QMD MCP Server Setup
 
-Manual MCP configuration for use without the qmd plugin.
+## Install
 
-> **Note**: If using the qmd plugin, MCP configuration is included automatically. This is only needed for manual setup.
+```bash
+npm install -g @tobilu/qmd
+qmd collection add ~/path/to/markdown --name myknowledge
+qmd embed
+```
 
-## Claude Code
+## Configure MCP Client
 
-Add to `~/.claude/settings.json`:
-
+**Claude Code** (`~/.claude/settings.json`):
 ```json
 {
   "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
+    "qmd": { "command": "qmd", "args": ["mcp"] }
+  }
+}
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "qmd": { "command": "qmd", "args": ["mcp"] }
+  }
+}
+```
+
+**OpenClaw** (`~/.openclaw/openclaw.json`):
+```json
+{
+  "mcp": {
+    "servers": {
+      "qmd": { "command": "qmd", "args": ["mcp"] }
     }
   }
 }
 ```
 
-## Claude Desktop
+## HTTP Mode
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+```bash
+qmd mcp --http              # Port 8181
+qmd mcp --http --daemon     # Background
+qmd mcp stop                # Stop daemon
+```
+
+## Tools
+
+### structured_search
+
+Search with pre-expanded queries.
 
 ```json
 {
-  "mcpServers": {
-    "qmd": {
-      "command": "qmd",
-      "args": ["mcp"]
-    }
-  }
+  "searches": [
+    { "type": "lex", "query": "keyword phrases" },
+    { "type": "vec", "query": "natural language question" },
+    { "type": "hyde", "query": "hypothetical answer passage..." }
+  ],
+  "limit": 10,
+  "collection": "optional",
+  "minScore": 0.0
 }
 ```
 
-## Available MCP Tools
+| Type | Method | Input |
+|------|--------|-------|
+| `lex` | BM25 | Keywords (2-5 terms) |
+| `vec` | Vector | Question |
+| `hyde` | Vector | Answer passage (50-100 words) |
 
-Once configured, these tools become available:
+### get
 
-### qmd_search
-Fast BM25 keyword search.
+Retrieve document by path or `#docid`.
 
-**Parameters:**
-- `query` (required): Search query string
-- `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
-- `minScore` (optional): Minimum relevance score
+| Param | Type | Description |
+|-------|------|-------------|
+| `path` | string | File path or `#docid` |
+| `full` | bool? | Return full content |
+| `lineNumbers` | bool? | Add line numbers |
 
-### qmd_vector_search
-Semantic vector search for conceptual similarity.
+### multi_get
 
-**Parameters:**
-- `query` (required): Search query string
-- `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
-- `minScore` (optional): Minimum relevance score
-
-### qmd_deep_search
-Hybrid search combining BM25, vector search, and LLM re-ranking.
-
-**Parameters:**
-- `query` (required): Search query string
-- `collection` (optional): Restrict to specific collection
-- `limit` (optional): Number of results (default: 5)
-- `minScore` (optional): Minimum relevance score
-
-### qmd_get
-Retrieve a document by path or docid.
-
-**Parameters:**
-- `path` (required): Document path or docid (e.g., `#abc123`)
-- `full` (optional): Return full content (default: true)
-- `lineNumbers` (optional): Include line numbers
-
-### qmd_multi_get
 Retrieve multiple documents.
 
-**Parameters:**
-- `pattern` (required): Glob pattern or comma-separated list
-- `maxBytes` (optional): Skip files larger than this (default: 10KB)
+| Param | Type | Description |
+|-------|------|-------------|
+| `pattern` | string | Glob or comma-separated list |
+| `maxBytes` | number? | Skip large files (default 10KB) |
 
-### qmd_status
-Get index health and collection information.
+### status
 
-**Parameters:** None
+Index health and collections. No params.
 
 ## Troubleshooting
 
-### MCP server not starting
-- Ensure qmd is in your PATH: `which qmd`
-- Try running `qmd mcp` manually to see errors
-- Check that Bun is installed: `bun --version`
-
-### No results returned
-- Verify collections exist: `qmd collection list`
-- Check index status: `qmd status`
-- Ensure embeddings are generated: `qmd embed`
-
-### Slow searches
-- For faster results, use `qmd_search` instead of `qmd_deep_search`
-- The first search may be slow while models load (~3GB)
-- Subsequent searches are much faster
-
-## Choosing Between CLI and MCP
-
-| Scenario | Recommendation |
-|----------|---------------|
-| MCP configured | Use `qmd_*` tools directly |
-| No MCP | Use Bash with `qmd` commands |
-| Complex pipelines | Bash may be more flexible |
-| Simple lookups | MCP tools are cleaner |
+- **Not starting**: `which qmd`, `qmd mcp` manually
+- **No results**: `qmd collection list`, `qmd embed`
+- **Slow first search**: Normal, models loading (~3GB)

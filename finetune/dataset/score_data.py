@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pydantic>=2.0"]
+# ///
 """Score JSONL datasets with the reward function."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import statistics
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from dataset.schema import (
-    normalize_output_items,
-    output_items_to_text,
-    parse_output_text,
-)
+from dataset.schema import load_examples, output_items_to_text
 from reward import score_expansion_detailed
 
 
@@ -24,42 +23,24 @@ def score_file(path: Path) -> tuple[int, int, list[float], dict]:
     scores: list[float] = []
     ratings: dict[str, int] = {}
 
-    with path.open("r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                errors += 1
-                continue
+    try:
+        examples = load_examples(path)
+    except ValueError as e:
+        print(f"  Error loading {path}: {e}")
+        return 0, 1, [], {}
 
-            query = obj.get("query") or obj.get("input")
-            output = obj.get("output")
-            if not isinstance(query, str) or not query.strip():
-                errors += 1
-                continue
-            if output is None:
-                errors += 1
-                continue
+    for ex in examples:
+        total += 1
+        output_text = output_items_to_text(ex.output)
+        if not output_text:
+            errors += 1
+            continue
 
-            if isinstance(output, str):
-                output_items = normalize_output_items(parse_output_text(output))
-            else:
-                output_items = normalize_output_items(output)
-
-            output_text = output_items_to_text(output_items)
-            if not output_text:
-                errors += 1
-                continue
-
-            detail = score_expansion_detailed(query, output_text)
-            score = detail["percentage"]
-            scores.append(score)
-            rating = detail["rating"]
-            ratings[rating] = ratings.get(rating, 0) + 1
+        detail = score_expansion_detailed(ex.query, output_text)
+        score = detail["percentage"]
+        scores.append(score)
+        rating = detail["rating"]
+        ratings[rating] = ratings.get(rating, 0) + 1
 
     return total, errors, scores, ratings
 

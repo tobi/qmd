@@ -5,7 +5,7 @@ import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join as pathJoin } from "path";
 import { parseArgs } from "util";
-import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
 import {
   getPwd,
   getRealPath,
@@ -59,8 +59,10 @@ import {
   handelize,
   hybridQuery,
   vectorSearchQuery,
+  structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
+  type StructuredSubSearch,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
@@ -79,6 +81,7 @@ import {
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
+  getDefaultCollectionNames,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
   setGlobalContext,
@@ -120,7 +123,16 @@ function getDbPath(): string {
 }
 
 function setIndexName(name: string | null): void {
-  storeDbPathOverride = name ? getDefaultDbPath(name) : undefined;
+  let normalizedName = name;
+  // Normalize relative paths to prevent malformed database paths
+  if (name && name.includes('/')) {
+    const { resolve } = require('path');
+    const { cwd } = require('process');
+    const absolutePath = resolve(cwd(), name);
+    // Replace path separators with underscores to create a valid filename
+    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  }
+  storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
 }
@@ -243,6 +255,11 @@ function formatTimeAgo(date: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
 }
 
 function formatBytes(bytes: number): string {
@@ -406,6 +423,41 @@ async function showStatus(): Promise<void> {
     console.log(`  CPU:      ${device.cpuCores} math cores`);
   } catch {
     // Don't fail status if LLM init fails
+  }
+
+  // Tips section
+  const tips: string[] = [];
+
+  // Check for collections without context
+  const collectionsWithoutContext = collections.filter(col => {
+    const contexts = contextsByCollection.get(col.name) || [];
+    return contexts.length === 0;
+  });
+  if (collectionsWithoutContext.length > 0) {
+    const names = collectionsWithoutContext.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutContext.length > 3 ? ` +${collectionsWithoutContext.length - 3} more` : '';
+    tips.push(`Add context to collections for better search results: ${names}${more}`);
+    tips.push(`  ${c.dim}qmd context add qmd://<name>/ "What this collection contains"${c.reset}`);
+    tips.push(`  ${c.dim}qmd context add qmd://<name>/meeting-notes "Weekly team meeting notes"${c.reset}`);
+  }
+
+  // Check for collections without update commands
+  const collectionsWithoutUpdate = collections.filter(col => {
+    const yamlCol = getCollectionFromYaml(col.name);
+    return !yamlCol?.update;
+  });
+  if (collectionsWithoutUpdate.length > 0 && collections.length > 1) {
+    const names = collectionsWithoutUpdate.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutUpdate.length > 3 ? ` +${collectionsWithoutUpdate.length - 3} more` : '';
+    tips.push(`Add update commands to keep collections fresh: ${names}${more}`);
+    tips.push(`  ${c.dim}qmd collection update-cmd <name> 'git stash && git pull --rebase --ff-only && git stash pop'${c.reset}`);
+  }
+
+  if (tips.length > 0) {
+    console.log(`\n${c.bold}Tips${c.reset}`);
+    for (const tip of tips) {
+      console.log(`  ${tip}`);
+    }
   }
 
   closeDb();
@@ -672,63 +724,6 @@ function contextRemove(pathArg: string): void {
   }
 
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
-}
-
-function contextCheck(): void {
-  const db = getDb();
-
-  // Get collections without any context
-  const collectionsWithoutContext = getCollectionsWithoutContext(db);
-
-  // Get all collections to check for missing path contexts
-  const allCollections = listCollections(db);
-
-  if (collectionsWithoutContext.length === 0 && allCollections.length > 0) {
-    // Check if all collections have contexts
-    console.log(`\n${c.green}✓${c.reset} ${c.bold}All collections have context configured${c.reset}\n`);
-  }
-
-  if (collectionsWithoutContext.length > 0) {
-    console.log(`\n${c.yellow}Collections without any context:${c.reset}\n`);
-
-    for (const coll of collectionsWithoutContext) {
-      console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(${coll.doc_count} documents)${c.reset}`);
-      console.log(`  ${c.dim}Suggestion: qmd context add qmd://${coll.name}/ "Description of ${coll.name}"${c.reset}\n`);
-    }
-  }
-
-  // Check for top-level paths without context within collections that DO have context
-  const collectionsWithContext = allCollections.filter(c =>
-    c && !collectionsWithoutContext.some(cwc => cwc.name === c.name)
-  );
-
-  let hasPathSuggestions = false;
-
-  for (const coll of collectionsWithContext) {
-    if (!coll) continue;
-    const missingPaths = getTopLevelPathsWithoutContext(db, coll.name);
-
-    if (missingPaths.length > 0) {
-      if (!hasPathSuggestions) {
-        console.log(`${c.yellow}Top-level directories without context:${c.reset}\n`);
-        hasPathSuggestions = true;
-      }
-
-      console.log(`${c.cyan}${coll.name}${c.reset}`);
-      for (const path of missingPaths) {
-        console.log(`  ${path}`);
-        console.log(`    ${c.dim}Suggestion: qmd context add qmd://${coll.name}/${path} "Description of ${path}"${c.reset}`);
-      }
-      console.log('');
-    }
-  }
-
-  if (collectionsWithoutContext.length === 0 && !hasPathSuggestions) {
-    console.log(`${c.dim}All collections and major paths have context configured.${c.reset}`);
-    console.log(`${c.dim}Use 'qmd context list' to see all configured contexts.${c.reset}\n`);
-  }
-
-  closeDb();
 }
 
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
@@ -1154,7 +1149,7 @@ function listFiles(pathArg?: string): void {
     const yamlCollections = yamlListCollections();
 
     if (yamlCollections.length === 0) {
-      console.log("No collections found. Run 'qmd add .' to index files.");
+      console.log("No collections found. Run 'qmd collection add .' to index files.");
       closeDb();
       return;
     }
@@ -1293,7 +1288,7 @@ function collectionList(): void {
   const collections = listCollections(db);
 
   if (collections.length === 0) {
-    console.log("No collections found. Run 'qmd add .' to create one.");
+    console.log("No collections found. Run 'qmd collection add .' to create one.");
     closeDb();
     return;
   }
@@ -1303,8 +1298,13 @@ function collectionList(): void {
   for (const coll of collections) {
     const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
     const timeAgo = formatTimeAgo(updatedAt);
+    
+    // Get YAML config to check includeByDefault
+    const yamlColl = getCollectionFromYaml(coll.name);
+    const excluded = yamlColl?.includeByDefault === false;
+    const excludeTag = excluded ? ` ${c.yellow}[excluded]${c.reset}` : '';
 
-    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
@@ -1748,7 +1748,7 @@ type OutputOptions = {
   limit: number;
   minScore: number;
   all?: boolean;
-  collection?: string;  // Filter by collection name (pwd suffix match)
+  collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
 };
@@ -1902,24 +1902,117 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   }
 }
 
-function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
-
-  // Validate collection filter if specified
-  let collectionName: string | undefined;
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
+// Resolve -c collection filter: supports single string, array, or undefined.
+// Returns validated collection names (exits on unknown collection).
+function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+  // If no filter specified and useDefaults is true, use default collections
+  if (!raw && useDefaults) {
+    return getDefaultCollectionNames();
+  }
+  if (!raw) return [];
+  const names = Array.isArray(raw) ? raw : [raw];
+  const validated: string[] = [];
+  for (const name of names) {
+    const coll = getCollectionFromYaml(name);
     if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
+      console.error(`Collection not found: ${name}`);
       closeDb();
       process.exit(1);
     }
-    collectionName = opts.collection;
+    validated.push(name);
   }
+  return validated;
+}
+
+// Post-filter results to only include files from specified collections.
+function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
+  if (collectionNames.length <= 1) return results;
+  const prefixes = collectionNames.map(n => `qmd://${n}/`);
+  return results.filter(r => {
+    const path = r.filepath || r.file || '';
+    return prefixes.some(p => path.startsWith(p));
+  });
+}
+
+/**
+ * Parse structured search query syntax.
+ * Lines starting with lex:, vec:, or hyde: are routed directly.
+ * Plain lines without prefix go through query expansion.
+ * 
+ * Returns null if this is a plain query (single line, no prefix).
+ * Returns StructuredSubSearch[] if structured syntax detected.
+ * Throws if multiple plain lines (ambiguous).
+ * 
+ * Examples:
+ *   "CAP theorem"                    -> null (plain query, use expansion)
+ *   "lex: CAP theorem"               -> [{ type: 'lex', query: 'CAP theorem' }]
+ *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
+ *   "CAP\nconsistency"               -> throws (multiple plain lines)
+ */
+function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+  const rawLines = query.split('\n').map((line, idx) => ({
+    raw: line,
+    trimmed: line.trim(),
+    number: idx + 1,
+  })).filter(line => line.trimmed.length > 0);
+
+  if (rawLines.length === 0) return null;
+
+  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const expandRe = /^expand:\s*/i;
+  const typed: StructuredSubSearch[] = [];
+
+  for (const line of rawLines) {
+    if (expandRe.test(line.trimmed)) {
+      if (rawLines.length > 1) {
+        throw new Error(`Line ${line.number} starts with expand:, but query documents cannot mix expand with typed lines. Submit a single expand query instead.`);
+      }
+      const text = line.trimmed.replace(expandRe, '').trim();
+      if (!text) {
+        throw new Error('expand: query must include text.');
+      }
+      return null; // treat as standalone expand query
+    }
+
+    const match = line.trimmed.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
+      const text = line.trimmed.slice(match[0].length).trim();
+      if (!text) {
+        throw new Error(`Line ${line.number} (${type}:) must include text.`);
+      }
+      if (/\r|\n/.test(text)) {
+        throw new Error(`Line ${line.number} (${type}:) contains a newline. Keep each query on a single line.`);
+      }
+      typed.push({ type, query: text, line: line.number });
+      continue;
+    }
+
+    if (rawLines.length === 1) {
+      // Single plain line -> implicit expand
+      return null;
+    }
+
+    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde: prefix. Each line in a query document must start with one.`);
+  }
+
+  return typed.length > 0 ? typed : null;
+}
+
+function search(query: string, opts: OutputOptions): void {
+  const db = getDb();
+
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionName);
+  const results = filterByCollections(
+    searchFTS(db, query, fetchLimit, singleCollection),
+    collectionNames
+  );
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1936,7 +2029,11 @@ function search(query: string, opts: OutputOptions): void {
   closeDb();
 
   if (resultsWithContext.length === 0) {
-    console.log("No results found.");
+    if (opts.format === "json") {
+      console.log("[]");
+    } else {
+      console.log("No results found.");
+    }
     return;
   }
   outputResults(resultsWithContext, query, opts);
@@ -1960,20 +2057,16 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    const results = await vectorSearchQuery(store, query, {
-      collection: opts.collection,
+    let results = await vectorSearchQuery(store, query, {
+      collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -1984,10 +2077,22 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       },
     });
 
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `qmd://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
+
     closeDb();
 
     if (results.length === 0) {
-      console.log("No results found.");
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
       return;
     }
 
@@ -2006,46 +2111,112 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
-  if (opts.collection) {
-    const coll = getCollectionFromYaml(opts.collection);
-    if (!coll) {
-      console.error(`Collection not found: ${opts.collection}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
+  // Check for structured query syntax (lex:/vec:/hyde: prefixes)
+  const structuredQueries = parseStructuredQuery(query);
+
   await withLLMSession(async () => {
-    const results = await hybridQuery(store, query, {
-      collection: opts.collection,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0,
-      hooks: {
-        onStrongSignal: (score) => {
-          process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+    let results;
+
+    if (structuredQueries) {
+      // Structured search — user provided their own query expansions
+      const typeLabels = structuredQueries.map(s => s.type).join('+');
+      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+      
+      // Log each sub-query
+      for (const s of structuredQueries) {
+        let preview = s.query.replace(/\n/g, ' ');
+        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+      }
+      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+
+      results = await structuredSearch(store, structuredQueries, {
+        collections: singleCollection ? [singleCollection] : undefined,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            progress.indeterminate();
+          },
+          onRerankDone: (ms) => {
+            progress.clear();
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
         },
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+      });
+    } else {
+      // Standard hybrid query with automatic expansion
+      results = await hybridQuery(store, query, {
+        collection: singleCollection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onStrongSignal: (score) => {
+            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+          },
+          onExpandStart: () => {
+            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
+          },
+          onExpand: (original, expanded, ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            logExpansionTree(original, expanded);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+          },
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            progress.indeterminate();
+          },
+          onRerankDone: (ms) => {
+            progress.clear();
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
         },
-        onRerankStart: (chunkCount) => {
-          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}\n`);
-          progress.indeterminate();
-        },
-        onRerankDone: () => {
-          progress.clear();
-        },
-      },
-    });
+      });
+    }
+
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `qmd://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
 
     closeDb();
 
     if (results.length === 0) {
-      console.log("No results found.");
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
       return;
     }
+
+    // Use first lex/vec query for output context, or original query
+    const displayQuery = structuredQueries
+      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
+      : query;
 
     // Map to CLI output format — use bestChunk for snippet display
     outputResults(results.map(r => ({
@@ -2057,7 +2228,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
-    })), query, { ...opts, limit: results.length });
+    })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
@@ -2073,11 +2244,9 @@ function parseCLI() {
       context: {
         type: "string",
       },
-      "no-lex": {
-        type: "boolean",
-      },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
+      skill: { type: "boolean" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2088,7 +2257,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
-      collection: { type: "string", short: "c" },  // Filter by collection
+      collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2137,7 +2306,7 @@ function parseCLI() {
     limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
-    collection: values.collection as string | undefined,
+    collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
   };
 
@@ -2150,50 +2319,104 @@ function parseCLI() {
   };
 }
 
+function showSkill(): void {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const relativePath = pathJoin("skills", "qmd", "SKILL.md");
+  const skillPath = pathJoin(scriptDir, "..", relativePath);
+
+  console.log(`QMD Skill (${relativePath})`);
+  console.log(`Location: ${skillPath}`);
+  console.log("");
+
+  if (!existsSync(skillPath)) {
+    console.error("SKILL.md not found. If you built from source, ensure skills/qmd/SKILL.md exists.");
+    return;
+  }
+
+  const content = readFileSync(skillPath, "utf-8");
+  process.stdout.write(content.endsWith("\n") ? content : content + "\n");
+}
+
 function showHelp(): void {
+  console.log("qmd — Quick Markdown Search");
+  console.log("");
   console.log("Usage:");
-  console.log("  qmd collection add [path] --name <name> --mask <pattern>  - Create/index collection");
-  console.log("  qmd collection list           - List all collections with details");
-  console.log("  qmd collection remove <name>  - Remove a collection by name");
-  console.log("  qmd collection rename <old> <new>  - Rename a collection");
-  console.log("  qmd ls [collection[/path]]    - List collections or files in a collection");
-  console.log("  qmd context add [path] \"text\" - Add context for path (defaults to current dir)");
-  console.log("  qmd context list              - List all contexts");
-  console.log("  qmd context rm <path>         - Remove context");
-  console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
-  console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
-  console.log("  qmd status                    - Show index status and collections");
-  console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (900 tokens/chunk, 15% overlap)");
-  console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
-  console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
-  console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
-  console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
-  console.log("  qmd mcp                       - Start MCP server (stdio transport)");
-  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
-  console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
-  console.log("  qmd mcp stop                  - Stop background MCP daemon");
+  console.log("  qmd <command> [options]");
+  console.log("");
+  console.log("Primary commands:");
+  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
+  console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
+  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
+  console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
+  console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
+  console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("");
+  console.log("Collections & context:");
+  console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
+  console.log("  qmd context add/list/rm                      - Attach human-written summaries");
+  console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
+  console.log("");
+  console.log("Maintenance:");
+  console.log("  qmd status                    - View index + collection health");
+  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("Query syntax (qmd query):");
+  console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
+  console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
+  console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
+  console.log("");
+  const grammar = [
+    `query          = expand_query | query_document ;`,
+    `expand_query   = text | explicit_expand ;`,
+    `explicit_expand= "expand:" text ;`,
+    `query_document = { typed_line } ;`,
+    `typed_line     = type ":" text newline ;`,
+    `type           = "lex" | "vec" | "hyde" ;`,
+    `text           = quoted_phrase | plain_text ;`,
+    `quoted_phrase  = '"' { character } '"' ;`,
+    `plain_text     = { character } ;`,
+    `newline        = "\\n" ;`,
+  ];
+  console.log("  Grammar:");
+  for (const line of grammar) {
+    console.log(`    ${line}`);
+  }
+  console.log("");
+  console.log("  Examples:");
+  console.log("    qmd query \"how does auth work\"                # single-line → implicit expand");
+  console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
+  console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
+  console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
+  console.log("");
+  console.log("  Constraints:");
+  console.log("    - Standalone expand queries cannot mix with typed lines.");
+  console.log("    - Query documents allow only lex:, vec:, or hyde: prefixes.");
+  console.log("    - Each typed line must be single-line text with balanced quotes.");
+  console.log("");
+  console.log("AI agents & integrations:");
+  console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
+  console.log("  - `qmd --skill` prints the packaged skills/qmd/SKILL.md (path + contents).");
+  console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
-  console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  --index <name>             - Use a named index (default: index)");
   console.log("");
   console.log("Search options:");
-  console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
-  console.log("  --all                      - Return all matches (use with --min-score to filter)");
+  console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
+  console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  --line-numbers             - Add line numbers to output");
-  console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
-  console.log("  --json                     - JSON output with snippets (default: 20 results)");
-  console.log("  --csv                      - CSV output with snippets");
-  console.log("  --md                       - Markdown output");
-  console.log("  --xml                      - XML output");
-  console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("  --line-numbers             - Include line numbers in output");
+  console.log("  --files | --json | --csv | --md | --xml  - Output format");
+  console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
-  console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
+  console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2215,11 +2438,22 @@ async function showVersion(): Promise<void> {
 }
 
 // Main CLI - only run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/qmd.ts") || process.argv[1]?.endsWith("/qmd.js")) {
+const __filename = fileURLToPath(import.meta.url);
+const argv1 = process.argv[1];
+const isMain = argv1 === __filename
+  || argv1?.endsWith("/qmd.ts")
+  || argv1?.endsWith("/qmd.js")
+  || (argv1 != null && realpathSync(argv1) === __filename);
+if (isMain) {
   const cli = parseCLI();
 
   if (cli.values.version) {
     await showVersion();
+    process.exit(0);
+  }
+
+  if (cli.values.skill) {
+    showSkill();
     process.exit(0);
   }
 
@@ -2232,13 +2466,12 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
     case "context": {
       const subcommand = cli.args[0];
       if (!subcommand) {
-        console.error("Usage: qmd context <add|list|check|rm>");
+        console.error("Usage: qmd context <add|list|rm>");
         console.error("");
         console.error("Commands:");
         console.error("  qmd context add [path] \"text\"  - Add context (defaults to current dir)");
         console.error("  qmd context add / \"text\"       - Add global context to all collections");
         console.error("  qmd context list                - List all contexts");
-        console.error("  qmd context check               - Check for missing contexts");
         console.error("  qmd context rm <path>           - Remove context");
         process.exit(1);
       }
@@ -2286,11 +2519,6 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           break;
         }
 
-        case "check": {
-          contextCheck();
-          break;
-        }
-
         case "rm":
         case "remove": {
           if (cli.args.length < 2 || !cli.args[1]) {
@@ -2306,7 +2534,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
 
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
-          console.error("Available: add, list, check, rm");
+          console.error("Available: add, list, rm");
           process.exit(1);
       }
       break;
@@ -2380,9 +2608,102 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
           break;
         }
 
+        case "set-update":
+        case "update-cmd": {
+          const name = cli.args[1];
+          const cmd = cli.args.slice(2).join(' ') || null;
+          if (!name) {
+            console.error("Usage: qmd collection update-cmd <name> [command]");
+            console.error("  Set the command to run before indexing (e.g., 'git pull')");
+            console.error("  Omit command to clear it");
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          updateCollectionSettings(name, { update: cmd });
+          if (cmd) {
+            console.log(`✓ Set update command for '${name}': ${cmd}`);
+          } else {
+            console.log(`✓ Cleared update command for '${name}'`);
+          }
+          break;
+        }
+
+        case "include":
+        case "exclude": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error(`Usage: qmd collection ${subcommand} <name>`);
+            console.error(`  ${subcommand === 'include' ? 'Include' : 'Exclude'} collection in default queries`);
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          const include = subcommand === 'include';
+          updateCollectionSettings(name, { includeByDefault: include });
+          console.log(`✓ Collection '${name}' ${include ? 'included in' : 'excluded from'} default queries`);
+          break;
+        }
+
+        case "show":
+        case "info": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error("Usage: qmd collection show <name>");
+            process.exit(1);
+          }
+          const { getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          console.log(`Collection: ${name}`);
+          console.log(`  Path:     ${col.path}`);
+          console.log(`  Pattern:  ${col.pattern}`);
+          console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.update) {
+            console.log(`  Update:   ${col.update}`);
+          }
+          if (col.context) {
+            const ctxCount = Object.keys(col.context).length;
+            console.log(`  Contexts: ${ctxCount}`);
+          }
+          break;
+        }
+
+        case "help":
+        case undefined: {
+          console.log("Usage: qmd collection <command> [options]");
+          console.log("");
+          console.log("Commands:");
+          console.log("  list                      List all collections");
+          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  remove <name>             Remove a collection");
+          console.log("  rename <old> <new>        Rename a collection");
+          console.log("  show <name>               Show collection details");
+          console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
+          console.log("  include <name>            Include in default queries");
+          console.log("  exclude <name>            Exclude from default queries");
+          console.log("");
+          console.log("Examples:");
+          console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection update-cmd brain 'git pull'");
+          console.log("  qmd collection exclude archive");
+          process.exit(0);
+        }
+
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
-          console.error("Available: list, add, remove, rename");
+          console.error("Run 'qmd collection help' for usage");
           process.exit(1);
       }
       break;

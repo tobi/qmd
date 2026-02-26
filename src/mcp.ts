@@ -19,12 +19,11 @@ import {
   createStore,
   extractSnippet,
   addLineNumbers,
-  hybridQuery,
-  vectorSearchQuery,
+  structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { Store } from "./store.js";
-import { getCollection, getGlobalContext } from "./collections.js";
+import type { Store, StructuredSubSearch } from "./store.js";
+import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
@@ -113,19 +112,23 @@ function buildInstructions(store: Store): string {
   // --- Capability gaps ---
   if (!status.hasVectorIndex) {
     lines.push("");
-    lines.push("Note: No vector embeddings. Only `search` (BM25) is available.");
+    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
   } else if (status.needsEmbedding > 0) {
     lines.push("");
     lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
   }
 
-  // --- When to use which tool (escalation ladder) ---
-  // Tool schemas describe parameters; instructions describe strategy.
+  // --- Search tool ---
   lines.push("");
-  lines.push("Search:");
-  lines.push("  - `search` (~30ms) — keyword and exact phrase matching.");
-  lines.push("  - `vector_search` (~2s) — meaning-based, finds adjacent concepts even when vocabulary differs.");
-  lines.push("  - `deep_search` (~10s) — auto-expands the query into variations, searches each by keyword and meaning, reranks for top hits.");
+  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde):");
+  lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
+  lines.push("  - type:'vec' — semantic vector search (meaning-based)");
+  lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
+  lines.push("");
+  lines.push("Examples:");
+  lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
+  lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
+  lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -222,78 +225,114 @@ function createMcpServer(store: Store): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_search (keyword)
+  // Tool: query (Primary search tool)
   // ---------------------------------------------------------------------------
+
+  const subSearchSchema = z.object({
+    type: z.enum(['lex', 'vec', 'hyde']).describe(
+      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
+      "vec = semantic question; hyde = hypothetical answer passage"
+    ),
+    query: z.string().describe(
+      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
+      "For vec: natural language question. For hyde: 50-100 word answer passage."
+    ),
+  });
 
   server.registerTool(
-    "search",
+    "query",
     {
-      title: "Keyword Search",
-      description: "Search by keyword. Finds documents containing exact words and phrases in the query.",
+      title: "Query",
+      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
+
+## Query Types
+
+**lex** — BM25 keyword search. Fast, exact, no LLM needed.
+Full lex syntax:
+- \`term\` — prefix match ("perf" matches "performance")
+- \`"exact phrase"\` — phrase must appear verbatim
+- \`-term\` or \`-"phrase"\` — exclude documents containing this
+
+Good lex examples:
+- \`"connection pool" timeout -redis\`
+- \`"machine learning" -sports -athlete\`
+- \`handleError async typescript\`
+
+**vec** — Semantic vector search. Write a natural language question. Finds documents by meaning, not exact words.
+- \`how does the rate limiter handle burst traffic?\`
+- \`what is the tradeoff between consistency and availability?\`
+
+**hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
+- \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
+
+## Strategy
+
+Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
+
+| Goal | Approach |
+|------|----------|
+| Know exact term/name | \`lex\` only |
+| Concept search | \`vec\` only |
+| Best recall | \`lex\` + \`vec\` |
+| Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
+| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
+
+## Examples
+
+Simple lookup:
+\`\`\`json
+[{ "type": "lex", "query": "CAP theorem" }]
+\`\`\`
+
+Best recall on a technical topic:
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"connection pool\\" timeout -redis" },
+  { "type": "vec", "query": "why do database connections time out under load" },
+  { "type": "hyde", "query": "Connection pool exhaustion occurs when all connections are in use and new requests must wait. This typically happens under high concurrency when queries run longer than expected." }
+]
+\`\`\`
+
+Intent-aware lex (C++ performance, not sports):
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
+  { "type": "vec", "query": "how to optimize C++ program performance" }
+]
+\`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        query: z.string().describe("Search query - keywords or phrases to find"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
+        searches: z.array(subSearchSchema).min(1).max(10).describe(
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
+        ),
+        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      const results = store.searchFTS(query, limit || 10, collection);
-      const filtered: SearchResultItem[] = results
-        .filter(r => r.score >= (minScore || 0))
-        .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.filepath),
-            snippet: addLineNumbers(snippet, line),  // Default to line numbers
-          };
-        });
+    async ({ searches, limit, minScore, collections }) => {
+      // Map to internal format
+      const subSearches: StructuredSubSearch[] = searches.map(s => ({
+        type: s.type,
+        query: s.query,
+      }));
 
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
+      // Use default collections if none specified
+      const effectiveCollections = collections ?? getDefaultCollectionNames();
 
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_vector_search (Vector semantic search)
-  // ---------------------------------------------------------------------------
+      const results = await structuredSearch(store, subSearches, {
+        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        limit,
+        minScore,
+      });
 
-  server.registerTool(
-    "vector_search",
-    {
-      title: "Vector Search",
-      description: "Search by meaning. Finds relevant documents even when they use different words than the query — handles synonyms, paraphrases, and related concepts.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
-
-      if (results.length === 0) {
-        // Distinguish "no embeddings" from "no matches" — check if vector table exists
-        const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-        if (!tableExists) {
-          return {
-            content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
-            isError: true,
-          };
-        }
-      }
+      // Use first lex or vec query for snippet extraction
+      const primaryQuery = searches.find(s => s.type === 'lex')?.query
+        || searches.find(s => s.type === 'vec')?.query
+        || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, query, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -305,46 +344,7 @@ function createMcpServer(store: Store): McpServer {
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_deep_search (Deep search with expansion + reranking)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "deep_search",
-    {
-      title: "Deep Search",
-      description: "Deep search. Auto-expands the query into variations, searches each by keyword and meaning, and reranks for top hits across all results.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const results = await hybridQuery(store, query, { collection, limit, minScore });
-
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, query, 300);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
         structuredContent: { results: filtered },
       };
     }
@@ -606,6 +606,57 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: POST /search — structured search without MCP protocol
+      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
+      if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const params = JSON.parse(rawBody);
+        
+        // Validate required fields
+        if (!params.searches || !Array.isArray(params.searches)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          return;
+        }
+
+        // Map to internal format
+        const subSearches: StructuredSubSearch[] = params.searches.map((s: any) => ({
+          type: s.type as 'lex' | 'vec' | 'hyde',
+          query: String(s.query || ""),
+        }));
+
+        // Use default collections if none specified
+        const effectiveCollections = params.collections ?? getDefaultCollectionNames();
+
+        const results = await structuredSearch(store, subSearches, {
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          limit: params.limit ?? 10,
+          minScore: params.minScore ?? 0,
+        });
+
+        // Use first lex or vec query for snippet extraction
+        const primaryQuery = params.searches.find((s: any) => s.type === 'lex')?.query
+          || params.searches.find((s: any) => s.type === 'vec')?.query
+          || params.searches[0]?.query || "";
+
+        const formatted = results.map(r => {
+          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: r.context,
+            snippet: addLineNumbers(snippet, line),
+          };
+        });
+
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results: formatted }));
+        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 

@@ -40,22 +40,24 @@ These feed into QMD's three search backends:
 # 1. SFT: teach the model the output format (~45 min on A10G, ~$1.50)
 hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 2h jobs/sft.py
 
-# 2. GRPO: RL refinement on top of SFT (~20 min on A10G, ~$0.50)
-hf jobs uv run --flavor a10g-large --secrets HF_TOKEN --timeout 4h jobs/grpo.py
+# 2. Evaluate against test queries (needs local GPU or use eval job)
+uv run eval.py tobil/qmd-query-expansion-1.7B
 
-# 3. Evaluate against test queries (needs local GPU or use eval job)
-uv run eval.py --model tobil/qmd-query-expansion-1.7B-grpo \
-               --sft-model tobil/qmd-query-expansion-1.7B-sft
-
-# 4. Convert to GGUF for local deployment (Ollama, llama.cpp)
+# 3. Convert to GGUF for local deployment (Ollama, llama.cpp)
 uv run convert_gguf.py --size 1.7B
+
+# NOTE: GRPO is currently experimental and moved to finetune/experiments/grpo
+# if you want to run it manually, use:
+#   cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ### Local training (if you have a GPU)
 
 ```bash
 uv run train.py sft  --config configs/sft.yaml
-uv run train.py grpo --config configs/grpo.yaml
+
+# Experimental GRPO
+cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ### Monitoring HF Jobs
@@ -85,27 +87,26 @@ direct `lex:/vec:/hyde:` output without `<think>` blocks.
 ```
 finetune/
 ├── reward.py          # Scoring/reward function (single source of truth)
-├── train.py           # Unified SFT + GRPO training (two subcommands)
+├── train.py           # SFT training entrypoint
 ├── eval.py            # Generate expansions and score them
 ├── convert_gguf.py    # GGUF conversion for Ollama/llama.cpp
 ├── jobs/
 │   ├── sft.py         # Self-contained SFT for HuggingFace Jobs
-│   ├── grpo.py        # Self-contained GRPO for HuggingFace Jobs
 │   ├── eval.py        # Self-contained eval for HuggingFace Jobs
-│   ├── eval_common.py # Shared eval utilities
-│   └── quantize.py    # GGUF quantization for HuggingFace Jobs
+│   └── eval_common.py # Shared eval utilities
 ├── configs/
-│   ├── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
-│   └── grpo.yaml      # GRPO hyperparameters for Qwen3-1.7B
+│   └── sft.yaml       # SFT hyperparameters for Qwen3-1.7B
 ├── evals/
 │   └── queries.txt    # 31 test queries across 8 categories
-├── data/
-│   └── qmd_expansion_v2.jsonl  # Source training data (1,000 high-quality examples)
+├── experiments/
+│   └── grpo/          # Experimental GRPO configuration and script (optional)
+├── data/              # Training JSONL files (all concatenated for training)
 ├── dataset/
-│   ├── generate_data.py         # Generate data via Claude API
-│   ├── generate_data_offline.py # Generate from existing HF dataset
-│   ├── prepare_data.py          # Format for Qwen3 chat template
-│   └── clean_data.py            # Detect technical term misinterpretations
+│   ├── prepare_data.py     # Format for Qwen3 chat template, dedup, split
+│   ├── schema.py           # Parse/normalize output format
+│   ├── validate_schema.py  # Validate JSONL against schema
+│   ├── score_data.py       # Score all examples using reward.py
+│   └── analyze_data.py     # Analyze distribution and quality
 ├── SCORING.md         # Detailed scoring rubric reference
 └── README.md          # This file
 ```
@@ -122,7 +123,7 @@ Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 | Method | LoRA (rank 16, alpha 32) |
 | Target modules | All projection layers (q/k/v/o/gate/up/down) |
 | Dataset | ~2,290 examples (train split) |
-| Effective batch size | 16 (4 × 4 gradient accumulation) |
+| Effective batch size | 16 (4 x 4 gradient accumulation) |
 | Epochs | 5 |
 | Learning rate | 2e-4 (cosine schedule) |
 
@@ -131,29 +132,14 @@ uv run train.py sft --config configs/sft.yaml
 uv run train.py sft --config configs/sft.yaml --dry-run  # preview config
 ```
 
-### Stage 2: GRPO (Group Relative Policy Optimization)
+### Stage 2: (Experimental) GRPO
 
-Reinforcement learning on top of the merged SFT weights. The model generates
-multiple expansions per query, they are scored by the reward function, and the
-model is updated to prefer higher-scoring outputs.
-
-| Parameter | Value |
-|-----------|-------|
-| Base | Merged SFT checkpoint |
-| Method | LoRA (rank 4, alpha 8) — smaller for RL stability |
-| Target modules | q_proj, v_proj only |
-| Reward | `reward.py` (rule-based, 5 dimensions) |
-| KL beta | 0.04 — prevents drift from SFT checkpoint |
-| Generations per prompt | 4 |
-| Max steps | 200 |
-| Learning rate | 5e-7 |
-
-**Important:** `beta > 0` is critical. With `beta=0` the model experiences
-catastrophic drift and scores drop to 0%.
+GRPO is currently treated as experimental and kept under `experiments/grpo/`.
+It is not part of the default production path for this repository.
 
 ```bash
-uv run train.py grpo --config configs/grpo.yaml
-uv run train.py grpo --config configs/grpo.yaml --dry-run  # test reward function
+# Optional experimental GRPO run
+cd finetune && uv run python experiments/grpo/grpo.py
 ```
 
 ## Evaluation
@@ -161,27 +147,26 @@ uv run train.py grpo --config configs/grpo.yaml --dry-run  # test reward functio
 `eval.py` generates expansions from a model and scores them against test queries:
 
 ```bash
-# Evaluate an SFT model
+# Evaluate a SFT model
 uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft
 
-# Evaluate a GRPO model (needs SFT adapter merged first)
-uv run eval.py --model tobil/qmd-query-expansion-1.7B-grpo \
-               --sft-model tobil/qmd-query-expansion-1.7B-sft
+# Evaluate an SFT output dir
+uv run eval.py outputs/sft
 
 # Verbose output with deduction details
-uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -v
+uv run eval.py tobil/qmd-query-expansion-1.7B -v
+
+# Optional: evaluate GRPO experimental output (if run)
+uv run eval.py outputs/grpo
 
 # Save detailed scores to JSON
-uv run eval.py --model tobil/qmd-query-expansion-1.7B-sft -o scores.json
-
-# Score an existing JSONL file (backwards compat with old run.py output)
-uv run eval.py --score-only evals/results_old.jsonl
+uv run eval.py tobil/qmd-query-expansion-1.7B -o scores.json
 ```
 
 ## Reward Function
 
-`reward.py` is the single source of truth for scoring. It is used both as the
-GRPO reward signal during training and for evaluation.
+`reward.py` is the single source of truth for scoring. It is used for evaluation
+and (optionally) as the GRPO reward signal in the experimental path.
 
 Five scoring dimensions (max 120 without hyde, 140 with):
 
@@ -205,15 +190,12 @@ uv run reward.py
 
 ## GGUF Conversion
 
-Merges base + SFT + GRPO adapters into a single model and produces
-quantized GGUF files for deployment:
+Merges base + SFT and (optionally) GRPO adapters into a single model, then
+produces quantized GGUF files for deployment:
 
 ```bash
 # Use preset for 1.7B
 uv run convert_gguf.py --size 1.7B
-
-# Use preset for 4B
-uv run convert_gguf.py --size 4B
 
 # Custom models
 uv run convert_gguf.py --base Qwen/Qwen3-1.7B \
@@ -235,34 +217,26 @@ ollama run qmd-expand
 
 ## Data Pipeline
 
-The training data (1,000 examples in `data/qmd_expansion_v2.jsonl`) was generated
-from two sources and cleaned for quality. To regenerate:
+All JSONL files in `data/` are concatenated for training. To prepare for training:
 
 ```bash
-# Generate from existing HuggingFace dataset (bulk, no API needed)
-uv run dataset/generate_data_offline.py
-
-# Generate via Claude API (higher quality, needs ANTHROPIC_API_KEY)
-uv run dataset/generate_data.py --count 100
-
-# Detect and fix technical term misinterpretations
-uv run dataset/clean_data.py
-
-# Format for Qwen3 chat template, add short-query augmentation, split train/val
+# Format for Qwen3 chat template, deduplicate, split train/val
 uv run dataset/prepare_data.py
+
+# Validate data quality
+just validate
 ```
 
 ## Architecture Notes
 
-The two-stage training approach (SFT → GRPO) is standard for structured-output models:
+The production training approach is currently **SFT-only**:
 
 1. **SFT** establishes format compliance and basic query understanding. It uses
    a large LoRA (rank 16, all projection layers) because it needs to learn a
    new output format from scratch.
 
-2. **GRPO** refines quality within the learned format. It uses a small LoRA
-   (rank 4, q/v only) and KL regularization to make incremental improvements
-   without losing what SFT taught.
+2. **GRPO** exists as an optional experimental path under `experiments/grpo/`
+   and is not in the production training pipeline.
 
 The reward function is entirely rule-based (no LLM judge) which makes it fast,
 deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubric.
@@ -280,20 +254,12 @@ deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubri
 | Epochs | 5 |
 | Hardware | A10G (24 GB VRAM) |
 
-### GRPO
-
-| Metric | Value |
-|--------|-------|
-| Mean reward | 0.757 |
-| Final loss | 0.0005 |
-| KL divergence | 0.00048 |
-| Mean completion length | ~58 tokens |
-| Training time | ~19 min (200 steps) |
-| Hardware | A10G (24 GB VRAM) |
-
 ### Evaluation Scores
 
 | Model | Average Score | Excellent (30) |
 |-------|--------------|-----------------|
 | SFT | 92.0% | 30/30 |
-| GRPO | 91.7% | 30/30 |
+
+> GRPO scores are not tracked in this branch; see `experiments/grpo/` for historical
+> experimental results.
+

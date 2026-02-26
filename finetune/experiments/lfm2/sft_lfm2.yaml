@@ -1,0 +1,60 @@
+# SFT Training Config for QMD Query Expansion with LiquidAI LFM2
+# Target: LFM2-1.2B with LoRA (hybrid architecture: convolutions + attention)
+#
+# LFM2 is optimized for on-device inference with fast decode/prefill.
+# Recommended for: agentic tasks, data extraction, RAG, creative writing.
+#
+# Usage: uv run train.py sft --config configs/sft_lfm2.yaml
+#
+# Requirements:
+#   - transformers >= 4.55.0 (LFM2 architecture support)
+#   - May need: pip install -U transformers
+
+model:
+  base: "LiquidAI/LFM2-1.2B"
+  output: "outputs/sft-lfm2"  # Local training output (push to HF manually after eval)
+
+dataset:
+  # Local: run `uv run dataset/prepare_data.py` first, then use "data/train/"
+  # HuggingFace: use "tobil/qmd-query-expansion-train" (already prepared)
+  name: "data/train/"
+  text_field: "text"
+  split: "train"
+  eval_split: 0.1
+
+training:
+  epochs: 5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_length: 512
+  warmup_ratio: 0.03
+  lr_scheduler: "cosine"
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  # LFM2 uses different architecture than standard transformers:
+  # - Attention layers: q_proj, k_proj, v_proj, out_proj
+  # - Input projection: in_proj  
+  # - FFN/MLP gates: w1, w2, w3 (SwiGLU activation)
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    - "in_proj"
+    - "w1"
+    - "w2"
+    - "w3"
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "sft-lfm2-1.2B"
+
+# LFM2-specific generation settings (recommended by LiquidAI)
+generation:
+  temperature: 0.3
+  min_p: 0.15
+  repetition_penalty: 1.05

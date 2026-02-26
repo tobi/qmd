@@ -25,10 +25,11 @@ export type ContextMap = Record<string, string>;
  * A single collection configuration
  */
 export interface Collection {
-  path: string;           // Absolute path to index
-  pattern: string;        // Glob pattern (e.g., "**/*.md")
-  context?: ContextMap;   // Optional context definitions
-  update?: string;        // Optional bash command to run during qmd update
+  path: string;              // Absolute path to index
+  pattern: string;           // Glob pattern (e.g., "**/*.md")
+  context?: ContextMap;      // Optional context definitions
+  update?: string;           // Optional bash command to run during qmd update
+  includeByDefault?: boolean; // Include in queries by default (default: true)
 }
 
 /**
@@ -58,13 +59,26 @@ let currentIndexName: string = "index";
  * Config file will be ~/.config/qmd/{indexName}.yml
  */
 export function setConfigIndexName(name: string): void {
-  currentIndexName = name;
+  // Resolve relative paths to absolute paths and sanitize for use as filename
+  if (name.includes('/')) {
+    const { resolve } = require('path');
+    const { cwd } = require('process');
+    const absolutePath = resolve(cwd(), name);
+    // Replace path separators with underscores to create a valid filename
+    currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  } else {
+    currentIndexName = name;
+  }
 }
 
 function getConfigDir(): string {
   // Allow override via QMD_CONFIG_DIR for testing
   if (process.env.QMD_CONFIG_DIR) {
     return process.env.QMD_CONFIG_DIR;
+  }
+  // Respect XDG Base Directory specification (consistent with store.ts)
+  if (process.env.XDG_CONFIG_HOME) {
+    return join(process.env.XDG_CONFIG_HOME, "qmd");
   }
   return join(homedir(), ".config", "qmd");
 }
@@ -154,6 +168,52 @@ export function listCollections(): NamedCollection[] {
     name,
     ...collection,
   }));
+}
+
+/**
+ * Get collections that are included by default in queries
+ */
+export function getDefaultCollections(): NamedCollection[] {
+  return listCollections().filter(c => c.includeByDefault !== false);
+}
+
+/**
+ * Get collection names that are included by default
+ */
+export function getDefaultCollectionNames(): string[] {
+  return getDefaultCollections().map(c => c.name);
+}
+
+/**
+ * Update a collection's settings
+ */
+export function updateCollectionSettings(
+  name: string,
+  settings: { update?: string | null; includeByDefault?: boolean }
+): boolean {
+  const config = loadConfig();
+  const collection = config.collections[name];
+  if (!collection) return false;
+
+  if (settings.update !== undefined) {
+    if (settings.update === null) {
+      delete collection.update;
+    } else {
+      collection.update = settings.update;
+    }
+  }
+
+  if (settings.includeByDefault !== undefined) {
+    if (settings.includeByDefault === true) {
+      // true is default, remove the field
+      delete collection.includeByDefault;
+    } else {
+      collection.includeByDefault = settings.includeByDefault;
+    }
+  }
+
+  saveConfig(config);
+  return true;
 }
 
 /**
