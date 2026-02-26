@@ -34,6 +34,83 @@ describe("Default LlamaCpp Singleton", () => {
 });
 
 // =============================================================================
+// Environment Variable Configuration Tests (no model loading required)
+// =============================================================================
+
+describe("LlamaCpp Environment Variable Configuration", () => {
+  const originalEnv = { ...process.env };
+
+  afterAll(() => {
+    // Restore original environment
+    process.env = originalEnv;
+  });
+
+  test("uses default models when no config or env vars provided", () => {
+    // Clear any env vars
+    delete process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_GENERATE_MODEL;
+    delete process.env.QMD_RERANK_MODEL;
+    delete process.env.QMD_MODEL_CACHE_DIR;
+
+    const llm = new LlamaCpp({});
+
+    // Access private properties for testing (TypeScript workaround)
+    expect((llm as any).embedModelUri).toContain("embeddinggemma");
+    expect((llm as any).generateModelUri).toContain("qmd-query-expansion");
+    expect((llm as any).rerankModelUri).toContain("qwen3-reranker");
+  });
+
+  test("env vars override defaults when no config provided", () => {
+    process.env.QMD_EMBED_MODEL = "hf:test/embed-model.gguf";
+    process.env.QMD_GENERATE_MODEL = "hf:test/generate-model.gguf";
+    process.env.QMD_RERANK_MODEL = "hf:test/rerank-model.gguf";
+    process.env.QMD_MODEL_CACHE_DIR = "/tmp/test-cache";
+
+    const llm = new LlamaCpp({});
+
+    expect((llm as any).embedModelUri).toBe("hf:test/embed-model.gguf");
+    expect((llm as any).generateModelUri).toBe("hf:test/generate-model.gguf");
+    expect((llm as any).rerankModelUri).toBe("hf:test/rerank-model.gguf");
+    expect((llm as any).modelCacheDir).toBe("/tmp/test-cache");
+
+    // Cleanup
+    delete process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_GENERATE_MODEL;
+    delete process.env.QMD_RERANK_MODEL;
+    delete process.env.QMD_MODEL_CACHE_DIR;
+  });
+
+  test("config takes priority over env vars", () => {
+    process.env.QMD_RERANK_MODEL = "hf:env/rerank-model.gguf";
+
+    const llm = new LlamaCpp({
+      rerankModel: "hf:config/rerank-model.gguf",
+    });
+
+    expect((llm as any).rerankModelUri).toBe("hf:config/rerank-model.gguf");
+
+    // Cleanup
+    delete process.env.QMD_RERANK_MODEL;
+  });
+
+  test("partial env var override works correctly", () => {
+    // Only set rerank model via env var
+    process.env.QMD_RERANK_MODEL = "hf:gpustack/jina-reranker-v1-tiny-en-GGUF/jina-reranker-v1-tiny-en-FP16.gguf";
+
+    const llm = new LlamaCpp({});
+
+    // Rerank should use env var
+    expect((llm as any).rerankModelUri).toBe("hf:gpustack/jina-reranker-v1-tiny-en-GGUF/jina-reranker-v1-tiny-en-FP16.gguf");
+    // Others should use defaults
+    expect((llm as any).embedModelUri).toContain("embeddinggemma");
+    expect((llm as any).generateModelUri).toContain("qmd-query-expansion");
+
+    // Cleanup
+    delete process.env.QMD_RERANK_MODEL;
+  });
+});
+
+// =============================================================================
 // Model Existence Tests
 // =============================================================================
 

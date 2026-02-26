@@ -490,6 +490,26 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_EMBED_MODEL` | `hf:ggml-org/embeddinggemma-300M-GGUF/...` | Override embedding model URI |
+| `QMD_GENERATE_MODEL` | `hf:tobil/qmd-query-expansion-1.7B-gguf/...` | Override query expansion model URI |
+| `QMD_RERANK_MODEL` | `hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/...` | Override reranker model URI |
+| `QMD_MODEL_CACHE_DIR` | `~/.cache/qmd/models` | Override model cache directory |
+
+### Model Override Example
+
+For latency-critical applications (e.g., API timeouts), use a faster reranker:
+
+```sh
+# Use Jina's tiny reranker (185x faster cold start, 6-10x faster warm)
+export QMD_RERANK_MODEL="hf:gpustack/jina-reranker-v1-tiny-en-GGUF/jina-reranker-v1-tiny-en-FP16.gguf"
+qmd query "your search"
+```
+
+**Priority order:** config object > environment variable > default
+
+**Trade-offs:**
+- `jina-reranker-v1-tiny-en` (33M params, 67MB): ~80ms cold, ~50ms warm, 78% ranking agreement
+- `qwen3-reranker-0.6b` (600M params, 639MB): ~15s cold, ~400ms warm, best quality
 
 ## How It Works
 
