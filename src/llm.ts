@@ -497,26 +497,37 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
-
       let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
-        }
-      } else {
+
+      // Check if GPU is forced OFF via environment variable
+      // This allows users to disable GPU acceleration without modifying code
+      const forceCpu =
+        process.env.NODE_LLAMA_CPP_GPU === "false" || process.env.GGML_CUDA === "OFF";
+
+      if (forceCpu) {
+        // Use CPU-only mode (respect env var)
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+      } else {
+        // Detect available GPU types and use the best one.
+        // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+        // (likely a binary/build config issue in node-llama-cpp).
+        // @ts-expect-error node-llama-cpp API compat
+        const gpuTypes = await getLlamaGpuTypes();
+        // Prefer CUDA > Metal > Vulkan > CPU
+        const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+
+        if (preferred) {
+          try {
+            llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          } catch {
+            llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+            process.stderr.write(
+              `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            );
+          }
+        } else {
+          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        }
       }
 
       if (!llama.gpu) {
