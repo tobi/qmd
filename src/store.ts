@@ -3938,7 +3938,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
+    const llm = getDefaultEmbeddingLLM();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
