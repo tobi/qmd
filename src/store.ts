@@ -3019,7 +3019,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultEmbeddingLLM();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     const embeddings = await llm.embedBatch(textsToEmbed);
 
