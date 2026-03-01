@@ -601,6 +601,23 @@ const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-re
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
+### GPU Backend Override
+
+QMD auto-detects GPU acceleration (CUDA > Metal > Vulkan > CPU). On some systems, auto-detection picks the wrong backend — for example, AMD ROCm systems where CUDA appears available but no CUDA Toolkit is installed.
+
+Set the `QMD_GPU` environment variable to force a specific backend:
+
+```bash
+# Force Vulkan (recommended for AMD GPUs)
+export QMD_GPU=vulkan
+
+# Force CUDA
+export QMD_GPU=cuda
+
+# Disable GPU (CPU only)
+export QMD_GPU=false
+```
+
 ### EmbeddingGemma Prompt Format
 
 ```
