@@ -24,18 +24,37 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // =============================================================================
 
 /**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
+ * Detect if a model URI uses the Qwen3-Embedding format.
+ * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
  */
-export function formatQueryForEmbedding(query: string): string {
+export function isQwen3EmbeddingModel(modelUri: string): boolean {
+  return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
+}
+
+/**
+ * Format a query for embedding.
+ * Uses nomic-style task prefix format for embeddinggemma (default).
+ * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ */
+export function formatQueryForEmbedding(query: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
+  }
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * Uses nomic-style format with title and text fields (default).
+ * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
-export function formatDocForEmbedding(text: string, title?: string): string {
+export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    // Qwen3-Embedding: documents are raw text, no task prefix
+    return title ? `${title}\n${text}` : text;
+  }
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -174,7 +193,8 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf)
+const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -1396,7 +1416,8 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const embedModel = process.env.QMD_EMBED_MODEL;
+    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
   }
   return defaultLlamaCpp;
 }
