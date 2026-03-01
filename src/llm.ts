@@ -700,6 +700,38 @@ export class LlamaCpp implements LLM {
     this.rerankModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
+
+      // On GPU, check if VRAM can fit the reranker model + context.
+      // If not, evict other models first — query expansion and embedding
+      // are already done by this point and can be reloaded later.
+      if (llama.gpu) {
+        try {
+          const modelBytes = statSync(modelPath).size;
+          const contextBytes = LlamaCpp.RERANK_CONTEXT_SIZE * 1024;
+          const needMB = (modelBytes + contextBytes) / (1024 * 1024) * 1.15; // 15% headroom
+          const vram = await llama.getVramState();
+          const freeMB = vram.free / (1024 * 1024);
+          if (freeMB < needMB) {
+            if (this.generateModel) {
+              await this.generateModel.dispose();
+              this.generateModel = null;
+              this.generateModelLoadPromise = null;
+            }
+            for (const ctx of this.embedContexts) {
+              await ctx.dispose();
+            }
+            this.embedContexts = [];
+            if (this.embedModel) {
+              await this.embedModel.dispose();
+              this.embedModel = null;
+              this.embedModelLoadPromise = null;
+            }
+          }
+        } catch {
+          /* VRAM query failed — proceed without eviction */
+        }
+      }
+
       const model = await llama.loadModel({ modelPath });
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
