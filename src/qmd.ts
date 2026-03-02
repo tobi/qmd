@@ -1303,8 +1303,10 @@ function collectionList(): void {
     const yamlColl = getCollectionFromYaml(coll.name);
     const excluded = yamlColl?.includeByDefault === false;
     const excludeTag = excluded ? ` ${c.yellow}[excluded]${c.reset}` : '';
+    const boost = yamlColl?.boost;
+    const boostTag = boost !== undefined && boost !== 1.0 ? ` ${c.green}[boost: ${boost}x]${c.reset}` : '';
 
-    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}${boostTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
@@ -2653,6 +2655,41 @@ if (isMain) {
           break;
         }
 
+        case "boost": {
+          const name = cli.args[1];
+          const value = cli.args[2];
+          if (!name) {
+            console.error("Usage: qmd collection boost <name> [multiplier]");
+            console.error("  Set or show the score boost multiplier for a collection.");
+            console.error("  Default is 1.0 (no boost). Values > 1.0 increase ranking priority.");
+            console.error("");
+            console.error("Examples:");
+            console.error("  qmd collection boost notes 1.5    # Boost notes results by 50%");
+            console.error("  qmd collection boost notes        # Show current boost");
+            console.error("  qmd collection boost notes 1.0    # Reset to default");
+            process.exit(1);
+          }
+          const { getCollection, updateCollectionSettings } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          if (value === undefined) {
+            // Show current boost
+            console.log(`Collection '${name}' boost: ${col.boost ?? 1.0}`);
+          } else {
+            const boost = parseFloat(value);
+            if (isNaN(boost) || boost <= 0) {
+              console.error("Boost must be a positive number (e.g., 1.0, 1.5, 2.0)");
+              process.exit(1);
+            }
+            updateCollectionSettings(name, { boost: boost === 1.0 ? undefined : boost });
+            console.log(`✓ Collection '${name}' boost set to ${boost}`);
+          }
+          break;
+        }
+
         case "show":
         case "info": {
           const name = cli.args[1];
@@ -2670,6 +2707,9 @@ if (isMain) {
           console.log(`  Path:     ${col.path}`);
           console.log(`  Pattern:  ${col.pattern}`);
           console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.boost !== undefined && col.boost !== 1.0) {
+            console.log(`  Boost:    ${col.boost}x`);
+          }
           if (col.update) {
             console.log(`  Update:   ${col.update}`);
           }
@@ -2690,6 +2730,7 @@ if (isMain) {
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
+          console.log("  boost <name> [value]      Set/show score boost multiplier (default: 1.0)");
           console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
           console.log("  include <name>            Include in default queries");
           console.log("  exclude <name>            Exclude from default queries");

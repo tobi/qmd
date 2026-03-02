@@ -790,9 +790,10 @@ export type Store = {
   cleanupOrphanedVectors: () => number;
   vacuumDatabase: () => void;
 
-  // Context
+  // Context & boost
   getContextForFile: (filepath: string) => string | null;
   getContextForPath: (collectionName: string, path: string) => string | null;
+  getBoostForFile: (filepath: string) => number;
   getCollectionByName: (name: string) => { name: string; pwd: string; glob_pattern: string } | null;
   getCollectionsWithoutContext: () => { name: string; pwd: string; doc_count: number }[];
   getTopLevelPathsWithoutContext: (collectionName: string) => string[];
@@ -873,9 +874,10 @@ export function createStore(dbPath?: string): Store {
     cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
-    // Context
+    // Context & boost
     getContextForFile: (filepath: string) => getContextForFile(db, filepath),
     getContextForPath: (collectionName: string, path: string) => getContextForPath(db, collectionName, path),
+    getBoostForFile: (filepath: string) => getBoostForFile(filepath),
     getCollectionByName: (name: string) => getCollectionByName(db, name),
     getCollectionsWithoutContext: () => getCollectionsWithoutContext(db),
     getTopLevelPathsWithoutContext: (collectionName: string) => getTopLevelPathsWithoutContext(db, collectionName),
@@ -1725,6 +1727,34 @@ export function getContextForFile(db: Database, filepath: string): string | null
 
   // Join all contexts with double newline
   return contexts.length > 0 ? contexts.join('\n\n') : null;
+}
+
+/**
+ * Get the boost multiplier for a file based on its collection.
+ * Returns the collection's boost value, or 1.0 if not set.
+ */
+export function getBoostForFile(filepath: string): number {
+  if (!filepath) return 1.0;
+
+  const parsedVirtual = filepath.startsWith('qmd://') ? parseVirtualPath(filepath) : null;
+  let collectionName: string | null = null;
+
+  if (parsedVirtual) {
+    collectionName = parsedVirtual.collectionName;
+  } else {
+    const collections = collectionsListCollections();
+    for (const coll of collections) {
+      if (!coll?.path) continue;
+      if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
+        collectionName = coll.name;
+        break;
+      }
+    }
+  }
+
+  if (!collectionName) return 1.0;
+  const coll = getCollection(collectionName);
+  return coll?.boost ?? 1.0;
 }
 
 /**
@@ -3060,7 +3090,8 @@ export async function hybridQuery(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const baseScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = baseScore * store.getBoostForFile(r.file);
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -3357,7 +3388,8 @@ export async function structuredSearch(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const baseScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = baseScore * store.getBoostForFile(r.file);
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);

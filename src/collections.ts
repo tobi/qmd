@@ -30,6 +30,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  boost?: number;            // Score multiplier for search results (default: 1.0)
 }
 
 /**
@@ -189,7 +190,7 @@ export function getDefaultCollectionNames(): string[] {
  */
 export function updateCollectionSettings(
   name: string,
-  settings: { update?: string | null; includeByDefault?: boolean }
+  settings: { update?: string | null; includeByDefault?: boolean; boost?: number }
 ): boolean {
   const config = loadConfig();
   const collection = config.collections[name];
@@ -210,6 +211,13 @@ export function updateCollectionSettings(
     } else {
       collection.includeByDefault = settings.includeByDefault;
     }
+  }
+
+  if (settings.boost !== undefined) {
+    collection.boost = settings.boost;
+  } else if ('boost' in settings) {
+    // Explicitly passed undefined = remove the field (reset to default 1.0)
+    delete collection.boost;
   }
 
   saveConfig(config);

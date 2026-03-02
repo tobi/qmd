@@ -1099,6 +1099,88 @@ describe("Path Context", () => {
 });
 
 // =============================================================================
+// Boost Tests
+// =============================================================================
+
+// Helper to set collection boost in YAML config
+async function setCollectionBoost(collectionName: string, boost: number | undefined): Promise<void> {
+  const configPath = join(testConfigDir, "index.yml");
+  const { readFile } = await import("node:fs/promises");
+  const content = await readFile(configPath, "utf-8");
+  const config = YAML.parse(content) as CollectionConfig;
+
+  if (!config.collections[collectionName]) {
+    throw new Error(`Collection ${collectionName} not found`);
+  }
+
+  if (boost === undefined || boost === 1.0) {
+    delete config.collections[collectionName].boost;
+  } else {
+    config.collections[collectionName].boost = boost;
+  }
+
+  await writeFile(configPath, YAML.stringify(config));
+}
+
+describe("Boost", () => {
+  test("getBoostForFile returns 1.0 for unknown paths", async () => {
+    const store = await createTestStore();
+    expect(store.getBoostForFile("/some/random/path.md")).toBe(1.0);
+    expect(store.getBoostForFile("")).toBe(1.0);
+    await cleanupTestDb(store);
+  });
+
+  test("getBoostForFile returns 1.0 when no boost set", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
+
+    expect(store.getBoostForFile("qmd://" + collectionName + "/readme.md")).toBe(1.0);
+    await cleanupTestDb(store);
+  });
+
+  test("getBoostForFile returns configured boost", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
+    await setCollectionBoost(collectionName, 1.5);
+
+    expect(store.getBoostForFile("qmd://" + collectionName + "/readme.md")).toBe(1.5);
+    await cleanupTestDb(store);
+  });
+
+  test("getBoostForFile resolves boost from filesystem path", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
+    await setCollectionBoost(collectionName, 2.0);
+
+    expect(store.getBoostForFile("/test/notes/readme.md")).toBe(2.0);
+    await cleanupTestDb(store);
+  });
+
+  test("getBoostForFile returns 1.0 after boost is reset", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
+    await setCollectionBoost(collectionName, 1.5);
+    expect(store.getBoostForFile("qmd://" + collectionName + "/readme.md")).toBe(1.5);
+
+    await setCollectionBoost(collectionName, undefined);
+    expect(store.getBoostForFile("qmd://" + collectionName + "/readme.md")).toBe(1.0);
+    await cleanupTestDb(store);
+  });
+
+  test("different collections can have different boosts", async () => {
+    const store = await createTestStore();
+    const notes = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md", name: "notes" });
+    const docs = await createTestCollection({ pwd: "/test/docs", glob: "**/*.md", name: "docs" });
+    await setCollectionBoost(notes, 1.5);
+    await setCollectionBoost(docs, 0.8);
+
+    expect(store.getBoostForFile("qmd://notes/readme.md")).toBe(1.5);
+    expect(store.getBoostForFile("qmd://docs/api.md")).toBe(0.8);
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
 // Collection Tests
 // =============================================================================
 
