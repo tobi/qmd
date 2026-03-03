@@ -107,7 +107,7 @@ export class OpenAIEmbedding implements LLM {
   constructor(config: OpenAIConfig = {}) {
     this.client = new OpenAI({ 
       apiKey: config.apiKey || process.env.OPENAI_API_KEY,
-      baseURL: config.baseURL,
+      baseURL: config.baseURL || process.env.OPENAI_BASE_URL,
     });
     this.embedModel = config.embedModel || DEFAULT_EMBED_MODEL;
     this.expansionModel = config.expansionModel || DEFAULT_EXPANSION_MODEL;
