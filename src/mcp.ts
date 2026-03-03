@@ -552,12 +552,30 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
   const store = createStore();
-  const mcpServer = createMcpServer(store);
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
-  });
-  await mcpServer.connect(transport);
+
+  // Per-session transport+server pairs. Each MCP client gets its own isolated
+  // session so multiple clients (e.g. Claude Code + dashboard) can connect
+  // concurrently without "Server already initialized" errors.
+  const sessions = new Map<string, { transport: WebStandardStreamableHTTPServerTransport; server: McpServer }>();
+
+  /** Create a new session: transport + server wired together. */
+  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
+    const server = createMcpServer(store);
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sessionId: string) => {
+        sessions.set(sessionId, { transport, server });
+        log(`${ts()} Session created: ${sessionId}`);
+      },
+      onsessionclosed: (sessionId: string) => {
+        sessions.delete(sessionId);
+        log(`${ts()} Session closed: ${sessionId}`);
+      },
+    });
+    await server.connect(transport);
+    return transport;
+  }
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -670,6 +688,20 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           if (typeof v === "string") headers[k] = v;
         }
         const request = new Request(url, { method: "POST", headers, body: rawBody });
+
+        // Route to existing session or create a new one for initialize
+        const sessionId = headers["mcp-session-id"];
+        let transport: WebStandardStreamableHTTPServerTransport;
+        if (sessionId && sessions.has(sessionId)) {
+          transport = sessions.get(sessionId)!.transport;
+        } else if (body.method === "initialize") {
+          transport = await createSession();
+        } else {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message: "Invalid or missing session ID" }, id: body.id ?? null }));
+          return;
+        }
+
         const response = await transport.handleRequest(request, { parsedBody: body });
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
@@ -685,6 +717,16 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         }
         const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
         const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
+
+        // Route GET/DELETE to existing session
+        const sessionId = headers["mcp-session-id"];
+        const transport = sessionId ? sessions.get(sessionId)?.transport : undefined;
+        if (!transport) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message: "Invalid or missing session ID" }, id: null }));
+          return;
+        }
+
         const response = await transport.handleRequest(request);
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
@@ -711,7 +753,10 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    await transport.close();
+    for (const { transport } of sessions.values()) {
+      await transport.close();
+    }
+    sessions.clear();
     httpServer.close();
     store.close();
     await disposeDefaultLlamaCpp();
