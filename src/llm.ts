@@ -510,10 +510,29 @@ export class LlamaCpp implements LLM {
         try {
           llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
         } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
+          // Primary GPU backend failed — try fallback order before giving up
+          // This handles cases like CUDA PTX incompatibility on older GPUs (e.g. Pascal/GTX1060)
+          // running on Ubuntu 24.04 with GCC 13, where the prebuilt PTX doesn't match
+          const fallbackOrder = (["vulkan", "metal", "cuda"] as const).filter(g => g !== preferred && gpuTypes.includes(g));
+          let recovered = false;
+          for (const fallback of fallbackOrder) {
+            try {
+              llama = await getLlama({ gpu: fallback, logLevel: LlamaLogLevel.error });
+              process.stderr.write(
+                `QMD Warning: ${preferred} failed to initialize, using ${fallback} instead.\n`
+              );
+              recovered = true;
+              break;
+            } catch {
+              // continue to next fallback
+            }
+          }
+          if (!recovered) {
+            llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+            process.stderr.write(
+              `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            );
+          }
         }
       } else {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
