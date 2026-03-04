@@ -35,8 +35,9 @@ import {
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
-} from "../src/store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
+  type SearchResult,
+} from "../src/store.js";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm.js";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -222,7 +223,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     let hits = 0;
     for (const { query, expectedDoc } of easyQueries) {
       const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      if (results.slice(0, 3).some((r: SearchResult) => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
   }, 60000);
@@ -234,7 +235,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     let hits = 0;
     for (const { query, expectedDoc } of mediumQueries) {
       const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      if (results.slice(0, 3).some((r: SearchResult) => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     // Vector search should do better on semantic queries than BM25
     expect(hits / mediumQueries.length).toBeGreaterThanOrEqual(0.4);
@@ -247,7 +248,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     let hits = 0;
     for (const { query, expectedDoc } of hardQueries) {
       const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      if (results.some((r: SearchResult) => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
   }, 60000);
@@ -258,7 +259,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     let hits = 0;
     for (const { query, expectedDoc } of evalQueries) {
       const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      if (results.slice(0, 3).some((r: SearchResult) => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
   }, 60000);
@@ -297,7 +298,7 @@ describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
     // FTS results
     const ftsResults = searchFTS(db, query, 20);
     if (ftsResults.length > 0) {
-      rankedLists.push(ftsResults.map(r => ({
+      rankedLists.push(ftsResults.map((r: SearchResult) => ({
         file: r.filepath,
         displayPath: r.displayPath,
         title: r.title,
@@ -309,7 +310,7 @@ describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
     // Vector results
     const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
     if (vecResults.length > 0) {
-      rankedLists.push(vecResults.map(r => ({
+      rankedLists.push(vecResults.map((r: SearchResult) => ({
         file: r.filepath,
         displayPath: r.displayPath,
         title: r.title,

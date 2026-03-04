@@ -7,6 +7,7 @@
  * collection management.
  */
 
+// @ts-expect-error bun:sqlite is only available under Bun runtime
 import { Database } from "bun:sqlite";
 import { join } from "path";
 import { homedir } from "os";

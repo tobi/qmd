@@ -110,17 +110,15 @@ async function benchmarkConfig(
 
   // Create contexts. On CPU, split threads evenly across contexts.
   const cpuThreads = !llama.gpu ? Math.floor(llama.cpuMathCores / parallelism) : 0;
-  const contexts = [];
+  const contexts: Awaited<ReturnType<typeof model.createRankingContext>>[] = [];
   for (let i = 0; i < parallelism; i++) {
     try {
       contexts.push(await model.createRankingContext({
         contextSize: CONTEXT_SIZE,
-        flashAttention: flash,
         ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
       }));
     } catch {
       if (contexts.length === 0) {
-        // Try without flash
         contexts.push(await model.createRankingContext({
           contextSize: CONTEXT_SIZE,
           ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
@@ -193,7 +191,7 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════════════\n");
 
   // Detect GPU
-  const gpuTypes = await getLlamaGpuTypes();
+  const gpuTypes = await getLlamaGpuTypes("supported");
   const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
 
   let llama: Llama;

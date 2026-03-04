@@ -53,6 +53,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
+    "@types/picomatch": "^4.0.2",
     "tsx": "^4.0.0",
     "vitest": "^3.0.0"
   },

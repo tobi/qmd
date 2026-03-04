@@ -1093,7 +1093,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/health`);
       expect(res.status).toBe(200);
-      const body = await res.json();
+      const body = await res.json() as { status: string };
       expect(body.status).toBe("ok");
     } finally {
       proc.kill("SIGTERM");

@@ -10,14 +10,14 @@ import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm.js";
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "../src/collections";
-import { setConfigIndexName } from "../src/collections";
+import type { CollectionConfig } from "../src/collections.js";
+import { setConfigIndexName } from "../src/collections.js";
 
 // =============================================================================
 // Test Database Setup
@@ -194,8 +194,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "../src/store";
-import type { RankedResult } from "../src/store";
+} from "../src/store.js";
+import type { RankedResult, SearchResult } from "../src/store.js";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -279,7 +279,7 @@ describe("MCP Server", () => {
 
     test("formats results as structured content", () => {
       const results = searchFTS(testDb, "api", 10);
-      const filtered = results.map(r => ({
+      const filtered = results.map((r: SearchResult) => ({
         file: r.displayPath,
         title: r.title,
         score: Math.round(r.score * 100) / 100,
@@ -349,7 +349,7 @@ describe("MCP Server", () => {
       const fused = reciprocalRankFusion([list1, list2]);
       expect(fused.length).toBe(3);
       // B appears in both lists, should have higher score
-      const bResult = fused.find(r => r.file === "/b");
+      const bResult = fused.find((r: RankedResult) => r.file === "/b");
       expect(bResult).toBeDefined();
     });
 
@@ -373,7 +373,7 @@ describe("MCP Server", () => {
       // Original query → FTS (probe)
       const probeFts = searchFTS(testDb, query, 20);
       if (probeFts.length > 0) {
-        rankedLists.push(probeFts.map(r => ({
+        rankedLists.push(probeFts.map((r: SearchResult) => ({
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
@@ -384,7 +384,7 @@ describe("MCP Server", () => {
         if (q.type === 'lex') {
           const ftsResults = searchFTS(testDb, q.text, 20);
           if (ftsResults.length > 0) {
-            rankedLists.push(ftsResults.map(r => ({
+            rankedLists.push(ftsResults.map((r: SearchResult) => ({
               file: r.filepath, displayPath: r.displayPath,
               title: r.title, body: r.body || "", score: r.score,
             })));
@@ -401,7 +401,7 @@ describe("MCP Server", () => {
       const candidates = fused.slice(0, 10);
       const reranked = await rerank(
         query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
+        candidates.map((c: RankedResult) => ({ file: c.file, text: c.body })),
         DEFAULT_RERANK_MODEL,
         testDb
       );
@@ -802,7 +802,7 @@ describe("MCP Server", () => {
 
     test("search results have correct structure for structuredContent", () => {
       const results = searchFTS(testDb, "readme", 5);
-      const structured = results.map(r => ({
+      const structured = results.map((r: SearchResult) => ({
         file: r.displayPath,
         title: r.title,
         score: Math.round(r.score * 100) / 100,
@@ -870,8 +870,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp";
-import { enableProductionMode } from "../src/store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp.js";
+import { enableProductionMode } from "../src/store.js";
 
 describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
@@ -937,7 +937,7 @@ describe("MCP HTTP Transport", () => {
     const res = await fetch(`${baseUrl}/health`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await res.json() as { status: string; uptime: number };
     expect(body.status).toBe("ok");
     expect(typeof body.uptime).toBe("number");
   });

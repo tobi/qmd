@@ -70,7 +70,8 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, setEmbedProvider, setGoogleApiKey, getEmbedProvider, needsEmbedFormatting, getDefaultLLM, disposeDefaultLLM, type EmbeddingResult } from "./llm.js";
+import { GOOGLE_EMBED_MODEL, GOOGLE_EMBED_DIMENSIONS } from "./google-embed.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -297,6 +298,7 @@ async function showStatus(): Promise<void> {
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
+  console.log(`Embed: ${getEmbedProvider() === "google" ? `Google AI (${GOOGLE_EMBED_MODEL})` : "Local (embeddinggemma)"}`);
 
   // MCP daemon status (check PID file liveness)
   const mcpCacheDir = process.env.XDG_CACHE_HOME
@@ -1600,39 +1602,40 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
-    // Get embedding dimensions from first chunk
+  const useGoogle = getEmbedProvider() === "google";
+
+  const embedChunks = async (doEmbed: (text: string) => Promise<EmbeddingResult | null>, doEmbedBatch: (texts: string[]) => Promise<(EmbeddingResult | null)[]>) => {
+    // Get embedding dimensions — known for Google, probe for local
     progress.indeterminate();
-    const firstChunk = allChunks[0];
-    if (!firstChunk) {
-      throw new Error("No chunks available to embed");
+    if (useGoogle) {
+      ensureVecTable(db, GOOGLE_EMBED_DIMENSIONS);
+    } else {
+      const firstChunk = allChunks[0];
+      if (!firstChunk) throw new Error("No chunks available to embed");
+      const firstText = needsEmbedFormatting() ? formatDocForEmbedding(firstChunk.text, firstChunk.title) : firstChunk.text;
+      const firstResult = await doEmbed(firstText);
+      if (!firstResult) throw new Error("Failed to get embedding dimensions from first chunk");
+      ensureVecTable(db, firstResult.embedding.length);
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    ensureVecTable(db, firstResult.embedding.length);
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
 
-    // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
+    // Google API supports up to 100 per batch; local llama.cpp needs smaller batches
+    const BATCH_SIZE = useGoogle ? 100 : 32;
 
     for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
       const batch = allChunks.slice(batchStart, batchEnd);
 
       // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+      const texts = needsEmbedFormatting()
+        ? batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title))
+        : batch.map(chunk => chunk.text);
 
       try {
         // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await doEmbedBatch(texts);
 
         // Insert each embedding
         for (let i = 0; i < batch.length; i++) {
@@ -1652,8 +1655,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         // If batch fails, try individual embeddings as fallback
         for (const chunk of batch) {
           try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
+            const text = needsEmbedFormatting() ? formatDocForEmbedding(chunk.text, chunk.title) : chunk.text;
+            const result = await doEmbed(text);
             if (result) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
               chunksEmbedded++;
@@ -1695,7 +1698,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  };
+
+  if (useGoogle) {
+    // Google provider: no local LLM session needed
+    const llm = getDefaultLLM();
+    await embedChunks(
+      (text) => llm.embed(text),
+      (texts) => llm.embedBatch(texts, false),
+    );
+  } else {
+    // Local provider: use lifecycle-managed LLM session (30 min timeout)
+    await withLLMSession(async (session) => {
+      await embedChunks(
+        (text) => session.embed(text),
+        (texts) => session.embedBatch(texts),
+      );
+    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  }
 
   closeDb();
 }
@@ -2263,6 +2283,7 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      provider: { type: "string" },  // embedding provider: local or google
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2717,9 +2738,24 @@ if (isMain) {
       await updateCollections();
       break;
 
-    case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+    case "embed": {
+      const provider = cli.values.provider as string | undefined;
+      if (provider && provider !== "local" && provider !== "google") {
+        console.error(`Error: invalid provider "${provider}". Must be "local" or "google".`);
+        process.exit(1);
+      }
+      if (provider === "google") {
+        if (!process.env.GEMINI_API_KEY) {
+          console.error("Error: GEMINI_API_KEY environment variable required for Google provider");
+          process.exit(1);
+        }
+        setEmbedProvider("google");
+        setGoogleApiKey(process.env.GEMINI_API_KEY);
+      }
+      const embedModel = getEmbedProvider() === "google" ? GOOGLE_EMBED_MODEL : DEFAULT_EMBED_MODEL;
+      await vectorIndex(embedModel, !!cli.values.force);
       break;
+    }
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);

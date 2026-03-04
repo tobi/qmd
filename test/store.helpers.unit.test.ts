@@ -15,7 +15,7 @@ import {
   normalizeDocid,
   isDocid,
   handelize,
-} from "../src/store";
+} from "../src/store.js";
 
 // =============================================================================
 // Path Utilities

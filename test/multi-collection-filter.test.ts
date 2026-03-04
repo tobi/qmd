@@ -78,7 +78,7 @@ describe("filterByCollections", () => {
     const filtered = filterByCollections(mixedResults, ["docs", "notes"]);
     expect(filtered).toHaveLength(1);
     // Should match via filepath (docs), not file (notes)
-    expect(filtered[0].filepath).toBe("qmd://docs/readme.md");
+    expect(filtered[0]!.filepath).toBe("qmd://docs/readme.md");
   });
 });
 

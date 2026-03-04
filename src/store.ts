@@ -19,8 +19,11 @@ import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
+  getActiveEmbedModel,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  needsEmbedFormatting,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -2241,11 +2244,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  // Google provider handles task differentiation via API taskType parameter — skip nomic formatting
+  const formattedText = needsEmbedFormatting()
+    ? (isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text))
+    : text;
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await getDefaultLLM().embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2984,11 +2989,13 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const llm = getDefaultLLM();
+    const textsToEmbed = needsEmbedFormatting()
+      ? vecQueries.map(q => formatQueryForEmbedding(q.text))
+      : vecQueries.map(q => q.text);
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, true);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -2997,7 +3004,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecQueries[i]!.text, getActiveEmbedModel(), 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -3143,7 +3150,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, getActiveEmbedModel(), limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -3273,11 +3280,13 @@ export async function structuredSearch(
   if (hasVectors) {
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const llm = getDefaultLLM();
+      const textsToEmbed = needsEmbedFormatting()
+        ? vecSearches.map(s => formatQueryForEmbedding(s.query))
+        : vecSearches.map(s => s.query);
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, true);
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
@@ -3286,7 +3295,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            vecSearches[i]!.query, getActiveEmbedModel(), 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {
