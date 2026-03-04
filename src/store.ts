@@ -1983,8 +1983,55 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+export function sanitizeFTS5Term(term: string): string {
+  return term.replace(/[^\p{L}\p{N}']/gu, '').replace(/^'+|'+$/g, '').toLowerCase();
+}
+
+// Single source of truth for CJK/Kana/Hangul character class
+// FTS5 unicode61 tokenizer treats each of these as a separate token — bigram splitting needed
+const CJK_CLASS =
+  '\u4E00-\u9FFF'    // CJK Unified Ideographs
+  + '\u3400-\u4DBF'  // CJK Extension A
+  + '\uF900-\uFAFF'  // CJK Compatibility Ideographs
+  + '\u3040-\u309F'  // Hiragana
+  + '\u30A0-\u30FF'  // Katakana (fullwidth)
+  + '\uFF65-\uFF9F'  // Katakana (halfwidth)
+  + '\uAC00-\uD7AF'  // Hangul Syllables
+  + '\u1100-\u11FF'  // Hangul Jamo
+  + '\u3130-\u318F'; // Hangul Compatibility Jamo
+
+const CJK_RANGE   = new RegExp(`[${CJK_CLASS}]`, 'u');
+const CJK_PURE    = new RegExp(`^[${CJK_CLASS}]+$`, 'u');
+const CJK_SEGMENT = new RegExp(`[${CJK_CLASS}]+|[^${CJK_CLASS}]+`, 'gu');
+
+// CJK fullwidth/special punctuation — not matched by \s, must pre-split before tokenization
+const CJK_PUNCT = /[，。！？、；：\u201C\u201D\u2018\u2019【】（）《》\xB7\u2026\u2014～「」『』〈〉〔〕｛｝／｜＝＼﹑\u3000]/g;
+
+/**
+ * Split CJK terms into overlapping bigrams for FTS5 search.
+ * FTS5's unicode61 tokenizer doesn't segment Chinese/Japanese/Korean properly.
+ * e.g., "飞书消息" → ["飞书", "书消", "消息"]
+ * Non-CJK terms are returned as-is. Mixed scripts split at boundaries.
+ */
+export function splitCJKBigrams(term: string): string[] {
+  if (!CJK_RANGE.test(term)) return [term];
+  // Mixed CJK+Latin/digits: split at script boundaries then process each segment
+  if (!CJK_PURE.test(term)) {
+    const segments = term.match(CJK_SEGMENT) || [term];
+    return segments.flatMap(seg => splitCJKBigrams(seg));
+  }
+  // Iterate by code points, not code units — safe for U+20000+ surrogate pairs
+  const chars = [...term];
+  if (chars.length <= 2) return [term];
+  const bigrams: string[] = [];
+  for (let i = 0; i < chars.length - 1; i++) {
+    bigrams.push(chars[i]! + chars[i + 1]!);
+  }
+  // Cap at 4 bigrams: keep first 2 + last 2, avoids overly strict AND chains
+  if (bigrams.length > 4) {
+    return [...bigrams.slice(0, 2), ...bigrams.slice(-2)];
+  }
+  return bigrams;
 }
 
 /**
@@ -2002,12 +2049,13 @@ function sanitizeFTS5Term(term: string): string {
  *   performance -sports     → "performance"* NOT "sports"*
  *   "machine learning"      → "machine learning"
  */
-function buildFTS5Query(query: string): string | null {
+export function buildFTS5Query(query: string): string | null {
   const positive: string[] = [];
   const negative: string[] = [];
 
   let i = 0;
-  const s = query.trim();
+  // Pre-split on CJK punctuation (not treated as \s by default)
+  const s = query.trim().replace(CJK_PUNCT, ' ').trim();
 
   while (i < s.length) {
     // Skip whitespace
