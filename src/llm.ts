@@ -552,7 +552,7 @@ export class LlamaCpp implements LLM {
     this.embedModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.embedModelUri);
-      const model = await llama.loadModel({ modelPath });
+      const model = await llama.loadModel({ modelPath, ...(LlamaCpp.FLASH_ATTENTION ? { defaultContextFlashAttention: true } : {}) });
       this.embedModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -668,7 +668,7 @@ export class LlamaCpp implements LLM {
       this.generateModelLoadPromise = (async () => {
         const llama = await this.ensureLlama();
         const modelPath = await this.resolveModel(this.generateModelUri);
-        const model = await llama.loadModel({ modelPath });
+        const model = await llama.loadModel({ modelPath, ...(LlamaCpp.FLASH_ATTENTION ? { defaultContextFlashAttention: true } : {}) });
         this.generateModel = model;
         return model;
       })();
@@ -700,7 +700,7 @@ export class LlamaCpp implements LLM {
     this.rerankModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
-      const model = await llama.loadModel({ modelPath });
+      const model = await llama.loadModel({ modelPath, ...(LlamaCpp.FLASH_ATTENTION ? { defaultContextFlashAttention: true } : {}) });
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -727,6 +727,7 @@ export class LlamaCpp implements LLM {
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
   private static readonly RERANK_CONTEXT_SIZE = 2048;
+  private static readonly FLASH_ATTENTION = process.env.QMD_FLASH_ATTENTION === "true";
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
