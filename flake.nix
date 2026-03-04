@@ -4,12 +4,16 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    bun2nix.url = "github:nix-community/bun2nix";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, bun2nix }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ bun2nix.overlays.default ];
+        };
 
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
@@ -27,16 +31,20 @@
           nativeBuildInputs = [
             pkgs.bun
             pkgs.makeWrapper
-            pkgs.python3  # needed by node-gyp to compile better-sqlite3
+            pkgs.python3
+            pkgs.bun2nix.hook
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
+            pkgs.darwin.cctools
           ];
 
           buildInputs = [ pkgs.sqlite ];
 
+          bunDeps = pkgs.bun2nix.fetchBunDeps {
+            bunNix = ./nix/bun.nix;
+          };
+
           buildPhase = ''
             export HOME=$(mktemp -d)
-            bun install --frozen-lockfile
           '';
 
           installPhase = ''

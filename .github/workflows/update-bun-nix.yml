@@ -1,0 +1,43 @@
+name: Update bun.nix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bun.lock'
+  pull_request:
+    paths:
+      - 'bun.lock'
+
+jobs:
+  update-bun-nix:
+    name: Update bun.nix
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Generate bun.nix
+        run: bunx bun2nix -o nix/bun.nix
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: 'chore: update bun.nix'
+          title: 'chore: update bun.nix'
+          body: |
+            Auto-generated PR to update `nix/bun.nix` after changes to `bun.lock`.
+            
+            Please review and merge.
+          branch: update-bun-nix
+          delete-branch: true
+          labels: |
+            automated
+            nix
