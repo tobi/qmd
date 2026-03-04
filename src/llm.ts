@@ -582,8 +582,10 @@ export class LlamaCpp implements LLM {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
-        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        return Math.max(1, Math.min(8, maxByVram));
+        const budget = parseFloat(process.env.QMD_VRAM_BUDGET_RATIO || "0.25");
+        const cap = parseInt(process.env.QMD_MAX_PARALLELISM || "8", 10);
+        const maxByVram = Math.floor((freeMB * budget) / perContextMB);
+        return Math.max(1, Math.min(cap, maxByVram));
       } catch {
         return 2;
       }

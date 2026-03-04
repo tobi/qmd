@@ -224,7 +224,7 @@ export const STRONG_SIGNAL_MIN_SCORE = 0.85;
 export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-export const RERANK_CANDIDATE_LIMIT = 40;
+export const RERANK_CANDIDATE_LIMIT = parseInt(process.env.QMD_RERANK_CANDIDATE_LIMIT || "40", 10);
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
