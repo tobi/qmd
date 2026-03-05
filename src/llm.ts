@@ -24,18 +24,29 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // =============================================================================
 
 /**
+ * Whether to use nomic-style task prefixes for embeddings.
+ * Enabled by default (optimized for embeddinggemma). Set QMD_EMBED_RAW=1 to
+ * disable prefixes — useful with models like Qwen3-Embedding that don't need them.
+ */
+const EMBED_RAW = process.env.QMD_EMBED_RAW === "1";
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma.
+ * Set QMD_EMBED_RAW=1 to pass text as-is.
  */
 export function formatQueryForEmbedding(query: string): string {
+  if (EMBED_RAW) return query;
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields.
+ * Set QMD_EMBED_RAW=1 to pass text as-is.
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
+  if (EMBED_RAW) return text;
   return `title: ${title || "none"} | text: ${text}`;
 }
 

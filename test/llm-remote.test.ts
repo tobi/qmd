@@ -8,7 +8,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
 import { RemoteLlamaCpp } from "../src/llm-remote.js";
-import { RerankNotSupportedError } from "../src/llm.js";
+import { RerankNotSupportedError, formatQueryForEmbedding, formatDocForEmbedding } from "../src/llm.js";
 
 // =============================================================================
 // Mock Server
@@ -341,5 +341,25 @@ describe("RemoteLlamaCpp lifecycle", () => {
   test("dispose does not throw", async () => {
     const llm = new RemoteLlamaCpp();
     await expect(llm.dispose()).resolves.not.toThrow();
+  });
+});
+
+// =============================================================================
+// Embedding Format Tests (QMD_EMBED_RAW)
+// =============================================================================
+
+describe("Embedding format prefix", () => {
+  test("formatQueryForEmbedding adds nomic prefix by default", () => {
+    delete process.env.QMD_EMBED_RAW;
+    // Note: EMBED_RAW is read at module load time, so this tests the default
+    const result = formatQueryForEmbedding("test query");
+    expect(result).toContain("task:");
+    expect(result).toContain("test query");
+  });
+
+  test("formatDocForEmbedding adds nomic prefix by default", () => {
+    const result = formatDocForEmbedding("some text", "My Title");
+    expect(result).toContain("title: My Title");
+    expect(result).toContain("some text");
   });
 });
