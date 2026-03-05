@@ -38,6 +38,7 @@ services:
       --host 0.0.0.0 --port 8011
       --hf-repo ${QMD_EMBED_HF_REPO:-ggml-org/embeddinggemma-300M-GGUF}
       --hf-file ${QMD_EMBED_HF_FILE:-embeddinggemma-300M-Q8_0.gguf}
+      --alias ${QMD_EMBED_ALIAS:-qmd-embed}
       --embedding
       --batch-size ${QMD_EMBED_BATCH_SIZE:-512}
     volumes:
@@ -53,6 +54,7 @@ services:
       --host 0.0.0.0 --port 8012
       --hf-repo ${QMD_GENERATE_HF_REPO:-tobil/qmd-query-expansion-1.7B-gguf}
       --hf-file ${QMD_GENERATE_HF_FILE:-qmd-query-expansion-1.7B-q4_k_m.gguf}
+      --alias ${QMD_GENERATE_ALIAS:-qmd-generate}
       --batch-size ${QMD_GENERATE_BATCH_SIZE:-512}
     volumes:
       - qmd-hf-cache:/root/.cache/huggingface
@@ -67,6 +69,7 @@ services:
       --host 0.0.0.0 --port 8013
       --hf-repo ${QMD_RERANK_HF_REPO:-ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF}
       --hf-file ${QMD_RERANK_HF_FILE:-qwen3-reranker-0.6b-q8_0.gguf}
+      --alias ${QMD_RERANK_ALIAS:-qmd-rerank}
       --reranking
       --ctx-size ${QMD_RERANK_CTX_SIZE:-2048}
       --batch-size ${QMD_RERANK_BATCH_SIZE:-256}
