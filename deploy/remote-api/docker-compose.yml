@@ -1,0 +1,77 @@
+# QMD Remote API — CPU-safe default stack.
+# For GPU acceleration, layer the GPU override:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Models are downloaded automatically from HuggingFace on first start
+# and cached in the named volume "qmd-hf-cache".
+#
+# Quick start:
+#   cp .env.example .env   # edit QMD_GATEWAY_API_KEY
+#   docker compose up -d
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: qmd-api-gateway
+    restart: unless-stopped
+    ports:
+      - "${QMD_GATEWAY_PORT:-8080}:8080"
+    environment:
+      - QMD_GATEWAY_API_KEY=${QMD_GATEWAY_API_KEY:-change-me}
+    volumes:
+      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    command: >
+      /bin/sh -lc "envsubst '$$QMD_GATEWAY_API_KEY' < /etc/nginx/templates/default.conf.template
+      > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - llama-embed
+      - llama-generate
+      - llama-rerank
+
+  llama-embed:
+    image: ${QMD_LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    container_name: qmd-llama-embed
+    restart: unless-stopped
+    environment:
+      - HUGGINGFACE_API_KEY=${HF_TOKEN:-}
+    command: >
+      --host 0.0.0.0 --port 8011
+      --hf-repo ${QMD_EMBED_HF_REPO:-ggml-org/embeddinggemma-300M-GGUF}
+      --hf-file ${QMD_EMBED_HF_FILE:-embeddinggemma-300M-Q8_0.gguf}
+      --embedding
+      --batch-size ${QMD_EMBED_BATCH_SIZE:-512}
+    volumes:
+      - qmd-hf-cache:/root/.cache/huggingface
+
+  llama-generate:
+    image: ${QMD_LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    container_name: qmd-llama-generate
+    restart: unless-stopped
+    environment:
+      - HUGGINGFACE_API_KEY=${HF_TOKEN:-}
+    command: >
+      --host 0.0.0.0 --port 8012
+      --hf-repo ${QMD_GENERATE_HF_REPO:-tobil/qmd-query-expansion-1.7B-gguf}
+      --hf-file ${QMD_GENERATE_HF_FILE:-qmd-query-expansion-1.7B-q4_k_m.gguf}
+      --batch-size ${QMD_GENERATE_BATCH_SIZE:-512}
+    volumes:
+      - qmd-hf-cache:/root/.cache/huggingface
+
+  llama-rerank:
+    image: ${QMD_LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    container_name: qmd-llama-rerank
+    restart: unless-stopped
+    environment:
+      - HUGGINGFACE_API_KEY=${HF_TOKEN:-}
+    command: >
+      --host 0.0.0.0 --port 8013
+      --hf-repo ${QMD_RERANK_HF_REPO:-ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF}
+      --hf-file ${QMD_RERANK_HF_FILE:-qwen3-reranker-0.6b-q8_0.gguf}
+      --reranking
+      --ctx-size ${QMD_RERANK_CTX_SIZE:-2048}
+      --batch-size ${QMD_RERANK_BATCH_SIZE:-256}
+    volumes:
+      - qmd-hf-cache:/root/.cache/huggingface
+
+volumes:
+  qmd-hf-cache:

@@ -18,6 +18,7 @@ import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
   LlamaCpp,
+  RerankNotSupportedError,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -2348,17 +2349,33 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents using LLM (local or remote)
   if (uncachedDocs.length > 0) {
     const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
-    // Cache results — use original doc.text for cache key (result.file lacks chunk text)
-    const textByFile = new Map(documents.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(result.file, result.score);
+    try {
+      const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+
+      // Cache results — use original doc.text for cache key (result.file lacks chunk text)
+      const textByFile = new Map(documents.map(d => [d.file, d.text]));
+      for (const result of rerankResult.results) {
+        const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(result.file, result.score);
+      }
+    } catch (error) {
+      if (error instanceof RerankNotSupportedError) {
+        // Fallback: preserve retrieval order when rerank endpoint is unavailable
+        for (let i = 0; i < uncachedDocs.length; i++) {
+          const doc = uncachedDocs[i]!;
+          const score = 1 - (i / Math.max(1, uncachedDocs.length));
+          const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+          setCachedResult(db, cacheKey, score.toString());
+          cachedResults.set(doc.file, score);
+        }
+      } else {
+        throw error;
+      }
     }
   }
 

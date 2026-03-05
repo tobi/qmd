@@ -1,0 +1,34 @@
+# GPU override for NVIDIA hosts.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# By default uses all available GPUs. To pin to a specific GPU, set
+# CUDA_VISIBLE_DEVICES in your .env file (e.g. CUDA_VISIBLE_DEVICES=0).
+
+services:
+  llama-embed:
+    image: ${QMD_LLAMA_GPU_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+  llama-generate:
+    image: ${QMD_LLAMA_GPU_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+  llama-rerank:
+    image: ${QMD_LLAMA_GPU_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]

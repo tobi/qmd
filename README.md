@@ -54,6 +54,20 @@ qmd search "API" -c notes
 qmd search "API" --all --files --min-score 0.3
 ```
 
+### Remote Mode
+
+Run QMD on a lightweight machine while a GPU server handles inference:
+
+```bash
+export QMD_REMOTE_MODE=1
+export QMD_REMOTE_EMBED_URL=http://gpu-host:8080
+export QMD_REMOTE_RERANK_URL=http://gpu-host:8081
+export QMD_REMOTE_GENERATE_URL=http://gpu-host:8082
+```
+
+A Docker Compose deployment with auth gateway is included in `deploy/remote-api/`.
+See [docs/REMOTE_MODE.md](docs/REMOTE_MODE.md) for full setup instructions.
+
 ### Using with AI Agents
 
 QMD's `--json` and `--files` output formats are designed for agentic workflows:
