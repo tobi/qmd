@@ -33,6 +33,12 @@ export QMD_REMOTE_TIMEOUT_MS=30000
 export QMD_REMOTE_EMBED_MODEL=embeddinggemma-300m
 export QMD_REMOTE_GENERATE_MODEL=qmd-query-expansion
 export QMD_REMOTE_RERANK_MODEL=qwen3-reranker
+
+# Optional: disable nomic-style embedding prefix (default: off)
+# Enable when using embedding models that don't need task prefixes
+# (e.g. Qwen3-Embedding, bge-m3). The default prefix is optimized
+# for embeddinggemma but can slightly hurt other models.
+export QMD_EMBED_RAW=1
 ```
 
 Then use QMD as usual — `qmd embed`, `qmd query`, MCP tools all work

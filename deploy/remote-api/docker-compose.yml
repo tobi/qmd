@@ -72,7 +72,7 @@ services:
       --alias ${QMD_RERANK_ALIAS:-qmd-rerank}
       --reranking
       --ctx-size ${QMD_RERANK_CTX_SIZE:-2048}
-      --batch-size ${QMD_RERANK_BATCH_SIZE:-256}
+      --batch-size ${QMD_RERANK_BATCH_SIZE:-2048}
     volumes:
       - qmd-hf-cache:/root/.cache/huggingface
 
