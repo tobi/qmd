@@ -97,7 +97,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude marketplace add tobi/qmd
+claude plugin marketplace add tobi/qmd
 claude plugin add qmd@qmd
 ```
 
