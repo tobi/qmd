@@ -1428,11 +1428,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   });
 
   const total = files.length;
-  if (total === 0) {
+  const hasNoFiles = total === 0;
+  if (hasNoFiles) {
     progress.clear();
     console.log("No files found matching pattern.");
-    closeDb();
-    return;
+    // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
