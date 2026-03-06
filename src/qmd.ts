@@ -70,7 +70,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, initRemoteLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2445,6 +2445,7 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
+  await initRemoteLlamaCpp();
   const cli = parseCLI();
 
   if (cli.values.version) {

@@ -164,7 +164,7 @@ export class RemoteLlamaCpp implements LLM {
     try {
       const res = await this.post<EmbeddingResponse>(
         `${this.embedUrl}/v1/embeddings`,
-        { input: texts, model: "embed" },
+        { input: texts, model: this.embedModelName },
         60000
       );
       // llama-server returns data[] with index field; sort by index for safety

@@ -1440,19 +1440,28 @@ export function canUnloadLLM(): boolean {
 let defaultLlamaCpp: LLM | null = null;
 
 /**
+ * Initialize the remote LLM backend (must be called before getDefaultLlamaCpp
+ * when QMD_REMOTE_MODE=1). Uses dynamic import to avoid pulling in
+ * llm-remote.ts when running in local mode.
+ */
+export async function initRemoteLlamaCpp(): Promise<void> {
+  if (process.env.QMD_REMOTE_MODE === "1" && !defaultLlamaCpp) {
+    const { RemoteLlamaCpp } = await import("./llm-remote.js");
+    defaultLlamaCpp = new RemoteLlamaCpp();
+  }
+}
+
+/**
  * Get the default LLM instance.
- * When QMD_REMOTE_MODE=1 is set, returns a RemoteLlamaCpp that delegates
- * to remote llama-server instances via HTTP instead of loading models locally.
+ * When QMD_REMOTE_MODE=1, requires initRemoteLlamaCpp() to have been called first.
  * Otherwise creates a local LlamaCpp instance using node-llama-cpp.
  */
 export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
     if (process.env.QMD_REMOTE_MODE === "1") {
-      const { RemoteLlamaCpp } = require("./llm-remote.js");
-      defaultLlamaCpp = new RemoteLlamaCpp();
-    } else {
-      defaultLlamaCpp = new LlamaCpp();
+      throw new Error("Remote mode enabled but initRemoteLlamaCpp() was not called. Call it before using getDefaultLlamaCpp().");
     }
+    defaultLlamaCpp = new LlamaCpp();
   }
   return defaultLlamaCpp;
 }
