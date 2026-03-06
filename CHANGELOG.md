@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Reranker: truncate documents exceeding the 2048-token context window
+  instead of silently producing garbage scores. Long chunks (e.g. from
+  PDF ingestion) now get a fair ranking.
+- Nix: add python3 and cctools to build dependencies. #214 (thanks
+  @pcasaretto)
+
 ## [1.1.0] - 2026-02-20
 
 QMD now speaks in **query documents** — structured multi-line queries where every line is typed (`lex:`, `vec:`, `hyde:`), combining keyword precision with semantic recall. A single plain query still works exactly as before (it's treated as an implicit `expand:` and auto-expanded by the LLM). Lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical. The formal query grammar is documented in `docs/SYNTAX.md`.
