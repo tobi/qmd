@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-03-06
+
 ### Fixes
 
 - Reranker: truncate documents exceeding the 2048-token context window
