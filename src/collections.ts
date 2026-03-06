@@ -37,6 +37,7 @@ export interface Collection {
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
+  attempted_llama_build?: boolean;            // Whether llama build was already attempted
   collections: Record<string, Collection>;    // Collection name -> config
 }
 
