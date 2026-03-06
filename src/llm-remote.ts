@@ -290,12 +290,28 @@ export class RemoteLlamaCpp implements LLM {
   // Reranking
   // ---------------------------------------------------------------------------
 
+  // Reranker context size (must match llama-server --ctx-size)
+  private static readonly RERANK_CTX_SIZE = 2048;
+  private static readonly RERANK_OVERHEAD = 200; // chat template tokens
+
   async rerank(
     query: string,
     documents: RerankDocument[],
     _options?: RerankOptions
   ): Promise<RerankResult> {
-    const texts = documents.map((d) => d.text);
+    // Truncate documents that would exceed the rerank context size.
+    // Without a real tokenizer, we use UTF-8 byte length as a conservative
+    // upper bound: 1 byte >= 1 token for any language (CJK/Cyrillic use
+    // 2-3 bytes per char but tokenize to ~2 chars/token, so bytes always
+    // overestimate). This may over-truncate English text slightly but
+    // guarantees no context overflow for multilingual content.
+    const queryBytes = new TextEncoder().encode(query).length;
+    const maxDocBytes = RemoteLlamaCpp.RERANK_CTX_SIZE - RemoteLlamaCpp.RERANK_OVERHEAD - queryBytes;
+    const texts = documents.map((d) => {
+      const bytes = new TextEncoder().encode(d.text);
+      if (bytes.length <= maxDocBytes) return d.text;
+      return new TextDecoder().decode(bytes.slice(0, maxDocBytes));
+    });
 
     // Try rerank endpoints in order of preference
     const paths = ["/v1/rerank", "/rerank"];
