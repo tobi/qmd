@@ -152,7 +152,9 @@ export class RemoteLlamaCpp implements LLM {
         input: text,
         model: this.embedModelName,
       });
-      return { embedding: res.data[0].embedding, model: this.embedModelUri };
+      const first = res.data[0];
+      if (!first) return null;
+      return { embedding: first.embedding, model: this.embedModelUri };
     } catch (e: unknown) {
       console.error("[QMD Remote] embed error:", (e as Error).message);
       return null;
@@ -204,7 +206,7 @@ export class RemoteLlamaCpp implements LLM {
         temperature: options?.temperature ?? 0.7,
       });
       return {
-        text: res.choices[0].message.content,
+        text: res.choices[0]?.message?.content ?? "",
         model: res.model || this.generateModelUri,
         done: true,
       };
@@ -239,7 +241,7 @@ export class RemoteLlamaCpp implements LLM {
         }
       );
 
-      const result = res.choices[0].message.content;
+      const result = res.choices[0]?.message?.content ?? "";
       const lines = result.trim().split("\n");
 
       const queryLower = query.toLowerCase();
@@ -316,7 +318,7 @@ export class RemoteLlamaCpp implements LLM {
 
         return {
           results: sorted.map((r) => ({
-            file: documents[r.index].file,
+            file: documents[r.index]?.file ?? "",
             score: r.relevance_score ?? r.score ?? 0,
             index: r.index,
           })),
