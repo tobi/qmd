@@ -74,7 +74,7 @@ services:
       --ctx-size ${QMD_RERANK_CTX_SIZE:-2048}
       --batch-size ${QMD_RERANK_BATCH_SIZE:-2048}
       --ubatch-size ${QMD_RERANK_UBATCH_SIZE:-2048}
-      --flash-attn
+      --flash-attn on
     volumes:
       - qmd-hf-cache:/root/.cache/huggingface
 
