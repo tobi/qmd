@@ -208,9 +208,33 @@ export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
+type RequestedGpuBackend = "auto" | "cuda" | "metal" | "vulkan" | false;
+
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
+
+export function resolveRequestedGpuBackend(env: NodeJS.ProcessEnv = process.env): RequestedGpuBackend {
+  const raw = env.QMD_GPU?.trim() || env.NODE_LLAMA_CPP_GPU?.trim();
+  if (!raw) {
+    return "auto";
+  }
+
+  const normalized = raw.toLowerCase();
+  if (
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "off" ||
+    normalized === "none" ||
+    normalized === "cpu"
+  ) {
+    return false;
+  }
+  if (normalized === "cuda" || normalized === "metal" || normalized === "vulkan") {
+    return normalized;
+  }
+  return "auto";
+}
 
 export type PullResult = {
   model: string;
@@ -545,11 +569,39 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      const llama = await getLlama({
-        // attempt to build
-        build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
-      });
+      const requestedGpu = resolveRequestedGpuBackend();
+
+      let llama: Llama;
+      if (requestedGpu === false) {
+        llama = await getLlama({
+          gpu: false,
+          build: "autoAttempt",
+          logLevel: LlamaLogLevel.error
+        });
+      } else if (requestedGpu !== "auto") {
+        try {
+          llama = await getLlama({
+            gpu: requestedGpu,
+            build: "autoAttempt",
+            logLevel: LlamaLogLevel.error
+          });
+        } catch {
+          llama = await getLlama({
+            gpu: false,
+            build: "autoAttempt",
+            logLevel: LlamaLogLevel.error
+          });
+          process.stderr.write(
+            `QMD Warning: ${requestedGpu} was requested but failed to initialize. Falling back to CPU.\n`
+          );
+        }
+      } else {
+        llama = await getLlama({
+          // attempt to build
+          build: "autoAttempt",
+          logLevel: LlamaLogLevel.error
+        });
+      }
 
       if (llama.gpu === false) {
         process.stderr.write(
