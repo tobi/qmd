@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -52,6 +52,68 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("LlamaCpp expand context size config", () => {
+  const defaultExpandContextSize = 2048;
+
+  test("uses default expand context size when no config or env is set", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("uses QMD_EXPAND_CONTEXT_SIZE when set to a positive integer", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "3072";
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(3072);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("config value overrides QMD_EXPAND_CONTEXT_SIZE", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "4096";
+    try {
+      const llm = new LlamaCpp({ expandContextSize: 1536 }) as any;
+      expect(llm.expandContextSize).toBe(1536);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("falls back to default and warns when QMD_EXPAND_CONTEXT_SIZE is invalid", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "bad";
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_EXPAND_CONTEXT_SIZE");
+    } finally {
+      stderrSpy.mockRestore();
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("throws when config expandContextSize is invalid", () => {
+    expect(() => new LlamaCpp({ expandContextSize: 0 })).toThrow(
+      "Invalid expandContextSize: 0. Must be a positive integer."
+    );
   });
 });
 
@@ -600,4 +662,3 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
     });
   });
 });
-

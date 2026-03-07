@@ -335,6 +335,11 @@ export type LlamaCppConfig = {
   rerankModel?: string;
   modelCacheDir?: string;
   /**
+   * Context size used for query expansion generation contexts.
+   * Default: 2048. Can also be set via QMD_EXPAND_CONTEXT_SIZE.
+   */
+  expandContextSize?: number;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -356,6 +361,28 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+
+function resolveExpandContextSize(configValue?: number): number {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue <= 0) {
+      throw new Error(`Invalid expandContextSize: ${configValue}. Must be a positive integer.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_EXPAND_CONTEXT_SIZE?.trim();
+  if (!envValue) return DEFAULT_EXPAND_CONTEXT_SIZE;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EXPAND_CONTEXT_SIZE="${envValue}", using default ${DEFAULT_EXPAND_CONTEXT_SIZE}.\n`
+    );
+    return DEFAULT_EXPAND_CONTEXT_SIZE;
+  }
+  return parsed;
+}
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -369,6 +396,7 @@ export class LlamaCpp implements LLM {
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
+  private expandContextSize: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -389,6 +417,7 @@ export class LlamaCpp implements LLM {
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
+    this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -710,7 +739,6 @@ export class LlamaCpp implements LLM {
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
   private static readonly RERANK_CONTEXT_SIZE = 2048;
-
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
@@ -943,8 +971,10 @@ export class LlamaCpp implements LLM {
 
     const prompt = `/no_think Expand this search query: ${query}`;
 
-    // Create fresh context for each call
-    const genContext = await this.generateModel!.createContext();
+    // Create a bounded context for expansion to prevent large default VRAM allocations.
+    const genContext = await this.generateModel!.createContext({
+      contextSize: this.expandContextSize,
+    });
     const sequence = genContext.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
