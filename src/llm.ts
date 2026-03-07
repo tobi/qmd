@@ -6,7 +6,6 @@
 
 import {
   getLlama,
-  getLlamaGpuTypes,
   resolveModelFile,
   LlamaChatSession,
   LlamaLogLevel,
@@ -497,29 +496,13 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const llama = await getLlama({
+        // attempt to build
+        build: "autoAttempt",
+        logLevel: LlamaLogLevel.error
+      });
 
-      let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
-        }
-      } else {
-        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-      }
-
-      if (!llama.gpu) {
+      if (llama.gpu === false) {
         process.stderr.write(
           "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
         );
