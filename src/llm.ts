@@ -970,7 +970,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -989,7 +989,10 @@ export class LlamaCpp implements LLM {
       `
     });
 
-    const prompt = `/no_think Expand this search query: ${query}`;
+    const intent = options.intent;
+    const prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
     const genContext = await this.generateModel!.createContext({

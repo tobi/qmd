@@ -892,8 +892,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2346,9 +2346,9 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2360,7 +2360,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2379,7 +2379,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+  // Prepend intent to rerank query so the reranker scores with domain context
+  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
 
@@ -2389,7 +2392,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
@@ -2403,13 +2406,13 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const llm = getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
@@ -2885,7 +2888,45 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
+/** Weight for intent terms relative to query terms (1.0) in snippet scoring */
+export const INTENT_WEIGHT_SNIPPET = 0.3;
+
+/** Weight for intent terms relative to query terms (1.0) in chunk selection */
+export const INTENT_WEIGHT_CHUNK = 0.5;
+
+// Common stop words filtered from intent strings before tokenization.
+// Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
+// 2-3 char function words so the length threshold can drop to >1 and let
+// short domain terms (API, SQL, LLM, CPU, CDN, …) survive.
+const INTENT_STOP_WORDS = new Set([
+  // 2-char function words
+  "am", "an", "as", "at", "be", "by", "do", "he", "if",
+  "in", "is", "it", "me", "my", "no", "of", "on", "or", "so",
+  "to", "up", "us", "we",
+  // 3-char function words
+  "all", "and", "any", "are", "but", "can", "did", "for", "get",
+  "has", "her", "him", "his", "how", "its", "let", "may", "not",
+  "our", "out", "the", "too", "was", "who", "why", "you",
+  // 4+ char common words
+  "also", "does", "find", "from", "have", "into", "more", "need",
+  "show", "some", "tell", "that", "them", "this", "want", "what",
+  "when", "will", "with", "your",
+  // Search-context noise
+  "about", "looking", "notes", "search", "where", "which",
+]);
+
+/**
+ * Extract meaningful terms from an intent string, filtering stop words and punctuation.
+ * Uses Unicode-aware punctuation stripping so domain terms like "API" survive.
+ * Returns lowercase terms suitable for text matching.
+ */
+export function extractIntentTerms(intent: string): string[] {
+  return intent.toLowerCase().split(/\s+/)
+    .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
+}
+
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
@@ -2904,13 +2945,17 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const lineLower = (lines[i] ?? "").toLowerCase();
     let score = 0;
     for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
+      if (lineLower.includes(term)) score += 1.0;
+    }
+    for (const term of intentTerms) {
+      if (lineLower.includes(term)) score += INTENT_WEIGHT_SNIPPET;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -2926,7 +2971,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
   if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+    return extractSnippet(body, query, maxLen, undefined, undefined, intent);
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
@@ -2998,6 +3043,7 @@ export interface HybridQueryOptions {
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
   explain?: boolean;        // include backend/RRF/rerank score traces
+  intent?: string;          // domain intent hint for disambiguation
   hooks?: SearchHooks;
 }
 
@@ -3043,6 +3089,7 @@ export async function hybridQuery(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
   const explain = options?.explain ?? false;
+  const intent = options?.intent;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -3053,11 +3100,14 @@ export async function hybridQuery(
   ).get();
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
+  // When intent is provided, disable strong-signal bypass — the obvious BM25
+  // match may not be what the caller wants (e.g. "performance" with intent
+  // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
   const initialFts = store.searchFTS(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0
+  const hasStrongSignal = !intent && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
@@ -3068,7 +3118,7 @@ export async function hybridQuery(
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query);
+    : await store.expandQuery(query, undefined, intent);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -3157,6 +3207,7 @@ export async function hybridQuery(
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
@@ -3165,11 +3216,15 @@ export async function hybridQuery(
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
@@ -3180,7 +3235,7 @@ export async function hybridQuery(
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -3251,6 +3306,7 @@ export interface VectorSearchOptions {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
+  intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -3281,6 +3337,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3289,7 +3346,7 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = await store.expandQuery(query, undefined, intent);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
@@ -3343,7 +3400,7 @@ export interface StructuredSearchOptions {
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
   explain?: boolean;        // include backend/RRF/rerank score traces
-  /** Future: domain intent hint for routing/boosting */
+  /** Domain intent hint for disambiguation — steers reranking and chunk selection */
   intent?: string;
   hooks?: SearchHooks;
 }
@@ -3375,6 +3432,7 @@ export async function structuredSearch(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
+  const intent = options?.intent;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -3489,6 +3547,7 @@ export async function structuredSearch(
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
@@ -3497,11 +3556,15 @@ export async function structuredSearch(
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
@@ -3512,7 +3575,7 @@ export async function structuredSearch(
   // Step 5: Rerank chunks
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score

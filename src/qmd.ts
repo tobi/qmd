@@ -1771,6 +1771,7 @@ type OutputOptions = {
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
+  intent?: string;       // Domain intent for disambiguation
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1863,7 +1864,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent).snippet : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1891,7 +1892,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -1954,7 +1955,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1967,7 +1968,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1977,7 +1978,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content, line);
@@ -2036,7 +2037,12 @@ function filterByCollections<T extends { filepath?: string; file?: string }>(res
  *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
  *   "CAP\nconsistency"               -> throws (multiple plain lines)
  */
-function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+interface ParsedStructuredQuery {
+  searches: StructuredSubSearch[];
+  intent?: string;
+}
+
+function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   const rawLines = query.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
@@ -2047,7 +2053,9 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
 
   const prefixRe = /^(lex|vec|hyde):\s*/i;
   const expandRe = /^expand:\s*/i;
+  const intentRe = /^intent:\s*/i;
   const typed: StructuredSubSearch[] = [];
+  let intent: string | undefined;
 
   for (const line of rawLines) {
     if (expandRe.test(line.trimmed)) {
@@ -2059,6 +2067,19 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
         throw new Error('expand: query must include text.');
       }
       return null; // treat as standalone expand query
+    }
+
+    // Parse intent: lines
+    if (intentRe.test(line.trimmed)) {
+      if (intent !== undefined) {
+        throw new Error(`Line ${line.number}: only one intent: line is allowed per query document.`);
+      }
+      const text = line.trimmed.replace(intentRe, '').trim();
+      if (!text) {
+        throw new Error(`Line ${line.number}: intent: must include text.`);
+      }
+      intent = text;
+      continue;
     }
 
     const match = line.trimmed.match(prefixRe);
@@ -2080,10 +2101,15 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
       return null;
     }
 
-    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde: prefix. Each line in a query document must start with one.`);
+    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde:/intent: prefix. Each line in a query document must start with one.`);
   }
 
-  return typed.length > 0 ? typed : null;
+  // intent: alone is not a valid query — must have at least one search
+  if (intent && typed.length === 0) {
+    throw new Error('intent: cannot appear alone. Add at least one lex:, vec:, or hyde: line.');
+  }
+
+  return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
 function search(query: string, opts: OutputOptions): void {
@@ -2152,6 +2178,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
+      intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2197,17 +2224,23 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   checkIndexHealth(store.db);
 
-  // Check for structured query syntax (lex:/vec:/hyde: prefixes)
-  const structuredQueries = parseStructuredQuery(query);
+  // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
+  const parsed = parseStructuredQuery(query);
+  // Intent can come from --intent flag or from intent: line in query document
+  const intent = opts.intent || parsed?.intent;
 
   await withLLMSession(async () => {
     let results;
 
-    if (structuredQueries) {
+    if (parsed) {
+      const structuredQueries = parsed.searches;
       // Structured search — user provided their own query expansions
       const typeLabels = structuredQueries.map(s => s.type).join('+');
       process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      
+      if (intent) {
+        process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
+      }
+
       // Log each sub-query
       for (const s of structuredQueries) {
         let preview = s.query.replace(/\n/g, ' ');
@@ -2222,6 +2255,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
+        intent,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2247,6 +2281,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
+        intent,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2293,6 +2328,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     }
 
     // Use first lex/vec query for output context, or original query
+    const structuredQueries = parsed?.searches;
     const displayQuery = structuredQueries
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
@@ -2354,6 +2390,7 @@ function parseCLI() {
       "line-numbers": { type: "boolean" },  // add line numbers to output
       // Query options
       "candidate-limit": { type: "string", short: "C" },
+      intent: { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2393,6 +2430,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     explain: !!values.explain,
+    intent: values.intent as string | undefined,
   };
 
   return {
@@ -2457,7 +2495,8 @@ function showHelp(): void {
     `query          = expand_query | query_document ;`,
     `expand_query   = text | explicit_expand ;`,
     `explicit_expand= "expand:" text ;`,
-    `query_document = { typed_line } ;`,
+    `query_document = [ intent_line ] { typed_line } ;`,
+    `intent_line    = "intent:" text newline ;`,
     `typed_line     = type ":" text newline ;`,
     `type           = "lex" | "vec" | "hyde" ;`,
     `text           = quoted_phrase | plain_text ;`,

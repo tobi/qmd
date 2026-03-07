@@ -126,10 +126,13 @@ function buildInstructions(store: Store): string {
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
   lines.push("");
+  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
+  lines.push("");
   lines.push("Examples:");
   lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
   lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
   lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
+  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -312,9 +315,12 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        intent: z.string().optional().describe(
+          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
       // Map to internal format
       const subSearches: StructuredSubSearch[] = searches.map(s => ({
         type: s.type,
@@ -329,6 +335,7 @@ Intent-aware lex (C++ performance, not sports):
         limit,
         minScore,
         candidateLimit,
+        intent,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -337,7 +344,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
