@@ -314,6 +314,64 @@ describe("CLI Search Command", () => {
     expect(stdout).toContain("No results");
   });
 
+  test("returns empty JSON array for non-matching query with --json", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--json"]);
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(stdout)).toEqual([]);
+  });
+
+  test("returns CSV header only for non-matching query with --csv", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--csv"]);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe("docid,score,file,title,context,line,snippet");
+  });
+
+  test("returns empty XML container for non-matching query with --xml", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--xml"]);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe("<results></results>");
+  });
+
+  test("returns empty output for non-matching query with --md", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--md"]);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe("");
+  });
+
+  test("returns empty output for non-matching query with --files", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--files"]);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe("");
+  });
+
+  test("returns min-score threshold message for default CLI output", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "test", "--min-score", "2"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("No results found above minimum score threshold.");
+  });
+
+  test("returns format-safe empty output when --min-score filters all results", async () => {
+    const json = await runQmd(["search", "test", "--json", "--min-score", "2"]);
+    expect(json.exitCode).toBe(0);
+    expect(JSON.parse(json.stdout)).toEqual([]);
+
+    const csv = await runQmd(["search", "test", "--csv", "--min-score", "2"]);
+    expect(csv.exitCode).toBe(0);
+    expect(csv.stdout.trim()).toBe("docid,score,file,title,context,line,snippet");
+
+    const xml = await runQmd(["search", "test", "--xml", "--min-score", "2"]);
+    expect(xml.exitCode).toBe(0);
+    expect(xml.stdout.trim()).toBe("<results></results>");
+
+    const md = await runQmd(["search", "test", "--md", "--min-score", "2"]);
+    expect(md.exitCode).toBe(0);
+    expect(md.stdout.trim()).toBe("");
+
+    const files = await runQmd(["search", "test", "--files", "--min-score", "2"]);
+    expect(files.exitCode).toBe(0);
+    expect(files.stdout.trim()).toBe("");
+  });
+
   test("requires query argument", async () => {
     const { stdout, stderr, exitCode } = await runQmd(["search"]);
     expect(exitCode).toBe(1);
