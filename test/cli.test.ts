@@ -820,6 +820,119 @@ describe("CLI Collection Commands", () => {
 });
 
 // =============================================================================
+// Collection Ignore Patterns
+// =============================================================================
+
+describe("collection ignore patterns", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let ignoreTestDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("ignore-patterns");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+
+    // Create directory structure with subdirectories to ignore
+    ignoreTestDir = join(testDir, "ignore-fixtures");
+    await mkdir(join(ignoreTestDir, "notes"), { recursive: true });
+    await mkdir(join(ignoreTestDir, "sessions"), { recursive: true });
+    await mkdir(join(ignoreTestDir, "sessions", "2026-03"), { recursive: true });
+    await mkdir(join(ignoreTestDir, "archive"), { recursive: true });
+
+    // Files that should be indexed
+    await writeFile(join(ignoreTestDir, "readme.md"), "# Main readme\nThis should be indexed.");
+    await writeFile(join(ignoreTestDir, "notes", "note1.md"), "# Note 1\nThis is a personal note.");
+
+    // Files that should be ignored
+    await writeFile(join(ignoreTestDir, "sessions", "session1.md"), "# Session 1\nThis session should be ignored.");
+    await writeFile(join(ignoreTestDir, "sessions", "2026-03", "session2.md"), "# Session 2\nNested session should also be ignored.");
+    await writeFile(join(ignoreTestDir, "archive", "old.md"), "# Old stuff\nThis archive file should be ignored.");
+  });
+
+  test("ignore patterns exclude matching files from indexing", async () => {
+    // Write YAML config with ignore patterns
+    await writeFile(
+      join(localConfigDir, "index.yml"),
+      `collections:
+  ignoretst:
+    path: ${ignoreTestDir}
+    pattern: "**/*.md"
+    ignore:
+      - "sessions/**"
+      - "archive/**"
+`
+    );
+
+    const { stdout, exitCode } = await runQmd(["update"], {
+      cwd: ignoreTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(exitCode).toBe(0);
+    // Should index 2 files (readme.md + notes/note1.md), not 5
+    expect(stdout).toContain("2 new");
+  });
+
+  test("ignored files are not searchable", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "session", "-n", "10"], {
+      cwd: ignoreTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    // Should find no results since sessions/ was ignored
+    if (exitCode === 0) {
+      expect(stdout).not.toContain("session1");
+      expect(stdout).not.toContain("session2");
+    }
+  });
+
+  test("non-ignored files are searchable", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "personal note", "-n", "10"], {
+      cwd: ignoreTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("note1");
+  });
+
+  test("status shows ignore patterns", async () => {
+    const { stdout, exitCode } = await runQmd(["collection", "list"], {
+      cwd: ignoreTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Ignore:");
+    expect(stdout).toContain("sessions/**");
+    expect(stdout).toContain("archive/**");
+  });
+
+  test("collection without ignore indexes all files", async () => {
+    // Create a second collection without ignore
+    const env2 = await createIsolatedTestEnv("no-ignore");
+    await writeFile(
+      join(env2.configDir, "index.yml"),
+      `collections:
+  allfiles:
+    path: ${ignoreTestDir}
+    pattern: "**/*.md"
+`
+    );
+
+    const { stdout, exitCode } = await runQmd(["update"], {
+      cwd: ignoreTestDir,
+      dbPath: env2.dbPath,
+      configDir: env2.configDir,
+    });
+    expect(exitCode).toBe(0);
+    // Should index all 5 files
+    expect(stdout).toContain("5 new");
+  });
+});
+
+// =============================================================================
 // Output Format Tests - qmd:// URIs, context, and docid
 // =============================================================================
 

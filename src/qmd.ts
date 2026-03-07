@@ -522,7 +522,7 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true, yamlCol?.ignore);
     console.log("");
   }
 
@@ -1306,6 +1306,9 @@ function collectionList(): void {
 
     console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
+    if (yamlColl?.ignore?.length) {
+      console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
+    }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
     console.log();
@@ -1348,7 +1351,8 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
-  await indexFiles(pwd, globPattern, collName);
+  const newColl = getCollectionFromYaml(collName);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1397,7 +1401,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1414,12 +1418,16 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(ignorePatterns || []),
+  ];
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,
-    ignore: excludeDirs.map(d => `**/${d}/**`),
+    ignore: allIgnore,
   });
   // Filter hidden files/folders (dot: false handles top-level but not nested)
   const files = allFiles.filter(file => {
