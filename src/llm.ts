@@ -759,6 +759,11 @@ export class LlamaCpp implements LLM {
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
   private static readonly RERANK_CONTEXT_SIZE = 2048;
+
+  // Embedding models (embeddinggemma-300M, Qwen3-Embedding) use 2048 token context
+  // Reserve overhead for formatting (title/text prefixes, task instructions)
+  private static readonly EMBED_CONTEXT_SIZE = 2048;
+  private static readonly EMBED_TEMPLATE_OVERHEAD = 100;
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
@@ -831,13 +836,32 @@ export class LlamaCpp implements LLM {
   // Core API methods
   // ==========================================================================
 
+  /**
+   * Truncate text to fit within embedding model's context window.
+   * Prevents SIGABRT crashes on oversized chunks.
+   */
+  private async truncateForEmbedding(text: string): Promise<string> {
+    const model = await this.ensureEmbedModel();
+    const tokens = model.tokenize(text);
+    const maxTokens = LlamaCpp.EMBED_CONTEXT_SIZE - LlamaCpp.EMBED_TEMPLATE_OVERHEAD;
+
+    if (tokens.length <= maxTokens) {
+      return text;
+    }
+
+    // Truncate to safe length
+    return model.detokenize(tokens.slice(0, maxTokens));
+  }
+
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
     try {
+      // Truncate text to prevent context window overflow
+      const truncated = await this.truncateForEmbedding(text);
       const context = await this.ensureEmbedContext();
-      const embedding = await context.getEmbeddingFor(text);
+      const embedding = await context.getEmbeddingFor(truncated);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -860,6 +884,11 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
+      // Truncate all texts upfront to prevent context window overflow
+      const truncated = await Promise.all(
+        texts.map(text => this.truncateForEmbedding(text))
+      );
+
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
 
@@ -867,7 +896,7 @@ export class LlamaCpp implements LLM {
         // Single context: sequential (no point splitting)
         const context = contexts[0]!;
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
-        for (const text of texts) {
+        for (const text of truncated) {
           try {
             const embedding = await context.getEmbeddingFor(text);
             this.touchActivity();
@@ -881,9 +910,9 @@ export class LlamaCpp implements LLM {
       }
 
       // Multiple contexts: split texts across contexts for parallel evaluation
-      const chunkSize = Math.ceil(texts.length / n);
+      const chunkSize = Math.ceil(truncated.length / n);
       const chunks = Array.from({ length: n }, (_, i) =>
-        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+        truncated.slice(i * chunkSize, (i + 1) * chunkSize)
       );
 
       const chunkResults = await Promise.all(
