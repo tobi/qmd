@@ -2,11 +2,54 @@
 
 ## [Unreleased]
 
+13 community PRs merged. GPU initialization replaced with node-llama-cpp's
+built-in `autoAttempt` — deleting ~220 lines of manual fallback code and
+fixing GPU issues reported across 10+ PRs in one shot. Reranking is faster
+through chunk deduplication and a parallelism cap that prevents VRAM
+exhaustion.
+
 ### Changes
 
-- Query: add `--explain` for `qmd query` to expose retrieval score traces
-  in JSON and CLI output. Includes backend scores (FTS/vector), per-list
-  RRF contributions, top-rank bonus, reranker score, and final blended score.
+- **GPU init**: use node-llama-cpp's `build: "autoAttempt"` instead of manual
+  GPU backend detection. Automatically tries Metal/CUDA/Vulkan and falls back
+  gracefully. #310 (thanks @giladgd — the node-llama-cpp author)
+- **Query `--explain`**: `qmd query --explain` exposes retrieval score traces
+  — backend scores, per-list RRF contributions, top-rank bonus, reranker
+  score, and final blended score. Works in JSON and CLI output. #242
+  (thanks @vyalamar)
+- **Collection ignore patterns**: `ignore: ["Sessions/**", "*.tmp"]` in
+  collection config to exclude files from indexing. #304 (thanks @sebkouba)
+- **Multilingual embeddings**: `QMD_EMBED_MODEL` env var lets you swap in
+  models like Qwen3-Embedding for non-English collections. #273 (thanks
+  @daocoding)
+- **Configurable expansion context**: `QMD_EXPAND_CONTEXT_SIZE` env var
+  (default 2048) — previously used the model's full 40960-token window,
+  wasting VRAM. #313 (thanks @0xble)
+- **`candidateLimit` exposed**: `-C` / `--candidate-limit` flag and MCP
+  parameter to tune how many candidates reach the reranker. #255 (thanks
+  @pandysp)
+- **MCP multi-session**: HTTP transport now supports multiple concurrent
+  client sessions, each with its own server instance. #286 (thanks @joelev)
+
+### Fixes
+
+- **Reranking performance**: cap parallel rerank contexts at 4 to prevent
+  VRAM exhaustion on high-core machines. Deduplicate identical chunk texts
+  before reranking — same content from different files now shares a single
+  reranker call. Cache scores by content hash instead of file path.
+- Deactivate stale docs when all files are removed from a collection and
+  `qmd update` is run. #312 (thanks @0xble)
+- Handle emoji-only filenames (`🐘.md` → `1f418.md`) instead of crashing.
+  #308 (thanks @debugerman)
+- Skip unreadable files during indexing (e.g. iCloud-evicted files returning
+  EAGAIN) instead of crashing. #253 (thanks @jimmynail)
+- Suppress progress bar escape sequences when stderr is not a TTY. #230
+  (thanks @dgilperez)
+- Emit format-appropriate empty output (`[]` for JSON, CSV header for CSV,
+  etc.) instead of plain text "No results." #228 (thanks @amsminn)
+- Correct Windows sqlite-vec package name (`sqlite-vec-windows-x64`) and add
+  `sqlite-vec-linux-arm64`. #225 (thanks @ilepn)
+- Fix claude plugin setup CLI commands in README. #311 (thanks @gi11es)
 
 ## [1.1.1] - 2026-03-06
 
