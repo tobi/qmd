@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-03-07
+
 13 community PRs merged. GPU initialization replaced with node-llama-cpp's
 built-in `autoAttempt` — deleting ~220 lines of manual fallback code and
 fixing GPU issues reported across 10+ PRs in one shot. Reranking is faster
