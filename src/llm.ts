@@ -763,7 +763,7 @@ export class LlamaCpp implements LLM {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
-      const n = await this.computeParallelism(1000);
+      const n = Math.min(await this.computeParallelism(1000), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
@@ -1057,6 +1057,7 @@ export class LlamaCpp implements LLM {
 
   // Qwen3 reranker chat template overhead (system prompt, tags, separators)
   private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+  private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
     query: string,
@@ -1073,34 +1074,58 @@ export class LlamaCpp implements LLM {
     // Budget = contextSize - template overhead - query tokens
     const queryTokens = model.tokenize(query).length;
     const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
+      const cached = truncationCache.get(doc.text);
+      if (cached !== undefined) {
+        return cached === doc.text ? doc : { ...doc, text: cached };
+      }
+
       const tokens = model.tokenize(doc.text);
-      if (tokens.length <= maxDocTokens) return doc;
-      const truncatedText = model.detokenize(tokens.slice(0, maxDocTokens));
+      const truncatedText = tokens.length <= maxDocTokens
+        ? doc.text
+        : model.detokenize(tokens.slice(0, maxDocTokens));
+      truncationCache.set(doc.text, truncatedText);
+
+      if (truncatedText === doc.text) return doc;
       return { ...doc, text: truncatedText };
     });
 
-    // Build a map from document text to original indices (for lookup after sorting)
-    const textToDoc = new Map<string, { file: string; index: number }>();
+    // Deduplicate identical effective texts before scoring.
+    // This avoids redundant work for repeated chunks and fixes collisions where
+    // multiple docs map to the same chunk text.
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
     truncatedDocs.forEach((doc, index) => {
-      textToDoc.set(doc.text, { file: doc.file, index });
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index }]);
+      }
     });
 
     // Extract just the text for ranking
-    const texts = truncatedDocs.map((doc) => doc.text);
+    const texts = Array.from(textToDocs.keys());
 
     // Split documents across contexts for parallel evaluation.
     // Each context has its own sequence with a lock, so parallelism comes
     // from multiple contexts evaluating different chunks simultaneously.
-    const n = contexts.length;
-    const chunkSize = Math.ceil(texts.length / n);
-    const chunks = Array.from({ length: n }, (_, i) =>
+    const activeContextCount = Math.max(
+      1,
+      Math.min(
+        contexts.length,
+        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+      )
+    );
+    const activeContexts = contexts.slice(0, activeContextCount);
+    const chunkSize = Math.ceil(texts.length / activeContexts.length);
+    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
       texts.slice(i * chunkSize, (i + 1) * chunkSize)
     ).filter(chunk => chunk.length > 0);
 
     const allScores = await Promise.all(
-      chunks.map((chunk, i) => contexts[i]!.rankAll(query, chunk))
+      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
     );
 
     // Reassemble scores in original order and sort
@@ -1109,15 +1134,18 @@ export class LlamaCpp implements LLM {
       .map((text, i) => ({ document: text, score: flatScores[i]! }))
       .sort((a, b) => b.score - a.score);
 
-    // Map back to our result format using the text-to-doc map
-    const results: RerankDocumentResult[] = ranked.map((item) => {
-      const docInfo = textToDoc.get(item.document)!;
-      return {
-        file: docInfo.file,
-        score: item.score,
-        index: docInfo.index,
-      };
-    });
+    // Map back to our result format.
+    const results: RerankDocumentResult[] = [];
+    for (const item of ranked) {
+      const docInfos = textToDocs.get(item.document) ?? [];
+      for (const docInfo of docInfos) {
+        results.push({
+          file: docInfo.file,
+          score: item.score,
+          index: docInfo.index,
+        });
+      }
+    }
 
     return {
       results,

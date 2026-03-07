@@ -117,6 +117,37 @@ describe("LlamaCpp expand context size config", () => {
   });
 });
 
+describe("LlamaCpp rerank deduping", () => {
+  test("deduplicates identical document texts before scoring", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const rankAll = vi.fn(async (_query: string, docs: string[]) =>
+      docs.map((doc) => doc === "shared chunk" ? 0.9 : 0.2)
+    );
+
+    llm.touchActivity = vi.fn();
+    llm.ensureRerankContexts = vi.fn().mockResolvedValue([{ rankAll }]);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+    });
+
+    const result = await llm.rerank("query", [
+      { file: "a.md", text: "shared chunk" },
+      { file: "b.md", text: "shared chunk" },
+      { file: "c.md", text: "different chunk" },
+    ]);
+
+    expect(rankAll).toHaveBeenCalledTimes(1);
+    expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
+    expect(result.results).toHaveLength(3);
+
+    const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
+    expect(scoreByFile.get("a.md")).toBe(0.9);
+    expect(scoreByFile.get("b.md")).toBe(0.9);
+    expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
 // =============================================================================
 // Integration Tests (require actual models)
 // =============================================================================
@@ -426,6 +457,34 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
       // Log timing for monitoring batch performance
       console.log(`Batch rerank of 10 docs took ${elapsed}ms`);
+    });
+
+    test("uses fewer active rerank contexts for small batches", async () => {
+      const freshLlm = new LlamaCpp({});
+      const calls: number[] = [];
+      const fakeModel = {
+        tokenize: (text: string) => Array.from(text),
+        detokenize: (tokens: string[]) => tokens.join(""),
+      };
+      const fakeContexts = Array.from({ length: 4 }, (_, idx) => ({
+        rankAll: async (_query: string, docs: string[]) => {
+          calls.push(idx);
+          return docs.map(() => 0.5);
+        },
+      }));
+
+      (freshLlm as any).ensureRerankModel = async () => fakeModel;
+      (freshLlm as any).ensureRerankContexts = async () => fakeContexts;
+
+      const documents: RerankDocument[] = Array.from({ length: 20 }, (_, i) => ({
+        file: `doc${i}.md`,
+        text: `Document number ${i}`,
+      }));
+
+      const result = await freshLlm.rerank("topic 1", documents);
+
+      expect(result.results).toHaveLength(20);
+      expect(calls).toEqual([0, 1]);
     });
 
     test("truncates and reranks document exceeding 2048 token context size", async () => {

@@ -13,6 +13,7 @@ import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
+import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
@@ -2426,6 +2427,40 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(results).toHaveLength(1);
 
     await cleanupTestDb(store);
+  });
+
+  test("rerank deduplicates identical chunks across files", async () => {
+    const store = await createTestStore();
+    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
+      results: docs.map((doc, index) => ({
+        file: doc.file,
+        score: 1 - index * 0.1,
+        index,
+      })),
+      model: "mock-reranker",
+    }));
+
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+      rerank: rerankSpy,
+    } as any);
+
+    try {
+      const docs = [
+        { file: "doc1.md", text: "Shared chunk text" },
+        { file: "doc2.md", text: "Shared chunk text" },
+      ];
+
+      const first = await store.rerank("shared", docs);
+      const second = await store.rerank("shared", docs);
+
+      expect(first).toHaveLength(2);
+      expect(second).toHaveLength(2);
+      expect(rerankSpy).toHaveBeenCalledTimes(1);
+      expect(rerankSpy.mock.calls[0]?.[1]).toEqual([{ file: "doc2.md", text: "Shared chunk text" }]);
+    } finally {
+      llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
   });
 });
 
