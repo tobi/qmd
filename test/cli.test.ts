@@ -395,6 +395,43 @@ describe("CLI Update Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
   });
+
+  test("deactivates stale docs when collection has zero matching files", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-empty");
+    const collectionDir = join(testDir, `update-empty-${Date.now()}`);
+    await mkdir(collectionDir, { recursive: true });
+
+    const docPath = join(collectionDir, "only.md");
+    const token = `stale-proof-${Date.now()}`;
+    await writeFile(
+      docPath,
+      `---
+date: 2026-03-06
+---
+# Empty Collection Deactivation
+${token}
+`
+    );
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "empty-check"],
+      { dbPath, configDir }
+    );
+    expect(add.exitCode).toBe(0);
+
+    const before = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
+    expect(before.exitCode).toBe(0);
+    expect(before.stdout).toContain(token);
+
+    unlinkSync(docPath);
+
+    const update = await runQmd(["update"], { dbPath, configDir });
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).toContain("No files found matching pattern.");
+
+    const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
+    expect(after.exitCode).toBe(1);
+  });
 });
 
 describe("CLI Add-Context Command", () => {
