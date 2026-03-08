@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-03-07
+
+Ambiguous queries like "performance" now produce dramatically better results
+when the caller knows what they mean. The new `intent` parameter steers all
+five pipeline stages — expansion, strong-signal bypass, chunk selection,
+reranking, and snippet extraction — without searching on its own.
+
+### Changes
+
+- **Intent parameter**: optional `intent` string disambiguates queries across
+  the entire search pipeline. Available via CLI (`--intent` flag or `intent:`
+  line in query documents), MCP (`intent` field on the query tool), and
+  programmatic API. Adapted from PR #180 (thanks @vyalamar).
+- **Query expansion**: when intent is provided, the expansion LLM prompt
+  includes `Query intent: {intent}`, matching the finetune training data
+  format for better-aligned expansions.
+- **Reranking**: intent is prepended to the rerank query so Qwen3-Reranker
+  scores with domain context.
+- **Chunk selection**: intent terms scored at 0.5× weight alongside query
+  terms (1.0×) when selecting the best chunk per document for reranking.
+- **Snippet extraction**: intent terms scored at 0.3× weight to nudge
+  snippets toward intent-relevant lines without overriding query anchoring.
+- **Strong-signal bypass disabled with intent**: when intent is provided, the
+  BM25 strong-signal shortcut is skipped — the obvious keyword match may not
+  be what the caller wants.
+- **MCP instructions**: callers are now guided to provide `intent` on every
+  search call for disambiguation.
+- **Query document syntax**: `intent:` recognized as a line type. At most one
+  per document, cannot appear alone. Grammar updated in `docs/SYNTAX.md`.
+
 ## [1.1.2] - 2026-03-07
 
 13 community PRs merged. GPU initialization replaced with node-llama-cpp's
