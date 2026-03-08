@@ -591,6 +591,33 @@ describe("CLI Output Formats", () => {
       expect(stdout.toLowerCase()).toContain("api");
     }
   });
+
+  test("search matches snake_case identifiers", async () => {
+    const env = await createIsolatedTestEnv("snake-case");
+    const fixtureDir = join(testDir, "snake-case-fixture");
+    await mkdir(fixtureDir, { recursive: true });
+    await writeFile(
+      join(fixtureDir, "sample.md"),
+      "# Sample\n\nFunction name: atomic_write_json\n\nAnother identifier: parse_http_response\n"
+    );
+
+    const add = await runQmd(["collection", "add", fixtureDir, "--name", "snake-case"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(add.exitCode).toBe(0);
+
+    const result = await runQmd(["search", "atomic_write_json", "--json"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(result.exitCode).toBe(0);
+
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].file).toContain("sample.md");
+    expect(parsed[0].snippet).toContain("atomic_write_json");
+  });
 });
 
 describe("CLI Search with Collection Filter", () => {

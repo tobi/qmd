@@ -1720,8 +1720,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
-  // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
-  return term.replace(/[^\w']/g, '').trim();
+  // Replace punctuation with spaces so snake_case and similar identifiers
+  // are tokenized the same way as the FTS5 unicode61 index.
+  return term.replace(/[^\p{L}\p{N}']/gu, ' ').toLowerCase().trim();
 }
 
 // Build FTS5 query: phrase-aware with fallback to individual terms

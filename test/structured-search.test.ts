@@ -396,7 +396,7 @@ describe("lex query syntax", () => {
 describe("buildFTS5Query (lex parser)", () => {
   // Mirror the function for unit testing
   function sanitizeFTS5Term(term: string): string {
-    return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+    return term.replace(/[^\p{L}\p{N}']/gu, ' ').toLowerCase().trim();
   }
 
   function buildFTS5Query(query: string): string | null {
@@ -485,7 +485,11 @@ describe("buildFTS5Query (lex parser)", () => {
     expect(buildFTS5Query("   ")).toBeNull();
   });
 
-  test("special chars in terms stripped", () => {
-    expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+  test("special chars in terms are preserved as tokenized phrase prefixes", () => {
+    expect(buildFTS5Query("hello!world")).toBe('"hello world"*');
+  });
+
+  test("snake_case identifiers are split into searchable terms", () => {
+    expect(buildFTS5Query("atomic_write_json")).toBe('"atomic write json"*');
   });
 });
