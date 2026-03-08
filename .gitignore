@@ -14,7 +14,12 @@ texts/
 !CHANGELOG.md
 !skills/**/*.md
 !finetune/*.md
+!finetune-mlx/*.md
 !docs/*.md
 finetune/outputs/
 finetune/data/train/
+
+# finetune-mlx artifacts (local runs)
+finetune-mlx/*.nohup.log
+finetune-mlx/eval_results.json
 .claude/

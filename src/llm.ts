@@ -318,6 +318,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -1224,6 +1229,416 @@ export class LlamaCpp implements LLM {
 }
 
 // =============================================================================
+// MLX Backend Implementation
+// =============================================================================
+
+import { spawn, type ChildProcess } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+// Get the directory of this module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+/**
+ * MLX backend configuration
+ */
+export type LlamaMlxConfig = {
+  pythonPath?: string;  // Path to Python executable (default: python3)
+  backendScript?: string;  // Path to mlx_backend.py (default: auto-detect)
+  maxRetries?: number;  // Max restart attempts (default: 3)
+  initTimeoutMs?: number;  // Initialization timeout (default: 60s)
+};
+
+/**
+ * JSON command sent to MLX backend
+ */
+interface MLXCommand {
+  command: string;
+  [key: string]: any;
+}
+
+/**
+ * JSON response from MLX backend
+ */
+interface MLXResponse {
+  success: boolean;
+  error?: string;
+  [key: string]: any;
+}
+
+/**
+ * LLM implementation using MLX Python backend
+ * 
+ * Spawns a Python subprocess running mlx_backend.py and communicates via JSON over stdin/stdout.
+ * Provides the same interface as LlamaCpp but uses Apple Silicon-optimized MLX models.
+ */
+export class LlamaMlx implements LLM {
+  private process: ChildProcess | null = null;
+  private pythonPath: string;
+  private backendScript: string;
+  private maxRetries: number;
+  private initTimeoutMs: number;
+  private initialized = false;
+  private disposed = false;
+  private pendingRequests = new Map<number, {
+    resolve: (value: any) => void;
+    reject: (error: any) => void;
+  }>();
+  private requestId = 0;
+  private responseBuffer = "";
+  private retryCount = 0;
+
+  constructor(config: LlamaMlxConfig = {}) {
+    // Auto-detect backend script location (relative to this file)
+    // When built (dist/llm.js), __dirname is dist/, so go up one level to project root
+    // When in dev (src/llm.ts), __dirname is src/, also go up one level
+      const projectRoot = join(__dirname, "..");
+    // Auto-detect Python: prefer venv in project root, then system python3
+    if (config.pythonPath) {
+      this.pythonPath = config.pythonPath;
+    } else {
+      const venvPython = join(projectRoot, "venv", "bin", "python3");
+      this.pythonPath = existsSync(venvPython) ? venvPython : "python3";
+    }
+    if (config.backendScript) {
+      this.backendScript = config.backendScript;
+    } else {
+      this.backendScript = join(projectRoot, "mlx_backend.py");
+    }
+    
+    this.maxRetries = config.maxRetries ?? 3;
+    this.initTimeoutMs = config.initTimeoutMs ?? 60000;  // 60s for model download
+  }
+
+  /**
+   * Start the Python backend subprocess
+   */
+  private async startBackend(): Promise<void> {
+    if (this.disposed) {
+      throw new Error("LlamaMlx has been disposed");
+    }
+
+    // Check if backend script exists
+    if (!existsSync(this.backendScript)) {
+      throw new Error(
+        `MLX backend script not found at: ${this.backendScript}\n` +
+        `Make sure mlx_backend.py is in the project root and Python dependencies are installed.\n` +
+        `Run: pip install -r requirements.txt`
+      );
+    }
+
+    // Spawn Python process
+    this.process = spawn(this.pythonPath, [this.backendScript], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // Handle stdout (JSON responses)
+    this.process.stdout?.on("data", (data: Buffer) => {
+      this.responseBuffer += data.toString();
+      this.processResponses();
+    });
+
+    // Handle stderr (logs)
+    this.process.stderr?.on("data", (data: Buffer) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.error(`[MLX Backend] ${msg}`);
+      }
+    });
+
+    // Handle process exit
+    this.process.on("exit", (code, signal) => {
+      console.error(`[MLX Backend] Process exited with code ${code}, signal ${signal}`);
+      this.handleBackendCrash();
+    });
+
+    // Handle process errors
+    this.process.on("error", (err) => {
+      console.error(`[MLX Backend] Process error:`, err);
+      this.handleBackendCrash();
+    });
+
+    // Wait for ready signal
+    await this.waitForReady();
+  }
+
+  /**
+   * Wait for the backend to send {"ready": true}
+   */
+  private async waitForReady(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(
+          `MLX backend failed to initialize within ${this.initTimeoutMs}ms.\n` +
+          `This could mean:\n` +
+          `1. Python dependencies not installed (run: pip install -r requirements.txt)\n` +
+          `2. Not on Apple Silicon (MLX only works on M1/M2/M3/M4)\n` +
+          `3. Models are downloading (first run can take time)\n` +
+          `Check stderr for details.`
+        ));
+      }, this.initTimeoutMs);
+
+      const checkReady = (data: Buffer) => {
+        const text = data.toString().trim();
+        if (text.includes('"ready"')) {
+          clearTimeout(timeout);
+          this.process?.stdout?.off("data", checkReady);
+          resolve();
+        }
+      };
+
+      this.process?.stdout?.on("data", checkReady);
+    });
+  }
+
+  /**
+   * Process buffered JSON responses
+   */
+  private processResponses(): void {
+    const lines = this.responseBuffer.split("\n");
+    this.responseBuffer = lines.pop() || "";  // Keep incomplete line in buffer
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      
+      try {
+        const response: MLXResponse = JSON.parse(line);
+        
+        // Handle ready signal (already processed in waitForReady)
+        if ("ready" in response) continue;
+        
+        // Find pending request (if any - we're not using request IDs yet, just FIFO)
+        const pending = Array.from(this.pendingRequests.values())[0];
+        if (pending) {
+          const requestId = Array.from(this.pendingRequests.keys())[0];
+          this.pendingRequests.delete(requestId!);
+          
+          if (response.success) {
+            pending.resolve(response);
+          } else {
+            pending.reject(new Error(response.error || "Unknown MLX backend error"));
+          }
+        }
+      } catch (err) {
+        console.error("[MLX Backend] Failed to parse response:", line, err);
+      }
+    }
+  }
+
+  /**
+   * Send a command to the backend and wait for response
+   */
+  private async sendCommand(command: MLXCommand): Promise<MLXResponse> {
+    if (!this.process || this.disposed) {
+      throw new Error("MLX backend not running");
+    }
+
+    return new Promise((resolve, reject) => {
+      const id = this.requestId++;
+      this.pendingRequests.set(id, { resolve, reject });
+
+      // Send command
+      const json = JSON.stringify(command) + "\n";
+      this.process!.stdin?.write(json, (err) => {
+        if (err) {
+          this.pendingRequests.delete(id);
+          reject(new Error(`Failed to send command to MLX backend: ${err.message}`));
+        }
+      });
+
+      // Timeout after 30s
+      setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          reject(new Error(`MLX backend command timeout: ${command.command}`));
+        }
+      }, 30000);
+    });
+  }
+
+  /**
+   * Handle backend crash - try to restart if retries available
+   */
+  private handleBackendCrash(): void {
+    // Reject all pending requests
+    for (const [id, { reject }] of this.pendingRequests.entries()) {
+      reject(new Error("MLX backend crashed"));
+      this.pendingRequests.delete(id);
+    }
+
+    this.initialized = false;
+    this.process = null;
+
+    // Try to restart if retries available
+    if (this.retryCount < this.maxRetries && !this.disposed) {
+      this.retryCount++;
+      console.error(`[MLX Backend] Attempting restart (${this.retryCount}/${this.maxRetries})...`);
+      this.startBackend().catch(err => {
+        console.error(`[MLX Backend] Restart failed:`, err);
+      });
+    }
+  }
+
+  /**
+   * Ensure backend is initialized
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+
+    // Start backend if not running
+    if (!this.process) {
+      await this.startBackend();
+    }
+
+    // Initialize models
+    const response = await this.sendCommand({ command: "initialize" });
+    if (!response.success) {
+      throw new Error(`Failed to initialize MLX backend: ${response.error}`);
+    }
+
+    this.initialized = true;
+    console.error("[MLX Backend] Initialized with models:", response.models);
+  }
+
+  // ==========================================================================
+  // LLM Interface Implementation
+  // ==========================================================================
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    await this.ensureInitialized();
+
+    const response = await this.sendCommand({
+      command: "embed",
+      text,
+      isQuery: options.isQuery ?? false,
+      title: options.title,
+    });
+
+    if (!response.success || !response.embedding) {
+      console.error("[MLX Backend] Embed failed:", response.error);
+      return null;
+    }
+
+    return {
+      embedding: response.embedding,
+      model: response.model,
+    };
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    
+    await this.ensureInitialized();
+
+    // For now, we'll batch all at once. Could implement chunking for large batches.
+    const response = await this.sendCommand({
+      command: "embedBatch",
+      texts,
+      isQuery: false,
+    });
+
+    if (!response.success || !response.embeddings) {
+      console.error("[MLX Backend] EmbedBatch failed:", response.error);
+      return texts.map(() => null);
+    }
+
+    return response.embeddings.map((embedding: number[]) => ({
+      embedding,
+      model: response.model,
+    }));
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    // Not implemented yet - could add to backend if needed
+    console.warn("[MLX Backend] generate() not implemented, using expandQuery instead");
+    return null;
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean } = {}
+  ): Promise<Queryable[]> {
+    await this.ensureInitialized();
+
+    const response = await this.sendCommand({
+      command: "expandQuery",
+      query,
+      context: options.context,
+      includeLexical: options.includeLexical ?? true,
+    });
+
+    if (!response.success || !response.queryables) {
+      console.error("[MLX Backend] ExpandQuery failed:", response.error);
+      // Fallback
+      return [{ type: "vec", text: query }];
+    }
+
+    return response.queryables;
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    await this.ensureInitialized();
+
+    const response = await this.sendCommand({
+      command: "rerank",
+      query,
+      documents,
+    });
+
+    if (!response.success || !response.results) {
+      throw new Error(`MLX rerank failed: ${response.error}`);
+    }
+
+    return {
+      results: response.results,
+      model: response.model,
+    };
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    // MLX models are handled by Python backend
+    return {
+      name: model,
+      exists: true,  // Assume models exist (will fail gracefully on init if not)
+    };
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+
+    // Send shutdown command
+    if (this.process && this.initialized) {
+      try {
+        await Promise.race([
+          this.sendCommand({ command: "shutdown" }),
+          new Promise(resolve => setTimeout(resolve, 1000)),  // 1s timeout
+        ]);
+      } catch (err) {
+        // Ignore errors during shutdown
+      }
+    }
+
+    // Kill process
+    if (this.process) {
+      this.process.kill();
+      this.process = null;
+    }
+
+    // Reject all pending requests
+    for (const { reject } of this.pendingRequests.values()) {
+      reject(new Error("LlamaMlx disposed"));
+    }
+    this.pendingRequests.clear();
+  }
+}
+
+// =============================================================================
 // Session Management Layer
 // =============================================================================
 
@@ -1232,11 +1647,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1272,7 +1687,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1375,18 +1790,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1394,7 +1809,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
@@ -1402,11 +1817,11 @@ class LLMSession implements ILLMSession {
 let defaultSessionManager: LLMSessionManager | null = null;
 
 /**
- * Get the session manager for the default LlamaCpp instance.
+ * Get the session manager for the default LLM instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1450,15 +1865,93 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Platform Detection and Backend Selection
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+/**
+ * Detect if running on Apple Silicon
+ */
+function isAppleSilicon(): boolean {
+  return process.platform === "darwin" && process.arch === "arm64";
+}
+
+/**
+ * Backend type to use
+ */
+export type BackendType = "mlx" | "gguf" | "auto";
+
+let backendPreference: BackendType = "auto";
+
+/**
+ * Set backend preference
+ */
+export function setBackendPreference(backend: BackendType): void {
+  backendPreference = backend;
+  // Clear existing instance to force recreation with new backend
+  defaultLlm = null;
+}
+
+/**
+ * Get backend preference
+ */
+export function getBackendPreference(): BackendType {
+  return backendPreference;
+}
+
+/**
+ * Determine which backend to use based on platform and preference
+ */
+function selectBackend(): "mlx" | "gguf" {
+  if (backendPreference === "mlx") return "mlx";
+  if (backendPreference === "gguf") return "gguf";
+  
+  // Auto-detect: use MLX on Apple Silicon, GGUF elsewhere
+  return isAppleSilicon() ? "mlx" : "gguf";
+}
+
+// =============================================================================
+// Singleton for default LLM instance
+// =============================================================================
+
+let defaultLlm: LLM | null = null;
+let defaultLlamaCpp: LlamaCpp | null = null;  // Keep for backwards compatibility
+
+/**
+ * Get the default LLM instance (creates one if needed)
+ * Automatically selects MLX on Apple Silicon, GGUF elsewhere
+ */
+export function getDefaultLLM(): LLM {
+  if (!defaultLlm) {
+    const backend = selectBackend();
+    
+    if (backend === "mlx") {
+      try {
+        defaultLlm = new LlamaMlx();
+        console.error("[QMD] Using MLX backend (Apple Silicon detected)");
+      } catch (err) {
+        console.error("[QMD] MLX backend failed to initialize, falling back to GGUF:", err);
+        defaultLlm = new LlamaCpp();
+      }
+    } else {
+      defaultLlm = new LlamaCpp();
+      console.error("[QMD] Using GGUF backend (node-llama-cpp)");
+    }
+  }
+  
+  return defaultLlm;
+}
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
+ * @deprecated Use getDefaultLLM() instead for automatic backend selection
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
+  // Try to return existing LlamaCpp instance if it exists
+  if (defaultLlm instanceof LlamaCpp) {
+    return defaultLlm;
+  }
+  
+  // Create new instance if needed
   if (!defaultLlamaCpp) {
     const embedModel = process.env.QMD_EMBED_MODEL;
     defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
@@ -1471,15 +1964,35 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+  defaultLlm = llm;
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
- * Call this before process exit to prevent NAPI crashes.
+ * Set a custom default LLM instance (useful for testing)
  */
-export async function disposeDefaultLlamaCpp(): Promise<void> {
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLlm = llm;
+}
+
+/**
+ * Dispose the default LLM instance if it exists.
+ * Call this before process exit to prevent crashes.
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultLlm) {
+    await defaultLlm.dispose();
+    defaultLlm = null;
+  }
   if (defaultLlamaCpp) {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+/**
+ * Dispose the default LlamaCpp instance if it exists.
+ * @deprecated Use disposeDefaultLLM() instead
+ */
+export async function disposeDefaultLlamaCpp(): Promise<void> {
+  await disposeDefaultLLM();
 }

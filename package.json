@@ -29,11 +29,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
+    "url": "git+https://github.com/ComputelessComputer/qmd-mlx.git"
   },
-  "homepage": "https://github.com/tobi/qmd#readme",
+  "homepage": "https://github.com/ComputelessComputer/qmd-mlx#readme",
   "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "url": "https://github.com/ComputelessComputer/qmd-mlx/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",

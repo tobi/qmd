@@ -1,0 +1,10 @@
+# MLX framework and related packages for Apple Silicon
+mlx>=0.25.0
+mlx-lm>=0.26.0
+mlx-embeddings>=0.0.5
+
+# HuggingFace Hub for model downloads
+huggingface-hub>=0.26.0
+
+# Utilities
+numpy>=1.24.0
