@@ -7,7 +7,8 @@
 Ambiguous queries like "performance" now produce dramatically better results
 when the caller knows what they mean. The new `intent` parameter steers all
 five pipeline stages — expansion, strong-signal bypass, chunk selection,
-reranking, and snippet extraction — without searching on its own.
+reranking, and snippet extraction — without searching on its own. Design and
+original implementation by Ilya Grigorik (@vyalamar) in #180.
 
 ### Changes
 
