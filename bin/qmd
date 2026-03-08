@@ -1,0 +1,7 @@
+#!/bin/sh
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$DIR/dist/qmd.js" "$@"
+else
+  exec node "$DIR/dist/qmd.js" "$@"
+fi
