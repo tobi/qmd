@@ -137,6 +137,81 @@ LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
+### SDK / Library Usage
+
+Use QMD as a library in your own Node.js or Bun applications:
+
+```sh
+npm install @tobilu/qmd
+```
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+// Create a store with inline config (no config file needed)
+const store = createStore({
+  dbPath: './my-index.sqlite',
+  config: {
+    collections: {
+      docs: { path: '/path/to/docs', pattern: '**/*.md' },
+      notes: { path: '/path/to/notes', pattern: '**/*.md' },
+    },
+  },
+})
+
+// Or reference a YAML config file
+const store2 = createStore({
+  dbPath: './my-index.sqlite',
+  configPath: './qmd.yml',
+})
+```
+
+**Search & retrieval:**
+
+```typescript
+// Hybrid search: BM25 + vector + query expansion + LLM reranking (best quality)
+const results = await store.query("authentication flow", { limit: 5 })
+
+// Fast BM25 keyword search (no LLM, synchronous)
+const keywords = store.search("auth middleware", { limit: 10 })
+
+// Structured search with pre-expanded queries (for LLM callers)
+const structured = await store.structuredSearch([
+  { type: 'lex', query: 'authentication' },
+  { type: 'vec', query: 'how users log in' },
+], { limit: 5 })
+
+// Get a document by path or docid
+const doc = store.get("docs/readme.md")
+const byId = store.get("#abc123")
+
+// Get multiple documents by glob
+const { docs, errors } = store.multiGet("docs/**/*.md")
+```
+
+**Collection & context management:**
+
+```typescript
+// Add a collection
+store.addCollection("myapp", { path: "/src/myapp", pattern: "**/*.ts" })
+
+// Add context (improves search relevance)
+store.addContext("myapp", "/auth", "Authentication and session management")
+store.setGlobalContext("Internal engineering documentation")
+
+// List everything
+store.listCollections()
+store.listContexts()
+```
+
+**Lifecycle:**
+
+```typescript
+store.close()
+```
+
+The SDK requires explicit `dbPath` and config — no defaults are assumed. This makes it safe to embed in any application without side effects.
+
 ## Architecture
 
 ```

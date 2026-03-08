@@ -6,7 +6,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
 
@@ -54,6 +54,33 @@ export interface NamedCollection extends Collection {
 
 // Current index name (default: "index")
 let currentIndexName: string = "index";
+
+// SDK mode: optional in-memory config or custom config path
+let configSource: { type: 'file'; path?: string } | { type: 'inline'; config: CollectionConfig } = { type: 'file' };
+
+/**
+ * Set the config source for SDK mode.
+ * - File path: load/save from a specific YAML file
+ * - Inline config: use an in-memory CollectionConfig (saveConfig updates in place, no file I/O)
+ * - undefined: reset to default file-based config
+ */
+export function setConfigSource(source?: { configPath?: string; config?: CollectionConfig }): void {
+  if (!source) {
+    configSource = { type: 'file' };
+    return;
+  }
+  if (source.config) {
+    // Ensure collections object exists
+    if (!source.config.collections) {
+      source.config.collections = {};
+    }
+    configSource = { type: 'inline', config: source.config };
+  } else if (source.configPath) {
+    configSource = { type: 'file', path: source.configPath };
+  } else {
+    configSource = { type: 'file' };
+  }
+}
 
 /**
  * Set the current index name for config file lookup
@@ -103,11 +130,19 @@ function ensureConfigDir(): void {
 // ============================================================================
 
 /**
- * Load configuration from ~/.config/qmd/index.yml
+ * Load configuration from the configured source.
+ * - Inline config: returns the in-memory object directly
+ * - File-based: reads from YAML file (default ~/.config/qmd/index.yml)
  * Returns empty config if file doesn't exist
  */
 export function loadConfig(): CollectionConfig {
-  const configPath = getConfigFilePath();
+  // SDK inline config mode
+  if (configSource.type === 'inline') {
+    return configSource.config;
+  }
+
+  // File-based config (SDK custom path or default)
+  const configPath = configSource.path || getConfigFilePath();
   if (!existsSync(configPath)) {
     return { collections: {} };
   }
@@ -128,11 +163,22 @@ export function loadConfig(): CollectionConfig {
 }
 
 /**
- * Save configuration to ~/.config/qmd/index.yml
+ * Save configuration to the configured source.
+ * - Inline config: updates the in-memory object (no file I/O)
+ * - File-based: writes to YAML file (default ~/.config/qmd/index.yml)
  */
 export function saveConfig(config: CollectionConfig): void {
-  ensureConfigDir();
-  const configPath = getConfigFilePath();
+  // SDK inline config mode: update in place, no file I/O
+  if (configSource.type === 'inline') {
+    configSource.config = config;
+    return;
+  }
+
+  const configPath = configSource.path || getConfigFilePath();
+  const configDir = dirname(configPath);
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true });
+  }
 
   try {
     const yaml = YAML.stringify(config, {
@@ -431,14 +477,17 @@ export function findContextForPath(
  * Get the config file path (useful for error messages)
  */
 export function getConfigPath(): string {
-  return getConfigFilePath();
+  if (configSource.type === 'inline') return '<inline>';
+  return configSource.path || getConfigFilePath();
 }
 
 /**
  * Check if config file exists
  */
 export function configExists(): boolean {
-  return existsSync(getConfigFilePath());
+  if (configSource.type === 'inline') return true;
+  const path = configSource.path || getConfigFilePath();
+  return existsSync(path);
 }
 
 /**
