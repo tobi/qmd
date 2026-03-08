@@ -1346,11 +1346,11 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; modified_at: string | null } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, modified_at FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; modified_at: string | null } | undefined;
   return row ?? null;
 }
 
