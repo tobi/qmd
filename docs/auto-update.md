@@ -11,13 +11,6 @@ To automate this, schedule both commands to run periodically.
 
 ## macOS (launchd)
 
-launchd runs with a minimal PATH, so use the full path to `qmd`. Find it with:
-
-```sh
-which qmd
-# e.g. /Users/yourname/.bun/bin/qmd  or  /Users/yourname/.nvm/versions/node/v22.0.0/bin/qmd
-```
-
 ```xml
 <!-- ~/Library/LaunchAgents/com.yourname.qmd-sync.plist -->
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,7 +23,7 @@ which qmd
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>/path/to/qmd update &amp;&amp; /path/to/qmd embed</string>
+        <string>qmd update &amp;&amp; qmd embed</string>
     </array>
     <key>StartInterval</key>
     <integer>14400</integer>
@@ -48,10 +41,8 @@ launchctl load ~/Library/LaunchAgents/com.yourname.qmd-sync.plist
 
 ## Linux (cron)
 
-Cron also runs with a minimal PATH. Use the full path to `qmd`:
-
 ```sh
 crontab -e
-# add (replace /path/to/qmd with output of `which qmd`):
-0 */4 * * * /path/to/qmd update && /path/to/qmd embed >> /tmp/qmd-sync.log 2>&1
+# add:
+0 */4 * * * qmd update && qmd embed >> /tmp/qmd-sync.log 2>&1
 ```
