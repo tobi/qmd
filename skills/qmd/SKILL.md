@@ -60,6 +60,21 @@ Local search engine for markdown content.
 - Lets the local LLM generate lex/vec/hyde variations
 - Do not mix `expand:` with other typed lines — it's either a standalone expand query or a full query document
 
+### Intent (Disambiguation)
+
+When a query term is ambiguous, add `intent` to steer results:
+
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "performance" }
+  ],
+  "intent": "web page load times and Core Web Vitals"
+}
+```
+
+Intent affects expansion, reranking, chunk selection, and snippet extraction. It does not search on its own — it's a steering signal that disambiguates queries like "performance" (web-perf vs team health vs fitness).
+
 ### Combining Types
 
 | Goal | Approach |
@@ -68,6 +83,7 @@ Local search engine for markdown content.
 | Don't know vocabulary | Use a single-line query (implicit `expand:`) or `vec` |
 | Best recall | `lex` + `vec` |
 | Complex topic | `lex` + `vec` + `hyde` |
+| Ambiguous query | Add `intent` to any combination above |
 
 First query gets 2x weight in fusion — put your best guess first.
 
@@ -104,6 +120,7 @@ Omit to search all collections.
 qmd query "question"              # Auto-expand + rerank
 qmd query $'lex: X\nvec: Y'       # Structured
 qmd query $'expand: question'     # Explicit expand
+qmd query --json --explain "q"    # Show score traces (RRF + rerank blend)
 qmd search "keywords"             # BM25 only (no LLM)
 qmd get "#abc123"                 # By docid
 qmd multi-get "journals/2026-*.md" -l 40  # Batch pull snippets by glob

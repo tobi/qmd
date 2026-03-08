@@ -809,8 +809,8 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -892,8 +892,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -958,16 +958,26 @@ export function getDocid(hash: string): string {
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
  */
+/** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
+function emojiToHex(str: string): string {
+  return str.replace(/(?:\p{So}\p{Mn}?|\p{Sk})+/gu, (run) => {
+    // Split the run into individual emoji and convert each to hex, dash-separated
+    return [...run].filter(c => /\p{So}|\p{Sk}/u.test(c))
+      .map(c => c.codePointAt(0)!.toString(16)).join('-');
+  });
+}
+
 export function handelize(path: string): string {
   if (!path || path.trim() === '') {
     throw new Error('handelize: path cannot be empty');
   }
 
   // Allow route-style "$" filenames while still rejecting paths with no usable content.
+  // Emoji (\p{So}) counts as valid content — they get converted to hex codepoints below.
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}$]/u.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}\p{So}\p{Sk}$]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
@@ -978,6 +988,9 @@ export function handelize(path: string): string {
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
+
+      // Convert emoji to hex codepoints before cleaning
+      segment = emojiToHex(segment);
 
       if (isLastSegment) {
         // For the filename (last segment), preserve the extension
@@ -1025,6 +1038,41 @@ export type RankedResult = {
   title: string;
   body: string;
   score: number;
+};
+
+export type RRFContributionTrace = {
+  listIndex: number;
+  source: "fts" | "vec";
+  queryType: "original" | "lex" | "vec" | "hyde";
+  query: string;
+  rank: number;            // 1-indexed rank within list
+  weight: number;
+  backendScore: number;    // Backend-normalized score before fusion
+  rrfContribution: number; // weight / (k + rank)
+};
+
+export type RRFScoreTrace = {
+  contributions: RRFContributionTrace[];
+  baseScore: number;       // Sum of reciprocal-rank contributions
+  topRank: number;         // Best (lowest) rank seen across lists
+  topRankBonus: number;    // +0.05 for rank 1, +0.02 for rank 2-3
+  totalScore: number;      // baseScore + topRankBonus
+};
+
+export type HybridQueryExplain = {
+  ftsScores: number[];
+  vectorScores: number[];
+  rrf: {
+    rank: number;          // Rank after RRF fusion (1-indexed)
+    positionScore: number; // 1 / rank used in position-aware blending
+    weight: number;        // Position-aware RRF weight (0.75 / 0.60 / 0.40)
+    baseScore: number;
+    topRankBonus: number;
+    totalScore: number;
+    contributions: RRFContributionTrace[];
+  };
+  rerankScore: number;
+  blendedScore: number;
 };
 
 /**
@@ -2242,7 +2290,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
@@ -2298,9 +2346,9 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2312,7 +2360,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2331,40 +2379,48 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+  // Prepend intent to rerank query so the reranker scores with domain context
+  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
   const cachedResults: Map<string, number> = new Map();
-  const uncachedDocs: RerankDocument[] = [];
+  const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
 
   // Check cache for each document
   // Cache key includes chunk text — different queries can select different chunks
   // from the same file, and the reranker score depends on which chunk was sent.
+  // File path is excluded from the new cache key because the reranker score
+  // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey);
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
-      cachedResults.set(doc.file, parseFloat(cached));
+      cachedResults.set(doc.text, parseFloat(cached));
     } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
+      uncachedDocsByChunk.set(doc.text, { file: doc.file, text: doc.text });
     }
   }
 
   // Rerank uncached documents using LlamaCpp
-  if (uncachedDocs.length > 0) {
+  if (uncachedDocsByChunk.size > 0) {
     const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const uncachedDocs = [...uncachedDocsByChunk.values()];
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
-    // Cache results — use original doc.text for cache key (result.file lacks chunk text)
-    const textByFile = new Map(documents.map(d => [d.file, d.text]));
+    // Cache results by chunk text so identical chunks across files are scored once.
+    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+      const chunk = textByFile.get(result.file) || "";
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(result.file, result.score);
+      cachedResults.set(chunk, result.score);
     }
   }
 
   // Return all results sorted by score
   return documents
-    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.file) || 0 }))
+    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
 }
 
@@ -2415,6 +2471,72 @@ export function reciprocalRankFusion(
   return Array.from(scores.values())
     .sort((a, b) => b.rrfScore - a.rrfScore)
     .map(e => ({ ...e.result, score: e.rrfScore }));
+}
+
+/**
+ * Build per-document RRF contribution traces for explain/debug output.
+ */
+export function buildRrfTrace(
+  resultLists: RankedResult[][],
+  weights: number[] = [],
+  listMeta: RankedListMeta[] = [],
+  k: number = 60
+): Map<string, RRFScoreTrace> {
+  const traces = new Map<string, RRFScoreTrace>();
+
+  for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
+    const list = resultLists[listIdx];
+    if (!list) continue;
+    const weight = weights[listIdx] ?? 1.0;
+    const meta = listMeta[listIdx] ?? {
+      source: "fts",
+      queryType: "original",
+      query: "",
+    } as const;
+
+    for (let rank0 = 0; rank0 < list.length; rank0++) {
+      const result = list[rank0];
+      if (!result) continue;
+      const rank = rank0 + 1; // 1-indexed rank for explain output
+      const contribution = weight / (k + rank);
+      const existing = traces.get(result.file);
+
+      const detail: RRFContributionTrace = {
+        listIndex: listIdx,
+        source: meta.source,
+        queryType: meta.queryType,
+        query: meta.query,
+        rank,
+        weight,
+        backendScore: result.score,
+        rrfContribution: contribution,
+      };
+
+      if (existing) {
+        existing.baseScore += contribution;
+        existing.topRank = Math.min(existing.topRank, rank);
+        existing.contributions.push(detail);
+      } else {
+        traces.set(result.file, {
+          contributions: [detail],
+          baseScore: contribution,
+          topRank: rank,
+          topRankBonus: 0,
+          totalScore: 0,
+        });
+      }
+    }
+  }
+
+  for (const trace of traces.values()) {
+    let bonus = 0;
+    if (trace.topRank === 1) bonus = 0.05;
+    else if (trace.topRank <= 3) bonus = 0.02;
+    trace.topRankBonus = bonus;
+    trace.totalScore = trace.baseScore + bonus;
+  }
+
+  return traces;
 }
 
 // =============================================================================
@@ -2766,7 +2888,45 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
+/** Weight for intent terms relative to query terms (1.0) in snippet scoring */
+export const INTENT_WEIGHT_SNIPPET = 0.3;
+
+/** Weight for intent terms relative to query terms (1.0) in chunk selection */
+export const INTENT_WEIGHT_CHUNK = 0.5;
+
+// Common stop words filtered from intent strings before tokenization.
+// Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
+// 2-3 char function words so the length threshold can drop to >1 and let
+// short domain terms (API, SQL, LLM, CPU, CDN, …) survive.
+const INTENT_STOP_WORDS = new Set([
+  // 2-char function words
+  "am", "an", "as", "at", "be", "by", "do", "he", "if",
+  "in", "is", "it", "me", "my", "no", "of", "on", "or", "so",
+  "to", "up", "us", "we",
+  // 3-char function words
+  "all", "and", "any", "are", "but", "can", "did", "for", "get",
+  "has", "her", "him", "his", "how", "its", "let", "may", "not",
+  "our", "out", "the", "too", "was", "who", "why", "you",
+  // 4+ char common words
+  "also", "does", "find", "from", "have", "into", "more", "need",
+  "show", "some", "tell", "that", "them", "this", "want", "what",
+  "when", "will", "with", "your",
+  // Search-context noise
+  "about", "looking", "notes", "search", "where", "which",
+]);
+
+/**
+ * Extract meaningful terms from an intent string, filtering stop words and punctuation.
+ * Uses Unicode-aware punctuation stripping so domain terms like "API" survive.
+ * Returns lowercase terms suitable for text matching.
+ */
+export function extractIntentTerms(intent: string): string[] {
+  return intent.toLowerCase().split(/\s+/)
+    .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
+}
+
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
@@ -2785,13 +2945,17 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const lineLower = (lines[i] ?? "").toLowerCase();
     let score = 0;
     for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
+      if (lineLower.includes(term)) score += 1.0;
+    }
+    for (const term of intentTerms) {
+      if (lineLower.includes(term)) score += INTENT_WEIGHT_SNIPPET;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -2807,7 +2971,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
   if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+    return extractSnippet(body, query, maxLen, undefined, undefined, intent);
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
@@ -2878,6 +3042,8 @@ export interface HybridQueryOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
+  explain?: boolean;        // include backend/RRF/rerank score traces
+  intent?: string;          // domain intent hint for disambiguation
   hooks?: SearchHooks;
 }
 
@@ -2891,7 +3057,14 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  explain?: HybridQueryExplain;
 }
+
+export type RankedListMeta = {
+  source: "fts" | "vec";
+  queryType: "original" | "lex" | "vec" | "hyde";
+  query: string;
+};
 
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
@@ -2915,20 +3088,26 @@ export async function hybridQuery(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
+  const explain = options?.explain ?? false;
+  const intent = options?.intent;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
+  const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
+  // When intent is provided, disable strong-signal bypass — the obvious BM25
+  // match may not be what the caller wants (e.g. "performance" with intent
+  // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
   const initialFts = store.searchFTS(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0
+  const hasStrongSignal = !intent && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
@@ -2939,7 +3118,7 @@ export async function hybridQuery(
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query);
+    : await store.expandQuery(query, undefined, intent);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -2950,6 +3129,7 @@ export async function hybridQuery(
       file: r.filepath, displayPath: r.displayPath,
       title: r.title, body: r.body || "", score: r.score,
     })));
+    rankedListMeta.push({ source: "fts", queryType: "original", query });
   }
 
   // Step 3: Route searches by query type
@@ -2968,18 +3148,19 @@ export async function hybridQuery(
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
+        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.text });
       }
     }
   }
 
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
   if (hasVectors) {
-    const vecQueries: { text: string; isOriginal: boolean }[] = [
-      { text: query, isOriginal: true },
+    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
+      { text: query, queryType: "original" },
     ];
     for (const q of expanded) {
       if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.text, isOriginal: false });
+        vecQueries.push({ text: q.text, queryType: q.type });
       }
     }
 
@@ -3006,6 +3187,11 @@ export async function hybridQuery(
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
+        rankedListMeta.push({
+          source: "vec",
+          queryType: vecQueries[i]!.queryType,
+          query: vecQueries[i]!.text,
+        });
       }
     }
   }
@@ -3013,6 +3199,7 @@ export async function hybridQuery(
   // Step 4: RRF fusion — first 2 lists (original FTS + first vec) get 2x weight
   const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
+  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -3020,6 +3207,7 @@ export async function hybridQuery(
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
@@ -3028,11 +3216,15 @@ export async function hybridQuery(
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
@@ -3043,7 +3235,7 @@ export async function hybridQuery(
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -3067,6 +3259,22 @@ export async function hybridQuery(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const trace = rrfTraceByFile?.get(r.file);
+    const explainData: HybridQueryExplain | undefined = explain ? {
+      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      rrf: {
+        rank: rrfRank,
+        positionScore: rrfScore,
+        weight: rrfWeight,
+        baseScore: trace?.baseScore ?? 0,
+        topRankBonus: trace?.topRankBonus ?? 0,
+        totalScore: trace?.totalScore ?? 0,
+        contributions: trace?.contributions ?? [],
+      },
+      rerankScore: r.score,
+      blendedScore,
+    } : undefined;
 
     return {
       file: r.file,
@@ -3078,6 +3286,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
 
@@ -3097,6 +3306,7 @@ export interface VectorSearchOptions {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
+  intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -3127,6 +3337,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3135,7 +3346,7 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = await store.expandQuery(query, undefined, intent);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
@@ -3188,7 +3399,8 @@ export interface StructuredSearchOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
-  /** Future: domain intent hint for routing/boosting */
+  explain?: boolean;        // include backend/RRF/rerank score traces
+  /** Domain intent hint for disambiguation — steers reranking and chunk selection */
   intent?: string;
   hooks?: SearchHooks;
 }
@@ -3219,6 +3431,8 @@ export async function structuredSearch(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const explain = options?.explain ?? false;
+  const intent = options?.intent;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -3245,6 +3459,7 @@ export async function structuredSearch(
   }
 
   const rankedLists: RankedResult[][] = [];
+  const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3264,6 +3479,11 @@ export async function structuredSearch(
             file: r.filepath, displayPath: r.displayPath,
             title: r.title, body: r.body || "", score: r.score,
           })));
+          rankedListMeta.push({
+            source: "fts",
+            queryType: "lex",
+            query: search.query,
+          });
         }
       }
     }
@@ -3271,7 +3491,10 @@ export async function structuredSearch(
 
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
-    const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
+    const vecSearches = searches.filter(
+      (s): s is StructuredSubSearch & { type: 'vec' | 'hyde' } =>
+        s.type === 'vec' || s.type === 'hyde'
+    );
     if (vecSearches.length > 0) {
       const llm = getDefaultLlamaCpp();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
@@ -3295,6 +3518,11 @@ export async function structuredSearch(
               file: r.filepath, displayPath: r.displayPath,
               title: r.title, body: r.body || "", score: r.score,
             })));
+            rankedListMeta.push({
+              source: "vec",
+              queryType: vecSearches[i]!.type,
+              query: vecSearches[i]!.query,
+            });
           }
         }
       }
@@ -3306,6 +3534,7 @@ export async function structuredSearch(
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
+  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -3318,6 +3547,7 @@ export async function structuredSearch(
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
@@ -3326,11 +3556,15 @@ export async function structuredSearch(
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
@@ -3341,7 +3575,7 @@ export async function structuredSearch(
   // Step 5: Rerank chunks
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -3364,6 +3598,22 @@ export async function structuredSearch(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const trace = rrfTraceByFile?.get(r.file);
+    const explainData: HybridQueryExplain | undefined = explain ? {
+      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      rrf: {
+        rank: rrfRank,
+        positionScore: rrfScore,
+        weight: rrfWeight,
+        baseScore: trace?.baseScore ?? 0,
+        topRankBonus: trace?.topRankBonus ?? 0,
+        totalScore: trace?.totalScore ?? 0,
+        contributions: trace?.contributions ?? [],
+      },
+      rerankScore: r.score,
+      blendedScore,
+    } : undefined;
 
     return {
       file: r.file,
@@ -3375,6 +3625,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
 

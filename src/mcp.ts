@@ -14,6 +14,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport }
   from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   createStore,
@@ -125,10 +126,13 @@ function buildInstructions(store: Store): string {
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
   lines.push("");
+  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
+  lines.push("");
   lines.push("Examples:");
   lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
   lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
   lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
+  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -307,10 +311,16 @@ Intent-aware lex (C++ performance, not sports):
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        candidateLimit: z.number().optional().describe(
+          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+        ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        intent: z.string().optional().describe(
+          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
+        ),
       },
     },
-    async ({ searches, limit, minScore, collections }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
       // Map to internal format
       const subSearches: StructuredSubSearch[] = searches.map(s => ({
         type: s.type,
@@ -324,6 +334,8 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
+        intent,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -332,7 +344,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -552,12 +564,31 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
   const store = createStore();
-  const mcpServer = createMcpServer(store);
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
-  });
-  await mcpServer.connect(transport);
+
+  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
+  // The store is shared — it's stateless SQLite, safe for concurrent access.
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+
+  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sessionId: string) => {
+        sessions.set(sessionId, transport);
+        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
+      },
+    });
+    const server = createMcpServer(store);
+    await server.connect(transport);
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+      }
+    };
+
+    return transport;
+  }
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -635,6 +666,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -669,8 +701,38 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
         }
+
+        // Route to existing session or create new one on initialize
+        const sessionId = headers["mcp-session-id"];
+        let transport: WebStandardStreamableHTTPServerTransport;
+
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (!existing) {
+            nodeRes.writeHead(404, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "Session not found" },
+              id: body?.id ?? null,
+            }));
+            return;
+          }
+          transport = existing;
+        } else if (isInitializeRequest(body)) {
+          transport = await createSession();
+        } else {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: body?.id ?? null,
+          }));
+          return;
+        }
+
         const request = new Request(url, { method: "POST", headers, body: rawBody });
         const response = await transport.handleRequest(request, { parsedBody: body });
+
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
         log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
@@ -678,11 +740,34 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       if (pathname === "/mcp") {
-        const url = `http://localhost:${port}${pathname}`;
         const headers: Record<string, string> = {};
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
         }
+
+        // GET/DELETE must have a valid session
+        const sessionId = headers["mcp-session-id"];
+        if (!sessionId) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: null,
+          }));
+          return;
+        }
+        const transport = sessions.get(sessionId);
+        if (!transport) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32001, message: "Session not found" },
+            id: null,
+          }));
+          return;
+        }
+
+        const url = `http://localhost:${port}${pathname}`;
         const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
         const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
         const response = await transport.handleRequest(request);
@@ -711,7 +796,10 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    await transport.close();
+    for (const transport of sessions.values()) {
+      await transport.close();
+    }
+    sessions.clear();
     httpServer.close();
     store.close();
     await disposeDefaultLlamaCpp();

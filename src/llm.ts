@@ -6,7 +6,6 @@
 
 import {
   getLlama,
-  getLlamaGpuTypes,
   resolveModelFile,
   LlamaChatSession,
   LlamaLogLevel,
@@ -24,18 +23,37 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // =============================================================================
 
 /**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
+ * Detect if a model URI uses the Qwen3-Embedding format.
+ * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
  */
-export function formatQueryForEmbedding(query: string): string {
+export function isQwen3EmbeddingModel(modelUri: string): boolean {
+  return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
+}
+
+/**
+ * Format a query for embedding.
+ * Uses nomic-style task prefix format for embeddinggemma (default).
+ * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ */
+export function formatQueryForEmbedding(query: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
+  }
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * Uses nomic-style format with title and text fields (default).
+ * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
-export function formatDocForEmbedding(text: string, title?: string): string {
+export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    // Qwen3-Embedding: documents are raw text, no task prefix
+    return title ? `${title}\n${text}` : text;
+  }
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -174,7 +192,8 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf)
+const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -341,6 +360,11 @@ export type LlamaCppConfig = {
   rerankModel?: string;
   modelCacheDir?: string;
   /**
+   * Context size used for query expansion generation contexts.
+   * Default: 2048. Can also be set via QMD_EXPAND_CONTEXT_SIZE.
+   */
+  expandContextSize?: number;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -362,6 +386,28 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+
+function resolveExpandContextSize(configValue?: number): number {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue <= 0) {
+      throw new Error(`Invalid expandContextSize: ${configValue}. Must be a positive integer.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_EXPAND_CONTEXT_SIZE?.trim();
+  if (!envValue) return DEFAULT_EXPAND_CONTEXT_SIZE;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EXPAND_CONTEXT_SIZE="${envValue}", using default ${DEFAULT_EXPAND_CONTEXT_SIZE}.\n`
+    );
+    return DEFAULT_EXPAND_CONTEXT_SIZE;
+  }
+  return parsed;
+}
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -375,6 +421,7 @@ export class LlamaCpp implements LLM {
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
+  private expandContextSize: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -395,6 +442,7 @@ export class LlamaCpp implements LLM {
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
+    this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -502,29 +550,13 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const llama = await getLlama({
+        // attempt to build
+        build: "autoAttempt",
+        logLevel: LlamaLogLevel.error
+      });
 
-      let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
-        }
-      } else {
-        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-      }
-
-      if (!llama.gpu) {
+      if (llama.gpu === false) {
         process.stderr.write(
           "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
         );
@@ -732,12 +764,11 @@ export class LlamaCpp implements LLM {
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
   private static readonly RERANK_CONTEXT_SIZE = 2048;
-
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
-      const n = await this.computeParallelism(1000);
+      const n = Math.min(await this.computeParallelism(1000), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
@@ -944,7 +975,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -963,10 +994,15 @@ export class LlamaCpp implements LLM {
       `
     });
 
-    const prompt = `/no_think Expand this search query: ${query}`;
+    const intent = options.intent;
+    const prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
 
-    // Create fresh context for each call
-    const genContext = await this.generateModel!.createContext();
+    // Create a bounded context for expansion to prevent large default VRAM allocations.
+    const genContext = await this.generateModel!.createContext({
+      contextSize: this.expandContextSize,
+    });
     const sequence = genContext.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
@@ -1029,6 +1065,7 @@ export class LlamaCpp implements LLM {
 
   // Qwen3 reranker chat template overhead (system prompt, tags, separators)
   private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+  private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
     query: string,
@@ -1045,34 +1082,58 @@ export class LlamaCpp implements LLM {
     // Budget = contextSize - template overhead - query tokens
     const queryTokens = model.tokenize(query).length;
     const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
+      const cached = truncationCache.get(doc.text);
+      if (cached !== undefined) {
+        return cached === doc.text ? doc : { ...doc, text: cached };
+      }
+
       const tokens = model.tokenize(doc.text);
-      if (tokens.length <= maxDocTokens) return doc;
-      const truncatedText = model.detokenize(tokens.slice(0, maxDocTokens));
+      const truncatedText = tokens.length <= maxDocTokens
+        ? doc.text
+        : model.detokenize(tokens.slice(0, maxDocTokens));
+      truncationCache.set(doc.text, truncatedText);
+
+      if (truncatedText === doc.text) return doc;
       return { ...doc, text: truncatedText };
     });
 
-    // Build a map from document text to original indices (for lookup after sorting)
-    const textToDoc = new Map<string, { file: string; index: number }>();
+    // Deduplicate identical effective texts before scoring.
+    // This avoids redundant work for repeated chunks and fixes collisions where
+    // multiple docs map to the same chunk text.
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
     truncatedDocs.forEach((doc, index) => {
-      textToDoc.set(doc.text, { file: doc.file, index });
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index }]);
+      }
     });
 
     // Extract just the text for ranking
-    const texts = truncatedDocs.map((doc) => doc.text);
+    const texts = Array.from(textToDocs.keys());
 
     // Split documents across contexts for parallel evaluation.
     // Each context has its own sequence with a lock, so parallelism comes
     // from multiple contexts evaluating different chunks simultaneously.
-    const n = contexts.length;
-    const chunkSize = Math.ceil(texts.length / n);
-    const chunks = Array.from({ length: n }, (_, i) =>
+    const activeContextCount = Math.max(
+      1,
+      Math.min(
+        contexts.length,
+        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+      )
+    );
+    const activeContexts = contexts.slice(0, activeContextCount);
+    const chunkSize = Math.ceil(texts.length / activeContexts.length);
+    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
       texts.slice(i * chunkSize, (i + 1) * chunkSize)
     ).filter(chunk => chunk.length > 0);
 
     const allScores = await Promise.all(
-      chunks.map((chunk, i) => contexts[i]!.rankAll(query, chunk))
+      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
     );
 
     // Reassemble scores in original order and sort
@@ -1081,15 +1142,18 @@ export class LlamaCpp implements LLM {
       .map((text, i) => ({ document: text, score: flatScores[i]! }))
       .sort((a, b) => b.score - a.score);
 
-    // Map back to our result format using the text-to-doc map
-    const results: RerankDocumentResult[] = ranked.map((item) => {
-      const docInfo = textToDoc.get(item.document)!;
-      return {
-        file: docInfo.file,
-        score: item.score,
-        index: docInfo.index,
-      };
-    });
+    // Map back to our result format.
+    const results: RerankDocumentResult[] = [];
+    for (const item of ranked) {
+      const docInfos = textToDocs.get(item.document) ?? [];
+      for (const docInfo of docInfos) {
+        results.push({
+          file: docInfo.file,
+          score: item.score,
+          index: docInfo.index,
+        });
+      }
+    }
 
     return {
       results,
@@ -1889,7 +1953,8 @@ export function getDefaultLlamaCpp(): LlamaCpp {
   
   // Create new instance if needed
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const embedModel = process.env.QMD_EMBED_MODEL;
+    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
   }
   return defaultLlamaCpp;
 }

@@ -8,7 +8,8 @@ QMD queries are structured documents with typed sub-queries. Each line specifies
 query          = expand_query | query_document ;
 expand_query   = text | explicit_expand ;
 explicit_expand= "expand:" text ;
-query_document = { typed_line } ;
+query_document = [ intent_line ] { typed_line } ;
+intent_line    = "intent:" text newline ;
 typed_line     = type ":" text newline ;
 type           = "lex" | "vec" | "hyde" ;
 text           = quoted_phrase | plain_text ;
@@ -101,11 +102,28 @@ error handling best practices
 
 Both forms call the local query expansion model, which generates lex, vec, and hyde variations automatically.
 
+## Intent
+
+An optional `intent:` line provides background context to disambiguate ambiguous queries. It steers query expansion, reranking, and snippet extraction but does not search on its own.
+
+- At most one `intent:` line per query document
+- `intent:` cannot appear alone — at least one `lex:`, `vec:`, or `hyde:` line is required
+- Intent is also available via the `--intent` CLI flag or MCP `intent` parameter
+
+```
+intent: web page load times and Core Web Vitals
+lex: performance
+vec: how to improve performance
+```
+
+Without intent, "performance" is ambiguous (web-perf? team health? fitness?). With intent, the search pipeline preferentially selects and ranks web-performance content.
+
 ## Constraints
 
 - Top-level query must be either a standalone expand query or a multi-line document
-- Query documents allow only `lex`, `vec`, and `hyde` typed lines (no `expand:` inside)
+- Query documents allow only `lex`, `vec`, `hyde`, and `intent` typed lines (no `expand:` inside)
 - `lex` syntax (`-term`, `"phrase"`) only works in lex queries
+- At most one `intent:` line per query document; cannot appear alone
 - Empty lines are ignored
 - Leading/trailing whitespace is trimmed
 
@@ -132,6 +150,17 @@ Or structured format:
 }
 ```
 
+With intent:
+
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "performance" }
+  ],
+  "intent": "web page load times and Core Web Vitals"
+}
+```
+
 ## CLI
 
 ```bash
@@ -143,4 +172,10 @@ qmd query $'lex: auth token\nvec: how does authentication work'
 
 # Structured
 qmd query $'lex: keywords\nvec: question\nhyde: hypothetical answer...'
+
+# With intent (inline)
+qmd query $'intent: web performance and latency\nlex: performance\nvec: how to improve performance'
+
+# With intent (flag)
+qmd query --intent "web performance and latency" "performance"
 ```

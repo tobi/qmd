@@ -13,7 +13,6 @@
 
 import {
   getLlama,
-  getLlamaGpuTypes,
   resolveModelFile,
   LlamaLogLevel,
   type Llama,
@@ -192,24 +191,14 @@ async function main() {
   console.log("  QMD Reranker Benchmark");
   console.log("═══════════════════════════════════════════════════════════════\n");
 
-  // Detect GPU
-  const gpuTypes = await getLlamaGpuTypes();
-  const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
-
-  let llama: Llama;
-  let gpuLabel: string;
-  if (preferred) {
-    try {
-      llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-      gpuLabel = `${preferred}`;
-    } catch {
-      llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-      gpuLabel = "cpu (gpu init failed)";
-    }
-  } else {
-    llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-    gpuLabel = "cpu";
-  }
+  const llama = await getLlama({
+    // attempt to build
+    build: "autoAttempt",
+    logLevel: LlamaLogLevel.error
+  });
+  let gpuLabel: string = llama.gpu === false
+    ? "cpu"
+    : llama.gpu;
 
   // System info
   const cpuInfo = cpus();

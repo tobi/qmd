@@ -137,6 +137,19 @@ describe("handelize", () => {
     expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
   });
 
+  test("handles emoji filenames (issue #302)", () => {
+    // Emoji-only filenames should convert to hex codepoints
+    expect(handelize("🐘.md")).toBe("1f418.md");
+    expect(handelize("🎉.md")).toBe("1f389.md");
+    // Emoji mixed with text
+    expect(handelize("notes 🐘.md")).toBe("notes-1f418.md");
+    expect(handelize("🐘 elephant.md")).toBe("1f418-elephant.md");
+    // Multiple emojis
+    expect(handelize("🐘🎉.md")).toBe("1f418-1f389.md");
+    // Emoji in directory names
+    expect(handelize("🐘/notes.md")).toBe("1f418/notes.md");
+  });
+
   test("handles dates and times in filenames", () => {
     expect(handelize("meeting-2025-01-15.md")).toBe("meeting-2025-01-15.md");
     expect(handelize("notes 2025/01/15.md")).toBe("notes-2025/01/15.md");

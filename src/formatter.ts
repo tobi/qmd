@@ -40,6 +40,7 @@ export type FormatOptions = {
   query?: string;       // Query for snippet extraction and highlighting
   useColor?: boolean;   // Enable terminal colors (default: false for non-CLI)
   lineNumbers?: boolean;// Add line numbers to output
+  intent?: string;      // Domain intent for snippet extraction disambiguation
 };
 
 // =============================================================================
@@ -101,7 +102,7 @@ export function searchResultsToJson(
   const output = results.map(row => {
     const bodyStr = row.body || "";
     let body = opts.full ? bodyStr : undefined;
-    let snippet = !opts.full ? extractSnippet(bodyStr, query, 300, row.chunkPos).snippet : undefined;
+    let snippet = !opts.full ? extractSnippet(bodyStr, query, 300, row.chunkPos, undefined, opts.intent).snippet : undefined;
 
     if (opts.lineNumbers) {
       if (body) body = addLineNumbers(body);
@@ -132,7 +133,7 @@ export function searchResultsToCsv(
   const header = "docid,score,file,title,context,line,snippet";
   const rows = results.map(row => {
     const bodyStr = row.body || "";
-    const { line, snippet } = extractSnippet(bodyStr, query, 500, row.chunkPos);
+    const { line, snippet } = extractSnippet(bodyStr, query, 500, row.chunkPos, undefined, opts.intent);
     let content = opts.full ? bodyStr : snippet;
     if (opts.lineNumbers && content) {
       content = addLineNumbers(content);
@@ -175,7 +176,7 @@ export function searchResultsToMarkdown(
     if (opts.full) {
       content = bodyStr;
     } else {
-      content = extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
+      content = extractSnippet(bodyStr, query, 500, row.chunkPos, undefined, opts.intent).snippet;
     }
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
@@ -196,7 +197,7 @@ export function searchResultsToXml(
   const items = results.map(row => {
     const titleAttr = row.title ? ` title="${escapeXml(row.title)}"` : "";
     const bodyStr = row.body || "";
-    let content = opts.full ? bodyStr : extractSnippet(bodyStr, query, 500, row.chunkPos).snippet;
+    let content = opts.full ? bodyStr : extractSnippet(bodyStr, query, 500, row.chunkPos, undefined, opts.intent).snippet;
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
     }

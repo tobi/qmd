@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -52,6 +52,99 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("LlamaCpp expand context size config", () => {
+  const defaultExpandContextSize = 2048;
+
+  test("uses default expand context size when no config or env is set", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("uses QMD_EXPAND_CONTEXT_SIZE when set to a positive integer", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "3072";
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(3072);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("config value overrides QMD_EXPAND_CONTEXT_SIZE", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "4096";
+    try {
+      const llm = new LlamaCpp({ expandContextSize: 1536 }) as any;
+      expect(llm.expandContextSize).toBe(1536);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("falls back to default and warns when QMD_EXPAND_CONTEXT_SIZE is invalid", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "bad";
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_EXPAND_CONTEXT_SIZE");
+    } finally {
+      stderrSpy.mockRestore();
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("throws when config expandContextSize is invalid", () => {
+    expect(() => new LlamaCpp({ expandContextSize: 0 })).toThrow(
+      "Invalid expandContextSize: 0. Must be a positive integer."
+    );
+  });
+});
+
+describe("LlamaCpp rerank deduping", () => {
+  test("deduplicates identical document texts before scoring", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const rankAll = vi.fn(async (_query: string, docs: string[]) =>
+      docs.map((doc) => doc === "shared chunk" ? 0.9 : 0.2)
+    );
+
+    llm.touchActivity = vi.fn();
+    llm.ensureRerankContexts = vi.fn().mockResolvedValue([{ rankAll }]);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+    });
+
+    const result = await llm.rerank("query", [
+      { file: "a.md", text: "shared chunk" },
+      { file: "b.md", text: "shared chunk" },
+      { file: "c.md", text: "different chunk" },
+    ]);
+
+    expect(rankAll).toHaveBeenCalledTimes(1);
+    expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
+    expect(result.results).toHaveLength(3);
+
+    const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
+    expect(scoreByFile.get("a.md")).toBe(0.9);
+    expect(scoreByFile.get("b.md")).toBe(0.9);
+    expect(scoreByFile.get("c.md")).toBe(0.2);
   });
 });
 
@@ -366,6 +459,34 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       console.log(`Batch rerank of 10 docs took ${elapsed}ms`);
     });
 
+    test("uses fewer active rerank contexts for small batches", async () => {
+      const freshLlm = new LlamaCpp({});
+      const calls: number[] = [];
+      const fakeModel = {
+        tokenize: (text: string) => Array.from(text),
+        detokenize: (tokens: string[]) => tokens.join(""),
+      };
+      const fakeContexts = Array.from({ length: 4 }, (_, idx) => ({
+        rankAll: async (_query: string, docs: string[]) => {
+          calls.push(idx);
+          return docs.map(() => 0.5);
+        },
+      }));
+
+      (freshLlm as any).ensureRerankModel = async () => fakeModel;
+      (freshLlm as any).ensureRerankContexts = async () => fakeContexts;
+
+      const documents: RerankDocument[] = Array.from({ length: 20 }, (_, i) => ({
+        file: `doc${i}.md`,
+        text: `Document number ${i}`,
+      }));
+
+      const result = await freshLlm.rerank("topic 1", documents);
+
+      expect(result.results).toHaveLength(20);
+      expect(calls).toEqual([0, 1]);
+    });
+
     test("truncates and reranks document exceeding 2048 token context size", async () => {
       // The reranker context is created with contextSize=2048. Documents that
       // exceed the token budget (contextSize - template overhead - query tokens)
@@ -600,4 +721,3 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
     });
   });
 });
-
