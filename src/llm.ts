@@ -546,8 +546,8 @@ export class LlamaCpp implements LLM {
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
       const llama = await getLlama({
-        // attempt to build
-        build: "autoAttempt",
+        // attempt to build (autoAttempt is valid but not in TS types yet)
+        build: "autoAttempt" as any,
         logLevel: LlamaLogLevel.error
       });
 
