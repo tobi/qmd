@@ -1,0 +1,12 @@
+#!/bin/sh
+# Detect the runtime used to install this package and use the matching one
+# to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
+
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Check if we were installed with bun (look for bun.lock or bun-lockb)
+if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ] || [ -n "$BUN_INSTALL" ]; then
+  exec bun "$DIR/dist/qmd.js" "$@"
+else
+  exec node "$DIR/dist/qmd.js" "$@"
+fi
