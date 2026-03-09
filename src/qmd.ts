@@ -1449,53 +1449,75 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const seenPaths = new Set<string>();
   const startTime = Date.now();
 
+  let skipped = 0;
+
+  // Wrap all inserts/updates in a single transaction for performance
+  db.exec("BEGIN TRANSACTION");
+
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch (err: any) {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
-      processed++;
-      progress.set((processed / total) * 100);
-      continue;
-    }
-
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
     // Check if document exists in this collection with this path
     const existing = findActiveDocument(db, collectionName, path);
 
     if (existing) {
+      // Fast path: skip file read if mtime hasn't changed
+      const stat = statSync(filepath);
+      const fileMtime = stat ? new Date(stat.mtime).toISOString() : null;
+      if (fileMtime && existing.modified_at === fileMtime) {
+        unchanged++;
+        skipped++;
+        processed++;
+        progress.set((processed / total) * 100);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const rate = processed / elapsed;
+        const remaining = (total - processed) / rate;
+        const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+        process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+        continue;
+      }
+
+      // mtime changed - read file and check content
+      const content = readFileSync(filepath, "utf-8");
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
+
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+
       if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
+        // Content unchanged despite mtime change - update mtime in DB
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
           updated++;
         } else {
           unchanged++;
         }
+        // Update modified_at to current mtime so future runs skip this file
+        if (fileMtime) {
+          updateDocument(db, existing.id, existing.title, existing.hash, fileMtime);
+        }
       } else {
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        updateDocument(db, existing.id, title, hash, fileMtime || now);
         updated++;
       }
     } else {
-      // New document - insert content and document
+      // New document - must read file
+      const content = readFileSync(filepath, "utf-8");
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
+
       indexed++;
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
@@ -1522,6 +1544,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     }
   }
 
+  // Commit the transaction
+  db.exec("COMMIT");
+
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
 
@@ -1529,7 +1554,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
-  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed${skipped > 0 ? ` (${skipped} skipped via mtime)` : ""}`);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
