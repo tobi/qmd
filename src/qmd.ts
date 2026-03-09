@@ -1627,10 +1627,25 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (!firstChunk) {
       throw new Error("No chunks available to embed");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
+    
+    // Find first chunk that can be embedded to get dimensions
+    let firstResult: { embedding: number[] } | null = null;
+    let dimensionsChecked = 0;
+    for (let i = 0; i < allChunks.length && !firstResult; i++) {
+      const chunk = allChunks[i];
+      if (!chunk) continue;
+      dimensionsChecked++;
+      const text = formatDocForEmbedding(chunk.text, chunk.title);
+      try {
+        firstResult = await session.embed(text);
+      } catch (err) {
+        // Skip chunks that exceed context window or fail embedding
+        console.error(`${c.yellow}⚠ Skipping oversized/failed chunk ${i} ("${chunk.displayName}")${c.reset}`);
+      }
+    }
+    
     if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
+      throw new Error("Failed to get embedding dimensions from any chunk - all chunks may exceed context window");
     }
     ensureVecTable(db, firstResult.embedding.length);
 
