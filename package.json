@@ -41,6 +41,7 @@
     "fast-glob": "^3.3.0",
     "node-llama-cpp": "^3.17.1",
     "picomatch": "^4.0.0",
+    "postgres": "^3.4.8",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
     "zod": "^4.2.1"
