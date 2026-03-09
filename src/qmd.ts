@@ -2968,7 +2968,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("./mcp.js");
         try {
-          await startMcpHttpServer(port, { dbPath: storeDbPathOverride });
+          await startMcpHttpServer(port, { dbPath: getDbPath() });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -2979,7 +2979,7 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("./mcp.js");
-        await startMcpServer(storeDbPathOverride);
+        await startMcpServer({ dbPath: getDbPath() });
       }
       break;
     }

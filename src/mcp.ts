@@ -541,8 +541,8 @@ Intent-aware lex (C++ performance, not sports):
 // Transport: stdio (default)
 // =============================================================================
 
-export async function startMcpServer(dbPath?: string): Promise<void> {
-  const store = createStore(dbPath);
+export async function startMcpServer(options?: { dbPath?: string }): Promise<void> {
+  const store = createStore(options?.dbPath);
   const server = createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
