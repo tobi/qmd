@@ -560,9 +560,11 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Binds to localhost by default. Use `options.host` to override (e.g. "0.0.0.0"
+ * to allow access from Docker containers or other network hosts).
+ * Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
   const store = createStore();
 
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
@@ -787,7 +789,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    const bindHost = options?.host ?? "localhost";
+    httpServer.listen(port, bindHost, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -816,7 +819,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  const displayHost = options?.host ?? "localhost";
+  log(`QMD MCP server listening on http://${displayHost}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 
