@@ -2610,6 +2610,16 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Returns hash, document body, and a sample path for display purposes.
  */
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+  if (isPostgresDb(db)) {
+    return db.prepare(`
+      SELECT d.hash, MIN(c.doc) as body, MIN(d.path) as path
+      FROM documents d
+      JOIN content c ON d.hash = c.hash
+      LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+      WHERE d.active = 1 AND v.hash IS NULL
+      GROUP BY d.hash
+    `).all() as { hash: string; body: string; path: string }[];
+  }
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
