@@ -1621,18 +1621,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   // Wrap all LLM embedding operations in a session for lifecycle management
   // Use 30 minute timeout for large collections
   await withLLMSession(async (session) => {
-    // Get embedding dimensions from first chunk
+    // Get embedding dimensions using a virtual probe text (guaranteed to succeed)
+    // This avoids dependency on the first chunk, which might be oversized
     progress.indeterminate();
-    const firstChunk = allChunks[0];
-    if (!firstChunk) {
-      throw new Error("No chunks available to embed");
+    const probeResult = await session.embed("dimension probe");
+    if (!probeResult) {
+      throw new Error("Failed to initialize embedding model");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    ensureVecTable(db, firstResult.embedding.length);
+    ensureVecTable(db, probeResult.embedding.length);
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
