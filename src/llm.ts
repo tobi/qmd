@@ -478,8 +478,6 @@ export type OpenRouterConfig = {
   embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
-  appName?: string;
-  appUrl?: string;
   requestTimeoutMs?: number;
 };
 
@@ -489,8 +487,6 @@ export class OpenRouterLLM implements LLM {
   private embedModelUri: string;
   private generateModelUri: string;
   private rerankModelUri: string;
-  private appName: string;
-  private appUrl: string;
   private requestTimeoutMs: number;
 
   constructor(config: OpenRouterConfig = {}) {
@@ -499,8 +495,6 @@ export class OpenRouterLLM implements LLM {
     this.embedModelUri = config.embedModel || process.env.QMD_OPENROUTER_EMBED_MODEL || DEFAULT_OPENROUTER_EMBED_MODEL;
     this.generateModelUri = config.generateModel || process.env.QMD_OPENROUTER_GENERATE_MODEL || DEFAULT_OPENROUTER_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || process.env.QMD_OPENROUTER_RERANK_MODEL || DEFAULT_OPENROUTER_RERANK_MODEL;
-    this.appName = config.appName || process.env.QMD_OPENROUTER_APP_NAME || "qmd";
-    this.appUrl = config.appUrl || process.env.QMD_OPENROUTER_APP_URL || "https://github.com/tobi/qmd";
     this.requestTimeoutMs = config.requestTimeoutMs ?? 60_000;
   }
 
@@ -515,8 +509,6 @@ export class OpenRouterLLM implements LLM {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": this.appUrl,
-          "X-Title": this.appName,
         },
         body: JSON.stringify(payload),
         signal: controller.signal,
