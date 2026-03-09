@@ -465,33 +465,43 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(collectionFilter?: string[], quiet: boolean = false): Promise<void> {
   const db = getDb();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
+
+  // Filter by collection names if specified
+  if (collectionFilter && collectionFilter.length > 0) {
+    collections = collections.filter(c => collectionFilter.includes(c.name));
+    if (collections.length === 0) {
+      if (!quiet) console.log(`${c.dim}No matching collections found. Available: ${listCollections(db).map(c => c.name).join(', ')}${c.reset}`);
+      closeDb();
+      return;
+    }
+  }
 
   if (collections.length === 0) {
-    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    if (!quiet) console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
     closeDb();
     return;
   }
 
   // Don't close db here - indexFiles will reuse it and close at the end
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  if (!quiet) console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
     if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+    if (!quiet) console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
     if (yamlCol?.update) {
-      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      if (!quiet) console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
           cwd: col.pwd,
@@ -507,25 +517,25 @@ async function updateCollections(): Promise<void> {
           proc.on("close", (code) => resolve([out, err, code ?? 1]));
         });
 
-        if (output.trim()) {
+        if (output.trim() && !quiet) {
           console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
         }
-        if (errorOutput.trim()) {
+        if (errorOutput.trim() && !quiet) {
           console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
         }
 
         if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
+          if (!quiet) console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
           process.exit(exitCode);
         }
       } catch (err) {
-        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
+        if (!quiet) console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
         process.exit(1);
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true, yamlCol?.ignore);
-    console.log("");
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true, yamlCol?.ignore, quiet);
+    if (!quiet) console.log("");
   }
 
   // Check if any documents need embedding (show once at end)
@@ -533,7 +543,7 @@ async function updateCollections(): Promise<void> {
   const needsEmbedding = getHashesNeedingEmbedding(finalDb);
   closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (!quiet) console.log(`${c.green}✓ All collections updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
@@ -1403,7 +1413,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[], quiet: boolean = false): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1417,7 +1427,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
   }
 
-  console.log(`Collection: ${resolvedPwd} (${globPattern})`);
+  if (!quiet) console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
   const allIgnore = [
@@ -1441,7 +1451,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const hasNoFiles = total === 0;
   if (hasNoFiles) {
     progress.clear();
-    console.log("No files found matching pattern.");
+    if (!quiet) console.log("No files found matching pattern.");
     // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
@@ -1504,12 +1514,14 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     }
 
     processed++;
-    progress.set((processed / total) * 100);
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+    if (!quiet) {
+      progress.set((processed / total) * 100);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = processed / elapsed;
+      const remaining = (total - processed) / rate;
+      const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+    }
   }
 
   // Deactivate documents in this collection that no longer exist
@@ -1528,13 +1540,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
-  progress.clear();
-  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
-  if (orphanedContent > 0) {
+  if (!quiet) progress.clear();
+  if (!quiet) console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  if (orphanedContent > 0 && !quiet) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
 
-  if (needsEmbedding > 0 && !suppressEmbedNotice) {
+  if (needsEmbedding > 0 && !suppressEmbedNotice && !quiet) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 
@@ -2383,6 +2395,7 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
+      quiet: { type: "boolean", short: "q" },  // suppress progress output
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2840,7 +2853,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(cli.opts.collection, !!cli.values.quiet);
       break;
 
     case "embed":
