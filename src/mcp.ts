@@ -22,6 +22,7 @@ import {
   addLineNumbers,
   structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  enableProductionMode,
 } from "./store.js";
 import type { Store, StructuredSubSearch } from "./store.js";
 import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
@@ -542,6 +543,7 @@ Intent-aware lex (C++ performance, not sports):
 // =============================================================================
 
 export async function startMcpServer(): Promise<void> {
+  enableProductionMode();
   const store = createStore();
   const server = createMcpServer(store);
   const transport = new StdioServerTransport();
@@ -563,6 +565,7 @@ export type HttpServerHandle = {
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+  enableProductionMode();
   const store = createStore();
 
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
