@@ -64,7 +64,6 @@ import {
   type ExpandedQuery,
   type HybridQueryExplain,
   type StructuredSubSearch,
-  DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
@@ -190,6 +189,22 @@ function formatETA(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+/**
+ * Extract a human-readable model name from a model URI.
+ * Examples:
+ *   "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf" -> "embeddinggemma-300M-Q8_0"
+ *   "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf" -> "Qwen3-Embedding-0.6B-Q8_0"
+ *   "/path/to/model.gguf" -> "model"
+ *   "model-name" -> "model-name"
+ */
+function extractModelDisplayName(uri: string): string {
+  // Remove hf: prefix if present
+  let modelPath = uri.replace(/^hf:/, "");
+  // Get filename without extension
+  const filename = modelPath.split("/").pop() || modelPath;
+  const withoutExt = filename.replace(/\.gguf$/i, "");
+  return withoutExt;
+}
 
 // Check index health and print warnings/tips
 function checkIndexHealth(db: Database): void {
@@ -1548,7 +1563,7 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+async function vectorIndex(model: string = DEFAULT_EMBED_MODEL_URI, force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -1613,7 +1628,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${extractModelDisplayName(model)}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
@@ -2163,7 +2178,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL_URI): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2214,7 +2229,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL_URI, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2844,7 +2859,7 @@ if (isMain) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force);
       break;
 
     case "pull": {
