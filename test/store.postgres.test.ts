@@ -1,24 +1,52 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 import YAML from "yaml";
 
-const TEST_POSTGRES_URL = "postgresql://teleclawd@localhost/qmd_test";
+// Run manually with:
+//   QMD_ENABLE_POSTGRES_TESTS=1 \
+//   QMD_TEST_POSTGRES_URL=postgresql://localhost/qmd_test \
+//   bun test --preload ./src/test-preload.ts test/store.postgres.test.ts
 const RUN_POSTGRES_TESTS = process.env.QMD_ENABLE_POSTGRES_TESTS === "1";
+
+// Opt-in integration tests. Defaults assume local PostgreSQL socket/TCP access
+// with the current OS user; override in CI or custom environments as needed.
+const TEST_POSTGRES_URL = process.env.QMD_TEST_POSTGRES_URL ?? "postgresql://localhost/qmd_test";
+const TEST_POSTGRES_DB = getDatabaseName(TEST_POSTGRES_URL);
+const ADMIN_POSTGRES_URL = process.env.QMD_TEST_POSTGRES_ADMIN_URL ?? replaceDatabase(TEST_POSTGRES_URL, "postgres");
 
 let testConfigDir = "";
 
+function getDatabaseName(connectionString: string): string {
+  const url = new URL(connectionString);
+  const databaseName = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
+  if (!databaseName) {
+    throw new Error(`Expected database name in QMD_TEST_POSTGRES_URL: ${connectionString}`);
+  }
+  return databaseName;
+}
+
+function replaceDatabase(connectionString: string, databaseName: string): string {
+  const url = new URL(connectionString);
+  url.pathname = `/${databaseName}`;
+  return url.toString();
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
 async function ensureTestDatabase(): Promise<void> {
-  const admin = postgres("postgresql://teleclawd@localhost/postgres", {
+  const admin = postgres(ADMIN_POSTGRES_URL, {
     max: 1,
     idle_timeout: 1,
     connect_timeout: 5,
   });
 
   try {
-    await admin.unsafe(`CREATE DATABASE qmd_test`);
+    await admin.unsafe(`CREATE DATABASE ${quoteIdentifier(TEST_POSTGRES_DB)}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (!message.includes("already exists") && !message.includes("duplicate_database")) {
@@ -75,7 +103,6 @@ async function cleanupConfigDir(): Promise<void> {
 }
 
 async function importStoreModule() {
-  vi.resetModules();
   process.env.QMD_BACKEND = "postgres";
   process.env.QMD_POSTGRES_URL = TEST_POSTGRES_URL;
   return await import("../src/store.js");

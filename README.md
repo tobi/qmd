@@ -524,7 +524,9 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ### PostgreSQL Backend
 
-QMD supports PostgreSQL + pgvector as an alternative backend.
+QMD supports PostgreSQL + pgvector as an alternative backend for shared or
+multi-agent deployments where multiple processes need concurrent access to the
+same index. SQLite remains the simplest default for single-user local use.
 
 ```sh
 export QMD_BACKEND=postgres

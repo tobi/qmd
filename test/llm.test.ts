@@ -245,24 +245,30 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(results).toHaveLength(0);
     });
 
-    test("batch is faster than sequential", async () => {
-      const texts = Array(10).fill(null).map((_, i) => `Document number ${i} with content`);
+    test("splits work across embedding contexts and preserves input order", async () => {
+      const freshLlm = new LlamaCpp({}) as any;
+      const ctx1 = {
+        getEmbeddingFor: vi.fn(async (text: string) => ({
+          vector: Float32Array.from([text.length, 1]),
+        })),
+      };
+      const ctx2 = {
+        getEmbeddingFor: vi.fn(async (text: string) => ({
+          vector: Float32Array.from([text.length, 2]),
+        })),
+      };
 
-      // Time batch
-      const batchStart = Date.now();
-      await llm.embedBatch(texts);
-      const batchTime = Date.now() - batchStart;
+      freshLlm.touchActivity = vi.fn();
+      freshLlm.ensureEmbedContexts = vi.fn().mockResolvedValue([ctx1, ctx2]);
 
-      // Time sequential
-      const seqStart = Date.now();
-      for (const text of texts) {
-        await llm.embed(text);
-      }
-      const seqTime = Date.now() - seqStart;
+      const texts = ["one", "two", "three", "four"];
+      const results = await freshLlm.embedBatch(texts);
 
-      console.log(`Batch: ${batchTime}ms, Sequential: ${seqTime}ms`);
-      // Performance is machine/load dependent. We only assert batch isn't drastically worse.
-      expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
+      expect(freshLlm.ensureEmbedContexts).toHaveBeenCalledTimes(1);
+      expect(ctx1.getEmbeddingFor.mock.calls.map(([text]: [string]) => text)).toEqual(["one", "two"]);
+      expect(ctx2.getEmbeddingFor.mock.calls.map(([text]: [string]) => text)).toEqual(["three", "four"]);
+      expect(results.map((result) => result?.embedding[0])).toEqual([3, 3, 5, 4]);
+      expect(results.map((result) => result?.embedding[1])).toEqual([1, 1, 2, 2]);
     });
 
     test("handles concurrent embedBatch calls on fresh instance without race condition", async () => {

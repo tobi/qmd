@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changes
+
+- **PostgreSQL backend**: add PostgreSQL + pgvector as an alternative storage
+  backend for shared and multi-agent deployments where multiple processes need
+  concurrent access to the same QMD index. Configure with `QMD_BACKEND=postgres`
+  and `QMD_POSTGRES_URL`.
+
 ## [1.1.5] - 2026-03-07
 
 Ambiguous queries like "performance" now produce dramatically better results
