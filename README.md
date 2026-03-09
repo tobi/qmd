@@ -591,6 +591,25 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_EMBED_MODEL` | `embeddinggemma-300M` | Override embedding model (HF URI) |
+| `QMD_EXPAND_CONTEXT_SIZE` | `2048` | Context size for query expansion |
+| `QMD_RERANK_CONTEXT_SIZE` | `2048` | Context size for reranking (lower = less VRAM) |
+| `QMD_EMBED_CONTEXT_SIZE` | auto | Context size for embedding (lower = less VRAM) |
+| `QMD_MAX_PARALLELISM` | auto | Cap on parallel contexts (lower = less VRAM) |
+| `QMD_EMBED_BATCH_SIZE` | `32` | Batch size for embedding loop |
+
+### Low-VRAM GPU Configuration
+
+On GPUs with ≤4GB VRAM (e.g. RTX 3050, GTX 960M), the default settings may cause
+OOM errors. Set these environment variables to reduce VRAM usage:
+
+```bash
+export QMD_RERANK_CONTEXT_SIZE=1024
+export QMD_EMBED_CONTEXT_SIZE=1024
+export QMD_MAX_PARALLELISM=2
+export QMD_EMBED_BATCH_SIZE=8
+export QMD_EXPAND_CONTEXT_SIZE=1024
+```
 
 ## How It Works
 

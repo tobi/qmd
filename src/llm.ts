@@ -360,6 +360,18 @@ export type LlamaCppConfig = {
    */
   expandContextSize?: number;
   /**
+   * Context size for rerank contexts.
+   * Default: 2048. Can also be set via QMD_RERANK_CONTEXT_SIZE.
+   * Lower values (e.g. 1024) reduce VRAM usage on low-VRAM GPUs.
+   */
+  rerankContextSize?: number;
+  /**
+   * Context size for embedding contexts.
+   * Default: auto (model decides). Can also be set via QMD_EMBED_CONTEXT_SIZE.
+   * Lower values (e.g. 1024) reduce VRAM usage on low-VRAM GPUs.
+   */
+  embedContextSize?: number;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -382,6 +394,7 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+const DEFAULT_RERANK_CONTEXT_SIZE = 2048;
 
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
@@ -404,6 +417,62 @@ function resolveExpandContextSize(configValue?: number): number {
   return parsed;
 }
 
+function resolveRerankContextSize(configValue?: number): number {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue <= 0) {
+      throw new Error(`Invalid rerankContextSize: ${configValue}. Must be a positive integer.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_RERANK_CONTEXT_SIZE?.trim();
+  if (!envValue) return DEFAULT_RERANK_CONTEXT_SIZE;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_RERANK_CONTEXT_SIZE="${envValue}", using default ${DEFAULT_RERANK_CONTEXT_SIZE}.\n`
+    );
+    return DEFAULT_RERANK_CONTEXT_SIZE;
+  }
+  return parsed;
+}
+
+function resolveEmbedContextSize(configValue?: number): number | undefined {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue <= 0) {
+      throw new Error(`Invalid embedContextSize: ${configValue}. Must be a positive integer.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_EMBED_CONTEXT_SIZE?.trim();
+  if (!envValue) return undefined; // auto (let node-llama-cpp decide)
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EMBED_CONTEXT_SIZE="${envValue}", using default (auto).\n`
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
+function resolveMaxParallelism(): number {
+  const envValue = process.env.QMD_MAX_PARALLELISM?.trim();
+  if (!envValue) return 0; // 0 means no override
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_MAX_PARALLELISM="${envValue}", ignoring.\n`
+    );
+    return 0;
+  }
+  return parsed;
+}
+
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -417,6 +486,8 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
+  private rerankContextSize: number;
+  private embedContextSize: number | undefined;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -438,6 +509,8 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
+    this.rerankContextSize = resolveRerankContextSize(config.rerankContextSize);
+    this.embedContextSize = resolveEmbedContextSize(config.embedContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -606,25 +679,35 @@ export class LlamaCpp implements LLM {
    * CPU: constrained by cores. Splitting threads across contexts enables
    *      true parallelism (each context runs on its own cores). Use at most
    *      half the math cores, with at least 4 threads per context.
+   *
+   * QMD_MAX_PARALLELISM env var can cap the result (useful for low-VRAM GPUs).
    */
   private async computeParallelism(perContextMB: number): Promise<number> {
+    const maxParallelism = resolveMaxParallelism();
     const llama = await this.ensureLlama();
+    let computed: number;
 
     if (llama.gpu) {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
         const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        return Math.max(1, Math.min(8, maxByVram));
+        computed = Math.max(1, Math.min(8, maxByVram));
       } catch {
-        return 2;
+        computed = 2;
       }
+    } else {
+      // CPU: split cores across contexts. At least 4 threads per context.
+      const cores = llama.cpuMathCores || 4;
+      const maxContexts = Math.floor(cores / 4);
+      computed = Math.max(1, Math.min(4, maxContexts));
     }
 
-    // CPU: split cores across contexts. At least 4 threads per context.
-    const cores = llama.cpuMathCores || 4;
-    const maxContexts = Math.floor(cores / 4);
-    return Math.max(1, Math.min(4, maxContexts));
+    // Allow env var override (useful for low-VRAM GPUs)
+    if (maxParallelism > 0) {
+      return Math.min(computed, maxParallelism);
+    }
+    return computed;
   }
 
   /**
@@ -662,6 +745,7 @@ export class LlamaCpp implements LLM {
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
+            ...(this.embedContextSize !== undefined ? { contextSize: this.embedContextSize } : {}),
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -758,7 +842,7 @@ export class LlamaCpp implements LLM {
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Configurable via QMD_RERANK_CONTEXT_SIZE env var for low-VRAM GPUs.
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
@@ -768,7 +852,7 @@ export class LlamaCpp implements LLM {
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
-            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            contextSize: this.rerankContextSize,
             flashAttention: true,
             ...(threads > 0 ? { threads } : {}),
           } as any));
@@ -777,7 +861,7 @@ export class LlamaCpp implements LLM {
             // Flash attention might not be supported — retry without it
             try {
               this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+                contextSize: this.rerankContextSize,
                 ...(threads > 0 ? { threads } : {}),
               }));
             } catch {
@@ -1076,7 +1160,7 @@ export class LlamaCpp implements LLM {
     // Truncate documents that would exceed the rerank context size.
     // Budget = contextSize - template overhead - query tokens
     const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const maxDocTokens = this.rerankContextSize - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
     const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
