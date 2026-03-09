@@ -17,6 +17,10 @@ search, collection/context management — without shelling out to the CLI.
 - **Package exports**: `package.json` now declares `main`, `types`, and
   `exports` so bundlers and TypeScript resolve `@tobilu/qmd` correctly.
 
+### Fixed
+
+- **MCP `--index` flag ignored**: `qmd --index myproject mcp` now correctly opens the named index instead of always falling back to `index.sqlite`. Both stdio and HTTP transports accept the resolved DB path from the CLI. Daemon mode also forwards `--index` to the spawned child process. (#343)
+
 ## [1.1.5] - 2026-03-07
 
 Ambiguous queries like "performance" now produce dramatically better results
