@@ -17,6 +17,7 @@ import {
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
+  type EmbeddingResult,
 } from "../src/llm.js";
 
 // =============================================================================
@@ -262,7 +263,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       freshLlm.ensureEmbedContexts = vi.fn().mockResolvedValue([ctx1, ctx2]);
 
       const texts = ["one", "two", "three", "four"];
-      const results = await freshLlm.embedBatch(texts);
+      const results: (EmbeddingResult | null)[] = await freshLlm.embedBatch(texts);
 
       expect(freshLlm.ensureEmbedContexts).toHaveBeenCalledTimes(1);
       expect(ctx1.getEmbeddingFor.mock.calls.map(([text]: [string]) => text)).toEqual(["one", "two"]);
