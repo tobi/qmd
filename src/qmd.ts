@@ -1638,8 +1638,10 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const startTime = Date.now();
 
     // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
+    // Process in batches to balance memory usage and efficiency
+    // Configurable via QMD_EMBED_BATCH_SIZE env var (default: 32, lower for low-VRAM GPUs)
+    const envBatchSize = process.env.QMD_EMBED_BATCH_SIZE?.trim();
+    const BATCH_SIZE = envBatchSize ? (Number.parseInt(envBatchSize, 10) || 32) : 32;
 
     for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
