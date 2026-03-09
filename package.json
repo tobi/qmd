@@ -22,7 +22,8 @@
     "vsearch": "tsx src/qmd.ts vsearch",
     "rerank": "tsx src/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "update-flake-hash": "./scripts/update-flake-hash.sh"
   },
   "publishConfig": {
     "access": "public"
