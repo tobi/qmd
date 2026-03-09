@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-03-09
+
+QMD can now be used as a library. `import { createStore } from '@tobilu/qmd'`
+gives you the full search and indexing API — hybrid query, BM25, structured
+search, collection/context management — without shelling out to the CLI.
+
+### Changes
+
+- **SDK / library mode**: `createStore({ dbPath, config })` returns a
+  `QMDStore` with `query()`, `search()`, `structuredSearch()`, `get()`,
+  `multiGet()`, and collection/context management methods. Supports inline
+  config (no files needed) or a YAML config path.
+- **Package exports**: `package.json` now declares `main`, `types`, and
+  `exports` so bundlers and TypeScript resolve `@tobilu/qmd` correctly.
+
 ## [1.1.5] - 2026-03-07
 
 Ambiguous queries like "performance" now produce dramatically better results
