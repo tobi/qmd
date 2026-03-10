@@ -679,7 +679,6 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type, active)`);
 
   // Cache table for LLM API calls
   db.exec(`
@@ -690,11 +689,12 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Content vectors
+  // Content vectors — migrate content_type column before creating index on it
   const docInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
   if (!docInfo.some(col => col.name === "content_type")) {
     db.exec(`ALTER TABLE documents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'`);
   }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type, active)`);
 
   const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
   const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
