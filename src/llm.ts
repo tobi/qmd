@@ -1611,7 +1611,7 @@ export async function getActiveEmbedModel(): Promise<string> {
 }
 
 export function getConfiguredEmbedDimensions(): number | null {
-  const provider = forcedEmbedProvider ?? parseEmbedProviderFromEnv() ?? resolvedEmbedProvider;
+  const provider = forcedEmbedProvider ?? parseEmbedProviderFromEnv();
   if (provider === "google") return parseGeminiDimensionsFromEnv();
   return null;
 }
