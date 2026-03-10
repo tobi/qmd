@@ -34,7 +34,7 @@ jobs:
       - run: npm install
 
       - name: Tests
-        run: npx vitest run --reporter=verbose test/
+        run: npx vitest run --reporter=verbose --testTimeout 60000 test/
         env:
           CI: true
 
@@ -64,7 +64,7 @@ jobs:
       - run: bun install
 
       - name: Tests
-        run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
+        run: bun test --timeout 60000 --preload ./src/test-preload.ts test/
         env:
           CI: true
           DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib

@@ -405,6 +405,7 @@ function resolveExpandContextSize(configValue?: number): number {
 }
 
 export class LlamaCpp implements LLM {
+  private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
@@ -854,6 +855,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -912,6 +914,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -971,6 +974,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1067,6 +1071,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 

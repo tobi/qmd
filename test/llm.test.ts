@@ -120,6 +120,7 @@ describe("LlamaCpp expand context size config", () => {
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
     const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false; // allow unit test even in CI (mocked, no real models)
     const rankAll = vi.fn(async (_query: string, docs: string[]) =>
       docs.map((doc) => doc === "shared chunk" ? 0.9 : 0.2)
     );
