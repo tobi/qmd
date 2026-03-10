@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-03-10
+
 QMD 2.0 declares a stable library API. The SDK is now the primary interface —
 the MCP server is a clean consumer of it, and the source is organized into
 `src/cli/` and `src/mcp/`. Also: Node 25 support and a runtime-aware bin wrapper
