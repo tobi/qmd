@@ -1048,3 +1048,98 @@ describe("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+// =============================================================================
+// --index flag: dbPath parameter tests
+// =============================================================================
+
+describe("MCP dbPath parameter (--index flag)", () => {
+  let handle: HttpServerHandle;
+  let baseUrl: string;
+  let dbPathTestDb: string;
+  let dbPathConfigDir: string;
+  let origIndexPath: string | undefined;
+  let origConfigDir: string | undefined;
+
+  beforeAll(async () => {
+    // Snapshot env inside beforeAll to avoid stale captures from module-load time
+    origIndexPath = process.env.INDEX_PATH;
+    origConfigDir = process.env.QMD_CONFIG_DIR;
+
+    // Create isolated test database
+    dbPathTestDb = `/tmp/qmd-mcp-dbpath-test-${Date.now()}.sqlite`;
+    const db = openDatabase(dbPathTestDb);
+    initTestDatabase(db);
+    seedTestData(db);
+    db.close();
+
+    // Create isolated YAML config
+    const configPrefix = join(tmpdir(), `qmd-mcp-dbpath-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    dbPathConfigDir = await mkdtemp(configPrefix);
+    const testConfig: CollectionConfig = {
+      collections: {
+        docs: {
+          path: "/test/docs",
+          pattern: "**/*.md",
+        }
+      }
+    };
+    await writeFile(join(dbPathConfigDir, "index.yml"), YAML.stringify(testConfig));
+
+    // Clear INDEX_PATH to prove dbPath parameter works on its own
+    delete process.env.INDEX_PATH;
+    process.env.QMD_CONFIG_DIR = dbPathConfigDir;
+
+    // Start server with explicit dbPath (simulates --index flag)
+    handle = await startMcpHttpServer(0, { quiet: true, dbPath: dbPathTestDb });
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    await handle.stop();
+
+    // Restore env
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    try { unlinkSync(dbPathTestDb); } catch {}
+    try {
+      const files = await readdir(dbPathConfigDir);
+      for (const f of files) await unlink(join(dbPathConfigDir, f));
+      await rmdir(dbPathConfigDir);
+    } catch {}
+  });
+
+  /** Send a JSON-RPC message to /mcp and return the parsed response. */
+  let sessionId: string | null = null;
+  async function mcpReq(body: object): Promise<{ status: number; json: any }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    const res = await fetch(`${baseUrl}/mcp`, { method: "POST", headers, body: JSON.stringify(body) });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+    return { status: res.status, json: await res.json() };
+  }
+
+  test("server uses dbPath instead of default index.sqlite", async () => {
+    await mcpReq({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpReq({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.content.length).toBeGreaterThan(0);
+    expect(json.result.content[0].text).toContain("readme");
+  });
+});
