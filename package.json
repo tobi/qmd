@@ -12,9 +12,10 @@
     }
   },
   "bin": {
-    "qmd": "dist/cli/qmd.js"
+    "qmd": "bin/qmd"
   },
   "files": [
+    "bin/",
     "dist/",
     "LICENSE",
     "CHANGELOG.md"
@@ -45,7 +46,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "^12.4.5",
     "fast-glob": "^3.3.0",
     "node-llama-cpp": "^3.17.1",
     "picomatch": "^4.0.0",
