@@ -2945,7 +2945,7 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
-          const indexArgs = indexName ? ["--index", indexName] : [];
+          const indexArgs = cli.values.index ? ["--index", cli.values.index as string] : [];
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
