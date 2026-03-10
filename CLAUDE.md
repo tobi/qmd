@@ -1,6 +1,6 @@
 # QMD - Query Markup Documents
 
-Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
+Written in Rust. Build with `cargo build --release`.
 
 ## Commands
 
@@ -18,7 +18,7 @@ qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
-qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed                         # Generate vector embeddings (uses llama-cpp-2)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
@@ -118,26 +118,25 @@ qmd multi-get "#abc123, #def456"
 ## Development
 
 ```sh
-bun src/qmd.ts <command>   # Run from source
-bun link               # Install globally as 'qmd'
+cargo run -- <command>     # Run from source
+cargo build --release      # Build optimized binary
+cargo install --path .     # Install globally as 'qmd-rs'
 ```
 
 ## Tests
 
-All tests live in `test/`. Run everything:
-
 ```sh
-npx vitest run --reporter=verbose test/
-bun test --preload ./src/test-preload.ts test/
+cargo test
 ```
 
 ## Architecture
 
-- SQLite FTS5 for full-text search (BM25)
+- Rust with rusqlite (bundled SQLite with FTS5) for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- llama-cpp-2 for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
+- Source code in `crate/`, binary name `qmd-rs`
 
 ## Important: Do NOT run automatically
 
@@ -145,12 +144,6 @@ bun test --preload ./src/test-preload.ts test/
 - Never modify the SQLite database directly
 - Write out example commands for the user to run manually
 - Index is stored at `~/.cache/qmd/index.sqlite`
-
-## Do NOT compile
-
-- Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
-- The `qmd` file is a shell script that runs compiled JS from `dist/` - do not replace it
-- `npm run build` compiles TypeScript to `dist/` via `tsc -p tsconfig.build.json`
 
 ## Releasing
 

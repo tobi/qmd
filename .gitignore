@@ -1,7 +1,4 @@
-node_modules/
-dist/
-package-lock.json
-.npmrc
+target/
 *.sqlite
 .DS_Store
 archive/
@@ -18,4 +15,3 @@ texts/
 finetune/outputs/
 finetune/data/train/
 .claude/
-target/
