@@ -5,51 +5,78 @@ on:
     tags: ["v*"]
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-      id-token: write
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: qmd-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: qmd-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: qmd-macos-x86_64
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          bun-version: latest
+          targets: ${{ matrix.target }}
 
-      - name: Install SQLite
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: Swatinem/rust-cache@v2
 
-      - run: bun install
-      - run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Tests
+        run: cargo test --verbose
         env:
           CI: true
-          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
 
-      - uses: actions/setup-node@v4
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/qmd-rs dist/${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
 
-      - run: npm run build
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Extract release notes
         id: notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=$(./scripts/extract-changelog.sh "$VERSION")
-          # Write to file for gh release (avoids quoting issues)
           echo "$NOTES" > /tmp/release-notes.md
 
       - name: Create GitHub release
         run: |
+          chmod +x dist/*
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/release-notes.md
+            --notes-file /tmp/release-notes.md \
+            dist/*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
