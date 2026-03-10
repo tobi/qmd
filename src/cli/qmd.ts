@@ -2397,12 +2397,12 @@ function parseCLI() {
   }
 
   if (typeof values.dimensions === "string") {
-    const dim = Number.parseInt(values.dimensions, 10);
-    if (![768, 1536, 3072].includes(dim)) {
+    const dimRaw = values.dimensions.trim();
+    if (!["768", "1536", "3072"].includes(dimRaw)) {
       console.error(`Invalid --dimensions value '${values.dimensions}'. Use 768, 1536, or 3072.`);
       process.exit(1);
     }
-    process.env.QMD_EMBED_DIMENSIONS = String(dim);
+    process.env.QMD_EMBED_DIMENSIONS = dimRaw;
   }
 
   // Determine output format

@@ -46,6 +46,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function parseRetryAfterMs(retryAfterHeader: string | null): number | null {
+  if (!retryAfterHeader) return null;
+
+  const seconds = Number.parseInt(retryAfterHeader, 10);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+
+  const retryAt = Date.parse(retryAfterHeader);
+  if (Number.isFinite(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return null;
+}
+
 export function parseGeminiDimensionsFromEnv(): number {
   const raw = process.env.QMD_EMBED_DIMENSIONS?.trim();
   if (!raw) return GOOGLE_EMBED_DEFAULT_DIMENSIONS;
@@ -128,18 +144,26 @@ export class GoogleAIEmbedder {
     let delayMs = 500;
 
     while (true) {
-      const res = await fetch(this.buildUrl(endpoint), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      try {
+        const res = await fetch(this.buildUrl(endpoint), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
 
-      if (res.ok) return res;
-      const retryable = res.status === 429 || res.status >= 500;
-      if (!retryable || attempt >= GOOGLE_EMBED_MAX_RETRIES) return res;
+        if (res.ok) return res;
+        const retryable = res.status === 429 || res.status >= 500;
+        if (!retryable || attempt >= GOOGLE_EMBED_MAX_RETRIES) return res;
 
-      const retryAfter = Number.parseInt(res.headers.get("retry-after") ?? "", 10);
-      await sleep(Number.isFinite(retryAfter) ? retryAfter * 1000 : delayMs);
+        const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+        await sleep(retryAfterMs ?? delayMs);
+      } catch (error) {
+        if (attempt >= GOOGLE_EMBED_MAX_RETRIES) {
+          throw error;
+        }
+        await sleep(delayMs);
+      }
+
       delayMs *= 2;
       attempt++;
     }
@@ -165,17 +189,30 @@ export class GoogleAIEmbedder {
   async embedBatch(inputs: EmbedInput[], options: GeminiEmbedOptions = {}): Promise<({ embedding: number[] } | null)[]> {
     if (inputs.length === 0) return [];
     const output: ({ embedding: number[] } | null)[] = Array(inputs.length).fill(null);
+    const outputDimensionality = options.outputDimensionality ?? this.dimensions;
+    const taskType = options.taskType ?? "RETRIEVAL_DOCUMENT";
 
     for (let start = 0; start < inputs.length; start += GOOGLE_EMBED_BATCH_LIMIT) {
       const chunk = inputs.slice(start, start + GOOGLE_EMBED_BATCH_LIMIT);
-      const outputDimensionality = options.outputDimensionality ?? this.dimensions;
-      const taskType = options.taskType ?? "RETRIEVAL_DOCUMENT";
-      const requests: EmbedRequest[] = chunk.map((input) => ({
-        model: GOOGLE_EMBED_MODEL_PATH,
-        content: { parts: normalizeInput(input) },
-        taskType,
-        outputDimensionality,
-      }));
+      const requests: EmbedRequest[] = [];
+      const requestToChunkIndex: number[] = [];
+      for (let i = 0; i < chunk.length; i++) {
+        try {
+          requests.push({
+            model: GOOGLE_EMBED_MODEL_PATH,
+            content: { parts: normalizeInput(chunk[i]!) },
+            taskType,
+            outputDimensionality,
+          });
+          requestToChunkIndex.push(i);
+        } catch {
+          output[start + i] = null;
+        }
+      }
+
+      if (requests.length === 0) {
+        continue;
+      }
 
       const res = await this.postWithRetries("batchEmbedContents", { requests });
       if (!res.ok) continue;
@@ -186,7 +223,7 @@ export class GoogleAIEmbedder {
         const values = embeddings[i]?.values;
         const embedding = this.normalizeEmbedding(values, requests[i]!.outputDimensionality);
         if (embedding) {
-          output[start + i] = { embedding };
+          output[start + requestToChunkIndex[i]!] = { embedding };
         }
       }
     }

@@ -11,6 +11,7 @@ import {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   delete process.env.QMD_EMBED_DIMENSIONS;
 });
 
@@ -76,5 +77,62 @@ describe("GoogleAIEmbedder", () => {
     expect(results).toHaveLength(GOOGLE_EMBED_BATCH_LIMIT + 1);
     expect(results.every(r => r?.embedding.length === 3072)).toBe(true);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries retryable HTTP responses and respects retry-after", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "0" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        embedding: { values: Array.from({ length: 3072 }, () => 0.3) },
+      }), { status: 200 }));
+
+    const embedder = new GoogleAIEmbedder("test-key", 3072);
+    const result = await embedder.embed("retry me");
+
+    expect(result).not.toBeNull();
+    expect(result?.embedding.length).toBe(3072);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries transient network errors", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        embedding: { values: Array.from({ length: 3072 }, () => 0.4) },
+      }), { status: 200 }));
+
+    const embedder = new GoogleAIEmbedder("test-key", 3072);
+    const pending = embedder.embed("network retry");
+    await vi.advanceTimersByTimeAsync(500);
+    const result = await pending;
+
+    expect(result).not.toBeNull();
+    expect(result?.embedding.length).toBe(3072);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("batch embed tolerates invalid multimodal input", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.requests).toHaveLength(1);
+      return new Response(JSON.stringify({
+        embeddings: [{ values: Array.from({ length: 3072 }, () => 0.5) }],
+      }), { status: 200 });
+    });
+
+    const embedder = new GoogleAIEmbedder("test-key", 3072);
+    const results = await embedder.embedBatch(
+      ["ok-text", { filePath: "/tmp/not-supported.txt" }],
+      { taskType: "RETRIEVAL_DOCUMENT" }
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0]?.embedding.length).toBe(3072);
+    expect(results[1]).toBeNull();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });
