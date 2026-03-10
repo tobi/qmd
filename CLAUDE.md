@@ -118,7 +118,7 @@ qmd multi-get "#abc123, #def456"
 ## Development
 
 ```sh
-bun src/qmd.ts <command>   # Run from source
+bun src/cli/qmd.ts <command>   # Run from source
 bun link               # Install globally as 'qmd'
 ```
 

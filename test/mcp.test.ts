@@ -894,7 +894,7 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
 import { enableProductionMode } from "../src/store";
 
 describe("MCP HTTP Transport", () => {

@@ -27,7 +27,7 @@ import {
   documentToXml,
   formatDocument,
   type MultiGetFile,
-} from "../src/formatter.js";
+} from "../src/cli/formatter.js";
 import type { SearchResult, DocumentResult } from "../src/store.js";
 
 // =============================================================================

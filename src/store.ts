@@ -16,7 +16,7 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+// Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import {
   LlamaCpp,
@@ -2267,7 +2267,7 @@ export function getCollectionByName(db: Database, name: string): { name: string;
  * List all collections with document counts from database.
  * Merges store_collections config with database statistics.
  */
-export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
+export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[] {
   const collections = getStoreCollections(db);
 
   // Get document counts from database for each collection
@@ -2288,6 +2288,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
       doc_count: stats?.doc_count || 0,
       active_count: stats?.active_count || 0,
       last_modified: stats?.last_modified || null,
+      includeByDefault: coll.includeByDefault !== false,
     };
   });
 

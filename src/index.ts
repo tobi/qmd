@@ -21,7 +21,10 @@ import {
   createStore as createStoreInternal,
   hybridQuery,
   structuredSearch,
+  extractSnippet,
+  addLineNumbers,
   DEFAULT_EMBED_MODEL,
+  DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   generateEmbeddings,
   listCollections as storeListCollections,
@@ -36,6 +39,12 @@ import {
   updateStoreContext,
   removeStoreContext,
   setStoreGlobalContext,
+  vacuumDatabase,
+  cleanupOrphanedContent,
+  cleanupOrphanedVectors,
+  deleteLLMCache,
+  deleteInactiveDocuments,
+  clearAllEmbeddings,
   type Store as InternalStore,
   type DocumentResult,
   type DocumentNotFound,
@@ -95,6 +104,18 @@ export type {
   NamedCollection,
   ContextMap,
 };
+
+// Re-export the internal Store type for advanced consumers
+export type { InternalStore };
+
+// Re-export utility functions used by frontends
+export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+
+// Re-export getDefaultDbPath for CLI/MCP that need the default database location
+export { getDefaultDbPath } from "./store.js";
+
+// Re-export Maintenance class for CLI housekeeping operations
+export { Maintenance } from "./maintenance.js";
 
 /**
  * Progress info emitted during update() for each file processed.
@@ -213,6 +234,9 @@ export interface QMDStore {
   /** Get a single document by path or docid */
   get(pathOrDocid: string, options?: { includeBody?: boolean }): Promise<DocumentResult | DocumentNotFound>;
 
+  /** Get the body content of a document, optionally sliced by line range */
+  getDocumentBody(pathOrDocid: string, opts?: { fromLine?: number; maxLines?: number }): Promise<string | null>;
+
   /** Get multiple documents by glob pattern or comma-separated list */
   multiGet(pattern: string, options?: { includeBody?: boolean; maxBytes?: number }): Promise<{ docs: MultiGetResult[]; errors: string[] }>;
 
@@ -228,7 +252,10 @@ export interface QMDStore {
   renameCollection(oldName: string, newName: string): Promise<boolean>;
 
   /** List all collections with document stats */
-  listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[]>;
+  listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
+
+  /** Get names of collections included by default in queries */
+  getDefaultCollectionNames(): Promise<string[]>;
 
   // ── Context Management ──────────────────────────────────────────────
 
@@ -379,6 +406,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
+    getDocumentBody: async (pathOrDocid, opts) => {
+      const result = internal.findDocument(pathOrDocid, { includeBody: false });
+      if ("error" in result) return null;
+      return internal.getDocumentBody(result, opts?.fromLine, opts?.maxLines);
+    },
     multiGet: async (pattern, opts) => internal.findDocuments(pattern, opts),
 
     // Collection Management — write to SQLite + write-through to YAML/inline if configured
@@ -403,6 +435,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     listCollections: async () => storeListCollections(db),
+    getDefaultCollectionNames: async () => {
+      const collections = storeListCollections(db);
+      return collections.filter(c => c.includeByDefault).map(c => c.name);
+    },
 
     // Context Management — write to SQLite + write-through to YAML/inline if configured
     addContext: async (collectionName, pathPrefix, contextText) => {

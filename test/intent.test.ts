@@ -22,7 +22,7 @@ import {
 } from "../src/store.js";
 
 // =============================================================================
-// parseStructuredQuery — duplicated from src/qmd.ts for unit testing
+// parseStructuredQuery — duplicated from src/cli/qmd.ts for unit testing
 // (qmd.ts doesn't export it since it's a CLI internal)
 // =============================================================================
 

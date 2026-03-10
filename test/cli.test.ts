@@ -24,7 +24,7 @@ let testCounter = 0; // Unique counter for each test run
 // Get the directory where this test file lives
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
-const qmdScript = join(projectRoot, "src", "qmd.ts");
+const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
 // Resolve tsx binary from project's node_modules (not cwd-dependent)
 const tsxBin = (() => {
   const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
@@ -485,7 +485,7 @@ ${token}
 
     const update = await runQmd(["update"], { dbPath, configDir });
     expect(update.exitCode).toBe(0);
-    expect(update.stdout).toContain("No files found matching pattern.");
+    expect(update.stdout).toContain("0 new, 0 updated, 0 unchanged, 1 removed");
 
     const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
     expect(after.exitCode).toBe(1);

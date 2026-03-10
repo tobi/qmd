@@ -1441,6 +1441,25 @@ export async function withLLMSession<T>(
 }
 
 /**
+ * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Unlike withLLMSession, this does not use the global singleton.
+ */
+export async function withLLMSessionForLlm<T>(
+  llm: LlamaCpp,
+  fn: (session: ILLMSession) => Promise<T>,
+  options?: LLMSessionOptions
+): Promise<T> {
+  const manager = new LLMSessionManager(llm);
+  const session = new LLMSession(manager, options);
+
+  try {
+    return await fn(session);
+  } finally {
+    session.release();
+  }
+}
+
+/**
  * Check if idle unload is safe (no active sessions or operations).
  * Used internally by LlamaCpp idle timer.
  */

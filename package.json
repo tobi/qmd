@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "qmd": "dist/qmd.js"
+    "qmd": "dist/cli/qmd.js"
   },
   "files": [
     "dist/",
@@ -21,15 +21,15 @@
   ],
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/qmd.js > dist/qmd.tmp && mv dist/qmd.tmp dist/qmd.js && chmod +x dist/qmd.js",
+    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
     "test": "vitest run --reporter=verbose test/",
-    "qmd": "tsx src/qmd.ts",
-    "index": "tsx src/qmd.ts index",
-    "vector": "tsx src/qmd.ts vector",
-    "search": "tsx src/qmd.ts search",
-    "vsearch": "tsx src/qmd.ts vsearch",
-    "rerank": "tsx src/qmd.ts rerank",
-    "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
+    "qmd": "tsx src/cli/qmd.ts",
+    "index": "tsx src/cli/qmd.ts index",
+    "vector": "tsx src/cli/qmd.ts vector",
+    "search": "tsx src/cli/qmd.ts search",
+    "vsearch": "tsx src/cli/qmd.ts vsearch",
+    "rerank": "tsx src/cli/qmd.ts rerank",
+    "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",
     "release": "./scripts/release.sh"
   },
   "publishConfig": {

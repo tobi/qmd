@@ -1,5 +1,5 @@
-import { openDatabase } from "./db.js";
-import type { Database } from "./db.js";
+import { openDatabase } from "../db.js";
+import type { Database } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -73,8 +73,8 @@ import {
   generateEmbeddings,
   syncConfigToDb,
   type ReindexResult,
-} from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+} from "../store.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -94,7 +94,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
-} from "./collections.js";
+} from "../collections.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -1400,7 +1400,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   }
 
   // Add to YAML config + sync to SQLite
-  const { addCollection } = await import("./collections.js");
+  const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
   resyncConfig();
 
@@ -2395,7 +2395,7 @@ function parseCLI() {
 function showSkill(): void {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const relativePath = pathJoin("skills", "qmd", "SKILL.md");
-  const skillPath = pathJoin(scriptDir, "..", relativePath);
+  const skillPath = pathJoin(scriptDir, "..", "..", relativePath);
 
   console.log(`QMD Skill (${relativePath})`);
   console.log(`Location: ${skillPath}`);
@@ -2499,7 +2499,7 @@ function showHelp(): void {
 
 async function showVersion(): Promise<void> {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
-  const pkgPath = resolve(scriptDir, "..", "package.json");
+  const pkgPath = resolve(scriptDir, "..", "..", "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   let commit = "";
@@ -2694,7 +2694,7 @@ if (isMain) {
             console.error("  Omit command to clear it");
             process.exit(1);
           }
-          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const { updateCollectionSettings, getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2717,7 +2717,7 @@ if (isMain) {
             console.error(`  ${subcommand === 'include' ? 'Include' : 'Exclude'} collection in default queries`);
             process.exit(1);
           }
-          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const { updateCollectionSettings, getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2736,7 +2736,7 @@ if (isMain) {
             console.error("Usage: qmd collection show <name>");
             process.exit(1);
           }
-          const { getCollection } = await import("./collections.js");
+          const { getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2896,7 +2896,7 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
@@ -2915,7 +2915,7 @@ if (isMain) {
         // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("./mcp.js");
+        const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
           await startMcpHttpServer(port);
         } catch (e: any) {
@@ -2927,7 +2927,7 @@ if (isMain) {
         }
       } else {
         // Default: stdio transport
-        const { startMcpServer } = await import("./mcp.js");
+        const { startMcpServer } = await import("../mcp/server.js");
         await startMcpServer();
       }
       break;
