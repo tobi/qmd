@@ -44,6 +44,7 @@ import {
   parseVirtualPath,
   normalizeDocid,
   isDocid,
+  syncConfigToDb,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   type Store,
@@ -67,6 +68,7 @@ import type { CollectionConfig } from "../src/collections.js";
 let testDir: string;
 let testDbPath: string;
 let testConfigDir: string;
+let currentTestStore: Store | null = null;
 
 async function createTestStore(): Promise<Store> {
   testDbPath = join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
@@ -85,10 +87,13 @@ async function createTestStore(): Promise<Store> {
     YAML.stringify(emptyConfig)
   );
 
-  return createStore(testDbPath);
+  const store = createStore(testDbPath);
+  currentTestStore = store;
+  return store;
 }
 
 async function cleanupTestDb(store: Store): Promise<void> {
+  currentTestStore = null;
   store.close();
   try {
     await unlink(store.dbPath);
@@ -163,6 +168,18 @@ async function insertTestDocument(
   return Number(result.lastInsertRowid);
 }
 
+/** Sync YAML config file to SQLite store_collections in the current test store */
+async function syncTestConfig(): Promise<void> {
+  if (!currentTestStore) return;
+  const configPath = join(testConfigDir, "index.yml");
+  const { readFile } = await import("node:fs/promises");
+  const content = await readFile(configPath, "utf-8");
+  const config = YAML.parse(content) as CollectionConfig;
+  // Clear config hash to force re-sync
+  currentTestStore.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+  syncConfigToDb(currentTestStore.db, config);
+}
+
 // Helper to create a test collection in YAML config
 async function createTestCollection(
   options: { pwd?: string; glob?: string; name?: string } = {}
@@ -185,6 +202,7 @@ async function createTestCollection(
 
   // Write back
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
   return name;
 }
 
@@ -209,6 +227,7 @@ async function addPathContext(collectionName: string, pathPrefix: string, contex
 
   // Write back
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
 }
 
 // Helper to add global context in YAML config
@@ -221,6 +240,7 @@ async function addGlobalContext(contextText: string): Promise<void> {
   config.global_context = contextText;
 
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
 }
 
 // =============================================================================
@@ -2376,8 +2396,8 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(expanded.length).toBeGreaterThanOrEqual(1);
     for (const q of expanded) {
       expect(['lex', 'vec', 'hyde']).toContain(q.type);
-      expect(q.text.length).toBeGreaterThan(0);
-      expect(q.text).not.toBe("test query"); // original excluded
+      expect(q.query.length).toBeGreaterThan(0);
+      expect(q.query).not.toBe("test query"); // original excluded
     }
 
     await cleanupTestDb(store);

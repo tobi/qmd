@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
+import { syncConfigToDb } from "../src/store";
 
 // =============================================================================
 // Test Database Setup
@@ -104,6 +105,26 @@ function initTestDatabase(db: Database): void {
 
   // Create vector table
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[768] distance_metric=cosine)`);
+
+  // Store collections — makes the DB self-contained
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_collections (
+      name TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      pattern TEXT NOT NULL DEFAULT '**/*.md',
+      ignore_patterns TEXT,
+      include_by_default INTEGER DEFAULT 1,
+      update_command TEXT,
+      context TEXT
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_config (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
 }
 
 function seedTestData(db: Database): void {
@@ -234,6 +255,9 @@ describe("MCP Server", () => {
     testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
+
+    // Sync YAML config into SQLite store_collections
+    syncConfigToDb(testDb, testConfig);
   });
 
   afterAll(async () => {
@@ -332,7 +356,7 @@ describe("MCP Server", () => {
       expect(expanded.length).toBeGreaterThanOrEqual(1);
       for (const q of expanded) {
         expect(['lex', 'vec', 'hyde']).toContain(q.type);
-        expect(q.text.length).toBeGreaterThan(0);
+        expect(q.query.length).toBeGreaterThan(0);
       }
     }, 30000); // 30s timeout for model loading
 
@@ -382,7 +406,7 @@ describe("MCP Server", () => {
       // Expanded queries → route by type: lex→FTS, vec/hyde skipped (no vectors in test)
       for (const q of expanded) {
         if (q.type === 'lex') {
-          const ftsResults = searchFTS(testDb, q.text, 20);
+          const ftsResults = searchFTS(testDb, q.query, 20);
           if (ftsResults.length > 0) {
             rankedLists.push(ftsResults.map(r => ({
               file: r.filepath, displayPath: r.displayPath,
@@ -888,12 +912,9 @@ describe("MCP HTTP Transport", () => {
     const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);
-    db.close();
 
-    // Create isolated YAML config
-    const configPrefix = join(tmpdir(), `qmd-mcp-http-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    httpTestConfigDir = await mkdtemp(configPrefix);
-    const testConfig: CollectionConfig = {
+    // Sync config into SQLite
+    const httpTestConfig: CollectionConfig = {
       collections: {
         docs: {
           path: "/test/docs",
@@ -901,7 +922,13 @@ describe("MCP HTTP Transport", () => {
         }
       }
     };
-    await writeFile(join(httpTestConfigDir, "index.yml"), YAML.stringify(testConfig));
+    syncConfigToDb(db, httpTestConfig);
+    db.close();
+
+    // Create isolated YAML config
+    const configPrefix = join(tmpdir(), `qmd-mcp-http-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    httpTestConfigDir = await mkdtemp(configPrefix);
+    await writeFile(join(httpTestConfigDir, "index.yml"), YAML.stringify(httpTestConfig));
 
     // Point createStore() at our test DB
     process.env.INDEX_PATH = httpTestDbPath;

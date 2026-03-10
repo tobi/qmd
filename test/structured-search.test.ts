@@ -3,7 +3,7 @@
  *
  * Tests cover:
  * - CLI query parser (parseStructuredQuery)
- * - StructuredSubSearch type validation
+ * - ExpandedQuery type validation
  * - Basic structuredSearch function behavior
  *
  * Run with: bun test structured-search.test.ts
@@ -18,7 +18,7 @@ import {
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
-  type StructuredSubSearch,
+  type ExpandedQuery,
   type Store,
 } from "../src/store.js";
 import { disposeDefaultLlamaCpp } from "../src/llm.js";
@@ -27,7 +27,7 @@ import { disposeDefaultLlamaCpp } from "../src/llm.js";
 // parseStructuredQuery Tests (CLI Parser)
 // =============================================================================
 
-function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+function parseStructuredQuery(query: string): ExpandedQuery[] | null {
   const rawLines = query.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
@@ -38,7 +38,7 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
 
   const prefixRe = /^(lex|vec|hyde):\s*/i;
   const expandRe = /^expand:\s*/i;
-  const typed: StructuredSubSearch[] = [];
+  const typed: ExpandedQuery[] = [];
 
   for (const line of rawLines) {
     if (expandRe.test(line.trimmed)) {
@@ -253,24 +253,24 @@ describe("parseStructuredQuery", () => {
 });
 
 // =============================================================================
-// StructuredSubSearch Type Tests
+// ExpandedQuery Type Tests
 // =============================================================================
 
-describe("StructuredSubSearch type", () => {
+describe("ExpandedQuery type", () => {
   test("accepts lex type", () => {
-    const search: StructuredSubSearch = { type: "lex", query: "test" };
+    const search: ExpandedQuery = { type: "lex", query: "test" };
     expect(search.type).toBe("lex");
     expect(search.query).toBe("test");
   });
 
   test("accepts vec type", () => {
-    const search: StructuredSubSearch = { type: "vec", query: "test" };
+    const search: ExpandedQuery = { type: "vec", query: "test" };
     expect(search.type).toBe("vec");
     expect(search.query).toBe("test");
   });
 
   test("accepts hyde type", () => {
-    const search: StructuredSubSearch = { type: "hyde", query: "test" };
+    const search: ExpandedQuery = { type: "hyde", query: "test" };
     expect(search.type).toBe("hyde");
     expect(search.query).toBe("test");
   });

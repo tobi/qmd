@@ -23,7 +23,7 @@ import {
   structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { Store, StructuredSubSearch } from "./store.js";
+import type { Store, ExpandedQuery } from "./store.js";
 import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 
@@ -322,7 +322,7 @@ Intent-aware lex (C++ performance, not sports):
     },
     async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
       // Map to internal format
-      const subSearches: StructuredSubSearch[] = searches.map(s => ({
+      const subSearches: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
         query: s.query,
       }));
@@ -654,7 +654,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         }
 
         // Map to internal format
-        const subSearches: StructuredSubSearch[] = params.searches.map((s: any) => ({
+        const subSearches: ExpandedQuery[] = params.searches.map((s: any) => ({
           type: s.type as 'lex' | 'vec' | 'hyde',
           query: String(s.query || ""),
         }));

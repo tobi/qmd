@@ -15,28 +15,24 @@ import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { realpathSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { resolve } from "node:path";
+import fastGlob from "fast-glob";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  withLLMSessionForLlm,
+  type LLMSessionOptions,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
-import {
-  findContextForPath as collectionsFindContextForPath,
-  addContext as collectionsAddContext,
-  removeContext as collectionsRemoveContext,
-  listAllContexts as collectionsListAllContexts,
-  getCollection,
-  listCollections as collectionsListCollections,
-  addCollection as collectionsAddCollection,
-  removeCollection as collectionsRemoveCollection,
-  renameCollection as collectionsRenameCollection,
-  setGlobalContext,
-  loadConfig as collectionsLoadConfig,
-  type NamedCollection,
+import type {
+  NamedCollection,
+  Collection,
+  CollectionConfig,
+  ContextMap,
 } from "./collections.js";
 
 // =============================================================================
@@ -60,6 +56,14 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 // Search window for finding optimal break points (in tokens, ~200 tokens)
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+
+/**
+ * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * falls back to the global singleton.
+ */
+function getLlm(store: Store): LlamaCpp {
+  return store.llm ?? getDefaultLlamaCpp();
+}
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -236,7 +240,9 @@ export const RERANK_CANDIDATE_LIMIT = 40;
  */
 export type ExpandedQuery = {
   type: 'lex' | 'vec' | 'hyde';
-  text: string;
+  query: string;
+  /** Optional line number for error reporting (CLI parser) */
+  line?: number;
 };
 
 // =============================================================================
@@ -560,8 +566,8 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  * Returns null if the file is not in any indexed collection.
  */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
+  // Get all collections from DB
+  const collections = getStoreCollections(db);
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
@@ -693,6 +699,27 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // Store collections — makes the DB self-contained (no external config needed)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_collections (
+      name TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      pattern TEXT NOT NULL DEFAULT '**/*.md',
+      ignore_patterns TEXT,
+      include_by_default INTEGER DEFAULT 1,
+      update_command TEXT,
+      context TEXT
+    )
+  `);
+
+  // Store config — key-value metadata (e.g. config_hash for sync optimization)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_config (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+
   // FTS - index filepath (collection/path), title, and content
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -740,6 +767,180 @@ function initializeDatabase(db: Database): void {
   `);
 }
 
+// =============================================================================
+// Store Collections — DB accessor functions
+// =============================================================================
+
+type StoreCollectionRow = {
+  name: string;
+  path: string;
+  pattern: string;
+  ignore_patterns: string | null;
+  include_by_default: number;
+  update_command: string | null;
+  context: string | null;
+};
+
+function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
+  return {
+    name: row.name,
+    path: row.path,
+    pattern: row.pattern,
+    ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
+    ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
+    ...(row.update_command ? { update: row.update_command } : {}),
+    ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
+  };
+}
+
+export function getStoreCollections(db: Database): NamedCollection[] {
+  const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
+  return rows.map(rowToNamedCollection);
+}
+
+export function getStoreCollection(db: Database, name: string): NamedCollection | null {
+  const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
+  if (row == null) return null;
+  return rowToNamedCollection(row);
+}
+
+export function getStoreGlobalContext(db: Database): string | undefined {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = 'global_context'`).get() as { value: string } | null | undefined;
+  if (row == null) return undefined;
+  return row.value || undefined;
+}
+
+export function getStoreContexts(db: Database): Array<{ collection: string; path: string; context: string }> {
+  const results: Array<{ collection: string; path: string; context: string }> = [];
+
+  // Global context
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    results.push({ collection: "*", path: "/", context: globalCtx });
+  }
+
+  // Collection contexts
+  const rows = db.prepare(`SELECT name, context FROM store_collections WHERE context IS NOT NULL`).all() as { name: string; context: string }[];
+  for (const row of rows) {
+    const ctxMap = JSON.parse(row.context) as ContextMap;
+    for (const [path, context] of Object.entries(ctxMap)) {
+      results.push({ collection: row.name, path, context });
+    }
+  }
+
+  return results;
+}
+
+export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  db.prepare(`
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      path = excluded.path,
+      pattern = excluded.pattern,
+      ignore_patterns = excluded.ignore_patterns,
+      include_by_default = excluded.include_by_default,
+      update_command = excluded.update_command,
+      context = excluded.context
+  `).run(
+    name,
+    collection.path,
+    collection.pattern || '**/*.md',
+    collection.ignore ? JSON.stringify(collection.ignore) : null,
+    collection.includeByDefault === false ? 0 : 1,
+    collection.update || null,
+    collection.context ? JSON.stringify(collection.context) : null,
+  );
+}
+
+export function deleteStoreCollection(db: Database, name: string): boolean {
+  const result = db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(name);
+  return result.changes > 0;
+}
+
+export function renameStoreCollection(db: Database, oldName: string, newName: string): boolean {
+  // Check target doesn't exist
+  const existing = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(newName) as { name: string } | null | undefined;
+  if (existing != null) {
+    throw new Error(`Collection '${newName}' already exists`);
+  }
+
+  const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
+  return result.changes > 0;
+}
+
+export function updateStoreContext(db: Database, collectionName: string, path: string, text: string): boolean {
+  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
+  if (row == null) return false;
+
+  const ctxMap: ContextMap = row.context ? JSON.parse(row.context) : {};
+  ctxMap[path] = text;
+  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(JSON.stringify(ctxMap), collectionName);
+  return true;
+}
+
+export function removeStoreContext(db: Database, collectionName: string, path: string): boolean {
+  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
+  if (row == null) return false;
+  if (!row.context) return false;
+
+  const ctxMap: ContextMap = JSON.parse(row.context);
+  if (!(path in ctxMap)) return false;
+
+  delete ctxMap[path];
+  const newCtx = Object.keys(ctxMap).length > 0 ? JSON.stringify(ctxMap) : null;
+  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(newCtx, collectionName);
+  return true;
+}
+
+export function setStoreGlobalContext(db: Database, value: string | undefined): void {
+  if (value === undefined) {
+    db.prepare(`DELETE FROM store_config WHERE key = 'global_context'`).run();
+  } else {
+    db.prepare(`INSERT INTO store_config (key, value) VALUES ('global_context', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(value);
+  }
+}
+
+/**
+ * Sync external config (YAML/inline) into SQLite store_collections.
+ * External config always wins. Skips sync if config hash hasn't changed.
+ */
+export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  // Check config hash — skip sync if unchanged
+  const configJson = JSON.stringify(config);
+  const hash = createHash('sha256').update(configJson).digest('hex');
+
+  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
+  if (existingHash != null && existingHash.value === hash) {
+    return; // Config unchanged, skip sync
+  }
+
+  // Sync collections
+  const configNames = new Set(Object.keys(config.collections));
+
+  for (const [name, coll] of Object.entries(config.collections)) {
+    upsertStoreCollection(db, name, coll);
+  }
+
+  // Delete collections not in config
+  const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
+  for (const row of dbCollections) {
+    if (!configNames.has(row.name)) {
+      db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+    }
+  }
+
+  // Sync global context
+  if (config.global_context !== undefined) {
+    setStoreGlobalContext(db, config.global_context);
+  } else {
+    setStoreGlobalContext(db, undefined);
+  }
+
+  // Save config hash
+  db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+}
+
 
 export function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
@@ -769,6 +970,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
+  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
+  llm?: LlamaCpp;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -837,6 +1040,275 @@ export type Store = {
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
 };
 
+// =============================================================================
+// Reindex & Embed — pure-logic functions for SDK and CLI
+// =============================================================================
+
+export type ReindexProgress = {
+  file: string;
+  current: number;
+  total: number;
+};
+
+export type ReindexResult = {
+  indexed: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  orphanedCleaned: number;
+};
+
+/**
+ * Re-index a single collection by scanning the filesystem and updating the database.
+ * Pure function — no console output, no db lifecycle management.
+ */
+export async function reindexCollection(
+  store: Store,
+  collectionPath: string,
+  globPattern: string,
+  collectionName: string,
+  options?: {
+    ignorePatterns?: string[];
+    onProgress?: (info: ReindexProgress) => void;
+  }
+): Promise<ReindexResult> {
+  const db = store.db;
+  const now = new Date().toISOString();
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(options?.ignorePatterns || []),
+  ];
+  const allFiles: string[] = await fastGlob(globPattern, {
+    cwd: collectionPath,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+    ignore: allIgnore,
+  });
+  // Filter hidden files/folders
+  const files = allFiles.filter(file => {
+    const parts = file.split("/");
+    return !parts.some(part => part.startsWith("."));
+  });
+
+  const total = files.length;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const seenPaths = new Set<string>();
+
+  for (const relativeFile of files) {
+    const filepath = getRealPath(resolve(collectionPath, relativeFile));
+    const path = handelize(relativeFile);
+    seenPaths.add(path);
+
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch {
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    if (!content.trim()) {
+      processed++;
+      continue;
+    }
+
+    const hash = await hashContent(content);
+    const title = extractTitle(content, relativeFile);
+
+    const existing = findActiveDocument(db, collectionName, path);
+
+    if (existing) {
+      if (existing.hash === hash) {
+        if (existing.title !== title) {
+          updateDocumentTitle(db, existing.id, title, now);
+          updated++;
+        } else {
+          unchanged++;
+        }
+      } else {
+        insertContent(db, hash, content, now);
+        const stat = statSync(filepath);
+        updateDocument(db, existing.id, title, hash,
+          stat ? new Date(stat.mtime).toISOString() : now);
+        updated++;
+      }
+    } else {
+      indexed++;
+      insertContent(db, hash, content, now);
+      const stat = statSync(filepath);
+      insertDocument(db, collectionName, path, title, hash,
+        stat ? new Date(stat.birthtime).toISOString() : now,
+        stat ? new Date(stat.mtime).toISOString() : now);
+    }
+
+    processed++;
+    options?.onProgress?.({ file: relativeFile, current: processed, total });
+  }
+
+  // Deactivate documents that no longer exist
+  const allActive = getActiveDocumentPaths(db, collectionName);
+  let removed = 0;
+  for (const path of allActive) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionName, path);
+      removed++;
+    }
+  }
+
+  const orphanedCleaned = cleanupOrphanedContent(db);
+
+  return { indexed, updated, unchanged, removed, orphanedCleaned };
+}
+
+export type EmbedProgress = {
+  chunksEmbedded: number;
+  totalChunks: number;
+  bytesProcessed: number;
+  totalBytes: number;
+  errors: number;
+};
+
+export type EmbedResult = {
+  docsProcessed: number;
+  chunksEmbedded: number;
+  errors: number;
+  durationMs: number;
+};
+
+/**
+ * Generate vector embeddings for documents that need them.
+ * Pure function — no console output, no db lifecycle management.
+ * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ */
+export async function generateEmbeddings(
+  store: Store,
+  options?: {
+    force?: boolean;
+    model?: string;
+    onProgress?: (info: EmbedProgress) => void;
+  }
+): Promise<EmbedResult> {
+  const db = store.db;
+  const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const now = new Date().toISOString();
+
+  if (options?.force) {
+    clearAllEmbeddings(db);
+  }
+
+  const hashesToEmbed = getHashesForEmbedding(db);
+
+  if (hashesToEmbed.length === 0) {
+    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+  }
+
+  // Chunk all documents
+  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number };
+  const allChunks: ChunkItem[] = [];
+
+  for (const item of hashesToEmbed) {
+    const encoder = new TextEncoder();
+    const bodyBytes = encoder.encode(item.body).length;
+    if (bodyBytes === 0) continue;
+
+    const title = extractTitle(item.body, item.path);
+    const chunks = await chunkDocumentByTokens(item.body);
+
+    for (let seq = 0; seq < chunks.length; seq++) {
+      allChunks.push({
+        hash: item.hash,
+        title,
+        text: chunks[seq]!.text,
+        seq,
+        pos: chunks[seq]!.pos,
+        tokens: chunks[seq]!.tokens,
+        bytes: encoder.encode(chunks[seq]!.text).length,
+      });
+    }
+  }
+
+  if (allChunks.length === 0) {
+    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+  }
+
+  const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
+  const totalChunks = allChunks.length;
+  const totalDocs = hashesToEmbed.length;
+  const startTime = Date.now();
+
+  // Use store's LlamaCpp or global singleton, wrapped in a session
+  const llm = getLlm(store);
+  const sessionOptions: LLMSessionOptions = { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' };
+
+  // Create a session manager for this llm instance
+  const result = await withLLMSessionForLlm(llm, async (session) => {
+    // Get embedding dimensions from first chunk
+    const firstChunk = allChunks[0]!;
+    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+    const firstResult = await session.embed(firstText);
+    if (!firstResult) {
+      throw new Error("Failed to get embedding dimensions from first chunk");
+    }
+    store.ensureVecTable(firstResult.embedding.length);
+
+    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
+    const BATCH_SIZE = 32;
+
+    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+      const batch = allChunks.slice(batchStart, batchEnd);
+      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
+      try {
+        const embeddings = await session.embedBatch(texts);
+        for (let i = 0; i < batch.length; i++) {
+          const chunk = batch[i]!;
+          const embedding = embeddings[i];
+          if (embedding) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+          bytesProcessed += chunk.bytes;
+        }
+      } catch {
+        // Batch failed — try individual embeddings as fallback
+        for (const chunk of batch) {
+          try {
+            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const result = await session.embed(text);
+            if (result) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              chunksEmbedded++;
+            } else {
+              errors++;
+            }
+          } catch {
+            errors++;
+          }
+          bytesProcessed += chunk.bytes;
+        }
+      }
+
+      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+    }
+
+    return { chunksEmbedded, errors };
+  }, sessionOptions);
+
+  return {
+    docsProcessed: totalDocs,
+    chunksEmbedded: result.chunksEmbedded,
+    errors: result.errors,
+    durationMs: Date.now() - startTime,
+  };
+}
+
 /**
  * Create a new store instance with the given database path.
  * If no path is provided, uses the default path (~/.cache/qmd/index.sqlite).
@@ -849,7 +1321,7 @@ export function createStore(dbPath?: string): Store {
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
-  return {
+  const store: Store = {
     db,
     dbPath: resolvedPath,
     close: () => db.close(),
@@ -892,8 +1364,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -919,6 +1391,8 @@ export function createStore(dbPath?: string): Store {
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
   };
+
+  return store;
 }
 
 // =============================================================================
@@ -1098,8 +1572,8 @@ export type MultiGetResult = {
 
 export type CollectionInfo = {
   name: string;
-  path: string;
-  pattern: string;
+  path: string | null;
+  pattern: string | null;
   documents: number;
   lastUpdated: string;
 };
@@ -1649,8 +2123,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * @returns Context string or null if no context is defined
  */
 export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
-  const config = collectionsLoadConfig();
-  const coll = getCollection(collectionName);
+  const coll = getStoreCollection(db, collectionName);
 
   if (!coll) return null;
 
@@ -1658,8 +2131,9 @@ export function getContextForPath(db: Database, collectionName: string, path: st
   const contexts: string[] = [];
 
   // Add global context if present
-  if (config.global_context) {
-    contexts.push(config.global_context);
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    contexts.push(globalCtx);
   }
 
   // Add all matching path contexts (from most general to most specific)
@@ -1690,15 +2164,14 @@ export function getContextForPath(db: Database, collectionName: string, path: st
 
 /**
  * Get context for a file path (virtual or filesystem).
- * Resolves the collection and relative path using the YAML collections config.
+ * Resolves the collection and relative path from the DB store_collections table.
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
   // Handle undefined or null filepath
   if (!filepath) return null;
 
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
-  const config = collectionsLoadConfig();
+  // Get all collections from DB
+  const collections = getStoreCollections(db);
 
   // Parse virtual path format: qmd://collection/path
   let collectionName: string | null = null;
@@ -1727,8 +2200,8 @@ export function getContextForFile(db: Database, filepath: string): string | null
     if (!collectionName || relativePath === null) return null;
   }
 
-  // Get the collection from config
-  const coll = getCollection(collectionName);
+  // Get the collection from DB
+  const coll = getStoreCollection(db, collectionName);
   if (!coll) return null;
 
   // Verify this document exists in the database
@@ -1745,8 +2218,9 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const contexts: string[] = [];
 
   // Add global context if present
-  if (config.global_context) {
-    contexts.push(config.global_context);
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    contexts.push(globalCtx);
   }
 
   // Add all matching path contexts (from most general to most specific)
@@ -1776,11 +2250,10 @@ export function getContextForFile(db: Database, filepath: string): string | null
 }
 
 /**
- * Get collection by name from YAML config.
- * Returns collection metadata from ~/.config/qmd/index.yml
+ * Get collection by name from DB store_collections table.
  */
 export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
-  const collection = getCollection(name);
+  const collection = getStoreCollection(db, name);
   if (!collection) return null;
 
   return {
@@ -1792,10 +2265,10 @@ export function getCollectionByName(db: Database, name: string): { name: string;
 
 /**
  * List all collections with document counts from database.
- * Merges YAML config with database statistics.
+ * Merges store_collections config with database statistics.
  */
 export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
-  const collections = collectionsListCollections();
+  const collections = getStoreCollections(db);
 
   // Get document counts from database for each collection
   const result = collections.map(coll => {
@@ -1835,8 +2308,8 @@ export function removeCollection(db: Database, collectionName: string): { delete
     WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
   `).run();
 
-  // Remove from YAML config (returns true if found and removed)
-  collectionsRemoveCollection(collectionName);
+  // Remove from store_collections
+  deleteStoreCollection(db, collectionName);
 
   return {
     deletedDocs: docResult.changes,
@@ -1853,8 +2326,8 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
     .run(newName, oldName);
 
-  // Rename in YAML config
-  collectionsRenameCollection(oldName, newName);
+  // Rename in store_collections
+  renameStoreCollection(db, oldName, newName);
 }
 
 // =============================================================================
@@ -1871,8 +2344,8 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
     throw new Error(`Collection with id ${collectionId} not found`);
   }
 
-  // Use collections.ts to add context
-  collectionsAddContext(coll.name, pathPrefix, context);
+  // Add context to store_collections
+  updateStoreContext(db, coll.name, pathPrefix, context);
 }
 
 /**
@@ -1880,8 +2353,8 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
  * Returns the number of contexts deleted.
  */
 export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
-  // Use collections.ts to remove context
-  const success = collectionsRemoveContext(collectionName, pathPrefix);
+  // Remove context from store_collections
+  const success = removeStoreContext(db, collectionName, pathPrefix);
   return success ? 1 : 0;
 }
 
@@ -1893,13 +2366,13 @@ export function deleteGlobalContexts(db: Database): number {
   let deletedCount = 0;
 
   // Remove global context
-  setGlobalContext(undefined);
+  setStoreGlobalContext(db, undefined);
   deletedCount++;
 
   // Remove root context (empty string) from all collections
-  const collections = collectionsListCollections();
+  const collections = getStoreCollections(db);
   for (const coll of collections) {
-    const success = collectionsRemoveContext(coll.name, '');
+    const success = removeStoreContext(db, coll.name, '');
     if (success) {
       deletedCount++;
     }
@@ -1913,7 +2386,7 @@ export function deleteGlobalContexts(db: Database): number {
  * Returns contexts ordered by collection name, then by path prefix length (longest first).
  */
 export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const allContexts = collectionsListAllContexts();
+  const allContexts = getStoreContexts(db);
 
   // Convert to expected format and sort
   return allContexts.map(ctx => ({
@@ -1938,7 +2411,7 @@ export function listPathContexts(db: Database): { collection_name: string; path_
  * Get all collections (name only - from YAML config).
  */
 export function getAllCollections(db: Database): { name: string }[] {
-  const collections = collectionsListCollections();
+  const collections = getStoreCollections(db);
   return collections.map(c => ({ name: c.name }));
 }
 
@@ -1947,13 +2420,13 @@ export function getAllCollections(db: Database): { name: string }[] {
  * Returns collections that have no context entries at all (not even root context).
  */
 export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
-  // Get all collections from YAML config
-  const yamlCollections = collectionsListCollections();
+  // Get all collections from DB
+  const allCollections = getStoreCollections(db);
 
   // Filter to those without context
   const collectionsWithoutContext: { name: string; pwd: string; doc_count: number }[] = [];
 
-  for (const coll of yamlCollections) {
+  for (const coll of allCollections) {
     // Check if collection has any context
     if (!coll.context || Object.keys(coll.context).length === 0) {
       // Get doc count from database
@@ -1985,13 +2458,13 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
     WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
 
-  // Get existing contexts for this collection from YAML
-  const yamlColl = getCollection(collectionName);
-  if (!yamlColl) return [];
+  // Get existing contexts for this collection from DB
+  const dbColl = getStoreCollection(db, collectionName);
+  if (!dbColl) return [];
 
   const contextPrefixes = new Set<string>();
-  if (yamlColl.context) {
-    for (const prefix of Object.keys(yamlColl.context)) {
+  if (dbColl.context) {
+    for (const prefix of Object.keys(dbColl.context)) {
       contextPrefixes.add(prefix);
     }
   }
@@ -2288,12 +2761,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2346,19 +2819,25 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
-      return JSON.parse(cached) as ExpandedQuery[];
+      const parsed = JSON.parse(cached) as any[];
+      // Migrate old cache format: { type, text } → { type, query }
+      if (parsed.length > 0 && parsed[0].query) {
+        return parsed as ExpandedQuery[];
+      } else if (parsed.length > 0 && parsed[0].text) {
+        return parsed.map((r: any) => ({ type: r.type, query: r.text }));
+      }
     } catch {
       // Old cache format (pre-typed, newline-separated text) — re-expand
     }
   }
 
-  const llm = getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
@@ -2366,7 +2845,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   // Filter out entries that duplicate the original query text.
   const expanded: ExpandedQuery[] = results
     .filter(r => r.text !== query)
-    .map(r => ({ type: r.type, text: r.text }));
+    .map(r => ({ type: r.type, query: r.text }));
 
   if (expanded.length > 0) {
     setCachedResult(db, cacheKey, JSON.stringify(expanded));
@@ -2379,7 +2858,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -2404,7 +2883,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
@@ -2620,9 +3099,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
     `).get(`%${filepath}`) as DbDocRow | null;
   }
 
-  // Try to match by absolute path (requires looking up collection paths from YAML)
+  // Try to match by absolute path (requires looking up collection paths from DB)
   if (!doc && !filepath.startsWith('qmd://')) {
-    const collections = collectionsListCollections();
+    const collections = getStoreCollections(db);
     for (const coll of collections) {
       let relativePath: string | null = null;
 
@@ -2690,9 +3169,9 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
     `).get(filepath) as { body: string } | null;
   }
 
-  // Try absolute path by looking up in YAML collections
+  // Try absolute path by looking up in DB store_collections
   if (!row) {
-    const collections = collectionsListCollections();
+    const collections = getStoreCollections(db);
     for (const coll of collections) {
       if (filepath.startsWith(coll.path + '/')) {
         const relativePath = filepath.slice(coll.path.length + 1);
@@ -2835,25 +3314,29 @@ export function findDocuments(
 // =============================================================================
 
 export function getStatus(db: Database): IndexStatus {
-  // Load collections from YAML
-  const yamlCollections = collectionsListCollections();
+  // DB is source of truth for collections — config provides supplementary metadata
+  const dbCollections = db.prepare(`
+    SELECT
+      collection as name,
+      COUNT(*) as active_count,
+      MAX(modified_at) as last_doc_update
+    FROM documents
+    WHERE active = 1
+    GROUP BY collection
+  `).all() as { name: string; active_count: number; last_doc_update: string | null }[];
 
-  // Get document counts and last update times for each collection
-  const collections = yamlCollections.map(col => {
-    const stats = db.prepare(`
-      SELECT
-        COUNT(*) as active_count,
-        MAX(modified_at) as last_doc_update
-      FROM documents
-      WHERE collection = ? AND active = 1
-    `).get(col.name) as { active_count: number; last_doc_update: string | null };
+  // Build a lookup from store_collections for path/pattern metadata
+  const storeCollections = getStoreCollections(db);
+  const configLookup = new Map(storeCollections.map(c => [c.name, { path: c.path, pattern: c.pattern }]));
 
+  const collections: CollectionInfo[] = dbCollections.map(row => {
+    const config = configLookup.get(row.name);
     return {
-      name: col.name,
-      path: col.path,
-      pattern: col.pattern,
-      documents: stats.active_count,
-      lastUpdated: stats.last_doc_update || new Date().toISOString(),
+      name: row.name,
+      path: config?.path ?? null,
+      pattern: config?.pattern ?? null,
+      documents: row.active_count,
+      lastUpdated: row.last_doc_update || new Date().toISOString(),
     };
   });
 
@@ -3044,6 +3527,7 @@ export interface HybridQueryOptions {
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
+  skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   hooks?: SearchHooks;
 }
 
@@ -3090,6 +3574,7 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
+  const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -3141,14 +3626,14 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.text, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
-        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.text });
+        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
     }
   }
@@ -3160,12 +3645,12 @@ export async function hybridQuery(
     ];
     for (const q of expanded) {
       if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.text, queryType: q.type });
+        vecQueries.push({ text: q.query, queryType: q.type });
       }
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
+    const llm = getLlm(store);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -3208,7 +3693,6 @@ export async function hybridQuery(
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
   for (const cand of candidates) {
@@ -3228,11 +3712,68 @@ export async function hybridQuery(
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
-    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
 
+  if (skipRerank) {
+    // Skip LLM reranking — return candidates scored by RRF only
+    const seenFiles = new Set<string>();
+    return candidates
+      .map((cand, i) => {
+        const chunkInfo = docChunkMap.get(cand.file);
+        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const rrfRank = i + 1;
+        const rrfScore = 1 / rrfRank;
+        const trace = rrfTraceByFile?.get(cand.file);
+        const explainData: HybridQueryExplain | undefined = explain ? {
+          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          rrf: {
+            rank: rrfRank,
+            positionScore: rrfScore,
+            weight: 1.0,
+            baseScore: trace?.baseScore ?? 0,
+            topRankBonus: trace?.topRankBonus ?? 0,
+            totalScore: trace?.totalScore ?? 0,
+            contributions: trace?.contributions ?? [],
+          },
+          rerankScore: 0,
+          blendedScore: rrfScore,
+        } : undefined;
+
+        return {
+          file: cand.file,
+          displayPath: cand.displayPath,
+          title: cand.title,
+          body: cand.body,
+          bestChunk,
+          bestChunkPos,
+          score: rrfScore,
+          context: store.getContextForFile(cand.file),
+          docid: docidMap.get(cand.file) || "",
+          ...(explainData ? { explain: explainData } : {}),
+        };
+      })
+      .filter(r => {
+        if (seenFiles.has(r.file)) return false;
+        seenFiles.add(r.file);
+        return true;
+      })
+      .filter(r => r.score >= minScore)
+      .slice(0, limit);
+  }
+
   // Step 6: Rerank chunks (NOT full bodies)
+  const chunksToRerank: { file: string; text: string }[] = [];
+  for (const cand of candidates) {
+    const chunkInfo = docChunkMap.get(cand.file);
+    if (chunkInfo) {
+      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    }
+  }
+
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
   const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
@@ -3351,7 +3892,7 @@ export async function vectorSearchQuery(
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const queryTexts = [query, ...vecExpanded.map(q => q.text)];
+  const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
     const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
@@ -3385,15 +3926,6 @@ export async function vectorSearchQuery(
  * A single sub-search in a structured search request.
  * Matches the format used in QMD training data.
  */
-export interface StructuredSubSearch {
-  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical */
-  type: 'lex' | 'vec' | 'hyde';
-  /** The search query text */
-  query: string;
-  /** Optional line number for error reporting (CLI parser) */
-  line?: number;
-}
-
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
   limit?: number;           // default 10
@@ -3402,6 +3934,8 @@ export interface StructuredSearchOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   /** Domain intent hint for disambiguation — steers reranking and chunk selection */
   intent?: string;
+  /** Skip LLM reranking, use only RRF scores */
+  skipRerank?: boolean;
   hooks?: SearchHooks;
 }
 
@@ -3425,7 +3959,7 @@ export interface StructuredSearchOptions {
  */
 export async function structuredSearch(
   store: Store,
-  searches: StructuredSubSearch[],
+  searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
   const limit = options?.limit ?? 10;
@@ -3433,6 +3967,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
+  const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -3492,11 +4027,11 @@ export async function structuredSearch(
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
     const vecSearches = searches.filter(
-      (s): s is StructuredSubSearch & { type: 'vec' | 'hyde' } =>
+      (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
+      const llm = getLlm(store);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
@@ -3548,7 +4083,6 @@ export async function structuredSearch(
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const chunksToRerank: { file: string; text: string }[] = [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
   for (const cand of candidates) {
@@ -3568,11 +4102,68 @@ export async function structuredSearch(
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
-    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
 
+  if (skipRerank) {
+    // Skip LLM reranking — return candidates scored by RRF only
+    const seenFiles = new Set<string>();
+    return candidates
+      .map((cand, i) => {
+        const chunkInfo = docChunkMap.get(cand.file);
+        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const rrfRank = i + 1;
+        const rrfScore = 1 / rrfRank;
+        const trace = rrfTraceByFile?.get(cand.file);
+        const explainData: HybridQueryExplain | undefined = explain ? {
+          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          rrf: {
+            rank: rrfRank,
+            positionScore: rrfScore,
+            weight: 1.0,
+            baseScore: trace?.baseScore ?? 0,
+            topRankBonus: trace?.topRankBonus ?? 0,
+            totalScore: trace?.totalScore ?? 0,
+            contributions: trace?.contributions ?? [],
+          },
+          rerankScore: 0,
+          blendedScore: rrfScore,
+        } : undefined;
+
+        return {
+          file: cand.file,
+          displayPath: cand.displayPath,
+          title: cand.title,
+          body: cand.body,
+          bestChunk,
+          bestChunkPos,
+          score: rrfScore,
+          context: store.getContextForFile(cand.file),
+          docid: docidMap.get(cand.file) || "",
+          ...(explainData ? { explain: explainData } : {}),
+        };
+      })
+      .filter(r => {
+        if (seenFiles.has(r.file)) return false;
+        seenFiles.add(r.file);
+        return true;
+      })
+      .filter(r => r.score >= minScore)
+      .slice(0, limit);
+  }
+
   // Step 5: Rerank chunks
+  const chunksToRerank: { file: string; text: string }[] = [];
+  for (const cand of candidates) {
+    const chunkInfo = docChunkMap.get(cand.file);
+    if (chunkInfo) {
+      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    }
+  }
+
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
   const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);

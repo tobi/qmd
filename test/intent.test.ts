@@ -18,7 +18,7 @@ import {
   extractIntentTerms,
   INTENT_WEIGHT_SNIPPET,
   INTENT_WEIGHT_CHUNK,
-  type StructuredSubSearch,
+  type ExpandedQuery,
 } from "../src/store.js";
 
 // =============================================================================
@@ -27,7 +27,7 @@ import {
 // =============================================================================
 
 interface ParsedStructuredQuery {
-  searches: StructuredSubSearch[];
+  searches: ExpandedQuery[];
   intent?: string;
 }
 
@@ -43,7 +43,7 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   const prefixRe = /^(lex|vec|hyde):\s*/i;
   const expandRe = /^expand:\s*/i;
   const intentRe = /^intent:\s*/i;
-  const typed: StructuredSubSearch[] = [];
+  const typed: ExpandedQuery[] = [];
   let intent: string | undefined;
 
   for (const line of rawLines) {
