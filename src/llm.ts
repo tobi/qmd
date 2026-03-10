@@ -171,7 +171,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(input: EmbedInput | string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(inputs: (EmbedInput | string)[], options?: EmbedBatchOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -351,7 +351,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -1414,12 +1414,14 @@ class LLMSession implements ILLMSession {
   }
 
   async embedBatch(inputs: (EmbedInput | string)[], options?: EmbedBatchOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(inputs, options));
+    // LlamaCpp.embedBatch currently only accepts inputs; query/document formatting
+    // is handled before session calls.
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(inputs));
   }
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean }
+    options?: { context?: string; includeLexical?: boolean; intent?: string }
   ): Promise<Queryable[]> {
     return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
   }
@@ -1666,7 +1668,7 @@ export class GoogleHybridLLM implements LLM {
     return this.localLlm.modelExists(model);
   }
 
-  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
     return this.localLlm.expandQuery(query, options);
   }
 

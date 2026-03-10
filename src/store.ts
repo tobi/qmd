@@ -24,8 +24,6 @@ import {
   getDefaultLlamaCpp,
   getActiveEmbedModel,
   getDefaultLLM,
-  needsEmbedFormatting,
-  resolveEmbedProvider,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -726,7 +724,7 @@ function initializeDatabase(db: Database): void {
     CREATE TABLE IF NOT EXISTS store_collections (
       name TEXT PRIMARY KEY,
       path TEXT NOT NULL,
-      pattern TEXT NOT NULL DEFAULT '**/*.md',
+      pattern TEXT NOT NULL DEFAULT '**/*.{md,png,jpg,jpeg,pdf}',
       ignore_patterns TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
@@ -1057,9 +1055,16 @@ export type Store = {
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
-  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  getHashesForEmbedding: () => {
+    hash: string;
+    body: string;
+    path: string;
+    collection: string;
+    contentType: string;
+    collectionPath: string;
+  }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, provider: string, embeddedAt: string) => void;
 };
 
 // =============================================================================
@@ -1087,6 +1092,15 @@ function getIndexedContentType(path: string): IndexedContentType {
   if (lower.endsWith(".pdf")) return "pdf";
   if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image";
   return "text";
+}
+
+function inferContentTypeFromVirtualPath(path: string): IndexedContentType {
+  return getIndexedContentType(path);
+}
+
+function withContentTypeContext(context: string | null, contentType: IndexedContentType): string | null {
+  if (contentType === "text") return context;
+  return context ? `${context}\n[${contentType}]` : `[${contentType}]`;
 }
 
 function loadIndexableContent(
@@ -1256,8 +1270,8 @@ export async function generateEmbeddings(
   }
 ): Promise<EmbedResult> {
   const db = store.db;
-  const provider = await resolveEmbedProvider();
   const llm = await getEmbeddingLlm(store);
+  const provider = llm instanceof LlamaCpp ? "local" : "google";
   const activeModel = options?.model ?? await getActiveEmbedModel();
   const now = new Date().toISOString();
 
@@ -1280,7 +1294,7 @@ export async function generateEmbeddings(
     input: EmbedInput | string;
   };
   const allChunks: ChunkItem[] = [];
-  const useLocalFormatting = await needsEmbedFormatting();
+  const useLocalFormatting = llm instanceof LlamaCpp;
 
   for (const item of hashesToEmbed) {
     const absolutePath = resolve(item.collectionPath, item.path);
@@ -1495,17 +1509,17 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, contentType: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, contentType, createdAt, modifiedAt),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
-    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
+    updateDocument: (documentId: number, title: string, hash: string, contentType: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, contentType, modifiedAt),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, provider: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, provider, embeddedAt),
   };
 
   return store;
@@ -1530,6 +1544,7 @@ export type DocumentResult = {
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
   body?: string;              // Document body (optional, load with getDocumentBody)
+  contentType?: string;       // Document content type (text/image/pdf)
 };
 
 /**
@@ -2743,6 +2758,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
+      d.content_type,
       content.doc as body,
       d.hash,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
@@ -2762,7 +2778,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; content_type: string; body: string; hash: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -2770,6 +2786,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
     // Monotonic and query-independent — no per-query normalization needed.
     const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+    const baseContext = getContextForFile(db, row.filepath);
+    const context = row.content_type !== "text"
+      ? (baseContext ? `${baseContext}\n[${row.content_type}]` : `[${row.content_type}]`)
+      : baseContext;
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -2780,7 +2800,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       modifiedAt: "",  // Not available in FTS query
       bodyLength: row.body.length,
       body: row.body,
-      context: getContextForFile(db, row.filepath),
+      context,
+      contentType: row.content_type,
       score,
       source: "fts" as const,
     };
@@ -2826,6 +2847,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
+      d.content_type,
       content.doc as body
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
@@ -2841,7 +2863,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; content_type: string; body: string;
   }[];
 
   // Combine with distances and dedupe by filepath
@@ -2859,6 +2881,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .slice(0, limit)
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      const baseContext = getContextForFile(db, row.filepath);
+      const context = row.content_type !== "text"
+        ? (baseContext ? `${baseContext}\n[${row.content_type}]` : `[${row.content_type}]`)
+        : baseContext;
       return {
         filepath: row.filepath,
         displayPath: row.display_path,
@@ -2869,7 +2895,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
         modifiedAt: "",  // Not available in vec query
         bodyLength: row.body.length,
         body: row.body,
-        context: getContextForFile(db, row.filepath),
+        context,
+        contentType: row.content_type,
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
@@ -2957,21 +2984,22 @@ export function insertEmbedding(
   pos: number,
   embedding: Float32Array,
   model: string,
+  provider: string,
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
   const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, provider, embedded_at) VALUES (?, ?, ?, ?, ?, ?)`);
 
   insertVecStmt.run(hashSeq, embedding);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+  insertContentVectorStmt.run(hash, seq, pos, model, provider, embeddedAt);
 }
 
 // =============================================================================
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3010,7 +3038,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3180,6 +3208,7 @@ type DbDocRow = {
   title: string;
   hash: string;
   collection: string;
+  content_type: string;
   path: string;
   modified_at: string;
   body_length: number;
@@ -3227,6 +3256,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     d.title,
     d.hash,
     d.collection,
+    d.content_type,
     d.modified_at,
     LENGTH(content.doc) as body_length
     ${bodyCol}
@@ -3297,6 +3327,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     collectionName: doc.collection,
     modifiedAt: doc.modified_at,
     bodyLength: doc.body_length,
+    contentType: (doc as any).content_type,
     ...(options.includeBody && doc.body !== undefined && { body: doc.body }),
   };
 }
@@ -3693,6 +3724,7 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  contentType?: string;     // Document content type
   explain?: HybridQueryExplain;
 }
 
@@ -3803,7 +3835,7 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = await getEmbeddingLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const textsToEmbed = vecQueries.map(q => llm instanceof LlamaCpp ? formatQueryForEmbedding(q.text) : q.text);
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true, taskType: "RETRIEVAL_QUERY" });
@@ -3895,6 +3927,7 @@ export async function hybridQuery(
           blendedScore: rrfScore,
         } : undefined;
 
+        const contentType = inferContentTypeFromVirtualPath(cand.file);
         return {
           file: cand.file,
           displayPath: cand.displayPath,
@@ -3903,8 +3936,9 @@ export async function hybridQuery(
           bestChunk,
           bestChunkPos,
           score: rrfScore,
-          context: store.getContextForFile(cand.file),
+          context: withContentTypeContext(store.getContextForFile(cand.file), contentType),
           docid: docidMap.get(cand.file) || "",
+          contentType,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -3969,6 +4003,7 @@ export async function hybridQuery(
       blendedScore,
     } : undefined;
 
+    const contentType = inferContentTypeFromVirtualPath(r.file);
     return {
       file: r.file,
       displayPath: candidate?.displayPath || "",
@@ -3977,8 +4012,9 @@ export async function hybridQuery(
       bestChunk,
       bestChunkPos,
       score: blendedScore,
-      context: store.getContextForFile(r.file),
+      context: withContentTypeContext(store.getContextForFile(r.file), contentType),
       docid: docidMap.get(r.file) || "",
+      contentType,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -4011,6 +4047,7 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  contentType?: string;
 }
 
 /**
@@ -4051,14 +4088,16 @@ export async function vectorSearchQuery(
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
+        const contentType = inferContentTypeFromVirtualPath(r.filepath);
         allResults.set(r.filepath, {
           file: r.filepath,
           displayPath: r.displayPath,
           title: r.title,
           body: r.body || "",
           score: r.score,
-          context: store.getContextForFile(r.filepath),
+          context: withContentTypeContext(store.getContextForFile(r.filepath), contentType),
           docid: r.docid,
+          contentType,
         });
       }
     }
@@ -4184,7 +4223,7 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = await getEmbeddingLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const textsToEmbed = vecSearches.map(s => llm instanceof LlamaCpp ? formatQueryForEmbedding(s.query) : s.query);
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true, taskType: "RETRIEVAL_QUERY" });
@@ -4285,6 +4324,7 @@ export async function structuredSearch(
           blendedScore: rrfScore,
         } : undefined;
 
+        const contentType = inferContentTypeFromVirtualPath(cand.file);
         return {
           file: cand.file,
           displayPath: cand.displayPath,
@@ -4293,8 +4333,9 @@ export async function structuredSearch(
           bestChunk,
           bestChunkPos,
           score: rrfScore,
-          context: store.getContextForFile(cand.file),
+          context: withContentTypeContext(store.getContextForFile(cand.file), contentType),
           docid: docidMap.get(cand.file) || "",
+          contentType,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -4358,6 +4399,7 @@ export async function structuredSearch(
       blendedScore,
     } : undefined;
 
+    const contentType = inferContentTypeFromVirtualPath(r.file);
     return {
       file: r.file,
       displayPath: candidate?.displayPath || "",
@@ -4366,8 +4408,9 @@ export async function structuredSearch(
       bestChunk,
       bestChunkPos,
       score: blendedScore,
-      context: store.getContextForFile(r.file),
+      context: withContentTypeContext(store.getContextForFile(r.file), contentType),
       docid: docidMap.get(r.file) || "",
+      contentType,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);

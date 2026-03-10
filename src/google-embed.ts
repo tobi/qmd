@@ -54,12 +54,16 @@ export function parseGeminiDimensionsFromEnv(): number {
   return GOOGLE_EMBED_DEFAULT_DIMENSIONS;
 }
 
-function getMimeTypeForPath(path: string): string | null {
+export function getMimeTypeForPath(path: string): string | null {
   const ext = extname(path).toLowerCase();
   if (ext === ".png") return "image/png";
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".pdf") return "application/pdf";
   return null;
+}
+
+export function isSupportedMultimodalPath(path: string): boolean {
+  return getMimeTypeForPath(path) !== null;
 }
 
 function fileToInlinePart(path: string): GeminiInlinePart {

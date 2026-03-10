@@ -511,7 +511,7 @@ describe("searchLex (BM25)", () => {
       const title = content.match(/^#\s+(.+)/m)?.[1] || file;
 
       internal.insertContent(hash, content, now);
-      internal.insertDocument("docs", `qmd://docs/${file}`, title, hash, now, now);
+      internal.insertDocument("docs", `qmd://docs/${file}`, title, hash, "text", now, now);
     }
 
     // Index notes collection
@@ -522,7 +522,7 @@ describe("searchLex (BM25)", () => {
       const title = content.match(/^#\s+(.+)/m)?.[1] || file;
 
       internal.insertContent(hash, content, now);
-      internal.insertDocument("notes", `qmd://notes/${file}`, title, hash, now, now);
+      internal.insertDocument("notes", `qmd://notes/${file}`, title, hash, "text", now, now);
     }
   });
 
@@ -697,7 +697,7 @@ describe("get and multiGet", () => {
       const title = content.match(/^#\s+(.+)/m)?.[1] || file;
 
       internal.insertContent(hash, content, now);
-      internal.insertDocument("docs", `qmd://docs/${file}`, title, hash, now, now);
+      internal.insertDocument("docs", `qmd://docs/${file}`, title, hash, "text", now, now);
     }
   });
 
