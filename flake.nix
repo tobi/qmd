@@ -18,9 +18,25 @@
           ];
         });
 
-        qmd = pkgs.stdenv.mkDerivation {
+        # Rust build (new)
+        qmd-rs = pkgs.rustPlatform.buildRustPackage {
           pname = "qmd";
-          version = "1.0.0";
+          version = "1.1.5";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          meta = with pkgs.lib; {
+            description = "On-device search engine for markdown notes, meeting transcripts, and knowledge bases";
+            homepage = "https://github.com/tobi/qmd";
+            license = licenses.mit;
+            platforms = platforms.unix;
+          };
+        };
+
+        # TypeScript build (legacy, kept for compatibility)
+        qmd-ts = pkgs.stdenv.mkDerivation {
+          pname = "qmd-ts";
+          version = "1.1.5";
 
           src = ./.;
 
@@ -54,7 +70,7 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "On-device search engine for markdown notes, meeting transcripts, and knowledge bases";
+            description = "On-device search engine for markdown notes (TypeScript version)";
             homepage = "https://github.com/tobi/qmd";
             license = licenses.mit;
             platforms = platforms.unix;
@@ -63,25 +79,31 @@
       in
       {
         packages = {
-          default = qmd;
-          qmd = qmd;
+          default = qmd-rs;
+          qmd = qmd-rs;
+          qmd-ts = qmd-ts;
         };
 
         apps.default = {
           type = "app";
-          program = "${qmd}/bin/qmd";
+          program = "${qmd-rs}/bin/qmd-rs";
         };
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.bun
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.rust-analyzer
+            pkgs.clippy
             sqliteWithExtensions
           ];
 
           shellHook = ''
             export BREW_PREFIX="''${BREW_PREFIX:-${sqliteWithExtensions.out}}"
-            echo "QMD development shell"
-            echo "Run: bun src/qmd.ts <command>"
+            echo "QMD development shell (Rust + TypeScript)"
+            echo "Rust:       cargo build"
+            echo "TypeScript: bun src/qmd.ts <command>"
           '';
         };
       }

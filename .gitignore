@@ -18,3 +18,4 @@ texts/
 finetune/outputs/
 finetune/data/train/
 .claude/
+target/
