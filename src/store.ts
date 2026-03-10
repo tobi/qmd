@@ -19,15 +19,27 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import {
+  type LLM,
   LlamaCpp,
   getDefaultLlamaCpp,
+  getActiveEmbedModel,
+  getDefaultLLM,
+  needsEmbedFormatting,
+  resolveEmbedProvider,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  type EmbeddingResult,
   type LLMSessionOptions,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import {
+  getMimeTypeForPath,
+  isSupportedMultimodalPath,
+  parseGeminiDimensionsFromEnv,
+  type EmbedInput,
+} from "./google-embed.js";
 import type {
   NamedCollection,
   Collection,
@@ -43,7 +55,7 @@ const HOME = process.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
-export const DEFAULT_GLOB = "**/*.md";
+export const DEFAULT_GLOB = "**/*.{md,png,jpg,jpeg,pdf}";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
 // Chunking: 900 tokens per chunk with 15% overlap
@@ -57,12 +69,9 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-/**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
- * falls back to the global singleton.
- */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+async function getEmbeddingLlm(store: Store): Promise<LLM> {
+  if (store.llm) return store.llm;
+  return await getDefaultLLM();
 }
 
 // =============================================================================
@@ -660,6 +669,7 @@ function initializeDatabase(db: Database): void {
       path TEXT NOT NULL,
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
+      content_type TEXT NOT NULL DEFAULT 'text',
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
@@ -671,6 +681,7 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type, active)`);
 
   // Cache table for LLM API calls
   db.exec(`
@@ -682,6 +693,11 @@ function initializeDatabase(db: Database): void {
   `);
 
   // Content vectors
+  const docInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!docInfo.some(col => col.name === "content_type")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'`);
+  }
+
   const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
   const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
   if (cvInfo.length > 0 && !hasSeqColumn) {
@@ -694,10 +710,16 @@ function initializeDatabase(db: Database): void {
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'local',
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
     )
   `);
+
+  const cvInfoPost = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+  if (!cvInfoPost.some(col => col.name === "provider")) {
+    db.exec(`ALTER TABLE content_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'local'`);
+  }
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -845,7 +867,7 @@ export function upsertStoreCollection(db: Database, name: string, collection: Om
   `).run(
     name,
     collection.path,
-    collection.pattern || '**/*.md',
+    collection.pattern || DEFAULT_GLOB,
     collection.ignore ? JSON.stringify(collection.ignore) : null,
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
@@ -970,8 +992,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional embedding-capable LLM implementation for this store */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1027,10 +1049,10 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, contentType: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
-  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  updateDocument: (documentId: number, title: string, hash: string, contentType: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
@@ -1057,6 +1079,35 @@ export type ReindexResult = {
   removed: number;
   orphanedCleaned: number;
 };
+
+type IndexedContentType = "text" | "image" | "pdf";
+
+function getIndexedContentType(path: string): IndexedContentType {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".pdf")) return "pdf";
+  if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image";
+  return "text";
+}
+
+function loadIndexableContent(
+  absolutePath: string,
+  relativePath: string,
+  contentType: IndexedContentType
+): { hash: string; textBody: string | null } {
+  if (contentType === "text") {
+    const text = readFileSync(absolutePath, "utf-8");
+    const hash = createHash("sha256").update(text).digest("hex");
+    return { hash, textBody: text };
+  }
+
+  const bytes = readFileSync(absolutePath);
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  const mimeType = getMimeTypeForPath(relativePath) ?? "application/octet-stream";
+  return {
+    hash,
+    textBody: `[${contentType}] ${relativePath} (${mimeType})`,
+  };
+}
 
 /**
  * Re-index a single collection by scanning the filesystem and updating the database.
@@ -1100,24 +1151,25 @@ export async function reindexCollection(
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
     const path = handelize(relativeFile);
+    const contentType = getIndexedContentType(relativeFile);
     seenPaths.add(path);
 
-    let content: string;
+    let loaded: { hash: string; textBody: string | null };
     try {
-      content = readFileSync(filepath, "utf-8");
+      loaded = loadIndexableContent(filepath, relativeFile, contentType);
     } catch {
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
     }
 
-    if (!content.trim()) {
+    if (contentType === "text" && !(loaded.textBody ?? "").trim()) {
       processed++;
       continue;
     }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+    const hash = loaded.hash;
+    const title = loaded.textBody ? extractTitle(loaded.textBody, relativeFile) : extractTitle("", relativeFile);
 
     const existing = findActiveDocument(db, collectionName, path);
 
@@ -1130,17 +1182,17 @@ export async function reindexCollection(
           unchanged++;
         }
       } else {
-        insertContent(db, hash, content, now);
+        insertContent(db, hash, loaded.textBody ?? "", now);
         const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
+        updateDocument(db, existing.id, title, hash, contentType,
           stat ? new Date(stat.mtime).toISOString() : now);
         updated++;
       }
     } else {
       indexed++;
-      insertContent(db, hash, content, now);
+      insertContent(db, hash, loaded.textBody ?? "", now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      insertDocument(db, collectionName, path, title, hash, contentType,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
@@ -1179,6 +1231,17 @@ export type EmbedResult = {
   durationMs: number;
 };
 
+function estimatePdfPageCount(path: string): number {
+  try {
+    const bytes = readFileSync(path);
+    const text = bytes.toString("latin1");
+    const matches = text.match(/\/Type\s*\/Page\b/g);
+    return matches?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -1193,7 +1256,9 @@ export async function generateEmbeddings(
   }
 ): Promise<EmbedResult> {
   const db = store.db;
-  const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const provider = await resolveEmbedProvider();
+  const llm = await getEmbeddingLlm(store);
+  const activeModel = options?.model ?? await getActiveEmbedModel();
   const now = new Date().toISOString();
 
   if (options?.force) {
@@ -1206,12 +1271,46 @@ export async function generateEmbeddings(
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
   }
 
-  // Chunk all documents
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number };
+  type ChunkItem = {
+    hash: string;
+    title: string;
+    seq: number;
+    pos: number;
+    bytes: number;
+    input: EmbedInput | string;
+  };
   const allChunks: ChunkItem[] = [];
+  const useLocalFormatting = await needsEmbedFormatting();
 
   for (const item of hashesToEmbed) {
+    const absolutePath = resolve(item.collectionPath, item.path);
+    const contentType = (item.contentType || "text").toLowerCase();
     const encoder = new TextEncoder();
+
+    if (contentType === "image" || contentType === "pdf") {
+      if (provider !== "google" || !isSupportedMultimodalPath(absolutePath)) {
+        continue;
+      }
+
+      if (contentType === "pdf") {
+        const pages = estimatePdfPageCount(absolutePath);
+        if (pages > 6) {
+          continue;
+        }
+      }
+
+      const input: EmbedInput = { filePath: absolutePath };
+      allChunks.push({
+        hash: item.hash,
+        title: extractTitle(item.body || "", item.path),
+        input,
+        seq: 0,
+        pos: 0,
+        bytes: readFileSync(absolutePath).length,
+      });
+      continue;
+    }
+
     const bodyBytes = encoder.encode(item.body).length;
     if (bodyBytes === 0) continue;
 
@@ -1219,14 +1318,17 @@ export async function generateEmbeddings(
     const chunks = await chunkDocumentByTokens(item.body);
 
     for (let seq = 0; seq < chunks.length; seq++) {
+      const chunk = chunks[seq]!;
+      const formatted = useLocalFormatting
+        ? formatDocForEmbedding(chunk.text, title)
+        : chunk.text;
       allChunks.push({
         hash: item.hash,
         title,
-        text: chunks[seq]!.text,
+        input: formatted,
         seq,
-        pos: chunks[seq]!.pos,
-        tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
+        pos: chunk.pos,
+        bytes: encoder.encode(chunk.text).length,
       });
     }
   }
@@ -1240,36 +1342,37 @@ export async function generateEmbeddings(
   const totalDocs = hashesToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
-  const sessionOptions: LLMSessionOptions = { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' };
+  const firstResult = await llm.embed(allChunks[0]!.input, {
+    isQuery: false,
+    taskType: "RETRIEVAL_DOCUMENT",
+    ...(provider === "google" ? { outputDimensionality: parseGeminiDimensionsFromEnv() } : {}),
+  });
+  if (!firstResult) {
+    throw new Error("Failed to get embedding dimensions from first input");
+  }
+  store.ensureVecTable(firstResult.embedding.length);
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
-    // Get embedding dimensions from first chunk
-    const firstChunk = allChunks[0]!;
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    store.ensureVecTable(firstResult.embedding.length);
+  let chunksEmbedded = 0;
+  let errors = 0;
+  let bytesProcessed = 0;
+  const batchSize = provider === "google" ? 100 : 32;
 
-    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-    const BATCH_SIZE = 32;
-
-    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+  const embedWith = async (
+    embedOne: (input: EmbedInput | string) => Promise<EmbeddingResult | null>,
+    embedMany: (inputs: (EmbedInput | string)[]) => Promise<(EmbeddingResult | null)[]>
+  ): Promise<void> => {
+    for (let batchStart = 0; batchStart < allChunks.length; batchStart += batchSize) {
+      const batchEnd = Math.min(batchStart + batchSize, allChunks.length);
       const batch = allChunks.slice(batchStart, batchEnd);
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+      const inputs = batch.map(chunk => chunk.input);
 
       try {
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await embedMany(inputs);
         for (let i = 0; i < batch.length; i++) {
           const chunk = batch[i]!;
           const embedding = embeddings[i];
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), embedding.model || activeModel, provider, now);
             chunksEmbedded++;
           } else {
             errors++;
@@ -1277,13 +1380,11 @@ export async function generateEmbeddings(
           bytesProcessed += chunk.bytes;
         }
       } catch {
-        // Batch failed — try individual embeddings as fallback
         for (const chunk of batch) {
           try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+            const embedding = await embedOne(chunk.input);
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), embedding.model || activeModel, provider, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1297,14 +1398,29 @@ export async function generateEmbeddings(
 
       options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
     }
+  };
 
-    return { chunksEmbedded, errors };
-  }, sessionOptions);
+  if (provider === "local" && (store.llm instanceof LlamaCpp || !store.llm)) {
+    const localLlm = store.llm instanceof LlamaCpp ? store.llm : getDefaultLlamaCpp();
+    const sessionOptions: LLMSessionOptions = { maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" };
+    await withLLMSessionForLlm(localLlm, async (session) => {
+      await embedWith(
+        (input) => session.embed(input, { isQuery: false }),
+        (inputs) => session.embedBatch(inputs, { isQuery: false })
+      );
+      return { chunksEmbedded, errors };
+    }, sessionOptions);
+  } else {
+    await embedWith(
+      (input) => llm.embed(input, { isQuery: false, taskType: "RETRIEVAL_DOCUMENT" }),
+      (inputs) => llm.embedBatch(inputs, { isQuery: false, taskType: "RETRIEVAL_DOCUMENT" })
+    );
+  }
 
   return {
     docsProcessed: totalDocs,
-    chunksEmbedded: result.chunksEmbedded,
-    errors: result.errors,
+    chunksEmbedded,
+    errors,
     durationMs: Date.now() - startTime,
   };
 }
@@ -1799,18 +1915,20 @@ export function insertDocument(
   path: string,
   title: string,
   hash: string,
+  contentType: string,
   createdAt: string,
   modifiedAt: string
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, title, hash, content_type, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(collection, path) DO UPDATE SET
       title = excluded.title,
       hash = excluded.hash,
+      content_type = excluded.content_type,
       modified_at = excluded.modified_at,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, title, hash, contentType, createdAt, modifiedAt);
 }
 
 /**
@@ -1850,10 +1968,11 @@ export function updateDocument(
   documentId: number,
   title: string,
   hash: string,
+  contentType: string,
   modifiedAt: string
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, content_type = ?, modified_at = ? WHERE id = ?`)
+    .run(title, hash, contentType, modifiedAt, documentId);
 }
 
 /**
@@ -2763,11 +2882,22 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
-  const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+  if (session) {
+    const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
+    const result = await session.embed(formattedText, { model, isQuery });
+    return result?.embedding || null;
+  }
+
+  const llm = llmOverride ?? await getDefaultLLM();
+  const useLocalFormatting = llm instanceof LlamaCpp;
+  const input = useLocalFormatting
+    ? (isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model))
+    : text;
+  const result = await llm.embed(input, {
+    model,
+    isQuery,
+    ...(isQuery ? { taskType: "RETRIEVAL_QUERY" as const } : { taskType: "RETRIEVAL_DOCUMENT" as const }),
+  });
   return result?.embedding || null;
 }
 
@@ -2775,15 +2905,36 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(db: Database): {
+  hash: string;
+  body: string;
+  path: string;
+  collection: string;
+  contentType: string;
+  collectionPath: string;
+}[] {
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+    SELECT
+      d.hash,
+      c.doc as body,
+      MIN(d.path) as path,
+      d.collection as collection,
+      MIN(d.content_type) as contentType,
+      sc.path as collectionPath
     FROM documents d
+    JOIN store_collections sc ON sc.name = d.collection
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
-    GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+    GROUP BY d.hash, d.collection, sc.path
+  `).all() as {
+    hash: string;
+    body: string;
+    path: string;
+    collection: string;
+    contentType: string;
+    collectionPath: string;
+  }[];
 }
 
 /**
@@ -3651,11 +3802,11 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
+    const llm = await getEmbeddingLlm(store);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true, taskType: "RETRIEVAL_QUERY" });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -4032,11 +4183,11 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
+      const llm = await getEmbeddingLlm(store);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true, taskType: "RETRIEVAL_QUERY" });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {

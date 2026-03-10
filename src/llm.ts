@@ -17,6 +17,13 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  GoogleAIEmbedder,
+  GOOGLE_EMBED_MODEL,
+  type EmbedInput,
+  type GeminiTaskType,
+  parseGeminiDimensionsFromEnv,
+} from "./google-embed.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -120,6 +127,14 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  taskType?: GeminiTaskType;
+  outputDimensionality?: number;
+};
+
+export type EmbedBatchOptions = {
+  isQuery?: boolean;
+  taskType?: GeminiTaskType;
+  outputDimensionality?: number;
 };
 
 /**
@@ -154,8 +169,8 @@ export type LLMSessionOptions = {
  * Session interface for scoped LLM access with lifecycle guarantees
  */
 export interface ILLMSession {
-  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embed(input: EmbedInput | string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+  embedBatch(inputs: (EmbedInput | string)[], options?: EmbedBatchOptions): Promise<(EmbeddingResult | null)[]>;
   expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
@@ -315,7 +330,12 @@ export interface LLM {
   /**
    * Get embeddings for text
    */
-  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+  embed(input: EmbedInput | string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Batch embed multiple inputs
+   */
+  embedBatch(inputs: (EmbedInput | string)[], options?: EmbedBatchOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -832,13 +852,17 @@ export class LlamaCpp implements LLM {
   // Core API methods
   // ==========================================================================
 
-  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+  async embed(input: EmbedInput | string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    if (typeof input !== "string") {
+      return null;
+    }
+
     try {
       const context = await this.ensureEmbedContext();
-      const embedding = await context.getEmbeddingFor(text);
+      const embedding = await context.getEmbeddingFor(input);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -854,12 +878,18 @@ export class LlamaCpp implements LLM {
    * Batch embed multiple texts efficiently
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(inputs: (EmbedInput | string)[]): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
-    if (texts.length === 0) return [];
+    if (inputs.length === 0) return [];
+
+    // Local embedding model only supports plain text input.
+    if (inputs.some((input) => typeof input !== "string")) {
+      return inputs.map(() => null);
+    }
+    const texts = inputs as string[];
 
     try {
       const contexts = await this.ensureEmbedContexts();
@@ -1379,12 +1409,12 @@ class LLMSession implements ILLMSession {
     }
   }
 
-  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+  async embed(input: EmbedInput | string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    return this.withOperation(() => this.manager.getLlamaCpp().embed(input, options));
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+  async embedBatch(inputs: (EmbedInput | string)[], options?: EmbedBatchOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(inputs, options));
   }
 
   async expandQuery(
@@ -1502,8 +1532,169 @@ export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
+  defaultHybridLLM = null;
+  resolvedEmbedProvider = null;
   if (defaultLlamaCpp) {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// Embed Provider Configuration
+// =============================================================================
+
+export type EmbedProvider = "local" | "google";
+
+let forcedEmbedProvider: EmbedProvider | null = null;
+let resolvedEmbedProvider: EmbedProvider | null = null;
+let defaultHybridLLM: GoogleHybridLLM | null = null;
+
+export function setEmbedProvider(provider: EmbedProvider | null): void {
+  forcedEmbedProvider = provider;
+  resolvedEmbedProvider = null;
+}
+
+export function getConfiguredEmbedProvider(): EmbedProvider | null {
+  return forcedEmbedProvider;
+}
+
+export function getResolvedEmbedProvider(): EmbedProvider | null {
+  return resolvedEmbedProvider;
+}
+
+function parseEmbedProviderFromEnv(): EmbedProvider | null {
+  const provider = process.env.QMD_EMBED_PROVIDER?.trim().toLowerCase();
+  if (provider === "google" || provider === "local") return provider;
+  return null;
+}
+
+export function getGoogleApiKey(): string | null {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  return key && key.length > 0 ? key : null;
+}
+
+export async function resolveEmbedProvider(): Promise<EmbedProvider> {
+  const explicit = forcedEmbedProvider ?? parseEmbedProviderFromEnv();
+  if (explicit) {
+    resolvedEmbedProvider = explicit;
+    return explicit;
+  }
+
+  const apiKey = getGoogleApiKey();
+  if (!apiKey) {
+    resolvedEmbedProvider = "local";
+    return "local";
+  }
+
+  // Auto mode: if Gemini key exists and local GPU is unavailable, prefer Google embeddings.
+  try {
+    const local = getDefaultLlamaCpp();
+    const device = await local.getDeviceInfo();
+    const provider: EmbedProvider = device.gpu ? "local" : "google";
+    resolvedEmbedProvider = provider;
+    return provider;
+  } catch {
+    resolvedEmbedProvider = "local";
+    return "local";
+  }
+}
+
+export async function needsEmbedFormatting(): Promise<boolean> {
+  return (await resolveEmbedProvider()) === "local";
+}
+
+export async function getActiveEmbedModel(): Promise<string> {
+  return (await resolveEmbedProvider()) === "google" ? GOOGLE_EMBED_MODEL : DEFAULT_EMBED_MODEL;
+}
+
+export function getConfiguredEmbedDimensions(): number | null {
+  const provider = forcedEmbedProvider ?? parseEmbedProviderFromEnv();
+  if (provider === "google") return parseGeminiDimensionsFromEnv();
+  return null;
+}
+
+// =============================================================================
+// GoogleHybridLLM — Gemini embedding API + local llama.cpp expansion/reranking
+// =============================================================================
+
+export class GoogleHybridLLM implements LLM {
+  private readonly localLlm: LlamaCpp;
+  private readonly googleEmbedder: GoogleAIEmbedder;
+
+  constructor(localLlm: LlamaCpp, apiKey: string) {
+    this.localLlm = localLlm;
+    this.googleEmbedder = new GoogleAIEmbedder(apiKey, parseGeminiDimensionsFromEnv());
+  }
+
+  async embed(input: EmbedInput | string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const defaultTaskType: GeminiTaskType = options.isQuery ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT";
+    const result = await this.googleEmbedder.embed(input, {
+      taskType: options.taskType ?? defaultTaskType,
+      outputDimensionality: options.outputDimensionality ?? parseGeminiDimensionsFromEnv(),
+    });
+    if (!result) return null;
+    return {
+      embedding: result.embedding,
+      model: GOOGLE_EMBED_MODEL,
+    };
+  }
+
+  async embedBatch(
+    inputs: (EmbedInput | string)[],
+    options: EmbedBatchOptions = {}
+  ): Promise<(EmbeddingResult | null)[]> {
+    const taskType: GeminiTaskType = options.taskType ?? (options.isQuery ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT");
+    const results = await this.googleEmbedder.embedBatch(inputs, {
+      taskType,
+      outputDimensionality: options.outputDimensionality ?? parseGeminiDimensionsFromEnv(),
+    });
+    return results.map((result) => {
+      if (!result) return null;
+      return {
+        embedding: result.embedding,
+        model: GOOGLE_EMBED_MODEL,
+      };
+    });
+  }
+
+  async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
+    return this.localLlm.generate(prompt, options);
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    return this.localLlm.modelExists(model);
+  }
+
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    return this.localLlm.expandQuery(query, options);
+  }
+
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    return this.localLlm.rerank(query, documents, options);
+  }
+
+  async dispose(): Promise<void> {
+    // localLlm is a shared singleton in normal operation; caller owns lifecycle.
+  }
+}
+
+/**
+ * Get default embedding-capable LLM implementation.
+ * - `google`: Gemini embeddings + local llama.cpp query expansion/reranking
+ * - `local`: llama.cpp for all operations
+ */
+export async function getDefaultLLM(): Promise<LLM> {
+  const provider = await resolveEmbedProvider();
+  if (provider === "google") {
+    const apiKey = getGoogleApiKey();
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is required when embed provider is google");
+    }
+    if (!defaultHybridLLM) {
+      defaultHybridLLM = new GoogleHybridLLM(getDefaultLlamaCpp(), apiKey);
+    }
+    return defaultHybridLLM;
+  }
+  return getDefaultLlamaCpp();
 }
