@@ -26,7 +26,7 @@ export type ContextMap = Record<string, string>;
  */
 export interface Collection {
   path: string;              // Absolute path to index
-  pattern: string;           // Glob pattern (e.g., "**/*.{md,png,jpg,jpeg,pdf}")
+  pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
@@ -48,7 +48,7 @@ export interface NamedCollection extends Collection {
   name: string;
 }
 
-export const DEFAULT_COLLECTION_PATTERN = "**/*.{md,png,jpg,jpeg,pdf}";
+export const DEFAULT_COLLECTION_PATTERN = "**/*.md";
 
 // ============================================================================
 // Configuration paths

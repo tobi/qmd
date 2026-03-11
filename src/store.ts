@@ -53,7 +53,7 @@ const HOME = process.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
-export const DEFAULT_GLOB = "**/*.{md,png,jpg,jpeg,pdf}";
+export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
 // Chunking: 900 tokens per chunk with 15% overlap
@@ -724,7 +724,7 @@ function initializeDatabase(db: Database): void {
     CREATE TABLE IF NOT EXISTS store_collections (
       name TEXT PRIMARY KEY,
       path TEXT NOT NULL,
-      pattern TEXT NOT NULL DEFAULT '**/*.{md,png,jpg,jpeg,pdf}',
+      pattern TEXT NOT NULL DEFAULT '**/*.md',
       ignore_patterns TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
@@ -1245,6 +1245,23 @@ export type EmbedResult = {
   durationMs: number;
 };
 
+function buildMultimodalEmbedText(path: string, title: string, body: string, contentType: string): string {
+  const lines: string[] = [];
+  const trimmedBody = body.trim();
+
+  lines.push(`File: ${path}`);
+  if (title.trim().length > 0) {
+    lines.push(`Title: ${title.trim()}`);
+  }
+  if (trimmedBody.length > 0) {
+    // Keep payload small enough for embeddings while preserving useful signals.
+    lines.push(`Body: ${trimmedBody.slice(0, 2000)}`);
+  }
+  lines.push(`Type: ${contentType}`);
+
+  return lines.join("\n");
+}
+
 function estimatePdfPageCount(path: string): number {
   try {
     const bytes = readFileSync(path);
@@ -1313,10 +1330,14 @@ export async function generateEmbeddings(
         }
       }
 
-      const input: EmbedInput = { filePath: absolutePath };
+      const title = extractTitle(item.body || "", item.path);
+      const input: EmbedInput = {
+        text: buildMultimodalEmbedText(item.path, title, item.body || "", contentType),
+        filePath: absolutePath,
+      };
       allChunks.push({
         hash: item.hash,
-        title: extractTitle(item.body || "", item.path),
+        title,
         input,
         seq: 0,
         pos: 0,
