@@ -10,6 +10,7 @@
         "fast-glob": "^3.3.0",
         "node-llama-cpp": "^3.17.1",
         "picomatch": "^4.0.0",
+        "postgres": "^3.4.8",
         "sqlite-vec": "^0.1.7-alpha.2",
         "yaml": "^2.8.2",
         "zod": "^4.2.1",
@@ -22,8 +23,9 @@
       "optionalDependencies": {
         "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-linux-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
-        "sqlite-vec-win32-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-windows-x64": "^0.1.7-alpha.2",
       },
       "peerDependencies": {
         "typescript": "^5.9.3",
@@ -538,6 +540,8 @@
     "pkce-challenge": ["pkce-challenge@5.0.1", "", {}, "sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ=="],
 
     "postcss": ["postcss@8.5.6", "", { "dependencies": { "nanoid": "^3.3.11", "picocolors": "^1.1.1", "source-map-js": "^1.2.1" } }, "sha512-3Ybi1tAuwAP9s0r1UQ2J4n5Y0G05bJkpUIO0/bI9MhwmD70S5aTWbXGBwxHrelT+XM1k6dM0pk+SwNkpTRN7Pg=="],
+
+    "postgres": ["postgres@3.4.8", "", {}, "sha512-d+JFcLM17njZaOLkv6SCev7uoLaBtfK86vMUXhW1Z4glPWh4jozno9APvW/XKFJ3CCxVoC7OL38BqRydtu5nGg=="],
 
     "prebuild-install": ["prebuild-install@7.1.3", "", { "dependencies": { "detect-libc": "^2.0.0", "expand-template": "^2.0.3", "github-from-package": "0.0.0", "minimist": "^1.2.3", "mkdirp-classic": "^0.5.3", "napi-build-utils": "^2.0.0", "node-abi": "^3.3.0", "pump": "^3.0.0", "rc": "^1.2.7", "simple-get": "^4.0.0", "tar-fs": "^2.0.0", "tunnel-agent": "^0.6.0" }, "bin": { "prebuild-install": "bin.js" } }, "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug=="],
 

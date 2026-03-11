@@ -308,10 +308,18 @@ async function showStatus(): Promise<void> {
 
   // Index size
   let indexSize = 0;
-  try {
-    const stat = statSync(dbPath).size;
-    indexSize = stat;
-  } catch { }
+  const backend = process.env.QMD_BACKEND || "sqlite";
+  if (backend === "postgres") {
+    try {
+      const sizeResult = db.prepare(`SELECT pg_database_size(current_database()) as size`).get() as { size: number };
+      indexSize = sizeResult?.size ?? 0;
+    } catch { }
+  } else {
+    try {
+      const stat = statSync(dbPath).size;
+      indexSize = stat;
+    } catch { }
+  }
 
   // Collections info (from YAML + database stats)
   const collections = listCollections(db);
@@ -325,7 +333,14 @@ async function showStatus(): Promise<void> {
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
 
   console.log(`${c.bold}QMD Status${c.reset}\n`);
-  console.log(`Index: ${dbPath}`);
+  if (backend === "postgres") {
+    const pgUrl = process.env.QMD_POSTGRES_URL || "postgresql://localhost/qmd";
+    // Show just host/db, strip credentials
+    const dbName = pgUrl.split("/").pop()?.split("?")[0] || "qmd";
+    console.log(`Backend: PostgreSQL (${dbName})`);
+  } else {
+    console.log(`Index: ${dbPath}`);
+  }
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
   // MCP daemon status (check PID file liveness)
