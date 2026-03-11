@@ -15,8 +15,12 @@ done
 # to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Check if we were installed with bun (look for bun.lock or bun-lockb)
-if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ] || [ -n "$BUN_INSTALL" ]; then
+# Check if we were installed with bun (look for bun.lock or bun-lockb).
+# $BUN_INSTALL is intentionally NOT checked here — it only indicates that bun
+# exists on the system, not that it was used to install this package.  When QMD
+# is installed via npm, native modules are compiled for Node and running them
+# under bun causes ABI mismatches (e.g. sqlite-vec "no such module: vec0").
+if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
   exec bun "$DIR/dist/cli/qmd.js" "$@"
 else
   exec node "$DIR/dist/cli/qmd.js" "$@"
