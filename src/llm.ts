@@ -318,6 +318,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in a single batch call
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;

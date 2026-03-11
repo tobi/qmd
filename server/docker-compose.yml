@@ -1,0 +1,68 @@
+name: qmd
+
+services:
+  qmd-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qmd-embed
+    ports:
+      - "8081:8080"
+    volumes:
+      - qmd-models:/models
+    command: >
+      -m /models/embeddinggemma-300M-Q8_0.gguf
+      --embedding --pooling mean
+      --host 0.0.0.0 --port 8080
+      -ngl 99 -b 4096 -ub 4096 -np 4 -c 16384
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  qmd-rerank:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qmd-rerank
+    ports:
+      - "8082:8080"
+    volumes:
+      - qmd-models:/models
+    command: >
+      -m /models/qwen3-reranker-0.6b-q8_0.gguf
+      --reranking --pooling rank
+      --host 0.0.0.0 --port 8080
+      -ngl 99 -b 2048 -ub 2048 -c 4096
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  qmd-generate:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qmd-generate
+    ports:
+      - "8083:8080"
+    volumes:
+      - qmd-models:/models
+    command: >
+      -m /models/qmd-query-expansion-1.7B-q4_k_m.gguf
+      --host 0.0.0.0 --port 8080
+      -ngl 99 -c 2048
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  qmd-models:
+    external: true

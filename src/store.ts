@@ -25,6 +25,7 @@ import {
   formatDocForEmbedding,
   withLLMSessionForLlm,
   type LLMSessionOptions,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -427,6 +428,75 @@ export function enableProductionMode(): void {
   _productionMode = true;
 }
 
+// =============================================================================
+// .qmd directory resolution
+// =============================================================================
+
+/**
+ * Find a local .qmd directory by searching current directory and parents.
+ */
+export function findLocalQmdDir(startDir?: string): string | null {
+  let dir = startDir || getPwd();
+  const root = resolve("/");
+
+  while (dir !== root) {
+    const qmdDir = resolve(dir, ".qmd");
+    try {
+      const stat = statSync(qmdDir);
+      if (stat.isDirectory()) return qmdDir;
+    } catch {
+      // Directory doesn't exist, continue searching
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Initialize a local .qmd directory in the specified path.
+ */
+export function initLocalQmdDir(targetDir?: string): string {
+  const dir = targetDir || getPwd();
+  const qmdDir = resolve(dir, ".qmd");
+  mkdirSync(qmdDir, { recursive: true });
+  return qmdDir;
+}
+
+// CLI-provided qmdDir (highest priority)
+let _cliQmdDir: string | null = null;
+
+export function setCliQmdDir(qmdDir: string | null): void {
+  _cliQmdDir = qmdDir;
+}
+
+export function getCliQmdDir(): string | null {
+  return _cliQmdDir;
+}
+
+// Config loader for saved qmdDir (avoids circular imports)
+let _loadQmdDirConfig: (() => string | null) | null = null;
+
+export function setQmdDirConfigLoader(loader: () => string | null): void {
+  _loadQmdDirConfig = loader;
+}
+
+/**
+ * Get the effective qmdDir with priority:
+ * 1. CLI flag (--qmd-dir)
+ * 2. Saved config (~/.cache/qmd/config.json)
+ * 3. Auto-discover (search upward for .qmd)
+ */
+export function getEffectiveQmdDir(): string | null {
+  if (_cliQmdDir) return _cliQmdDir;
+  if (_loadQmdDirConfig) {
+    const saved = _loadQmdDirConfig();
+    if (saved) return saved;
+  }
+  return findLocalQmdDir();
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (process.env.INDEX_PATH) {
@@ -441,6 +511,13 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
+  // Check for .qmd directory (CLI > config > auto-discover)
+  const qmdDir = getEffectiveQmdDir();
+  if (qmdDir) {
+    return resolve(qmdDir, `${indexName}.sqlite`);
+  }
+
+  // Fall back to global cache
   const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
   try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
@@ -1012,8 +1089,8 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, model?: string, intent?: string, llm?: LLM) => Promise<ExpandedQuery[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, llm?: LLM) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -1364,8 +1441,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
+    expandQuery: (query: string, model?: string, intent?: string, llm?: LLM) => expandQuery(query, model, db, intent, llm ?? store.llm),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, llm?: LLM) => rerank(query, documents, model, db, intent, llm ?? store.llm),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2820,7 +2897,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -2859,7 +2936,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3530,6 +3607,7 @@ export interface HybridQueryOptions {
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   hooks?: SearchHooks;
+  llm?: LLM;               // override LLM backend (default: local node-llama-cpp)
 }
 
 export interface HybridQueryResult {
@@ -3604,7 +3682,7 @@ export async function hybridQuery(
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query, undefined, intent);
+    : await store.expandQuery(query, undefined, intent, options?.llm);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -3651,21 +3729,26 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
+    const llm = options?.llm ?? getLlm(store);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-    // Run sqlite-vec lookups with pre-computed embeddings
-    for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
-      if (!embedding) continue;
+    // Average all embeddings into one vector for a single scan
+    const validEmbeddings = embeddings.filter(e => e !== null).map(e => e!.embedding);
+    if (validEmbeddings.length > 0) {
+      const dim = validEmbeddings[0]!.length;
+      const avgEmbedding = new Array(dim).fill(0);
+      for (const emb of validEmbeddings) {
+        for (let j = 0; j < dim; j++) avgEmbedding[j] += emb[j]!;
+      }
+      for (let j = 0; j < dim; j++) avgEmbedding[j] /= validEmbeddings.length;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
-        undefined, embedding
+        query, DEFAULT_EMBED_MODEL, 20, collection,
+        undefined, avgEmbedding
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -3777,7 +3860,7 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent, options?.llm);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -3850,6 +3933,7 @@ export interface VectorSearchOptions {
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
+  llm?: LLM;
 }
 
 export interface VectorSearchResult {
@@ -3888,29 +3972,39 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query, undefined, intent);
+  const allExpanded = await store.expandQuery(query, undefined, intent, options?.llm);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
-  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
+  // Batch embed all query texts, then average into single embedding for one scan
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
+  const llm = options?.llm ?? getLlm(store);
+  const textsToEmbed = queryTexts.map(q => formatQueryForEmbedding(q));
+  const embeddings = await llm.embedBatch(textsToEmbed);
+
+  // Average all embeddings into one vector
+  const validEmbeddings = embeddings.filter(e => e !== null).map(e => e!.embedding);
+  if (validEmbeddings.length === 0) return [];
+  const dim = validEmbeddings[0]!.length;
+  const avgEmbedding = new Array(dim).fill(0);
+  for (const emb of validEmbeddings) {
+    for (let i = 0; i < dim; i++) avgEmbedding[i] += emb[i]!;
+  }
+  for (let i = 0; i < dim; i++) avgEmbedding[i] /= validEmbeddings.length;
+
+  // Single scan with averaged embedding
+  const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit, collection, undefined, avgEmbedding);
   const allResults = new Map<string, VectorSearchResult>();
-  for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
-    for (const r of vecResults) {
-      const existing = allResults.get(r.filepath);
-      if (!existing || r.score > existing.score) {
-        allResults.set(r.filepath, {
-          file: r.filepath,
-          displayPath: r.displayPath,
-          title: r.title,
-          body: r.body || "",
-          score: r.score,
-          context: store.getContextForFile(r.filepath),
-          docid: r.docid,
-        });
-      }
-    }
+  for (const r of vecResults) {
+    allResults.set(r.filepath, {
+      file: r.filepath,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body || "",
+      score: r.score,
+      context: store.getContextForFile(r.filepath),
+      docid: r.docid,
+    });
   }
 
   return Array.from(allResults.values())
@@ -3938,6 +4032,7 @@ export interface StructuredSearchOptions {
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
   hooks?: SearchHooks;
+  llm?: LLM;
 }
 
 /**
@@ -4032,7 +4127,7 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
+      const llm = options?.llm ?? getLlm(store);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
@@ -4167,7 +4262,7 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, options?.llm);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score

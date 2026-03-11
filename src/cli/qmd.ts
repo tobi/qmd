@@ -32,6 +32,7 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
+  chunkDocument,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -74,8 +75,15 @@ import {
   generateEmbeddings,
   syncConfigToDb,
   type ReindexResult,
+  findLocalQmdDir,
+  initLocalQmdDir,
+  setCliQmdDir,
+  getCliQmdDir,
+  getEffectiveQmdDir,
+  setQmdDirConfigLoader,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { RemoteLLM, loadRemoteConfig, saveRemoteConfig, clearRemoteConfig, isRemoteConfigured, getDefaultRemoteLLM, disposeDefaultRemoteLLM, withRemoteLLMSession, loadQmdDirConfig, saveQmdDirConfig, clearQmdDirConfig } from "../llm-remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -95,12 +103,49 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  setConfigDirResolver,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
 enableProductionMode();
+
+// Wire .qmd directory config resolution
+setQmdDirConfigLoader(loadQmdDirConfig);
+setConfigDirResolver(() => getEffectiveQmdDir());
+
+// =============================================================================
+// LLM Backend Selection
+// =============================================================================
+
+let forceLocalMode = false;
+
+function setForceLocalMode(force: boolean): void {
+  forceLocalMode = force;
+}
+
+function shouldUseRemote(): boolean {
+  if (forceLocalMode) return false;
+  return isRemoteConfigured();
+}
+
+async function withLLMSessionAuto<T>(
+  fn: (session: any) => Promise<T>,
+  options?: any
+): Promise<T> {
+  if (shouldUseRemote()) {
+    return withRemoteLLMSession(fn, options);
+  }
+  return withLLMSession(fn, options);
+}
+
+async function disposeAllLLM(): Promise<void> {
+  if (shouldUseRemote()) {
+    await disposeDefaultRemoteLLM();
+  }
+  await disposeDefaultLlamaCpp();
+}
 
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
@@ -2125,12 +2170,13 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  await withLLMSessionAuto(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
+      llm: shouldUseRemote() ? getDefaultRemoteLLM() : undefined,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2181,7 +2227,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
-  await withLLMSession(async () => {
+  await withLLMSessionAuto(async () => {
     let results;
 
     if (parsed) {
@@ -2234,6 +2280,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
         intent,
+        llm: shouldUseRemote() ? getDefaultRemoteLLM() : undefined,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2349,6 +2396,12 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Remote LLM options
+      local: { type: "boolean" },
+      "embed-url": { type: "string" },
+      "rerank-url": { type: "string" },
+      "generate-url": { type: "string" },
+      "generate-model": { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2543,6 +2596,11 @@ function showHelp(): void {
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
   console.log("");
+  console.log("Remote LLM backend:");
+  console.log("  qmd remote set <urls>         - Configure remote embed/rerank/generate endpoints");
+  console.log("  qmd remote status             - Show remote config and check health");
+  console.log("  qmd remote clear              - Clear remote config (revert to local)");
+  console.log("");
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
@@ -2592,6 +2650,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  --local                    - Force local LLM mode (ignore remote config)");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
@@ -2660,6 +2719,10 @@ if (isMain) {
     console.log("  --yes                Also create the .claude/skills/qmd symlink");
     console.log("  -f, --force          Replace existing install or symlink");
     process.exit(0);
+  }
+
+  if (cli.values.local) {
+    setForceLocalMode(true);
   }
 
   if (!cli.command || cli.values.help) {
@@ -3132,6 +3195,92 @@ if (isMain) {
       break;
     }
 
+    case "remote": {
+      const subcommand = cli.args[0];
+      if (!subcommand) {
+        console.error("Usage: qmd remote <set|status|clear>");
+        console.error("");
+        console.error("Commands:");
+        console.error("  qmd remote set <embed-url> <rerank-url> <generate-url>");
+        console.error("  qmd remote status       - Show current remote configuration");
+        console.error("  qmd remote clear        - Clear remote config (use local mode)");
+        process.exit(1);
+      }
+
+      switch (subcommand) {
+        case "set": {
+          let embedUrl = cli.values["embed-url"] as string | undefined;
+          let rerankUrl = cli.values["rerank-url"] as string | undefined;
+          let generateUrl = cli.values["generate-url"] as string | undefined;
+          const generateModel = cli.values["generate-model"] as string | undefined;
+
+          if (cli.args.length >= 4) {
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[2];
+            generateUrl = cli.args[3];
+          } else if (cli.args.length === 2 && cli.args[1]) {
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[1];
+            generateUrl = cli.args[1];
+          }
+
+          if (!embedUrl && !rerankUrl && !generateUrl && !generateModel) {
+            console.error("Usage: qmd remote set <embed-url> <rerank-url> <generate-url>");
+            process.exit(1);
+          }
+
+          const existingConfig = loadRemoteConfig();
+          const newConfig = {
+            embedUrl: embedUrl ?? existingConfig.embedUrl,
+            rerankUrl: rerankUrl ?? existingConfig.rerankUrl,
+            generateUrl: generateUrl ?? existingConfig.generateUrl,
+            generateModel: generateModel ?? existingConfig.generateModel,
+          };
+
+          saveRemoteConfig(newConfig);
+          console.log("Remote configuration saved");
+          console.log(`  Embed:    ${newConfig.embedUrl || "(not set)"}`);
+          console.log(`  Rerank:   ${newConfig.rerankUrl || "(not set)"}`);
+          console.log(`  Generate: ${newConfig.generateUrl || "(not set)"}`);
+          if (newConfig.generateModel) {
+            console.log(`  Generate model: ${newConfig.generateModel}`);
+          }
+          break;
+        }
+        case "status": {
+          const config = loadRemoteConfig();
+          if (!config.embedUrl && !config.rerankUrl && !config.generateUrl) {
+            console.log("Remote mode: disabled (using local models)");
+          } else {
+            console.log("Remote Configuration\n");
+            console.log(`  Embed:    ${config.embedUrl || "(not set)"}`);
+            console.log(`  Rerank:   ${config.rerankUrl || "(not set)"}`);
+            console.log(`  Generate: ${config.generateUrl || "(not set)"}`);
+            if (config.generateModel) {
+              console.log(`  Generate model: ${config.generateModel}`);
+            }
+            console.log("\nChecking endpoint health...");
+            const remote = new RemoteLLM(config);
+            const health = await remote.checkHealth();
+            console.log(`  Embed:    ${health.embed ? "healthy" : "unreachable"}`);
+            console.log(`  Rerank:   ${health.rerank ? "healthy" : "unreachable"}`);
+            console.log(`  Generate: ${health.generate ? "healthy" : "unreachable"}`);
+          }
+          break;
+        }
+        case "clear": {
+          clearRemoteConfig();
+          console.log("Remote configuration cleared");
+          console.log("Now using local models");
+          break;
+        }
+        default:
+          console.error(`Unknown remote subcommand: ${subcommand}`);
+          process.exit(1);
+      }
+      break;
+    }
+
     default:
       console.error(`Unknown command: ${cli.command}`);
       console.error("Run 'qmd --help' for usage.");
@@ -3139,7 +3288,7 @@ if (isMain) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
+    await disposeAllLLM();
     process.exit(0);
   }
 
