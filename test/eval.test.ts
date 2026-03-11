@@ -120,7 +120,7 @@ describe("BM25 Search (FTS)", () => {
       const now = new Date().toISOString();
 
       insertContent(db, hash, content, now);
-      insertDocument(db, "eval-docs", file, title, hash, now, now);
+      insertDocument(db, "eval-docs", file, title, hash, "text", now, now);
     }
   });
 
@@ -201,7 +201,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
           // Convert to Float32Array for sqlite-vec
           const embedding = new Float32Array(result.embedding);
           const now = new Date().toISOString();
-          insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
+          insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, "local", now);
         }
       }
     }

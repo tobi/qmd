@@ -48,6 +48,8 @@ export interface NamedCollection extends Collection {
   name: string;
 }
 
+export const DEFAULT_COLLECTION_PATTERN = "**/*.md";
+
 // ============================================================================
 // Configuration paths
 // ============================================================================
@@ -269,7 +271,7 @@ export function updateCollectionSettings(
 export function addCollection(
   name: string,
   path: string,
-  pattern: string = "**/*.md"
+  pattern: string = DEFAULT_COLLECTION_PATTERN
 ): void {
   const config = loadConfig();
 

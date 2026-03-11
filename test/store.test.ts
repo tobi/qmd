@@ -2772,7 +2772,7 @@ describe("Content-Addressable Storage", () => {
     const oldContent = "# First Version";
     const oldHash = await hashContent(oldContent);
     store.insertContent(oldHash, oldContent, now);
-    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, now, now);
+    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, "text", now, now);
 
     // Simulate file removal during update pass.
     store.deactivateDocument(collectionName, "docs/foo.md");
@@ -2784,7 +2784,7 @@ describe("Content-Addressable Storage", () => {
     store.insertContent(newHash, newContent, now);
 
     expect(() => {
-      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, now, now);
+      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, "text", now, now);
     }).not.toThrow();
 
     const rows = store.db.prepare(`

@@ -75,7 +75,21 @@ import {
   syncConfigToDb,
   type ReindexResult,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_MODEL_CACHE_DIR,
+  setEmbedProvider,
+  resolveEmbedProvider,
+  getActiveEmbedModel,
+  getConfiguredEmbedDimensions,
+  getGoogleApiKey,
+} from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -419,10 +433,20 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const provider = await resolveEmbedProvider();
+    const configuredDims = getConfiguredEmbedDimensions();
+    const embeddingModel = provider === "google"
+      ? "Google Gemini Embedding 2"
+      : hfLink(DEFAULT_EMBED_MODEL_URI);
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    console.log(`  Provider:    ${provider}${provider === "google" && configuredDims ? ` (${configuredDims}d)` : ""}`);
+    console.log(`  Embedding:   ${embeddingModel}`);
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    if (provider === "google") {
+      const keyStatus = getGoogleApiKey() ? "set" : "missing";
+      console.log(`  GEMINI_API_KEY: ${keyStatus}`);
+    }
   }
 
   // Device / GPU info
@@ -1548,7 +1572,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
         const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
+        updateDocument(db, existing.id, title, hash, "text",
           stat ? new Date(stat.mtime).toISOString() : now);
         updated++;
       }
@@ -1557,7 +1581,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      insertDocument(db, collectionName, path, title, hash, "text",
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
@@ -1607,9 +1631,11 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+async function vectorIndex(model?: string, force: boolean = false): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const provider = await resolveEmbedProvider();
+  const activeModel = model ?? await getActiveEmbedModel();
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -1623,7 +1649,10 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const dimensions = getConfiguredEmbedDimensions();
+  const dimInfo = provider === "google" && dimensions ? ` (${dimensions}d)` : "";
+  console.log(`${c.dim}Provider: ${provider}${dimInfo}${c.reset}`);
+  console.log(`${c.dim}Model: ${activeModel}${c.reset}\n`);
   cursor.hide();
   progress.indeterminate();
 
@@ -1631,7 +1660,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   const result = await generateEmbeddings(storeInstance, {
     force,
-    model,
+    model: activeModel,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -2334,6 +2363,8 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      provider: { type: "string" },
+      dimensions: { type: "string" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2359,6 +2390,23 @@ function parseCLI() {
   if (indexName) {
     setIndexName(indexName);
     setConfigIndexName(indexName);
+  }
+
+  const providerValue = typeof values.provider === "string" ? values.provider.toLowerCase() : undefined;
+  if (providerValue === "google" || providerValue === "local") {
+    setEmbedProvider(providerValue);
+  } else if (providerValue != null) {
+    console.error(`Invalid --provider value '${providerValue}'. Use 'local' or 'google'.`);
+    process.exit(1);
+  }
+
+  if (typeof values.dimensions === "string") {
+    const dimRaw = values.dimensions.trim();
+    if (!["768", "1536", "3072"].includes(dimRaw)) {
+      console.error(`Invalid --dimensions value '${values.dimensions}'. Use 768, 1536, or 3072.`);
+      process.exit(1);
+    }
+    process.env.QMD_EMBED_DIMENSIONS = dimRaw;
   }
 
   // Determine output format
@@ -2546,7 +2594,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd embed [-f] [--provider local|google] [--dimensions 768|1536|3072] - Generate/refresh vector embeddings");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -2608,6 +2656,11 @@ function showHelp(): void {
   console.log("  -l <num>                   - Maximum lines per file");
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
+  console.log("");
+  console.log("Embed options:");
+  console.log("  -f, --force                 - Force full re-embedding");
+  console.log("  --provider <local|google>   - Embedding backend (or QMD_EMBED_PROVIDER)");
+  console.log("  --dimensions <n>            - Gemini output dimensions (768/1536/3072)");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2923,7 +2976,7 @@ if (isMain) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      await vectorIndex(undefined, !!cli.values.force);
       break;
 
     case "pull": {
