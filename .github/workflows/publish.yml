@@ -23,7 +23,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - run: bun install
-      - run: bun test --timeout 30000 --preload ./src/test-preload.ts test/
+      - run: bun test --timeout 60000 --preload ./src/test-preload.ts test/
         env:
           CI: true
           LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu

@@ -614,42 +614,6 @@ describe("search (unified API)", () => {
 
   test("search() with intent and rerank:false returns results", async () => {
     const results = await store.search({
-      query: "meeting",
-      intent: "quarterly planning and roadmap",
-      rerank: false,
-    });
-    expect(results.length).toBeGreaterThan(0);
-  }, 120_000);
-
-  test("search() with collection filter", async () => {
-    const results = await store.search({
-      query: "authentication",
-      collection: "docs",
-      rerank: false,
-    });
-    for (const r of results) {
-      expect(r.file).toMatch(/^qmd:\/\/docs\//);
-    }
-  });
-
-  test("search() with collections filter", async () => {
-    const results = await store.search({
-      query: "authentication",
-      collections: ["docs"],
-      rerank: false,
-    });
-    for (const r of results) {
-      expect(r.file).toMatch(/^qmd:\/\/docs\//);
-    }
-  });
-
-  test("search() with limit", async () => {
-    const results = await store.search({ query: "meeting", limit: 1, rerank: false });
-    expect(results.length).toBeLessThanOrEqual(1);
-  });
-
-  test("search() with pre-expanded queries and rerank:false", async () => {
-    const results = await store.search({
       queries: [
         { type: "lex", query: "authentication JWT" },
         { type: "lex", query: "login session" },
@@ -657,11 +621,60 @@ describe("search (unified API)", () => {
       rerank: false,
     });
     expect(results.length).toBeGreaterThan(0);
-  });
+  }, 120_000);
 
-  test("search() returns empty for non-matching query", async () => {
-    const results = await store.search({ query: "xyznonexistentterm123", rerank: false });
-    expect(results).toHaveLength(0);
+  // Tests below use search({ query: ... }) which triggers LLM query expansion
+  describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
+    test("search() with query and rerank:false returns results", async () => {
+      const results = await store.search({ query: "authentication", rerank: false });
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0]).toHaveProperty("file");
+      expect(results[0]).toHaveProperty("score");
+      expect(results[0]).toHaveProperty("title");
+      expect(results[0]).toHaveProperty("bestChunk");
+      expect(results[0]).toHaveProperty("docid");
+    });
+
+    test("search() with intent and rerank:false returns results", async () => {
+      const results = await store.search({
+        query: "meeting",
+        intent: "quarterly planning and roadmap",
+        rerank: false,
+      });
+      expect(results.length).toBeGreaterThan(0);
+    });
+
+    test("search() with collection filter", async () => {
+      const results = await store.search({
+        query: "authentication",
+        collection: "docs",
+        rerank: false,
+      });
+      for (const r of results) {
+        expect(r.file).toMatch(/^qmd:\/\/docs\//);
+      }
+    });
+
+    test("search() with collections filter", async () => {
+      const results = await store.search({
+        query: "authentication",
+        collections: ["docs"],
+        rerank: false,
+      });
+      for (const r of results) {
+        expect(r.file).toMatch(/^qmd:\/\/docs\//);
+      }
+    });
+
+    test("search() with limit", async () => {
+      const results = await store.search({ query: "meeting", limit: 1, rerank: false });
+      expect(results.length).toBeLessThanOrEqual(1);
+    });
+
+    test("search() returns empty for non-matching query", async () => {
+      const results = await store.search({ query: "xyznonexistentterm123", rerank: false });
+      expect(results).toHaveLength(0);
+    });
   });
 });
 

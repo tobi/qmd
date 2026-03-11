@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "main": "dist/index.js",

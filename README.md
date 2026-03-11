@@ -500,7 +500,7 @@ This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
 
 ```sh
 # Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
-export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
+export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
 
 # After changing the model, re-embed all collections:
 qmd embed -f

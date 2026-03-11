@@ -1,8 +1,19 @@
 #!/bin/sh
+# Resolve symlinks so global installs (npm link / npm install -g) can find the
+# actual package directory instead of the global bin directory.
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *) SOURCE="$SOURCE_DIR/$TARGET" ;;
+  esac
+done
+
 # Detect the runtime used to install this package and use the matching one
 # to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
-
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 # Check if we were installed with bun (look for bun.lock or bun-lockb)
 if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ] || [ -n "$BUN_INSTALL" ]; then

@@ -7,7 +7,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -231,12 +231,95 @@ describe("CLI Help", () => {
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("qmd skill show/install");
   });
 
   test("shows help with no arguments", async () => {
     const { stdout, exitCode } = await runQmd([]);
     expect(exitCode).toBe(1);
     expect(stdout).toContain("Usage:");
+  });
+});
+
+describe("CLI Skill Commands", () => {
+  test("shows embedded skill with --skill alias", async () => {
+    const { stdout, exitCode } = await runQmd(["--skill"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("QMD Skill (embedded)");
+    expect(stdout).toContain("name: qmd");
+    expect(stdout).toContain("allowed-tools: Bash(qmd:*), mcp__qmd__*");
+  });
+
+  test("shows skill help with -h", async () => {
+    const { stdout, exitCode } = await runQmd(["skill", "-h"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Usage: qmd skill <show|install> [options]");
+    expect(stdout).toContain("install");
+    expect(stdout).toContain("--global");
+  });
+
+  test("installs the skill into the current project", async () => {
+    const projectDir = join(testDir, "skill-project");
+    await mkdir(projectDir, { recursive: true });
+
+    const { stdout, exitCode } = await runQmd(["skill", "install"], { cwd: projectDir });
+    expect(exitCode).toBe(0);
+
+    const skillDir = join(projectDir, ".agents", "skills", "qmd");
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(readFileSync(join(skillDir, "references", "mcp-setup.md"), "utf-8")).toContain("Claude Code");
+    expect(existsSync(join(projectDir, ".claude", "skills", "qmd"))).toBe(false);
+    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
+    expect(stdout).toContain("Tip: create a Claude symlink manually");
+  });
+
+  test("installs globally and creates the Claude symlink with --yes", async () => {
+    const fakeHome = join(testDir, "skill-home");
+    await mkdir(fakeHome, { recursive: true });
+
+    const { stdout, exitCode } = await runQmd(["skill", "install", "--global", "--yes"], {
+      env: { HOME: fakeHome },
+    });
+    expect(exitCode).toBe(0);
+
+    const skillDir = join(fakeHome, ".agents", "skills", "qmd");
+    const claudeLink = join(fakeHome, ".claude", "skills", "qmd");
+
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(lstatSync(claudeLink).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(claudeLink, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
+    expect(stdout).toContain(`✓ Linked Claude skill at ${claudeLink}`);
+  });
+
+  test("skips Claude qmd symlink when .claude/skills already points to .agents/skills", async () => {
+    const fakeHome = join(testDir, "skill-home-shared");
+    await mkdir(join(fakeHome, ".agents"), { recursive: true });
+    await mkdir(join(fakeHome, ".claude"), { recursive: true });
+    symlinkSync(join(fakeHome, ".agents", "skills"), join(fakeHome, ".claude", "skills"), "dir");
+
+    const { stdout, exitCode } = await runQmd(["skill", "install", "--global", "--yes"], {
+      env: { HOME: fakeHome },
+    });
+    expect(exitCode).toBe(0);
+
+    const skillDir = join(fakeHome, ".agents", "skills", "qmd");
+    expect(lstatSync(skillDir).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(stdout).toContain(`✓ Claude already sees the skill via ${join(fakeHome, ".claude", "skills")}`);
+  });
+
+  test("refuses to overwrite an existing install without --force", async () => {
+    const projectDir = join(testDir, "skill-project-force");
+    await mkdir(projectDir, { recursive: true });
+
+    const first = await runQmd(["skill", "install"], { cwd: projectDir });
+    expect(first.exitCode).toBe(0);
+
+    const second = await runQmd(["skill", "install"], { cwd: projectDir });
+    expect(second.exitCode).toBe(1);
+    expect(second.stderr).toContain("Skill already exists");
+    expect(second.stderr).toContain("--force");
   });
 });
 
