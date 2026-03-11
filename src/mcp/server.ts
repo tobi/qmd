@@ -8,6 +8,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { normalizeMcpHost } from "../mcp-host.js";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -538,9 +539,12 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Binds to localhost by default. Use `options.host` to override (e.g. "127.0.0.1"
+ * to force IPv4, or "0.0.0.0" for all interfaces).
+ * Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
+  const { bindHost, displayHost } = normalizeMcpHost(options?.host);
   const store = await createStore({ dbPath: getDefaultDbPath() });
 
   // Pre-fetch default collection names for REST endpoint
@@ -769,7 +773,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, bindHost, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -797,7 +801,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${displayHost}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 
