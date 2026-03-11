@@ -731,7 +731,10 @@ qmd cleanup
 
 ## Data Storage
 
-Index stored in: `~/.cache/qmd/index.sqlite`
+Default index (SQLite) stored in: `~/.cache/qmd/index.sqlite`
+
+When using PostgreSQL (`QMD_BACKEND=postgres`), QMD stores all index data in the
+database specified by `QMD_POSTGRES_URL`.
 
 ### Schema
 
@@ -750,6 +753,26 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_BACKEND` | `sqlite` | Storage backend (`sqlite` or `postgres`) |
+| `QMD_POSTGRES_URL` | _(unset)_ | PostgreSQL URL used when `QMD_BACKEND=postgres` |
+
+### PostgreSQL Backend
+
+QMD supports PostgreSQL + pgvector as an alternative backend for shared or
+multi-agent deployments where multiple processes need concurrent access to the
+same index. SQLite remains the simplest default for single-user local use.
+
+```sh
+export QMD_BACKEND=postgres
+export QMD_POSTGRES_URL=postgresql://user:pass@localhost:5432/qmd
+
+# initialize / migrate schema on first run
+qmd status
+```
+
+Requirements:
+- PostgreSQL with `pgvector` installed
+- `vector` extension available in the target database (`CREATE EXTENSION vector;`)
 
 ## How It Works
 
