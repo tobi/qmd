@@ -631,9 +631,10 @@ function initializeDatabase(db: Database): void {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
     _sqliteVecAvailable = true;
-  } catch {
+  } catch (err) {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
+    console.warn(getErrorMessage(err));
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
