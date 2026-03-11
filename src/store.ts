@@ -1330,7 +1330,7 @@ export async function generateEmbeddings(
         }
       }
 
-      const title = extractTitle(item.body || "", item.path);
+      const title = item.title?.trim() || extractTitle(item.body || "", item.path);
       const input: EmbedInput = {
         text: buildMultimodalEmbedText(item.path, title, item.body || "", contentType),
         filePath: absolutePath,
@@ -2957,6 +2957,7 @@ export function getHashesForEmbedding(db: Database): {
   hash: string;
   body: string;
   path: string;
+  title: string;
   collection: string;
   contentType: string;
   collectionPath: string;
@@ -2966,6 +2967,7 @@ export function getHashesForEmbedding(db: Database): {
       d.hash,
       c.doc as body,
       MIN(d.path) as path,
+      MIN(d.title) as title,
       d.collection as collection,
       MIN(d.content_type) as contentType,
       sc.path as collectionPath
@@ -2979,6 +2981,7 @@ export function getHashesForEmbedding(db: Database): {
     hash: string;
     body: string;
     path: string;
+    title: string;
     collection: string;
     contentType: string;
     collectionPath: string;

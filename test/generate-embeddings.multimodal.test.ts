@@ -99,7 +99,7 @@ describe("generateEmbeddings multimodal inputs", () => {
     expect(typeof input).toBe("object");
     expect(input.filePath).toBe(absolutePath);
     expect(input.text).toContain("File: receipts/invoice.png");
-    expect(input.text).toContain("Title: invoice");
+    expect(input.text).toContain("Title: March Invoice");
     expect(input.text).toContain("Body: [image] receipts/invoice.png (image/png)");
     expect(input.text).toContain("Type: image");
     expect(batchInputs[0]?.length).toBe(1);
@@ -138,7 +138,7 @@ describe("generateEmbeddings multimodal inputs", () => {
     expect(typeof input).toBe("object");
     expect(input.filePath).toBe(absolutePath);
     expect(input.text).toContain("File: reports/q1.pdf");
-    expect(input.text).toContain("Title: q1");
+    expect(input.text).toContain("Title: Q1 Report");
     expect(input.text).toContain("Body: [pdf] reports/q1.pdf (application/pdf)");
     expect(input.text).toContain("Type: pdf");
   });
