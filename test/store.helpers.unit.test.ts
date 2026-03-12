@@ -15,6 +15,7 @@ import {
   normalizeDocid,
   isDocid,
   handelize,
+  cleanupOrphanedVectors,
 } from "../src/store";
 
 // =============================================================================
@@ -78,6 +79,33 @@ describe("Path Utilities", () => {
     const result = getRealPath("/tmp");
     expect(result).toBeTruthy();
     expect(result === "/tmp" || result === "/private/tmp").toBe(true);
+  });
+});
+
+// =============================================================================
+// Handelize Tests
+// =============================================================================
+
+describe("cleanupOrphanedVectors", () => {
+  test("returns 0 when vec table exists in schema but sqlite-vec is unavailable", () => {
+    const prepare = (sql: string) => {
+      if (sql.includes("sqlite_master") && sql.includes("vectors_vec")) {
+        return { get: () => ({ name: "vectors_vec" }) };
+      }
+      if (sql.includes("SELECT 1 FROM vectors_vec LIMIT 0")) {
+        return { get: () => { throw new Error("no such module: vec0"); } };
+      }
+      throw new Error(`Unexpected SQL in test: ${sql}`);
+    };
+
+    const db = {
+      prepare,
+      exec: () => {
+        throw new Error("cleanup should not execute vector deletes when sqlite-vec is unavailable");
+      },
+    } as any;
+
+    expect(cleanupOrphanedVectors(db)).toBe(0);
   });
 });
 
