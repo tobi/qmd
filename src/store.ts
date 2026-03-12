@@ -1686,12 +1686,10 @@ export function cleanupOrphanedContent(db: Database): number {
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
-  // Check if vectors_vec table exists
-  const tableExists = db.prepare(`
-    SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-  `).get();
-
-  if (!tableExists) {
+  // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
+  // The vectors_vec virtual table can appear in sqlite_master from a prior
+  // session, but querying it without the vec0 module loaded will crash (#380).
+  if (!isSqliteVecAvailable()) {
     return 0;
   }
 
