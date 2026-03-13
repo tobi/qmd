@@ -21,6 +21,12 @@ analyze:
 prepare:
     QMD_BASE_MODEL=Qwen/Qwen3-1.7B uv run dataset/prepare_data.py --seed 42
 
+convert-onnx size="1.7B":
+    uv run convert_onnx.py --size {{size}}
+
+convert-gguf size="1.7B":
+    uv run convert_gguf.py --size {{size}}
+
 train-local:
     just prepare
     HF_TOKEN=${HF_TOKEN} uv run torchrun --standalone --nproc_per_node auto \
