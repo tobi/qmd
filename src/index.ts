@@ -286,6 +286,8 @@ export interface QMDStore {
   embed(options?: {
     force?: boolean;
     model?: string;
+    maxDocsPerBatch?: number;
+    maxBatchBytes?: number;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -502,6 +504,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
+        maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
+        maxBatchBytes: embedOpts?.maxBatchBytes,
         onProgress: embedOpts?.onProgress,
       });
     },

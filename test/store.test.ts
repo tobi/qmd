@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp } from "../src/llm.js";
+import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -47,6 +47,7 @@ import {
   syncConfigToDb,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
+  generateEmbeddings,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -2586,6 +2587,113 @@ describe("Edge Cases", () => {
     expect(results).toHaveLength(10);
 
     await cleanupTestDb(store);
+  });
+});
+
+describe("Embedding batching", () => {
+  function createFakeTokenizer() {
+    return {
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+    };
+  }
+
+  function createFakeEmbedLlm() {
+    const embedBatchCalls: string[][] = [];
+    return {
+      embedBatchCalls,
+      async embed(_text: string) {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+  }
+
+  test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+      });
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(3);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings flushes batches when maxBatchBytes is reached", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    const docOne = "# One\n\n" + "A".repeat(36);
+    const docTwo = "# Two\n\n" + "B".repeat(36);
+    const docThree = "# Three\n\n" + "C".repeat(36);
+    const batchLimit = new TextEncoder().encode(docOne).length
+      + new TextEncoder().encode(docTwo).length
+      + 1;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "a-one", body: docOne });
+      await insertTestDocument(db, "docs", { name: "b-two", body: docTwo });
+      await insertTestDocument(db, "docs", { name: "c-three", body: docThree });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 64,
+        maxBatchBytes: batchLimit,
+      });
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(2);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([2, 1]);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings rejects invalid batch limits", async () => {
+    const store = await createTestStore();
+
+    try {
+      await expect(generateEmbeddings(store, { maxDocsPerBatch: 0 })).rejects.toThrow(
+        "maxDocsPerBatch"
+      );
+      await expect(generateEmbeddings(store, { maxBatchBytes: 0 })).rejects.toThrow(
+        "maxBatchBytes"
+      );
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
   });
 });
 
