@@ -22,6 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
+import { setDefaultLlamaCpp } from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -921,6 +922,79 @@ describe("update", () => {
     expect(results.length).toBeGreaterThan(0);
 
     await store.close();
+  });
+});
+
+describe("embed", () => {
+  function createFakeTokenizer() {
+    return {
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+    };
+  }
+
+  function createFakeEmbedLlm() {
+    const embedBatchCalls: string[][] = [];
+    return {
+      embedBatchCalls,
+      async embed(_text: string) {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+  }
+
+  test("store.embed forwards batch limit options", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const fakeLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      const result = await store.embed({
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+      });
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(3);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed rejects invalid batch limits", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+    });
+
+    try {
+      await expect(store.embed({ maxDocsPerBatch: 0 })).rejects.toThrow("maxDocsPerBatch");
+      await expect(store.embed({ maxBatchBytes: 0 })).rejects.toThrow("maxBatchBytes");
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
   });
 });
 

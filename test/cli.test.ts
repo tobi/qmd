@@ -241,6 +241,20 @@ describe("CLI Help", () => {
   });
 });
 
+describe("CLI Embed", () => {
+  test("rejects invalid --max-docs-per-batch", async () => {
+    const { stderr, exitCode } = await runQmd(["embed", "--max-docs-per-batch", "0"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("maxDocsPerBatch");
+  });
+
+  test("rejects invalid --max-batch-mb", async () => {
+    const { stderr, exitCode } = await runQmd(["embed", "--max-batch-mb", "0"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("maxBatchBytes");
+  });
+});
+
 describe("CLI Skill Commands", () => {
   test("shows embedded skill with --skill alias", async () => {
     const { stdout, exitCode } = await runQmd(["--skill"]);
