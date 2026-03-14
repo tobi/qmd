@@ -271,7 +271,8 @@ export function isAbsolutePath(path: string): boolean {
   if (path.startsWith('/')) {
     // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
     // Requires path[2] === '/' to distinguish from Unix paths like /c or /cache
-    if (path.length >= 3 && path[2] === '/') {
+    // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
+    if (!isWSL() && path.length >= 3 && path[2] === '/') {
       const driveLetter = path[1];
       if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
         return true;
@@ -295,6 +296,14 @@ export function isAbsolutePath(path: string): boolean {
  */
 export function normalizePathSeparators(path: string): string {
   return path.replace(/\\/g, '/');
+}
+
+/**
+ * Detect if running inside WSL (Windows Subsystem for Linux).
+ * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths.
+ */
+function isWSL(): boolean {
+  return !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 }
 
 /**
@@ -349,8 +358,9 @@ export function resolve(...paths: string[]): string {
     if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
       windowsDrive = firstPath.slice(0, 2);
       result = firstPath.slice(2);
-    } else if (firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
+    } else if (!isWSL() && firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
       // Git Bash style: /c/ -> C: (C-Z drives only, not A or B)
+      // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
       const driveLetter = firstPath[1];
       if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
         windowsDrive = driveLetter.toUpperCase() + ':';
@@ -381,8 +391,9 @@ export function resolve(...paths: string[]): string {
       if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
         windowsDrive = p.slice(0, 2);
         result = p.slice(2);
-      } else if (p.startsWith('/') && p.length >= 3 && p[2] === '/') {
+      } else if (!isWSL() && p.startsWith('/') && p.length >= 3 && p[2] === '/') {
         // Git Bash style (C-Z drives only, not A or B)
+        // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
         const driveLetter = p[1];
         if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
           windowsDrive = driveLetter.toUpperCase() + ':';
