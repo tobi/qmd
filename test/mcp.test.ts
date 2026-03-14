@@ -1075,3 +1075,285 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+// =============================================================================
+// MCP HTTP host binding — 18 in-process integration tests
+// =============================================================================
+
+import { createServer as createNetServer } from "node:net";
+
+/** Detect IPv6 loopback availability (::1) */
+async function hasIPv6Loopback(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = createNetServer();
+    srv.listen(0, "::1", () => { srv.close(() => resolve(true)); });
+    srv.on("error", () => resolve(false));
+  });
+}
+
+/** Create a session-tracking MCP client for a given base URL */
+function makeMcpClient(base: string) {
+  let sessionId: string | null = null;
+  return async function mcpRequest(body: object) {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    const res = await fetch(`${base}/mcp`, { method: "POST", headers, body: JSON.stringify(body) });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+    const json = await res.json();
+    return { status: res.status, json, sessionId: sid || sessionId };
+  };
+}
+
+describe("MCP HTTP host binding", () => {
+  let ipv6Available = false;
+  // Stash/restore env
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+  let hostTestDbPath: string;
+  let hostTestConfigDir: string;
+
+  beforeAll(async () => {
+    ipv6Available = await hasIPv6Loopback();
+
+    // Create isolated test database
+    hostTestDbPath = `/tmp/qmd-mcp-host-test-${Date.now()}.sqlite`;
+    const db = openDatabase(hostTestDbPath);
+    initTestDatabase(db);
+    seedTestData(db);
+    db.close();
+
+    // Create isolated YAML config
+    const configPrefix = join(tmpdir(), `qmd-mcp-host-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    hostTestConfigDir = await mkdtemp(configPrefix);
+    const testConfig: CollectionConfig = {
+      collections: { docs: { path: "/test/docs", pattern: "**/*.md" } },
+    };
+    await writeFile(join(hostTestConfigDir, "index.yml"), YAML.stringify(testConfig));
+
+    process.env.INDEX_PATH = hostTestDbPath;
+    process.env.QMD_CONFIG_DIR = hostTestConfigDir;
+  });
+
+  afterAll(async () => {
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+    try { unlinkSync(hostTestDbPath); } catch {}
+    try {
+      const files = await readdir(hostTestConfigDir);
+      for (const f of files) await unlink(join(hostTestConfigDir, f));
+      await rmdir(hostTestConfigDir);
+    } catch {}
+  });
+
+  // Helper: start server and ensure cleanup
+  async function startServer(opts: { host?: string; port?: number } = {}) {
+    const handle = await startMcpHttpServer(opts.port ?? 0, { quiet: true, host: opts.host });
+    return handle;
+  }
+
+  // --- Binding tests ---
+
+  test("explicit IPv4 bind serves health check", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/health`);
+      expect(res.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("bracketed IPv6 normalization binds to ::1", async () => {
+    if (!ipv6Available) return;
+    const h = await startServer({ host: "[::1]" });
+    try {
+      const addr = h.httpServer.address() as import("net").AddressInfo;
+      expect(addr.address).toBe("::1");
+    } finally { await h.stop(); }
+  });
+
+  test("empty host falls back to localhost", async () => {
+    const h = await startServer({ host: "   " });
+    try {
+      const res = await fetch(`http://localhost:${h.port}/health`);
+      expect(res.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("no host option defaults to localhost", async () => {
+    const h = await startServer();
+    try {
+      const res = await fetch(`http://localhost:${h.port}/health`);
+      expect(res.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("host: undefined defaults to localhost", async () => {
+    const h = await startServer({ host: undefined });
+    try {
+      const res = await fetch(`http://localhost:${h.port}/health`);
+      expect(res.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("ephemeral port (0) reports actual bound port", async () => {
+    const h = await startServer({ host: "127.0.0.1", port: 0 });
+    try {
+      expect(h.port).toBeGreaterThan(0);
+      expect(h.port).not.toBe(0);
+    } finally { await h.stop(); }
+  });
+
+  test("bound address matches requested host for IPv4", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const addr = h.httpServer.address() as import("net").AddressInfo;
+      expect(addr.address).toBe("127.0.0.1");
+    } finally { await h.stop(); }
+  });
+
+  test("bound address matches requested host for IPv6", async () => {
+    if (!ipv6Available) return;
+    const h = await startServer({ host: "::1" });
+    try {
+      const addr = h.httpServer.address() as import("net").AddressInfo;
+      expect(addr.address).toBe("::1");
+    } finally { await h.stop(); }
+  });
+
+  test("wildcard 0.0.0.0 is reachable from 127.0.0.1", async () => {
+    const h = await startServer({ host: "0.0.0.0" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/health`);
+      expect(res.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("EADDRINUSE when binding same host:port twice", async () => {
+    const h1 = await startServer({ host: "127.0.0.1" });
+    try {
+      await expect(startServer({ host: "127.0.0.1", port: h1.port })).rejects.toMatchObject({ code: "EADDRINUSE" });
+    } finally { await h1.stop(); }
+  });
+
+  test("dual-stack: same port on different hosts (IPv4 vs IPv6)", async () => {
+    if (!ipv6Available) return;
+    const h1 = await startServer({ host: "127.0.0.1" });
+    try {
+      const h2 = await startServer({ host: "::1", port: h1.port });
+      try {
+        const r1 = await fetch(`http://127.0.0.1:${h1.port}/health`);
+        const r2 = await fetch(`http://[::1]:${h2.port}/health`);
+        expect(r1.status).toBe(200);
+        expect(r2.status).toBe(200);
+      } finally { await h2.stop(); }
+    } finally { await h1.stop(); }
+  });
+
+  // --- MCP session tests on custom host ---
+
+  test("MCP session works over explicit IPv4 host", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const client = makeMcpClient(`http://127.0.0.1:${h.port}`);
+      const init = await client({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+      });
+      expect(init.status).toBe(200);
+      expect(init.sessionId).toBeTruthy();
+
+      const tools = await client({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+      expect(tools.status).toBe(200);
+      expect(tools.json.result.tools.length).toBeGreaterThan(0);
+    } finally { await h.stop(); }
+  });
+
+  test("MCP session works over IPv6 host", async () => {
+    if (!ipv6Available) return;
+    const h = await startServer({ host: "::1" });
+    try {
+      const client = makeMcpClient(`http://[::1]:${h.port}`);
+      const init = await client({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+      });
+      expect(init.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("concurrent sessions on custom host both succeed", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const clientA = makeMcpClient(`http://127.0.0.1:${h.port}`);
+      const clientB = makeMcpClient(`http://127.0.0.1:${h.port}`);
+      const initA = await clientA({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "testA", version: "1.0" } },
+      });
+      const initB = await clientB({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "testB", version: "1.0" } },
+      });
+      expect(initA.sessionId).not.toBe(initB.sessionId);
+
+      const toolsA = await clientA({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+      const toolsB = await clientB({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+      expect(toolsA.status).toBe(200);
+      expect(toolsB.status).toBe(200);
+    } finally { await h.stop(); }
+  });
+
+  test("missing session ID returns 400 on custom host", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error.message).toContain("Missing session ID");
+    } finally { await h.stop(); }
+  });
+
+  test("invalid session ID returns 404 on custom host", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+          "mcp-session-id": "nonexistent-uuid",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      expect(res.status).toBe(404);
+      const json = await res.json();
+      expect(json.error.message).toContain("Session not found");
+    } finally { await h.stop(); }
+  });
+
+  test("stop() shuts down server on custom host", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    const port = h.port;
+    await h.stop();
+    await expect(fetch(`http://127.0.0.1:${port}/health`)).rejects.toThrow();
+  });
+
+  test("health endpoint returns correct JSON shape on custom host", async () => {
+    const h = await startServer({ host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/health`);
+      const body = await res.json();
+      expect(body).toHaveProperty("status", "ok");
+      expect(typeof body.uptime).toBe("number");
+    } finally { await h.stop(); }
+  });
+});

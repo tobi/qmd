@@ -1323,8 +1323,10 @@ describe("mcp http daemon", () => {
   }
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
-  function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+  function spawnHttpServer(port: number, host?: string): import("child_process").ChildProcess {
+    const args = [qmdScript, "mcp", "--http", "--port", String(port)];
+    if (host) args.push("--host", host);
+    const proc = spawn(tsxBin, args, {
       cwd: fixturesDir,
       env: {
         ...process.env,
@@ -1338,11 +1340,12 @@ describe("mcp http daemon", () => {
   }
 
   /** Wait for HTTP server to become ready */
-  async function waitForServer(port: number, timeoutMs = 5000): Promise<boolean> {
+  async function waitForServer(port: number, timeoutMs = 5000, host = "localhost"): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
+    const displayHost = host.includes(":") ? `[${host}]` : host;
     while (Date.now() < deadline) {
       try {
-        const res = await fetch(`http://localhost:${port}/health`);
+        const res = await fetch(`http://${displayHost}:${port}/health`);
         if (res.ok) return true;
       } catch { /* not ready yet */ }
       await sleep(200);
@@ -1519,5 +1522,392 @@ describe("mcp http daemon", () => {
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
+  });
+
+  // -------------------------------------------------------------------------
+  // Daemon IPC readiness handshake
+  // -------------------------------------------------------------------------
+
+  test("daemon waits for child to bind before reporting success", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--host", "127.0.0.1", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Started on");
+
+    // Verify the server is actually responding (not just that parent printed success)
+    const ready = await waitForServer(port, 5000, "127.0.0.1");
+    expect(ready).toBe(true);
+
+    // Clean up
+    const pf = pidPath();
+    if (existsSync(pf)) {
+      const pid = parseInt(readFileSync(pf, "utf-8").trim());
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      await sleep(500);
+      try { unlinkSync(pf); } catch {}
+    }
+  });
+
+  test("daemon reports failure on port collision", async () => {
+    const port = randomPort();
+    // Start a foreground server to occupy the port
+    const blocker = spawnHttpServer(port, "127.0.0.1");
+    try {
+      const ready = await waitForServer(port, 5000, "127.0.0.1");
+      expect(ready).toBe(true);
+
+      // Try to start daemon on the same port — should fail
+      const { stderr, exitCode } = await runDaemonQmd([
+        "mcp", "--http", "--daemon", "--host", "127.0.0.1", "--port", String(port),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("already in use");
+
+      // PID file must NOT exist after failed daemon start
+      expect(existsSync(pidPath())).toBe(false);
+    } finally {
+      blocker.kill("SIGTERM");
+      await new Promise(r => blocker.on("close", r));
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // --host flag tests
+  // -------------------------------------------------------------------------
+
+  test("foreground HTTP server accepts --host 127.0.0.1", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "127.0.0.1");
+    try {
+      const ready = await waitForServer(port, 5000, "127.0.0.1");
+      expect(ready).toBe(true);
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("--daemon forwards --host to child process", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--host", "127.0.0.1", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://127.0.0.1:${port}/mcp`);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    const ready = await waitForServer(port, 5000, "127.0.0.1");
+    expect(ready).toBe(true);
+
+    process.kill(pid, "SIGTERM");
+    await sleep(500);
+    try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--host rejects URL-like values", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "http://127.0.0.1",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("not a URL");
+  });
+
+  test("--host without a value exits with error", async () => {
+    // parseArgs strict:false gives boolean true for bare --host
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("requires");
+  });
+
+  test("--host with value stolen by next flag exits with error", async () => {
+    // --host --daemon: parseArgs gives host="--daemon"
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "--daemon",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("requires a hostname");
+  });
+
+  test("--host with host:port pattern exits with error", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "localhost:8181",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--host and --port separately");
+  });
+
+  test("foreground HTTP server accepts --host 0.0.0.0", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "0.0.0.0");
+    try {
+      const ready = await waitForServer(port, 5000, "127.0.0.1");
+      expect(ready).toBe(true);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("foreground HTTP server accepts --host ::1 (bare IPv6)", async () => {
+    // Check IPv6 availability
+    const ipv6 = await new Promise<boolean>((resolve) => {
+      const { createServer } = require("net");
+      const srv = createServer();
+      srv.listen(0, "::1", () => { srv.close(() => resolve(true)); });
+      srv.on("error", () => resolve(false));
+    });
+    if (!ipv6) return; // skip gracefully
+
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "::1");
+    try {
+      const ready = await waitForServer(port, 5000, "::1");
+      expect(ready).toBe(true);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("foreground HTTP server accepts --host [::1] (bracketed)", async () => {
+    const ipv6 = await new Promise<boolean>((resolve) => {
+      const { createServer } = require("net");
+      const srv = createServer();
+      srv.listen(0, "::1", () => { srv.close(() => resolve(true)); });
+      srv.on("error", () => resolve(false));
+    });
+    if (!ipv6) return;
+
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "[::1]");
+    try {
+      const ready = await waitForServer(port, 5000, "::1");
+      expect(ready).toBe(true);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("--daemon with --host [::1] shows bracketed display in output", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--host", "[::1]", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://[::1]:${port}/mcp`);
+
+    // Clean up daemon
+    try {
+      const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+      spawnedPids.push(pid);
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    } catch {}
+  });
+
+  test("--daemon without --host shows localhost in output", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    process.kill(pid, "SIGTERM");
+    await sleep(500);
+    try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--host rejects /tmp/socket (path-like)", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "/tmp/socket",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("not a URL");
+  });
+
+  test("--host rejects 127.0.0.1:8080 (host:port)", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "127.0.0.1:8080",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--host and --port separately");
+  });
+
+  test("--host rejects [::1]:8080 (bracketed IPv6 with port)", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "[::1]:8080",
+    ]);
+    expect(exitCode).toBe(1);
+    // [::1]:8080 doesn't end with ], so it won't be treated as bracketed IPv6
+    // The inner value will contain ":" and fail isIP, triggering the host:port rejection
+    expect(stderr).toContain("Invalid --host");
+  });
+
+  test("EADDRINUSE error message includes custom host", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "127.0.0.1");
+    try {
+      const ready = await waitForServer(port, 5000, "127.0.0.1");
+      expect(ready).toBe(true);
+
+      // Now try to start a second foreground server on the same port
+      const { stderr, exitCode } = await runDaemonQmd([
+        "mcp", "--http", "--host", "127.0.0.1", "--port", String(port),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("already in use on 127.0.0.1");
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("--host + --port together work correctly via daemon", async () => {
+    const port = randomPort();
+    const { stdout, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--host", "127.0.0.1", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    const ready = await waitForServer(port, 5000, "127.0.0.1");
+    expect(ready).toBe(true);
+
+    process.kill(pid, "SIGTERM");
+    await sleep(500);
+    try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--host position is independent of other flags", async () => {
+    // Put --host before --http
+    const port = randomPort();
+    const { exitCode, stdout } = await runDaemonQmd([
+      "mcp", "--host", "127.0.0.1", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`http://127.0.0.1:${port}/mcp`);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    process.kill(pid, "SIGTERM");
+    await sleep(500);
+    try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--host with hostname 'localhost' resolves and binds", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "localhost");
+    try {
+      const ready = await waitForServer(port, 5000, "localhost");
+      expect(ready).toBe(true);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("MCP protocol works via CLI-spawned server with custom host", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "127.0.0.1");
+    try {
+      const ready = await waitForServer(port, 5000, "127.0.0.1");
+      expect(ready).toBe(true);
+
+      // Initialize MCP session
+      const initRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1, method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+        }),
+      });
+      expect(initRes.status).toBe(200);
+      const sessionId = initRes.headers.get("mcp-session-id");
+      expect(sessionId).toBeTruthy();
+
+      // tools/list with session
+      const toolsRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+          "mcp-session-id": sessionId!,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+      });
+      expect(toolsRes.status).toBe(200);
+      const tools = await toolsRes.json();
+      expect(tools.result.tools.length).toBeGreaterThan(0);
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("--host rejects empty string", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("non-empty");
+  });
+
+  test("--host rejects whitespace-only string", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "   ",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("non-empty");
+  });
+
+  test("--host rejects empty brackets []", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "[]",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("brackets");
+  });
+
+  test("--host rejects bracketed hostname [localhost]", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "[localhost]",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("brackets");
+  });
+
+  test("--host rejects whitespace in host value", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "foo bar",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("whitespace");
+  });
+
+  test("--host rejects --port=8181 (flag-like value)", async () => {
+    const { stderr, exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--host", "--port=8181",
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("requires a hostname");
   });
 });
