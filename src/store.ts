@@ -2650,8 +2650,8 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+export function sanitizeFTS5Term(term: string): string {
+  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
 }
 
 /**

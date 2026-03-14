@@ -16,6 +16,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  sanitizeFTS5Term,
 } from "../src/store";
 
 // =============================================================================
@@ -242,5 +243,43 @@ describe("handelize", () => {
     expect(isDocid("#123456")).toBe(true);
     expect(isDocid("bad-id")).toBe(false);
     expect(isDocid("12345")).toBe(false);
+  });
+});
+
+// =============================================================================
+// sanitizeFTS5Term Tests
+// =============================================================================
+
+describe("sanitizeFTS5Term", () => {
+  test("preserves underscores in snake_case identifiers", () => {
+    expect(sanitizeFTS5Term("my_variable")).toBe("my_variable");
+    expect(sanitizeFTS5Term("MAX_RETRIES")).toBe("max_retries");
+    expect(sanitizeFTS5Term("__init__")).toBe("__init__");
+  });
+
+  test("preserves alphanumeric characters", () => {
+    expect(sanitizeFTS5Term("hello123")).toBe("hello123");
+    expect(sanitizeFTS5Term("test")).toBe("test");
+  });
+
+  test("preserves apostrophes for contractions", () => {
+    expect(sanitizeFTS5Term("don't")).toBe("don't");
+    expect(sanitizeFTS5Term("it's")).toBe("it's");
+  });
+
+  test("strips other punctuation", () => {
+    expect(sanitizeFTS5Term("hello!")).toBe("hello");
+    expect(sanitizeFTS5Term("test@value")).toBe("testvalue");
+    expect(sanitizeFTS5Term("a.b")).toBe("ab");
+  });
+
+  test("lowercases output", () => {
+    expect(sanitizeFTS5Term("Hello")).toBe("hello");
+    expect(sanitizeFTS5Term("MY_VAR")).toBe("my_var");
+  });
+
+  test("handles unicode letters and numbers", () => {
+    expect(sanitizeFTS5Term("café")).toBe("café");
+    expect(sanitizeFTS5Term("日本語")).toBe("日本語");
   });
 });
