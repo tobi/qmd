@@ -33,6 +33,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import type { RemoteEmbeddingProvider } from "./remote-embedding.js";
 
 // =============================================================================
 // Configuration
@@ -985,6 +986,8 @@ export type Store = {
   dbPath: string;
   /** Optional LlamaCpp instance for this store (overrides the global singleton) */
   llm?: LlamaCpp;
+  /** Optional remote embedding provider (overrides local GGUF for embeddings) */
+  remoteEmbedding?: RemoteEmbeddingProvider;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1022,7 +1025,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], remoteProvider?: RemoteEmbeddingProvider) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1305,10 +1308,11 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const model = options?.model ?? DEFAULT_EMBED_MODEL;
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+  const remote = store.remoteEmbedding;
+  const model = remote ? remote.modelUri : (options?.model ?? DEFAULT_EMBED_MODEL);
 
   if (options?.force) {
     clearAllEmbeddings(db);
@@ -1323,7 +1327,12 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Remote embedding path — no LlamaCpp session needed
+  if (remote) {
+    return generateEmbeddingsRemote(store, remote, model, docsToEmbed, totalBytes, totalDocs, now, maxDocsPerBatch, maxBatchBytes, options);
+  }
+
+  // Local GGUF path — use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
 
   // Create a session manager for this llm instance
@@ -1447,6 +1456,134 @@ export async function generateEmbeddings(
 }
 
 /**
+ * Generate embeddings using a remote provider (Gemini, OpenAI, etc.).
+ * Skips nomic-style prefixes — remote models handle their own formatting.
+ * Uses char-based chunking (no local tokenizer needed).
+ */
+async function generateEmbeddingsRemote(
+  store: Store,
+  remote: RemoteEmbeddingProvider,
+  model: string,
+  docsToEmbed: PendingEmbeddingDoc[],
+  totalBytes: number,
+  totalDocs: number,
+  now: string,
+  maxDocsPerBatch: number,
+  maxBatchBytes: number,
+  options?: EmbedOptions,
+): Promise<EmbedResult> {
+  const db = store.db;
+  const encoder = new TextEncoder();
+  const startTime = Date.now();
+  let chunksEmbedded = 0;
+  let errors = 0;
+  let bytesProcessed = 0;
+  let totalChunks = 0;
+  let vectorTableInitialized = false;
+  const BATCH_SIZE = 64; // Remote APIs handle larger batches efficiently
+
+  const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+
+  for (const batchMeta of batches) {
+    const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+    const batchChunks: ChunkItem[] = [];
+    const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+
+    for (const doc of batchDocs) {
+      if (!doc.body.trim()) continue;
+      const title = extractTitle(doc.body, doc.path);
+      // Use char-based chunking for remote providers (no local tokenizer dependency)
+      const chunks = chunkDocument(doc.body);
+      for (let seq = 0; seq < chunks.length; seq++) {
+        batchChunks.push({
+          hash: doc.hash,
+          title,
+          text: chunks[seq]!.text,
+          seq,
+          pos: chunks[seq]!.pos,
+          tokens: 0, // Not applicable for remote
+          bytes: encoder.encode(chunks[seq]!.text).length,
+        });
+      }
+    }
+
+    totalChunks += batchChunks.length;
+
+    if (batchChunks.length === 0) {
+      bytesProcessed += batchBytes;
+      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+      continue;
+    }
+
+    // Initialize vector table from first embedding dimensions
+    if (!vectorTableInitialized) {
+      const firstResult = await remote.embed(batchChunks[0]!.text);
+      store.ensureVecTable(firstResult.embedding.length);
+      vectorTableInitialized = true;
+    }
+
+    const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+    let batchChunkBytesProcessed = 0;
+
+    for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+      const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+      // Remote providers: send raw text without nomic-style prefixes
+      const texts = chunkBatch.map(chunk => chunk.text);
+
+      try {
+        const embeddings = await remote.embedBatch(texts);
+        for (let i = 0; i < chunkBatch.length; i++) {
+          const chunk = chunkBatch[i]!;
+          const result = embeddings[i];
+          if (result) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+          batchChunkBytesProcessed += chunk.bytes;
+        }
+      } catch (err) {
+        // Batch failed — try individual embeddings as fallback
+        console.error("Remote batch embedding error, falling back to individual:", err);
+        for (const chunk of chunkBatch) {
+          try {
+            const result = await remote.embed(chunk.text);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+            chunksEmbedded++;
+          } catch {
+            errors++;
+          }
+          batchChunkBytesProcessed += chunk.bytes;
+        }
+      }
+
+      const proportionalBytes = totalBatchChunkBytes === 0
+        ? batchBytes
+        : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+      options?.onProgress?.({
+        chunksEmbedded,
+        totalChunks,
+        bytesProcessed: bytesProcessed + proportionalBytes,
+        totalBytes,
+        errors,
+      });
+    }
+
+    bytesProcessed += batchBytes;
+    options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+  }
+
+  return {
+    docsProcessed: totalDocs,
+    chunksEmbedded,
+    errors,
+    durationMs: Date.now() - startTime,
+  };
+}
+
+/**
  * Create a new store instance with the given database path.
  * If no path is provided, uses the default path (~/.cache/qmd/index.sqlite).
  *
@@ -1498,7 +1635,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], remoteProvider?: RemoteEmbeddingProvider) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, remoteProvider),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
@@ -2817,11 +2954,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], remoteProvider?: RemoteEmbeddingProvider): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, undefined, remoteProvider);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2907,8 +3044,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp, remoteProvider?: RemoteEmbeddingProvider): Promise<number[] | null> {
+  // Remote providers: send raw text without nomic-style prefixes
+  if (remoteProvider) {
+    try {
+      const result = await remoteProvider.embed(text);
+      return result.embedding;
+    } catch (error) {
+      console.error("Remote embedding error:", error);
+      return null;
+    }
+  }
+
+  // Local GGUF: format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
@@ -3796,16 +3944,30 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
-    hooks?.onEmbedStart?.(textsToEmbed.length);
-    const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
-    hooks?.onEmbedDone?.(Date.now() - embedStart);
+    const remote = store.remoteEmbedding;
+    let precomputedEmbeddings: (number[] | null)[];
+
+    if (remote) {
+      // Remote providers: send raw text without nomic-style prefixes
+      const textsToEmbed = vecQueries.map(q => q.text);
+      hooks?.onEmbedStart?.(textsToEmbed.length);
+      const embedStart = Date.now();
+      const results = await remote.embedBatch(textsToEmbed);
+      precomputedEmbeddings = results.map(r => r.embedding);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
+    } else {
+      const llm = getLlm(store);
+      const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+      hooks?.onEmbedStart?.(textsToEmbed.length);
+      const embedStart = Date.now();
+      const embeddings = await llm.embedBatch(textsToEmbed);
+      precomputedEmbeddings = embeddings.map(e => e?.embedding ?? null);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
+    }
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
+      const embedding = precomputedEmbeddings[i];
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
@@ -4041,7 +4203,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection, undefined, undefined, store.remoteEmbedding);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4177,15 +4339,28 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
-      hooks?.onEmbedStart?.(textsToEmbed.length);
-      const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
-      hooks?.onEmbedDone?.(Date.now() - embedStart);
+      const remote = store.remoteEmbedding;
+      let precomputedEmbeddings: (number[] | null)[];
+
+      if (remote) {
+        const textsToEmbed = vecSearches.map(s => s.query);
+        hooks?.onEmbedStart?.(textsToEmbed.length);
+        const embedStart = Date.now();
+        const results = await remote.embedBatch(textsToEmbed);
+        precomputedEmbeddings = results.map(r => r.embedding);
+        hooks?.onEmbedDone?.(Date.now() - embedStart);
+      } else {
+        const llm = getLlm(store);
+        const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+        hooks?.onEmbedStart?.(textsToEmbed.length);
+        const embedStart = Date.now();
+        const embeddings = await llm.embedBatch(textsToEmbed);
+        precomputedEmbeddings = embeddings.map(e => e?.embedding ?? null);
+        hooks?.onEmbedDone?.(Date.now() - embedStart);
+      }
 
       for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
+        const embedding = precomputedEmbeddings[i];
         if (!embedding) continue;
 
         for (const coll of collectionList) {
