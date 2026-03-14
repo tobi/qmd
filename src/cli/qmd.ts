@@ -69,6 +69,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  getExcludeDirs,
   createStore,
   getDefaultDbPath,
   reindexCollection,
@@ -1467,7 +1468,6 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1481,7 +1481,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.indeterminate();
   const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
+    ...getExcludeDirs().map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
   const allFiles: string[] = await fastGlob(globPattern, {
