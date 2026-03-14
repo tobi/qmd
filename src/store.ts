@@ -1820,6 +1820,16 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
+  // The schema entry can exist even when sqlite-vec itself is unavailable
+  // (for example when reopening a DB without vec0 loaded). In that case,
+  // touching the virtual table throws "no such module: vec0" and cleanup
+  // should degrade gracefully like the rest of the vector features.
+  try {
+    db.prepare(`SELECT 1 FROM vectors_vec LIMIT 0`).get();
+  } catch {
+    return 0;
+  }
+
   // Count orphaned vectors first
   const countResult = db.prepare(`
     SELECT COUNT(*) as c FROM content_vectors cv
