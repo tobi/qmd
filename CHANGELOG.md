@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Remote embedding providers** — use cloud embedding APIs (Gemini, OpenAI)
+  instead of local GGUF models. Configure in `~/.config/qmd/index.yml`:
+  ```yaml
+  embedding:
+    provider: gemini  # or "openai"
+    model: gemini-embedding-2-preview
+    api_key: ${GOOGLE_API_KEY}
+    dimensions: 3072  # optional
+  ```
+  Supports both single and batch embedding via the Gemini `embedContent` /
+  `batchEmbedContents` endpoints and OpenAI-compatible `/v1/embeddings`.
+  Falls back to `GOOGLE_API_KEY` / `OPENAI_API_KEY` env vars when
+  `api_key` is not set. Local GGUF remains the default when no remote
+  provider is configured — zero breaking changes. #403
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

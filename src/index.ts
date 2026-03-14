@@ -80,6 +80,7 @@ import {
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
+import { createRemoteEmbeddingProvider, type RemoteEmbeddingConfig } from "./remote-embedding.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -103,6 +104,7 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  RemoteEmbeddingConfig,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -345,18 +347,28 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
-  // Sync config into SQLite store_collections
+  // Sync config into SQLite store_collections and attach remote embedding
+  let resolvedConfig: CollectionConfig | undefined;
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    const config = loadConfig();
-    syncConfigToDb(db, config);
+    resolvedConfig = loadConfig();
+    syncConfigToDb(db, resolvedConfig);
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
     syncConfigToDb(db, options.config);
+    resolvedConfig = options.config;
   }
   // else: DB-only mode — no external config, use existing store_collections
+
+  // Attach remote embedding provider if configured
+  if (resolvedConfig) {
+    const remoteProvider = createRemoteEmbeddingProvider(resolvedConfig);
+    if (remoteProvider) {
+      internal.remoteEmbedding = remoteProvider;
+    }
+  }
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.

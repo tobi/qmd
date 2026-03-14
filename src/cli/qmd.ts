@@ -98,6 +98,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { createRemoteEmbeddingProvider } from "../remote-embedding.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -117,6 +118,11 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      // Attach remote embedding provider if configured
+      const remoteProvider = createRemoteEmbeddingProvider(config);
+      if (remoteProvider) {
+        store.remoteEmbedding = remoteProvider;
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -421,7 +427,13 @@ async function showStatus(): Promise<void> {
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    const storeInstance = getStore();
+    if (storeInstance.remoteEmbedding) {
+      const re = storeInstance.remoteEmbedding;
+      console.log(`  Embedding:   ${c.green}${re.provider}${c.reset} ${re.model}${re.dimensions ? ` (${re.dimensions}d)` : ''} ${c.dim}(remote)${c.reset}`);
+    } else {
+      console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    }
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
@@ -1637,7 +1649,10 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const displayModel = storeInstance.remoteEmbedding
+    ? `${storeInstance.remoteEmbedding.modelUri} (remote)`
+    : model;
+  console.log(`${c.dim}Model: ${displayModel}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;

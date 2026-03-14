@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
+import type { RemoteEmbeddingConfig } from "./remote-embedding.js";
 
 // ============================================================================
 // Types
@@ -39,6 +40,7 @@ export interface Collection {
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  embedding?: RemoteEmbeddingConfig;          // Optional remote embedding provider
 }
 
 /**
