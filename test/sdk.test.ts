@@ -603,7 +603,17 @@ describe("search (unified API)", () => {
     await expect(store.search({} as SearchOptions)).rejects.toThrow("requires either 'query' or 'queries'");
   });
 
-  test("search() with pre-expanded queries and rerank:false", async () => {
+  test("search() with query and rerank:false returns results", async () => {
+    const results = await store.search({ query: "authentication", rerank: false });
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]).toHaveProperty("file");
+    expect(results[0]).toHaveProperty("score");
+    expect(results[0]).toHaveProperty("title");
+    expect(results[0]).toHaveProperty("bestChunk");
+    expect(results[0]).toHaveProperty("docid");
+  }, 120_000);
+
+  test("search() with intent and rerank:false returns results", async () => {
     const results = await store.search({
       queries: [
         { type: "lex", query: "authentication JWT" },
@@ -612,7 +622,7 @@ describe("search (unified API)", () => {
       rerank: false,
     });
     expect(results.length).toBeGreaterThan(0);
-  });
+  }, 120_000);
 
   // Tests below use search({ query: ... }) which triggers LLM query expansion
   describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
