@@ -22,7 +22,9 @@ jobs:
       - name: Install SQLite
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - run: bun install
+      - name: Verify lockfile is up-to-date
+        run: bun install --frozen-lockfile
+
       - run: bun test --timeout 60000 --preload ./src/test-preload.ts test/
         env:
           CI: true

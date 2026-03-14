@@ -61,7 +61,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sqlite
 
-      - run: bun install
+      - name: Verify lockfile is up-to-date
+        run: bun install --frozen-lockfile
 
       - name: Tests
         run: bun test --timeout 60000 --preload ./src/test-preload.ts test/

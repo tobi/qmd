@@ -6,7 +6,7 @@
       "name": "2025-12-07-bm25-q",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.25.1",
-        "better-sqlite3": "^11.0.0",
+        "better-sqlite3": "^12.4.5",
         "fast-glob": "^3.3.0",
         "node-llama-cpp": "^3.17.1",
         "picomatch": "^4.0.0",
@@ -22,8 +22,9 @@
       "optionalDependencies": {
         "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-linux-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
-        "sqlite-vec-win32-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-windows-x64": "^0.1.7-alpha.2",
       },
       "peerDependencies": {
         "typescript": "^5.9.3",
@@ -241,7 +242,7 @@
 
     "base64-js": ["base64-js@1.5.1", "", {}, "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA=="],
 
-    "better-sqlite3": ["better-sqlite3@11.10.0", "", { "dependencies": { "bindings": "^1.5.0", "prebuild-install": "^7.1.1" } }, "sha512-EwhOpyXiOEL/lKzHz9AW1msWFNzGc/z+LzeB3/jnFJpxu+th2yqvzsSWas1v9jgs9+xiXJcD5A8CJxAG2TaghQ=="],
+    "better-sqlite3": ["better-sqlite3@12.6.2", "", { "dependencies": { "bindings": "^1.5.0", "prebuild-install": "^7.1.1" } }, "sha512-8VYKM3MjCa9WcaSAI3hzwhmyHVlH8tiGFwf0RlTsZPWJ1I5MkzjiudCo4KC4DxOaL/53A5B1sI/IbldNFDbsKA=="],
 
     "bindings": ["bindings@1.5.0", "", { "dependencies": { "file-uri-to-path": "1.0.0" } }, "sha512-p2q/t/mhvuOj/UeLlV6566GD/guowlr0hHxClI0W9m7MWYkL1F0hLo+0Aexs9HSPCtR1SXQ0TD3MMKrXZajbiQ=="],
 
