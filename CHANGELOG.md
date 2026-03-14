@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Per-collection `slugify` option (default: `true`). Set `slugify: false` in collection config to preserve original filenames with spaces and uppercase characters instead of converting to kebab-case during indexing
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

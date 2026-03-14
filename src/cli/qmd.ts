@@ -57,6 +57,7 @@ import {
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
+  normalizeRelativePath,
   hybridQuery,
   vectorSearchQuery,
   structuredSearch,
@@ -559,6 +560,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      slugify: yamlCol?.slugify,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1410,7 +1412,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
   const newColl = getCollectionFromYaml(collName);
-  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore, newColl?.slugify);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1463,7 +1465,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[], slugify?: boolean): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1511,7 +1513,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = handelize(relativeFile); // Normalize path for token-friendliness
+    const path = (slugify ?? true) ? handelize(relativeFile) : normalizeRelativePath(relativeFile);
     seenPaths.add(path);
 
     let content: string;

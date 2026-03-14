@@ -31,6 +31,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  slugify?: boolean;         // Slugify filenames to kebab-case during indexing (default: true)
 }
 
 /**

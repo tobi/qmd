@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -39,6 +39,7 @@ import {
   extractSnippet,
   getCacheKey,
   handelize,
+  reindexCollection,
   normalizeVirtualPath,
   isVirtualPath,
   parseVirtualPath,
@@ -1131,6 +1132,93 @@ describe("Collections", () => {
 
     // Collections are now in YAML, not in the database
     expect(collectionName).toBe("myapp");
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
+// Reindex slugify option Tests
+// =============================================================================
+
+describe("reindexCollection slugify option", () => {
+  test("default (slugify: true) handleizes paths to kebab-case", async () => {
+    const store = await createTestStore();
+    const collectionName = "music";
+
+    const collectionDir = join(testDir, "music-default");
+    await mkdir(join(collectionDir, "bass-guitar"), { recursive: true });
+
+    await writeFile(
+      join(collectionDir, "bass-guitar", "BASS PLAYER Lesson 02.md"),
+      "# Bass Player Lesson 02\n\nLearn the basics of bass guitar."
+    );
+
+    await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+    await reindexCollection(store, collectionDir, "**/*.md", collectionName);
+
+    const rows = store.db.prepare(
+      `SELECT path FROM documents WHERE collection = ? AND active = 1`
+    ).all(collectionName) as { path: string }[];
+
+    const paths = rows.map(r => r.path);
+    expect(paths).toContain("bass-guitar/bass-player-lesson-02.md");
+    expect(paths).not.toContain("bass-guitar/BASS PLAYER Lesson 02.md");
+
+    await cleanupTestDb(store);
+  });
+
+  test("slugify: false preserves original filenames with spaces and uppercase", async () => {
+    const store = await createTestStore();
+    const collectionName = "music";
+
+    const collectionDir = join(testDir, "music-preserve");
+    await mkdir(join(collectionDir, "bass-guitar"), { recursive: true });
+
+    await writeFile(
+      join(collectionDir, "bass-guitar", "BASS PLAYER Lesson 02.md"),
+      "# Bass Player Lesson 02\n\nLearn the basics of bass guitar."
+    );
+    await writeFile(
+      join(collectionDir, "bass-guitar", "simple-file.md"),
+      "# Simple File\n\nAlready lowercase no spaces."
+    );
+
+    await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+    await reindexCollection(store, collectionDir, "**/*.md", collectionName, { slugify: false });
+
+    const rows = store.db.prepare(
+      `SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path`
+    ).all(collectionName) as { path: string }[];
+
+    const paths = rows.map(r => r.path);
+
+    expect(paths).toContain("bass-guitar/BASS PLAYER Lesson 02.md");
+    expect(paths).toContain("bass-guitar/simple-file.md");
+    expect(paths).not.toContain("bass-guitar/bass-player-lesson-02.md");
+
+    await cleanupTestDb(store);
+  });
+
+  test("slugify: false search results return original filenames", async () => {
+    const store = await createTestStore();
+    const collectionName = "notes";
+
+    const collectionDir = join(testDir, "notes-preserve");
+    await mkdir(collectionDir, { recursive: true });
+
+    await writeFile(
+      join(collectionDir, "My Meeting Notes.md"),
+      "# Meeting Notes\n\nDiscussed quarterly planning and budget reviews."
+    );
+
+    await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+    await reindexCollection(store, collectionDir, "**/*.md", collectionName, { slugify: false });
+
+    const results = store.searchFTS("quarterly planning", 5);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe("notes/My Meeting Notes.md");
 
     await cleanupTestDb(store);
   });

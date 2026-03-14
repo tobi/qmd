@@ -307,6 +307,21 @@ function isWSL(): boolean {
 }
 
 /**
+ * Normalize a relative file path for storage: forward-slash separators,
+ * no leading/trailing slashes, collapse runs of slashes. Preserves
+ * original filename casing, spaces, and special characters.
+ */
+export function normalizeRelativePath(path: string): string {
+  if (!path || path.trim() === '') {
+    throw new Error('normalizeRelativePath: path cannot be empty');
+  }
+  return normalizePathSeparators(path)
+    .split('/')
+    .filter(Boolean)
+    .join('/');
+}
+
+/**
  * Get the relative path from a prefix.
  * Returns null if path is not under prefix.
  * Returns empty string if path equals prefix.
@@ -1082,11 +1097,13 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    slugify?: boolean;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
+  const slugifyPaths = options?.slugify ?? true;
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   const allIgnore = [
@@ -1112,7 +1129,7 @@ export async function reindexCollection(
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    const path = handelize(relativeFile);
+    const path = slugifyPaths ? handelize(relativeFile) : normalizeRelativePath(relativeFile);
     seenPaths.add(path);
 
     let content: string;
