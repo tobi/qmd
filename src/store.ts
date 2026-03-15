@@ -2742,8 +2742,9 @@ function buildFTS5Query(query: string): string | null {
  * Returns error message if invalid, null if valid.
  */
 export function validateSemanticQuery(query: string): string | null {
-  // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  // Check for negation syntax — only at token boundaries (start of string or after whitespace).
+  // Hyphenated words like "real-time" or "write-ahead" must not trigger this.
+  if (/(^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;

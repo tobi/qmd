@@ -361,15 +361,71 @@ describe("lex query syntax", () => {
       expect(validateSemanticQuery("what is the CAP theorem")).toBeNull();
     });
 
-    test("rejects negation syntax", () => {
+    test("rejects negation at start of query", () => {
+      expect(validateSemanticQuery("-redis connection pooling")).toContain("Negation");
+    });
+
+    test("rejects negation after space", () => {
       expect(validateSemanticQuery("performance -sports")).toContain("Negation");
+    });
+
+    test("rejects negated quoted phrase", () => {
       expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
     });
 
+    test("rejects multiple negations", () => {
+      expect(validateSemanticQuery("error handling -java -python")).toContain("Negation");
+    });
+
+    test("rejects negation after leading whitespace", () => {
+      expect(validateSemanticQuery("  -term at start")).toContain("Negation");
+    });
+
+    test("rejects negation after tab", () => {
+      expect(validateSemanticQuery("foo\t-bar")).toContain("Negation");
+    });
+
+    test("accepts hyphenated compound words", () => {
+      expect(validateSemanticQuery("long-lived server shared across clients")).toBeNull();
+      expect(validateSemanticQuery("real-time voice processing pipeline")).toBeNull();
+      expect(validateSemanticQuery("how does the rate-limiter handle burst traffic")).toBeNull();
+      expect(validateSemanticQuery("self-hosted deployment options")).toBeNull();
+      expect(validateSemanticQuery("multi-client session architecture")).toBeNull();
+      expect(validateSemanticQuery("cross-platform compatibility")).toBeNull();
+      expect(validateSemanticQuery("non-blocking I/O model")).toBeNull();
+      expect(validateSemanticQuery("in-memory caching strategy")).toBeNull();
+      expect(validateSemanticQuery("write-ahead log for crash recovery")).toBeNull();
+      expect(validateSemanticQuery("copy-on-write semantics")).toBeNull();
+    });
+
+    test("accepts multiple hyphens in a phrase", () => {
+      expect(validateSemanticQuery("state-of-the-art embedding models")).toBeNull();
+      expect(validateSemanticQuery("end-to-end testing")).toBeNull();
+      expect(validateSemanticQuery("man-in-the-middle attack prevention")).toBeNull();
+    });
+
+    test("accepts multiple hyphenated words in one query", () => {
+      expect(validateSemanticQuery("built-in vs add-on features")).toBeNull();
+    });
+
+    test("accepts short hyphenated terms", () => {
+      expect(validateSemanticQuery("A-B testing for ML models")).toBeNull();
+      expect(validateSemanticQuery("e-commerce platform")).toBeNull();
+    });
+
+    test("accepts bare hyphen without word character", () => {
+      expect(validateSemanticQuery("-")).toBeNull();
+    });
 
     test("accepts hyde-style hypothetical answers", () => {
       expect(validateSemanticQuery(
         "The CAP theorem states that a distributed system cannot simultaneously provide consistency, availability, and partition tolerance."
+      )).toBeNull();
+    });
+
+    test("accepts hyde with hyphenated words", () => {
+      expect(validateSemanticQuery(
+        "HTTP transport runs a single long-lived daemon shared across all clients, avoiding per-session model re-loading."
       )).toBeNull();
     });
   });
