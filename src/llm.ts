@@ -382,6 +382,21 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+const DEFAULT_RERANK_CONTEXT_SIZE = 2048;
+
+function resolveRerankContextSize(): number {
+  const envValue = process.env.QMD_RERANK_CONTEXT_SIZE?.trim();
+  if (!envValue) return DEFAULT_RERANK_CONTEXT_SIZE;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed < 512 || parsed > 32768) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_RERANK_CONTEXT_SIZE="${envValue}", using default ${DEFAULT_RERANK_CONTEXT_SIZE}.\n`
+    );
+    return DEFAULT_RERANK_CONTEXT_SIZE;
+  }
+  return parsed;
+}
 
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
@@ -758,8 +773,9 @@ export class LlamaCpp implements LLM {
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
-  // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Default 2048 for safety margin. Still 17x less than auto (40960).
+  // Override via QMD_RERANK_CONTEXT_SIZE env var (512-32768) for CJK or long content.
+  private static readonly RERANK_CONTEXT_SIZE = resolveRerankContextSize();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
