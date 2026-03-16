@@ -3049,7 +3049,6 @@ if (isMain) {
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
         const host = cli.values.host || "localhost";
-        console.log(`THE host is ${host} and THE port is ${port}`);
 
         if (cli.values.daemon) {
           // Guard: check if already running
