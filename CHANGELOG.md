@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changes
+
+- **External model providers** — embedding and reranking can now run on a
+  remote OpenAI-compatible server (e.g. oMLX with MLX models) instead of
+  local GGUF. Set `QMD_REMOTE_URL` to enable; without it, behavior is
+  unchanged. Query expansion stays on local LlamaCpp. Useful on
+  memory-constrained Macs where MLX models via oMLX are significantly
+  faster than node-llama-cpp GGUF.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
