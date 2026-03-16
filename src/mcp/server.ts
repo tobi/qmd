@@ -502,7 +502,7 @@ Intent-aware lex (C++ performance, not sports):
       ];
 
       for (const col of status.collections) {
-        summary.push(`    - ${col.path} (${col.documents} docs)`);
+        summary.push(`    - ${col.name}: ${col.path} (${col.documents} docs)`);
       }
 
       return {
