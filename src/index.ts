@@ -65,7 +65,11 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  setDefaultLLM,
+  type LLM,
 } from "./llm.js";
+import { RemoteLLM } from "./remote-llm.js";
+import { HybridLLM } from "./hybrid-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -116,6 +120,39 @@ export { getDefaultDbPath } from "./store.js";
 
 // Re-export Maintenance class for CLI housekeeping operations
 export { Maintenance } from "./maintenance.js";
+
+// Re-export remote LLM types for advanced consumers
+export { RemoteLLM, type RemoteLLMConfig } from "./remote-llm.js";
+export { HybridLLM } from "./hybrid-llm.js";
+
+/**
+ * Create the appropriate LLM instance based on environment configuration.
+ *
+ * When QMD_REMOTE_URL is set, creates a HybridLLM that routes:
+ * - embed/rerank → remote server (e.g. omlx with bge-m3, bge-reranker)
+ * - generate/expandQuery → local LlamaCpp (QMD fine-tuned model)
+ *
+ * Without QMD_REMOTE_URL, returns a standard LlamaCpp instance.
+ */
+function createLLM(): LLM {
+  const local = new LlamaCpp({
+    inactivityTimeoutMs: 5 * 60 * 1000,
+    disposeModelsOnInactivity: true,
+  });
+
+  const remoteUrl = process.env.QMD_REMOTE_URL;
+  if (remoteUrl) {
+    const remote = new RemoteLLM({
+      baseUrl: remoteUrl,
+      embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
+      rerankModel: process.env.QMD_REMOTE_RERANK_MODEL,
+      apiKey: process.env.QMD_REMOTE_API_KEY,
+    });
+    return new HybridLLM(local, remote);
+  }
+
+  return local;
+}
 
 /**
  * Progress info emitted during update() for each file processed.
@@ -358,12 +395,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
+  // Create a per-store LLM instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
+  const llm = createLLM();
   internal.llm = llm;
 
   const store: QMDStore = {
