@@ -968,7 +968,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 

@@ -2245,7 +2245,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display
@@ -3354,7 +3354,7 @@ export function findDocuments(
   pattern: string,
   options: { includeBody?: boolean; maxBytes?: number } = {}
 ): { docs: MultiGetResult[]; errors: string[] } {
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
   const errors: string[] = [];
   const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
 
