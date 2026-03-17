@@ -546,10 +546,13 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
+      // QMD_FORCE_CPU=1 forces CPU-only mode (useful for older GPUs like Pascal)
+      const forceCpu = process.env.QMD_FORCE_CPU === "1" || process.env.QMD_FORCE_CPU === "true";
       const llama = await getLlama({
         // attempt to build
-        build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
+        build: "autoAttempt" as any,
+        logLevel: LlamaLogLevel.error,
+        gpu: forceCpu ? false : "auto",
       });
 
       if (llama.gpu === false) {
