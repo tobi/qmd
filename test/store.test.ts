@@ -2680,6 +2680,74 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("issue 410 regression: seven large docs continue past ~39k chunks without mass failures", async () => {
+    vi.useFakeTimers();
+
+    const store = await createTestStore();
+    const db = store.db;
+    const slowBatchLlm = {
+      async embed(_text: string) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+
+    // Scale the issue's "7 files, 100k+ remaining failures after ~39k successes"
+    // down to a test-friendly corpus while preserving the same chunk cadence.
+    const largeDocChars = 2_800_000;
+    const smallDocChars = 1_450_000;
+    const docPlan = [
+      ["vol-1", largeDocChars],
+      ["vol-2", largeDocChars],
+      ["vol-3", largeDocChars],
+      ["appendix-a", smallDocChars],
+      ["appendix-b", smallDocChars],
+      ["appendix-c", smallDocChars],
+      ["appendix-d", smallDocChars],
+    ] as const;
+
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return { length: Math.max(1, text.length * 4) } as any;
+      },
+    } as any);
+    store.llm = slowBatchLlm as any;
+
+    try {
+      for (const [name, charCount] of docPlan) {
+        await insertTestDocument(db, "docs", {
+          name,
+          body: `# ${name}\n\n${"A".repeat(charCount)}`,
+        });
+      }
+
+      const embedPromise = generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 256 * 1024 * 1024,
+      });
+
+      // ~1.5s per embedBatch means the legacy single-session design would
+      // cross its 30 minute cap at about 39k chunks and start cascading errors.
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+
+      const result = await embedPromise;
+      expect(result.docsProcessed).toBe(7);
+      expect(result.chunksEmbedded).toBeGreaterThan(100000);
+      expect(result.errors).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      vi.useRealTimers();
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 

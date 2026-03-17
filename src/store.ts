@@ -1323,125 +1323,137 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's LlamaCpp or global singleton.
   const llm = getLlm(store);
+  // Each embed call gets its own short-lived session so no single timer
+  // accumulates across the entire multi-batch job (see #410).
+  // The default 10-minute maxDuration per session is more than enough
+  // for a single batch of ≤32 texts.
+  const embedText = async (text: string, name: string) =>
+    withLLMSessionForLlm(
+      llm,
+      (session) => session.embed(text),
+      { name }
+    );
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
-    let chunksEmbedded = 0;
-    let errors = 0;
-    let bytesProcessed = 0;
-    let totalChunks = 0;
-    let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
-    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+  const embedBatchTexts = async (texts: string[], name: string) =>
+    withLLMSessionForLlm(
+      llm,
+      (session) => session.embedBatch(texts),
+      { name }
+    );
 
-    for (const batchMeta of batches) {
-      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
-      const batchChunks: ChunkItem[] = [];
-      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+  let chunksEmbedded = 0;
+  let errors = 0;
+  let bytesProcessed = 0;
+  let totalChunks = 0;
+  let vectorTableInitialized = false;
+  const BATCH_SIZE = 32;
+  const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
-      for (const doc of batchDocs) {
-        if (!doc.body.trim()) continue;
+  for (const batchMeta of batches) {
+    const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+    const batchChunks: ChunkItem[] = [];
+    const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
-        const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+    for (const doc of batchDocs) {
+      if (!doc.body.trim()) continue;
 
-        for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
-            hash: doc.hash,
-            title,
-            text: chunks[seq]!.text,
-            seq,
-            pos: chunks[seq]!.pos,
-            tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
-          });
+      const title = extractTitle(doc.body, doc.path);
+      const chunks = await chunkDocumentByTokens(doc.body);
+
+      for (let seq = 0; seq < chunks.length; seq++) {
+        batchChunks.push({
+          hash: doc.hash,
+          title,
+          text: chunks[seq]!.text,
+          seq,
+          pos: chunks[seq]!.pos,
+          tokens: chunks[seq]!.tokens,
+          bytes: encoder.encode(chunks[seq]!.text).length,
+        });
+      }
+    }
+
+    totalChunks += batchChunks.length;
+
+    if (batchChunks.length === 0) {
+      bytesProcessed += batchBytes;
+      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+      continue;
+    }
+
+    if (!vectorTableInitialized) {
+      const firstChunk = batchChunks[0]!;
+      const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+      const firstResult = await embedText(firstText, "generateEmbeddings:init");
+      if (!firstResult) {
+        throw new Error("Failed to get embedding dimensions from first chunk");
+      }
+      store.ensureVecTable(firstResult.embedding.length);
+      vectorTableInitialized = true;
+    }
+
+    const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+    let batchChunkBytesProcessed = 0;
+
+    for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+      const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+      const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
+      try {
+        const embeddings = await embedBatchTexts(texts, "generateEmbeddings:batch");
+        for (let i = 0; i < chunkBatch.length; i++) {
+          const chunk = chunkBatch[i]!;
+          const embedding = embeddings[i];
+          if (embedding) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+          batchChunkBytesProcessed += chunk.bytes;
         }
-      }
-
-      totalChunks += batchChunks.length;
-
-      if (batchChunks.length === 0) {
-        bytesProcessed += batchBytes;
-        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
-        continue;
-      }
-
-      if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-        const firstResult = await session.embed(firstText);
-        if (!firstResult) {
-          throw new Error("Failed to get embedding dimensions from first chunk");
-        }
-        store.ensureVecTable(firstResult.embedding.length);
-        vectorTableInitialized = true;
-      }
-
-      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
-      let batchChunkBytesProcessed = 0;
-
-      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
-        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-        try {
-          const embeddings = await session.embedBatch(texts);
-          for (let i = 0; i < chunkBatch.length; i++) {
-            const chunk = chunkBatch[i]!;
-            const embedding = embeddings[i];
-            if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+      } catch {
+        // Batch failed — try individual embeddings as fallback
+        for (const chunk of chunkBatch) {
+          try {
+            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const result = await embedText(text, "generateEmbeddings:fallback");
+            if (result) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
               chunksEmbedded++;
             } else {
               errors++;
             }
-            batchChunkBytesProcessed += chunk.bytes;
+          } catch {
+            errors++;
           }
-        } catch {
-          // Batch failed — try individual embeddings as fallback
-          for (const chunk of chunkBatch) {
-            try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
-              const result = await session.embed(text);
-              if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                chunksEmbedded++;
-              } else {
-                errors++;
-              }
-            } catch {
-              errors++;
-            }
-            batchChunkBytesProcessed += chunk.bytes;
-          }
+          batchChunkBytesProcessed += chunk.bytes;
         }
-
-        const proportionalBytes = totalBatchChunkBytes === 0
-          ? batchBytes
-          : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
-        options?.onProgress?.({
-          chunksEmbedded,
-          totalChunks,
-          bytesProcessed: bytesProcessed + proportionalBytes,
-          totalBytes,
-          errors,
-        });
       }
 
-      bytesProcessed += batchBytes;
-      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+      const proportionalBytes = totalBatchChunkBytes === 0
+        ? batchBytes
+        : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+      options?.onProgress?.({
+        chunksEmbedded,
+        totalChunks,
+        bytesProcessed: bytesProcessed + proportionalBytes,
+        totalBytes,
+        errors,
+      });
     }
 
-    return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+    bytesProcessed += batchBytes;
+    options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+  }
 
   return {
     docsProcessed: totalDocs,
-    chunksEmbedded: result.chunksEmbedded,
-    errors: result.errors,
+    chunksEmbedded,
+    errors,
     durationMs: Date.now() - startTime,
   };
 }
