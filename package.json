@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "qmd": "bin/qmd"
+    "qmd": "bin/qmd.js"
   },
   "files": [
     "bin/",

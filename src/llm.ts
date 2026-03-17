@@ -546,13 +546,19 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
+      // Check if GPU is explicitly enabled
+      const useGpu = process.env.QMD_USE_GPU === '1' || process.env.QMD_USE_GPU === 'true';
+      const isWindows = process.platform === 'win32';
+
       const llama = await getLlama({
         // attempt to build
         build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
+        logLevel: LlamaLogLevel.error,
+        // Disable GPU on Windows by default to avoid Vulkan crashes
+        gpu: useGpu ? "auto" : (isWindows ? false : "auto")
       });
 
-      if (llama.gpu === false) {
+      if (llama.gpu === false && useGpu) {
         process.stderr.write(
           "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
         );
