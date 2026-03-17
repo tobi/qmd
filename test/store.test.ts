@@ -1757,6 +1757,55 @@ describe("Document Retrieval", () => {
 
       await cleanupTestDb(store);
     });
+
+    test("findDocuments supports brace expansion patterns", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc1",
+        filepath: "/path/doc1.md",
+        displayPath: "doc1.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc2",
+        filepath: "/path/doc2.md",
+        displayPath: "doc2.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc3",
+        filepath: "/path/doc3.md",
+        displayPath: "doc3.md",
+      });
+
+      const { docs, errors } = store.findDocuments("{doc1,doc2}.md");
+      expect(errors).toHaveLength(0);
+      expect(docs).toHaveLength(2);
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments supports brace expansion with collection prefix", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "readme",
+        filepath: "/path/readme.md",
+        displayPath: "readme.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "changelog",
+        filepath: "/path/changelog.md",
+        displayPath: "changelog.md",
+      });
+
+      const { docs, errors } = store.findDocuments(`${collectionName}/{readme,changelog}.md`);
+      expect(errors).toHaveLength(0);
+      expect(docs).toHaveLength(2);
+
+      await cleanupTestDb(store);
+    });
   });
 
 });
@@ -2112,6 +2161,48 @@ describe("Fuzzy Matching", () => {
     const matches = store.matchFilesByGlob("journals/*.md");
     expect(matches).toHaveLength(2);
     expect(matches.every(m => m.displayPath.startsWith("journals/"))).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("matchFilesByGlob matches collection/path patterns", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/readme.md",
+      displayPath: "readme.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/changelog.md",
+      displayPath: "changelog.md",
+    });
+
+    const matches = store.matchFilesByGlob(`${collectionName}/*.md`);
+    expect(matches).toHaveLength(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("matchFilesByGlob matches brace expansion", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/readme.md",
+      displayPath: "readme.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/changelog.md",
+      displayPath: "changelog.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/license.md",
+      displayPath: "license.md",
+    });
+
+    const matches = store.matchFilesByGlob(`${collectionName}/{readme,changelog}.md`);
+    expect(matches).toHaveLength(2);
 
     await cleanupTestDb(store);
   });
