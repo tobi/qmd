@@ -40,6 +40,21 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   snippet: string;
+  explain?: {
+    ftsScores: number[];
+    vectorScores: number[];
+    rrf: {
+      rank: number;
+      positionScore: number;
+      weight: number;
+      baseScore: number;
+      topRankBonus: number;
+      totalScore: number;
+      contributions: { source: string; queryType: string; rank: number; rrfContribution: number }[];
+    };
+    rerankScore: number;
+    blendedScore: number;
+  };
 };
 
 type StatusResult = {
@@ -318,9 +333,13 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        explain: z.boolean().optional().default(false).describe(
+          "Include retrieval score traces (FTS scores, vector scores, RRF fusion breakdown, " +
+          "rerank blend weights) in each result. Useful for debugging query quality and search tuning."
+        ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank, explain }) => {
       // Validate: exactly one of query/searches should be provided
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -356,6 +375,7 @@ Intent-aware lex (C++ performance, not sports):
           minScore,
           rerank,
           intent,
+          explain,
         });
       } else {
         const queries: ExpandedQuery[] = (searches ?? []).map(s => ({
@@ -374,6 +394,7 @@ Intent-aware lex (C++ performance, not sports):
           minScore,
           rerank,
           intent,
+          explain,
         });
       }
 
@@ -386,6 +407,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           snippet: addLineNumbers(snippet, line),
+          ...(r.explain ? { explain: r.explain } : {}),
         };
       });
 
@@ -705,6 +727,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
           intent: params.intent,
+          explain: params.explain ?? false,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -721,6 +744,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             snippet: addLineNumbers(snippet, line),
+            ...(r.explain ? { explain: r.explain } : {}),
           };
         });
 
