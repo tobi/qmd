@@ -2651,7 +2651,7 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // =============================================================================
 
 function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+  return term.replace(/[^\p{L}\p{N}'_-]/gu, '').toLowerCase();
 }
 
 /**
@@ -2743,7 +2743,7 @@ function buildFTS5Query(query: string): string | null {
  */
 export function validateSemanticQuery(query: string): string | null {
   // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  if (/(?:^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;
