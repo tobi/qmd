@@ -292,13 +292,16 @@ Intent-aware lex (C++ performance, not sports):
         candidateLimit: z.number().optional().describe(
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
+        skipRerank: z.boolean().optional().describe(
+          "Skip LLM reranking and use RRF fusion scores only. Much faster on CPU-only servers."
+        ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ searches, limit, minScore, candidateLimit, skipRerank, collections, intent }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -313,7 +316,9 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
         intent,
+        ...(skipRerank ? { rerank: false } : {}),
       });
 
       // Use first lex or vec query for snippet extraction

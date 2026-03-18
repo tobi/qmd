@@ -159,6 +159,8 @@ export interface SearchOptions {
   limit?: number;
   /** Minimum score threshold */
   minScore?: number;
+  /** Maximum candidates to rerank (default: 40) */
+  candidateLimit?: number;
   /** Include explain traces */
   explain?: boolean;
 }
@@ -388,6 +390,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           collections: collections.length > 0 ? collections : undefined,
           limit: opts.limit,
           minScore: opts.minScore,
+          candidateLimit: opts.candidateLimit,
           explain: opts.explain,
           intent: opts.intent,
           skipRerank,
