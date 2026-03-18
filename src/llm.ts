@@ -30,13 +30,89 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+// =============================================================================
+// Embedding API Support (OpenAI-compatible + Gemini)
+// =============================================================================
+
+type EmbedApiType = "openai" | "gemini";
+
+/**
+ * Returns true if external embedding API is configured via QMD_EMBED_API_URL.
+ */
+export function isApiEmbeddingConfigured(): boolean {
+  return !!process.env.QMD_EMBED_API_URL;
+}
+
+/**
+ * Detect API type from the base URL.
+ * URLs containing "googleapis.com" use Gemini format; all others use OpenAI-compatible format.
+ */
+function getEmbedApiType(url: string): EmbedApiType {
+  return url.includes("googleapis.com") ? "gemini" : "openai";
+}
+
+/**
+ * Call external embedding API (OpenAI-compatible or Gemini) for a batch of texts.
+ * Returns embeddings in input order.
+ */
+async function callEmbeddingApi(texts: string[]): Promise<(number[] | null)[]> {
+  const baseUrl = process.env.QMD_EMBED_API_URL!;
+  const apiKey = process.env.QMD_EMBED_API_KEY ?? "";
+  const model = process.env.QMD_EMBED_API_MODEL ?? "text-embedding-3-small";
+  const apiType = getEmbedApiType(baseUrl);
+
+  if (apiType === "gemini") {
+    const modelId = model.startsWith("models/") ? model : `models/${model}`;
+    const url = `${baseUrl}/${modelId}:embedContent?key=${apiKey}`;
+    // Gemini only supports single embedContent; call in parallel for batch
+    return await Promise.all(
+      texts.map(async text => {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: { parts: [{ text }] } }),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(`Gemini embedding API error ${resp.status}: ${errText}`);
+        }
+        const data = await resp.json() as { embedding: { values: number[] } };
+        return data.embedding?.values ?? null;
+      })
+    );
+  } else {
+    // OpenAI-compatible
+    const url = `${baseUrl}/embeddings`;
+    const body = { model, input: texts };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`OpenAI embedding API error ${resp.status}: ${errText}`);
+    }
+    const data = await resp.json() as { data: { index: number; embedding: number[] }[] };
+    const result: (number[] | null)[] = new Array(texts.length).fill(null);
+    for (const item of data.data) {
+      result[item.index] = item.embedding;
+    }
+    return result;
+  }
+}
+
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * API mode (uri starts with "api:"): returns raw text without any prefix.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? (isApiEmbeddingConfigured() ? `api:${process.env.QMD_EMBED_API_MODEL ?? ""}` : (process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL));
+  if (uri.startsWith("api:")) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -47,9 +123,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields (default).
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
+ * API mode (uri starts with "api:"): returns raw text without any prefix.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? (isApiEmbeddingConfigured() ? `api:${process.env.QMD_EMBED_API_MODEL ?? ""}` : (process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL));
+  if (uri.startsWith("api:")) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -854,7 +932,20 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true };
   }
 
-  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+  async embed(text: string, _options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (isApiEmbeddingConfigured()) {
+      try {
+        const results = await callEmbeddingApi([text]);
+        const vec = results[0];
+        if (!vec) return null;
+        const model = `api:${process.env.QMD_EMBED_API_MODEL ?? ""}`;
+        return { embedding: vec, model };
+      } catch (error) {
+        console.error("API embedding error:", error);
+        return null;
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -885,10 +976,22 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
 
     if (texts.length === 0) return [];
+
+    if (isApiEmbeddingConfigured()) {
+      try {
+        const vecs = await callEmbeddingApi(texts);
+        const model = `api:${process.env.QMD_EMBED_API_MODEL ?? ""}`;
+        return vecs.map(vec => vec ? { embedding: vec, model } : null);
+      } catch (error) {
+        console.error("API batch embedding error:", error);
+        return texts.map(() => null);
+      }
+    }
+
+    // Ping activity at start to keep models alive during this operation
+    this.touchActivity();
 
     try {
       const contexts = await this.ensureEmbedContexts();
@@ -975,7 +1078,7 @@ export class LlamaCpp implements LLM {
         temperature,
         topK: 20,
         topP: 0.8,
-        onTextChunk: (text) => {
+        onTextChunk: (text: string) => {
           result += text;
         },
       });
@@ -1019,7 +1122,6 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
 
     const grammar = await llama.createGrammar({
       grammar: `
@@ -1068,7 +1170,7 @@ export class LlamaCpp implements LLM {
         return queryTerms.some(term => lower.includes(term));
       };
 
-      const queryables: Queryable[] = lines.map(line => {
+      const queryables: Queryable[] = lines.map((line: string) => {
         const colonIdx = line.indexOf(":");
         if (colonIdx === -1) return null;
         const type = line.slice(0, colonIdx).trim();
@@ -1076,7 +1178,7 @@ export class LlamaCpp implements LLM {
         const text = line.slice(colonIdx + 1).trim();
         if (!hasQueryTerm(text)) return null;
         return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
+      }).filter((q: Queryable | null): q is Queryable => q !== null);
 
       // Filter out lex entries if not requested
       const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
@@ -1106,7 +1208,7 @@ export class LlamaCpp implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    options: RerankOptions = {}
+    _options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation

@@ -1,6 +1,5 @@
 {
   "lockfileVersion": 1,
-  "configVersion": 1,
   "workspaces": {
     "": {
       "name": "2025-12-07-bm25-q",
@@ -12,7 +11,7 @@
         "picomatch": "^4.0.0",
         "sqlite-vec": "^0.1.7-alpha.2",
         "yaml": "^2.8.2",
-        "zod": "^4.2.1",
+        "zod": "4.2.1",
       },
       "devDependencies": {
         "@types/better-sqlite3": "^7.6.0",
