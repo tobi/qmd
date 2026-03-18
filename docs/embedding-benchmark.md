@@ -2,8 +2,8 @@
 
 **Date:** 2026-03-18
 **Machine:** Apple M3 Max (36GB RAM, 28GB VRAM), macOS 25.3.0
-**Dataset:** 63 chunks sampled from `dig_chat/outcome` (한국어+영어 혼합 ChatGPT 대화록)
-**Chunk size:** ~700 chars (첫 번째 의미 블록, YAML frontmatter 제외)
+**Dataset:** 63 chunks sampled from `dig_chat/outcome` (mixed Korean/English ChatGPT conversation logs)
+**Chunk size:** ~700 chars (first meaningful text block, YAML frontmatter stripped)
 **Script:** `scripts/benchmark-embed.ts`
 
 ## Results
@@ -18,51 +18,51 @@
 
 ## API Details
 
-- **OpenAI:** `POST /v1/embeddings` — input 배열로 배치 전송 (batch_size=32)
-- **Gemini:** `POST /v1beta/models/{model}:batchEmbedContents` — requests 배열로 배치 전송 (batch_size=32)
-- **Local:** node-llama-cpp + Metal (MPS) 자동 활성화, batch_size=8
+- **OpenAI:** `POST /v1/embeddings` — array input, batches of 32
+- **Gemini:** `POST /v1beta/models/{model}:batchEmbedContents` — requests array, batches of 32
+- **Local:** node-llama-cpp with Metal (MPS) auto-enabled, batches of 8
 
-> `asyncBatchEmbedContent`는 GCS 기반 대용량 비동기 API로 inline content 미지원 — 사용 불가
+> `asyncBatchEmbedContent` is a GCS-based async API for large-scale batch jobs and does not support inline content — not usable here.
 
-## Projected: dig_chat/outcome 전체 (7,149 파일, ~57,000 청크 추정)
+## Projected: full dig_chat/outcome (7,149 files, ~57,000 chunks estimated)
 
-| Model | 예상 시간 | 예상 비용 |
-|-------|:---------:|:---------:|
-| embeddinggemma-300M (local) | ~45분 | $0 |
-| text-embedding-3-small | ~15분 | ~$0.26 |
-| text-embedding-3-large | ~12분 | ~$1.70 |
-| gemini-embedding-001 | ~36분 | 무료 |
-| gemini-embedding-2-preview | ~39분 | 무료 |
+| Model | Estimated time | Estimated cost |
+|-------|:--------------:|:--------------:|
+| embeddinggemma-300M (local) | ~45 min | $0 |
+| text-embedding-3-small | ~15 min | ~$0.26 |
+| text-embedding-3-large | ~12 min | ~$1.70 |
+| gemini-embedding-001 | ~36 min | free |
+| gemini-embedding-2-preview | ~39 min | free |
 
-청크 수는 파일당 평균 ~8청크(한국어 15KB 기준, 900토큰/청크) 가정.
+Assumes ~8 chunks per file (based on 15KB Korean-text files at 900 tokens/chunk).
 
 ## Key Observations
 
-1. **속도 순위:** text-embedding-3-large ≒ small > gemini-001 ≒ gemini-2-preview > local GGUF
-   OpenAI가 Gemini보다 2~3배 빠른 건 배치 API 방식 차이가 아니라 인프라/모델 추론 속도 차이.
+1. **Speed ranking:** text-embedding-3-large ≈ small > gemini-001 ≈ gemini-2-preview > local GGUF.
+   OpenAI is 2–3× faster than Gemini — both use batch APIs, so the difference is infrastructure/model throughput, not batching strategy.
 
-2. **로컬 GGUF:** Metal(MPS) 자동 활성화됨에도 API 대비 느림. 72ms/chunk의 상당 부분은 모델 로딩 오버헤드 — 순수 추론만 약 48ms/chunk 추정. 오프라인/프라이버시 요건 시 적합.
+2. **Local GGUF:** Metal (MPS) is auto-enabled, but still slower than cloud APIs. The 72ms/chunk figure includes model load overhead — pure inference is ~48ms/chunk. Best for offline or privacy-sensitive workloads.
 
-3. **비용 대비 성능:**
-   - 속도 우선 → `text-embedding-3-small` (저렴 + 빠름)
-   - 무료 + 3072차원 → `gemini-embedding-001` (속도 준수)
-   - 완전 로컬 → `embeddinggemma-300M` (느리지만 $0, 프라이버시 보장)
+3. **Cost/performance:**
+   - Speed-first → `text-embedding-3-small` (fast + cheap)
+   - Free + 3072 dims → `gemini-embedding-001` (solid throughput)
+   - Fully local → `embeddinggemma-300M` (slower, $0, private)
 
-4. **RAM 주의 (M3 Max 기준):** 로컬 embed 실행 시 RAM 여유가 적으면 VRAM(28GB)에 모델이 올라가 CPU RAM 영향은 적지만, Node.js 프로세스 자체 RAM 사용 주의.
+4. **RAM note (M3 Max):** With low free RAM, the embedding model loads into VRAM (28GB available), keeping CPU RAM impact minimal. However, the Node.js process itself still consumes CPU RAM.
 
 ## Recommended Config
 
 ```bash
-# 비용 최소 + 속도 균형 (추천)
+# Speed + cost balance (recommended)
 export QMD_EMBED_API_URL="https://api.openai.com/v1"
 export QMD_EMBED_API_KEY="sk-..."
 export QMD_EMBED_API_MODEL="text-embedding-3-small"
 
-# 완전 무료 + 고차원
+# Free + high-dimensional
 export QMD_EMBED_API_URL="https://generativelanguage.googleapis.com/v1beta"
 export QMD_EMBED_API_KEY="AIza..."
 export QMD_EMBED_API_MODEL="gemini-embedding-001"
 
-# 완전 로컬 (기본값, 추가 설정 불필요)
+# Fully local (default, no config needed)
 unset QMD_EMBED_API_URL
 ```
