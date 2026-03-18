@@ -359,10 +359,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // else: DB-only mode — no external config, use existing store_collections
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // auto-unloads after inactivity to free VRAM.
+  //
+  // QMD_MODEL_KEEP_ALIVE=1  — disable inactivity timer entirely (models + contexts stay in RAM)
+  // QMD_MODEL_TTL=<seconds> — override inactivity timeout (default: 300s / 5 min)
+  const keepAlive = process.env.QMD_MODEL_KEEP_ALIVE === '1';
+  const ttlSec = Number(process.env.QMD_MODEL_TTL) || 300;
   const llm = new LlamaCpp({
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
+    inactivityTimeoutMs: keepAlive ? 0 : ttlSec * 1000,
+    disposeModelsOnInactivity: !keepAlive,
   });
   internal.llm = llm;
 
