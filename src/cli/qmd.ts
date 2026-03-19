@@ -2945,6 +2945,15 @@ if (isMain) {
       break;
     }
 
+    case "modal": {
+      const { handleModalCommand } = await import("./modal.js");
+      const result = await handleModalCommand(cli.args);
+      if (result.stderr) console.error(result.stderr);
+      if (result.stdout) console.log(result.stdout);
+      if (result.exitCode !== 0) process.exit(result.exitCode);
+      break;
+    }
+
     case "status":
       await showStatus();
       break;
