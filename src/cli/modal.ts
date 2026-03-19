@@ -130,9 +130,22 @@ async function handleDeploy(
 
   setModalConfig({ inference: true });
 
+  // Trigger snapshot creation by calling ping() — this forces a container
+  // to spin up and load models onto GPU. Without this, the first user call
+  // would pay the ~40s snapshot creation cost.
+  let snapshotNote = "";
+  try {
+    const backend = new ModalBackend();
+    await backend.ping();
+    snapshotNote = "\nGPU snapshot created — subsequent cold starts will be ~6s.";
+  } catch {
+    snapshotNote = "\nWarning: could not create GPU snapshot. First call may be slow (~40s).";
+  }
+
   const costNote =
     `Modal inference deployed successfully.\n` +
-    `GPU: ${gpu} (~$0.59/hr, billed per second, scales to zero when idle)`;
+    `GPU: ${gpu} (~$0.59/hr, billed per second, scales to zero when idle)` +
+    snapshotNote;
 
   return { exitCode: 0, stdout: costNote, stderr: "" };
 }
