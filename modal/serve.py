@@ -72,7 +72,7 @@ image = (
         # Pre-built llama-server with CUDA 12.4 support.
         # Built from llama.cpp b8179 (same as node-llama-cpp v3.17.1).
         # Image built by .github/workflows/build-llama-server.yml
-        "ghcr.io/ofekby/qmd-llama-server:b8179-sm75",
+        "ghcr.io/ofekby/qmd-llama-server@sha256:30d719c680fddf682f42a7c8f578de27bb816f71f66efb3d31fc63aea3ef0bea",
         add_python="3.11",
     )
     .pip_install("huggingface-hub", "requests")
