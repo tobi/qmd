@@ -1606,6 +1606,12 @@ export class ModalLLM implements LLM {
     };
   }
 
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    const vectors = await this.backend.embed(texts);
+    return vectors.map((v) => (v ? { embedding: v, model: "modal" } : null));
+  }
+
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     const maxTokens = options.maxTokens ?? 150;
     const text = await this.backend.generate(prompt, null, maxTokens, "expand");

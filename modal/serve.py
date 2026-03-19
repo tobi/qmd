@@ -74,6 +74,7 @@ image = (
         # Image built by .github/workflows/build-llama-server.yml
         "ghcr.io/ofekby/qmd-llama-server:b8179-sm75",
         add_python="3.11",
+        force_build=True,  # TODO: remove after first successful deploy with this image
     )
     .pip_install("huggingface-hub", "requests")
     .run_function(download_models)
@@ -224,9 +225,12 @@ class QMDInference:
             )
             resp.raise_for_status()
             data = resp.json()
-            # Response is a list of objects with "embedding" key;
-            # take the first (and only) entry.
-            result.append(data[0]["embedding"])
+            # Response is a list of objects with "embedding" key.
+            # The embedding value may be nested [[...floats...]], so flatten.
+            emb = data[0]["embedding"]
+            if isinstance(emb[0], list):
+                emb = emb[0]
+            result.append(emb)
         return result
 
     @modal.method()
