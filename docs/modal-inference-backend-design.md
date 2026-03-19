@@ -2,7 +2,7 @@
 
 ## Summary
 
-Add optional remote GPU inference via Modal.com, allowing users without a local GPU to run QMD's three GGUF models (embedding, reranking, query expansion) on a cheap cloud GPU. The Modal function is a dumb model server exposing raw inference primitives — all prompt formatting and search logic stays in QMD's JS codebase.
+Add optional remote GPU inference via Modal.com, allowing users without a local GPU to run QMD's three GGUF models (embedding, reranking, query expansion) on a cheap cloud GPU. The Modal function is a dumb model server exposing raw inference primitives (`embed()`, `generate()`, `ping()`) — all prompt formatting (including chat templates and special tokens), grammar construction, and search logic stays in QMD's JS codebase. Reranking is handled via `generate()` — the JS side constructs the full Qwen3-Reranker chat-templated prompt and passes it as a completion request.
 
 ## Architecture Overview
 
@@ -15,7 +15,7 @@ User machine (JS/TS)                          Modal (Python)
 │  │ Grammar logic      │  │   JS SDK (gRPC)   │  │                    │  │
 │  │ Result parsing     │──┼──────────────────►│  │ embed()   - raw    │  │
 │  │                    │  │                   │  │ generate() - raw   │  │
-│  │ ModalBackend       │  │                   │  │ score()   - raw    │  │
+│  │ ModalBackend       │  │                   │  │ ping()    - health │  │
 │  └───────────────────┘  │                   │  └────────────────────┘  │
 │                         │                   │                          │
 │  src/store.ts           │                   │  T4 GPU (default)        │
@@ -47,7 +47,7 @@ app = modal.App("qmd-inference")
 @app.cls(
     gpu=gpu_config,                     # Configurable, default "T4"
     scaledown_window=idle_timeout,      # Configurable, default 15 seconds
-    allow_concurrent_inputs=10,         # Handle burst queries on single container
+    allow_concurrent_inputs=4,          # See Design Decisions for concurrency rationale
     enable_memory_snapshot=True,        # Snapshot model state after loading
 )
 class QMDInference:
@@ -71,36 +71,43 @@ class QMDInference:
         )
         # Warmup passes to pre-fill caches before snapshot
         self.embed_model.embed("warmup")
+        self.rerank_model("warmup", max_tokens=1)
         self.expand_model("warmup", max_tokens=1)
 
     @modal.method()
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Raw embedding — no prompt formatting."""
-        return [self.embed_model.embed(text) for text in texts]
+        """Raw embedding — no prompt formatting.
+        Returns shape [n_texts, embed_dim].
+        Note: llama-cpp-python's Llama.embed() returns List[List[float]].
+        We normalize to always return one embedding vector per input text.
+        """
+        result = []
+        for text in texts:
+            vec = self.embed_model.embed(text)
+            # Llama.embed() returns List[List[float]] — take first element
+            # to normalize to a single vector per input text
+            if isinstance(vec[0], list):
+                result.append(vec[0])
+            else:
+                result.append(vec)
+        return result
 
     @modal.method()
-    def generate(self, prompt: str, grammar: str | None, max_tokens: int) -> str:
-        """Raw completion with optional GBNF grammar constraint."""
+    def generate(self, prompt: str, grammar: str | None, max_tokens: int,
+                 model: str = "expand") -> str:
+        """Raw completion with optional GBNF grammar constraint.
+        No chat template application — the caller must construct the full
+        prompt including any special tokens (e.g. <|im_start|>, <|im_end|>).
+        Used for both query expansion (model="expand") and reranking
+        (model="rerank") since both go through raw completion.
+        """
+        llm = self.rerank_model if model == "rerank" else self.expand_model
         kwargs = {"prompt": prompt, "max_tokens": max_tokens}
         if grammar:
             from llama_cpp import LlamaGrammar
             kwargs["grammar"] = LlamaGrammar.from_string(grammar)
-        result = self.expand_model(**kwargs)
+        result = llm(**kwargs)
         return result["choices"][0]["text"]
-
-    @modal.method()
-    def score(self, pairs: list[tuple[str, str]]) -> list[float]:
-        """Raw cross-encoder scoring of (query, document) pairs."""
-        scores = []
-        for query, document in pairs:
-            # Use rerank model to score relevance
-            result = self.rerank_model.create_completion(
-                prompt=f"{query}\n{document}",
-                max_tokens=1,
-                logprobs=True,
-            )
-            scores.append(result["choices"][0]["logprobs"]["token_logprobs"][0])
-        return scores
 
     @modal.method()
     def ping(self) -> bool:
@@ -111,7 +118,7 @@ class QMDInference:
 ### Container Behavior
 
 - `scaledown_window=15` — container shuts down 15s after last request (cost-efficient for burst patterns)
-- `allow_concurrent_inputs=10` — single container handles bursts without triggering scale-up
+- `allow_concurrent_inputs=4` — single container handles bursts without triggering scale-up. llama-cpp-python serializes GPU inference internally, so concurrent requests queue at the CUDA level rather than causing OOM, but lower concurrency reduces latency variance
 - `enable_memory_snapshot=True` + `@modal.enter(snap=True)` — after first deploy, subsequent cold starts restore from memory snapshot instead of re-loading ~2GB of models
 - No `min_containers` / `keep_warm` — scales to zero when idle
 - Single container by design (no max_containers param exists, but concurrency + low traffic pattern means no scale-up)
@@ -127,6 +134,8 @@ python modal/serve.py destroy
 ```
 
 ## QMD Config
+
+The `modal.*` config keys live in QMD's existing config file at `~/.config/qmd/index.yml` (managed by `src/collections.ts`). These are global settings, not per-collection.
 
 ### New Config Keys
 
@@ -151,9 +160,9 @@ Reads from `~/.modal.toml` (Modal's native auth file, created by user running `m
 3. Check `~/.modal.toml` exists
    - If missing: `Error: Modal not authenticated. Run: modal token set`
 4. Read `modal.gpu` and `modal.scaledown_window` from QMD config
-5. Shell out to `python3 modal/serve.py deploy --gpu <gpu> --scaledown-window <timeout>`
+5. Shell out to `python3 modal/serve.py deploy --gpu <gpu> --scaledown-window <timeout>`. The JS CLI resolves `modal/serve.py` relative to the QMD package installation directory (via `import.meta.url` resolution from the compiled JS in `dist/`). The `modal/` directory must be included in `package.json`'s `files` array.
 6. On success: auto-set `modal.inference = true` in QMD config
-7. Print confirmation with deployed function name
+7. Print confirmation with deployed function name and a brief cost note: "GPU: T4 (~$0.59/hr, billed per second, scales to zero when idle)"
 
 ### `qmd modal status`
 
@@ -162,6 +171,16 @@ Check if the Modal function is deployed and reachable. Calls `ping()` method.
 ### `qmd modal destroy`
 
 Tears down the deployed Modal function. Sets `modal.inference = false`.
+
+### `qmd modal test`
+
+Runs a small end-to-end smoke test to verify the deployed function works correctly:
+
+1. Calls `embed()` with a short test string, verifies the response is a well-formed embedding vector (array of floats with expected dimensionality)
+2. Calls `generate()` with a short prompt, verifies the response is a non-empty string of generated tokens
+3. Prints pass/fail for each check
+
+This catches model loading or CUDA issues that `ping()` alone would not detect (e.g., models loaded but producing garbage output, CUDA out-of-memory during inference).
 
 ## JS Runtime Integration (`src/modal.ts`)
 
@@ -179,15 +198,11 @@ class ModalBackend {
 
   /**
    * Raw text generation with optional GBNF grammar.
-   * Caller passes the fully formatted prompt and grammar string.
+   * Caller passes the fully formatted prompt (including all special tokens)
+   * and grammar string. Used for both query expansion and reranking.
    */
-  async generate(prompt: string, grammar: string | null, maxTokens: number): Promise<string>
-
-  /**
-   * Raw cross-encoder scoring.
-   * Caller passes pre-formatted (query, document) pairs.
-   */
-  async score(pairs: [string, string][]): Promise<number[]>
+  async generate(prompt: string, grammar: string | null, maxTokens: number,
+                 model?: "expand" | "rerank"): Promise<string>
 
   /**
    * Health check.
@@ -195,6 +210,10 @@ class ModalBackend {
   async ping(): Promise<boolean>
 }
 ```
+
+`ModalBackend` should implement the existing `LLM` interface from `src/llm.ts` so it can be swapped in transparently. Session management (`withLLMSession`, `canUnload`, inactivity timeouts) becomes a no-op in Modal mode since there are no local models to manage.
+
+**Chat template responsibility:** The JS side must construct full chat-templated prompts (including `<|im_start|>`, `<|im_end|>` special tokens) for both query expansion and reranking before sending to `generate()`. The Python `generate()` does raw completion only — it does not apply any chat template.
 
 ### Initialization
 
@@ -205,10 +224,12 @@ class ModalBackend {
 
 ### Retry Logic (Connection Errors Only)
 
+3 total attempts: initial call, 1 immediate retry, 1 retry after 100ms.
+
 ```
-attempt 1 → connection error → immediate retry
-          → connection error → wait 100ms → retry
-          → connection error → throw with full stacktrace and reason
+attempt 1 (initial)   → connection error → immediate retry
+attempt 2 (retry)     → connection error → wait 100ms → retry
+attempt 3 (final)     → connection error → throw with full stacktrace and reason
 
 Non-connection errors (auth, not found, etc.) → immediate throw, no retry
 ```
@@ -283,9 +304,9 @@ src/
 
 ```
 src/llm.ts            # Conditional: local vs modal backend at inference call sites
-src/cli/qmd.ts        # New 'qmd modal deploy|status|destroy' subcommands
+src/cli/qmd.ts        # New 'qmd modal deploy|status|destroy|test' subcommands
 src/config.ts         # New config keys: modal.inference, modal.gpu, modal.scaledown_window
-package.json          # Add 'modal' npm dependency
+package.json          # Add 'modal' npm dependency; add "modal/" to `files` array so serve.py ships with the npm package
 ```
 
 ## Dependencies
@@ -306,14 +327,18 @@ package.json          # Add 'modal' npm dependency
 
 ## Design Decisions
 
-1. **Dumb model server** — Modal function exposes raw `embed()`, `generate()`, `score()`. All prompt formatting, grammar construction, and result parsing stays in JS. Zero duplication, zero drift risk.
+1. **Dumb model server** — Modal function exposes raw `embed()`, `generate()`, `ping()`. All prompt formatting (including chat templates with special tokens), grammar construction, and result parsing stays in JS. Reranking goes through `generate()` with the JS side constructing the full Qwen3-Reranker chat-templated prompt. Zero duplication, zero drift risk.
 
 2. **Memory snapshots** — `enable_memory_snapshot=True` with `@modal.enter(snap=True)` captures loaded models in memory. Subsequent cold starts restore from snapshot instead of re-loading ~2GB of model weights.
 
-3. **Single container** — `allow_concurrent_inputs=10` handles burst patterns on one container. 15s idle timeout scales to zero quickly. No `keep_warm` to minimize cost.
+3. **Single container** — `allow_concurrent_inputs=4` handles burst patterns on one container. llama-cpp-python serializes GPU inference internally, so concurrent requests queue at the CUDA level rather than causing OOM, but lower concurrency (4 instead of 10) reduces latency variance. 15s idle timeout scales to zero quickly. No `keep_warm` to minimize cost.
 
 4. **JS SDK for runtime** — The `modal` npm package calls deployed functions directly via gRPC. No HTTP endpoints, no URL management. Auth handled by Modal tokens.
 
 5. **Python only for deploy** — Users need Python + `modal` pip package only for the one-time `qmd modal deploy`. Runtime is pure JS.
 
-6. **No fallback** — When `modal.inference = true`, local models are never used. Clear failure modes prevent confusing mixed results. Connection errors get 2 retries (immediate + 100ms), then hard fail.
+6. **No fallback** — When `modal.inference = true`, local models are never used. Clear failure modes prevent confusing mixed results. Connection errors get 3 total attempts (initial call, 1 immediate retry, 1 retry after 100ms), then hard fail.
+
+7. **JS SDK risk** — The `modal` npm SDK is beta (v0.6). If it becomes unavailable, a fallback to HTTP web endpoints is straightforward since the Python side can expose the same methods via `@modal.web_endpoint`.
+
+8. **GBNF grammar compatibility** — GBNF grammar syntax compatibility between node-llama-cpp and llama-cpp-python must be verified during implementation. Both use llama.cpp's grammar parser under the hood so they should be identical, but edge cases should be tested.
