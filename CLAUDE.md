@@ -26,6 +26,10 @@ qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
+qmd modal deploy                  # Deploy Modal inference (remote GPU)
+qmd modal status                  # Check Modal deployment status
+qmd modal test                    # Smoke test embed + generate
+qmd modal destroy                 # Tear down Modal deployment
 ```
 
 ## Collection Management
@@ -131,11 +135,39 @@ npx vitest run --reporter=verbose test/
 bun test --preload ./src/test-preload.ts test/
 ```
 
+## Modal Inference (Remote GPU)
+
+Optional remote GPU inference via Modal.com for users without a local GPU.
+Runs the same 3 GGUF models on a T4 GPU using llama-server (llama.cpp HTTP server).
+
+```sh
+# Prerequisites: pip install modal && modal token set
+
+# Deploy (creates GPU snapshot, ~1 min first time)
+qmd modal deploy
+
+# Query uses Modal automatically when deployed
+qmd query "search terms"
+
+# Tear down
+qmd modal destroy
+```
+
+Config keys in `~/.config/qmd/index.yml`:
+- `modal.inference` (bool, default false) — enable/disable Modal inference
+- `modal.gpu` (string, default "T4") — GPU type
+- `modal.scaledown_window` (number, default 15) — idle timeout in seconds
+
+Architecture: 3 llama-server subprocesses per container (embed/expand/rerank),
+pre-built Docker image at `ghcr.io/ofekby/qmd-llama-server:b8179-sm75`,
+GPU memory snapshots for ~6s cold starts. JS calls Modal via `modal` npm SDK.
+
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- node-llama-cpp for local embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- Modal.com for optional remote GPU inference (same models via llama-server)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 
