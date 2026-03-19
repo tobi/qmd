@@ -25,6 +25,7 @@ let testCounter = 0; // Unique counter for each test run
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
+const parallelStartupHarness = join(projectRoot, "test", "parallel-startup-harness.ts");
 // Resolve tsx binary from project's node_modules (not cwd-dependent)
 const tsxBin = (() => {
   const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
@@ -91,6 +92,12 @@ async function runQmdWithBun(
   options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return runQmdCommand(bunBin, [qmdScript, ...args], options);
+}
+
+async function runParallelStartupHarness(
+  dbPath: string
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return runQmdCommand(bunBin, [parallelStartupHarness, dbPath], { cwd: projectRoot, dbPath });
 }
 
 // Get a fresh database path for isolated tests
@@ -244,39 +251,39 @@ beforeEach(async () => {
 describe("CLI parallel startup regression", () => {
   const parallelStartupTest = bunAvailable ? test : test.skip;
 
-  function expectSuccessfulStatus(result: { stdout: string; stderr: string; exitCode: number }): void {
+  function expectSuccessfulStartup(result: { stdout: string; stderr: string; exitCode: number }): void {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("database is locked");
     expect(result.stderr).not.toContain("SQLITE_BUSY");
     expect(result.stderr).not.toContain("sqlite-vec probe failed");
-    expect(result.stdout).toContain("QMD Status");
+    expect(result.stdout).toContain("startup-ok");
   }
 
   parallelStartupTest("allows two Bun qmd processes to initialize the same fresh DB concurrently", async () => {
-    const { dbPath, configDir } = await createIsolatedTestEnv("parallel-startup-fresh");
+    const dbPath = getFreshDbPath();
 
     const [first, second] = await Promise.all([
-      runQmdWithBun(["status"], { dbPath, configDir }),
-      runQmdWithBun(["status"], { dbPath, configDir }),
+      runParallelStartupHarness(dbPath),
+      runParallelStartupHarness(dbPath),
     ]);
 
-    expectSuccessfulStatus(first);
-    expectSuccessfulStatus(second);
+    expectSuccessfulStartup(first);
+    expectSuccessfulStartup(second);
   }, 15000);
 
   parallelStartupTest("allows two Bun qmd processes to initialize the same existing DB concurrently", async () => {
-    const { dbPath, configDir } = await createIsolatedTestEnv("parallel-startup-existing");
+    const dbPath = getFreshDbPath();
 
-    const warmup = await runQmdWithBun(["status"], { dbPath, configDir });
-    expectSuccessfulStatus(warmup);
+    const warmup = await runParallelStartupHarness(dbPath);
+    expectSuccessfulStartup(warmup);
 
     const [first, second] = await Promise.all([
-      runQmdWithBun(["status"], { dbPath, configDir }),
-      runQmdWithBun(["status"], { dbPath, configDir }),
+      runParallelStartupHarness(dbPath),
+      runParallelStartupHarness(dbPath),
     ]);
 
-    expectSuccessfulStatus(first);
-    expectSuccessfulStatus(second);
+    expectSuccessfulStartup(first);
+    expectSuccessfulStartup(second);
   }, 15000);
 });
 
