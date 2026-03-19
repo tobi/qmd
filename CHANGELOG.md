@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Support remote OpenAI-compatible embedding API via `QMD_EMBED_API_URL`.
+  When set, `embed` and `embedBatch` delegate to the remote `/v1/embeddings`
+  endpoint instead of loading a local GGUF model. Useful for GPU offloading
+  (e.g. llama-server, Ollama) or cloud APIs (OpenAI, LiteLLM).
+  Optional: `QMD_EMBED_API_KEY` (Bearer token), `QMD_EMBED_API_MODEL` (model
+  name, default `text-embedding-3-small`). Fixes #403.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

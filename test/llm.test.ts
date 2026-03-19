@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -720,5 +720,163 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
         })
       ).rejects.toThrow("Custom test error");
     });
+  });
+});
+
+// =============================================================================
+// Remote Embed API Tests (QMD_EMBED_API_URL)
+// =============================================================================
+
+describe("RemoteEmbedClient via LlamaCpp (QMD_EMBED_API_URL)", () => {
+  const FAKE_URL = "http://fake-embed-server/v1";
+
+  afterEach(() => {
+    delete process.env.QMD_EMBED_API_URL;
+    delete process.env.QMD_EMBED_API_KEY;
+    delete process.env.QMD_EMBED_API_MODEL;
+    vi.restoreAllMocks();
+  });
+
+  test("delegates embed() to remote API when QMD_EMBED_API_URL is set", async () => {
+    const mockEmbedding = Array.from({ length: 768 }, (_, i) => i / 768);
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [{ embedding: mockEmbedding, index: 0 }],
+        model: "text-embedding-remote",
+      }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({});
+    const result = await llm.embed("hello world");
+
+    expect(result).not.toBeNull();
+    expect(result!.embedding).toHaveLength(768);
+    expect(result!.embedding[0]).toBeCloseTo(mockEmbedding[0]!);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(String(url)).toContain("/embeddings");
+    expect((init as RequestInit).method).toBe("POST");
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.input).toEqual(["hello world"]);
+  });
+
+  test("includes Authorization header when QMD_EMBED_API_KEY is set", async () => {
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: [0.1], index: 0 }], model: "m" }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    process.env.QMD_EMBED_API_KEY = "sk-test-key";
+    const llm = new LlamaCpp({});
+    await llm.embed("test");
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer sk-test-key");
+  });
+
+  test("omits Authorization header when QMD_EMBED_API_KEY is not set", async () => {
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: [0.1], index: 0 }], model: "m" }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({});
+    await llm.embed("test");
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers["Authorization"]).toBeUndefined();
+  });
+
+  test("embedBatch() sends all texts in one request and preserves order", async () => {
+    const embeddings = [
+      Array.from({ length: 4 }, () => 0.1),
+      Array.from({ length: 4 }, () => 0.2),
+      Array.from({ length: 4 }, () => 0.3),
+    ];
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        // Return in reverse order to test index-based sorting
+        data: [
+          { embedding: embeddings[2]!, index: 2 },
+          { embedding: embeddings[0]!, index: 0 },
+          { embedding: embeddings[1]!, index: 1 },
+        ],
+        model: "text-embedding-remote",
+      }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({});
+    const results = await llm.embedBatch(["a", "b", "c"]);
+
+    expect(results).toHaveLength(3);
+    expect(fetchSpy).toHaveBeenCalledOnce(); // single batch request
+    const body = JSON.parse((fetchSpy.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.input).toEqual(["a", "b", "c"]);
+    // Results should be in original order
+    expect(results[0]!.embedding[0]).toBeCloseTo(0.1);
+    expect(results[1]!.embedding[0]).toBeCloseTo(0.2);
+    expect(results[2]!.embedding[0]).toBeCloseTo(0.3);
+  });
+
+  test("embed() returns null on HTTP error and does not throw", async () => {
+    vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Internal Server Error",
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({});
+    const result = await llm.embed("test");
+
+    expect(result).toBeNull();
+  });
+
+  test("embed() returns null on network failure and does not throw", async () => {
+    vi.spyOn(global, "fetch").mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({});
+    const result = await llm.embed("test");
+
+    expect(result).toBeNull();
+  });
+
+  test("uses QMD_EMBED_API_MODEL as model field in request", async () => {
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: [0.5], index: 0 }], model: "custom-model" }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    process.env.QMD_EMBED_API_MODEL = "custom-model";
+    const llm = new LlamaCpp({});
+    await llm.embed("test");
+
+    const body = JSON.parse((fetchSpy.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.model).toBe("custom-model");
+  });
+
+  test("does NOT call local node-llama-cpp when QMD_EMBED_API_URL is set", async () => {
+    vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: [0.1], index: 0 }], model: "m" }),
+    } as Response);
+
+    process.env.QMD_EMBED_API_URL = FAKE_URL;
+    const llm = new LlamaCpp({}) as any;
+    const ensureEmbedSpy = vi.spyOn(llm, "ensureEmbedContext").mockResolvedValue({} as any);
+
+    await llm.embed("test");
+
+    expect(ensureEmbedSpy).not.toHaveBeenCalled();
   });
 });

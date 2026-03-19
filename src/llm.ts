@@ -305,6 +305,72 @@ export async function pullModels(
 }
 
 // =============================================================================
+// Remote Embed Client
+// =============================================================================
+
+/**
+ * OpenAI-compatible remote embedding client.
+ *
+ * Activated when `QMD_EMBED_API_URL` is set. Sends texts to a remote
+ * `/v1/embeddings` endpoint (Ollama, OpenAI, LiteLLM, vLLM, etc.) instead
+ * of running a local GGUF model via node-llama-cpp.
+ *
+ * Environment variables:
+ *   QMD_EMBED_API_URL   Base URL of the embedding server (e.g. http://localhost:11434/v1)
+ *   QMD_EMBED_API_KEY   Optional API key sent as Bearer token
+ *   QMD_EMBED_API_MODEL Model name to pass in the request body (default: "text-embedding-3-small")
+ */
+class RemoteEmbedClient {
+  private readonly baseUrl: string;
+  private readonly apiKey: string | undefined;
+  private readonly model: string;
+
+  constructor() {
+    this.baseUrl = (process.env.QMD_EMBED_API_URL ?? "").replace(/\/+$/, "");
+    this.apiKey = process.env.QMD_EMBED_API_KEY;
+    this.model = process.env.QMD_EMBED_API_MODEL ?? "text-embedding-3-small";
+  }
+
+  async embed(text: string): Promise<EmbeddingResult | null> {
+    const results = await this.embedBatch([text]);
+    return results[0] ?? null;
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+
+    try {
+      const res = await fetch(`${this.baseUrl}/embeddings`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ input: texts, model: this.model }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text().catch(() => String(res.status));
+        console.error(`QMD remote embed API error ${res.status}: ${msg}`);
+        return texts.map(() => null);
+      }
+
+      const json = await res.json() as {
+        data: { embedding: number[]; index: number }[];
+        model: string;
+      };
+
+      // Sort by index to guarantee input order is preserved
+      const sorted = [...json.data].sort((a, b) => a.index - b.index);
+      return sorted.map(d => ({ embedding: d.embedding, model: json.model }));
+    } catch (err) {
+      console.error("QMD remote embed fetch error:", err);
+      return texts.map(() => null);
+    }
+  }
+}
+
+// =============================================================================
 // LLM Interface
 // =============================================================================
 
@@ -855,6 +921,10 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (process.env.QMD_EMBED_API_URL) {
+      return new RemoteEmbedClient().embed(text);
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -884,6 +954,10 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (process.env.QMD_EMBED_API_URL) {
+      return new RemoteEmbedClient().embedBatch(texts);
+    }
+
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
