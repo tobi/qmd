@@ -135,6 +135,7 @@ async function handleDeploy(
   // would pay the ~40s snapshot creation cost.
   let snapshotNote = "";
   try {
+    process.stdout.write("Creating GPU snapshot (loading models onto GPU, ~1 minute)...\n");
     const backend = new ModalBackend();
     await backend.ping();
     snapshotNote = "\nGPU snapshot created — subsequent cold starts will be ~6s.";
