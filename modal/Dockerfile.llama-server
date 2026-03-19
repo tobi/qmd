@@ -5,10 +5,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ARG LLAMA_CPP_TAG=b8179
+ARG CUDA_ARCHITECTURES=75
+
+# Create libcuda.so.1 symlink so the linker can resolve the CUDA driver stub
+# (the real driver is provided at runtime by the NVIDIA container toolkit)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+    && echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf \
+    && ldconfig
+
 RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
     https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp \
     && cd /tmp/llama.cpp \
     && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
     && cmake --build build --target llama-server -j$(nproc) \
     && cp build/bin/llama-server /usr/local/bin/llama-server
 
