@@ -638,7 +638,41 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
+const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+
+function isBusyLockError(err: unknown): boolean {
+  const message = getErrorMessage(err).toLowerCase();
+  return message.includes("database is locked") || message.includes("sqlite_busy");
+}
+
+export function configureConnectionPragmas(db: Database): void {
+  db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS}`);
+
+  let journalModeRow = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+  if (journalModeRow?.journal_mode?.toLowerCase() !== "wal") {
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+    } catch (err) {
+      if (!isBusyLockError(err)) {
+        throw err;
+      }
+
+      // Two qmd processes can both observe a non-WAL database and then race to
+      // become the one that flips the shared file into WAL mode. Losing that
+      // race should not abort startup; re-probe for observability, then proceed.
+      journalModeRow = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+    }
+  }
+
+  db.exec("PRAGMA foreign_keys = ON");
+}
+
 function initializeDatabase(db: Database): void {
+  // Configure the connection before any probe queries. Parallel qmd processes
+  // can race during startup; without a busy timeout even read-only probe work
+  // like `SELECT vec_version()` can fail immediately with SQLITE_BUSY.
+  configureConnectionPragmas(db);
+
   try {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
@@ -648,8 +682,6 @@ function initializeDatabase(db: Database): void {
     _sqliteVecAvailable = false;
     console.warn(getErrorMessage(err));
   }
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
   db.exec(`DROP TABLE IF EXISTS path_contexts`);

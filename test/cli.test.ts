@@ -11,7 +11,7 @@ import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlink
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 
 // Test fixtures directory and database path
@@ -33,16 +33,19 @@ const tsxBin = (() => {
   }
   return join(process.cwd(), "node_modules", ".bin", "tsx");
 })();
+const bunBin = "bun";
+const bunAvailable = spawnSync(bunBin, ["--version"], { stdio: "ignore" }).status === 0;
 
 // Helper to run qmd command with test database
-async function runQmd(
-  args: string[],
+async function runQmdCommand(
+  command: string,
+  commandArgs: string[],
   options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
   const configDir = options.configDir || testConfigDir;
-  const proc = spawn(tsxBin, [qmdScript, ...args], {
+  const proc = spawn(command, commandArgs, {
     cwd: workingDir,
     env: {
       ...process.env,
@@ -74,6 +77,20 @@ async function runQmd(
   const stderr = await stderrPromise;
 
   return { stdout, stderr, exitCode };
+}
+
+async function runQmd(
+  args: string[],
+  options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return runQmdCommand(tsxBin, [qmdScript, ...args], options);
+}
+
+async function runQmdWithBun(
+  args: string[],
+  options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return runQmdCommand(bunBin, [qmdScript, ...args], options);
 }
 
 // Get a fresh database path for isolated tests
@@ -222,6 +239,45 @@ beforeEach(async () => {
     join(testConfigDir, "index.yml"),
     "collections: {}\n"
   );
+});
+
+describe("CLI parallel startup regression", () => {
+  const parallelStartupTest = bunAvailable ? test : test.skip;
+
+  function expectSuccessfulStatus(result: { stdout: string; stderr: string; exitCode: number }): void {
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("database is locked");
+    expect(result.stderr).not.toContain("SQLITE_BUSY");
+    expect(result.stderr).not.toContain("sqlite-vec probe failed");
+    expect(result.stdout).toContain("QMD Status");
+  }
+
+  parallelStartupTest("allows two Bun qmd processes to initialize the same fresh DB concurrently", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("parallel-startup-fresh");
+
+    const [first, second] = await Promise.all([
+      runQmdWithBun(["status"], { dbPath, configDir }),
+      runQmdWithBun(["status"], { dbPath, configDir }),
+    ]);
+
+    expectSuccessfulStatus(first);
+    expectSuccessfulStatus(second);
+  }, 15000);
+
+  parallelStartupTest("allows two Bun qmd processes to initialize the same existing DB concurrently", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("parallel-startup-existing");
+
+    const warmup = await runQmdWithBun(["status"], { dbPath, configDir });
+    expectSuccessfulStatus(warmup);
+
+    const [first, second] = await Promise.all([
+      runQmdWithBun(["status"], { dbPath, configDir }),
+      runQmdWithBun(["status"], { dbPath, configDir }),
+    ]);
+
+    expectSuccessfulStatus(first);
+    expectSuccessfulStatus(second);
+  }, 15000);
 });
 
 describe("CLI Help", () => {

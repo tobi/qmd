@@ -16,6 +16,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  configureConnectionPragmas,
 } from "../src/store";
 
 // =============================================================================
@@ -106,6 +107,116 @@ describe("cleanupOrphanedVectors", () => {
     } as any;
 
     expect(cleanupOrphanedVectors(db)).toBe(0);
+  });
+});
+
+// =============================================================================
+// Connection pragma tests
+// =============================================================================
+
+describe("configureConnectionPragmas", () => {
+  test("skips resetting journal mode when database is already in WAL mode", () => {
+    const execCalls: string[] = [];
+    const db = {
+      exec: (sql: string) => execCalls.push(sql),
+      prepare: (sql: string) => {
+        expect(sql).toBe("PRAGMA journal_mode");
+        return { get: () => ({ journal_mode: "wal" }) };
+      },
+    } as any;
+
+    configureConnectionPragmas(db);
+
+    expect(execCalls).toEqual([
+      "PRAGMA busy_timeout = 5000",
+      "PRAGMA foreign_keys = ON",
+    ]);
+  });
+
+  test("enables WAL once when database is not already in WAL mode", () => {
+    const execCalls: string[] = [];
+    const db = {
+      exec: (sql: string) => execCalls.push(sql),
+      prepare: (sql: string) => {
+        expect(sql).toBe("PRAGMA journal_mode");
+        return { get: () => ({ journal_mode: "delete" }) };
+      },
+    } as any;
+
+    configureConnectionPragmas(db);
+
+    expect(execCalls).toEqual([
+      "PRAGMA busy_timeout = 5000",
+      "PRAGMA journal_mode = WAL",
+      "PRAGMA foreign_keys = ON",
+    ]);
+  });
+
+  test("tolerates a busy WAL switch when another process wins the race", () => {
+    const execCalls: string[] = [];
+    let journalModeReads = 0;
+    const db = {
+      exec: (sql: string) => {
+        execCalls.push(sql);
+        if (sql === "PRAGMA journal_mode = WAL") {
+          throw new Error("database is locked");
+        }
+      },
+      prepare: (sql: string) => {
+        expect(sql).toBe("PRAGMA journal_mode");
+        return {
+          get: () => ({ journal_mode: journalModeReads++ === 0 ? "delete" : "wal" }),
+        };
+      },
+    } as any;
+
+    expect(() => configureConnectionPragmas(db)).not.toThrow();
+    expect(execCalls).toEqual([
+      "PRAGMA busy_timeout = 5000",
+      "PRAGMA journal_mode = WAL",
+      "PRAGMA foreign_keys = ON",
+    ]);
+  });
+
+  test("continues when WAL switch is busy and follow-up probe still reports non-WAL", () => {
+    const execCalls: string[] = [];
+    const db = {
+      exec: (sql: string) => {
+        execCalls.push(sql);
+        if (sql === "PRAGMA journal_mode = WAL") {
+          throw new Error("SQLITE_BUSY_RECOVERY: database is locked");
+        }
+      },
+      prepare: (sql: string) => {
+        expect(sql).toBe("PRAGMA journal_mode");
+        return {
+          get: () => ({ journal_mode: "delete" }),
+        };
+      },
+    } as any;
+
+    expect(() => configureConnectionPragmas(db)).not.toThrow();
+    expect(execCalls).toEqual([
+      "PRAGMA busy_timeout = 5000",
+      "PRAGMA journal_mode = WAL",
+      "PRAGMA foreign_keys = ON",
+    ]);
+  });
+
+  test("rethrows non-lock WAL errors", () => {
+    const db = {
+      exec: (sql: string) => {
+        if (sql === "PRAGMA journal_mode = WAL") {
+          throw new Error("disk I/O error");
+        }
+      },
+      prepare: (sql: string) => {
+        expect(sql).toBe("PRAGMA journal_mode");
+        return { get: () => ({ journal_mode: "delete" }) };
+      },
+    } as any;
+
+    expect(() => configureConnectionPragmas(db)).toThrow("disk I/O error");
   });
 });
 
