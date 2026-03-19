@@ -100,7 +100,7 @@ EMBED_SERVER = ServerConfig(
     name="embed",
     port=8081,
     model_file="embeddinggemma-300M-Q8_0.gguf",
-    extra_args=["--embedding", "--pooling", "mean"],
+    extra_args=["--embedding", "--pooling", "mean", "--ubatch-size", "2048"],
 )
 
 EXPAND_SERVER = ServerConfig(
@@ -211,22 +211,24 @@ class QMDInference:
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Raw embedding -- no prompt formatting.
 
+        Sends all texts in a single batch request to llama-server's
+        /embedding endpoint for minimal round-trip overhead.
         Returns one embedding vector per input text.
         """
         import requests
 
+        resp = requests.post(
+            f"http://127.0.0.1:{EMBED_SERVER.port}/embedding",
+            json={"content": texts},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
         result: list[list[float]] = []
-        for text in texts:
-            resp = requests.post(
-                f"http://127.0.0.1:{EMBED_SERVER.port}/embedding",
-                json={"content": text},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            # Response is a list of objects with "embedding" key.
-            # The embedding value may be nested [[...floats...]], so flatten.
-            emb = data[0]["embedding"]
+        for entry in data:
+            emb = entry["embedding"]
+            # Flatten if nested [[...floats...]]
             if isinstance(emb[0], list):
                 emb = emb[0]
             result.append(emb)
