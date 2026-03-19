@@ -2376,6 +2376,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3047,6 +3048,7 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        const host = (cli.values.host as string | undefined) ?? process.env.QMD_MCP_HOST ?? "127.0.0.1";
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -3065,9 +3067,10 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const baseArgs = ["mcp", "--http", "--port", String(port), "--host", host];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...baseArgs]
+            : [selfPath, ...baseArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3076,7 +3079,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${host}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -3087,7 +3090,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { host });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);

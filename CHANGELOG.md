@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `qmd mcp --http --host <addr>` flag to control the bind address of the MCP
+  HTTP server. Defaults to `127.0.0.1` (loopback-only, same security posture
+  as before). Set to `0.0.0.0` to accept connections from other hosts (e.g.
+  containers, remote clients). Also configurable via `QMD_MCP_HOST` env var;
+  the CLI flag takes precedence.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

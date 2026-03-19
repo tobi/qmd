@@ -1075,3 +1075,101 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+// =============================================================================
+// MCP HTTP Bind Host Tests (QMD_MCP_HOST / host option)
+// =============================================================================
+
+describe.skipIf(!!process.env.CI)("MCP HTTP bind host", () => {
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+  const origMcpHost = process.env.QMD_MCP_HOST;
+
+  // Reuse the httpTestDbPath and httpTestConfigDir variables are not in scope here,
+  // so we set up our own isolated DB for these tests.
+  let bindTestDbPath: string;
+  let bindTestConfigDir: string;
+
+  beforeAll(async () => {
+    bindTestDbPath = `/tmp/qmd-mcp-bind-test-${Date.now()}.sqlite`;
+    const db = openDatabase(bindTestDbPath);
+    initTestDatabase(db);
+    seedTestData(db);
+
+    const bindTestConfig: CollectionConfig = {
+      collections: { docs: { path: "/test/docs", pattern: "**/*.md" } }
+    };
+    syncConfigToDb(db, bindTestConfig);
+    db.close();
+
+    const configPrefix = join(tmpdir(), `qmd-mcp-bind-config-${Date.now()}`);
+    bindTestConfigDir = await mkdtemp(configPrefix);
+    await writeFile(join(bindTestConfigDir, "index.yml"), YAML.stringify(bindTestConfig));
+
+    process.env.INDEX_PATH = bindTestDbPath;
+    process.env.QMD_CONFIG_DIR = bindTestConfigDir;
+  });
+
+  afterAll(async () => {
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+    if (origMcpHost !== undefined) process.env.QMD_MCP_HOST = origMcpHost;
+    else delete process.env.QMD_MCP_HOST;
+
+    try { unlinkSync(bindTestDbPath); } catch {}
+    try {
+      const files = await readdir(bindTestConfigDir);
+      for (const f of files) await unlink(join(bindTestConfigDir, f));
+      await rmdir(bindTestConfigDir);
+    } catch {}
+  });
+
+  test("accepts host option and binds to specified address", async () => {
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { status: string };
+      expect(body.status).toBe("ok");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  test("uses QMD_MCP_HOST env var when no host option is given", async () => {
+    process.env.QMD_MCP_HOST = "127.0.0.1";
+    const handle = await startMcpHttpServer(0, { quiet: true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+      delete process.env.QMD_MCP_HOST;
+    }
+  });
+
+  test("host option takes precedence over QMD_MCP_HOST", async () => {
+    process.env.QMD_MCP_HOST = "0.0.0.0";
+    const handle = await startMcpHttpServer(0, { quiet: true, host: "127.0.0.1" });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+      delete process.env.QMD_MCP_HOST;
+    }
+  });
+
+  test("defaults to 127.0.0.1 when neither option nor env var is set", async () => {
+    delete process.env.QMD_MCP_HOST;
+    const handle = await startMcpHttpServer(0, { quiet: true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
