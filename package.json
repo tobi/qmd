@@ -17,6 +17,7 @@
   "files": [
     "bin/",
     "dist/",
+    "modal/",
     "LICENSE",
     "CHANGELOG.md"
   ],
