@@ -61,8 +61,9 @@ def download_models() -> None:
 
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("nvidia-cuda-runtime-cu12")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.0-runtime-ubuntu22.04", add_python="3.11"
+    )
     .pip_install(
         "llama-cpp-python",
         extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
