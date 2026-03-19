@@ -33,4 +33,4 @@ RUN ln -s /usr/local/lib/llama/llama-server /usr/local/bin/llama-server \
     && echo "/usr/local/lib/llama" > /etc/ld.so.conf.d/llama.conf \
     && ldconfig
 
-ENTRYPOINT ["llama-server"]
+# No ENTRYPOINT — Modal runs its own Python process inside the container
