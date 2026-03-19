@@ -2,7 +2,7 @@
 
 ## Summary
 
-Add optional remote GPU inference via Modal.com, allowing users without a local GPU to run QMD's three GGUF models (embedding, reranking, query expansion) on a cheap cloud GPU. The Modal function is a dumb model server exposing raw inference primitives (`embed()`, `generate()`, `ping()`) — all prompt formatting (including chat templates and special tokens), grammar construction, and search logic stays in QMD's JS codebase. Reranking is handled via `generate()` — the JS side constructs the full Qwen3-Reranker chat-templated prompt and passes it as a completion request.
+Add optional remote GPU inference via Modal.com, allowing users without a local GPU to run QMD's three GGUF models (embedding, reranking, query expansion) on a cheap cloud GPU. The Modal function is a dumb model server exposing raw inference primitives (`embed()`, `generate()`, `rerank()`, `ping()`) — all prompt formatting (including chat templates and special tokens), grammar construction, and search logic stays in QMD's JS codebase. Reranking uses a dedicated `rerank()` method that leverages `create_chat_completion()` for model-native template handling (analogous to node-llama-cpp's `rankAll()`).
 
 ## Architecture Overview
 
@@ -15,6 +15,7 @@ User machine (JS/TS)                          Modal (Python)
 │  │ Grammar logic      │  │   JS SDK (gRPC)   │  │                    │  │
 │  │ Result parsing     │──┼──────────────────►│  │ embed()   - raw    │  │
 │  │                    │  │                   │  │ generate() - raw   │  │
+│  │                    │  │                   │  │ rerank()  - scores │  │
 │  │ ModalBackend       │  │                   │  │ ping()    - health │  │
 │  └───────────────────┘  │                   │  └────────────────────┘  │
 │                         │                   │                          │
@@ -108,6 +109,35 @@ class QMDInference:
             kwargs["grammar"] = LlamaGrammar.from_string(grammar)
         result = llm(**kwargs)
         return result["choices"][0]["text"]
+
+    @modal.method()
+    def rerank(self, query: str, texts: list[str]) -> list[float]:
+        """Cross-encoder scoring using Qwen3-Reranker.
+        Uses create_chat_completion() which applies the model's native
+        chat template automatically (same as node-llama-cpp's rankAll).
+        """
+        scores = []
+        for text in texts:
+            response = self.rerank_model.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "Judge whether the Document meets the requirements of the Query. Note that the answer can only be \"yes\" or \"no\"."},
+                    {"role": "user", "content": f"<Query>{query}</Query>\n<Document>{text}</Document>"}
+                ],
+                max_tokens=1,
+                logprobs=True,
+                top_logprobs=5,
+            )
+            # Extract the "yes" probability as the relevance score
+            # (standard Qwen3-Reranker scoring approach)
+            logprobs_data = response["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+            yes_prob = 0.0
+            for lp in logprobs_data:
+                if lp["token"].lower().strip() == "yes":
+                    import math
+                    yes_prob = math.exp(lp["logprob"])
+                    break
+            scores.append(yes_prob)
+        return scores
 
     @modal.method()
     def ping(self) -> bool:
@@ -205,6 +235,13 @@ class ModalBackend {
                  model?: "expand" | "rerank"): Promise<string>
 
   /**
+   * Cross-encoder reranking using Qwen3-Reranker.
+   * Python side uses create_chat_completion() for model-native template handling.
+   * Returns relevance scores (0-1) for each text.
+   */
+  async rerank(query: string, texts: string[]): Promise<number[]>
+
+  /**
    * Health check.
    */
   async ping(): Promise<boolean>
@@ -213,7 +250,7 @@ class ModalBackend {
 
 `ModalBackend` should implement the existing `LLM` interface from `src/llm.ts` so it can be swapped in transparently. Session management (`withLLMSession`, `canUnload`, inactivity timeouts) becomes a no-op in Modal mode since there are no local models to manage.
 
-**Chat template responsibility:** The JS side must construct full chat-templated prompts (including `<|im_start|>`, `<|im_end|>` special tokens) for both query expansion and reranking before sending to `generate()`. The Python `generate()` does raw completion only — it does not apply any chat template.
+**Chat template responsibility:** The JS side must construct full chat-templated prompts (including `<|im_start|>`, `<|im_end|>` special tokens) for query expansion before sending to `generate()`. The Python `generate()` does raw completion only — it does not apply any chat template. Reranking uses the dedicated `rerank()` method, which handles the Qwen3-Reranker chat template via `create_chat_completion()` on the Python side.
 
 ### Initialization
 
@@ -305,7 +342,7 @@ src/
 ```
 src/llm.ts            # Conditional: local vs modal backend at inference call sites
 src/cli/qmd.ts        # New 'qmd modal deploy|status|destroy|test' subcommands
-src/config.ts         # New config keys: modal.inference, modal.gpu, modal.scaledown_window
+src/collections.ts    # New config keys: modal.inference, modal.gpu, modal.scaledown_window
 package.json          # Add 'modal' npm dependency; add "modal/" to `files` array so serve.py ships with the npm package
 ```
 
@@ -327,7 +364,7 @@ package.json          # Add 'modal' npm dependency; add "modal/" to `files` arra
 
 ## Design Decisions
 
-1. **Dumb model server** — Modal function exposes raw `embed()`, `generate()`, `ping()`. All prompt formatting (including chat templates with special tokens), grammar construction, and result parsing stays in JS. Reranking goes through `generate()` with the JS side constructing the full Qwen3-Reranker chat-templated prompt. Zero duplication, zero drift risk.
+1. **Dumb model server** — Modal function exposes raw `embed()`, `generate()`, `rerank()`, `ping()`. All prompt formatting (including chat templates with special tokens), grammar construction, and result parsing stays in JS. The `rerank()` method is the one exception to the "dumb server" principle: it uses `create_chat_completion()` for model-native template handling, analogous to how node-llama-cpp's `rankAll()` handles the Qwen3-Reranker chat template internally. This is necessary because `rankAll()` is a high-level API with no visible prompt template to reverse-engineer on the JS side. Zero duplication, zero drift risk.
 
 2. **Memory snapshots** — `enable_memory_snapshot=True` with `@modal.enter(snap=True)` captures loaded models in memory. Subsequent cold starts restore from snapshot instead of re-loading ~2GB of model weights.
 
