@@ -22,7 +22,7 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   getDefaultLLM,
-  ModalLLM,
+  type LLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -64,8 +64,8 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp | ModalLLM {
-  return store.llm ?? (getDefaultLLM() as LlamaCpp | ModalLLM);
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1325,8 +1325,9 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
+  // Embedding generation requires local LlamaCpp for tokenization during chunking.
+  // Even with Modal inference enabled, indexing uses the local model.
+  const llm = store.llm ?? getDefaultLlamaCpp();
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -2096,7 +2097,9 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLLM();
+  // Tokenization requires LlamaCpp (local) — not available via Modal.
+  // This is only called during indexing (generateEmbeddings), not search.
+  const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
