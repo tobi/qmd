@@ -1,7 +1,13 @@
 """QMD Modal Inference Service.
 
 Deploys three GGUF models (embedding, reranking, query expansion) on a Modal
-GPU container and exposes raw inference methods via Modal's RPC.
+GPU container using llama-server (the llama.cpp HTTP server) and exposes raw
+inference methods via Modal's RPC.
+
+Each model runs as a separate llama-server subprocess on its own port:
+  - Port 8081: embeddinggemma  (embedding, --pooling mean)
+  - Port 8082: qmd-query-expansion (completion)
+  - Port 8083: qwen3-reranker (reranking, --pooling rank)
 
 Manual test instructions:
     # 1. Authenticate with Modal (one-time setup)
@@ -20,9 +26,9 @@ Manual test instructions:
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
+from dataclasses import dataclass
 
 import modal
 
@@ -31,6 +37,7 @@ import modal
 # ---------------------------------------------------------------------------
 
 MODELS_DIR = "/models"
+LLAMA_SERVER_BIN = "/usr/local/bin/llama-server"
 
 MODELS = [
     {
@@ -62,13 +69,22 @@ def download_models() -> None:
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.0-runtime-ubuntu22.04", add_python="3.11"
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
     )
-    .pip_install(
-        "llama-cpp-python",
-        extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+    .apt_install("libgomp1", "libcurl4", "build-essential", "cmake", "git")
+    .run_commands(
+        # Build llama-server from llama.cpp b8179 (same version as
+        # node-llama-cpp v3.17.1) with CUDA support.  No pre-built Linux
+        # CUDA binary is published for this release.
+        "git clone --depth 1 --branch b8179"
+        " https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp"
+        " && cd /tmp/llama.cpp"
+        " && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release"
+        " && cmake --build build --target llama-server -j$(nproc)"
+        f" && cp build/bin/llama-server {LLAMA_SERVER_BIN}"
+        " && rm -rf /tmp/llama.cpp"
     )
-    .pip_install("huggingface-hub")
+    .pip_install("huggingface-hub", "requests")
     .run_function(download_models)
 )
 
@@ -76,12 +92,47 @@ app = modal.App("qmd-inference", image=image)
 
 
 # ---------------------------------------------------------------------------
-# Section B: QMDInference class
+# Section B: Server configuration
 # ---------------------------------------------------------------------------
 
-# Read GPU/scaledown config from environment when the module is imported
-# during ``modal deploy``.  The CLI deploy command passes these via env vars
-# so the decorator picks up the configured values at import time.
+@dataclass
+class ServerConfig:
+    """Configuration for a single llama-server instance."""
+
+    name: str
+    port: int
+    model_file: str
+    extra_args: list[str]
+
+
+EMBED_SERVER = ServerConfig(
+    name="embed",
+    port=8081,
+    model_file="embeddinggemma-300M-Q8_0.gguf",
+    extra_args=["--embedding", "--pooling", "mean"],
+)
+
+EXPAND_SERVER = ServerConfig(
+    name="expand",
+    port=8082,
+    model_file="qmd-query-expansion-1.7B-q4_k_m.gguf",
+    extra_args=[],
+)
+
+RERANK_SERVER = ServerConfig(
+    name="rerank",
+    port=8083,
+    model_file="qwen3-reranker-0.6b-q8_0.gguf",
+    extra_args=["--embedding", "--pooling", "rank"],
+)
+
+ALL_SERVERS = [EMBED_SERVER, EXPAND_SERVER, RERANK_SERVER]
+
+
+# ---------------------------------------------------------------------------
+# Section C: QMDInference class
+# ---------------------------------------------------------------------------
+
 gpu_config: str = os.environ.get("QMD_MODAL_GPU", "T4")
 idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
 
@@ -93,54 +144,97 @@ idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
 )
 @modal.concurrent(max_inputs=4)
 class QMDInference:
-    """Raw inference service for QMD's three GGUF models."""
+    """Raw inference service for QMD's three GGUF models.
+
+    Runs three llama-server subprocesses (one per model) and proxies
+    requests to them via HTTP.
+    """
 
     @modal.enter(snap=True)
-    def load_models(self) -> None:
-        """Load all 3 models and run warmup passes.
+    def start_servers(self) -> None:
+        """Start all llama-server instances and wait until healthy.
 
-        The ``snap=True`` flag captures the loaded model state in a memory
-        snapshot so subsequent cold starts restore from the snapshot instead
-        of re-loading ~2 GB of weights.
+        Uses ``snap=True`` so the running subprocesses are captured in a
+        memory snapshot.  On restore the servers are already running with
+        models loaded.
         """
-        from llama_cpp import Llama
+        import subprocess
+        import time
 
-        self.embed_model = Llama(
-            model_path=f"{MODELS_DIR}/embeddinggemma-300M-Q8_0.gguf",
-            embedding=True,
-            n_ctx=2048,
-        )
-        self.rerank_model = Llama(
-            model_path=f"{MODELS_DIR}/qwen3-reranker-0.6b-q8_0.gguf",
-            n_ctx=2048,
-        )
-        self.expand_model = Llama(
-            model_path=f"{MODELS_DIR}/qmd-query-expansion-1.7B-q4_k_m.gguf",
-            n_ctx=2048,
-        )
+        import requests
+
+        self._processes: list[subprocess.Popen[bytes]] = []
+
+        for server in ALL_SERVERS:
+            cmd = [
+                LLAMA_SERVER_BIN,
+                "--model", f"{MODELS_DIR}/{server.model_file}",
+                "--port", str(server.port),
+                "--ctx-size", "2048",
+                "--n-gpu-layers", "99",
+                *server.extra_args,
+            ]
+            proc = subprocess.Popen(cmd)
+            self._processes.append(proc)
+
+        # Wait for all servers to become healthy
+        for server in ALL_SERVERS:
+            url = f"http://127.0.0.1:{server.port}/health"
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                try:
+                    resp = requests.get(url, timeout=2)
+                    if resp.status_code == 200:
+                        break
+                except requests.ConnectionError:
+                    pass
+                time.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    f"llama-server '{server.name}' on port {server.port} "
+                    f"did not become healthy within 120s"
+                )
 
         # Warmup passes to pre-fill caches before snapshot
-        self.embed_model.embed("warmup")
-        self.rerank_model("warmup", max_tokens=1)
-        self.expand_model("warmup", max_tokens=1)
+        requests.post(
+            f"http://127.0.0.1:{EMBED_SERVER.port}/embedding",
+            json={"content": "warmup"},
+            timeout=30,
+        )
+        requests.post(
+            f"http://127.0.0.1:{EXPAND_SERVER.port}/completion",
+            json={"prompt": "warmup", "n_predict": 1},
+            timeout=30,
+        )
+        requests.post(
+            f"http://127.0.0.1:{RERANK_SERVER.port}/reranking",
+            json={
+                "query": "warmup",
+                "documents": ["warmup"],
+            },
+            timeout=30,
+        )
 
     @modal.method()
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Raw embedding -- no prompt formatting.
 
-        Returns one embedding vector per input text.  llama-cpp-python's
-        ``Llama.embed()`` returns ``list[list[float]]``; we normalise to
-        always yield a single vector per input.
+        Returns one embedding vector per input text.
         """
+        import requests
+
         result: list[list[float]] = []
         for text in texts:
-            vec = self.embed_model.embed(text)
-            # Llama.embed() may return list[list[float]] or list[float]
-            # depending on input; normalise to a single vector per text.
-            if isinstance(vec[0], list):
-                result.append(vec[0])
-            else:
-                result.append(vec)
+            resp = requests.post(
+                f"http://127.0.0.1:{EMBED_SERVER.port}/embedding",
+                json={"content": text},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Response is a list of objects with "embedding" key;
+            # take the first (and only) entry.
+            result.append(data[0]["embedding"])
         return result
 
     @modal.method()
@@ -164,77 +258,62 @@ class QMDInference:
             model: Which model to use -- ``"expand"`` (default) for query
                    expansion, ``"rerank"`` for the reranker model.
         """
-        llm = self.rerank_model if model == "rerank" else self.expand_model
-        kwargs: dict = {"prompt": prompt, "max_tokens": max_tokens}
-        if grammar:
-            from llama_cpp import LlamaGrammar
+        import requests
 
-            kwargs["grammar"] = LlamaGrammar.from_string(grammar)
-        result = llm(**kwargs)
-        return result["choices"][0]["text"]
+        port = RERANK_SERVER.port if model == "rerank" else EXPAND_SERVER.port
+        payload: dict = {"prompt": prompt, "n_predict": max_tokens}
+        if grammar:
+            payload["grammar"] = grammar
+        resp = requests.post(
+            f"http://127.0.0.1:{port}/completion",
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["content"]
 
     @modal.method()
     def rerank(self, query: str, texts: list[str]) -> list[float]:
         """Cross-encoder scoring using Qwen3-Reranker.
 
-        Uses ``create_chat_completion()`` which applies the model's native
-        chat template automatically (analogous to node-llama-cpp's
-        ``rankAll()``).
+        Uses llama-server's native ``/reranking`` endpoint (the server runs
+        with ``--pooling rank``), which applies the model's reranking logic
+        directly.
 
-        Returns a list of relevance scores (0--1), one per input text.
+        Returns a list of relevance scores, one per input text.
         """
-        scores: list[float] = []
-        for text in texts:
-            response = self.rerank_model.create_chat_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Judge whether the Document meets the "
-                            "requirements of the Query. Note that the "
-                            'answer can only be "yes" or "no".'
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"<Query>{query}</Query>\n"
-                            f"<Document>{text}</Document>"
-                        ),
-                    },
-                ],
-                max_tokens=1,
-                logprobs=True,
-                top_logprobs=5,
-            )
-            score = _extract_yes_probability(response)
-            scores.append(score)
-        return scores
+        import requests
+
+        resp = requests.post(
+            f"http://127.0.0.1:{RERANK_SERVER.port}/reranking",
+            json={"query": query, "documents": texts},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Response contains "results" sorted by index, each with
+        # "index" and "relevance_score".  Return scores in the
+        # original document order.
+        results = sorted(data["results"], key=lambda r: r["index"])
+        return [r["relevance_score"] for r in results]
 
     @modal.method()
     def ping(self) -> bool:
-        """Health check -- verifies function is reachable and models loaded."""
+        """Health check -- verifies function is reachable and servers running."""
+        import requests
+
+        for server in ALL_SERVERS:
+            resp = requests.get(
+                f"http://127.0.0.1:{server.port}/health",
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return False
         return True
 
 
-def _extract_yes_probability(response: dict) -> float:
-    """Extract the probability of the 'yes' token from chat completion logprobs.
-
-    This is the standard Qwen3-Reranker scoring approach: the model is asked
-    to judge relevance with a yes/no answer, and we use the probability of
-    'yes' as the relevance score.
-    """
-    logprobs_data = response["choices"][0]["logprobs"]["content"][0][
-        "top_logprobs"
-    ]
-    for lp in logprobs_data:
-        if lp["token"].lower().strip() == "yes":
-            return math.exp(lp["logprob"])
-    return 0.0
-
-
 # ---------------------------------------------------------------------------
-# Section C: CLI entry point
+# Section D: CLI entry point
 # ---------------------------------------------------------------------------
 
 
@@ -246,9 +325,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         f"Deploying qmd-inference "
         f"(gpu={args.gpu}, scaledown_window={args.scaledown_window})..."
     )
-    # Shell out to ``modal deploy`` with env vars so the module re-imports
-    # with the configured GPU and scaledown window values.
-    env = {**os.environ, "QMD_MODAL_GPU": args.gpu, "QMD_MODAL_SCALEDOWN": str(args.scaledown_window)}
+    env = {
+        **os.environ,
+        "QMD_MODAL_GPU": args.gpu,
+        "QMD_MODAL_SCALEDOWN": str(args.scaledown_window),
+    }
     subprocess.run(
         [sys.executable, "-m", "modal", "deploy", __file__],
         check=True,
