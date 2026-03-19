@@ -62,6 +62,7 @@ def download_models() -> None:
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .pip_install("nvidia-cuda-runtime-cu12")
     .pip_install(
         "llama-cpp-python",
         extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
@@ -84,10 +85,10 @@ gpu_config: str = os.environ.get("QMD_MODAL_GPU", "T4")
 idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
 
 
+@modal.concurrent(max_inputs=4)
 @app.cls(
     gpu=gpu_config,
     scaledown_window=idle_timeout,
-    allow_concurrent_inputs=4,
     enable_memory_snapshot=True,
 )
 class QMDInference:
