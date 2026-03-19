@@ -132,6 +132,7 @@ idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
     gpu=gpu_config,
     scaledown_window=idle_timeout,
     enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=4)
 class QMDInference:
