@@ -12,6 +12,10 @@ on:
         description: 'llama.cpp tag to build (e.g. b8179)'
         required: false
         default: 'b8179'
+      cuda_architectures:
+        description: 'CUDA architectures (e.g. 75 for T4)'
+        required: false
+        default: '75'
 
 env:
   REGISTRY: ghcr.io
@@ -45,9 +49,10 @@ jobs:
           file: ./modal/Dockerfile.llama-server
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.llama_cpp_tag || 'b8179' }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.llama_cpp_tag || 'b8179' }}-sm${{ inputs.cuda_architectures || '75' }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           build-args: |
             LLAMA_CPP_TAG=${{ inputs.llama_cpp_tag || 'b8179' }}
+            CUDA_ARCHITECTURES=${{ inputs.cuda_architectures || '75' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
