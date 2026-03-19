@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- **Time-based search filters**: `qmd search`, `qmd query`, `qmd vsearch`,
+  and `qmd ls` now accept `--modified-since` / `--created-since`. SDK and MCP
+  search APIs now expose matching `modifiedAfter` / `createdAfter` filters.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

@@ -106,6 +106,31 @@ Note: `-term` only works in lex queries, not vec/hyde.
 
 Omit to search all collections.
 
+### Time Filters
+
+Use time filters when the user wants only recently changed or newly created docs.
+Keep this as metadata filtering, not query text.
+
+- CLI: `--modified-since 48h|7d|2w|2026-03-01`, `--created-since ...`
+- MCP: `modifiedAfter`, `createdAfter` (ISO timestamp/date)
+- Applies to `query`, `search`, `vsearch`, and `ls`
+- Filters use indexed timestamps, so run `qmd update` first if freshness matters
+
+Examples:
+
+```bash
+qmd query --modified-since 7d "project ideas"
+qmd search --created-since 30d "meeting notes"
+qmd ls notes --modified-since 2w
+```
+
+```json
+{
+  "searches": [{ "type": "lex", "query": "project ideas" }],
+  "modifiedAfter": "2026-03-01T00:00:00Z"
+}
+```
+
 ## Other MCP Tools
 
 | Tool | Use |

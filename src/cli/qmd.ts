@@ -1198,7 +1198,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 }
 
 // List files in virtual file tree
-function listFiles(pathArg?: string): void {
+function listFiles(pathArg?: string, opts?: Pick<OutputOptions, "modifiedAfter" | "createdAfter">): void {
   const db = getDb();
 
   if (!pathArg) {
@@ -1276,7 +1276,6 @@ function listFiles(pathArg?: string): void {
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
       WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-      ORDER BY d.path
     `;
     params = [coll.name, `${pathPrefix}%`];
   } else {
@@ -1286,10 +1285,19 @@ function listFiles(pathArg?: string): void {
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
       WHERE d.collection = ? AND d.active = 1
-      ORDER BY d.path
     `;
     params = [coll.name];
   }
+
+  if (opts?.modifiedAfter) {
+    query += ` AND d.modified_at >= ?`;
+    params.push(opts.modifiedAfter);
+  }
+  if (opts?.createdAfter) {
+    query += ` AND d.created_at >= ?`;
+    params.push(opts.createdAfter);
+  }
+  query += ` ORDER BY d.path`;
 
   const files = db.prepare(query).all(...params) as { path: string; title: string; modified_at: string; size: number }[];
 
@@ -1617,6 +1625,42 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
   return parsed;
 }
 
+function parseRelativeTime(value: string): number | null {
+  const match = value.trim().match(/^(\d+)([hdw])$/i);
+  if (!match) return null;
+  const amount = parseInt(match[1] || "0", 10);
+  const unit = (match[2] || "").toLowerCase();
+  if (amount < 1) return null;
+
+  const unitMs = unit === "h"
+    ? 60 * 60 * 1000
+    : unit === "d"
+      ? 24 * 60 * 60 * 1000
+      : unit === "w"
+        ? 7 * 24 * 60 * 60 * 1000
+        : 0;
+  return unitMs > 0 ? amount * unitMs : null;
+}
+
+function parseTimeFilterOption(flag: string, value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const raw = String(value).trim();
+  if (!raw) {
+    throw new Error(`${flag} requires a value`);
+  }
+
+  const relativeMs = parseRelativeTime(raw);
+  if (relativeMs !== null) {
+    return new Date(Date.now() - relativeMs).toISOString();
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${flag} must be a relative duration (48h, 7d, 2w) or a valid date/timestamp`);
+  }
+  return date.toISOString();
+}
+
 async function vectorIndex(
   model: string = DEFAULT_EMBED_MODEL,
   force: boolean = false,
@@ -1746,6 +1790,8 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  modifiedAfter?: string;
+  createdAfter?: string;
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2097,7 +2143,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchFTS(db, query, fetchLimit, singleCollection, opts),
     collectionNames
   );
 
@@ -2153,6 +2199,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
+      modifiedAfter: opts.modifiedAfter,
+      createdAfter: opts.createdAfter,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2231,6 +2279,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        modifiedAfter: opts.modifiedAfter,
+        createdAfter: opts.createdAfter,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2258,6 +2308,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        modifiedAfter: opts.modifiedAfter,
+        createdAfter: opts.createdAfter,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2372,6 +2424,8 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       intent: { type: "string" },
+      "modified-since": { type: "string" },
+      "created-since": { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2413,6 +2467,8 @@ function parseCLI() {
     skipRerank: !!values["no-rerank"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
+    modifiedAfter: parseTimeFilterOption("--modified-since", values["modified-since"]),
+    createdAfter: parseTimeFilterOption("--created-since", values["created-since"]),
   };
 
   return {
@@ -2632,6 +2688,8 @@ function showHelp(): void {
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
+  console.log("  --modified-since <t>       - Only include docs modified since 48h/7d/2w/date");
+  console.log("  --created-since <t>        - Only include docs created since 48h/7d/2w/date");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
@@ -2667,7 +2725,13 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
-  const cli = parseCLI();
+  let cli;
+  try {
+    cli = parseCLI();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 
   if (cli.values.version) {
     await showVersion();
@@ -2800,7 +2864,7 @@ if (isMain) {
     }
 
     case "ls": {
-      listFiles(cli.args[0]);
+      listFiles(cli.args[0], cli.opts);
       break;
     }
 

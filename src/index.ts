@@ -58,6 +58,7 @@ import {
   type IndexStatus,
   type IndexHealthInfo,
   type SearchHooks,
+  type SearchTimeFilters,
   type ReindexProgress,
   type ReindexResult,
   type EmbedProgress,
@@ -142,7 +143,7 @@ export type UpdateResult = {
 /**
  * Options for the unified search() method.
  */
-export interface SearchOptions {
+export interface SearchOptions extends SearchTimeFilters {
   /** Simple query string — will be auto-expanded via LLM */
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
@@ -166,7 +167,7 @@ export interface SearchOptions {
 /**
  * Options for searchLex() — BM25 keyword search.
  */
-export interface LexSearchOptions {
+export interface LexSearchOptions extends SearchTimeFilters {
   limit?: number;
   collection?: string;
 }
@@ -174,7 +175,7 @@ export interface LexSearchOptions {
 /**
  * Options for searchVector() — vector similarity search.
  */
-export interface VectorSearchOptions {
+export interface VectorSearchOptions extends SearchTimeFilters {
   limit?: number;
   collection?: string;
 }
@@ -390,6 +391,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           minScore: opts.minScore,
           explain: opts.explain,
           intent: opts.intent,
+          modifiedAfter: opts.modifiedAfter,
+          createdAfter: opts.createdAfter,
           skipRerank,
         });
       }
@@ -401,11 +404,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         minScore: opts.minScore,
         explain: opts.explain,
         intent: opts.intent,
+        modifiedAfter: opts.modifiedAfter,
+        createdAfter: opts.createdAfter,
         skipRerank,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts),
+    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, opts),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

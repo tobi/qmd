@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { openDatabase } from "../src/db.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -25,6 +26,7 @@ let testCounter = 0; // Unique counter for each test run
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
+const qmdSkillDir = join(projectRoot, "skills", "qmd");
 // Resolve tsx binary from project's node_modules (not cwd-dependent)
 const tsxBin = (() => {
   const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
@@ -90,6 +92,35 @@ async function createIsolatedTestEnv(prefix: string): Promise<{ dbPath: string; 
   await mkdir(configDir, { recursive: true });
   await writeFile(join(configDir, "index.yml"), "collections: {}\n");
   return { dbPath, configDir };
+}
+
+function readPackagedSkillFile(relativePath: string): string {
+  return readFileSync(join(qmdSkillDir, relativePath), "utf-8");
+}
+
+function expectInstalledSkillMatchesSource(skillDir: string): void {
+  expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toBe(readPackagedSkillFile("SKILL.md"));
+  expect(readFileSync(join(skillDir, "references", "mcp-setup.md"), "utf-8")).toBe(
+    readPackagedSkillFile("references/mcp-setup.md")
+  );
+}
+
+function setDocumentTimestamps(
+  dbPath: string,
+  path: string,
+  timestamps: { modifiedAt?: string; createdAt?: string }
+): void {
+  const db = openDatabase(dbPath);
+  try {
+    if (timestamps.modifiedAt) {
+      db.prepare(`UPDATE documents SET modified_at = ? WHERE path = ?`).run(timestamps.modifiedAt, path);
+    }
+    if (timestamps.createdAt) {
+      db.prepare(`UPDATE documents SET created_at = ? WHERE path = ?`).run(timestamps.createdAt, path);
+    }
+  } finally {
+    db.close();
+  }
 }
 
 // Setup test fixtures
@@ -259,9 +290,10 @@ describe("CLI Skill Commands", () => {
   test("shows embedded skill with --skill alias", async () => {
     const { stdout, exitCode } = await runQmd(["--skill"]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("QMD Skill (embedded)");
-    expect(stdout).toContain("name: qmd");
-    expect(stdout).toContain("allowed-tools: Bash(qmd:*), mcp__qmd__*");
+    expect(stdout).toMatch(/^QMD Skill \(embedded\)\n\n/);
+    expect(stdout.replace(/^QMD Skill \(embedded\)\n\n/, "").trimEnd()).toBe(
+      readPackagedSkillFile("SKILL.md").trimEnd()
+    );
   });
 
   test("shows skill help with -h", async () => {
@@ -280,8 +312,7 @@ describe("CLI Skill Commands", () => {
     expect(exitCode).toBe(0);
 
     const skillDir = join(projectDir, ".agents", "skills", "qmd");
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
-    expect(readFileSync(join(skillDir, "references", "mcp-setup.md"), "utf-8")).toContain("Claude Code");
+    expectInstalledSkillMatchesSource(skillDir);
     expect(existsSync(join(projectDir, ".claude", "skills", "qmd"))).toBe(false);
     expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
     expect(stdout).toContain("Tip: create a Claude symlink manually");
@@ -299,9 +330,9 @@ describe("CLI Skill Commands", () => {
     const skillDir = join(fakeHome, ".agents", "skills", "qmd");
     const claudeLink = join(fakeHome, ".claude", "skills", "qmd");
 
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expectInstalledSkillMatchesSource(skillDir);
     expect(lstatSync(claudeLink).isSymbolicLink()).toBe(true);
-    expect(readFileSync(join(claudeLink, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expectInstalledSkillMatchesSource(claudeLink);
     expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
     expect(stdout).toContain(`✓ Linked Claude skill at ${claudeLink}`);
   });
@@ -319,7 +350,7 @@ describe("CLI Skill Commands", () => {
 
     const skillDir = join(fakeHome, ".agents", "skills", "qmd");
     expect(lstatSync(skillDir).isSymbolicLink()).toBe(false);
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expectInstalledSkillMatchesSource(skillDir);
     expect(stdout).toContain(`✓ Claude already sees the skill via ${join(fakeHome, ".claude", "skills")}`);
   });
 
@@ -860,6 +891,79 @@ describe("CLI ls Command", () => {
     const { stderr, exitCode } = await runQmd(["ls", "nonexistent"], { dbPath: localDbPath });
     expect(exitCode).toBe(1);
     expect(stderr).toContain("Collection not found");
+  });
+});
+
+describe("CLI time filters", () => {
+  let localDbPath: string;
+
+  beforeEach(async () => {
+    localDbPath = getFreshDbPath();
+    await runQmd(["collection", "add", "."], { dbPath: localDbPath });
+
+    const recent = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const stale = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+
+    setDocumentTimestamps(localDbPath, "notes/meeting.md", {
+      modifiedAt: recent,
+      createdAt: recent,
+    });
+    setDocumentTimestamps(localDbPath, "docs/api.md", {
+      modifiedAt: stale,
+      createdAt: stale,
+    });
+  });
+
+  test("filters BM25 search by modified time", async () => {
+    const { stdout, exitCode } = await runQmd([
+      "search",
+      "--modified-since",
+      "7d",
+      "meeting",
+    ], { dbPath: localDbPath });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
+    expect(stdout).not.toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("filters ls by created time", async () => {
+    const { stdout, exitCode } = await runQmd([
+      "ls",
+      "fixtures",
+      "--created-since",
+      "7d",
+    ], { dbPath: localDbPath });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
+    expect(stdout).not.toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("filters structured query search by modified time", async () => {
+    const { stdout, exitCode } = await runQmd([
+      "query",
+      "--modified-since",
+      "7d",
+      "--no-rerank",
+      "lex: meeting",
+    ], { dbPath: localDbPath });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
+    expect(stdout).not.toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("rejects invalid time filter values", async () => {
+    const { stderr, exitCode } = await runQmd([
+      "search",
+      "--modified-since",
+      "not-a-date",
+      "meeting",
+    ], { dbPath: localDbPath });
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--modified-since must be a relative duration");
   });
 });
 
