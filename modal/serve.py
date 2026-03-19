@@ -74,7 +74,6 @@ image = (
         # Image built by .github/workflows/build-llama-server.yml
         "ghcr.io/ofekby/qmd-llama-server:b8179-sm75",
         add_python="3.11",
-        force_build=True,  # TODO: remove after first successful deploy with this image
     )
     .pip_install("huggingface-hub", "requests")
     .run_function(download_models)
