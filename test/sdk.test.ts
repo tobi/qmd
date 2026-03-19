@@ -61,6 +61,20 @@ function freshDbPath(): string {
   return join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
 }
 
+function setStoreDocumentTimestamps(
+  store: QMDStore,
+  path: string,
+  timestamps: { modifiedAt?: string; createdAt?: string }
+): void {
+  const db = store.internal.db;
+  if (timestamps.modifiedAt) {
+    db.prepare(`UPDATE documents SET modified_at = ? WHERE path = ?`).run(timestamps.modifiedAt, path);
+  }
+  if (timestamps.createdAt) {
+    db.prepare(`UPDATE documents SET created_at = ? WHERE path = ?`).run(timestamps.createdAt, path);
+  }
+}
+
 // =============================================================================
 // Constructor Tests
 // =============================================================================
@@ -922,6 +936,175 @@ describe("update", () => {
     expect(results.length).toBeGreaterThan(0);
 
     await store.close();
+  });
+
+  test("searchLex filters by modifiedAfter", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    setStoreDocumentTimestamps(store, "auth.md", { modifiedAt: "2026-03-15T12:00:00.000Z" });
+    setStoreDocumentTimestamps(store, "api.md", { modifiedAt: "2026-02-01T12:00:00.000Z" });
+
+    const results = await store.searchLex("authentication", {
+      modifiedAfter: "2026-03-10T00:00:00Z",
+    });
+
+    expect(results.map(r => r.displayPath)).toEqual(["docs/auth.md"]);
+
+    await store.close();
+  });
+
+  test("unified search filters by createdAfter", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          notes: { path: notesDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    setStoreDocumentTimestamps(store, "meeting-2025-02.md", { createdAt: "2026-03-15T12:00:00.000Z" });
+    setStoreDocumentTimestamps(store, "meeting-2025-01.md", { createdAt: "2026-02-01T12:00:00.000Z" });
+
+    const results = await store.search({
+      queries: [{ type: "lex", query: "February" }],
+      rerank: false,
+      createdAfter: "2026-03-10T00:00:00Z",
+    });
+
+    expect(results.map(r => r.displayPath)).toEqual(["notes/meeting-2025-02.md"]);
+
+    await store.close();
+  });
+
+  test("searchLex uses inclusive modifiedAfter boundary", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    setStoreDocumentTimestamps(store, "auth.md", { modifiedAt: "2026-03-10T00:00:00.000Z" });
+
+    const results = await store.searchLex("authentication", {
+      modifiedAfter: "2026-03-10T00:00:00.000Z",
+    });
+
+    expect(results.map(r => r.displayPath)).toContain("docs/auth.md");
+
+    await store.close();
+  });
+
+  test("searchLex applies modifiedAfter and createdAfter together", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          notes: { path: notesDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    setStoreDocumentTimestamps(store, "meeting-2025-02.md", {
+      modifiedAt: "2026-03-15T12:00:00.000Z",
+      createdAt: "2026-03-15T12:00:00.000Z",
+    });
+    setStoreDocumentTimestamps(store, "meeting-2025-01.md", {
+      modifiedAt: "2026-03-15T12:00:00.000Z",
+      createdAt: "2026-02-01T12:00:00.000Z",
+    });
+
+    const results = await store.searchLex("meeting", {
+      modifiedAfter: "2026-03-10T00:00:00Z",
+      createdAfter: "2026-03-10T00:00:00Z",
+    });
+
+    expect(results.map(r => r.displayPath)).toEqual(["notes/meeting-2025-02.md"]);
+
+    await store.close();
+  });
+
+  test("searchLex rejects invalid timestamp filters", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    await expect(store.searchLex("authentication", {
+      modifiedAfter: "not-a-date",
+    })).rejects.toThrow("Invalid modifiedAfter timestamp");
+
+    await store.close();
+  });
+
+  test("searchVector filters by modifiedAfter", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const fakeLlm = {
+      async embed(_text: string) {
+        return { embedding: new Array(768).fill(0.5), model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        return texts.map(() => ({
+          embedding: new Array(768).fill(0.5),
+          model: "fake-embed",
+        }));
+      },
+    };
+
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+      async embed(_text: string) {
+        return { embedding: new Array(768).fill(0.5), model: "fake-embed" };
+      },
+    } as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      await store.embed();
+      setStoreDocumentTimestamps(store, "auth.md", { modifiedAt: "2026-03-15T12:00:00.000Z" });
+      setStoreDocumentTimestamps(store, "api.md", { modifiedAt: "2026-02-01T12:00:00.000Z" });
+
+      const results = await store.searchVector("authentication", {
+        modifiedAfter: "2026-03-10T00:00:00Z",
+      });
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(results.map(r => r.displayPath)).toContain("docs/auth.md");
+      expect(results.map(r => r.displayPath)).not.toContain("docs/api.md");
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
   });
 });
 

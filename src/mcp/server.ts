@@ -296,9 +296,15 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
+        modifiedAfter: z.string().optional().describe(
+          "Only include documents modified on or after this ISO timestamp/date. Example: 2026-03-09T00:00:00Z"
+        ),
+        createdAfter: z.string().optional().describe(
+          "Only include documents created on or after this ISO timestamp/date. Example: 2026-03-09T00:00:00Z"
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent, modifiedAfter, createdAfter }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -314,6 +320,8 @@ Intent-aware lex (C++ performance, not sports):
         limit,
         minScore,
         intent,
+        modifiedAfter,
+        createdAfter,
       });
 
       // Use first lex or vec query for snippet extraction

@@ -209,6 +209,7 @@ const results2 = await store.search({
   limit: 5,
   minScore: 0.3,
   explain: true,
+  modifiedAfter: "2026-03-01T00:00:00Z",
 })
 
 // Pre-expanded queries — skip auto-expansion, control each sub-query
@@ -554,6 +555,9 @@ qmd collection rename myproject my-project
 # List files in a collection
 qmd ls notes
 qmd ls notes/subfolder
+
+# Show only files modified recently
+qmd ls notes --modified-since 7d
 ```
 
 ### Generate Vector Embeddings
@@ -610,6 +614,10 @@ qmd vsearch "how to login"
 
 # Hybrid search with re-ranking (best quality)
 qmd query "user authentication"
+
+# Limit to recently changed files
+qmd query --modified-since 7d "user authentication"
+qmd search --created-since 30d "meeting notes"
 ```
 
 ### Options
@@ -623,7 +631,12 @@ qmd query "user authentication"
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)
+--modified-since   # Only include docs modified since 48h/7d/2w/date
+--created-since    # Only include docs created since 48h/7d/2w/date
 --index <name>     # Use named index
+
+# Time filters use indexed filesystem timestamps, so run `qmd update`
+# first if you need the latest created/modified data.
 
 # Output formats (for search and multi-get)
 --files            # Output: docid,score,filepath,context
@@ -687,6 +700,9 @@ qmd query --json "quarterly reports"
 
 # Inspect how each result was scored (RRF + rerank blend)
 qmd query --json --explain "quarterly reports"
+
+# Search only recently modified documents
+qmd query --modified-since 14d "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"

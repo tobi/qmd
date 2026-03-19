@@ -191,6 +191,15 @@ function seedTestData(db: Database): void {
   }
 }
 
+function setDocumentTimestamps(db: Database, path: string, timestamps: { modifiedAt?: string; createdAt?: string }): void {
+  if (timestamps.modifiedAt) {
+    db.prepare(`UPDATE documents SET modified_at = ? WHERE path = ?`).run(timestamps.modifiedAt, path);
+  }
+  if (timestamps.createdAt) {
+    db.prepare(`UPDATE documents SET created_at = ? WHERE path = ?`).run(timestamps.createdAt, path);
+  }
+}
+
 // =============================================================================
 // MCP Server Test Helpers
 // =============================================================================
@@ -912,6 +921,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);
+    setDocumentTimestamps(db, "readme.md", { modifiedAt: "2026-03-15T12:00:00.000Z" });
+    setDocumentTimestamps(db, "api.md", { modifiedAt: "2026-02-01T12:00:00.000Z" });
 
     // Sync config into SQLite
     const httpTestConfig: CollectionConfig = {
@@ -1057,6 +1068,30 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     // Should have content array with text results
     expect(json.result.content.length).toBeGreaterThan(0);
     expect(json.result.content[0].type).toBe("text");
+  });
+
+  test("POST /mcp tools/call query applies modifiedAfter filter", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "query",
+        arguments: {
+          searches: [{ type: "lex", query: "readme" }],
+          modifiedAfter: "2100-01-01T00:00:00Z",
+        },
+      },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.structuredContent.results).toEqual([]);
+    expect(json.result.content[0].text).toContain("No results found");
   });
 
   test("POST /mcp tools/call get returns document", async () => {

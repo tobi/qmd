@@ -1021,8 +1021,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string, filters?: SearchTimeFilters) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], filters?: SearchTimeFilters) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1497,8 +1497,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string, filters?: SearchTimeFilters) => searchFTS(db, query, limit, collectionName, filters),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], filters?: SearchTimeFilters) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, filters),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
@@ -2760,7 +2760,7 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, filters?: SearchTimeFilters): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -2771,24 +2771,35 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
+      d.modified_at,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
+  const params: unknown[] = [ftsQuery];
 
   if (collectionName) {
     sql += ` AND d.collection = ?`;
     params.push(String(collectionName));
   }
 
+  sql = appendSearchTimeFilters(sql, params, filters);
+
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as {
+    filepath: string;
+    display_path: string;
+    title: string;
+    body: string;
+    hash: string;
+    modified_at: string;
+    bm25_score: number;
+  }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -2803,7 +2814,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       hash: row.hash,
       docid: getDocid(row.hash),
       collectionName,
-      modifiedAt: "",  // Not available in FTS query
+      modifiedAt: row.modified_at,
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
@@ -2817,7 +2828,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], filters?: SearchTimeFilters): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2852,22 +2863,25 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
+      d.modified_at,
       content.doc as body
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: unknown[] = [...hashSeqs];
 
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
     params.push(collectionName);
   }
 
+  docSql = appendSearchTimeFilters(docSql, params, filters);
+
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; modified_at: string; body: string;
   }[];
 
   // Combine with distances and dedupe by filepath
@@ -2892,7 +2906,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         hash: row.hash,
         docid: getDocid(row.hash),
         collectionName,
-        modifiedAt: "",  // Not available in vec query
+        modifiedAt: row.modified_at,
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
@@ -3666,7 +3680,50 @@ export interface SearchHooks {
   onRerankDone?: (elapsedMs: number) => void;
 }
 
-export interface HybridQueryOptions {
+export interface SearchTimeFilters {
+  modifiedAfter?: string;
+  createdAfter?: string;
+}
+
+function normalizeTimestampFilter(name: string, value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid ${name} timestamp: ${value}`);
+  }
+  return date.toISOString();
+}
+
+function normalizeSearchTimeFilters(filters?: SearchTimeFilters): SearchTimeFilters | undefined {
+  if (!filters) return undefined;
+  const normalized = {
+    modifiedAfter: normalizeTimestampFilter("modifiedAfter", filters.modifiedAfter),
+    createdAfter: normalizeTimestampFilter("createdAfter", filters.createdAfter),
+  };
+  return normalized.modifiedAfter || normalized.createdAfter ? normalized : undefined;
+}
+
+function appendSearchTimeFilters(
+  sql: string,
+  params: unknown[],
+  filters?: SearchTimeFilters,
+  alias: string = "d"
+): string {
+  const normalized = normalizeSearchTimeFilters(filters);
+  if (!normalized) return sql;
+
+  if (normalized.modifiedAfter) {
+    sql += ` AND ${alias}.modified_at >= ?`;
+    params.push(normalized.modifiedAfter);
+  }
+  if (normalized.createdAfter) {
+    sql += ` AND ${alias}.created_at >= ?`;
+    params.push(normalized.createdAfter);
+  }
+  return sql;
+}
+
+export interface HybridQueryOptions extends SearchTimeFilters {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0
@@ -3722,6 +3779,7 @@ export async function hybridQuery(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+  const filters = normalizeSearchTimeFilters(options);
 
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
@@ -3735,7 +3793,7 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const initialFts = store.searchFTS(query, 20, collection, filters);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -3772,7 +3830,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection, filters);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -3810,7 +3868,7 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
-        undefined, embedding
+        undefined, embedding, filters
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -3989,7 +4047,7 @@ export async function hybridQuery(
     .slice(0, limit);
 }
 
-export interface VectorSearchOptions {
+export interface VectorSearchOptions extends SearchTimeFilters {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
@@ -4025,6 +4083,7 @@ export async function vectorSearchQuery(
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
   const intent = options?.intent;
+  const filters = normalizeSearchTimeFilters(options);
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -4041,7 +4100,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection, undefined, undefined, filters);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4072,7 +4131,7 @@ export async function vectorSearchQuery(
  * A single sub-search in a structured search request.
  * Matches the format used in QMD training data.
  */
-export interface StructuredSearchOptions {
+export interface StructuredSearchOptions extends SearchTimeFilters {
   collections?: string[];   // Filter to specific collections (OR match)
   limit?: number;           // default 10
   minScore?: number;        // default 0
@@ -4115,6 +4174,7 @@ export async function structuredSearch(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+  const filters = normalizeSearchTimeFilters(options);
 
   const collections = options?.collections;
 
@@ -4153,7 +4213,7 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, filters);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
@@ -4191,7 +4251,7 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
-            undefined, embedding
+            undefined, embedding, filters
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
