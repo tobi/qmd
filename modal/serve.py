@@ -85,12 +85,12 @@ gpu_config: str = os.environ.get("QMD_MODAL_GPU", "T4")
 idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
 
 
-@modal.concurrent(max_inputs=4)
 @app.cls(
     gpu=gpu_config,
     scaledown_window=idle_timeout,
     enable_memory_snapshot=True,
 )
+@modal.concurrent(max_inputs=4)
 class QMDInference:
     """Raw inference service for QMD's three GGUF models."""
 
