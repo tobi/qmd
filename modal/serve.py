@@ -69,20 +69,11 @@ def download_models() -> None:
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
-    )
-    .apt_install("libgomp1", "libcurl4", "build-essential", "cmake", "git")
-    .run_commands(
-        # Build llama-server from llama.cpp b8179 (same version as
-        # node-llama-cpp v3.17.1) with CUDA support.  No pre-built Linux
-        # CUDA binary is published for this release.
-        "git clone --depth 1 --branch b8179"
-        " https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp"
-        " && cd /tmp/llama.cpp"
-        " && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release"
-        " && cmake --build build --target llama-server -j$(nproc)"
-        f" && cp build/bin/llama-server {LLAMA_SERVER_BIN}"
-        " && rm -rf /tmp/llama.cpp"
+        # Pre-built llama-server with CUDA 12.4 support.
+        # Built from llama.cpp b8179 (same as node-llama-cpp v3.17.1).
+        # Image built by .github/workflows/build-llama-server.yml
+        "ghcr.io/ofekby/qmd-llama-server:b8179",
+        add_python="3.11",
     )
     .pip_install("huggingface-hub", "requests")
     .run_function(download_models)

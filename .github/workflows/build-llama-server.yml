@@ -1,0 +1,53 @@
+name: Build llama-server CUDA image
+
+on:
+  push:
+    branches: [feat/modal-inference]
+    paths:
+      - 'modal/Dockerfile.llama-server'
+      - '.github/workflows/build-llama-server.yml'
+  workflow_dispatch:
+    inputs:
+      llama_cpp_tag:
+        description: 'llama.cpp tag to build (e.g. b8179)'
+        required: false
+        default: 'b8179'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/qmd-llama-server
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./modal
+          file: ./modal/Dockerfile.llama-server
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.llama_cpp_tag || 'b8179' }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            LLAMA_CPP_TAG=${{ inputs.llama_cpp_tag || 'b8179' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,23 @@
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG LLAMA_CPP_TAG=b8179
+RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+    https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp \
+    && cd /tmp/llama.cpp \
+    && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target llama-server -j$(nproc) \
+    && cp build/bin/llama-server /usr/local/bin/llama-server
+
+FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/llama-server /usr/local/bin/llama-server
+
+ENTRYPOINT ["llama-server"]
