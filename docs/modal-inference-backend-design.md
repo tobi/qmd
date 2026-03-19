@@ -1,0 +1,319 @@
+# Modal Inference Backend for QMD
+
+## Summary
+
+Add optional remote GPU inference via Modal.com, allowing users without a local GPU to run QMD's three GGUF models (embedding, reranking, query expansion) on a cheap cloud GPU. The Modal function is a dumb model server exposing raw inference primitives — all prompt formatting and search logic stays in QMD's JS codebase.
+
+## Architecture Overview
+
+```
+User machine (JS/TS)                          Modal (Python)
+┌─────────────────────────┐                   ┌──────────────────────────┐
+│  src/llm.ts             │                   │  modal/serve.py          │
+│  ┌───────────────────┐  │                   │  ┌────────────────────┐  │
+│  │ Prompt formatting  │  │                   │  │ QMDInference class │  │
+│  │ Grammar logic      │  │   JS SDK (gRPC)   │  │                    │  │
+│  │ Result parsing     │──┼──────────────────►│  │ embed()   - raw    │  │
+│  │                    │  │                   │  │ generate() - raw   │  │
+│  │ ModalBackend       │  │                   │  │ score()   - raw    │  │
+│  └───────────────────┘  │                   │  └────────────────────┘  │
+│                         │                   │                          │
+│  src/store.ts           │                   │  T4 GPU (default)        │
+│  (unchanged logic)      │                   │  3 GGUF models in image  │
+└─────────────────────────┘                   └──────────────────────────┘
+```
+
+## Python Modal Service (`modal/serve.py`)
+
+A single Python file shipped in the QMD repo. Defines and deploys the Modal function.
+
+### Image Build
+
+- Base image with `llama-cpp-python` installed with CUDA support
+- Downloads all 3 GGUF models from HuggingFace at image build time:
+  - `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf` (~300MB)
+  - `hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf` (~640MB)
+  - `hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf` (~1.1GB)
+- Models baked into image — no runtime downloads
+
+### Class Definition
+
+```python
+import modal
+
+app = modal.App("qmd-inference")
+
+# gpu and scaledown_window are passed as CLI args during deploy
+@app.cls(
+    gpu=gpu_config,                     # Configurable, default "T4"
+    scaledown_window=idle_timeout,      # Configurable, default 15 seconds
+    allow_concurrent_inputs=10,         # Handle burst queries on single container
+    enable_memory_snapshot=True,        # Snapshot model state after loading
+)
+class QMDInference:
+    @modal.enter(snap=True)
+    def load_models(self):
+        """Load all 3 models + warmup. Captured in memory snapshot."""
+        from llama_cpp import Llama
+
+        self.embed_model = Llama(
+            model_path="/models/embeddinggemma-300M-Q8_0.gguf",
+            embedding=True,
+            n_ctx=2048,
+        )
+        self.rerank_model = Llama(
+            model_path="/models/qwen3-reranker-0.6b-q8_0.gguf",
+            n_ctx=2048,
+        )
+        self.expand_model = Llama(
+            model_path="/models/qmd-query-expansion-1.7B-q4_k_m.gguf",
+            n_ctx=2048,
+        )
+        # Warmup passes to pre-fill caches before snapshot
+        self.embed_model.embed("warmup")
+        self.expand_model("warmup", max_tokens=1)
+
+    @modal.method()
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Raw embedding — no prompt formatting."""
+        return [self.embed_model.embed(text) for text in texts]
+
+    @modal.method()
+    def generate(self, prompt: str, grammar: str | None, max_tokens: int) -> str:
+        """Raw completion with optional GBNF grammar constraint."""
+        kwargs = {"prompt": prompt, "max_tokens": max_tokens}
+        if grammar:
+            from llama_cpp import LlamaGrammar
+            kwargs["grammar"] = LlamaGrammar.from_string(grammar)
+        result = self.expand_model(**kwargs)
+        return result["choices"][0]["text"]
+
+    @modal.method()
+    def score(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Raw cross-encoder scoring of (query, document) pairs."""
+        scores = []
+        for query, document in pairs:
+            # Use rerank model to score relevance
+            result = self.rerank_model.create_completion(
+                prompt=f"{query}\n{document}",
+                max_tokens=1,
+                logprobs=True,
+            )
+            scores.append(result["choices"][0]["logprobs"]["token_logprobs"][0])
+        return scores
+
+    @modal.method()
+    def ping(self) -> bool:
+        """Health check — verifies function is reachable and models loaded."""
+        return True
+```
+
+### Container Behavior
+
+- `scaledown_window=15` — container shuts down 15s after last request (cost-efficient for burst patterns)
+- `allow_concurrent_inputs=10` — single container handles bursts without triggering scale-up
+- `enable_memory_snapshot=True` + `@modal.enter(snap=True)` — after first deploy, subsequent cold starts restore from memory snapshot instead of re-loading ~2GB of models
+- No `min_containers` / `keep_warm` — scales to zero when idle
+- Single container by design (no max_containers param exists, but concurrency + low traffic pattern means no scale-up)
+
+### Deploy CLI
+
+`modal/serve.py` also acts as a CLI entry point:
+
+```sh
+python modal/serve.py deploy --gpu T4 --scaledown-window 15
+python modal/serve.py status
+python modal/serve.py destroy
+```
+
+## QMD Config
+
+### New Config Keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `modal.inference` | boolean | `false` | Enable Modal-based inference |
+| `modal.gpu` | string | `"T4"` | GPU type for the Modal container |
+| `modal.scaledown_window` | number | `15` | Seconds before idle container shuts down |
+
+### Auth
+
+Reads from `~/.modal.toml` (Modal's native auth file, created by user running `modal token set`). QMD does not store Modal credentials — it relies on Modal's own config.
+
+## CLI Commands
+
+### `qmd modal deploy`
+
+1. Check `python3` is available on PATH
+   - If missing: `Error: python3 not found. Install Python 3.10+ to deploy Modal functions. See https://python.org`
+2. Check `modal` Python package is installed (`python3 -c "import modal"`)
+   - If missing: `Error: Modal Python package not found. Run: pip install modal`
+3. Check `~/.modal.toml` exists
+   - If missing: `Error: Modal not authenticated. Run: modal token set`
+4. Read `modal.gpu` and `modal.scaledown_window` from QMD config
+5. Shell out to `python3 modal/serve.py deploy --gpu <gpu> --scaledown-window <timeout>`
+6. On success: auto-set `modal.inference = true` in QMD config
+7. Print confirmation with deployed function name
+
+### `qmd modal status`
+
+Check if the Modal function is deployed and reachable. Calls `ping()` method.
+
+### `qmd modal destroy`
+
+Tears down the deployed Modal function. Sets `modal.inference = false`.
+
+## JS Runtime Integration (`src/modal.ts`)
+
+### ModalBackend Class
+
+```typescript
+class ModalBackend {
+  private client: modal.Client
+  private fn: modal.Function  // Reference to deployed QMDInference
+
+  /**
+   * Raw embedding — caller is responsible for prompt formatting.
+   */
+  async embed(texts: string[]): Promise<number[][]>
+
+  /**
+   * Raw text generation with optional GBNF grammar.
+   * Caller passes the fully formatted prompt and grammar string.
+   */
+  async generate(prompt: string, grammar: string | null, maxTokens: number): Promise<string>
+
+  /**
+   * Raw cross-encoder scoring.
+   * Caller passes pre-formatted (query, document) pairs.
+   */
+  async score(pairs: [string, string][]): Promise<number[]>
+
+  /**
+   * Health check.
+   */
+  async ping(): Promise<boolean>
+}
+```
+
+### Initialization
+
+- Created lazily on first inference call
+- Reads `~/.modal.toml` for auth (via `modal` npm package)
+- Resolves the deployed `qmd-inference` function reference
+- If function not found or auth missing: immediate hard fail with clear error message
+
+### Retry Logic (Connection Errors Only)
+
+```
+attempt 1 → connection error → immediate retry
+          → connection error → wait 100ms → retry
+          → connection error → throw with full stacktrace and reason
+
+Non-connection errors (auth, not found, etc.) → immediate throw, no retry
+```
+
+### Integration in `src/llm.ts`
+
+The existing inference call sites in `llm.ts` get a conditional swap:
+
+```typescript
+// At each inference call site (embed, generate, rerank)
+if (config.get("modal.inference")) {
+  return modalBackend.embed(texts)
+} else {
+  return localLlama.embed(texts)
+}
+```
+
+`src/store.ts` functions (`generateEmbeddings`, `searchVec`, `expandQuery`, `rerank`) remain unchanged — they call `llm.ts` which handles the backend swap transparently.
+
+### Startup Validation
+
+When `modal.inference = true`:
+- On MCP server startup: call `ping()` to verify Modal function is reachable
+- On CLI command: same `ping()` check before executing
+- Failure: hard fail with full error, no fallback to local
+
+## Error Messages
+
+### Deploy-Time Errors
+
+```
+Error: python3 not found on PATH.
+Modal deployment requires Python 3.10+.
+Install it from https://python.org or via your package manager.
+
+Error: Python 'modal' package not found.
+Install it with: pip install modal
+Then authenticate with: modal token set
+
+Error: Modal not authenticated. No ~/.modal.toml found.
+Run: modal token set
+to authenticate with your Modal account.
+
+Error: Modal deployment failed.
+<full stderr from python process>
+```
+
+### Runtime Errors
+
+```
+Error: Modal inference is enabled but the deployed function is not reachable.
+Run 'qmd modal status' to check deployment, or 'qmd modal deploy' to redeploy.
+<full error details / stacktrace>
+
+Error: Modal inference is enabled but ~/.modal.toml is missing or invalid.
+Run: modal token set
+```
+
+## File Layout
+
+### New Files
+
+```
+modal/
+  serve.py            # Modal app definition + deploy CLI
+  requirements.txt    # llama-cpp-python, modal (for reference — installed in Modal image)
+src/
+  modal.ts            # ModalBackend class (JS SDK client)
+```
+
+### Modified Files
+
+```
+src/llm.ts            # Conditional: local vs modal backend at inference call sites
+src/cli/qmd.ts        # New 'qmd modal deploy|status|destroy' subcommands
+src/config.ts         # New config keys: modal.inference, modal.gpu, modal.scaledown_window
+package.json          # Add 'modal' npm dependency
+```
+
+## Dependencies
+
+### Deploy-Time (user's machine)
+
+- `python3` (3.10+)
+- `modal` pip package (for `modal deploy` CLI)
+
+### Runtime (user's machine)
+
+- `modal` npm package (v0.6+) — JS SDK for calling deployed function
+
+### Modal Image (cloud)
+
+- `llama-cpp-python` with CUDA support
+- 3 GGUF model files (baked into image)
+
+## Design Decisions
+
+1. **Dumb model server** — Modal function exposes raw `embed()`, `generate()`, `score()`. All prompt formatting, grammar construction, and result parsing stays in JS. Zero duplication, zero drift risk.
+
+2. **Memory snapshots** — `enable_memory_snapshot=True` with `@modal.enter(snap=True)` captures loaded models in memory. Subsequent cold starts restore from snapshot instead of re-loading ~2GB of model weights.
+
+3. **Single container** — `allow_concurrent_inputs=10` handles burst patterns on one container. 15s idle timeout scales to zero quickly. No `keep_warm` to minimize cost.
+
+4. **JS SDK for runtime** — The `modal` npm package calls deployed functions directly via gRPC. No HTTP endpoints, no URL management. Auth handled by Modal tokens.
+
+5. **Python only for deploy** — Users need Python + `modal` pip package only for the one-time `qmd modal deploy`. Runtime is pure JS.
+
+6. **No fallback** — When `modal.inference = true`, local models are never used. Clear failure modes prevent confusing mixed results. Connection errors get 2 retries (immediate + 100ms), then hard fail.
