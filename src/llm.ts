@@ -17,6 +17,8 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { getModalConfig } from "./collections.js";
+import { ModalBackend } from "./modal.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -1472,6 +1474,17 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
+  // When Modal is active, bypass LLMSessionManager entirely
+  if (getModalConfig().inference) {
+    const modalLLM = getOrCreateModalLLM();
+    const session = new ModalSession(modalLLM, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+
   const manager = getSessionManager();
   const session = new LLMSession(manager, options);
 
@@ -1542,5 +1555,345 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
   if (defaultLlamaCpp) {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
+  }
+}
+
+// =============================================================================
+// Modal LLM Implementation
+// =============================================================================
+
+/**
+ * Character-based approximation for max document length in reranking.
+ * Qwen3-Reranker context is 2048 tokens; ~4 chars/token is a safe estimate.
+ * Budget: contextSize(2048) - templateOverhead(200) - queryTokens(~100) = ~1748 tokens * 4 = ~7000 chars.
+ */
+const MODAL_RERANK_MAX_DOC_CHARS = 7000;
+
+/**
+ * GBNF grammar for query expansion output format.
+ * Identical to the grammar used by LlamaCpp.expandQuery.
+ */
+const EXPAND_GRAMMAR = `root ::= line+
+line ::= type ": " content "\\n"
+type ::= "lex" | "vec" | "hyde"
+content ::= [^\\n]+`;
+
+/**
+ * LLM implementation that delegates inference to a Modal backend.
+ *
+ * All prompt formatting (chat templates, embedding prefixes) happens locally.
+ * Only raw inference calls (embed, generate, rerank) go to Modal.
+ */
+export class ModalLLM implements LLM {
+  private backend: ModalBackend;
+
+  constructor(backend?: ModalBackend) {
+    this.backend = backend ?? new ModalBackend();
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const isQuery = options.isQuery ?? true;
+    const formattedText = isQuery
+      ? formatQueryForEmbedding(text)
+      : formatDocForEmbedding(text, options.title);
+
+    const vectors = await this.backend.embed([formattedText]);
+    if (!vectors || vectors.length === 0) return null;
+
+    return {
+      embedding: vectors[0]!,
+      model: "modal",
+    };
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    const maxTokens = options.maxTokens ?? 150;
+    const text = await this.backend.generate(prompt, null, maxTokens, "expand");
+    return {
+      text,
+      model: "modal",
+      done: true,
+    };
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean; intent?: string } = {},
+  ): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const intent = options.intent;
+
+    const userMessage = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
+
+    // Build the full Qwen3 chat template as a raw string.
+    // The Python side does raw completion only — no template application.
+    const fullPrompt =
+      `<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n` +
+      `<|im_start|>user\n${userMessage}<|im_end|>\n` +
+      `<|im_start|>assistant\n`;
+
+    // TODO: Generation params (temperature=0.7, top_k=20, top_p=0.8) should be
+    // configurable and passed to the Python side's generate(). For now, the
+    // Python model uses its defaults.
+    const result = await this.backend.generate(fullPrompt, EXPAND_GRAMMAR, 600, "expand");
+
+    return parseExpandResult(result, query, includeLexical);
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    _options: RerankOptions = {},
+  ): Promise<RerankResult> {
+    if (documents.length === 0) {
+      return { results: [], model: "modal" };
+    }
+
+    // Character-based truncation (no tokenizer available in Modal mode)
+    const truncatedDocs = documents.map((doc) => {
+      if (doc.text.length <= MODAL_RERANK_MAX_DOC_CHARS) return doc;
+      return { ...doc, text: doc.text.slice(0, MODAL_RERANK_MAX_DOC_CHARS) };
+    });
+
+    // Deduplicate identical texts before scoring
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
+    for (let i = 0; i < truncatedDocs.length; i++) {
+      const doc = truncatedDocs[i]!;
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index: i });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index: i }]);
+      }
+    }
+
+    const uniqueTexts = Array.from(textToDocs.keys());
+    const scores = await this.backend.rerank(query, uniqueTexts);
+
+    // Build ranked results sorted by score descending
+    const scored = uniqueTexts
+      .map((text, i) => ({ text, score: scores[i]! }))
+      .sort((a, b) => b.score - a.score);
+
+    const results: RerankDocumentResult[] = [];
+    for (const item of scored) {
+      const docInfos = textToDocs.get(item.text) ?? [];
+      for (const info of docInfos) {
+        results.push({
+          file: info.file,
+          score: item.score,
+          index: info.index,
+        });
+      }
+    }
+
+    return { results, model: "modal" };
+  }
+
+  async modelExists(_model: string): Promise<ModelInfo> {
+    return { name: "modal", exists: true };
+  }
+
+  async dispose(): Promise<void> {
+    this.backend.dispose();
+  }
+
+  /** Expose backend for ping/validation. */
+  getBackend(): ModalBackend {
+    return this.backend;
+  }
+}
+
+/**
+ * Parse the raw text output from query expansion into Queryable objects.
+ * Mirrors the parsing logic in LlamaCpp.expandQuery.
+ */
+function parseExpandResult(
+  raw: string,
+  query: string,
+  includeLexical: boolean,
+): Queryable[] {
+  const lines = raw.trim().split("\n");
+  const queryLower = query.toLowerCase();
+  const queryTerms = queryLower
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const hasQueryTerm = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    if (queryTerms.length === 0) return true;
+    return queryTerms.some((term) => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines
+    .map((line) => {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx === -1) return null;
+      const type = line.slice(0, colonIdx).trim();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+      const text = line.slice(colonIdx + 1).trim();
+      if (!hasQueryTerm(text)) return null;
+      return { type: type as QueryType, text };
+    })
+    .filter((q): q is Queryable => q !== null);
+
+  const filtered = includeLexical
+    ? queryables
+    : queryables.filter((q) => q.type !== "lex");
+
+  if (filtered.length > 0) return filtered;
+
+  // Fallback to basic queries
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${query}` },
+    { type: "lex", text: query },
+    { type: "vec", text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter((q) => q.type !== "lex");
+}
+
+// =============================================================================
+// Modal LLM Singleton
+// =============================================================================
+
+let defaultModalLLM: ModalLLM | null = null;
+
+/**
+ * Get or create the singleton ModalLLM instance.
+ */
+export function getOrCreateModalLLM(): ModalLLM {
+  if (!defaultModalLLM) {
+    defaultModalLLM = new ModalLLM();
+  }
+  return defaultModalLLM;
+}
+
+/**
+ * Reset the ModalLLM singleton (for testing).
+ */
+export function resetModalLLM(): void {
+  defaultModalLLM = null;
+}
+
+/**
+ * Get the default LLM based on modal configuration.
+ * When modal.inference=true, returns ModalLLM. Otherwise returns LlamaCpp.
+ */
+export function getDefaultLLM(): LLM {
+  if (getModalConfig().inference) return getOrCreateModalLLM();
+  return getDefaultLlamaCpp();
+}
+
+/**
+ * Validate that the Modal backend is reachable.
+ * Calls ping() and throws with a clear error message on failure.
+ */
+export async function validateModalConnection(): Promise<void> {
+  const modalLLM = getOrCreateModalLLM();
+  try {
+    const ok = await modalLLM.getBackend().ping();
+    if (!ok) {
+      throw new Error("ping returned false");
+    }
+  } catch (err) {
+    throw new Error(
+      `Modal inference is enabled but the deployed function is not reachable.\n` +
+        `Run 'qmd modal status' to check deployment, or 'qmd modal deploy' to redeploy.\n` +
+        `Original error: ${err instanceof Error ? err.message : err}`,
+    );
+  }
+}
+
+// =============================================================================
+// Modal Session — thin ILLMSession wrapper for ModalLLM
+// =============================================================================
+
+/**
+ * Lightweight session wrapper for ModalLLM.
+ * No concurrency tracking or inactivity timeout — Modal handles that server-side.
+ */
+class ModalSession implements ILLMSession {
+  private modalLLM: ModalLLM;
+  private released = false;
+  private abortController: AbortController;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(modalLLM: ModalLLM, options: LLMSessionOptions = {}) {
+    this.modalLLM = modalLLM;
+    this.abortController = new AbortController();
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.abortController.abort(options.signal.reason);
+      } else {
+        options.signal.addEventListener(
+          "abort",
+          () => this.abortController.abort(options.signal!.reason),
+          { once: true },
+        );
+      }
+    }
+
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000;
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(
+          new Error(`Modal session exceeded max duration of ${maxDuration}ms`),
+        );
+      }, maxDuration);
+      this.maxDurationTimer.unref();
+    }
+  }
+
+  get isValid(): boolean {
+    return !this.released && !this.abortController.signal.aborted;
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.maxDurationTimer) {
+      clearTimeout(this.maxDurationTimer);
+      this.maxDurationTimer = null;
+    }
+    this.abortController.abort(new Error("Session released"));
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.embed(text, options);
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    const results: (EmbeddingResult | null)[] = [];
+    for (const text of texts) {
+      results.push(await this.modalLLM.embed(text));
+    }
+    return results;
+  }
+
+  async expandQuery(
+    query: string,
+    options?: { context?: string; includeLexical?: boolean },
+  ): Promise<Queryable[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.expandQuery(query, options);
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options?: RerankOptions,
+  ): Promise<RerankResult> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.rerank(query, documents, options);
   }
 }
