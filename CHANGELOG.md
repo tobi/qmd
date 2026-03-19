@@ -4,6 +4,10 @@
 
 ### Fixes
 
+- Configure SQLite connection pragmas before probing `sqlite-vec`, avoid
+  resetting `PRAGMA journal_mode = WAL` on every query startup, and tolerate
+  another process winning the WAL transition race so parallel readers don't
+  fail during initialization with transient `database is locked` errors.
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
