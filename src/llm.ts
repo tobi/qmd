@@ -347,6 +347,17 @@ export interface LLM {
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
 
   /**
+   * Tokenize text using the embedding model's tokenizer.
+   * Returns tokenizer tokens (opaque type from the underlying implementation).
+   */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+
+  /**
+   * Count tokens in text using the embedding model's tokenizer.
+   */
+  countTokens(text: string): Promise<number>;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;
@@ -1705,6 +1716,14 @@ export class ModalLLM implements LLM {
 
   async modelExists(_model: string): Promise<ModelInfo> {
     return { name: "modal", exists: true };
+  }
+
+  async tokenize(_text: string): Promise<readonly LlamaToken[]> {
+    return [];
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return Math.ceil(text.length / 4);
   }
 
   async dispose(): Promise<void> {
