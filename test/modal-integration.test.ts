@@ -30,6 +30,7 @@ const mockGenerate = vi.fn();
 const mockRerank = vi.fn();
 const mockPing = vi.fn();
 const mockTokenize = vi.fn();
+const mockDetokenize = vi.fn();
 const mockDispose = vi.fn();
 
 vi.mock("../src/modal.js", () => ({
@@ -39,6 +40,7 @@ vi.mock("../src/modal.js", () => ({
     rerank: mockRerank,
     ping: mockPing,
     tokenize: mockTokenize,
+    detokenize: mockDetokenize,
     dispose: mockDispose,
   })),
 }));
@@ -159,6 +161,26 @@ describe("ModalLLM", () => {
 
       const count = await modalLLM.countTokens("hello world");
       expect(count).toBe(5);
+    });
+  });
+
+  describe("detokenize", () => {
+    test("calls backend.detokenize with tokens and returns text", async () => {
+      const modalLLM = new ModalLLM();
+      mockDetokenize.mockResolvedValue("hello world");
+
+      const result = await modalLLM.detokenize([1, 2, 3, 4] as unknown as readonly import("node-llama-cpp").Token[]);
+
+      expect(mockDetokenize).toHaveBeenCalledWith([1, 2, 3, 4]);
+      expect(result).toBe("hello world");
+    });
+
+    test("returns empty string for empty token array", async () => {
+      const modalLLM = new ModalLLM();
+      mockDetokenize.mockResolvedValue("");
+
+      const result = await modalLLM.detokenize([] as unknown as readonly import("node-llama-cpp").Token[]);
+      expect(result).toBe("");
     });
   });
 

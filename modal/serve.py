@@ -257,6 +257,24 @@ class QMDInference:
         return resp.json()
 
     @modal.method()
+    def detokenize(self, tokens: list[int]) -> str:
+        """Convert token IDs back to text using the embedding model's tokenizer.
+
+        Proxies to llama-server's /detokenize endpoint on port 8081
+        (the embeddinggemma model).
+        """
+        import requests
+
+        resp = requests.post(
+            f"http://127.0.0.1:{EMBED_SERVER.port}/detokenize",
+            json={"tokens": tokens},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("content", "")
+
+    @modal.method()
     def generate(
         self,
         prompt: str,

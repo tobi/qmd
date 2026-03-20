@@ -358,6 +358,11 @@ export interface LLM {
   countTokens(text: string): Promise<number>;
 
   /**
+   * Detokenize token IDs back to text.
+   */
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;
@@ -1587,11 +1592,11 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
 // =============================================================================
 
 /**
- * Character-based approximation for max document length in reranking.
- * Qwen3-Reranker context is 2048 tokens; ~4 chars/token is a safe estimate.
- * Budget: contextSize(2048) - templateOverhead(200) - queryTokens(~100) = ~1748 tokens * 4 = ~7000 chars.
+ * Rerank context size constants (must match llama-server --ctx-size).
+ * Modal rerank server runs with --ctx-size 2048.
  */
-const MODAL_RERANK_MAX_DOC_CHARS = 7000;
+const MODAL_RERANK_CONTEXT_SIZE = 2048;
+const MODAL_RERANK_TEMPLATE_OVERHEAD = 200;
 
 /**
  * GBNF grammar for query expansion output format.
@@ -1681,11 +1686,30 @@ export class ModalLLM implements LLM {
       return { results: [], model: "modal" };
     }
 
-    // Character-based truncation (no tokenizer available in Modal mode)
-    const truncatedDocs = documents.map((doc) => {
-      if (doc.text.length <= MODAL_RERANK_MAX_DOC_CHARS) return doc;
-      return { ...doc, text: doc.text.slice(0, MODAL_RERANK_MAX_DOC_CHARS) };
-    });
+    // Token-level truncation (same logic as LlamaCpp.rerank).
+    // Budget = contextSize - template overhead - query tokens
+    const queryTokens = await this.countTokens(query);
+    const maxDocTokens = MODAL_RERANK_CONTEXT_SIZE - MODAL_RERANK_TEMPLATE_OVERHEAD - queryTokens;
+
+    // Truncate documents that would exceed the rerank context size.
+    // Use a cache to avoid re-tokenizing identical documents.
+    const truncationCache = new Map<string, string>();
+    const truncatedDocs = await Promise.all(
+      documents.map(async (doc) => {
+        const cached = truncationCache.get(doc.text);
+        if (cached !== undefined) {
+          return cached === doc.text ? doc : { ...doc, text: cached };
+        }
+
+        const tokens = await this.tokenize(doc.text);
+        const truncatedText = tokens.length <= maxDocTokens
+          ? doc.text
+          : await this.detokenize(tokens.slice(0, maxDocTokens));
+        truncationCache.set(doc.text, truncatedText);
+
+        return truncatedText === doc.text ? doc : { ...doc, text: truncatedText };
+      }),
+    );
 
     // Deduplicate identical texts before scoring
     const textToDocs = new Map<string, { file: string; index: number }[]>();
@@ -1733,6 +1757,10 @@ export class ModalLLM implements LLM {
 
   async countTokens(text: string): Promise<number> {
     return (await this.tokenize(text)).length;
+  }
+
+  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    return this.backend.detokenize(tokens as unknown as number[]);
   }
 
   async dispose(): Promise<void> {

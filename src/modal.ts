@@ -199,6 +199,25 @@ export class ModalBackend {
   }
 
   /**
+   * Detokenize token IDs back to text using the embedding model's tokenizer.
+   */
+  async detokenize(tokens: number[]): Promise<string> {
+    await this.ensureConnected();
+    return withRetry(async () => {
+      const fn = this.getMethod("detokenize");
+      return fn.remote([tokens]);
+    }).catch((err) => {
+      throw isConnectionError(err)
+        ? new Error(
+            `Modal inference function not reachable after retries.\n` +
+              `Run 'qmd modal status' to check deployment, or 'qmd modal deploy' to redeploy.\n` +
+              `Original error: ${err instanceof Error ? err.message : err}`,
+          )
+        : err;
+    });
+  }
+
+  /**
    * Raw text generation with optional GBNF grammar.
    * Caller passes the fully formatted prompt including special tokens.
    */
