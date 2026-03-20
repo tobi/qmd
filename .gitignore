@@ -16,6 +16,7 @@ texts/
 !finetune/*.md
 !docs/*.md
 !docs/superpowers/specs/*.md
+!docs/superpowers/plans/*.md
 finetune/outputs/
 finetune/data/train/
 .claude/
