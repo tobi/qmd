@@ -22,7 +22,7 @@ Inside `generateEmbeddings` (`src/store.ts:1305`):
 - **Chunking**: `chunkDocumentByTokens()` calls `getDefaultLlamaCpp().tokenize()` — always local
 - **Embedding**: `withLLMSessionForLlm(llm, ...)` where `llm = store.llm ?? getDefaultLlamaCpp()` — always local LlamaCpp
 
-The session management (`withLLMSessionForLlm`) only accepts `LlamaCpp`, not the broader `LLM` interface, preventing Modal routing.
+The session management (`withLLMSessionForLlm`) accepts `LlamaCpp` and wraps it in `LLMSessionManager`. It should also accept `ModalLLM` since `ModalLLM` is sessionless — `withLLMSessionForLlm` can use `ModalSession` for ModalLLM (which is a thin no-op wrapper that delegates to the underlying LLM). The session management is not needed for Modal, but keeping the session wrapper means the same code path works for both backends.
 
 ## Goal
 
@@ -92,18 +92,14 @@ async tokenize(texts: string[]): Promise<number[][]> {
 In `generateEmbeddings` (`src/store.ts:1330`), replace:
 ```typescript
 const llm = store.llm ?? getDefaultLlamaCpp();
-const result = await withLLMSessionForLlm(llm, async (session) => {
-  // session.embed() / session.embedBatch()
-});
 ```
 
 With:
 ```typescript
 const llm = store.llm ?? getDefaultLLM();
-// Call embed/embedBatch directly — both LlamaCpp and ModalLLM implement LLM interface
-// Remove withLLMSessionForLlm wrapper (LlamaCpp.embed handles its own session internally)
-// For ModalLLM, there's no session management needed
 ```
+
+The `withLLMSessionForLlm` wrapper is kept — it dispatches to `LLMSession` for `LlamaCpp` (with operation tracking and idle timer management) and `ModalSession` for `ModalLLM` (a thin no-op wrapper that just delegates since Modal handles its own session lifecycle). Both session types implement `ILLMSession` with `embed()` and `embedBatch()`.
 
 Note: `getDefaultLLM()` already returns `ModalLLM` when `modal.inference=true` (see `src/llm.ts:1797`).
 
@@ -168,8 +164,8 @@ qmd embed
 | `modal/serve.py` | Add `tokenize()` method to `QMDInference` |
 | `src/modal.ts` | Add `tokenize()` to `ModalBackend` |
 | `src/llm.ts` | Add `tokenize`/`countTokens` to `LLM` interface; implement in `ModalLLM` |
-| `src/store.ts` | `generateEmbeddings`: use `getDefaultLLM()`, call embed directly; `chunkDocumentByTokens`: use `getDefaultLLM()`; `Store` type: `llm?: LLM` |
-| `test/modal-backend.test.ts` | Test `ModalBackend.tokenize()` |
+| `src/llm.ts` | `withLLMSessionForLlm`: generalize to accept `LLM`, dispatch to `ModalSession` for `ModalLLM` |
+| `src/store.ts` | `generateEmbeddings`: use `getDefaultLLM()`; `chunkDocumentByTokens`: use `getDefaultLLM()`; `Store` type: `llm?: LLM` |
 | `test/modal-backend.test.ts` | Test `ModalBackend.tokenize()` |
 | `test/modal-integration.test.ts` | Test `ModalLLM.tokenize()` and `countTokens()` |
 
