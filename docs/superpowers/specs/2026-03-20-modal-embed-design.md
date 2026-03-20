@@ -157,8 +157,8 @@ qmd embed
 ## Testing
 
 1. **Unit**: `modal-backend.test.ts` — add test for `ModalBackend.tokenize()`
-2. **Unit**: `llm.test.ts` — add test for `ModalLLM.tokenize()`
-3. **Integration**: `modal-integration.test.ts` — add test for `generateEmbeddings` routing to Modal (mock `ModalBackend`)
+2. **Unit**: `modal-integration.test.ts` — add test for `ModalLLM.tokenize()` and `countTokens()` (this file already tests ModalLLM with mocked ModalBackend)
+3. **Integration**: existing `store.test.ts` `generateEmbeddings` tests verify routing (they use `store.llm` mock — no changes needed)
 4. **CLI smoke**: `modal-cli.test.ts` — add `qmd embed --force` test with Modal enabled
 
 ## Files Changed
@@ -170,8 +170,8 @@ qmd embed
 | `src/llm.ts` | Add `tokenize`/`countTokens` to `LLM` interface; implement in `ModalLLM` |
 | `src/store.ts` | `generateEmbeddings`: use `getDefaultLLM()`, call embed directly; `chunkDocumentByTokens`: use `getDefaultLLM()`; `Store` type: `llm?: LLM` |
 | `test/modal-backend.test.ts` | Test `ModalBackend.tokenize()` |
-| `test/llm.test.ts` | Test `ModalLLM.tokenize()` |
-| `test/modal-integration.test.ts` | Test `generateEmbeddings` with Modal |
+| `test/modal-backend.test.ts` | Test `ModalBackend.tokenize()` |
+| `test/modal-integration.test.ts` | Test `ModalLLM.tokenize()` and `countTokens()` |
 
 ## Out of Scope
 
