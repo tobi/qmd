@@ -86,6 +86,7 @@ app = modal.App("qmd-inference", image=image)
 # Section B: Server configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ServerConfig:
     """Configuration for a single llama-server instance."""
@@ -160,10 +161,14 @@ class QMDInference:
         for server in ALL_SERVERS:
             cmd = [
                 LLAMA_SERVER_BIN,
-                "--model", f"{MODELS_DIR}/{server.model_file}",
-                "--port", str(server.port),
-                "--ctx-size", "2048",
-                "--n-gpu-layers", "99",
+                "--model",
+                f"{MODELS_DIR}/{server.model_file}",
+                "--port",
+                str(server.port),
+                "--ctx-size",
+                "2048",
+                "--n-gpu-layers",
+                "99",
                 *server.extra_args,
             ]
             proc = subprocess.Popen(cmd)
@@ -233,6 +238,23 @@ class QMDInference:
                 emb = emb[0]
             result.append(emb)
         return result
+
+    @modal.method()
+    def tokenize(self, texts: list[str]) -> list[list[int]]:
+        """Tokenize texts using the embedding model's tokenizer.
+
+        Proxies to llama-server's /tokenize endpoint on port 8081
+        (the embeddinggemma model). Returns token IDs as nested int lists.
+        """
+        import requests
+
+        resp = requests.post(
+            f"http://127.0.0.1:{EMBED_SERVER.port}/tokenize",
+            json={"content": texts},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     @modal.method()
     def generate(
@@ -346,14 +368,9 @@ def cmd_status(_args: argparse.Namespace) -> None:
         if result:
             print("qmd-inference is deployed and responding.")
         else:
-            print(
-                "qmd-inference is deployed but ping returned unexpected result."
-            )
+            print("qmd-inference is deployed but ping returned unexpected result.")
     except modal.exception.NotFoundError:
-        print(
-            "qmd-inference is not deployed. "
-            "Run: python modal/serve.py deploy"
-        )
+        print("qmd-inference is not deployed. Run: python modal/serve.py deploy")
         sys.exit(1)
     except Exception as exc:
         print(f"Error checking status: {exc}")
@@ -378,9 +395,7 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    deploy_parser = subparsers.add_parser(
-        "deploy", help="Deploy the inference service"
-    )
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy the inference service")
     deploy_parser.add_argument(
         "--gpu",
         default="T4",
