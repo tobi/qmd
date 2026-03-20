@@ -1718,12 +1718,13 @@ export class ModalLLM implements LLM {
     return { name: "modal", exists: true };
   }
 
-  async tokenize(_text: string): Promise<readonly LlamaToken[]> {
-    return [];
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    const tokens = await this.backend.tokenize([text]);
+    return (tokens[0] ?? []) as unknown as readonly LlamaToken[];
   }
 
   async countTokens(text: string): Promise<number> {
-    return Math.ceil(text.length / 4);
+    return (await this.tokenize(text)).length;
   }
 
   async dispose(): Promise<void> {
@@ -1908,6 +1909,16 @@ class ModalSession implements ILLMSession {
       results.push(await this.modalLLM.embed(text));
     }
     return results;
+  }
+
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.tokenize(text);
+  }
+
+  async countTokens(text: string): Promise<number> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.countTokens(text);
   }
 
   async expandQuery(
