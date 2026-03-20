@@ -1512,15 +1512,23 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
- * Unlike withLLMSession, this does not use the global singleton.
+ * Execute a function with a scoped LLM session for a specific LLM instance.
+ * Dispatches to ModalSession for ModalLLM, or LLMSession for LlamaCpp.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
+  if (llm instanceof ModalLLM) {
+    const session = new ModalSession(llm, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+  const manager = new LLMSessionManager(llm as LlamaCpp);
   const session = new LLMSession(manager, options);
 
   try {
