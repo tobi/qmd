@@ -29,6 +29,7 @@ const mockEmbed = vi.fn();
 const mockGenerate = vi.fn();
 const mockRerank = vi.fn();
 const mockPing = vi.fn();
+const mockTokenize = vi.fn();
 const mockDispose = vi.fn();
 
 vi.mock("../src/modal.js", () => ({
@@ -37,6 +38,7 @@ vi.mock("../src/modal.js", () => ({
     generate: mockGenerate,
     rerank: mockRerank,
     ping: mockPing,
+    tokenize: mockTokenize,
     dispose: mockDispose,
   })),
 }));
@@ -127,6 +129,36 @@ describe("ModalLLM", () => {
 
       const result = await modalLLM.embed("test");
       expect(result).toBeNull();
+    });
+  });
+
+  describe("tokenize", () => {
+    test("calls backend.tokenize with text and returns tokens", async () => {
+      const modalLLM = new ModalLLM();
+      mockTokenize.mockResolvedValue([[1, 2, 3, 4]]);
+
+      const result = await modalLLM.tokenize("hello world");
+
+      expect(mockTokenize).toHaveBeenCalledWith(["hello world"]);
+      expect(result).toEqual([1, 2, 3, 4]);
+    });
+
+    test("returns empty array when backend returns no tokens", async () => {
+      const modalLLM = new ModalLLM();
+      mockTokenize.mockResolvedValue([[]]);
+
+      const result = await modalLLM.tokenize("test");
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe("countTokens", () => {
+    test("returns length of token array from tokenize", async () => {
+      const modalLLM = new ModalLLM();
+      mockTokenize.mockResolvedValue([[1, 2, 3, 4, 5]]);
+
+      const count = await modalLLM.countTokens("hello world");
+      expect(count).toBe(5);
     });
   });
 

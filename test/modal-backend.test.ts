@@ -201,6 +201,31 @@ describe("ModalBackend", () => {
     });
   });
 
+  describe("tokenize", () => {
+    test("calls remote with texts and returns token IDs", async () => {
+      const { mockRemote, mockMethod } = await getMocks();
+      const tokenIds = [[1, 2, 3], [4, 5, 6, 7]];
+      mockRemote.mockResolvedValue(tokenIds);
+
+      const backend = createBackend();
+      const result = await backend.tokenize(["hello world", "goodbye"]);
+
+      expect(mockMethod).toHaveBeenCalledWith("tokenize");
+      expect(mockRemote).toHaveBeenCalledWith([["hello world", "goodbye"]]);
+      expect(result).toEqual(tokenIds);
+    });
+
+    test("throws on connection error after retries", async () => {
+      const { mockRemote } = await getMocks();
+      mockRemote.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+      const backend = createBackend();
+      await expect(backend.tokenize(["test"])).rejects.toThrow(
+        /Modal .* not reachable/,
+      );
+    });
+  });
+
   describe("generate", () => {
     test("calls remote with prompt, grammar, maxTokens, model", async () => {
       const { mockRemote, mockMethod } = await getMocks();
