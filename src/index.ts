@@ -52,6 +52,7 @@ import {
   type HybridQueryResult,
   type HybridQueryOptions,
   type HybridQueryExplain,
+  type RecencyOptions,
   type ExpandedQuery,
   type StructuredSearchOptions,
   type MultiGetResult,
@@ -89,6 +90,7 @@ export type {
   HybridQueryResult,
   HybridQueryOptions,
   HybridQueryExplain,
+  RecencyOptions,
   ExpandedQuery,
   StructuredSearchOptions,
   MultiGetResult,
@@ -161,6 +163,8 @@ export interface SearchOptions {
   minScore?: number;
   /** Include explain traces */
   explain?: boolean;
+  /** Optional temporal relevance boost — decays scores by document age */
+  recency?: { halfLife: number; weight: number };
 }
 
 /**
@@ -391,6 +395,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           explain: opts.explain,
           intent: opts.intent,
           skipRerank,
+          recency: opts.recency,
         });
       }
 
@@ -402,6 +407,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         explain: opts.explain,
         intent: opts.intent,
         skipRerank,
+        recency: opts.recency,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),

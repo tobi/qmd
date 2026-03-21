@@ -16,6 +16,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  applyRecencyDecay,
 } from "../src/store";
 
 // =============================================================================
@@ -242,5 +243,53 @@ describe("handelize", () => {
     expect(isDocid("#123456")).toBe(true);
     expect(isDocid("bad-id")).toBe(false);
     expect(isDocid("12345")).toBe(false);
+  });
+});
+
+// =============================================================================
+// Temporal Relevance Boost
+// =============================================================================
+
+describe("applyRecencyDecay", () => {
+  const recency = { halfLife: 30, weight: 0.15 };
+
+  test("today's document gets no decay", () => {
+    const now = new Date().toISOString();
+    const result = applyRecencyDecay(1.0, now, recency);
+    expect(result).toBeCloseTo(1.0, 2);
+  });
+
+  test("document at half-life gets expected decay", () => {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const result = applyRecencyDecay(1.0, thirtyDaysAgo, recency);
+    // At halfLife: decay = 0.5, score = 1 * (1 - 0.15 + 0.15 * 0.5) = 0.925
+    expect(result).toBeCloseTo(0.925, 2);
+  });
+
+  test("very old document is never zeroed out", () => {
+    const yearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const result = applyRecencyDecay(1.0, yearAgo, recency);
+    // Asymptotes to (1 - weight) = 0.85
+    expect(result).toBeGreaterThan(0.84);
+    expect(result).toBeLessThan(0.86);
+  });
+
+  test("shorter half-life produces steeper decay", () => {
+    const fifteenDaysAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    const gentleDecay = applyRecencyDecay(1.0, fifteenDaysAgo, { halfLife: 90, weight: 0.15 });
+    const steepDecay = applyRecencyDecay(1.0, fifteenDaysAgo, { halfLife: 7, weight: 0.15 });
+    expect(gentleDecay).toBeGreaterThan(steepDecay);
+  });
+
+  test("empty modifiedAt returns score unchanged", () => {
+    const result = applyRecencyDecay(0.75, "", recency);
+    expect(result).toBe(0.75);
+  });
+
+  test("preserves score proportions", () => {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const high = applyRecencyDecay(0.9, thirtyDaysAgo, recency);
+    const low = applyRecencyDecay(0.3, thirtyDaysAgo, recency);
+    expect(high / low).toBeCloseTo(0.9 / 0.3, 1);
   });
 });

@@ -1684,6 +1684,7 @@ export type HybridQueryExplain = {
   };
   rerankScore: number;
   blendedScore: number;
+  recencyDecay?: number;    // temporal decay multiplier (1.0 = no decay)
 };
 
 /**
@@ -3050,6 +3051,31 @@ export async function rerank(query: string, documents: { file: string; text: str
 }
 
 // =============================================================================
+// Temporal Relevance Boost
+// =============================================================================
+
+/**
+ * Apply exponential time-decay to a score based on document age.
+ *
+ * Formula: score * (1 - weight + weight * 2^(-ageDays / halfLife))
+ *
+ * - Today's document:   score * 1.0
+ * - At halfLife days:   score * (1 - weight/2)
+ * - Very old documents: score * (1 - weight) — never zeroed out
+ */
+export function applyRecencyDecay(
+  score: number,
+  modifiedAt: string,
+  recency: RecencyOptions
+): number {
+  if (!modifiedAt) return score;
+  const ageMs = Date.now() - new Date(modifiedAt).getTime();
+  const ageDays = Math.max(0, ageMs / (1000 * 60 * 60 * 24));
+  const decay = Math.pow(2, -ageDays / recency.halfLife);
+  return score * (1 - recency.weight + recency.weight * decay);
+}
+
+// =============================================================================
 // Reciprocal Rank Fusion
 // =============================================================================
 
@@ -3666,6 +3692,11 @@ export interface SearchHooks {
   onRerankDone?: (elapsedMs: number) => void;
 }
 
+export interface RecencyOptions {
+  halfLife: number;   // days until score decays to midpoint
+  weight: number;     // max influence on score, 0-1
+}
+
 export interface HybridQueryOptions {
   collection?: string;
   limit?: number;           // default 10
@@ -3674,6 +3705,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  recency?: RecencyOptions; // optional temporal relevance boost
   hooks?: SearchHooks;
 }
 
@@ -3721,6 +3753,7 @@ export async function hybridQuery(
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
+  const recency = options?.recency;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -3835,6 +3868,22 @@ export async function hybridQuery(
 
   if (candidates.length === 0) return [];
 
+  // Batch-lookup modified_at timestamps for recency boost (one query for all candidates)
+  const modifiedAtMap = new Map<string, string>();
+  if (recency) {
+    const virtualPaths = candidates.map(c => c.file);
+    for (const vp of virtualPaths) {
+      // Extract collection and path from virtual path qmd://collection/path
+      const match = vp.match(/^qmd:\/\/([^/]+)\/(.+)$/);
+      if (match) {
+        const row = store.db.prepare(
+          `SELECT modified_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
+        ).get(match[1], match[2]) as { modified_at: string } | undefined;
+        if (row) modifiedAtMap.set(vp, row.modified_at);
+      }
+    }
+  }
+
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
@@ -3872,6 +3921,9 @@ export async function hybridQuery(
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
+        const modifiedAt = modifiedAtMap.get(cand.file) || "";
+        const decayMultiplier = recency ? applyRecencyDecay(1, modifiedAt, recency) : undefined;
+        const finalScore = decayMultiplier !== undefined ? rrfScore * decayMultiplier : rrfScore;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
           ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
@@ -3887,6 +3939,7 @@ export async function hybridQuery(
           },
           rerankScore: 0,
           blendedScore: rrfScore,
+          ...(decayMultiplier !== undefined ? { recencyDecay: decayMultiplier } : {}),
         } : undefined;
 
         return {
@@ -3896,12 +3949,13 @@ export async function hybridQuery(
           body: cand.body,
           bestChunk,
           bestChunkPos,
-          score: rrfScore,
+          score: finalScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
         };
       })
+      .sort((a, b) => b.score - a.score) // re-sort after recency adjustment
       .filter(r => {
         if (seenFiles.has(r.file)) return false;
         seenFiles.add(r.file);
@@ -3940,6 +3994,9 @@ export async function hybridQuery(
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const modifiedAt = modifiedAtMap.get(r.file) || "";
+    const decayMultiplier = recency ? applyRecencyDecay(1, modifiedAt, recency) : undefined;
+    const finalScore = decayMultiplier !== undefined ? blendedScore * decayMultiplier : blendedScore;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -3961,6 +4018,7 @@ export async function hybridQuery(
       },
       rerankScore: r.score,
       blendedScore,
+      ...(decayMultiplier !== undefined ? { recencyDecay: decayMultiplier } : {}),
     } : undefined;
 
     return {
@@ -3970,7 +4028,7 @@ export async function hybridQuery(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: finalScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
@@ -4082,6 +4140,8 @@ export interface StructuredSearchOptions {
   intent?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
+  /** Optional temporal relevance boost */
+  recency?: RecencyOptions;
   hooks?: SearchHooks;
 }
 
@@ -4114,6 +4174,7 @@ export async function structuredSearch(
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
+  const recency = options?.recency;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -4220,6 +4281,20 @@ export async function structuredSearch(
 
   if (candidates.length === 0) return [];
 
+  // Batch-lookup modified_at timestamps for recency boost
+  const modifiedAtMap = new Map<string, string>();
+  if (recency) {
+    for (const cand of candidates) {
+      const match = cand.file.match(/^qmd:\/\/([^/]+)\/(.+)$/);
+      if (match) {
+        const row = store.db.prepare(
+          `SELECT modified_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
+        ).get(match[1], match[2]) as { modified_at: string } | undefined;
+        if (row) modifiedAtMap.set(cand.file, row.modified_at);
+      }
+    }
+  }
+
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
@@ -4262,6 +4337,9 @@ export async function structuredSearch(
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
+        const modifiedAt = modifiedAtMap.get(cand.file) || "";
+        const decayMultiplier = recency ? applyRecencyDecay(1, modifiedAt, recency) : undefined;
+        const finalScore = decayMultiplier !== undefined ? rrfScore * decayMultiplier : rrfScore;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
           ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
@@ -4277,6 +4355,7 @@ export async function structuredSearch(
           },
           rerankScore: 0,
           blendedScore: rrfScore,
+          ...(decayMultiplier !== undefined ? { recencyDecay: decayMultiplier } : {}),
         } : undefined;
 
         return {
@@ -4286,12 +4365,13 @@ export async function structuredSearch(
           body: cand.body,
           bestChunk,
           bestChunkPos,
-          score: rrfScore,
+          score: finalScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
         };
       })
+      .sort((a, b) => b.score - a.score) // re-sort after recency adjustment
       .filter(r => {
         if (seenFiles.has(r.file)) return false;
         seenFiles.add(r.file);
@@ -4329,6 +4409,9 @@ export async function structuredSearch(
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const modifiedAt = modifiedAtMap.get(r.file) || "";
+    const decayMultiplier = recency ? applyRecencyDecay(1, modifiedAt, recency) : undefined;
+    const finalScore = decayMultiplier !== undefined ? blendedScore * decayMultiplier : blendedScore;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -4350,6 +4433,7 @@ export async function structuredSearch(
       },
       rerankScore: r.score,
       blendedScore,
+      ...(decayMultiplier !== undefined ? { recencyDecay: decayMultiplier } : {}),
     } : undefined;
 
     return {
@@ -4359,7 +4443,7 @@ export async function structuredSearch(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: finalScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
