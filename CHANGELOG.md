@@ -4,6 +4,7 @@
 
 ### Fixes
 
+- **MCP `--index` flag ignored**: `qmd --index myproject mcp` now correctly opens the named index instead of always falling back to `index.sqlite`. Both stdio and HTTP transports accept the resolved DB path from the CLI. Daemon mode also forwards `--index` to the spawned child process. (#343)
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
