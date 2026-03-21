@@ -53,6 +53,7 @@ import {
   type HybridQueryResult,
   type HybridQueryOptions,
   type HybridQueryExplain,
+  type RecencyOptions,
   type ExpandedQuery,
   type StructuredSearchOptions,
   type MultiGetResult,
@@ -93,6 +94,7 @@ export type {
   HybridQueryResult,
   HybridQueryOptions,
   HybridQueryExplain,
+  RecencyOptions,
   ExpandedQuery,
   StructuredSearchOptions,
   MultiGetResult,
@@ -170,6 +172,8 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Optional temporal relevance boost — decays scores by document age */
+  recency?: { halfLife: number; weight: number };
 }
 
 /**
@@ -410,6 +414,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
+          recency: opts.recency,
         });
       }
 
@@ -423,6 +428,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
+        recency: opts.recency,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),

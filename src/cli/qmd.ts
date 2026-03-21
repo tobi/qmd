@@ -2007,6 +2007,7 @@ type OutputOptions = {
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
+  recencyDays?: number;  // Temporal relevance boost half-life in days
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2613,6 +2614,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        recency: opts.recencyDays ? { halfLife: opts.recencyDays, weight: 0.15 } : undefined,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -2641,6 +2643,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        recency: opts.recencyDays ? { halfLife: opts.recencyDays, weight: 0.15 } : undefined,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -2764,6 +2767,7 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      "recency-days": { type: "string" },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -2834,6 +2838,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    recencyDays: values["recency-days"] ? parseInt(String(values["recency-days"]), 10) : undefined,
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -3345,6 +3350,7 @@ function showHelp(): void {
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
+  console.log("  --recency-days <n>         - Boost recent documents (half-life in days, e.g. 30)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
