@@ -20,7 +20,7 @@ const execAsync = promisify(exec);
 
 const REGION_ENDPOINTS: Record<string, string> = {
   us: "ec2.us-east-1.amazonaws.com",
-  eu: "ec2.eu-central-1.amazonaws.com",
+  eu: "ec2.eu-west-3.amazonaws.com",  // Paris - closest to Frankfurt
   ap: "ec2.ap-northeast-1.amazonaws.com",
   uk: "ec2.eu-west-2.amazonaws.com",
   ca: "ec2.ca-central-1.amazonaws.com",
