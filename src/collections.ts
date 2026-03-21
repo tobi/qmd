@@ -40,6 +40,7 @@ export interface ModalConfig {
   inference?: boolean;       // Whether to use Modal for inference (default: false)
   gpu?: string;              // GPU type to use (default: "T4")
   scaledown_window?: number; // Seconds before idle container scales down (default: 15)
+  region?: string;           // Modal region for worker deployment (default: "" = auto-detect)
 }
 
 /**
@@ -487,6 +488,7 @@ const MODAL_DEFAULTS: Required<ModalConfig> = {
   inference: false,
   gpu: "T4",
   scaledown_window: 15,
+  region: "",
 };
 
 /**
