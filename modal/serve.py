@@ -127,10 +127,12 @@ ALL_SERVERS = [EMBED_SERVER, EXPAND_SERVER, RERANK_SERVER]
 
 gpu_config: str = os.environ.get("QMD_MODAL_GPU", "T4")
 idle_timeout: int = int(os.environ.get("QMD_MODAL_SCALEDOWN", "15"))
+region: str | None = os.environ.get("QMD_MODAL_REGION")
 
 
 @app.cls(
     gpu=gpu_config,
+    region=region,
     scaledown_window=idle_timeout,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
@@ -358,15 +360,18 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     """Deploy the QMD inference service to Modal."""
     import subprocess
 
+    region_info = f", region={args.region}" if args.region else ""
     print(
         f"Deploying qmd-inference "
-        f"(gpu={args.gpu}, scaledown_window={args.scaledown_window})..."
+        f"(gpu={args.gpu}, scaledown_window={args.scaledown_window}{region_info})..."
     )
     env = {
         **os.environ,
         "QMD_MODAL_GPU": args.gpu,
         "QMD_MODAL_SCALEDOWN": str(args.scaledown_window),
     }
+    if args.region:
+        env["QMD_MODAL_REGION"] = args.region
     subprocess.run(
         [sys.executable, "-m", "modal", "deploy", __file__],
         check=True,
@@ -424,6 +429,13 @@ def main() -> None:
         type=int,
         default=15,
         help="Seconds before idle container shuts down (default: 15)",
+    )
+    deploy_parser.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        choices=["us", "eu", "ap", "uk", "ca", "me", "sa", "af", "mx"],
+        help="Region for Modal deployment (default: Modal's default, typically US)",
     )
 
     subparsers.add_parser("status", help="Check deployment status")
