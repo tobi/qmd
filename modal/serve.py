@@ -115,7 +115,15 @@ RERANK_SERVER = ServerConfig(
     name="rerank",
     port=8083,
     model_file="qwen3-reranker-0.6b-q8_0.gguf",
-    extra_args=["--embedding", "--pooling", "rank", "--ubatch-size", "2048"],
+    extra_args=[
+        "--embedding",
+        "--pooling",
+        "rank",
+        "--parallel",
+        "1",
+        "--ubatch-size",
+        "2048",
+    ],
 )
 
 ALL_SERVERS = [EMBED_SERVER, EXPAND_SERVER, RERANK_SERVER]
