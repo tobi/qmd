@@ -87,6 +87,10 @@ export interface ModalCommandOptions {
   tomlPath?: string;
   /** Override serve.py path (for testing). */
   servePyPath?: string;
+  /** Region override for deploy (e.g., "us", "eu"). */
+  region?: string;
+  /** Force region auto-detection. */
+  detectRegion?: boolean;
 }
 
 // ============================================================================
@@ -156,6 +160,8 @@ function resolveServePyPath(): string {
 async function handleDeploy(
   tomlPath: string,
   servePyPath: string,
+  region?: string,
+  forceDetectRegion?: boolean,
 ): Promise<ModalCommandResult> {
   const preflight = preflightChecks(tomlPath);
   if (preflight) {
@@ -163,12 +169,37 @@ async function handleDeploy(
   }
 
   const modalConfig = getModalConfig();
+
+  // Determine region (but DON'T save to config yet)
+  let selectedRegion = region;
+  if (forceDetectRegion || (!selectedRegion && !modalConfig.region)) {
+    selectedRegion = await detectRegion();
+  } else if (!selectedRegion) {
+    selectedRegion = modalConfig.region || "us";
+  }
+
+  // Handle "default" = clear region
+  if (selectedRegion === "default") {
+    selectedRegion = undefined;
+    console.log("Region cleared, using Modal default (US)");
+  }
+
+  // Validate region
+  if (selectedRegion && !isValidRegion(selectedRegion)) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `Invalid region '${selectedRegion}'. Valid: ${VALID_REGIONS.join(", ")}`,
+    };
+  }
+
   const gpu = modalConfig.gpu;
   const scaledownWindow = modalConfig.scaledown_window;
 
   try {
+    const regionArg = selectedRegion ? ` --region ${selectedRegion}` : "";
     execSync(
-      `python3 "${servePyPath}" deploy --gpu ${gpu} --scaledown-window ${scaledownWindow}`,
+      `python3 "${servePyPath}" deploy --gpu ${gpu} --scaledown-window ${scaledownWindow}${regionArg}`,
       { stdio: "pipe" },
     );
   } catch (err: unknown) {
@@ -183,7 +214,11 @@ async function handleDeploy(
     };
   }
 
+  // Save config AFTER successful deploy
   setModalConfig({ inference: true });
+  if (selectedRegion) {
+    setModalConfig({ region: selectedRegion });
+  }
 
   // Trigger snapshot creation by calling ping() — this forces a container
   // to spin up and load models onto GPU. Without this, the first user call
@@ -318,17 +353,21 @@ export async function handleModalCommand(
       "Usage: qmd modal <command>",
       "",
       "Commands:",
-      "  deploy   Deploy the Modal inference function",
-      "  status   Check if the Modal function is deployed and reachable",
-      "  destroy  Tear down the deployed Modal function",
-      "  test     Run a smoke test against the deployed function",
+      "  deploy [--region <region>] [--detect-region]  Deploy the Modal inference function",
+      "  status                                          Check if Modal is deployed",
+      "  destroy                                         Tear down the deployed function",
+      "  test                                            Run a smoke test",
+      "",
+      "Regions: us, eu, ap, uk, ca, me, sa, af, mx",
+      "  --region default  Clear saved region (use US default)",
+      "  --detect-region   Force re-detection of fastest region",
     ].join("\n");
     return { exitCode: 1, stdout: "", stderr: usage };
   }
 
   switch (subcommand) {
     case "deploy":
-      return handleDeploy(tomlPath, servePyPath);
+      return handleDeploy(tomlPath, servePyPath, options?.region, options?.detectRegion);
     case "destroy":
       return handleDestroy(tomlPath, servePyPath);
     case "status":
