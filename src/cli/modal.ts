@@ -6,14 +6,69 @@
  * the modal pip package, and ~/.modal.toml before deploy/destroy.
  */
 
-import { execSync } from "child_process";
+import { execSync, exec } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { homedir, platform } from "os";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
+import { promisify } from "util";
 import { getModalConfig, setModalConfig } from "../collections.js";
 import { ModalBackend } from "../modal.js";
+
+const execAsync = promisify(exec);
+
+const REGION_ENDPOINTS: Record<string, string> = {
+  us: "ec2.us-east-1.amazonaws.com",
+  eu: "ec2.eu-central-1.amazonaws.com",
+  ap: "ec2.ap-northeast-1.amazonaws.com",
+  uk: "ec2.eu-west-2.amazonaws.com",
+  ca: "ec2.ca-central-1.amazonaws.com",
+};
+
+const VALID_REGIONS = ["us", "eu", "ap", "uk", "ca", "me", "sa", "af", "mx", "default"];
+
+async function pingEndpoint(endpoint: string, count: number = 3): Promise<number> {
+  const isWindows = platform() === "win32";
+  const countFlag = isWindows ? "-n" : "-c";
+  const cmd = `ping ${countFlag} ${count} ${endpoint}`;
+
+  try {
+    const { stdout } = await execAsync(cmd, { timeout: 30000 });
+    const linuxMatch = stdout.match(/rtt min\/avg\/max\/mdev = [\d.]+\/([\d.]+)/);
+    const winMatch = stdout.match(/Average = (\d+)ms/);
+    const match = linuxMatch ?? winMatch;
+    return match?.[1] ? parseFloat(match[1]) : Infinity;
+  } catch {
+    return Infinity;
+  }
+}
+
+async function detectRegion(): Promise<string> {
+  console.log("Detecting fastest Modal region...");
+
+  const entries = Object.entries(REGION_ENDPOINTS);
+  const results = await Promise.all(
+    entries.map(async ([region, endpoint]) => {
+      const latency = await pingEndpoint(endpoint);
+      return { region, latency };
+    }),
+  );
+
+  const valid = results.filter(r => isFinite(r.latency));
+  if (valid.length === 0) {
+    console.warn("Warning: Region detection failed, using US default");
+    return "us";
+  }
+
+  const best = valid.reduce((a, b) => a.latency < b.latency ? a : b);
+  console.log(`Detected fastest region: ${best.region} (${best.latency.toFixed(1)}ms median)`);
+  return best.region;
+}
+
+function isValidRegion(value: string): boolean {
+  return VALID_REGIONS.includes(value);
+}
 
 // ============================================================================
 // Types
