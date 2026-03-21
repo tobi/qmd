@@ -129,3 +129,37 @@ For bulk operations (embedding many documents), EU region saves significant time
 - 500 docs: ~43 seconds saved
 
 For typical queries, savings are modest (~100-200ms per query).
+
+## Region Auto-Detection
+
+`qmd modal deploy` automatically detects the fastest Modal region on first deployment:
+
+1. Pings AWS endpoints for each Modal region (3 pings, median)
+2. Selects region with lowest latency
+3. Stores in `~/.config/qmd/index.yml`
+
+### CLI Commands
+
+```bash
+# Auto-detect (first deploy)
+qmd modal deploy
+
+# Manual override
+qmd modal deploy --region eu
+
+# Force re-detection
+qmd modal deploy --detect-region
+
+# Clear saved region
+qmd modal deploy --region default
+```
+
+### Supported Regions
+
+| Region | Description | Endpoint |
+|--------|-------------|----------|
+| us | United States | ec2.us-east-1.amazonaws.com |
+| eu | European Economic Area | ec2.eu-central-1.amazonaws.com |
+| ap | Asia-Pacific | ec2.ap-northeast-1.amazonaws.com |
+| uk | United Kingdom | ec2.eu-west-2.amazonaws.com |
+| ca | Canada | ec2.ca-central-1.amazonaws.com |
