@@ -253,8 +253,7 @@ describe("handelize", () => {
 
 // =============================================================================
 // sanitizeFTS5Term Tests
-// ======================================================================
-
+// =============================================================================
 
 describe("sanitizeFTS5Term", () => {
   test("preserves underscores in snake_case identifiers", () => {
@@ -287,7 +286,11 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
-=======
+  });
+});
+
+
+// =============================================================================
 // Temporal Relevance Boost
 // =============================================================================
 
