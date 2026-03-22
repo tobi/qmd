@@ -29,6 +29,9 @@ import {
   formatDocForEmbedding,
   chunkDocument,
   chunkDocumentByTokens,
+  chunkDocumentAsync,
+  chunkDocumentWithBreakPoints,
+  mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
   isInsideCodeFence,
@@ -1016,6 +1019,127 @@ Final section content.
       expect(typeof chunk.text).toBe('string');
       expect(chunk.text.length).toBeGreaterThan(0);
       expect(chunk.pos).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+// =============================================================================
+// AST-Aware Chunking Integration Tests
+// =============================================================================
+
+describe("mergeBreakPoints", () => {
+  test("merges two sets of break points keeping highest score at each position", () => {
+    const regexPoints: BreakPoint[] = [
+      { pos: 10, score: 20, type: "blank" },
+      { pos: 50, score: 1, type: "newline" },
+    ];
+    const astPoints: BreakPoint[] = [
+      { pos: 10, score: 90, type: "ast:func" },
+      { pos: 100, score: 100, type: "ast:class" },
+    ];
+
+    const merged = mergeBreakPoints(regexPoints, astPoints);
+    expect(merged).toHaveLength(3);
+
+    // pos 10: AST score (90) wins over regex (20)
+    const at10 = merged.find(p => p.pos === 10);
+    expect(at10?.score).toBe(90);
+    expect(at10?.type).toBe("ast:func");
+
+    // pos 50: only regex
+    expect(merged.find(p => p.pos === 50)?.score).toBe(1);
+
+    // pos 100: only AST
+    expect(merged.find(p => p.pos === 100)?.score).toBe(100);
+  });
+
+  test("returns sorted by position", () => {
+    const a: BreakPoint[] = [{ pos: 100, score: 10, type: "a" }];
+    const b: BreakPoint[] = [{ pos: 5, score: 20, type: "b" }];
+    const merged = mergeBreakPoints(a, b);
+    expect(merged[0]!.pos).toBe(5);
+    expect(merged[1]!.pos).toBe(100);
+  });
+});
+
+describe("chunkDocumentWithBreakPoints", () => {
+  test("produces same output as chunkDocument for same input", () => {
+    const content = "a".repeat(5000) + "\n\n" + "b".repeat(5000);
+    const breakPoints = scanBreakPoints(content);
+    const codeFences = findCodeFences(content);
+
+    const chunksOriginal = chunkDocument(content);
+    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, codeFences);
+
+    expect(chunksNew.length).toBe(chunksOriginal.length);
+    for (let i = 0; i < chunksNew.length; i++) {
+      expect(chunksNew[i]!.text).toBe(chunksOriginal[i]!.text);
+      expect(chunksNew[i]!.pos).toBe(chunksOriginal[i]!.pos);
+    }
+  });
+});
+
+describe("AST-aware chunkDocumentAsync", () => {
+  const TS_CODE = `import { Database } from './db';
+
+export class AuthService {
+  constructor(private db: Database) {}
+
+  async authenticate(user: User, token: string): Promise<boolean> {
+    const session = await this.db.findSession(token);
+    return session?.userId === user.id;
+  }
+
+  validateToken(token: string): boolean {
+    return token.length === 64;
+  }
+}
+
+export function hashPassword(password: string): string {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+`.repeat(10); // Repeat to make it large enough to trigger chunking
+
+  test("returns chunks for code files with AST strategy", async () => {
+    const chunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, "auth.ts", "auto");
+    expect(chunks.length).toBeGreaterThan(0);
+    // Each chunk should have text and pos
+    for (const chunk of chunks) {
+      expect(typeof chunk.text).toBe("string");
+      expect(chunk.text.length).toBeGreaterThan(0);
+      expect(chunk.pos).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test("regex strategy produces same output as chunkDocument for code files", async () => {
+    const asyncChunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, "auth.ts", "regex");
+    const syncChunks = chunkDocument(TS_CODE);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
+      expect(asyncChunks[i]!.pos).toBe(syncChunks[i]!.pos);
+    }
+  });
+
+  test("markdown files are unchanged in auto mode", async () => {
+    const mdContent = ("# Heading\n\n" + "Some text. ".repeat(200) + "\n\n").repeat(10);
+    const asyncChunks = await chunkDocumentAsync(mdContent, undefined, undefined, undefined, "readme.md", "auto");
+    const syncChunks = chunkDocument(mdContent);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
+    }
+  });
+
+  test("no filepath falls back to regex-only", async () => {
+    const asyncChunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, undefined, "auto");
+    const syncChunks = chunkDocument(TS_CODE);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
     }
   });
 });

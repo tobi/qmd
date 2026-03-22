@@ -318,6 +318,7 @@ const result = await store.update({
 // Generate vector embeddings
 const embedResult = await store.embed({
   force: false,           // true to re-embed everything
+  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
   onProgress: ({ current, total, collection }) => {
     console.log(`Embedding ${current}/${total}`)
   },
@@ -564,7 +565,26 @@ qmd embed
 
 # Force re-embed everything
 qmd embed -f
+
+# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
+qmd embed --chunk-strategy auto
+
+# Also works with query for consistent chunk selection
+qmd query "auth flow" --chunk-strategy auto
 ```
+
+**AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
+files at function, class, and import boundaries instead of arbitrary text
+positions. This produces higher-quality chunks and better search results for
+codebases. Markdown and other file types always use regex-based chunking
+regardless of strategy.
+
+The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
+opt in. Run `qmd status` to verify which grammars are available.
+
+> **Note:** Tree-sitter grammars are optional dependencies. If they are not
+> installed, `--chunk-strategy auto` falls back to regex-only chunking
+> automatically. Tested on both Node.js and Bun.
 
 ### Context Management
 
@@ -812,6 +832,19 @@ Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to fin
 The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target (score 1), but a closer heading wins over a distant one.
 
 **Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the chunk size, it's kept whole when possible.
+
+**AST-Aware Chunking (Code Files):**
+
+For supported code files, QMD also parses the source with [tree-sitter](https://tree-sitter.github.io/) and adds AST-derived break points that are merged with the regex scores above:
+
+| AST Node | Score | Languages |
+|----------|-------|-----------|
+| Class / interface / struct / impl / trait | 100 | All |
+| Function / method | 90 | All |
+| Type alias / enum | 80 | All |
+| Import / use declaration | 60 | All |
+
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
 
 ### Query Flow (Hybrid)
 

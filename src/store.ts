@@ -223,6 +223,89 @@ export function findBestCutoff(
   return bestPos;
 }
 
+// =============================================================================
+// Chunk Strategy
+// =============================================================================
+
+export type ChunkStrategy = "auto" | "regex";
+
+/**
+ * Merge two sets of break points (e.g. regex + AST), keeping the highest
+ * score at each position. Result is sorted by position.
+ */
+export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[] {
+  const seen = new Map<number, BreakPoint>();
+  for (const bp of a) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  for (const bp of b) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+}
+
+/**
+ * Core chunk algorithm that operates on precomputed break points and code fences.
+ * This is the shared implementation used by both regex-only and AST-aware chunking.
+ */
+export function chunkDocumentWithBreakPoints(
+  content: string,
+  breakPoints: BreakPoint[],
+  codeFences: CodeFenceRegion[],
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS
+): { text: string; pos: number }[] {
+  if (content.length <= maxChars) {
+    return [{ text: content, pos: 0 }];
+  }
+
+  const chunks: { text: string; pos: number }[] = [];
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    const targetEndPos = Math.min(charPos + maxChars, content.length);
+    let endPos = targetEndPos;
+
+    if (endPos < content.length) {
+      const bestCutoff = findBestCutoff(
+        breakPoints,
+        targetEndPos,
+        windowChars,
+        0.7,
+        codeFences
+      );
+
+      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
+        endPos = bestCutoff;
+      }
+    }
+
+    if (endPos <= charPos) {
+      endPos = Math.min(charPos + maxChars, content.length);
+    }
+
+    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+
+    if (endPos >= content.length) {
+      break;
+    }
+    charPos = endPos - overlapChars;
+    const lastChunkPos = chunks.at(-1)!.pos;
+    if (charPos <= lastChunkPos) {
+      charPos = endPos;
+    }
+  }
+
+  return chunks;
+}
+
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
 export const STRONG_SIGNAL_MIN_SCORE = 0.85;
@@ -1197,6 +1280,7 @@ export type EmbedOptions = {
   model?: string;
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
+  chunkStrategy?: ChunkStrategy;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -1345,7 +1429,12 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+        const chunks = await chunkDocumentByTokens(
+          doc.body,
+          undefined, undefined, undefined,
+          doc.path,
+          options?.chunkStrategy,
+        );
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -2021,78 +2110,66 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
+/**
+ * Chunk a document using regex-only break point detection.
+ * This is the sync, backward-compatible API used by tests and legacy callers.
+ */
 export function chunkDocument(
   content: string,
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  if (content.length <= maxChars) {
-    return [{ text: content, pos: 0 }];
-  }
-
-  // Pre-scan all break points and code fences once
   const breakPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+}
 
-  const chunks: { text: string; pos: number }[] = [];
-  let charPos = 0;
+/**
+ * Async AST-aware chunking. Detects language from filepath, computes AST
+ * break points for supported code files, merges with regex break points,
+ * and delegates to the shared chunk algorithm.
+ *
+ * Falls back to regex-only when strategy is "regex", filepath is absent,
+ * or language is unsupported.
+ */
+export async function chunkDocumentAsync(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+): Promise<{ text: string; pos: number }[]> {
+  const regexPoints = scanBreakPoints(content);
+  const codeFences = findCodeFences(content);
 
-  while (charPos < content.length) {
-    // Calculate target end position for this chunk
-    const targetEndPos = Math.min(charPos + maxChars, content.length);
-
-    let endPos = targetEndPos;
-
-    // If not at the end, find the best break point
-    if (endPos < content.length) {
-      // Find best cutoff using scored algorithm
-      const bestCutoff = findBestCutoff(
-        breakPoints,
-        targetEndPos,
-        windowChars,
-        0.7,
-        codeFences
-      );
-
-      // Only use the cutoff if it's within our current chunk
-      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
-        endPos = bestCutoff;
-      }
-    }
-
-    // Ensure we make progress
-    if (endPos <= charPos) {
-      endPos = Math.min(charPos + maxChars, content.length);
-    }
-
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
-
-    // Move forward, but overlap with previous chunk
-    // For last chunk, don't overlap (just go to the end)
-    if (endPos >= content.length) {
-      break;
-    }
-    charPos = endPos - overlapChars;
-    const lastChunkPos = chunks.at(-1)!.pos;
-    if (charPos <= lastChunkPos) {
-      // Prevent infinite loop - move forward at least a bit
-      charPos = endPos;
+  let breakPoints = regexPoints;
+  if (chunkStrategy === "auto" && filepath) {
+    const { getASTBreakPoints } = await import("./ast.js");
+    const astPoints = await getASTBreakPoints(content, filepath);
+    if (astPoints.length > 0) {
+      breakPoints = mergeBreakPoints(regexPoints, astPoints);
     }
   }
 
-  return chunks;
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
 }
 
 /**
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
+ *
+ * When filepath and chunkStrategy are provided, uses AST-aware break points
+ * for supported code files.
  */
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
@@ -2104,7 +2181,8 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  // Use AST-aware chunking for the first pass when filepath/strategy provided
+  let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
@@ -3674,6 +3752,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -3841,8 +3920,9 @@ export async function hybridQuery(
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
+  const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
@@ -4082,6 +4162,7 @@ export interface StructuredSearchOptions {
   intent?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -4230,9 +4311,10 @@ export async function structuredSearch(
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap

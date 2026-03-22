@@ -138,6 +138,7 @@ bun test --preload ./src/test-preload.ts test/
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
+- AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
 
 ## Important: Do NOT run automatically
 
