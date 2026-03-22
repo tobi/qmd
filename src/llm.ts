@@ -757,9 +757,16 @@ export class LlamaCpp implements LLM {
    * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
-  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
-  // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Default 2048 was too small for longer documents (e.g. session transcripts,
+  // CJK text, or large markdown files) — callers hit "input lengths exceed
+  // context size" errors even after truncation because the overhead estimate
+  // was insufficient.  4096 comfortably fits the largest real-world chunks
+  // while staying well below the 40 960-token auto size.
+  // Override with QMD_RERANK_CONTEXT_SIZE env var if you need more headroom.
+  private static readonly RERANK_CONTEXT_SIZE: number = (() => {
+    const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : 4096;
+  })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
@@ -1099,8 +1106,10 @@ export class LlamaCpp implements LLM {
     }
   }
 
-  // Qwen3 reranker chat template overhead (system prompt, tags, separators)
-  private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+  // Qwen3 reranker chat template overhead (system prompt, tags, separators).
+  // Measured at ~350 tokens on real queries; use 512 as a safe upper bound so
+  // the truncation budget never lets a document slip past the context limit.
+  private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
