@@ -2461,7 +2461,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       model: "mock-reranker",
     }));
 
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLLM").mockReturnValue({
       rerank: rerankSpy,
     } as any);
 

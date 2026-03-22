@@ -1,0 +1,36 @@
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG LLAMA_CPP_TAG=b8179
+ARG CUDA_ARCHITECTURES=75
+
+# Create libcuda.so.1 symlink so the linker can resolve the CUDA driver stub
+# (the real driver is provided at runtime by the NVIDIA container toolkit)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+    && echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf \
+    && ldconfig
+
+RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+    https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp \
+    && cd /tmp/llama.cpp \
+    && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
+    && cmake --build build --target llama-server -j$(nproc)
+
+FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy llama-server binary and all shared libraries it depends on
+# The build outputs .so files alongside the binary in build/bin/
+COPY --from=builder /tmp/llama.cpp/build/bin/ /usr/local/lib/llama/
+RUN ln -s /usr/local/lib/llama/llama-server /usr/local/bin/llama-server \
+    && echo "/usr/local/lib/llama" > /etc/ld.so.conf.d/llama.conf \
+    && ldconfig
+
+# No ENTRYPOINT — Modal runs its own Python process inside the container

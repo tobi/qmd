@@ -1,0 +1,3 @@
+modal==1.2.6
+huggingface-hub==1.7.1
+requests==2.32.5

@@ -34,11 +34,22 @@ export interface Collection {
 }
 
 /**
+ * Modal inference backend configuration
+ */
+export interface ModalConfig {
+  inference?: boolean;       // Whether to use Modal for inference (default: false)
+  gpu?: string;              // GPU type to use (default: "T4")
+  scaledown_window?: number; // Seconds before idle container scales down (default: 15)
+  region?: string;           // Modal region for worker deployment (default: "" = auto-detect)
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  modal?: ModalConfig;                        // Optional Modal inference config
 }
 
 /**
@@ -467,6 +478,36 @@ export function findContextForPath(
 
   // Fallback to global context
   return config.global_context;
+}
+
+// ============================================================================
+// Modal configuration
+// ============================================================================
+
+const MODAL_DEFAULTS: Required<ModalConfig> = {
+  inference: false,
+  gpu: "T4",
+  scaledown_window: 15,
+  region: "",
+};
+
+/**
+ * Get the modal config with defaults applied for any missing fields.
+ * Returns a fully populated ModalConfig.
+ */
+export function getModalConfig(): Required<ModalConfig> {
+  const config = loadConfig();
+  return { ...MODAL_DEFAULTS, ...config.modal };
+}
+
+/**
+ * Merge a partial modal config update into the existing config and save.
+ * Only the provided fields are updated; existing fields are preserved.
+ */
+export function setModalConfig(partial: Partial<ModalConfig>): void {
+  const config = loadConfig();
+  config.modal = { ...config.modal, ...partial };
+  saveConfig(config);
 }
 
 // ============================================================================

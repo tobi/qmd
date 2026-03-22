@@ -96,6 +96,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  getModalConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -426,34 +427,43 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
 
-  // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
-        }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
-      }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
+  // Inference backend info
+  {
+    const modalConfig = getModalConfig();
+    console.log(`\n${c.bold}Inference${c.reset}`);
+    if (modalConfig.inference) {
+      console.log(`  Backend:  ${c.green}Modal${c.reset} (remote GPU)`);
+      console.log(`  GPU:      ${modalConfig.gpu}`);
+      console.log(`  Region:   ${modalConfig.region || 'auto-detect'}`);
     } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`  Backend:  ${c.green}local${c.reset}`);
+      try {
+        const llm = getDefaultLlamaCpp();
+        const device = await llm.getDeviceInfo();
+        if (device.gpu) {
+          console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+          if (device.gpuDevices.length > 0) {
+            const counts = new Map<string, number>();
+            for (const name of device.gpuDevices) {
+              counts.set(name, (counts.get(name) || 0) + 1);
+            }
+            const deviceStr = Array.from(counts.entries())
+              .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+              .join(', ');
+            console.log(`  Devices:  ${deviceStr}`);
+          }
+          if (device.vram) {
+            console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+          }
+        } else {
+          console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+          console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+        }
+        console.log(`  CPU:      ${device.cpuCores} math cores`);
+      } catch {
+        // Don't fail status if LLM init fails
+      }
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
   }
 
   // Tips section
@@ -2942,6 +2952,15 @@ if (isMain) {
           console.error("Run 'qmd collection help' for usage");
           process.exit(1);
       }
+      break;
+    }
+
+    case "modal": {
+      const { handleModalCommand } = await import("./modal.js");
+      const result = await handleModalCommand(cli.args);
+      if (result.stderr) console.error(result.stderr);
+      if (result.stdout) console.log(result.stdout);
+      if (result.exitCode !== 0) process.exit(result.exitCode);
       break;
     }
 

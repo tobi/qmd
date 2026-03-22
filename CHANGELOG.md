@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Added: Optional Modal.com inference backend for remote GPU inference (`qmd modal deploy`)
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

@@ -17,6 +17,8 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { getModalConfig } from "./collections.js";
+import { ModalBackend } from "./modal.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -318,6 +320,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in a single batch call.
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -331,13 +338,29 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Tokenize text using the embedding model's tokenizer.
+   * Returns tokenizer tokens (opaque type from the underlying implementation).
+   */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+
+  /**
+   * Count tokens in text using the embedding model's tokenizer.
+   */
+  countTokens(text: string): Promise<number>;
+
+  /**
+   * Detokenize token IDs back to text.
+   */
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
 
   /**
    * Dispose of resources
@@ -1472,6 +1495,17 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
+  // When Modal is active, bypass LLMSessionManager entirely
+  if (getModalConfig().inference) {
+    const modalLLM = getOrCreateModalLLM();
+    const session = new ModalSession(modalLLM, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+
   const manager = getSessionManager();
   const session = new LLMSession(manager, options);
 
@@ -1483,15 +1517,23 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
- * Unlike withLLMSession, this does not use the global singleton.
+ * Execute a function with a scoped LLM session for a specific LLM instance.
+ * Dispatches to ModalSession for ModalLLM, or LLMSession for LlamaCpp.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
+  if (llm instanceof ModalLLM) {
+    const session = new ModalSession(llm, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+  const manager = new LLMSessionManager(llm as LlamaCpp);
   const session = new LLMSession(manager, options);
 
   try {
@@ -1542,5 +1584,393 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
   if (defaultLlamaCpp) {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
+  }
+}
+
+// =============================================================================
+// Modal LLM Implementation
+// =============================================================================
+
+/**
+ * Rerank context size constants (must match llama-server --ctx-size).
+ * Modal rerank server runs with --ctx-size 2048.
+ */
+const MODAL_RERANK_CONTEXT_SIZE = 2048;
+const MODAL_RERANK_TEMPLATE_OVERHEAD = 200;
+
+/**
+ * GBNF grammar for query expansion output format.
+ * Identical to the grammar used by LlamaCpp.expandQuery.
+ */
+const EXPAND_GRAMMAR = `root ::= line+
+line ::= type ": " content "\\n"
+type ::= "lex" | "vec" | "hyde"
+content ::= [^\\n]+`;
+
+/**
+ * LLM implementation that delegates inference to a Modal backend.
+ *
+ * All prompt formatting (chat templates, embedding prefixes) happens locally.
+ * Only raw inference calls (embed, generate, rerank) go to Modal.
+ */
+export class ModalLLM implements LLM {
+  private backend: ModalBackend;
+
+  constructor(backend?: ModalBackend) {
+    this.backend = backend ?? new ModalBackend();
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const isQuery = options.isQuery ?? true;
+    const formattedText = isQuery
+      ? formatQueryForEmbedding(text)
+      : formatDocForEmbedding(text, options.title);
+
+    const vectors = await this.backend.embed([formattedText]);
+    if (!vectors || vectors.length === 0) return null;
+
+    return {
+      embedding: vectors[0]!,
+      model: "modal",
+    };
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    const vectors = await this.backend.embed(texts);
+    return vectors.map((v) => (v ? { embedding: v, model: "modal" } : null));
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    const maxTokens = options.maxTokens ?? 150;
+    const text = await this.backend.generate(prompt, null, maxTokens, "expand");
+    return {
+      text,
+      model: "modal",
+      done: true,
+    };
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean; intent?: string } = {},
+  ): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const intent = options.intent;
+
+    const userMessage = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
+
+    // Build the full Qwen3 chat template as a raw string.
+    // The Python side does raw completion only — no template application.
+    const fullPrompt =
+      `<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n` +
+      `<|im_start|>user\n${userMessage}<|im_end|>\n` +
+      `<|im_start|>assistant\n`;
+
+    // TODO: Generation params (temperature=0.7, top_k=20, top_p=0.8) should be
+    // configurable and passed to the Python side's generate(). For now, the
+    // Python model uses its defaults.
+    const result = await this.backend.generate(fullPrompt, EXPAND_GRAMMAR, 600, "expand");
+
+    return parseExpandResult(result, query, includeLexical);
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    _options: RerankOptions = {},
+  ): Promise<RerankResult> {
+    if (documents.length === 0) {
+      return { results: [], model: "modal" };
+    }
+
+    // Token-level truncation (same logic as LlamaCpp.rerank).
+    // Budget = contextSize - template overhead - query tokens
+    const queryTokens = await this.countTokens(query);
+    const maxDocTokens = MODAL_RERANK_CONTEXT_SIZE - MODAL_RERANK_TEMPLATE_OVERHEAD - queryTokens;
+
+    // Truncate documents that would exceed the rerank context size.
+    // Use a cache to avoid re-tokenizing identical documents.
+    const truncationCache = new Map<string, string>();
+    const truncatedDocs = await Promise.all(
+      documents.map(async (doc) => {
+        const cached = truncationCache.get(doc.text);
+        if (cached !== undefined) {
+          return cached === doc.text ? doc : { ...doc, text: cached };
+        }
+
+        const tokens = await this.tokenize(doc.text);
+        const truncatedText = tokens.length <= maxDocTokens
+          ? doc.text
+          : await this.detokenize(tokens.slice(0, maxDocTokens));
+        truncationCache.set(doc.text, truncatedText);
+
+        return truncatedText === doc.text ? doc : { ...doc, text: truncatedText };
+      }),
+    );
+
+    // Deduplicate identical texts before scoring
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
+    for (let i = 0; i < truncatedDocs.length; i++) {
+      const doc = truncatedDocs[i]!;
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index: i });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index: i }]);
+      }
+    }
+
+    const uniqueTexts = Array.from(textToDocs.keys());
+    const scores = await this.backend.rerank(query, uniqueTexts);
+
+    // Build ranked results sorted by score descending
+    const scored = uniqueTexts
+      .map((text, i) => ({ text, score: scores[i]! }))
+      .sort((a, b) => b.score - a.score);
+
+    const results: RerankDocumentResult[] = [];
+    for (const item of scored) {
+      const docInfos = textToDocs.get(item.text) ?? [];
+      for (const info of docInfos) {
+        results.push({
+          file: info.file,
+          score: item.score,
+          index: info.index,
+        });
+      }
+    }
+
+    return { results, model: "modal" };
+  }
+
+  async modelExists(_model: string): Promise<ModelInfo> {
+    return { name: "modal", exists: true };
+  }
+
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    const tokens = await this.backend.tokenize([text]);
+    return (tokens[0] ?? []) as unknown as readonly LlamaToken[];
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return (await this.tokenize(text)).length;
+  }
+
+  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    return this.backend.detokenize(tokens as unknown as number[]);
+  }
+
+  async dispose(): Promise<void> {
+    this.backend.dispose();
+  }
+
+  /** Expose backend for ping/validation. */
+  getBackend(): ModalBackend {
+    return this.backend;
+  }
+}
+
+/**
+ * Parse the raw text output from query expansion into Queryable objects.
+ * Mirrors the parsing logic in LlamaCpp.expandQuery.
+ */
+function parseExpandResult(
+  raw: string,
+  query: string,
+  includeLexical: boolean,
+): Queryable[] {
+  const lines = raw.trim().split("\n");
+  const queryLower = query.toLowerCase();
+  const queryTerms = queryLower
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const hasQueryTerm = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    if (queryTerms.length === 0) return true;
+    return queryTerms.some((term) => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines
+    .map((line) => {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx === -1) return null;
+      const type = line.slice(0, colonIdx).trim();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+      const text = line.slice(colonIdx + 1).trim();
+      if (!hasQueryTerm(text)) return null;
+      return { type: type as QueryType, text };
+    })
+    .filter((q): q is Queryable => q !== null);
+
+  const filtered = includeLexical
+    ? queryables
+    : queryables.filter((q) => q.type !== "lex");
+
+  if (filtered.length > 0) return filtered;
+
+  // Fallback to basic queries
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${query}` },
+    { type: "lex", text: query },
+    { type: "vec", text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter((q) => q.type !== "lex");
+}
+
+// =============================================================================
+// Modal LLM Singleton
+// =============================================================================
+
+let defaultModalLLM: ModalLLM | null = null;
+
+/**
+ * Get or create the singleton ModalLLM instance.
+ */
+export function getOrCreateModalLLM(): ModalLLM {
+  if (!defaultModalLLM) {
+    defaultModalLLM = new ModalLLM();
+  }
+  return defaultModalLLM;
+}
+
+/**
+ * Reset the ModalLLM singleton (for testing).
+ */
+export function resetModalLLM(): void {
+  defaultModalLLM = null;
+}
+
+/**
+ * Get the default LLM based on modal configuration.
+ * When modal.inference=true, returns ModalLLM. Otherwise returns LlamaCpp.
+ */
+export function getDefaultLLM(): LLM {
+  if (getModalConfig().inference) return getOrCreateModalLLM();
+  return getDefaultLlamaCpp();
+}
+
+/**
+ * Validate that the Modal backend is reachable.
+ * Calls ping() and throws with a clear error message on failure.
+ */
+export async function validateModalConnection(): Promise<void> {
+  const modalLLM = getOrCreateModalLLM();
+  try {
+    const ok = await modalLLM.getBackend().ping();
+    if (!ok) {
+      throw new Error("ping returned false");
+    }
+  } catch (err) {
+    throw new Error(
+      `Modal inference is enabled but the deployed function is not reachable.\n` +
+        `Run 'qmd modal status' to check deployment, or 'qmd modal deploy' to redeploy.\n` +
+        `Original error: ${err instanceof Error ? err.message : err}`,
+    );
+  }
+}
+
+// =============================================================================
+// Modal Session — thin ILLMSession wrapper for ModalLLM
+// =============================================================================
+
+/**
+ * Lightweight session wrapper for ModalLLM.
+ * No concurrency tracking or inactivity timeout — Modal handles that server-side.
+ */
+class ModalSession implements ILLMSession {
+  private modalLLM: ModalLLM;
+  private released = false;
+  private abortController: AbortController;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(modalLLM: ModalLLM, options: LLMSessionOptions = {}) {
+    this.modalLLM = modalLLM;
+    this.abortController = new AbortController();
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.abortController.abort(options.signal.reason);
+      } else {
+        options.signal.addEventListener(
+          "abort",
+          () => this.abortController.abort(options.signal!.reason),
+          { once: true },
+        );
+      }
+    }
+
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000;
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(
+          new Error(`Modal session exceeded max duration of ${maxDuration}ms`),
+        );
+      }, maxDuration);
+      this.maxDurationTimer.unref();
+    }
+  }
+
+  get isValid(): boolean {
+    return !this.released && !this.abortController.signal.aborted;
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.maxDurationTimer) {
+      clearTimeout(this.maxDurationTimer);
+      this.maxDurationTimer = null;
+    }
+    this.abortController.abort(new Error("Session released"));
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.embed(text, options);
+  }
+
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    const results: (EmbeddingResult | null)[] = [];
+    for (const text of texts) {
+      results.push(await this.modalLLM.embed(text));
+    }
+    return results;
+  }
+
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.tokenize(text);
+  }
+
+  async countTokens(text: string): Promise<number> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.countTokens(text);
+  }
+
+  async expandQuery(
+    query: string,
+    options?: { context?: string; includeLexical?: boolean },
+  ): Promise<Queryable[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.expandQuery(query, options);
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options?: RerankOptions,
+  ): Promise<RerankResult> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.modalLLM.rerank(query, documents, options);
   }
 }
