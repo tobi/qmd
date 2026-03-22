@@ -1746,6 +1746,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  recencyDays?: number;  // Temporal relevance boost half-life in days
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2229,6 +2230,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        recency: opts.recencyDays ? { halfLife: opts.recencyDays, weight: 0.15 } : undefined,
         explain: !!opts.explain,
         intent,
         hooks: {
@@ -2256,6 +2258,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        recency: opts.recencyDays ? { halfLife: opts.recencyDays, weight: 0.15 } : undefined,
         explain: !!opts.explain,
         intent,
         hooks: {
@@ -2371,6 +2374,7 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "recency-days": { type: "string" },
       intent: { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
@@ -2411,6 +2415,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    recencyDays: values["recency-days"] ? parseInt(String(values["recency-days"]), 10) : undefined,
     explain: !!values.explain,
     intent: values.intent as string | undefined,
   };
@@ -2630,6 +2635,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --recency-days <n>         - Boost recent documents (half-life in days, e.g. 30)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");

@@ -296,9 +296,12 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
+        recencyDays: z.number().optional().describe(
+          "Boost recent documents with temporal decay. Value is the half-life in days (e.g. 30 = documents from 30 days ago score ~7.5% lower). Useful for journals, meeting notes, and evolving knowledge bases."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent, recencyDays }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -314,6 +317,7 @@ Intent-aware lex (C++ performance, not sports):
         limit,
         minScore,
         intent,
+        recency: recencyDays ? { halfLife: recencyDays, weight: 0.15 } : undefined,
       });
 
       // Use first lex or vec query for snippet extraction
