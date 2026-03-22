@@ -112,6 +112,7 @@ export type { InternalStore };
 // Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
 export type { ChunkStrategy } from "./store.js";
+export type { SymbolInfo } from "./ast.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
 export { getDefaultDbPath } from "./store.js";
@@ -163,7 +164,7 @@ export interface SearchOptions {
   minScore?: number;
   /** Include explain traces */
   explain?: boolean;
-  /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
+  /** Chunk strategy: "regex" (default, existing behavior) or "auto" (uses AST for code files) */
   chunkStrategy?: ChunkStrategy;
 }
 

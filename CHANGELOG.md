@@ -13,6 +13,13 @@
   chunking for code files.
 - `qmd status` now shows AST grammar availability.
 - SDK: `chunkStrategy` option on `embed()` and `search()` methods.
+- Symbol extraction: search results now include function names, class
+  names, signatures, and kinds for code files. Symbols appear in CLI
+  output, JSON, and MCP query responses. Embedding vectors are enriched
+  with symbol names for better semantic retrieval. Run `qmd embed -f`
+  after upgrading to benefit from symbol-enriched embeddings.
+- SDK: `SymbolInfo` type exported. `HybridQueryResult.symbols` field
+  contains extracted symbols for the best chunk.
 
 ### Fixes
 

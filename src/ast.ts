@@ -1,8 +1,8 @@
 /**
- * AST-aware chunking support via web-tree-sitter.
+ * AST-aware chunking and symbol extraction via web-tree-sitter.
  *
  * Provides language detection, AST break point extraction for supported
- * code file types, and a stub for future symbol extraction.
+ * code file types, and symbol extraction (names, kinds, signatures).
  *
  * All functions degrade gracefully: parse failures or unsupported languages
  * return empty arrays, falling back to regex-only chunking.
@@ -26,6 +26,7 @@ import type { BreakPoint } from "./store.js";
 type ParserType = import("web-tree-sitter").Parser;
 type LanguageType = import("web-tree-sitter").Language;
 type QueryType = import("web-tree-sitter").Query;
+type NodeType = import("web-tree-sitter").Node;
 
 // =============================================================================
 // Language Detection
@@ -60,12 +61,12 @@ export function detectLanguage(filepath: string): SupportedLanguage | null {
 // Grammar Resolution
 // =============================================================================
 
-/**
- * Maps language to the npm package and wasm filename for the grammar.
- */
 const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
   typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm" },
+  // JavaScript uses the TypeScript grammar — TS is a superset so the parser handles
+  // plain JS correctly, and we avoid an extra grammar dependency. Symbol queries use
+  // TS node types (e.g. type_identifier) which also work for JS ASTs.
   javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
@@ -77,12 +78,7 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
 // =============================================================================
 
 /**
- * Tree-sitter S-expression queries for each language.
- * Each capture name maps to a break point score via SCORE_MAP.
- *
- * For TypeScript/JavaScript, we match export_statement wrappers to get the
- * correct start position (before `export`), plus bare declarations for
- * non-exported code.
+ * Breakpoint queries — capture outer nodes for chunk boundary scoring.
  */
 const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
   typescript: `
@@ -144,9 +140,56 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
 };
 
 /**
+ * Symbol queries — capture both outer node and name child for extraction.
+ */
+const SYMBOL_QUERIES: Record<SupportedLanguage, string> = {
+  typescript: `
+    (class_declaration name: (type_identifier) @class_name) @class
+    (function_declaration name: (identifier) @func_name) @func
+    (method_definition name: (property_identifier) @method_name) @method
+    (interface_declaration name: (type_identifier) @iface_name) @iface
+    (type_alias_declaration name: (type_identifier) @type_name) @type
+    (enum_declaration name: (identifier) @enum_name) @enum
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (arrow_function))) @func
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (function_expression))) @func
+  `,
+  tsx: `
+    (class_declaration name: (type_identifier) @class_name) @class
+    (function_declaration name: (identifier) @func_name) @func
+    (method_definition name: (property_identifier) @method_name) @method
+    (interface_declaration name: (type_identifier) @iface_name) @iface
+    (type_alias_declaration name: (type_identifier) @type_name) @type
+    (enum_declaration name: (identifier) @enum_name) @enum
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (arrow_function))) @func
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (function_expression))) @func
+  `,
+  javascript: `
+    (class_declaration name: (type_identifier) @class_name) @class
+    (function_declaration name: (identifier) @func_name) @func
+    (method_definition name: (property_identifier) @method_name) @method
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (arrow_function))) @func
+    (lexical_declaration (variable_declarator name: (identifier) @func_name value: (function_expression))) @func
+  `,
+  python: `
+    (class_definition name: (identifier) @class_name) @class
+    (function_definition name: (identifier) @func_name) @func
+  `,
+  go: `
+    (function_declaration name: (identifier) @func_name) @func
+    (method_declaration name: (field_identifier) @method_name) @method
+    (type_declaration (type_spec name: (type_identifier) @type_name)) @type
+  `,
+  rust: `
+    (function_item name: (identifier) @func_name) @func
+    (struct_item name: (type_identifier) @struct_name) @struct
+    (impl_item type: (type_identifier) @impl_name) @impl
+    (trait_item name: (type_identifier) @trait_name) @trait
+    (enum_item name: (type_identifier) @enum_name) @enum
+  `,
+};
+
+/**
  * Score mapping from capture names to break point scores.
- * Aligned with the markdown BREAK_PATTERNS scale (h1=100, h2=90, etc.)
- * so findBestCutoff() decay works unchanged.
  */
 const SCORE_MAP: Record<string, number> = {
   class:     100,
@@ -164,6 +207,47 @@ const SCORE_MAP: Record<string, number> = {
   import:     60,
 };
 
+/**
+ * Maps symbol capture names to user-facing kind strings.
+ */
+const KIND_MAP: Record<string, string> = {
+  class:  "class",
+  iface:  "interface",
+  struct: "struct",
+  trait:  "trait",
+  impl:   "impl",
+  func:   "function",
+  method: "method",
+  type:   "type",
+  enum:   "enum",
+};
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/**
+ * Internal symbol with byte offset — used for chunk-to-symbol mapping.
+ * Never exposed through SDK/MCP/CLI.
+ */
+export interface InternalSymbol {
+  name: string;
+  kind: string;
+  signature?: string;
+  line: number;
+  pos: number;
+}
+
+/**
+ * Public symbol type — user-facing, no internal byte offset.
+ */
+export interface SymbolInfo {
+  name: string;
+  kind: string;
+  signature?: string;
+  line: number;
+}
+
 // =============================================================================
 // Parser Caching & Initialization
 // =============================================================================
@@ -179,8 +263,11 @@ const failedLanguages = new Set<string>();
 /** Cached grammar load promises. */
 const grammarCache = new Map<string, Promise<LanguageType>>();
 
-/** Cached compiled queries per language. */
+/** Cached compiled breakpoint queries per language. */
 const queryCache = new Map<string, QueryType>();
+
+/** Cached compiled symbol queries per language. */
+const symbolQueryCache = new Map<string, QueryType>();
 
 /**
  * Initialize web-tree-sitter. Called once and cached.
@@ -200,7 +287,6 @@ async function ensureInit(): Promise<void> {
 
 /**
  * Resolve the filesystem path to a grammar .wasm file.
- * Uses createRequire to resolve from installed dependency packages.
  */
 function resolveGrammarPath(language: SupportedLanguage): string {
   const { pkg, wasm } = GRAMMAR_MAP[language];
@@ -234,9 +320,9 @@ async function loadGrammar(language: SupportedLanguage): Promise<LanguageType | 
 }
 
 /**
- * Get or create a compiled query for the given language.
+ * Get or create a compiled breakpoint query for the given language.
  */
-function getQuery(language: SupportedLanguage, grammar: LanguageType): QueryType {
+function getBreakpointQuery(language: SupportedLanguage, grammar: LanguageType): QueryType {
   if (!queryCache.has(language)) {
     const source = LANGUAGE_QUERIES[language];
     const query = new QueryClass!(grammar, source);
@@ -245,69 +331,221 @@ function getQuery(language: SupportedLanguage, grammar: LanguageType): QueryType
   return queryCache.get(language)!;
 }
 
+/**
+ * Get or create a compiled symbol query for the given language.
+ */
+function getSymbolQuery(language: SupportedLanguage, grammar: LanguageType): QueryType {
+  if (!symbolQueryCache.has(language)) {
+    const source = SYMBOL_QUERIES[language];
+    const query = new QueryClass!(grammar, source);
+    symbolQueryCache.set(language, query);
+  }
+  return symbolQueryCache.get(language)!;
+}
+
 // =============================================================================
-// AST Break Point Extraction
+// Signature Extraction
 // =============================================================================
 
 /**
- * Parse a source file and return break points at AST node boundaries.
- *
- * Returns an empty array for unsupported languages, parse failures,
- * or grammar loading failures. Never throws.
- *
- * @param content - The file content to parse.
- * @param filepath - The file path (used for language detection).
- * @returns Array of BreakPoint objects suitable for merging with regex break points.
+ * Child node types to include when building a signature.
+ * These contain parameters and return types.
  */
-export async function getASTBreakPoints(
+const SIGNATURE_INCLUDE_TYPES = new Set([
+  // TypeScript / JavaScript
+  "formal_parameters", "type_annotation",
+  // Python
+  "parameters",
+  // Go
+  "parameter_list", "pointer_type", "qualified_type",
+  "slice_type", "map_type", "array_type", "generic_type",
+  // Rust
+  "parameters",
+]);
+
+/**
+ * Child node types to skip when building a signature.
+ * These contain implementation bodies, keywords, or name nodes we don't need.
+ */
+const SIGNATURE_SKIP_TYPES = new Set([
+  "statement_block", "block", "body", "declaration_list",
+  "field_declaration_list", "enum_variant_list",
+  "visibility_modifier", "pub", "async", "def", "fn", "func", "function",
+  "class", "interface", "type", "struct", "trait", "impl", "enum",
+  "identifier", "type_identifier", "property_identifier", "field_identifier",
+  ":", "comment",
+  // Go/Rust type-related keywords
+  "type_spec",
+]);
+
+/**
+ * Symbol kinds that are "type-like" — they don't have meaningful signatures.
+ * The name field already carries all the identity info; a signature would
+ * just repeat the name or capture irrelevant child text.
+ */
+const NO_SIGNATURE_KINDS = new Set([
+  "class", "interface", "struct", "enum", "trait", "impl", "type",
+]);
+
+/**
+ * Extract a compact signature from an AST node by concatenating
+ * parameter and type children, skipping body/keyword children.
+ */
+function extractSignature(node: NodeType, kind: string, language: SupportedLanguage): string | undefined {
+  // Type-like declarations don't have meaningful signatures
+  if (NO_SIGNATURE_KINDS.has(kind)) return undefined;
+
+  // For lexical_declaration wrapping arrow/function expressions,
+  // drill into the actual function node for signature children
+  let sigNode = node;
+  if (node.type === "lexical_declaration") {
+    for (const child of node.children) {
+      if (child.type === "variable_declarator") {
+        for (const grandchild of child.children) {
+          if (grandchild.type === "arrow_function" || grandchild.type === "function_expression") {
+            sigNode = grandchild;
+            break;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  const parts: string[] = [];
+
+  for (const child of sigNode.children) {
+    const t = child.type;
+
+    if (SIGNATURE_INCLUDE_TYPES.has(t)) {
+      parts.push(child.text);
+    } else if (t === "->" && (language === "python" || language === "rust")) {
+      parts.push("->");
+    } else if (t === "type" && language === "python") {
+      // Python return type after ->
+      parts.push(child.text);
+    } else if (language === "go" && t === "type_identifier") {
+      // Go return type (e.g., "error", "string") — must check before SKIP set
+      parts.push(child.text);
+    } else if (language === "rust" && (t === "type_identifier" || t === "generic_type" || t === "scoped_type_identifier")) {
+      // Rust return type after -> — must check before SKIP set
+      parts.push(child.text);
+    } else if (SIGNATURE_SKIP_TYPES.has(t)) {
+      continue;
+    }
+  }
+
+  if (parts.length === 0) return undefined;
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+// =============================================================================
+// Unified Parse: Breakpoints + Symbols from One Tree
+// =============================================================================
+
+/**
+ * Parse a code file once and extract both break points and symbols.
+ * This is the single-parse optimization — avoids parsing the same file twice
+ * during embedding (once for chunking, once for symbols).
+ *
+ * Returns empty results for unsupported languages or parse failures.
+ */
+export async function parseCodeFile(
   content: string,
   filepath: string,
-): Promise<BreakPoint[]> {
+): Promise<{ breakPoints: BreakPoint[]; symbols: InternalSymbol[] }> {
+  const empty = { breakPoints: [], symbols: [] };
   const language = detectLanguage(filepath);
-  if (!language) return [];
+  if (!language) return empty;
 
   try {
     await ensureInit();
 
     const grammar = await loadGrammar(language);
-    if (!grammar) return [];
+    if (!grammar) return empty;
 
     const parser = new ParserClass!();
-    parser.setLanguage(grammar);
+    let tree: ReturnType<typeof parser.parse> | null = null;
+    try {
+      parser.setLanguage(grammar);
 
-    const tree = parser.parse(content);
-    if (!tree) {
+      tree = parser.parse(content);
+      if (!tree) {
+        return empty;
+      }
+
+      // --- Break points (same logic as getASTBreakPoints) ---
+      const bpQuery = getBreakpointQuery(language, grammar);
+      const bpCaptures = bpQuery.captures(tree.rootNode);
+
+      const bpSeen = new Map<number, BreakPoint>();
+      for (const cap of bpCaptures) {
+        const pos = cap.node.startIndex;
+        const score = SCORE_MAP[cap.name] ?? 20;
+        const type = `ast:${cap.name}`;
+        const existing = bpSeen.get(pos);
+        if (!existing || score > existing.score) {
+          bpSeen.set(pos, { pos, score, type });
+        }
+      }
+      const breakPoints = Array.from(bpSeen.values()).sort((a, b) => a.pos - b.pos);
+
+      // --- Symbols ---
+      const symQuery = getSymbolQuery(language, grammar);
+      const symMatches = symQuery.matches(tree.rootNode);
+      const symbols = extractSymbolsFromMatches(symMatches, language);
+
+      return { breakPoints, symbols };
+    } finally {
+      tree?.delete();
       parser.delete();
-      return [];
     }
+  } catch (err) {
+    console.warn(`[qmd] AST parse failed for ${filepath}, falling back to regex: ${err instanceof Error ? err.message : err}`);
+    return empty;
+  }
+}
 
-    const query = getQuery(language, grammar);
-    const captures = query.captures(tree.rootNode);
+/**
+ * Process tree-sitter query matches into InternalSymbol[].
+ */
+function extractSymbolsFromMatches(
+  matches: import("web-tree-sitter").QueryMatch[],
+  language: SupportedLanguage,
+): InternalSymbol[] {
+  const symbols: InternalSymbol[] = [];
 
-    // Deduplicate: at each byte position, keep the highest-scoring capture.
-    // This handles cases like export_statement wrapping a class_declaration
-    // at different offsets — we want the outermost (earliest) position.
-    const seen = new Map<number, BreakPoint>();
+  for (const match of matches) {
+    let outerNode: NodeType | null = null;
+    let nameText: string | null = null;
+    let captureName: string | null = null;
 
-    for (const cap of captures) {
-      const pos = cap.node.startIndex;
-      const score = SCORE_MAP[cap.name] ?? 20;
-      const type = `ast:${cap.name}`;
-
-      const existing = seen.get(pos);
-      if (!existing || score > existing.score) {
-        seen.set(pos, { pos, score, type });
+    for (const cap of match.captures) {
+      if (cap.name.endsWith("_name")) {
+        nameText = cap.node.text;
+      } else {
+        outerNode = cap.node;
+        captureName = cap.name;
       }
     }
 
-    tree.delete();
-    parser.delete();
+    if (!outerNode || !nameText || !captureName) continue;
 
-    return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
-  } catch (err) {
-    console.warn(`[qmd] AST parse failed for ${filepath}, falling back to regex: ${err instanceof Error ? err.message : err}`);
-    return [];
+    const kind = KIND_MAP[captureName];
+    if (!kind) continue;
+
+    const signature = extractSignature(outerNode, kind, language);
+
+    symbols.push({
+      name: nameText,
+      kind,
+      signature,
+      line: outerNode.startPosition.row + 1,
+      pos: outerNode.startIndex,
+    });
   }
+
+  return symbols.sort((a, b) => a.pos - b.pos);
 }
 
 // =============================================================================
@@ -341,8 +579,9 @@ export async function getASTStatus(): Promise<{
     try {
       const grammar = await loadGrammar(lang);
       if (grammar) {
-        // Also verify the query compiles
-        getQuery(lang, grammar);
+        // Verify both breakpoint and symbol queries compile
+        getBreakpointQuery(lang, grammar);
+        getSymbolQuery(lang, grammar);
         languages.push({ language: lang, available: true });
       } else {
         languages.push({ language: lang, available: false, error: "grammar failed to load" });
@@ -363,29 +602,49 @@ export async function getASTStatus(): Promise<{
 }
 
 // =============================================================================
-// Symbol Extraction (Phase 2 Stub)
+// Public API: Break Point Extraction
 // =============================================================================
 
 /**
- * Metadata about a code symbol within a chunk.
- * Stubbed for Phase 2 — always returns empty array in Phase 1.
+ * Parse a source file and return break points at AST node boundaries.
+ * Delegates to parseCodeFile() for the actual parsing.
  */
-export interface SymbolInfo {
-  name: string;
-  kind: string;
-  signature?: string;
-  line: number;
+export async function getASTBreakPoints(
+  content: string,
+  filepath: string,
+): Promise<BreakPoint[]> {
+  const { breakPoints } = await parseCodeFile(content, filepath);
+  return breakPoints;
+}
+
+// =============================================================================
+// Public API: Symbol Extraction
+// =============================================================================
+
+/**
+ * Extract all symbols from a source file. Returns InternalSymbol[] with
+ * byte offsets for chunk-to-symbol mapping during embedding.
+ */
+export async function extractAllSymbols(
+  content: string,
+  filepath: string,
+): Promise<InternalSymbol[]> {
+  const { symbols } = await parseCodeFile(content, filepath);
+  return symbols;
 }
 
 /**
- * Extract symbol metadata for code within a byte range.
- * Stubbed for Phase 2 — returns empty array.
+ * Extract symbols within a byte range. Returns public SymbolInfo[] (no pos).
+ * Used at query time to enrich search results.
  */
-export function extractSymbols(
-  _content: string,
-  _language: string,
-  _startPos: number,
-  _endPos: number,
-): SymbolInfo[] {
-  return [];
+export async function extractSymbols(
+  content: string,
+  filepath: string,
+  startPos: number,
+  endPos: number,
+): Promise<SymbolInfo[]> {
+  const all = await extractAllSymbols(content, filepath);
+  return all
+    .filter(s => s.pos >= startPos && s.pos < endPos)
+    .map(({ name, kind, signature, line }) => ({ name, kind, signature, line }));
 }

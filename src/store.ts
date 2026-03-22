@@ -13,6 +13,7 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
+import type { SymbolInfo } from "./ast.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -791,9 +792,19 @@ function initializeDatabase(db: Database): void {
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
+      symbols TEXT,
       PRIMARY KEY (hash, seq)
     )
   `);
+
+  // Migration: add symbols column if missing (existing databases)
+  try {
+    db.exec(`ALTER TABLE content_vectors ADD COLUMN symbols TEXT`);
+  } catch (err: unknown) {
+    // Only swallow "duplicate column" — rethrow real errors (disk full, corruption, etc.)
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("duplicate column")) throw err;
+  }
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -1133,7 +1144,7 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, symbols?: string | null) => void;
 };
 
 // =============================================================================
@@ -1302,6 +1313,7 @@ type ChunkItem = {
   pos: number;
   tokens: number;
   bytes: number;
+  symbols?: import("./ast.js").InternalSymbol[];
 };
 
 function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
@@ -1431,27 +1443,42 @@ export async function generateEmbeddings(
       const batchChunks: ChunkItem[] = [];
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
+      // Dynamic import of AST module for single-parse optimization
+      const { parseCodeFile } = await import("./ast.js");
+
       for (const doc of batchDocs) {
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
+
+        // Single parse: get both breakpoints and symbols from one tree-sitter pass
+        const { breakPoints, symbols: allSymbols } = await parseCodeFile(doc.body, doc.path);
+
+        // Chunk using precomputed breakpoints (no second AST parse)
         const chunks = await chunkDocumentByTokens(
           doc.body,
           undefined, undefined, undefined,
           doc.path,
           options?.chunkStrategy,
+          breakPoints.length > 0 ? breakPoints : undefined,
           session.signal,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
+          const chunk = chunks[seq]!;
+          // Map symbols to this chunk by byte range (chunks overlap, so a symbol may appear in multiple chunks)
+          const chunkEnd = chunk.pos + chunk.text.length;
+          const chunkSymbols = allSymbols.filter(s => s.pos >= chunk.pos && s.pos < chunkEnd);
+
           batchChunks.push({
             hash: doc.hash,
             title,
-            text: chunks[seq]!.text,
+            text: chunk.text,
             seq,
-            pos: chunks[seq]!.pos,
-            tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
+            pos: chunk.pos,
+            tokens: chunk.tokens,
+            bytes: encoder.encode(chunk.text).length,
+            symbols: chunkSymbols.length > 0 ? chunkSymbols : undefined,
           });
         }
       }
@@ -1466,7 +1493,8 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+        const firstSymbolNames = firstChunk.symbols?.map(s => s.name);
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, undefined, firstSymbolNames);
         const firstResult = await session.embed(firstText);
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1498,7 +1526,10 @@ export async function generateEmbeddings(
 
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+        const texts = chunkBatch.map(chunk => {
+          const symbolNames = chunk.symbols?.map(s => s.name);
+          return formatDocForEmbedding(chunk.text, chunk.title, undefined, symbolNames);
+        });
 
         try {
           const embeddings = await session.embedBatch(texts);
@@ -1506,7 +1537,8 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              const symbolsJson = chunk.symbols ? JSON.stringify(chunk.symbols) : null;
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, symbolsJson);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1522,10 +1554,12 @@ export async function generateEmbeddings(
           } else {
             for (const chunk of chunkBatch) {
               try {
-                const text = formatDocForEmbedding(chunk.text, chunk.title);
+                const symbolNames = chunk.symbols?.map(s => s.name);
+                const text = formatDocForEmbedding(chunk.text, chunk.title, undefined, symbolNames);
                 const result = await session.embed(text);
                 if (result) {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                  const symbolsJson = chunk.symbols ? JSON.stringify(chunk.symbols) : null;
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, symbolsJson);
                   chunksEmbedded++;
                 } else {
                   errors++;
@@ -1645,7 +1679,7 @@ export function createStore(dbPath?: string): Store {
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, symbols?: string | null) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, symbols),
   };
 
   return store;
@@ -2169,12 +2203,17 @@ export async function chunkDocumentAsync(
   windowChars: number = CHUNK_WINDOW_CHARS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
+  precomputedBreakPoints?: BreakPoint[],
 ): Promise<{ text: string; pos: number }[]> {
   const regexPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
 
   let breakPoints = regexPoints;
-  if (chunkStrategy === "auto" && filepath) {
+  if (precomputedBreakPoints && precomputedBreakPoints.length > 0) {
+    // Use precomputed AST break points (from parseCodeFile single-parse optimization)
+    breakPoints = mergeBreakPoints(regexPoints, precomputedBreakPoints);
+  } else if (chunkStrategy === "auto" && filepath) {
+    // Fallback: parse on demand (non-embedding callers)
     const { getASTBreakPoints } = await import("./ast.js");
     const astPoints = await getASTBreakPoints(content, filepath);
     if (astPoints.length > 0) {
@@ -2199,6 +2238,7 @@ export async function chunkDocumentByTokens(
   windowTokens: number = CHUNK_WINDOW_TOKENS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
+  precomputedBreakPoints?: BreakPoint[],
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
@@ -2212,7 +2252,7 @@ export async function chunkDocumentByTokens(
 
   // Chunk in character space with conservative estimate
   // Use AST-aware chunking for the first pass when filepath/strategy provided
-  let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+  let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy, precomputedBreakPoints);
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
@@ -3127,13 +3167,14 @@ export function insertEmbedding(
   pos: number,
   embedding: Float32Array,
   model: string,
-  embeddedAt: string
+  embeddedAt: string,
+  symbols?: string | null
 ): void {
   const hashSeq = `${hash}_${seq}`;
 
   // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, symbols) VALUES (?, ?, ?, ?, ?, ?)`);
+  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt, symbols ?? null);
 
   // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
   const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
@@ -3870,6 +3911,7 @@ export interface HybridQueryResult {
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
   explain?: HybridQueryExplain;
+  symbols?: import("./ast.js").SymbolInfo[];  // symbols in best chunk (Phase 2)
 }
 
 export type RankedListMeta = {
@@ -3891,6 +3933,69 @@ export type RankedListMeta = {
  * 7. Position-aware score blending (RRF rank × reranker score)
  * 8. Dedup by file, filter by minScore, slice to limit
  */
+
+/**
+ * Enrich final search results with symbol metadata.
+ * Reads pre-extracted symbols from the content_vectors table (stored during embedding)
+ * and falls back to on-demand tree-sitter parsing only when stored symbols are unavailable.
+ */
+async function enrichWithSymbols(db: Database, results: HybridQueryResult[]): Promise<HybridQueryResult[]> {
+  if (results.length === 0) return results;
+
+  // Try to load symbols from DB first (written during `qmd embed --chunk-strategy auto`)
+  const stmt = db.prepare(`SELECT hash, seq, pos, symbols FROM content_vectors WHERE symbols IS NOT NULL`);
+  const allStoredRows = stmt.all() as { hash: string; seq: number; pos: number; symbols: string }[];
+
+  // Index stored symbols by hash for fast lookup
+  const storedByHash = new Map<string, { seq: number; pos: number; symbols: string }[]>();
+  for (const row of allStoredRows) {
+    let arr = storedByHash.get(row.hash);
+    if (!arr) { arr = []; storedByHash.set(row.hash, arr); }
+    arr.push(row);
+  }
+
+  // Lazy-load AST module only if we need on-demand parsing
+  let extractSymbolsFn: typeof import("./ast.js")["extractSymbols"] | null = null;
+
+  // Process sequentially to avoid unbounded concurrent WASM tree-sitter parses.
+  // The DB lookup path (common case) is synchronous, so Promise.all gives no
+  // benefit there, and the fallback parse path allocates WASM linear memory
+  // that isn't GC'd — 50 concurrent parses would spike memory.
+  const enriched: HybridQueryResult[] = [];
+  for (const r of results) {
+    // Attempt 1: Read stored symbols from the chunk overlapping bestChunkPos
+    const docHash = r.docid?.replace(/^#/, "");
+    const storedChunks = docHash ? storedByHash.get(docHash) : undefined;
+    if (storedChunks) {
+      // Find chunks whose byte range overlaps the best chunk
+      const bestChunkEnd = r.bestChunkPos + r.bestChunk.length;
+      const matching = storedChunks.filter(c => c.pos >= 0 && c.pos <= bestChunkEnd);
+
+      // Collect symbols from all matching chunks, parse the stored JSON
+      const symbols: SymbolInfo[] = [];
+      for (const chunk of matching) {
+        try {
+          const parsed = JSON.parse(chunk.symbols) as SymbolInfo[];
+          for (const s of parsed) {
+            if (!symbols.some(existing => existing.name === s.name && existing.kind === s.kind)) {
+              symbols.push(s);
+            }
+          }
+        } catch { /* corrupt JSON — fall through to on-demand */ }
+      }
+      if (symbols.length > 0) { enriched.push({ ...r, symbols }); continue; }
+    }
+
+    // Attempt 2: On-demand tree-sitter parse (for files not yet re-embedded with symbols)
+    if (!extractSymbolsFn) {
+      extractSymbolsFn = (await import("./ast.js")).extractSymbols;
+    }
+    const symbols = await extractSymbolsFn(r.body, r.file, r.bestChunkPos, r.bestChunkPos + r.bestChunk.length);
+    enriched.push(symbols.length > 0 ? { ...r, symbols } : r);
+  }
+  return enriched;
+}
+
 export async function hybridQuery(
   store: Store,
   query: string,
@@ -4047,7 +4152,7 @@ export async function hybridQuery(
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
     const seenFiles = new Set<string>();
-    return candidates
+    const rawResults = candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -4092,6 +4197,7 @@ export async function hybridQuery(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
+    return enrichWithSymbols(store.db, rawResults);
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -4162,7 +4268,7 @@ export async function hybridQuery(
 
   // Step 8: Dedup by file (safety net — prevents duplicate output)
   const seenFiles = new Set<string>();
-  return blended
+  const rerankedResults = blended
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -4170,6 +4276,7 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+  return enrichWithSymbols(store.db, rerankedResults);
 }
 
 export interface VectorSearchOptions {
@@ -4439,7 +4546,7 @@ export async function structuredSearch(
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
     const seenFiles = new Set<string>();
-    return candidates
+    const ssRawResults = candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -4484,6 +4591,7 @@ export async function structuredSearch(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
+    return enrichWithSymbols(store.db, ssRawResults);
   }
 
   // Step 5: Rerank chunks
@@ -4553,7 +4661,7 @@ export async function structuredSearch(
 
   // Step 7: Dedup by file
   const seenFiles = new Set<string>();
-  return blended
+  const ssRerankedResults = blended
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -4561,4 +4669,5 @@ export async function structuredSearch(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+  return enrichWithSymbols(store.db, ssRerankedResults);
 }

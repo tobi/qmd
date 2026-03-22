@@ -38,6 +38,7 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   snippet: string;
+  symbols?: { name: string; kind: string; signature?: string; line: number }[];
 };
 
 type StatusResult = {
@@ -334,6 +335,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           snippet: addLineNumbers(snippet, line),
+          symbols: r.symbols,
         };
       });
 
@@ -669,6 +671,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             snippet: addLineNumbers(snippet, line),
+            symbols: r.symbols,
           };
         });
 

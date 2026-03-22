@@ -1856,6 +1856,7 @@ type OutputRow = {
   hash?: string;
   docid?: string;
   explain?: HybridQueryExplain;
+  symbols?: { name: string; kind: string; signature?: string; line: number }[];
 };
 
 function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
@@ -1888,6 +1889,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
+        ...(row.symbols?.length && { symbols: row.symbols }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -1947,6 +1949,13 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
         if (contribSummary.length > 0) {
           console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
+        }
+      }
+      // Symbols (if available)
+      if (row.symbols && row.symbols.length > 0) {
+        for (const sym of row.symbols) {
+          const sig = sym.signature ? sym.signature : "";
+          console.log(`${c.dim}  [${sym.kind}] ${c.reset}${sym.name}${c.dim}${sig}${c.reset}`);
         }
       }
       console.log();
@@ -2358,6 +2367,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       context: r.context,
       docid: r.docid,
       explain: r.explain,
+      symbols: r.symbols,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
