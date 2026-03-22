@@ -75,6 +75,7 @@ import {
   generateEmbeddings,
   syncConfigToDb,
   type ReindexResult,
+  type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
@@ -370,6 +371,32 @@ async function showStatus(): Promise<void> {
       path_prefix: ctx.path,
       context: ctx.context
     });
+  }
+
+  // AST chunking status
+  try {
+    const { getASTStatus } = await import("../ast.js");
+    const ast = await getASTStatus();
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    if (ast.available) {
+      const ok = ast.languages.filter(l => l.available).map(l => l.language);
+      const fail = ast.languages.filter(l => !l.available);
+      console.log(`  Status:   ${c.green}active${c.reset}`);
+      console.log(`  Languages: ${ok.join(", ")}`);
+      if (fail.length > 0) {
+        for (const f of fail) {
+          console.log(`  ${c.yellow}Unavailable: ${f.language} (${f.error})${c.reset}`);
+        }
+      }
+    } else {
+      console.log(`  Status:   ${c.yellow}unavailable${c.reset} (falling back to regex chunking)`);
+      for (const l of ast.languages) {
+        if (l.error) console.log(`  ${c.dim}${l.language}: ${l.error}${c.reset}`);
+      }
+    }
+  } catch {
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    console.log(`  Status:   ${c.dim}not available${c.reset}`);
   }
 
   if (collections.length > 0) {
@@ -1617,10 +1644,17 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
   return parsed;
 }
 
+function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
+  if (value === undefined) return undefined;
+  const s = String(value);
+  if (s === "auto" || s === "regex") return s;
+  throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
+}
+
 async function vectorIndex(
   model: string = DEFAULT_EMBED_MODEL,
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1653,6 +1687,7 @@ async function vectorIndex(
     model,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
+    chunkStrategy: batchOptions?.chunkStrategy,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -1746,6 +1781,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2231,6 +2267,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2258,6 +2295,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2372,6 +2410,8 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       intent: { type: "string" },
+      // Chunking options
+      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2413,6 +2453,7 @@ function parseCLI() {
     skipRerank: !!values["no-rerank"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
+    chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
   };
 
   return {
@@ -2634,6 +2675,9 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("");
+  console.log("Embed/query options:");
+  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -2957,9 +3001,11 @@ if (isMain) {
       try {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
+        const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
         await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
+          chunkStrategy: embedChunkStrategy,
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));

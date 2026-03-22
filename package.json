@@ -51,6 +51,7 @@
     "node-llama-cpp": "^3.17.1",
     "picomatch": "^4.0.0",
     "sqlite-vec": "^0.1.7-alpha.2",
+    "web-tree-sitter": "0.26.7",
     "yaml": "^2.8.2",
     "zod": "4.2.1"
   },
@@ -59,7 +60,11 @@
     "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
     "sqlite-vec-linux-arm64": "^0.1.7-alpha.2",
     "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
-    "sqlite-vec-windows-x64": "^0.1.7-alpha.2"
+    "sqlite-vec-windows-x64": "^0.1.7-alpha.2",
+    "tree-sitter-go": "0.23.4",
+    "tree-sitter-python": "0.23.4",
+    "tree-sitter-rust": "0.24.0",
+    "tree-sitter-typescript": "0.23.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
