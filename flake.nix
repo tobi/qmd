@@ -35,9 +35,11 @@
           ];
         });
 
+        packageJson = builtins.fromJSON (builtins.readFile ./package.json);
+
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
-          version = "1.0.0";
+          version = packageJson.version;
 
           src = ./.;
 
