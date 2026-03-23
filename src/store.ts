@@ -2764,20 +2764,38 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
+  // Use a CTE to force FTS5 to run first, then filter by collection.
+  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
+  // collection filter in a single WHERE clause, which can cause it to
+  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
+  // query into a 17-second query on large collections.
+  const params: (string | number)[] = [ftsQuery];
+
+  // When filtering by collection, fetch extra candidates from the FTS index
+  // since some will be filtered out. Without a collection filter we can
+  // fetch exactly the requested limit.
+  const ftsLimit = collectionName ? limit * 10 : limit;
+
   let sql = `
+    WITH fts_matches AS (
+      SELECT rowid, bm25(documents_fts, 10.0, 1.0) as bm25_score
+      FROM documents_fts
+      WHERE documents_fts MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ${ftsLimit}
+    )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
-    FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
+      fm.bm25_score
+    FROM fts_matches fm
+    JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
-    WHERE documents_fts MATCH ? AND d.active = 1
+    WHERE d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
 
   if (collectionName) {
     sql += ` AND d.collection = ?`;
@@ -2785,7 +2803,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   }
 
   // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY bm25_score ASC LIMIT ?`;
+  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
