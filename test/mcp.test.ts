@@ -1039,6 +1039,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
+    expect(toolNames).toContain("refresh");
+    expect(toolNames).toContain("embed");
   });
 
   test("POST /mcp tools/call query returns results", async () => {
@@ -1073,5 +1075,180 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
     expect(json.result.content.length).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
+// Write-loop tools: refresh & embed (needs production schema + real files on disk)
+// =============================================================================
+
+describe.skipIf(!!process.env.CI)("MCP Write-Loop Tools", () => {
+  let handle: HttpServerHandle;
+  let baseUrl: string;
+  let wlTestDbPath: string;
+  let wlTestConfigDir: string;
+  let wlTestDocsDir: string;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  /** Send a JSON-RPC message to /mcp and return the parsed response. */
+  let wlSessionId: string | null = null;
+  async function wlMcpRequest(body: object): Promise<{ status: number; json: any; contentType: string | null }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (wlSessionId) headers["mcp-session-id"] = wlSessionId;
+
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) wlSessionId = sid;
+
+    const json = await res.json();
+    return { status: res.status, json, contentType: res.headers.get("content-type") };
+  }
+
+  beforeAll(async () => {
+    // Create a real temp directory with markdown files
+    const docsPrefix = join(tmpdir(), `qmd-mcp-wl-docs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    wlTestDocsDir = await mkdtemp(docsPrefix);
+    await writeFile(join(wlTestDocsDir, "note-a.md"), "# Note A\n\nFirst test note for refresh.");
+    await writeFile(join(wlTestDocsDir, "note-b.md"), "# Note B\n\nSecond test note for refresh.");
+
+    // Create DB with production schema via the internal createStore, then sync config
+    wlTestDbPath = `/tmp/qmd-mcp-wl-test-${Date.now()}.sqlite`;
+    const internalStore = createStore(wlTestDbPath);
+    const wlConfig: CollectionConfig = {
+      collections: {
+        notes: {
+          path: wlTestDocsDir,
+          pattern: "**/*.md",
+        }
+      }
+    };
+    syncConfigToDb(internalStore.db, wlConfig);
+    internalStore.close();
+
+    // YAML config (for QMD_CONFIG_DIR, though MCP server reads from DB)
+    const configPrefix = join(tmpdir(), `qmd-mcp-wl-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    wlTestConfigDir = await mkdtemp(configPrefix);
+    await writeFile(join(wlTestConfigDir, "index.yml"), YAML.stringify(wlConfig));
+
+    process.env.INDEX_PATH = wlTestDbPath;
+    process.env.QMD_CONFIG_DIR = wlTestConfigDir;
+
+    handle = await startMcpHttpServer(0, { quiet: true });
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    await handle.stop();
+
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    try { unlinkSync(wlTestDbPath); } catch {}
+    try {
+      const files = await readdir(wlTestConfigDir);
+      for (const f of files) await unlink(join(wlTestConfigDir, f));
+      await rmdir(wlTestConfigDir);
+    } catch {}
+    try {
+      const files = await readdir(wlTestDocsDir);
+      for (const f of files) await unlink(join(wlTestDocsDir, f));
+      await rmdir(wlTestDocsDir);
+    } catch {}
+  });
+
+  test("refresh scans files and returns update results", async () => {
+    // Initialize MCP session
+    await wlMcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await wlMcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "refresh", arguments: {} },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.content.length).toBeGreaterThan(0);
+    expect(json.result.content[0].type).toBe("text");
+    expect(json.result.content[0].text).toContain("Refresh complete");
+    // Should have indexed the 2 test files
+    expect(json.result.content[0].text).toContain("New documents: 2");
+  });
+
+  test("refresh with collection filter works", async () => {
+    await wlMcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await wlMcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "refresh", arguments: { collection: "notes" } },
+    });
+    expect(status).toBe(200);
+    expect(json.result.content[0].text).toContain("Refresh complete");
+    // Files already indexed from previous test, so they should be unchanged
+    expect(json.result.content[0].text).toContain("Unchanged:");
+  });
+
+  test("refresh detects new files added after initial scan", async () => {
+    await wlMcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    // Add a new file to the docs directory
+    await writeFile(join(wlTestDocsDir, "note-c.md"), "# Note C\n\nNewly added note.");
+
+    const { status, json } = await wlMcpRequest({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "refresh", arguments: {} },
+    });
+    expect(status).toBe(200);
+    expect(json.result.content[0].text).toContain("New documents: 1");
+  });
+
+  test("embed generates embeddings", async () => {
+    await wlMcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await wlMcpRequest({
+      jsonrpc: "2.0", id: 5, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.content.length).toBeGreaterThan(0);
+    expect(json.result.content[0].type).toBe("text");
+    expect(json.result.content[0].text).toContain("Embedding complete");
+  });
+
+  test("search finds documents after refresh", async () => {
+    await wlMcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await wlMcpRequest({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: { name: "query", arguments: { searches: [{ type: "lex", query: "note" }] } },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.content[0].text).toContain("Found");
   });
 });
