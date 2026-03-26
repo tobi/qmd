@@ -31,6 +31,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  follow_symlinks?: boolean; // Follow symbolic links when scanning (default: false)
 }
 
 /**
@@ -236,7 +237,7 @@ export function getDefaultCollectionNames(): string[] {
  */
 export function updateCollectionSettings(
   name: string,
-  settings: { update?: string | null; includeByDefault?: boolean }
+  settings: { update?: string | null; includeByDefault?: boolean; follow_symlinks?: boolean }
 ): boolean {
   const config = loadConfig();
   const collection = config.collections[name];
@@ -259,6 +260,15 @@ export function updateCollectionSettings(
     }
   }
 
+  if (settings.follow_symlinks !== undefined) {
+    if (settings.follow_symlinks === false) {
+      // false is default, remove the field
+      delete collection.follow_symlinks;
+    } else {
+      collection.follow_symlinks = settings.follow_symlinks;
+    }
+  }
+
   saveConfig(config);
   return true;
 }
@@ -269,7 +279,8 @@ export function updateCollectionSettings(
 export function addCollection(
   name: string,
   path: string,
-  pattern: string = "**/*.md"
+  pattern: string = "**/*.md",
+  options?: { follow_symlinks?: boolean }
 ): void {
   const config = loadConfig();
 
@@ -277,6 +288,7 @@ export function addCollection(
     path,
     pattern,
     context: config.collections[name]?.context, // Preserve existing context
+    ...(options?.follow_symlinks ? { follow_symlinks: true } : {}),
   };
 
   saveConfig(config);
