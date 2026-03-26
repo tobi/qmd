@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Add REST search endpoints to MCP HTTP server: `POST /search/bm25`,
+  `/search/vector`, `/search/hybrid` for direct access to individual
+  search backends without MCP protocol overhead.
+- Pass `rerank` parameter through existing `POST /query` REST endpoint,
+  enabling `"rerank": false` to skip LLM reranking via HTTP.
+- Add `--warm` flag to `qmd mcp --http` to pre-load the embedding model
+  on startup. First vector search drops from ~700ms to ~24ms.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
