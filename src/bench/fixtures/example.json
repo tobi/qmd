@@ -1,0 +1,87 @@
+{
+  "description": "Example benchmark fixture for QMD eval-docs. Tests exact keyword, semantic, and cross-domain retrieval across 6 documents.",
+  "version": 1,
+  "collection": "eval-docs",
+  "queries": [
+    {
+      "id": "exact-api",
+      "query": "API versioning",
+      "type": "exact",
+      "description": "Direct keyword match in API design document",
+      "expected_files": ["api-design-principles.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "exact-fundraising",
+      "query": "Series A fundraising",
+      "type": "exact",
+      "description": "Direct keyword match in fundraising memo",
+      "expected_files": ["startup-fundraising-memo.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "exact-cap",
+      "query": "CAP theorem",
+      "type": "exact",
+      "description": "Direct keyword match in distributed systems doc",
+      "expected_files": ["distributed-systems-overview.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "semantic-rest",
+      "query": "how to structure REST endpoints",
+      "type": "semantic",
+      "description": "Conceptual match — no exact keyword overlap with 'API design'",
+      "expected_files": ["api-design-principles.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "semantic-fundraising",
+      "query": "raising money for startup",
+      "type": "semantic",
+      "description": "Synonym match — 'raising money' should find 'fundraising'",
+      "expected_files": ["startup-fundraising-memo.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "semantic-overfitting",
+      "query": "how to prevent models from memorizing data",
+      "type": "semantic",
+      "description": "Conceptual match for overfitting in ML primer",
+      "expected_files": ["machine-learning-primer.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "topical-launch",
+      "query": "what went wrong with the product launch",
+      "type": "topical",
+      "description": "Should find the retrospective document",
+      "expected_files": ["product-launch-retrospective.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "cross-domain-consistency",
+      "query": "consistency vs availability tradeoffs",
+      "type": "cross-domain",
+      "description": "CAP theorem concept — specific detail in longer document",
+      "expected_files": ["distributed-systems-overview.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "alias-remote",
+      "query": "working from home guidelines",
+      "type": "alias",
+      "description": "Synonym match — 'working from home' should find 'remote work policy'",
+      "expected_files": ["remote-work-policy.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "hard-partial",
+      "query": "nouns not verbs",
+      "type": "semantic",
+      "description": "Partial phrase recall — API design principle about resource naming",
+      "expected_files": ["api-design-principles.md"],
+      "expected_in_top_k": 5
+    }
+  ]
+}
