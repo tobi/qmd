@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Add `qmd bench <fixture.json>` command for search quality benchmarks.
+  Measures precision@k, recall, MRR, and F1 across BM25, vector, hybrid,
+  and full pipeline backends. Ships with an example fixture against
+  the eval-docs test collection.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

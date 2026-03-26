@@ -2565,6 +2565,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -3016,6 +3017,23 @@ if (isMain) {
       }
       await querySearch(cli.query, cli.opts);
       break;
+
+    case "bench": {
+      const fixturePath = cli.args[0];
+      if (!fixturePath) {
+        console.error("Usage: qmd bench <fixture.json> [--json] [-c collection]");
+        console.error("");
+        console.error("Run search quality benchmarks against a fixture file.");
+        console.error("See src/bench/fixtures/example.json for the fixture format.");
+        process.exit(1);
+      }
+      const { runBenchmark } = await import("../bench/bench.js");
+      await runBenchmark(fixturePath, {
+        json: !!cli.opts.json,
+        collection: cli.opts.collection,
+      });
+      break;
+    }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
