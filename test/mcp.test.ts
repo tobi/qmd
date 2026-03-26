@@ -1074,4 +1074,85 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result).toBeDefined();
     expect(json.result.content.length).toBeGreaterThan(0);
   });
+
+  // ---------------------------------------------------------------------------
+  // REST search endpoints
+  // ---------------------------------------------------------------------------
+
+  test("POST /search/bm25 returns BM25 results", async () => {
+    const res = await fetch(`${baseUrl}/search/bm25`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "API", limit: 5 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.mode).toBe("bm25");
+    expect(body.results).toBeDefined();
+    expect(Array.isArray(body.results)).toBe(true);
+    expect(typeof body.latency_ms).toBe("number");
+  });
+
+  test("POST /search/vector returns vector results", async () => {
+    const res = await fetch(`${baseUrl}/search/vector`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "API documentation", limit: 5 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.mode).toBe("vector");
+    expect(body.results).toBeDefined();
+    expect(Array.isArray(body.results)).toBe(true);
+  });
+
+  test("POST /search/hybrid returns hybrid results without reranking", async () => {
+    const res = await fetch(`${baseUrl}/search/hybrid`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "API endpoints", limit: 5 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.mode).toBe("hybrid");
+    expect(body.results).toBeDefined();
+    expect(Array.isArray(body.results)).toBe(true);
+  });
+
+  test("POST /search/bm25 returns 400 when query is missing", async () => {
+    const res = await fetch(`${baseUrl}/search/bm25`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 5 }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("query");
+  });
+
+  test("POST /search/unknown returns 404", async () => {
+    const res = await fetch(`${baseUrl}/search/unknown`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "test" }),
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("unknown");
+  });
+
+  test("POST /query passes rerank:false through", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "API" }],
+        rerank: false,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results).toBeDefined();
+    expect(Array.isArray(body.results)).toBe(true);
+  });
 });

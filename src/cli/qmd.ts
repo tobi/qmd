@@ -2376,6 +2376,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      warm: { type: "boolean" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2619,6 +2620,8 @@ function showHelp(): void {
   console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
+  console.log("  - `qmd mcp --http --warm` pre-loads the embedding model for fast vector searches (~24ms vs ~700ms cold).");
+  console.log("  - REST endpoints: POST /search/bm25, /search/vector, /search/hybrid, /query");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
@@ -3065,9 +3068,11 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const mcpArgs = ["mcp", "--http", "--port", String(port)];
+          if (cli.values.warm) mcpArgs.push("--warm");
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...mcpArgs]
+            : [selfPath, ...mcpArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3087,7 +3092,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { warm: !!cli.values.warm });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
