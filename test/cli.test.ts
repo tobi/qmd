@@ -368,6 +368,57 @@ describe("CLI Add Command", () => {
   });
 });
 
+describe("CLI Follow Symlinks", () => {
+  let symlinkTarget: string;
+
+  beforeEach(async () => {
+    // Create a directory outside the fixtures tree with a markdown file
+    symlinkTarget = join(testDir, "symlink-target");
+    await mkdir(symlinkTarget, { recursive: true });
+    await writeFile(join(symlinkTarget, "linked.md"), "# Symlinked Document\n\nThis file lives behind a symlink.\n");
+
+    // Create a symlink inside fixtures pointing to the external directory
+    const symlinkPath = join(fixturesDir, "linked-dir");
+    try { unlinkSync(symlinkPath); } catch {}
+    symlinkSync(symlinkTarget, symlinkPath, "dir");
+  });
+
+  test("skips symlinked directories by default", async () => {
+    const { stdout, exitCode } = await runQmd(["collection", "add", "."]);
+    expect(exitCode).toBe(0);
+
+    const { stdout: lsOut } = await runQmd(["ls", "fixtures"]);
+    expect(lsOut).not.toContain("linked-dir/linked.md");
+  });
+
+  test("follows symlinked directories with --follow-symlinks", async () => {
+    const { stdout, exitCode } = await runQmd(["collection", "add", ".", "--follow-symlinks"]);
+    expect(exitCode).toBe(0);
+
+    const { stdout: lsOut } = await runQmd(["ls", "fixtures"]);
+    expect(lsOut).toContain("linked-dir/linked.md");
+  });
+
+  test("persists follow_symlinks in config and respects it on update", async () => {
+    // Add with --follow-symlinks
+    await runQmd(["collection", "add", ".", "--follow-symlinks"]);
+
+    // Verify config was persisted
+    const configContent = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
+    expect(configContent).toContain("follow_symlinks: true");
+
+    // Add a new file behind the symlink
+    writeFileSync(join(symlinkTarget, "new-linked.md"), "# New Linked\n\nAdded after initial index.\n");
+
+    // Run update — should pick up the new file through the symlink
+    const { stdout: updateOut } = await runQmd(["update"]);
+    expect(updateOut).toContain("1 new");
+
+    const { stdout: lsOut } = await runQmd(["ls", "fixtures"]);
+    expect(lsOut).toContain("new-linked.md");
+  });
+});
+
 describe("CLI Status Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
