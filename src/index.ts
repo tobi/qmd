@@ -200,6 +200,21 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /**
+   * Keep model weights in memory between queries (default: false).
+   *
+   * When true, only LLM contexts (the per-session VRAM objects) are released
+   * on inactivity — the model weights themselves stay loaded so the next query
+   * starts instantly without a reload.  Ideal for long-running servers such as
+   * `qmd mcp --http`.
+   *
+   * When false (the default), both contexts *and* model weights are disposed
+   * after the inactivity timeout, freeing VRAM — good for one-off CLI use
+   * where you don't want to keep memory pinned after a single query.
+   *
+   * Can also be set via the `QMD_KEEP_MODELS=1` environment variable.
+   */
+  keepModels?: boolean;
 }
 
 /**
@@ -358,11 +373,20 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // Resolve keepModels: explicit option takes priority, then env var.
+  const keepModels =
+    options.keepModels !== undefined
+      ? options.keepModels
+      : process.env.QMD_KEEP_MODELS === "1" || process.env.QMD_KEEP_MODELS === "true";
+
+  // Create a per-store LlamaCpp instance — lazy-loads models on first use.
+  // By default both contexts and model weights are released after 5 min of
+  // inactivity (good for CLI one-off queries).  When keepModels is true only
+  // contexts are released — weights stay warm for fast subsequent queries,
+  // which is ideal for long-running servers like `qmd mcp --http`.
   const llm = new LlamaCpp({
     inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
+    disposeModelsOnInactivity: !keepModels,
   });
   internal.llm = llm;
 
