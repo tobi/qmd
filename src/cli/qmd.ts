@@ -2909,6 +2909,9 @@ if (isMain) {
           console.log(`  Path:     ${col.path}`);
           console.log(`  Pattern:  ${col.pattern}`);
           console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.follow_symlinks) {
+            console.log(`  Symlinks: follow`);
+          }
           if (col.update) {
             console.log(`  Update:   ${col.update}`);
           }
