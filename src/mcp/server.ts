@@ -296,9 +296,12 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
+        rerank: z.boolean().optional().default(true).describe(
+          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -313,6 +316,7 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        rerank,
         intent,
       });
 
