@@ -2960,6 +2960,12 @@ export function clearAllEmbeddings(db: Database): void {
 /**
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
+ *
+ * content_vectors is inserted first so that getHashesForEmbedding (which checks
+ * only content_vectors) won't re-select the hash on a crash between the two inserts.
+ *
+ * vectors_vec uses DELETE + INSERT instead of INSERT OR REPLACE because sqlite-vec's
+ * vec0 virtual tables silently ignore the OR REPLACE conflict clause.
  */
 export function insertEmbedding(
   db: Database,
@@ -2971,11 +2977,16 @@ export function insertEmbedding(
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
-  insertVecStmt.run(hashSeq, embedding);
+  // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+
+  // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
+  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  deleteVecStmt.run(hashSeq);
+  insertVecStmt.run(hashSeq, embedding);
 }
 
 // =============================================================================
