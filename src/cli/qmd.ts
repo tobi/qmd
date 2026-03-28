@@ -76,7 +76,7 @@ import {
   syncConfigToDb,
   type ReindexResult,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultEmbeddingLLM, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -96,6 +96,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -2096,10 +2097,8 @@ function search(query: string, opts: OutputOptions): void {
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  // Pass collections directly to searchFTS (it now supports arrays)
+  const results = searchFTS(db, query, fetchLimit, collectionNames.length > 0 ? collectionNames : undefined);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2696,6 +2695,18 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration from config file
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  if (embeddingYamlConfig.provider === 'openai') {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {
