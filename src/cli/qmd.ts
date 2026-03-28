@@ -76,7 +76,7 @@ import {
   syncConfigToDb,
   type ReindexResult,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultEmbeddingLLM, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -96,6 +96,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -276,7 +277,6 @@ function computeDisplayPath(
   return filepath;
 }
 
-
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -426,34 +426,40 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
 
-  // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+  // Device / GPU info (local llama-cpp mode only)
+  if (!isUsingOpenAI()) {
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo();
+      console.log(`
+${c.bold}Device${c.reset}`);
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch {
+      // Don't fail status if LLM init fails
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
+  } else {
+    console.log(`
+${c.bold}Provider${c.reset}`);
+    console.log(`  Embeddings/Rerank/Expansion: OpenAI-compatible endpoint`);
   }
 
   // Tips section
@@ -2147,7 +2153,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  const run = async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2185,7 +2191,13 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  };
+
+  if (isUsingOpenAI()) {
+    await run();
+  } else {
+    await withLLMSession(async () => run(), { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  }
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2696,6 +2708,21 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration from config file or env var
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  const useOpenAI = process.env.QMD_OPENAI === '1' || embeddingYamlConfig.provider === 'openai';
+  
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: process.env.OPENAI_API_KEY || embeddingYamlConfig.openai?.api_key,
+        baseURL: process.env.OPENAI_BASE_URL || embeddingYamlConfig.openai?.base_url,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {
