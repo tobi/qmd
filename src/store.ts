@@ -2770,7 +2770,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
+      bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
