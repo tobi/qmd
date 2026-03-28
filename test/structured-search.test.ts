@@ -399,6 +399,14 @@ describe("buildFTS5Query (lex parser)", () => {
     return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
   }
 
+  function isHyphenatedToken(token: string): boolean {
+    return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
+  }
+
+  function sanitizeHyphenatedTerm(term: string): string {
+    return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+  }
+
   function buildFTS5Query(query: string): string | null {
     const positive: string[] = [];
     const negative: string[] = [];
@@ -424,8 +432,14 @@ describe("buildFTS5Query (lex parser)", () => {
         const start = i;
         while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
         const term = s.slice(start, i);
-        const sanitized = sanitizeFTS5Term(term);
-        if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
+
+        if (isHyphenatedToken(term)) {
+          const sanitized = sanitizeHyphenatedTerm(term);
+          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
+        } else {
+          const sanitized = sanitizeFTS5Term(term);
+          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
+        }
       }
     }
 
@@ -487,5 +501,38 @@ describe("buildFTS5Query (lex parser)", () => {
 
   test("special chars in terms stripped", () => {
     expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+  });
+
+  // Hyphenated token tests
+  test("hyphenated term → phrase match", () => {
+    expect(buildFTS5Query("multi-agent")).toBe('"multi agent"');
+  });
+
+  test("hyphenated identifier → phrase match", () => {
+    expect(buildFTS5Query("DEC-0054")).toBe('"dec 0054"');
+  });
+
+  test("hyphenated model name → phrase match", () => {
+    expect(buildFTS5Query("gpt-4")).toBe('"gpt 4"');
+  });
+
+  test("multi-hyphen term → phrase match", () => {
+    expect(buildFTS5Query("foo-bar-baz")).toBe('"foo bar baz"');
+  });
+
+  test("hyphenated term mixed with plain terms", () => {
+    expect(buildFTS5Query("multi-agent memory")).toBe('"multi agent" AND "memory"*');
+  });
+
+  test("negation still works alongside hyphenated terms", () => {
+    expect(buildFTS5Query("multi-agent -sports")).toBe('"multi agent" NOT "sports"*');
+  });
+
+  test("negated hyphenated term", () => {
+    expect(buildFTS5Query("performance -multi-agent")).toBe('"performance"* NOT "multi agent"');
+  });
+
+  test("plain negation still works (not confused with hyphen)", () => {
+    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
   });
 });
