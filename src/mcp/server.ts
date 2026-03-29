@@ -523,8 +523,8 @@ Intent-aware lex (C++ performance, not sports):
 // Transport: stdio (default)
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+export async function startMcpServer(options?: { keepModels?: boolean }): Promise<void> {
+  const store = await createStore({ dbPath: getDefaultDbPath(), keepModels: options?.keepModels });
   const server = await createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -544,8 +544,8 @@ export type HttpServerHandle = {
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; keepModels?: boolean }): Promise<HttpServerHandle> {
+  const store = await createStore({ dbPath: getDefaultDbPath(), keepModels: options?.keepModels });
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();

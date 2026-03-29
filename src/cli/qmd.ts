@@ -2416,6 +2416,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      "keep-models": { type: "boolean" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2606,6 +2607,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("    --keep-models               - Keep model weights in RAM between queries (good for servers)");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -2660,6 +2662,8 @@ function showHelp(): void {
   console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
+  console.log("  - Use `qmd mcp --keep-models` (or QMD_KEEP_MODELS=1) to keep model weights warm between queries.");
+  console.log("    This avoids reload latency for long-running servers. For one-off CLI use the default is fine.");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
@@ -3091,6 +3095,12 @@ if (isMain) {
         process.exit(0);
       }
 
+      // Resolve keep-models: flag > env var
+      const keepModels =
+        Boolean(cli.values["keep-models"]) ||
+        process.env.QMD_KEEP_MODELS === "1" ||
+        process.env.QMD_KEEP_MODELS === "true";
+
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
 
@@ -3111,9 +3121,10 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const keepModelsArgs = keepModels ? ["--keep-models"] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port), ...keepModelsArgs]
+            : [selfPath, "mcp", "--http", "--port", String(port), ...keepModelsArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3133,7 +3144,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { keepModels });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -3144,7 +3155,7 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer();
+        await startMcpServer({ keepModels });
       }
       break;
     }
