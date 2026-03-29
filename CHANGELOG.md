@@ -13,6 +13,7 @@
   chunking for code files.
 - `qmd status` now shows AST grammar availability.
 - SDK: `chunkStrategy` option on `embed()` and `search()` methods.
+- GitHub Actions workflow to build the Nix flake on Linux and macOS.
 
 ### Fixes
 
