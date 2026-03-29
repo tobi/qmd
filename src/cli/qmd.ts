@@ -586,6 +586,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      followSymlinks: yamlCol?.follow_symlinks,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1401,7 +1402,7 @@ function collectionList(): void {
   closeDb();
 }
 
-async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+async function collectionAdd(pwd: string, globPattern: string, name?: string, followSymlinks?: boolean): Promise<void> {
   // If name not provided, generate from pwd basename
   let collName = name;
   if (!collName) {
@@ -1431,13 +1432,13 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
-  addCollection(collName, pwd, globPattern);
+  addCollection(collName, pwd, globPattern, { follow_symlinks: followSymlinks });
   resyncConfig();
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
   const newColl = getCollectionFromYaml(collName);
-  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore, followSymlinks);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1490,7 +1491,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[], followSymlinks?: boolean): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1514,7 +1515,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
-    followSymbolicLinks: false,
+    followSymbolicLinks: followSymlinks ?? false,
     dot: false,
     ignore: allIgnore,
   });
@@ -2394,6 +2395,7 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      "follow-symlinks": { type: "boolean" },  // follow symbolic links when scanning
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -2861,8 +2863,9 @@ if (isMain) {
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
+          const followSymlinks = cli.values["follow-symlinks"] as boolean | undefined;
 
-          await collectionAdd(resolvedPwd, globPattern, name);
+          await collectionAdd(resolvedPwd, globPattern, name, followSymlinks);
           break;
         }
 
@@ -2950,6 +2953,9 @@ if (isMain) {
           console.log(`  Path:     ${col.path}`);
           console.log(`  Pattern:  ${col.pattern}`);
           console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.follow_symlinks) {
+            console.log(`  Symlinks: follow`);
+          }
           if (col.update) {
             console.log(`  Update:   ${col.update}`);
           }
@@ -2966,7 +2972,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--follow-symlinks]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
@@ -2976,6 +2982,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection add ~/notes --follow-symlinks");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);

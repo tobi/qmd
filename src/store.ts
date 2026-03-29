@@ -1165,6 +1165,7 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    followSymlinks?: boolean;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1179,7 +1180,7 @@ export async function reindexCollection(
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: collectionPath,
     onlyFiles: true,
-    followSymbolicLinks: false,
+    followSymbolicLinks: options?.followSymlinks ?? false,
     dot: false,
     ignore: allIgnore,
   });
