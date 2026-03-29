@@ -42,9 +42,11 @@ qmd embed
 ## HTTP Mode
 
 ```bash
-qmd mcp --http              # Port 8181
-qmd mcp --http --daemon     # Background
-qmd mcp stop                # Stop daemon
+qmd mcp --http                # Port 8181, Host localhost
+qmd mcp --http --port 8080    # Custom port
+qmd mcp --http --host 0.0.0.0 # Custom host
+qmd mcp --http --daemon       # Background
+qmd mcp stop                  # Stop daemon
 ```
 
 ## Tools
