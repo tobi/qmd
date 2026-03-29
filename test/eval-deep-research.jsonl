@@ -1,0 +1,25 @@
+{"query": "that tradeoff between data correctness and always being up", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "distributed systems architecture", "notes": "CAP theorem - no keywords match"}
+{"query": "what we learned from the dashboard thing", "expected_doc": "product-launch", "difficulty": "hard", "intent": "project retrospectives", "notes": "Project Phoenix retrospective - vague reference"}
+{"query": "how much we're burning through each month", "expected_doc": "fundraising", "difficulty": "hard", "intent": "startup finances", "notes": "burn rate - colloquial phrasing"}
+{"query": "when do I need to be online", "expected_doc": "remote-work", "difficulty": "hard", "intent": "work schedule policies", "notes": "core hours policy - no exact terms"}
+{"query": "that algorithm for getting nodes to agree", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "distributed consensus", "notes": "consensus/Raft/Paxos - conceptual reference"}
+{"query": "why we pushed back the release date", "expected_doc": "product-launch", "difficulty": "hard", "intent": "project timeline decisions", "notes": "timeline pressure - implied from retrospective"}
+{"query": "how to structure URLs for our service", "expected_doc": "api-design", "difficulty": "hard", "intent": "API design patterns", "notes": "REST endpoints - no exact match"}
+{"query": "preventing the model from just memorizing", "expected_doc": "machine-learning", "difficulty": "hard", "intent": "ML model training", "notes": "overfitting - conceptual synonym"}
+{"query": "who we're pitching to first", "expected_doc": "fundraising", "difficulty": "hard", "intent": "investor outreach strategy", "notes": "tier 1 investors - colloquial"}
+{"query": "can I work from another country", "expected_doc": "remote-work", "difficulty": "hard", "intent": "remote work eligibility", "notes": "remote eligibility - implied question"}
+{"query": "how the beta users found problems", "expected_doc": "product-launch", "difficulty": "hard", "intent": "product testing feedback", "notes": "beta program bugs - indirect reference"}
+{"query": "that thing Leslie Lamport invented", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "distributed systems history", "notes": "Paxos - person reference only"}
+{"query": "what happens when the network splits", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "network failure handling", "notes": "partition tolerance - rephrased concept"}
+{"query": "teaching computers to find patterns", "expected_doc": "machine-learning", "difficulty": "hard", "intent": "machine learning fundamentals", "notes": "ML definition - abstract description"}
+{"query": "how much runway before we're out of cash", "expected_doc": "fundraising", "difficulty": "hard", "intent": "startup financial planning", "notes": "runway months - colloquial finance term"}
+{"query": "the 47 issues we found before shipping", "expected_doc": "product-launch", "difficulty": "hard", "intent": "pre-launch QA", "notes": "beta bugs - specific number, no keywords"}
+{"query": "grouping customers by behavior", "expected_doc": "machine-learning", "difficulty": "hard", "intent": "customer analytics", "notes": "clustering/segmentation - conceptual"}
+{"query": "why URLs should be things not actions", "expected_doc": "api-design", "difficulty": "hard", "intent": "RESTful design principles", "notes": "nouns not verbs - conceptual inversion"}
+{"query": "what Eric Brewer proved you can't have", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "distributed systems theory", "notes": "CAP theorem - person + concept"}
+{"query": "how fast the new feature loaded", "expected_doc": "product-launch", "difficulty": "hard", "intent": "performance metrics", "notes": "performance 4.2s - indirect reference"}
+{"query": "days everyone needs to be in the office", "expected_doc": "remote-work", "difficulty": "hard", "intent": "hybrid work schedule", "notes": "collaboration days - rephrased"}
+{"query": "the number that shows customers are expanding", "expected_doc": "fundraising", "difficulty": "hard", "intent": "SaaS growth metrics", "notes": "NRR 124% - metric description"}
+{"query": "telling spam from real email", "expected_doc": "machine-learning", "difficulty": "hard", "intent": "classification use cases", "notes": "classification example - specific use case"}
+{"query": "how to get user 123's purchases", "expected_doc": "api-design", "difficulty": "hard", "intent": "API endpoint design", "notes": "hierarchical URLs - example-based query"}
+{"query": "zookeeper etcd consul what they have in common", "expected_doc": "distributed-systems", "difficulty": "hard", "intent": "distributed coordination tools", "notes": "CP systems - asking about category"}

@@ -1,0 +1,20 @@
+============================================================
+QMD Query Expansion — Unsloth SFT
+  Base model:  unsloth/Qwen3.5-0.8B
+  Output:      outputs/qwen3.5-0.8B
+  Data:        data/train/train.jsonl
+  Epochs:      5
+  Batch:       4 x 4 accum
+  LR:          0.0002
+  LoRA rank:   16
+  Max seq len: 512
+============================================================
+Traceback (most recent call last):
+  File "/home/tobi/src/github.com/tobi/qmd/finetune/train_unsloth.py", line 198, in <module>
+    main()
+    ~~~~^^
+  File "/home/tobi/src/github.com/tobi/qmd/finetune/train_unsloth.py", line 68, in main
+    from unsloth import FastLanguageModel
+  File "/home/tobi/src/github.com/tobi/qmd/finetune/.venv-unsloth/lib/python3.14/site-packages/unsloth/__init__.py", line 93, in <module>
+    raise NotImplementedError("Unsloth: No NVIDIA GPU found? Unsloth currently only supports GPUs!")
+NotImplementedError: Unsloth: No NVIDIA GPU found? Unsloth currently only supports GPUs!

@@ -1,0 +1,58 @@
+# SFT Training Config for QMD Query Expansion
+# Target: LiquidAI LFM2.5-1.2B-Instruct with LoRA
+#
+# LFM2.5 is a hybrid model: 10 conv blocks + 6 GQA attention blocks
+# Uses ChatML template: <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+# No /no_think needed (not Qwen3)
+#
+# Usage: uv run train.py sft --config configs/sft-lfm2.yaml
+
+model:
+  base: "LiquidAI/LFM2.5-1.2B-Instruct"
+  output: "outputs/sft-lfm2"
+  trust_remote_code: true
+
+dataset:
+  name: "data/train-lfm2/"
+  text_field: "text"
+  split: "train"
+  eval_split: 0.1
+
+training:
+  epochs: 5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_length: 512
+  warmup_ratio: 0.03
+  lr_scheduler: "cosine"
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    # Convolution blocks (layers 0,1,3,4,6,7,9,11,13,15)
+    - "conv.in_proj"
+    - "conv.out_proj"
+    # Attention blocks (layers 2,5,8,10,12,14)
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    # FFN (all 16 layers)
+    - "feed_forward.w1"
+    - "feed_forward.w2"
+    - "feed_forward.w3"
+
+generation:
+  temperature: 0.1
+  top_k: 50
+  top_p: 0.1
+  repetition_penalty: 1.05
+
+gguf: false  # LFM2.5 hybrid arch not supported by llama.cpp
+
+tracking:
+  project: "qmd-query-expansion"
+  run_name: "sft-lfm2-1.2B"

@@ -1327,6 +1327,34 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS title boost outweighs higher body frequency", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // Document with "quantum" mentioned in a longer body but NOT in the title
+    await insertTestDocument(store.db, collectionName, {
+      name: "body-only",
+      title: "General Science Notes",
+      body: "This research paper discusses quantum mechanics and the quantum model of computation. The quantum approach offers improvements over classical methods.",
+      displayPath: "test/body-only.md",
+    });
+
+    // Document with "quantum" in the title but a shorter body mention
+    await insertTestDocument(store.db, collectionName, {
+      name: "title-match",
+      title: "Quantum Computing Overview",
+      body: "An introduction to the fundamentals of this emerging computing paradigm.",
+      displayPath: "test/title-match.md",
+    });
+
+    const results = store.searchFTS("quantum", 10);
+    expect(results.length).toBe(2);
+    // Title-match doc should rank higher due to BM25 column weights boosting title
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/title-match.md`);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS respects limit parameter", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

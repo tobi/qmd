@@ -73,6 +73,8 @@ def format_for_training(ex: TrainingExample) -> dict:
     text = text.replace("<think>\n\n</think>\n\n", "")
 
     return {
+        "query": ex.query,
+        "output": ex.output_as_lists(),
         "text": text,
         "messages": messages,
     }

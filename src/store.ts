@@ -1421,6 +1421,12 @@ export async function generateEmbeddings(
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
+      // Abort early if session has been invalidated
+      if (!session.isValid) {
+        console.warn(`⚠ Session expired — skipping remaining document batches`);
+        break;
+      }
+
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
@@ -1434,6 +1440,7 @@ export async function generateEmbeddings(
           undefined, undefined, undefined,
           doc.path,
           options?.chunkStrategy,
+          session.signal,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -1472,6 +1479,23 @@ export async function generateEmbeddings(
       let batchChunkBytesProcessed = 0;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+        // Abort early if session has been invalidated (e.g. max duration exceeded)
+        if (!session.isValid) {
+          const remaining = batchChunks.length - batchStart;
+          errors += remaining;
+          console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
+          break;
+        }
+
+        // Abort early if error rate is too high (>80% of processed chunks failed)
+        const processed = chunksEmbedded + errors;
+        if (processed >= BATCH_SIZE && errors > processed * 0.8) {
+          const remaining = batchChunks.length - batchStart;
+          errors += remaining;
+          console.warn(`⚠ Error rate too high (${errors}/${processed}) — aborting embedding`);
+          break;
+        }
+
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
@@ -1491,20 +1515,26 @@ export async function generateEmbeddings(
           }
         } catch {
           // Batch failed — try individual embeddings as fallback
-          for (const chunk of chunkBatch) {
-            try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
-              const result = await session.embed(text);
-              if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                chunksEmbedded++;
-              } else {
+          // But skip if session is already invalid (avoids N doomed retries)
+          if (!session.isValid) {
+            errors += chunkBatch.length;
+            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
+          } else {
+            for (const chunk of chunkBatch) {
+              try {
+                const text = formatDocForEmbedding(chunk.text, chunk.title);
+                const result = await session.embed(text);
+                if (result) {
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                  chunksEmbedded++;
+                } else {
+                  errors++;
+                }
+              } catch {
                 errors++;
               }
-            } catch {
-              errors++;
+              batchChunkBytesProcessed += chunk.bytes;
             }
-            batchChunkBytesProcessed += chunk.bytes;
           }
         }
 
@@ -1684,7 +1714,6 @@ export function handelize(path: string): string {
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
@@ -1699,7 +1728,7 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
+          .replace(/[^\p{L}\p{N}.$]+/gu, '-')  // Keep letters, numbers, dots, "$"; dash-separate rest
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
@@ -2170,6 +2199,7 @@ export async function chunkDocumentByTokens(
   windowTokens: number = CHUNK_WINDOW_TOKENS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
+  signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
@@ -2188,6 +2218,9 @@ export async function chunkDocumentByTokens(
   const results: { text: string; pos: number; tokens: number }[] = [];
 
   for (const chunk of charChunks) {
+    // Respect abort signal to avoid runaway tokenization
+    if (signal?.aborted) break;
+
     const tokens = await llm.tokenize(chunk.text);
 
     if (tokens.length <= maxTokens) {
@@ -2201,6 +2234,7 @@ export async function chunkDocumentByTokens(
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
       for (const subChunk of subChunks) {
+        if (signal?.aborted) break;
         const subTokens = await llm.tokenize(subChunk.text);
         results.push({
           text: subChunk.text,
@@ -2733,19 +2767,45 @@ function sanitizeFTS5Term(term: string): string {
 }
 
 /**
+ * Check if a token is a hyphenated compound word (e.g., multi-agent, DEC-0054, gpt-4).
+ * Returns true if the token contains internal hyphens between word/digit characters.
+ */
+function isHyphenatedToken(token: string): boolean {
+  return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
+}
+
+/**
+ * Sanitize a hyphenated term into an FTS5 phrase by splitting on hyphens
+ * and sanitizing each part. Returns the parts joined by spaces for use
+ * inside FTS5 quotes: "multi agent" matches "multi-agent" in porter tokenizer.
+ */
+function sanitizeHyphenatedTerm(term: string): string {
+  return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+}
+
+/**
  * Parse lex query syntax into FTS5 query.
  *
  * Supports:
  * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
  * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - Hyphenated tokens: multi-agent, DEC-0054, gpt-4 → treated as phrases
  * - Plain terms: term → "term"* (prefix match)
  *
  * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
  * So `-term` only works when there are also positive terms.
  *
+ * Hyphen disambiguation: `-sports` at a word boundary is negation, but `multi-agent`
+ * (where `-` is between word characters) is treated as a hyphenated phrase.
+ * When a leading `-` is followed by what looks like a hyphenated compound word
+ * (e.g., `-multi-agent`), the entire token is treated as a negated phrase.
+ *
  * Examples:
  *   performance -sports     → "performance"* NOT "sports"*
  *   "machine learning"      → "machine learning"
+ *   multi-agent memory      → "multi agent" AND "memory"*
+ *   DEC-0054               → "dec 0054"
+ *   -multi-agent            → NOT "multi agent"
  */
 function buildFTS5Query(query: string): string | null {
   const positive: string[] = [];
@@ -2787,13 +2847,27 @@ function buildFTS5Query(query: string): string | null {
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
       const term = s.slice(start, i);
 
-      const sanitized = sanitizeFTS5Term(term);
-      if (sanitized) {
-        const ftsTerm = `"${sanitized}"*`;  // Prefix match
-        if (negated) {
-          negative.push(ftsTerm);
-        } else {
-          positive.push(ftsTerm);
+      // Handle hyphenated tokens: multi-agent, DEC-0054, gpt-4
+      // These get split into phrase queries so FTS5 porter tokenizer matches them.
+      if (isHyphenatedToken(term)) {
+        const sanitized = sanitizeHyphenatedTerm(term);
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // Phrase match (no prefix)
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+          }
+        }
+      } else {
+        const sanitized = sanitizeFTS5Term(term);
+        if (sanitized) {
+          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          if (negated) {
+            negative.push(ftsTerm);
+          } else {
+            positive.push(ftsTerm);
+          }
         }
       }
     }
@@ -2842,20 +2916,38 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
+  // Use a CTE to force FTS5 to run first, then filter by collection.
+  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
+  // collection filter in a single WHERE clause, which can cause it to
+  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
+  // query into a 17-second query on large collections.
+  const params: (string | number)[] = [ftsQuery];
+
+  // When filtering by collection, fetch extra candidates from the FTS index
+  // since some will be filtered out. Without a collection filter we can
+  // fetch exactly the requested limit.
+  const ftsLimit = collectionName ? limit * 10 : limit;
+
   let sql = `
+    WITH fts_matches AS (
+      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+      FROM documents_fts
+      WHERE documents_fts MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ${ftsLimit}
+    )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
-    FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
+      fm.bm25_score
+    FROM fts_matches fm
+    JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
-    WHERE documents_fts MATCH ? AND d.active = 1
+    WHERE d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
 
   if (collectionName) {
     sql += ` AND d.collection = ?`;
@@ -2863,7 +2955,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   }
 
   // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY bm25_score ASC LIMIT ?`;
+  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
@@ -3021,6 +3113,12 @@ export function clearAllEmbeddings(db: Database): void {
 /**
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
+ *
+ * content_vectors is inserted first so that getHashesForEmbedding (which checks
+ * only content_vectors) won't re-select the hash on a crash between the two inserts.
+ *
+ * vectors_vec uses DELETE + INSERT instead of INSERT OR REPLACE because sqlite-vec's
+ * vec0 virtual tables silently ignore the OR REPLACE conflict clause.
  */
 export function insertEmbedding(
   db: Database,
@@ -3032,11 +3130,16 @@ export function insertEmbedding(
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
-  insertVecStmt.run(hashSeq, embedding);
+  // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+
+  // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
+  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  deleteVecStmt.run(hashSeq);
+  insertVecStmt.run(hashSeq, embedding);
 }
 
 // =============================================================================

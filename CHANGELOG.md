@@ -16,6 +16,7 @@
 
 ### Fixes
 
+- Fix paths in nix flake 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
