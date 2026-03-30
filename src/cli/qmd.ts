@@ -521,15 +521,44 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(collectionFilter?: string[], excludeFilter?: string[]): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
+  // Validate mutual exclusivity of -c and --exclude
+  if (collectionFilter && collectionFilter.length > 0 && excludeFilter && excludeFilter.length > 0) {
+    console.error(`${c.yellow}Error: -c/--collection and --exclude are mutually exclusive.${c.reset}`);
+    closeDb();
+    process.exit(1);
+  }
+
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
+
+  // Filter by collection names if specified
+  if (collectionFilter && collectionFilter.length > 0) {
+    collections = collections.filter(col => collectionFilter.includes(col.name));
+    if (collections.length === 0) {
+      console.log(`${c.dim}No matching collections found. Available: ${listCollections(db).map(col => col.name).join(', ')}${c.reset}`);
+      closeDb();
+      return;
+    }
+  }
+
+  // Exclude collections by name if specified
+  if (excludeFilter && excludeFilter.length > 0) {
+    const before = collections.length;
+    collections = collections.filter(col => !excludeFilter.includes(col.name));
+    if (collections.length === 0) {
+      console.log(`${c.dim}All collections were excluded. Available: ${listCollections(db).map(col => col.name).join(', ')}${c.reset}`);
+      closeDb();
+      return;
+    }
+    console.log(`${c.dim}Excluded ${before - collections.length} collection(s): ${excludeFilter.join(', ')}${c.reset}\n`);
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -600,6 +629,12 @@ async function updateCollections(): Promise<void> {
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+    }
+    if (result.skippedFiles && result.skippedFiles.length > 0) {
+      console.log(`${c.yellow}Skipped ${result.skippedFiles.length} file(s) due to read errors:${c.reset}`);
+      for (const skipped of result.skippedFiles) {
+        console.log(`  ${c.dim}- ${skipped}${c.reset}`);
+      }
     }
     console.log("");
   }
@@ -1534,6 +1569,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  const skippedFiles: string[] = [];
   const startTime = Date.now();
 
   for (const relativeFile of files) {
@@ -1545,7 +1581,10 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     try {
       content = readFileSync(filepath, "utf-8");
     } catch (err: any) {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+      // Skip files that can't be read (e.g. iCloud evicted, ETIMEDOUT, ENOENT)
+      const code = err?.code || "UNKNOWN";
+      process.stderr.write(`\n  warning: Skipped ${relativeFile}: ${code}\n`);
+      skippedFiles.push(relativeFile);
       processed++;
       progress.set((processed / total) * 100);
       continue;
@@ -1619,6 +1658,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+  if (skippedFiles.length > 0) {
+    console.log(`${c.yellow}Skipped ${skippedFiles.length} file(s) due to read errors:${c.reset}`);
+    for (const skipped of skippedFiles) {
+      console.log(`  ${c.dim}- ${skipped}${c.reset}`);
+    }
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
@@ -2400,6 +2445,7 @@ function parseCLI() {
       "max-batch-mb": { type: "string" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      exclude: { type: "string", multiple: true },  // Exclude collection(s) from update
       refresh: { type: "boolean" },
       // Get options
       l: { type: "string" },  // max lines
@@ -2615,6 +2661,8 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("    -c, --collection <name>     - Update only named collection(s) (repeatable)");
+  console.log("    --exclude <name>            - Update all EXCEPT named collection(s) (repeatable)");
   console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -2994,7 +3042,10 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(
+        cli.opts.collection ? (Array.isArray(cli.opts.collection) ? cli.opts.collection : [cli.opts.collection]) : undefined,
+        cli.values.exclude as string[] | undefined,
+      );
       break;
 
     case "embed":
