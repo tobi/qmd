@@ -2753,13 +2753,19 @@ describe("Embedding batching", () => {
 
   function createFakeEmbedLlm() {
     const embedBatchCalls: string[][] = [];
+    const embedCalls: { text: string; options?: { model?: string } }[] = [];
+    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
     return {
       embedBatchCalls,
-      async embed(_text: string) {
+      embedCalls,
+      embedBatchModelCalls,
+      async embed(text: string, options?: { model?: string }) {
+        embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },
-      async embedBatch(texts: string[]) {
+      async embedBatch(texts: string[], options?: { model?: string }) {
         embedBatchCalls.push([...texts]);
+        embedBatchModelCalls.push(options);
         return texts.map((_text, index) => ({
           embedding: [index + 1, index + 2, index + 3],
           model: "fake-embed",
@@ -2826,6 +2832,30 @@ describe("Embedding batching", () => {
       expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([2, 1]);
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings passes the selected model through to embed calls and metadata", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+
+      const result = await generateEmbeddings(store, { model });
+
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
