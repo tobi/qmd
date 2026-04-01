@@ -27,6 +27,13 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import {
+  computeStrength,
+  isValidCategory,
+  PRUNE_THRESHOLD,
+  CATEGORIES,
+  type Category,
+} from "./decay.js";
 import type {
   NamedCollection,
   Collection,
@@ -768,6 +775,37 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
+  // Memory decay columns — migrate existing tables via ALTER TABLE ADD COLUMN
+  const docCols = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  const docColNames = new Set(docCols.map(c => c.name));
+  if (!docColNames.has("importance")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN importance REAL NOT NULL DEFAULT 0.5`);
+  }
+  if (!docColNames.has("recall_count")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!docColNames.has("last_recalled_at")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN last_recalled_at TEXT`);
+  }
+  if (!docColNames.has("category")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN category TEXT NOT NULL DEFAULT 'fact'`);
+  }
+
+  // Decay categories — base lambda values for Ebbinghaus forgetting curve
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS decay_categories (
+      name TEXT PRIMARY KEY,
+      base_lambda REAL NOT NULL,
+      description TEXT
+    )
+  `);
+  db.exec(`INSERT OR IGNORE INTO decay_categories (name, base_lambda, description) VALUES
+    ('strategy', 0.10, 'Strategic documents — slow decay'),
+    ('fact', 0.16, 'Factual information — moderate decay'),
+    ('assumption', 0.20, 'Assumptions — faster decay, needs re-validation'),
+    ('failure', 0.35, 'Failure records — fast decay unless recalled')
+  `);
+
   // Cache table for LLM API calls
   db.exec(`
     CREATE TABLE IF NOT EXISTS llm_cache (
@@ -1134,6 +1172,15 @@ export type Store = {
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+
+  // Memory decay
+  getDecayStats: () => DecayStats;
+  setDocumentImportance: (filepath: string, importance: number) => boolean;
+  setDocumentCategory: (filepath: string, category: Category) => boolean;
+  recordRecall: (filepaths: string[]) => void;
+  pruneLowStrength: () => number;
+  getDocumentDecayInfo: (filepath: string) => DecayDocInfo | null;
+  getDecayStrengthForFile: (filepath: string) => number;
 };
 
 // =============================================================================
@@ -1565,6 +1612,171 @@ export async function generateEmbeddings(
   };
 }
 
+// =============================================================================
+// Memory Decay — DB accessor functions
+// =============================================================================
+
+export type DecayDocInfo = {
+  id: number;
+  filepath: string;
+  importance: number;
+  recallCount: number;
+  lastRecalledAt: string | null;
+  category: Category;
+  strength: number;
+};
+
+export type DecayStats = {
+  totalDocs: number;
+  byCategory: { category: string; count: number; avgStrength: number }[];
+  pruneCandidates: DecayDocInfo[];
+  belowThreshold: number;
+  strengthDistribution: { range: string; count: number }[];
+};
+
+function getDecayStats(db: Database): DecayStats {
+  const rows = db.prepare(`
+    SELECT id, collection || '/' || path AS filepath,
+           importance, recall_count, last_recalled_at, category, created_at
+    FROM documents WHERE active = 1
+  `).all() as { id: number; filepath: string; importance: number; recall_count: number; last_recalled_at: string | null; category: string; created_at: string }[];
+
+  const docs: DecayDocInfo[] = rows.map(r => {
+    const cat = isValidCategory(r.category) ? r.category : "fact";
+    return {
+      id: r.id,
+      filepath: r.filepath,
+      importance: r.importance,
+      recallCount: r.recall_count,
+      lastRecalledAt: r.last_recalled_at,
+      category: cat,
+      strength: computeStrength(r.importance, cat, r.created_at, r.recall_count),
+    };
+  });
+
+  const byCategory = CATEGORIES.map(cat => {
+    const catDocs = docs.filter(d => d.category === cat);
+    const avgStrength = catDocs.length > 0
+      ? catDocs.reduce((sum, d) => sum + d.strength, 0) / catDocs.length
+      : 0;
+    return { category: cat, count: catDocs.length, avgStrength };
+  });
+
+  const pruneCandidates = docs.filter(d => d.strength < PRUNE_THRESHOLD);
+
+  const ranges = [
+    { range: '0.00-0.05', min: 0, max: 0.05, count: 0 },
+    { range: '0.05-0.20', min: 0.05, max: 0.20, count: 0 },
+    { range: '0.20-0.50', min: 0.20, max: 0.50, count: 0 },
+    { range: '0.50-0.80', min: 0.50, max: 0.80, count: 0 },
+    { range: '0.80-1.00+', min: 0.80, max: Infinity, count: 0 },
+  ];
+  for (const doc of docs) {
+    for (const r of ranges) {
+      if (doc.strength >= r.min && doc.strength < r.max) {
+        r.count++;
+        break;
+      }
+    }
+  }
+
+  return {
+    totalDocs: docs.length,
+    byCategory,
+    pruneCandidates,
+    belowThreshold: pruneCandidates.length,
+    strengthDistribution: ranges.map(r => ({ range: r.range, count: r.count })),
+  };
+}
+
+function setDocumentImportance(db: Database, filepath: string, importance: number): boolean {
+  // filepath can be "collection/path" or just a path suffix
+  const result = db.prepare(`
+    UPDATE documents SET importance = ?
+    WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+  `).run(importance, filepath, filepath);
+  return result.changes > 0;
+}
+
+function setDocumentCategory(db: Database, filepath: string, category: Category): boolean {
+  const result = db.prepare(`
+    UPDATE documents SET category = ?
+    WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+  `).run(category, filepath, filepath);
+  return result.changes > 0;
+}
+
+function recordRecall(db: Database, filepaths: string[]): void {
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`
+    UPDATE documents SET recall_count = recall_count + 1, last_recalled_at = ?
+    WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+  `);
+  for (const fp of filepaths) {
+    stmt.run(now, fp, fp);
+  }
+}
+
+function pruneLowStrength(db: Database): number {
+  const rows = db.prepare(`
+    SELECT id, importance, recall_count, category, created_at
+    FROM documents WHERE active = 1
+  `).all() as { id: number; importance: number; recall_count: number; category: string; created_at: string }[];
+
+  const toPrune: number[] = [];
+  for (const r of rows) {
+    const cat = isValidCategory(r.category) ? r.category : "fact";
+    const strength = computeStrength(r.importance, cat, r.created_at, r.recall_count);
+    if (strength < PRUNE_THRESHOLD) {
+      toPrune.push(r.id);
+    }
+  }
+
+  if (toPrune.length === 0) return 0;
+
+  const stmt = db.prepare(`UPDATE documents SET active = 0 WHERE id = ?`);
+  for (const id of toPrune) {
+    stmt.run(id);
+  }
+  return toPrune.length;
+}
+
+function getDocumentDecayInfo(db: Database, filepath: string): DecayDocInfo | null {
+  const row = db.prepare(`
+    SELECT id, collection || '/' || path AS filepath,
+           importance, recall_count, last_recalled_at, category, created_at
+    FROM documents WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+  `).get(filepath, filepath) as { id: number; filepath: string; importance: number; recall_count: number; last_recalled_at: string | null; category: string; created_at: string } | undefined;
+
+  if (!row) return null;
+  const cat = isValidCategory(row.category) ? row.category : "fact";
+  return {
+    id: row.id,
+    filepath: row.filepath,
+    importance: row.importance,
+    recallCount: row.recall_count,
+    lastRecalledAt: row.last_recalled_at,
+    category: cat,
+    strength: computeStrength(row.importance, cat, row.created_at, row.recall_count),
+  };
+}
+
+/**
+ * Compute decay strength for a document by its filepath.
+ * Returns 1.0 if the document is not found (no penalty for unknown docs).
+ */
+function getDecayStrengthForFile(db: Database, filepath: string): number {
+  const row = db.prepare(`
+    SELECT importance, recall_count, category, created_at
+    FROM documents WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+    LIMIT 1
+  `).get(filepath, filepath) as { importance: number; recall_count: number; category: string; created_at: string } | undefined;
+
+  if (!row) return 1.0;
+  const cat = isValidCategory(row.category) ? row.category : "fact";
+  return computeStrength(row.importance, cat, row.created_at, row.recall_count);
+}
+
 /**
  * Create a new store instance with the given database path.
  * If no path is provided, uses the default path (~/.cache/qmd/index.sqlite).
@@ -1646,6 +1858,15 @@ export function createStore(dbPath?: string): Store {
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+
+    // Memory decay
+    getDecayStats: () => getDecayStats(db),
+    setDocumentImportance: (filepath: string, importance: number) => setDocumentImportance(db, filepath, importance),
+    setDocumentCategory: (filepath: string, category: Category) => setDocumentCategory(db, filepath, category),
+    recordRecall: (filepaths: string[]) => recordRecall(db, filepaths),
+    pruneLowStrength: () => pruneLowStrength(db),
+    getDocumentDecayInfo: (filepath: string) => getDocumentDecayInfo(db, filepath),
+    getDecayStrengthForFile: (filepath: string) => getDecayStrengthForFile(db, filepath),
   };
 
   return store;
@@ -4047,7 +4268,7 @@ export async function hybridQuery(
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
     const seenFiles = new Set<string>();
-    return candidates
+    const skipRerankResults = candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -4072,6 +4293,10 @@ export async function hybridQuery(
           blendedScore: rrfScore,
         } : undefined;
 
+        // Apply memory decay strength to score
+        const decayStrength = getDecayStrengthForFile(store.db, cand.file);
+        const decayedScore = rrfScore * decayStrength;
+
         return {
           file: cand.file,
           displayPath: cand.displayPath,
@@ -4079,7 +4304,7 @@ export async function hybridQuery(
           body: cand.body,
           bestChunk,
           bestChunkPos,
-          score: rrfScore,
+          score: decayedScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
@@ -4091,7 +4316,14 @@ export async function hybridQuery(
         return true;
       })
       .filter(r => r.score >= minScore)
+      .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+
+    // Record recalls for returned results (top 5)
+    const recallPaths = skipRerankResults.slice(0, 5).map(r => r.file);
+    if (recallPaths.length > 0) recordRecall(store.db, recallPaths);
+
+    return skipRerankResults;
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -4146,6 +4378,10 @@ export async function hybridQuery(
       blendedScore,
     } : undefined;
 
+    // Apply memory decay strength to score
+    const decayStrength = getDecayStrengthForFile(store.db, r.file);
+    const decayedScore = blendedScore * decayStrength;
+
     return {
       file: r.file,
       displayPath: candidate?.displayPath || "",
@@ -4153,7 +4389,7 @@ export async function hybridQuery(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: decayedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
@@ -4162,7 +4398,7 @@ export async function hybridQuery(
 
   // Step 8: Dedup by file (safety net — prevents duplicate output)
   const seenFiles = new Set<string>();
-  return blended
+  const finalResults = blended
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -4170,6 +4406,12 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+
+  // Record recalls for returned results (top 5)
+  const recallPaths = finalResults.slice(0, 5).map(r => r.file);
+  if (recallPaths.length > 0) recordRecall(store.db, recallPaths);
+
+  return finalResults;
 }
 
 export interface VectorSearchOptions {
@@ -4464,6 +4706,10 @@ export async function structuredSearch(
           blendedScore: rrfScore,
         } : undefined;
 
+        // Apply memory decay strength to score
+        const decayStrength = getDecayStrengthForFile(store.db, cand.file);
+        const decayedScore = rrfScore * decayStrength;
+
         return {
           file: cand.file,
           displayPath: cand.displayPath,
@@ -4471,7 +4717,7 @@ export async function structuredSearch(
           body: cand.body,
           bestChunk,
           bestChunkPos,
-          score: rrfScore,
+          score: decayedScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
@@ -4483,6 +4729,7 @@ export async function structuredSearch(
         return true;
       })
       .filter(r => r.score >= minScore)
+      .sort((a, b) => b.score - a.score)
       .slice(0, limit);
   }
 
@@ -4537,6 +4784,10 @@ export async function structuredSearch(
       blendedScore,
     } : undefined;
 
+    // Apply memory decay strength to score
+    const decayStrength = getDecayStrengthForFile(store.db, r.file);
+    const decayedScore = blendedScore * decayStrength;
+
     return {
       file: r.file,
       displayPath: candidate?.displayPath || "",
@@ -4544,7 +4795,7 @@ export async function structuredSearch(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: decayedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),

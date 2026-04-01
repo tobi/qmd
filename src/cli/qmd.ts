@@ -76,7 +76,10 @@ import {
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
+  type DecayStats,
+  type DecayDocInfo,
 } from "../store.js";
+import { isValidCategory, PRUNE_THRESHOLD, CATEGORIES, type Category } from "../decay.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
@@ -2412,6 +2415,8 @@ function parseCLI() {
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
+      // Decay options
+      run: { type: "boolean" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2619,6 +2624,12 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("Memory decay:");
+  console.log("  qmd decay                     - Show decay statistics and prune candidates");
+  console.log("  qmd decay --run               - Deactivate documents below strength threshold");
+  console.log("  qmd importance set <file> <v> - Set document importance (0.0-1.0)");
+  console.log("  qmd category set <file> <cat> - Set category (strategy|fact|assumption|failure)");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -3215,6 +3226,103 @@ if (isMain) {
       vacuumDatabase(db);
       console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
+      closeDb();
+      break;
+    }
+
+    case "decay": {
+      const store = getStore();
+      const runPrune = cli.values.run;
+
+      if (runPrune) {
+        const pruned = store.pruneLowStrength();
+        if (pruned > 0) {
+          console.log(`${c.green}✓${c.reset} Pruned ${pruned} documents below strength threshold (${PRUNE_THRESHOLD})`);
+        } else {
+          console.log(`${c.dim}No documents below pruning threshold (${PRUNE_THRESHOLD})${c.reset}`);
+        }
+      } else {
+        const stats = store.getDecayStats();
+        console.log(`${c.bold}Memory Decay Statistics${c.reset}`);
+        console.log(`Total documents: ${stats.totalDocs}`);
+        console.log(`Below pruning threshold (${PRUNE_THRESHOLD}): ${stats.belowThreshold}`);
+        console.log();
+
+        console.log(`${c.bold}By Category:${c.reset}`);
+        for (const cat of stats.byCategory) {
+          console.log(`  ${cat.category.padEnd(12)} ${String(cat.count).padStart(5)} docs  avg strength: ${cat.avgStrength.toFixed(3)}`);
+        }
+        console.log();
+
+        console.log(`${c.bold}Strength Distribution:${c.reset}`);
+        for (const range of stats.strengthDistribution) {
+          const bar = "█".repeat(Math.min(40, Math.round(range.count / Math.max(1, stats.totalDocs) * 40)));
+          console.log(`  ${range.range.padEnd(12)} ${String(range.count).padStart(5)}  ${bar}`);
+        }
+
+        if (stats.belowThreshold > 0) {
+          console.log();
+          console.log(`${c.yellow}Tip:${c.reset} Run ${c.bold}qmd decay --run${c.reset} to prune ${stats.belowThreshold} low-strength documents`);
+        }
+      }
+      closeDb();
+      break;
+    }
+
+    case "importance": {
+      const subcommand = cli.args[0];
+      if (subcommand !== "set" || cli.args.length < 3) {
+        console.error("Usage: qmd importance set <file> <value>");
+        console.error("");
+        console.error("Set document importance (0.0 to 1.0)");
+        console.error("Higher importance = slower memory decay");
+        process.exit(1);
+      }
+
+      const filepath = cli.args[1]!;
+      const value = parseFloat(cli.args[2]!);
+      if (isNaN(value) || value < 0 || value > 1) {
+        console.error("Error: importance must be a number between 0 and 1");
+        process.exit(1);
+      }
+
+      const store = getStore();
+      const updated = store.setDocumentImportance(filepath, value);
+      if (updated) {
+        console.log(`${c.green}✓${c.reset} Set importance of ${filepath} to ${value}`);
+      } else {
+        console.error(`Error: document not found: ${filepath}`);
+        process.exit(1);
+      }
+      closeDb();
+      break;
+    }
+
+    case "category": {
+      const subcommand = cli.args[0];
+      if (subcommand !== "set" || cli.args.length < 3) {
+        console.error("Usage: qmd category set <file> <category>");
+        console.error("");
+        console.error(`Valid categories: ${CATEGORIES.join(", ")}`);
+        process.exit(1);
+      }
+
+      const filepath = cli.args[1]!;
+      const category = cli.args[2]!;
+      if (!isValidCategory(category)) {
+        console.error(`Error: invalid category '${category}'`);
+        console.error(`Valid categories: ${CATEGORIES.join(", ")}`);
+        process.exit(1);
+      }
+
+      const store = getStore();
+      const updated = store.setDocumentCategory(filepath, category);
+      if (updated) {
+        console.log(`${c.green}✓${c.reset} Set category of ${filepath} to ${category}`);
+      } else {
+        console.error(`Error: document not found: ${filepath}`);
+        process.exit(1);
+      }
       closeDb();
       break;
     }
