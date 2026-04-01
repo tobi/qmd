@@ -2183,7 +2183,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  const runSearch = async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2221,7 +2221,14 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  };
+
+  // Skip local LLM session when using remote Ollama for embeddings
+  if (process.env.OLLAMA_EMBED_URL) {
+    await runSearch();
+  } else {
+    await withLLMSession(runSearch, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  }
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2239,7 +2246,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
-  await withLLMSession(async () => {
+  const runQuery = async () => {
     let results;
 
     if (parsed) {
@@ -2359,7 +2366,14 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       docid: r.docid,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  };
+
+  // Skip local LLM session when using remote Ollama for embeddings
+  if (process.env.OLLAMA_EMBED_URL) {
+    await runQuery();
+  } else {
+    await withLLMSession(runQuery, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  }
 }
 
 // Parse CLI arguments using util.parseArgs

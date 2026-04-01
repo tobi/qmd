@@ -39,6 +39,42 @@ import type {
 // =============================================================================
 
 const HOME = process.env.HOME || "/tmp";
+
+// Remote Ollama embedding support — when OLLAMA_EMBED_URL is set, all embedding
+// and tokenization operations use the remote Ollama HTTP API instead of
+// node-llama-cpp. This enables QMD on platforms without local GPU/Vulkan
+// (ARM64 VPS, Docker, CI) and with remote Ollama instances (Tailscale, LAN).
+const OLLAMA_EMBED_URL = process.env.OLLAMA_EMBED_URL;
+const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
+
+interface OllamaEmbedResult {
+  embedding: number[];
+  model: string;
+}
+
+async function ollamaEmbed(text: string): Promise<OllamaEmbedResult> {
+  const res = await fetch(`${OLLAMA_EMBED_URL}/api/embed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
+  });
+  if (!res.ok) throw new Error(`Ollama embed failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as { embeddings: number[][] };
+  const embedding = data.embeddings[0];
+  if (!embedding) throw new Error('Ollama returned empty embeddings array');
+  return { embedding, model: OLLAMA_EMBED_MODEL };
+}
+
+async function ollamaEmbedBatch(texts: string[]): Promise<OllamaEmbedResult[]> {
+  const res = await fetch(`${OLLAMA_EMBED_URL}/api/embed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: texts }),
+  });
+  if (!res.ok) throw new Error(`Ollama embed batch failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as { embeddings: number[][] };
+  return data.embeddings.map(e => ({ embedding: e, model: OLLAMA_EMBED_MODEL }));
+}
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
@@ -1407,6 +1443,67 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
+  // Remote Ollama mode: bypass local LLM entirely
+  if (OLLAMA_EMBED_URL) {
+    let chunksEmbedded = 0;
+    let errors = 0;
+    let bytesProcessed = 0;
+    let totalChunks = 0;
+    let vectorTableInitialized = false;
+    const BATCH_SIZE = 32;
+    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+
+    for (const batchMeta of batches) {
+      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+      const batchChunks: ChunkItem[] = [];
+      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+
+      for (const doc of batchDocs) {
+        if (!doc.body.trim()) continue;
+        const title = extractTitle(doc.body, doc.path);
+        const chunks = await chunkDocumentByTokens(doc.body, undefined, undefined, undefined, doc.path, options?.chunkStrategy);
+        for (let seq = 0; seq < chunks.length; seq++) {
+          batchChunks.push({ hash: doc.hash, title, text: chunks[seq]!.text, seq, pos: chunks[seq]!.pos, tokens: chunks[seq]!.tokens, bytes: encoder.encode(chunks[seq]!.text).length });
+        }
+      }
+
+      totalChunks += batchChunks.length;
+      if (batchChunks.length === 0) { bytesProcessed += batchBytes; options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors }); continue; }
+
+      if (!vectorTableInitialized) {
+        const firstResult = await ollamaEmbed(batchChunks[0]!.text);
+        store.ensureVecTable(firstResult.embedding.length);
+        vectorTableInitialized = true;
+      }
+
+      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+        const texts = chunkBatch.map(chunk => chunk.text);
+        try {
+          const embeddings = await ollamaEmbedBatch(texts);
+          for (let i = 0; i < chunkBatch.length; i++) {
+            const chunk = chunkBatch[i]!;
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embeddings[i]!.embedding), model, now);
+            chunksEmbedded++;
+          }
+        } catch {
+          for (const chunk of chunkBatch) {
+            try {
+              const result = await ollamaEmbed(chunk.text);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              chunksEmbedded++;
+            } catch { errors++; }
+          }
+        }
+        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed: bytesProcessed + batchBytes, totalBytes, errors });
+      }
+      bytesProcessed += batchBytes;
+    }
+
+    return { docsProcessed: totalDocs, chunksEmbedded, errors, durationMs: Date.now() - startTime };
+  }
+
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
 
@@ -2201,14 +2298,19 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
-
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
-  // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
   const maxChars = maxTokens * avgCharsPerToken;
   const overlapChars = overlapTokens * avgCharsPerToken;
   const windowChars = windowTokens * avgCharsPerToken;
+
+  // Remote Ollama mode: skip local tokenizer, use char-based chunking
+  if (OLLAMA_EMBED_URL) {
+    const charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+    return charChunks.map(c => ({ text: c.text, pos: c.pos, tokens: Math.ceil(c.text.length / avgCharsPerToken) }));
+  }
+
+  const llm = getDefaultLlamaCpp();
 
   // Chunk in character space with conservative estimate
   // Use AST-aware chunking for the first pass when filepath/strategy provided
@@ -3078,6 +3180,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+  // Remote Ollama mode: bypass local LLM entirely
+  if (OLLAMA_EMBED_URL && !session && !llmOverride) {
+    const result = await ollamaEmbed(text);
+    return result.embedding;
+  }
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -3147,6 +3254,11 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  // Remote Ollama mode: skip LLM-based HYDE query expansion (no local model)
+  if (OLLAMA_EMBED_URL && !llmOverride) {
+    return [{ type: 'vec' as const, query }];
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
