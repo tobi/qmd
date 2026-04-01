@@ -41,11 +41,12 @@ export function computeStrength(
   importance: number,
   category: Category,
   createdAt: string,
-  recallCount: number
+  recallCount: number,
+  now?: number
 ): number {
   const baseLambda = BASE_LAMBDA[category];
   const lambdaEff = baseLambda * (1 - importance * 0.8);
-  const days = Math.max(0, (Date.now() - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24));
+  const days = Math.max(0, ((now ?? Date.now()) - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24));
   return importance * Math.exp(-lambdaEff * days) * (1 + recallCount * 0.2);
 }
 
