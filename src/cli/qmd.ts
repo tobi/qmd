@@ -99,6 +99,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { normalizeMcpHost, validateMcpHostInput } from "../mcp-host.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -2416,6 +2417,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2606,6 +2608,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd mcp --http [--host ADDR] [--port N]  - Start MCP server (HTTP, default localhost:8181)");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -2659,7 +2662,7 @@ function showHelp(): void {
   console.log("  - `qmd skill install` installs the QMD skill into ./.agents/skills/qmd.");
   console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
-  console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
+  console.log("  - Advanced: `qmd mcp --http [--host ADDR] [--port N]` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
@@ -3094,6 +3097,25 @@ if (isMain) {
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
 
+        // Validate and normalize --host
+        let host: string | undefined;
+        let normalizedHost = normalizeMcpHost(undefined);
+        if (cli.values.host !== undefined) {
+          if (typeof cli.values.host !== "string") {
+            console.error(`Invalid --host value: "--host" requires a hostname or IP address argument.`);
+            process.exit(1);
+          }
+          const rawHost = cli.values.host;
+          try {
+            validateMcpHostInput(rawHost);
+          } catch (err: any) {
+            console.error(String(err.message || err));
+            process.exit(1);
+          }
+          normalizedHost = normalizeMcpHost(rawHost);
+          host = normalizedHost.bindHost;
+        }
+
         if (cli.values.daemon) {
           // Guard: check if already running
           if (existsSync(pidPath)) {
@@ -3114,17 +3136,63 @@ if (isMain) {
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
+          if (host !== undefined) {
+            spawnArgs.push("--host", host);
+          }
           const child = nodeSpawn(process.execPath, spawnArgs, {
-            stdio: ["ignore", logFd, logFd],
+            stdio: ["ignore", logFd, logFd, "ipc"],
             detached: true,
           });
-          child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
 
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
-          console.log(`Logs: ${logPath}`);
-          process.exit(0);
+          // Wait for child to report ready or error via IPC.
+          // Settled guard prevents double-resolution from message+exit or error+exit races.
+          const result = await new Promise<{ status: string; port?: number; code?: string; message?: string }>((resolve) => {
+            let settled = false;
+            const settle = (r: { status: string; port?: number; code?: string; message?: string }) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              resolve(r);
+            };
+
+            const timeout = setTimeout(() => {
+              settle({ status: "error", message: "Daemon startup timed out (10s)" });
+            }, 10_000);
+
+            child.on("message", (msg: any) => settle(msg));
+
+            child.on("error", (err) => {
+              settle({ status: "error", message: `Spawn error: ${err.message}` });
+            });
+
+            child.on("exit", (code) => {
+              const logContent = existsSync(logPath) ? readFileSync(logPath, "utf-8").trim() : "";
+              settle({ status: "error", message: `Daemon exited with code ${code}.${logContent ? "\n" + logContent : ""}` });
+            });
+          });
+
+          if (result.status === "ready") {
+            // Disconnect IPC before unref — Node docs: unref() does not fully detach
+            // while an IPC channel is still established.
+            if (child.connected) child.disconnect();
+            child.unref();
+            writeFileSync(pidPath, String(child.pid));
+            const actualPort = result.port ?? port;
+            console.log(`Started on http://${normalizedHost.displayHost}:${actualPort}/mcp (PID ${child.pid})`);
+            console.log(`Logs: ${logPath}`);
+            process.exit(0);
+          } else {
+            if (child.connected) child.disconnect();
+            try { child.kill(); } catch {}
+            try { unlinkSync(pidPath); } catch {}
+            if ((result as any).code === "EADDRINUSE") {
+              console.error(`Port ${port} already in use on ${normalizedHost.bindHost}. Try a different port with --port.`);
+            } else {
+              console.error(`Daemon failed to start: ${result.message}`);
+            }
+            process.exit(1);
+          }
         }
 
         // Foreground HTTP mode — remove top-level cursor handlers so the
@@ -3133,10 +3201,22 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          const handle = await startMcpHttpServer(port, { host });
+          // Signal parent daemon process if spawned with IPC.
+          // Use send(msg, callback) → disconnect in callback for deterministic ordering.
+          if (process.send) {
+            process.send({ status: "ready", port: handle.port }, () => {
+              process.disconnect?.();
+            });
+          }
         } catch (e: any) {
+          if (process.send) {
+            process.send({ status: "error", code: e?.code, message: e?.message || String(e) }, () => {
+              process.disconnect?.();
+            });
+          }
           if (e?.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            console.error(`Port ${port} already in use on ${normalizedHost.bindHost}. Try a different port with --port.`);
             process.exit(1);
           }
           throw e;
