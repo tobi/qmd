@@ -548,10 +548,23 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
+      // QMD_FORCE_CPU=1 forces CPU-only mode (useful for older GPUs like Pascal)
+      // QMD_FORCE_CUDA=1 forces CUDA and disables Vulkan offloading
+      const forceCpu = process.env.QMD_FORCE_CPU === "1" || process.env.QMD_FORCE_CPU === "true";
+      const forceCuda = process.env.QMD_FORCE_CUDA === "1" || process.env.QMD_FORCE_CUDA === "true";
+      
+      let gpuSetting: "auto" | "cuda" | false = "auto";
+      if (forceCpu) {
+        gpuSetting = false;
+      } else if (forceCuda) {
+        gpuSetting = "cuda";
+      }
+      
       const llama = await getLlama({
         // attempt to build
-        build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
+        build: "autoAttempt" as any,
+        logLevel: LlamaLogLevel.error,
+        gpu: gpuSetting,
       });
 
       if (llama.gpu === false) {
