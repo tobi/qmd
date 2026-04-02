@@ -46,11 +46,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@types/mdast": "^4.0.4",
     "better-sqlite3": "12.8.0",
     "fast-glob": "3.3.3",
     "node-llama-cpp": "3.18.1",
     "picomatch": "4.0.4",
+    "remark-parse": "^11.0.0",
     "sqlite-vec": "0.1.9",
+    "unified": "^11.0.5",
     "web-tree-sitter": "0.26.7",
     "yaml": "2.8.3",
     "zod": "4.2.1"

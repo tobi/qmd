@@ -24,6 +24,11 @@ export type ContextMap = Record<string, string>;
 /**
  * A single collection configuration
  */
+export interface SectionFilter {
+  heading: string;           // Heading text to match (e.g., "Notes")
+  level: number;             // Heading level (e.g., 2 for ##)
+}
+
 export interface Collection {
   path: string;              // Absolute path to index
   pattern: string;           // Glob pattern (e.g., "**/*.md")
@@ -31,6 +36,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  section?: SectionFilter;   // Optional: only index content under this heading
 }
 
 /**

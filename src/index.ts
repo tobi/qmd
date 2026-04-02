@@ -80,6 +80,7 @@ import {
   type CollectionConfig,
   type NamedCollection,
   type ContextMap,
+  type SectionFilter,
 } from "./collections.js";
 
 // Re-export types for SDK consumers
@@ -104,6 +105,7 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  SectionFilter,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -492,6 +494,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          section: col.section,
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,
