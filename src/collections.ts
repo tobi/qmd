@@ -287,7 +287,8 @@ export function updateCollectionSettings(
 export function addCollection(
   name: string,
   path: string,
-  pattern: string = "**/*.md"
+  pattern: string = "**/*.md",
+  section?: SectionFilter
 ): void {
   const config = loadConfig();
 
@@ -295,6 +296,7 @@ export function addCollection(
     path,
     pattern,
     context: config.collections[name]?.context, // Preserve existing context
+    ...(section ? { section } : {}),
   };
 
   saveConfig(config);

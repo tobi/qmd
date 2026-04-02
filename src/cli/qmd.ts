@@ -97,6 +97,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  type SectionFilter,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -1409,7 +1410,7 @@ function collectionList(): void {
   closeDb();
 }
 
-async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+async function collectionAdd(pwd: string, globPattern: string, name?: string, section?: SectionFilter): Promise<void> {
   // If name not provided, generate from pwd basename
   let collName = name;
   if (!collName) {
@@ -1439,7 +1440,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
-  addCollection(collName, pwd, globPattern);
+  addCollection(collName, pwd, globPattern, section);
   resyncConfig();
 
   // Create the collection and index files
@@ -2470,6 +2471,8 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      "heading-name": { type: "string" },  // section filter: heading text
+      "heading-level": { type: "string" },  // section filter: heading level
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -2939,8 +2942,17 @@ if (isMain) {
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
+          const headingName = cli.values["heading-name"] as string | undefined;
+          const headingLevel = cli.values["heading-level"] as string | undefined;
+          let section: SectionFilter | undefined;
+          if (headingName) {
+            section = {
+              heading: headingName,
+              level: headingLevel ? parseInt(headingLevel, 10) : 2,
+            };
+          }
 
-          await collectionAdd(resolvedPwd, globPattern, name);
+          await collectionAdd(resolvedPwd, globPattern, name, section);
           break;
         }
 
@@ -3028,6 +3040,9 @@ if (isMain) {
           console.log(`  Path:     ${col.path}`);
           console.log(`  Pattern:  ${col.pattern}`);
           console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.section) {
+            console.log(`  Section:  ## ${col.section.heading} (level ${col.section.level})`);
+          }
           if (col.update) {
             console.log(`  Update:   ${col.update}`);
           }
@@ -3044,7 +3059,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--heading-name H --heading-level N]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
@@ -3054,6 +3069,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection add ~/vault/claims --name claims --heading-name Notes --heading-level 2");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);
