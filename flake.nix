@@ -18,6 +18,55 @@
           ];
         });
 
+        nodeModulesHashes = {
+          x86_64-linux = "sha256-Hymzuiid76j0LbDRACYlRQ2UVxQp7t9xg4nH37l0Keg=";
+          aarch64-darwin = "sha256-/9kp5mNrI7hVR137DRpSuZHnl1RL/wFu2hKyzXW66TU=";
+
+          # Populate these on first build for additional hosts if/when needed.
+          aarch64-linux = pkgs.lib.fakeHash;
+          x86_64-darwin = pkgs.lib.fakeHash;
+        };
+
+        nodeModules = pkgs.stdenvNoCC.mkDerivation {
+          pname = "qmd-node-modules";
+          version = "1.0.0";
+
+          src = ./.;
+
+          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [
+            "GIT_PROXY_COMMAND"
+            "SOCKS_SERVER"
+          ];
+
+          nativeBuildInputs = [
+            pkgs.bun
+          ];
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            export HOME=$(mktemp -d)
+
+            bun install \
+              --backend copyfile \
+              --frozen-lockfile \
+              --ignore-scripts \
+              --no-progress \
+              --production
+          '';
+
+          installPhase = ''
+            mkdir -p $out
+            cp -R node_modules $out/
+          '';
+
+          dontFixup = true;
+
+          outputHash = nodeModulesHashes.${system};
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+        };
+
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
           version = "1.0.0";
@@ -27,6 +76,8 @@
           nativeBuildInputs = [
             pkgs.bun
             pkgs.makeWrapper
+            pkgs.nodejs
+            pkgs.node-gyp
             pkgs.python3  # needed by node-gyp to compile better-sqlite3
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
@@ -36,7 +87,11 @@
 
           buildPhase = ''
             export HOME=$(mktemp -d)
-            bun install --frozen-lockfile
+
+            cp -R ${nodeModules}/node_modules ./
+            chmod -R u+w node_modules
+
+            (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
           '';
 
           installPhase = ''

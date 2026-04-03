@@ -406,7 +406,7 @@ describe("handelize", () => {
   });
 
   test("handles special project naming patterns", () => {
-    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("project-abc-v2-0.md");
+    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("project-abc-v2.0.md");
     expect(handelize("[WIP] Feature Request.md")).toBe("wip-feature-request.md");
     expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
   });

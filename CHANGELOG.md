@@ -18,9 +18,13 @@
 ### Fixes
 
 - Fix paths in nix flake 
+- Make the Nix flake's Bun dependency fetch a fixed-output derivation so
+  sandboxed Linux builds can install dependencies offline.
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
+- Sync duplicated `handelize()` test expectations with the restored lowercase
+  behavior.
 
 ## [2.0.1] - 2026-03-10
 
