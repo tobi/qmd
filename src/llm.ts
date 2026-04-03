@@ -445,6 +445,10 @@ export class LlamaCpp implements LLM {
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
 
+  get embedModelName(): string {
+    return this.embedModelUri;
+  }
+
   /**
    * Reset the inactivity timer. Called after each model operation.
    * When timer fires, models are unloaded to free memory (if no active sessions).
