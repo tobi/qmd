@@ -47,6 +47,13 @@ export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 
+const BASE_EXCLUDE_DIRS = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+
+export function getExcludeDirs(): string[] {
+  const extra = process.env.QMD_EXCLUDE_DIRS?.split(',').map(d => d.trim()).filter(Boolean) ?? [];
+  return [...BASE_EXCLUDE_DIRS, ...extra];
+}
+
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
 export const CHUNK_SIZE_TOKENS = 900;
@@ -1170,10 +1177,9 @@ export async function reindexCollection(
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
+    ...getExcludeDirs().map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
   const allFiles: string[] = await fastGlob(globPattern, {

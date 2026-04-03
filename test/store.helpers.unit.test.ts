@@ -16,6 +16,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  getExcludeDirs,
 } from "../src/store";
 
 // =============================================================================
@@ -242,5 +243,58 @@ describe("handelize", () => {
     expect(isDocid("#123456")).toBe(true);
     expect(isDocid("bad-id")).toBe(false);
     expect(isDocid("12345")).toBe(false);
+  });
+});
+
+// =============================================================================
+// getExcludeDirs Tests
+// =============================================================================
+
+describe("getExcludeDirs", () => {
+  test("returns default exclude dirs when env var is unset", () => {
+    const original = process.env.QMD_EXCLUDE_DIRS;
+    delete process.env.QMD_EXCLUDE_DIRS;
+
+    const dirs = getExcludeDirs();
+    expect(dirs).toContain("node_modules");
+    expect(dirs).toContain(".git");
+    expect(dirs).toContain("vendor");
+    expect(dirs).toContain("dist");
+    expect(dirs).toContain("build");
+    expect(dirs).toContain(".cache");
+
+    if (original) process.env.QMD_EXCLUDE_DIRS = original;
+  });
+
+  test("appends custom dirs from QMD_EXCLUDE_DIRS", () => {
+    const original = process.env.QMD_EXCLUDE_DIRS;
+    process.env.QMD_EXCLUDE_DIRS = ".obsidian,tmp";
+
+    const dirs = getExcludeDirs();
+    expect(dirs).toContain("node_modules");
+    expect(dirs).toContain(".obsidian");
+    expect(dirs).toContain("tmp");
+
+    if (original) {
+      process.env.QMD_EXCLUDE_DIRS = original;
+    } else {
+      delete process.env.QMD_EXCLUDE_DIRS;
+    }
+  });
+
+  test("handles whitespace in QMD_EXCLUDE_DIRS", () => {
+    const original = process.env.QMD_EXCLUDE_DIRS;
+    process.env.QMD_EXCLUDE_DIRS = " .obsidian , tmp , ";
+
+    const dirs = getExcludeDirs();
+    expect(dirs).toContain(".obsidian");
+    expect(dirs).toContain("tmp");
+    expect(dirs).not.toContain("");
+
+    if (original) {
+      process.env.QMD_EXCLUDE_DIRS = original;
+    } else {
+      delete process.env.QMD_EXCLUDE_DIRS;
+    }
   });
 });
