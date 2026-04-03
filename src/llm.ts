@@ -665,6 +665,7 @@ export class LlamaCpp implements LLM {
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -768,6 +769,11 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_CONTEXT_SIZE: number = (() => {
     const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
     return Number.isFinite(v) && v > 0 ? v : 4096;
+  })();
+
+  private static readonly EMBED_CONTEXT_SIZE: number = (() => {
+    const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
