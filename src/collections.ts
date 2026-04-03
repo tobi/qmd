@@ -34,11 +34,21 @@ export interface Collection {
 }
 
 /**
+ * Model configuration for embedding, reranking, and generation
+ */
+export interface ModelsConfig {
+  embed?: string;
+  rerank?: string;
+  generate?: string;
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  models?: ModelsConfig;
 }
 
 /**
