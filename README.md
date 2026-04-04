@@ -1,8 +1,15 @@
-# QMD - Query Markup Documents
+# QMD - Query Markup Documents (with Remote Model Server Support)
+
+> **Fork note:** This fork adds `qmd serve` — a shared model server so multiple QMD clients
+> (e.g. OpenClaw agents in separate LXC containers) can share a single set of embedding,
+> reranking, and query expansion models over HTTP instead of each loading their own into RAM.
+> See [Remote Model Server](#remote-model-server) below. Tracks upstream [tobi/qmd](https://github.com/tobi/qmd).
+>
+> Related upstream issues: [#489](https://github.com/tobi/qmd/issues/489), [#490](https://github.com/tobi/qmd/issues/490), [#502](https://github.com/tobi/qmd/issues/502), [#480](https://github.com/tobi/qmd/issues/480)
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models. **This fork also supports remote model serving** for shared/multi-agent deployments.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -911,6 +918,64 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 ### Qwen3 (Query Expansion)
 
 Used for generating query variations via `LlamaChatSession`.
+
+## Remote Model Server
+
+> **New in this fork** — share embedding, reranking, and query expansion models across multiple QMD clients over HTTP.
+
+### Problem
+
+When running multiple AI agents (e.g. OpenClaw agents in separate LXC containers), each agent's QMD instance loads its own copy of the embedding model (~314MB), reranker (~610MB), and query expansion model (~1.2GB) into RAM. On a 16GB ARM SBC running 3 agents, that's ~6GB of duplicated model weights.
+
+### Solution
+
+Run `qmd serve` once on the host with the models loaded, then point all clients at it:
+
+```sh
+# On the host (loads models once, serves all three model types)
+qmd serve --port 7832 --bind 0.0.0.0
+
+# On each client (no local models needed)
+QMD_SERVER=http://192.168.6.123:7832 qmd query "how does auth work"
+
+# Or per-command
+qmd query --server http://192.168.6.123:7832 "search terms"
+```
+
+### Server Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/embed` | POST | Embed a single text |
+| `/embed-batch` | POST | Batch embed multiple texts |
+| `/rerank` | POST | Rerank documents by relevance |
+| `/expand` | POST | Expand a query (lex/vec/hyde) |
+| `/tokenize` | POST | Count tokens in text |
+| `/health` | GET | Server status + loaded models |
+
+### OpenClaw Integration
+
+For OpenClaw agents using QMD as their memory backend, set the `QMD_SERVER` environment variable in each agent's environment or systemd service:
+
+```ini
+# In ~/.config/systemd/user/openclaw-gateway.service
+Environment=QMD_SERVER=http://192.168.6.123:7832
+```
+
+### Use Cases
+
+- **Multi-agent setups**: Multiple OpenClaw/Claude agents sharing one embedding server
+- **LXC/Docker containers**: Agents in isolated containers accessing host-level GPU/models
+- **Low-memory devices**: ARM SBCs (Orange Pi, Raspberry Pi) where RAM is scarce
+- **Ollama alternative**: Purpose-built for QMD's embed+rerank+expand pipeline (Ollama only supports embeddings)
+
+### Installation (from this fork)
+
+```sh
+npm install -g github:jaylfc/qmd#feat/remote-llm-provider
+# or
+bun install -g github:jaylfc/qmd#feat/remote-llm-provider
+```
 
 ## License
 
