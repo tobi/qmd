@@ -189,18 +189,23 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
     }
   });
 
-  // Graceful shutdown
-  const shutdown = async () => {
-    console.log("\n[qmd serve] Shutting down...");
-    server.close();
-    await llm.dispose();
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // Return a Promise that stays pending until the server shuts down.
+  // This prevents the CLI from falling through to process.exit(0) after
+  // startServer() resolves.
+  return new Promise<void>((resolve) => {
+    // Graceful shutdown
+    const shutdown = async () => {
+      console.log("\n[qmd serve] Shutting down...");
+      server.close();
+      await llm.dispose();
+      resolve();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
 
-  server.listen(port, bind, () => {
-    console.log(`[qmd serve] Listening on http://${bind}:${port}`);
-    console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
+    server.listen(port, bind, () => {
+      console.log(`[qmd serve] Listening on http://${bind}:${port}`);
+      console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
+    });
   });
 }
