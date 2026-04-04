@@ -455,8 +455,12 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
 
-  // Device / GPU info
+  // Device / GPU info (skip if using remote server - no local GPU to report)
   try {
+    if (process.env.QMD_SERVER) {
+      console.log(`\n${c.bold}Device${c.reset}`);
+      console.log(`  Remote:   ${c.green}${process.env.QMD_SERVER}${c.reset} (QMD_SERVER)`);
+    } else {
     const llm = getDefaultLlamaCpp();
     const device = await llm.getDeviceInfo();
     console.log(`\n${c.bold}Device${c.reset}`);
@@ -481,6 +485,7 @@ async function showStatus(): Promise<void> {
       console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
     }
     console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } // close else block for non-remote
   } catch {
     // Don't fail status if LLM init fails
   }

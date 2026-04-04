@@ -1546,6 +1546,18 @@ let defaultLLM: LLM | null = null;
  */
 export function getDefaultLLM(): LLM {
   if (defaultLLM) return defaultLLM;
+  // Auto-detect QMD_SERVER env var as a safety net —
+  // the CLI sets defaultLLM explicitly, but SDK consumers and
+  // internal callers (e.g. chunkDocumentByTokens) may reach here
+  // without the CLI having run setDefaultLLM first.
+  const serverUrl = process.env.QMD_SERVER;
+  if (serverUrl) {
+    // Lazy import to avoid circular dependency at module load time
+    const { RemoteLLM } = require("./llm-remote.js");
+    const remote: LLM = new RemoteLLM({ serverUrl });
+    defaultLLM = remote;
+    return remote;
+  }
   return getDefaultLlamaCpp();
 }
 
@@ -1554,7 +1566,7 @@ export function getDefaultLLM(): LLM {
  * When set, getDefaultLLM() will return this instead of the local LlamaCpp.
  */
 export function setDefaultLLM(llm: LLM | null): void {
-  defaultLLM = llm;
+  defaultLLM = llm as LLM;
 }
 
 /**
