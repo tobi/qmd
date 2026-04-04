@@ -1489,9 +1489,10 @@ export async function generateEmbeddings(
           break;
         }
 
-        // Abort early if error rate is too high (>80% of processed chunks failed)
+        // Abort early if error rate is too high (>95% of processed chunks failed)
+        // Generous threshold for SBC/NPU backends where intermittent failures are common
         const processed = chunksEmbedded + errors;
-        if (processed >= BATCH_SIZE && errors > processed * 0.8) {
+        if (processed >= BATCH_SIZE * 2 && errors > processed * 0.95) {
           const remaining = batchChunks.length - batchStart;
           errors += remaining;
           console.warn(`⚠ Error rate too high (${errors}/${processed}) — aborting embedding`);
