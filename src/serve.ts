@@ -187,38 +187,26 @@ class RKLlamaBackend implements ModelBackend {
   }
 
   async rerank(query: string, documents: RerankDocument[]): Promise<RerankResult> {
-    // Qwen3-Reranker uses a yes/no classification approach
-    // We generate for each doc and extract the logit scores
-    const results: RerankDocumentResult[] = [];
+    // Use rkllama's native /api/rerank endpoint which uses logit-based
+    // cross-encoder scoring (softmax over yes/no token probabilities).
+    // This produces accurate relevance scores directly from the NPU.
+    const docTexts = documents.map((d) => d.text.slice(0, 2000));
 
-    for (let i = 0; i < documents.length; i++) {
-      const doc = documents[i]!;
-      const prompt = `<|im_start|>user\n` +
-        `Instruct: Given a web search query, retrieve relevant passages that answer the query\n` +
-        `Query: ${query}\n` +
-        `Document: ${doc.text.slice(0, 2000)}\n` +
-        `Is this document relevant to the query? Answer only "yes" or "no".<|im_end|>\n` +
-        `<|im_start|>assistant\n`;
+    const result = await this.post<{
+      model: string;
+      results: { index: number; relevance_score: number }[];
+    }>("/api/rerank", {
+      model: this.rerankModel,
+      query,
+      documents: docTexts,
+    });
 
-      try {
-        const result = await this.post<{
-          response: string;
-          eval_duration: number;
-        }>("/api/generate", {
-          model: this.rerankModel,
-          prompt,
-          stream: false,
-        });
-
-        // Convert yes/no response to a score
-        const response = result.response.toLowerCase().trim();
-        const score = response.startsWith("yes") ? 0.8 : 0.2;
-
-        results.push({ file: doc.file, score, index: i });
-      } catch {
-        results.push({ file: doc.file, score: 0.0, index: i });
-      }
-    }
+    // Map rkllama's response format to QMD's RerankResult format
+    const results: RerankDocumentResult[] = result.results.map((r) => ({
+      file: documents[r.index]?.file ?? `doc-${r.index}`,
+      score: r.relevance_score,
+      index: r.index,
+    }));
 
     // Sort by score descending
     results.sort((a, b) => b.score - a.score);
@@ -230,35 +218,61 @@ class RKLlamaBackend implements ModelBackend {
     query: string,
     options?: { context?: string; includeLexical?: boolean; intent?: string },
   ): Promise<Queryable[]> {
-    const prompt = `/no_think Expand this search query: ${query}`;
+    // The QMD query expansion model is fine-tuned to output structured lines:
+    //   lex: keyword terms for BM25
+    //   vec: semantic rephrasing for vector search
+    //   hyde: hypothetical document for HyDE search
+    // Without grammar constraints (rkllama doesn't support GBNF), we use
+    // the model's training + a clear prompt to get structured output.
+    const intent = options?.intent;
+    const prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
 
     const result = await this.post<{ response: string }>("/api/generate", {
       model: this.expandModel,
       prompt,
       stream: false,
+      options: { temperature: 0.7, top_k: 20, top_p: 0.8, num_predict: 600 },
     });
 
-    // Parse the response into lex/vec/hyde queryables
+    // Parse the response - the fine-tuned model should output lex:/vec:/hyde: lines
     const response = result.response.trim();
     const queryables: Queryable[] = [];
+    const queryLower = query.toLowerCase();
+    const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+    // Check if a generated line relates to the original query
+    const hasQueryTerm = (text: string): boolean => {
+      const lower = text.toLowerCase();
+      if (queryTerms.length === 0) return true;
+      return queryTerms.some(term => lower.includes(term));
+    };
 
     for (const line of response.split("\n")) {
       const trimmed = line.trim();
-      if (trimmed.startsWith("lex:")) {
-        queryables.push({ type: "lex", text: trimmed.slice(4).trim() });
-      } else if (trimmed.startsWith("vec:")) {
-        queryables.push({ type: "vec", text: trimmed.slice(4).trim() });
-      } else if (trimmed.startsWith("hyde:")) {
-        queryables.push({ type: "hyde", text: trimmed.slice(5).trim() });
-      }
+      const colonIdx = trimmed.indexOf(":");
+      if (colonIdx === -1) continue;
+      const type = trimmed.slice(0, colonIdx).trim().toLowerCase();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") continue;
+      const text = trimmed.slice(colonIdx + 1).trim();
+      if (!text || !hasQueryTerm(text)) continue;
+      queryables.push({ type: type as "lex" | "vec" | "hyde", text });
     }
 
-    // If model didn't produce structured output, create a basic expansion
-    if (queryables.length === 0 && response.length > 0) {
-      queryables.push({ type: "vec", text: response.slice(0, 500) });
-    }
+    // If the model produced valid structured output, return it
+    const includeLexical = options?.includeLexical ?? true;
+    const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+    if (filtered.length > 0) return filtered;
 
-    return queryables;
+    // Fallback: if model produced free text instead of structured lines,
+    // wrap it as a vec query and add the original as lex
+    const fallback: Queryable[] = [
+      { type: "hyde", text: `Information about ${query}` },
+      { type: "lex", text: query },
+      { type: "vec", text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
   }
 
   async tokenize(text: string): Promise<number> {
