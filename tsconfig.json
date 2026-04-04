@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     // Environment setup & latest features
-    "lib": ["ESNext"],
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "target": "ESNext",
     "module": "nodenext",
     "moduleDetection": "force",
@@ -24,5 +24,15 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/qmd.ts",
+    "src/mcp.ts",
+    "src/formatter.ts",
+    "src/test-preload.ts",
+    "src/bench-*.ts",
+    "migrate-schema.ts"
+  ]
 }

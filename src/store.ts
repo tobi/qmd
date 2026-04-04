@@ -24,9 +24,11 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  RemoteLLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import { createRemoteConfigFromEnv } from "./remote-config.js";
 import type {
   NamedCollection,
   Collection,
@@ -3155,6 +3157,17 @@ export function insertEmbedding(
 }
 
 // =============================================================================
+// Remote LLM helper — builds a RemoteLLM from the current env on each call.
+// Config is read fresh every time so changes to process.env (e.g. from
+// loadQmdEnv() at startup) are always reflected.
+// =============================================================================
+
+function getRemoteEmbedder(): RemoteLLM | null {
+  const config = createRemoteConfigFromEnv();
+  return config ? new RemoteLLM(config) : null;
+}
+
+// =============================================================================
 // Query expansion
 // =============================================================================
 
@@ -3197,9 +3210,22 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model?: string, db?: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const effectiveModel = model ?? DEFAULT_RERANK_MODEL;
+
+  // Try remote reranking first if configured and no local override is forced
+  if (!llmOverride) {
+    const remote = getRemoteEmbedder();
+    if (remote) {
+      const rerankDocs = documents.map(d => ({ file: d.file, text: d.text }));
+      const result = await remote.rerank(rerankQuery, rerankDocs, {});
+      return result.results
+        .map(r => ({ file: r.file, score: r.score }))
+        .sort((a, b) => b.score - a.score);
+    }
+  }
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -3209,13 +3235,19 @@ export async function rerank(query: string, documents: { file: string; text: str
   // from the same file, and the reranker score depends on which chunk was sent.
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
-  for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
-    if (cached !== null) {
-      cachedResults.set(doc.text, parseFloat(cached));
-    } else {
+  if (db) {
+    for (const doc of documents) {
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: effectiveModel, chunk: doc.text });
+      const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: effectiveModel, chunk: doc.text });
+      const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+      if (cached !== null) {
+        cachedResults.set(doc.text, parseFloat(cached));
+      } else {
+        uncachedDocsByChunk.set(doc.text, { file: doc.file, text: doc.text });
+      }
+    }
+  } else {
+    for (const doc of documents) {
       uncachedDocsByChunk.set(doc.text, { file: doc.file, text: doc.text });
     }
   }
@@ -3224,15 +3256,21 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: effectiveModel });
 
     // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
+    if (db) {
+      const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+      for (const result of rerankResult.results) {
+        const chunk = textByFile.get(result.file) || "";
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: effectiveModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
+    } else {
+      for (const result of rerankResult.results) {
+        cachedResults.set(result.file, result.score);
+      }
     }
   }
 

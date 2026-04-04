@@ -1,3 +1,6 @@
+import { loadQmdEnv } from "../env.js";
+loadQmdEnv();
+
 import { openDatabase } from "../db.js";
 import type { Database } from "../db.js";
 import fastGlob from "fast-glob";

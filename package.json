@@ -24,6 +24,7 @@
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
     "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
     "test": "vitest run --reporter=verbose test/",
+    "typecheck": "tsc --noEmit",
     "qmd": "tsx src/cli/qmd.ts",
     "index": "tsx src/cli/qmd.ts index",
     "vector": "tsx src/cli/qmd.ts vector",
@@ -68,6 +69,8 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/picomatch": "^4.0.3",
     "tsx": "4.21.0",
     "vitest": "3.2.4"
   },

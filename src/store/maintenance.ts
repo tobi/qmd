@@ -1,0 +1,15 @@
+export {
+  getIndexHealth,
+  getHashesNeedingEmbedding,
+  clearAllEmbeddings,
+  clearCache,
+  getCacheKey,
+  getCachedResult,
+  setCachedResult,
+  deleteLLMCache,
+  deleteInactiveDocuments,
+  cleanupOrphanedContent,
+  cleanupOrphanedVectors,
+  vacuumDatabase,
+  getStatus,
+} from "../store.js";
