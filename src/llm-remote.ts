@@ -28,7 +28,7 @@ import type {
 export interface RemoteLLMConfig {
   /** Base URL of the qmd serve instance, e.g. "http://192.168.6.123:7832" */
   serverUrl: string;
-  /** Request timeout in ms (default: 120 000) */
+  /** Request timeout in ms (default: 300 000 — 5 minutes, generous for CPU-only ARM SBCs) */
   timeoutMs?: number;
 }
 
@@ -43,7 +43,7 @@ export class RemoteLLM implements LLM {
   constructor(config: RemoteLLMConfig) {
     // Normalise: strip trailing slash
     this.baseUrl = config.serverUrl.replace(/\/+$/, "");
-    this.timeoutMs = config.timeoutMs ?? 120_000;
+    this.timeoutMs = config.timeoutMs ?? 300_000;
   }
 
   // ---- helpers ----------------------------------------------------------
