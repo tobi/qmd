@@ -190,7 +190,7 @@ class RKLlamaBackend implements ModelBackend {
     // Use rkllama's native /api/rerank endpoint which uses logit-based
     // cross-encoder scoring (softmax over yes/no token probabilities).
     // This produces accurate relevance scores directly from the NPU.
-    const docTexts = documents.map((d) => d.text.slice(0, 2000));
+    const docTexts = documents.map((d) => d.text);
 
     const result = await this.post<{
       model: string;
