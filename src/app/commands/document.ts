@@ -1,4 +1,4 @@
-import type { OutputFormat } from "../../formatter.js";
+import type { OutputFormat } from "../../cli/formatter.js";
 
 export function handleGetCommand(
   args: string[],
