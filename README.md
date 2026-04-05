@@ -921,25 +921,29 @@ Used for generating query variations via `LlamaChatSession`.
 
 ## Remote Model Server
 
-> **New in this fork** — share embedding, reranking, and query expansion models across multiple QMD clients over HTTP.
+Share embedding, reranking, and query expansion models across multiple QMD clients over HTTP. Load models once, serve many clients.
 
 ### Problem
 
-When running multiple AI agents (e.g. OpenClaw agents in separate LXC containers), each agent's QMD instance loads its own copy of the embedding model (~314MB), reranker (~610MB), and query expansion model (~1.2GB) into RAM. On a 16GB ARM SBC running 3 agents, that's ~6GB of duplicated model weights.
+When running multiple QMD instances (e.g. agents in LXC containers, Docker, or separate machines), each loads its own copy of the embedding, reranker, and query expansion models into RAM. On memory-constrained devices, this is wasteful. On ARM64 or headless servers without GPU drivers, `node-llama-cpp` can't compile at all.
 
 ### Solution
 
-Run `qmd serve` once on the host with the models loaded, then point all clients at it:
+Run `qmd serve` once on a host with GPU/NPU access, then point clients at it:
 
 ```sh
-# On the host (loads models once, serves all three model types)
-qmd serve --port 7832 --bind 0.0.0.0
+# On the host (loads models once)
+qmd serve --port 7832
+qmd serve --port 7832 --bind 0.0.0.0    # expose to network
 
-# On each client (no local models needed)
-QMD_SERVER=http://192.168.6.123:7832 qmd query "how does auth work"
+# With rkllama NPU backend (RK3588)
+qmd serve --backend rkllama --rkllama-url http://localhost:8080
+
+# On each client (no local models needed, no compilation)
+QMD_SERVER=http://your-host:7832 qmd query "how does auth work"
 
 # Or per-command
-qmd query --server http://192.168.6.123:7832 "search terms"
+qmd query --server http://your-host:7832 "search terms"
 ```
 
 ### Server Endpoints
@@ -959,28 +963,24 @@ qmd query --server http://192.168.6.123:7832 "search terms"
 
 The index endpoints (`/status`, `/collections`, `/search`, `/browse`) require a QMD database to be present. They return 503 if no database is loaded.
 
-### OpenClaw Integration
+### Agent/Container Integration
 
-For OpenClaw agents using QMD as their memory backend, set the `QMD_SERVER` environment variable in each agent's environment or systemd service:
+Set the `QMD_SERVER` environment variable so clients use the remote server automatically:
 
-```ini
-# In ~/.config/systemd/user/openclaw-gateway.service
-Environment=QMD_SERVER=http://192.168.6.123:7832
+```bash
+export QMD_SERVER=http://your-host:7832
+
+# Or in a systemd service
+Environment=QMD_SERVER=http://your-host:7832
 ```
 
 ### Use Cases
 
-- **Multi-agent setups**: Multiple OpenClaw/Claude agents sharing one embedding server
-- **LXC/Docker containers**: Agents in isolated containers accessing host-level GPU/models
+- **Multi-agent setups**: Multiple agents sharing one embedding server
+- **LXC/Docker containers**: Agents in isolated containers accessing host-level GPU/NPU models
+- **ARM64/headless servers**: No local GPU drivers needed — bypass `node-llama-cpp` compilation entirely
 - **Low-memory devices**: ARM SBCs (Orange Pi, Raspberry Pi) where RAM is scarce
-- **Ollama alternative**: Purpose-built for QMD's embed+rerank+expand pipeline (Ollama only supports embeddings)
-
-### Installation (from this fork)
-
-```sh
-npm install -g github:jaylfc/qmd#feat/remote-llm-provider
-# or
-bun install -g github:jaylfc/qmd#feat/remote-llm-provider
+- **Full pipeline**: Unlike Ollama (embeddings only), `qmd serve` handles embed + rerank + query expansion
 ```
 
 ## License

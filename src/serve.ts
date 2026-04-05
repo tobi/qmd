@@ -54,10 +54,21 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
+const MAX_BODY_BYTES = 50 * 1024 * 1024; // 50MB
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let totalBytes = 0;
+    req.on("data", (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error(`Request body exceeds ${MAX_BODY_BYTES / 1024 / 1024}MB limit`));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
@@ -342,7 +353,7 @@ export interface ServeOptions {
 
 export async function startServer(options: ServeOptions = {}): Promise<void> {
   const port = options.port ?? 7832;
-  const bind = options.bind ?? "0.0.0.0";
+  const bind = options.bind ?? "127.0.0.1";
   const backendType = options.backend ?? "local";
 
   let backend: ModelBackend;
@@ -474,8 +485,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
           text: string;
           options?: EmbedOptions;
         };
-        if (!text) {
-          json(res, 400, { error: "text is required" });
+        if (typeof text !== "string" || text.length === 0) {
+          json(res, 400, { error: "text must be a non-empty string" });
           return;
         }
         const result = await backend.embed(text, embedOpts);
@@ -486,8 +497,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       // ----- Embed Batch ------------------------------------------------------
       if (path === "/embed-batch") {
         const { texts } = body as { texts: string[] };
-        if (!Array.isArray(texts) || texts.length === 0) {
-          json(res, 400, { error: "texts array is required" });
+        if (!Array.isArray(texts) || texts.length === 0 || !texts.every(t => typeof t === "string")) {
+          json(res, 400, { error: "texts must be a non-empty array of strings" });
           return;
         }
         const results = await backend.embedBatch(texts);
@@ -501,8 +512,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
           query: string;
           documents: RerankDocument[];
         };
-        if (!query || !Array.isArray(documents)) {
-          json(res, 400, { error: "query and documents are required" });
+        if (typeof query !== "string" || query.length === 0 || !Array.isArray(documents) || documents.length === 0) {
+          json(res, 400, { error: "query must be a non-empty string and documents must be a non-empty array" });
           return;
         }
         const result = await backend.rerank(query, documents);
@@ -516,8 +527,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
           query: string;
           options?: { context?: string; includeLexical?: boolean; intent?: string };
         };
-        if (!query) {
-          json(res, 400, { error: "query is required" });
+        if (typeof query !== "string" || query.length === 0) {
+          json(res, 400, { error: "query must be a non-empty string" });
           return;
         }
         const result = await backend.expandQuery(query, expandOpts);
@@ -528,8 +539,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       // ----- Tokenize ---------------------------------------------------------
       if (path === "/tokenize") {
         const { text } = body as { text: string };
-        if (!text) {
-          json(res, 400, { error: "text is required" });
+        if (typeof text !== "string" || text.length === 0) {
+          json(res, 400, { error: "text must be a non-empty string" });
           return;
         }
         const count = await backend.tokenize(text);
