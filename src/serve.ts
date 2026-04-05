@@ -25,6 +25,7 @@
  *   GET  /collections     -> CollectionInfo[] (names, doc counts, last modified)
  *   GET  /search?q=...    -> { results: SearchResult[], total: number }
  *   GET  /browse?limit=N  -> { chunks: [...], total, limit, offset }
+ *   POST /vsearch        { query: string, limit?: number }             -> { results: SearchResult[] }
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
@@ -46,6 +47,7 @@ import {
   createStore,
   enableProductionMode,
   searchFTS,
+  searchVec,
   listCollections,
   type Store,
 } from "./store.js";
@@ -479,6 +481,34 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
 
       const body = JSON.parse(await readBody(req));
 
+      // ----- Vector Search (semantic) -------------------------------------------
+      if (path === "/vsearch") {
+        if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
+        const { query: vsQuery, limit: vsLimit, collection: vsCollection } = body as {
+          query: string;
+          limit?: number;
+          collection?: string;
+        };
+        if (typeof vsQuery !== "string" || vsQuery.length === 0) {
+          json(res, 400, { error: "query must be a non-empty string" });
+          return;
+        }
+        // Step 1: embed the query via our backend
+        const embedResult = await backend.embed(vsQuery, { isQuery: true });
+        if (!embedResult) {
+          json(res, 500, { error: "Failed to embed query" });
+          return;
+        }
+        // Step 2: vector search with precomputed embedding
+        const results = await searchVec(
+          store.db, vsQuery, embedResult.model,
+          vsLimit ?? 20, vsCollection ?? undefined,
+          undefined, embedResult.embedding,
+        );
+        json(res, 200, { results, total: results.length });
+        return;
+      }
+
       // ----- Embed ------------------------------------------------------------
       if (path === "/embed") {
         const { text, options: embedOpts } = body as {
@@ -572,7 +602,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       console.log(`[qmd serve] Listening on http://${bind}:${port}`);
       console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
       if (store) {
-        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse`);
+        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /vsearch, /browse`);
       }
     });
   });
