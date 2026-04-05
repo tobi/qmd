@@ -73,8 +73,10 @@ import {
   getDefaultDbPath,
   reindexCollection,
   generateEmbeddings,
+  syncCollection,
   syncConfigToDb,
   type ReindexResult,
+  type SyncResult,
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
@@ -1488,6 +1490,59 @@ function collectionRename(oldName: string, newName: string): void {
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
+}
+
+async function collectionSync(name: string): Promise<void> {
+  const coll = getCollectionFromYaml(name);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
+
+  const storeInstance = getStore();
+  const startTime = Date.now();
+
+  console.log(`${c.bold}Syncing collection '${name}'...${c.reset}`);
+  console.log(`  ${c.dim}Path: ${coll.path}${c.reset}`);
+  console.log(`  ${c.dim}Pattern: ${coll.pattern}${c.reset}\n`);
+
+  const result = await syncCollection(storeInstance, coll.path, coll.pattern, name, {
+    ignorePatterns: coll.ignore,
+    onProgress: (info) => {
+      if (info.phase === 'scanning') {
+        process.stderr.write(`\r${c.dim}Scanning filesystem...${c.reset}`);
+      } else if (info.phase === 'processing' && info.file) {
+        process.stderr.write(`\r${c.dim}[${info.current}/${info.total}] ${info.file}${c.reset}\x1b[K`);
+      } else if (info.phase === 'cleanup') {
+        process.stderr.write(`\r${c.dim}Cleaning up...${c.reset}\x1b[K`);
+      }
+    },
+  });
+
+  process.stderr.write('\r\x1b[K'); // Clear progress line
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  console.log(`${c.green}✓${c.reset} Sync complete in ${elapsed}s\n`);
+  console.log(`  ${c.cyan}${result.filesScanned}${c.reset} files scanned`);
+  console.log(`  ${c.green}${result.added}${c.reset} added`);
+  console.log(`  ${c.yellow}${result.updated}${c.reset} updated`);
+  if (result.renamed > 0) {
+    console.log(`  ${c.magenta}${result.renamed}${c.reset} renamed (embeddings reused)`);
+  }
+  console.log(`  ${result.removed > 0 ? c.yellow : c.dim}${result.removed}${c.reset} removed`);
+  console.log(`  ${c.dim}${result.unchanged}${c.reset} unchanged ${c.dim}(${result.skippedMtime} skipped by mtime, ${result.skippedHash} by hash)${c.reset}`);
+
+  if (result.orphanedCleaned > 0) {
+    console.log(`  ${c.dim}${result.orphanedCleaned} orphaned content entries cleaned${c.reset}`);
+  }
+
+  const needsEmbedding = storeInstance.getHashesNeedingEmbedding();
+  if (needsEmbedding > 0) {
+    console.log(`\n${c.dim}${needsEmbedding} document(s) need embedding. Run 'qmd embed' to generate vectors.${c.reset}`);
+  }
+
+  closeDb();
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
@@ -2933,6 +2988,18 @@ if (isMain) {
           break;
         }
 
+        case "sync": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error("Usage: qmd collection sync <name>");
+            console.error("  Incrementally sync a collection using mtime-first diffing");
+            console.error("  Use 'qmd collection list' to see available collections");
+            process.exit(1);
+          }
+          await collectionSync(name);
+          break;
+        }
+
         case "show":
         case "info": {
           const name = cli.args[1];
@@ -2969,6 +3036,7 @@ if (isMain) {
           console.log("  add <path> [--name NAME]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
+          console.log("  sync <name>               Incremental sync (mtime-first diffing)");
           console.log("  show <name>               Show collection details");
           console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
           console.log("  include <name>            Include in default queries");
@@ -2976,6 +3044,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection sync notes");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);
