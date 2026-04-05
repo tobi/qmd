@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { buildEditorUri } from "../src/cli/qmd.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -1184,6 +1185,30 @@ describe("search output formats", () => {
     // Ensure no full filesystem paths
     expect(stdout).not.toMatch(/\/Users\//);
     expect(stdout).not.toMatch(/\/home\//);
+  });
+});
+
+describe("editor URI templates", () => {
+  test("buildEditorUri expands path, line, and col placeholders", () => {
+    const uri = buildEditorUri(
+      "vscode://file/{path}:{line}:{col}",
+      "/tmp/my notes/readme.md",
+      42,
+      1,
+    );
+
+    expect(uri).toBe("vscode://file//tmp/my%20notes/readme.md:42:1");
+  });
+
+  test("buildEditorUri supports {column} alias", () => {
+    const uri = buildEditorUri(
+      "cursor://file/{path}:{line}:{column}",
+      "/tmp/docs/api.md",
+      7,
+      3,
+    );
+
+    expect(uri).toBe("cursor://file//tmp/docs/api.md:7:3");
   });
 });
 

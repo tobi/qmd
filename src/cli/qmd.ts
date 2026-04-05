@@ -1858,6 +1858,57 @@ type OutputRow = {
   explain?: HybridQueryExplain;
 };
 
+const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
+
+function encodePathForEditorUri(absolutePath: string): string {
+  return encodeURI(absolutePath)
+    .replace(/\?/g, "%3F")
+    .replace(/#/g, "%23");
+}
+
+function getEditorUriTemplate(): string {
+  const envTemplate = process.env.QMD_EDITOR_URI?.trim();
+  if (envTemplate) return envTemplate;
+
+  try {
+    const config = loadConfig() as {
+      editor_uri?: string;
+      editor_uri_template?: string;
+      editorUri?: string;
+      [key: string]: unknown;
+    };
+    const configTemplate = (
+      config.editor_uri
+      || config.editor_uri_template
+      || config.editorUri
+      || (typeof config["editor-uri"] === "string" ? config["editor-uri"] : undefined)
+    )?.trim();
+
+    if (configTemplate) return configTemplate;
+  } catch {
+    // Ignore config parsing issues and use default template.
+  }
+
+  return DEFAULT_EDITOR_URI_TEMPLATE;
+}
+
+export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
+  const safeLine = Number.isFinite(line) && line > 0 ? Math.floor(line) : 1;
+  const safeCol = Number.isFinite(col) && col > 0 ? Math.floor(col) : 1;
+  const encodedPath = encodePathForEditorUri(absolutePath);
+
+  return template
+    .replace(/\{path\}/g, encodedPath)
+    .replace(/\{line\}/g, String(safeLine))
+    .replace(/\{col\}/g, String(safeCol))
+    .replace(/\{column\}/g, String(safeCol));
+}
+
+function termLink(text: string, url: string): string {
+  if (!process.stdout.isTTY) return text;
+  return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+}
+
 function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
@@ -1899,6 +1950,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
+    const editorUriTemplate = getEditorUriTemplate();
+    const linkDb = getDb();
+
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
@@ -1906,13 +1960,27 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const path = toQmdPath(row.displayPath);
+      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      const parsed = parseVirtualPath(virtualPath);
+      const absolutePath = resolveVirtualPath(linkDb, virtualPath);
+
+      const legacyPath = toQmdPath(row.displayPath);
+      const displayPath = parsed?.path || row.displayPath;
+
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
-      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+
+      if (process.stdout.isTTY && absolutePath && parsed?.path) {
+        const linkLine = hasMatch ? line : 1;
+        const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
+        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
+      } else {
+        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+      }
 
       // Line 2: Title (if available)
       if (row.title) {
@@ -2663,6 +2731,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");

@@ -13,6 +13,11 @@
   chunking for code files.
 - `qmd status` now shows AST grammar availability.
 - SDK: `chunkStrategy` option on `embed()` and `search()` methods.
+- CLI search output now emits clickable OSC 8 terminal hyperlinks when
+  stdout is a TTY. Links resolve `qmd://` paths to absolute filesystem
+  paths and open in editors via URI templates (default:
+  `vscode://file/{path}:{line}:{col}`). Configure with `QMD_EDITOR_URI`
+  or `editor_uri` in the YAML config.
 
 ### Fixes
 
