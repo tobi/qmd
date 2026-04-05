@@ -837,8 +837,7 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    // handelize converts to lowercase
-    expect(stdout).toContain("qmd://fixtures/readme.md");
+    expect(stdout).toContain("qmd://fixtures/README.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
