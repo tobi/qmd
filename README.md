@@ -1,8 +1,15 @@
-# QMD - Query Markup Documents
+# QMD - Query Markup Documents (with Remote Model Server Support)
+
+> **Fork note:** This fork adds `qmd serve` — a shared model server so multiple QMD clients
+> (e.g. OpenClaw agents in separate LXC containers) can share a single set of embedding,
+> reranking, and query expansion models over HTTP instead of each loading their own into RAM.
+> See [Remote Model Server](#remote-model-server) below. Tracks upstream [tobi/qmd](https://github.com/tobi/qmd).
+>
+> Related upstream issues: [#489](https://github.com/tobi/qmd/issues/489), [#490](https://github.com/tobi/qmd/issues/490), [#502](https://github.com/tobi/qmd/issues/502), [#480](https://github.com/tobi/qmd/issues/480)
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models. **This fork also supports remote model serving** for shared/multi-agent deployments.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -911,6 +918,70 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 ### Qwen3 (Query Expansion)
 
 Used for generating query variations via `LlamaChatSession`.
+
+## Remote Model Server
+
+Share embedding, reranking, and query expansion models across multiple QMD clients over HTTP. Load models once, serve many clients.
+
+### Problem
+
+When running multiple QMD instances (e.g. agents in LXC containers, Docker, or separate machines), each loads its own copy of the embedding, reranker, and query expansion models into RAM. On memory-constrained devices, this is wasteful. On ARM64 or headless servers without GPU drivers, `node-llama-cpp` can't compile at all.
+
+### Solution
+
+Run `qmd serve` once on a host with GPU/NPU access, then point clients at it:
+
+```sh
+# On the host (loads models once)
+qmd serve --port 7832
+qmd serve --port 7832 --bind 0.0.0.0    # expose to network
+
+# With rkllama NPU backend (RK3588)
+qmd serve --backend rkllama --rkllama-url http://localhost:8080
+
+# On each client (no local models needed, no compilation)
+QMD_SERVER=http://your-host:7832 qmd query "how does auth work"
+
+# Or per-command
+qmd query --server http://your-host:7832 "search terms"
+```
+
+### Server Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/embed` | POST | Embed a single text |
+| `/embed-batch` | POST | Batch embed multiple texts |
+| `/rerank` | POST | Rerank documents by relevance |
+| `/expand` | POST | Expand a query (lex/vec/hyde) |
+| `/tokenize` | POST | Count tokens in text |
+| `/health` | GET | Server status + loaded models |
+| `/status` | GET | Index health (doc counts, embedding status) |
+| `/collections` | GET | List collections with doc counts |
+| `/search?q=X` | GET | FTS5 keyword search (optional `&collection=`, `&limit=`) |
+| `/browse` | GET | Paginated chunk listing (optional `&collection=`, `&limit=`, `&offset=`) |
+
+The index endpoints (`/status`, `/collections`, `/search`, `/browse`) require a QMD database to be present. They return 503 if no database is loaded.
+
+### Agent/Container Integration
+
+Set the `QMD_SERVER` environment variable so clients use the remote server automatically:
+
+```bash
+export QMD_SERVER=http://your-host:7832
+
+# Or in a systemd service
+Environment=QMD_SERVER=http://your-host:7832
+```
+
+### Use Cases
+
+- **Multi-agent setups**: Multiple agents sharing one embedding server
+- **LXC/Docker containers**: Agents in isolated containers accessing host-level GPU/NPU models
+- **ARM64/headless servers**: No local GPU drivers needed — bypass `node-llama-cpp` compilation entirely
+- **Low-memory devices**: ARM SBCs (Orange Pi, Raspberry Pi) where RAM is scarce
+- **Full pipeline**: Unlike Ollama (embeddings only), `qmd serve` handles embed + rerank + query expansion
+```
 
 ## License
 
