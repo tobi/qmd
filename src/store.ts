@@ -1470,13 +1470,21 @@ export async function generateEmbeddings(
       }
 
       if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-        const firstResult = await session.embed(firstText);
-        if (!firstResult) {
-          throw new Error("Failed to get embedding dimensions from first chunk");
+        // Try chunks until one succeeds — oversized chunks may exceed context window
+        let initResult: { embedding: number[] } | null = null;
+        for (const chunk of batchChunks) {
+          const text = formatDocForEmbedding(chunk.text, chunk.title);
+          try {
+            initResult = await session.embed(text);
+            if (initResult) break;
+          } catch {
+            // Skip oversized/failed chunks, try next
+          }
         }
-        store.ensureVecTable(firstResult.embedding.length);
+        if (!initResult) {
+          throw new Error("Failed to get embedding dimensions — all chunks may exceed context window");
+        }
+        store.ensureVecTable(initResult.embedding.length);
         vectorTableInitialized = true;
       }
 
