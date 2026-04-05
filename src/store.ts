@@ -1176,7 +1176,7 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
+  /** Optional LLM instance for this store (overrides the global singleton). Can be LlamaCpp or RemoteLLM. */
   llm?: LlamaCpp;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;

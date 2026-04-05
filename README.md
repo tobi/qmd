@@ -1,8 +1,17 @@
-# QMD - Query Markup Documents
+# QMD - Query Markup Documents (with Remote Model Server Support)
 
-An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+> **Fork note:** This fork adds `qmd serve` — a shared model server so multiple QMD clients
+> (e.g. OpenClaw agents in separate LXC containers) can share a single set of embedding,
+> reranking, and query expansion models over HTTP instead of each loading their own into RAM.
+> See [Remote Model Server](#remote-model-server) below. Tracks upstream [tobi/qmd](https://github.com/tobi/qmd).
+>
+> Related upstream issues: [#489](https://github.com/tobi/qmd/issues/489), [#490](https://github.com/tobi/qmd/issues/490), [#502](https://github.com/tobi/qmd/issues/502), [#480](https://github.com/tobi/qmd/issues/480)
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts,
+documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp
+with GGUF models. **This fork also supports remote model serving** for shared/multi-agent deployments.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -71,9 +80,11 @@ qmd get "docs/api-reference.md" --full
 
 ### MCP Server
 
-Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
+Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an
+MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
+
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
@@ -114,7 +125,8 @@ Or configure MCP manually in `~/.claude/settings.json`:
 
 #### HTTP Transport
 
-By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:
+By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that
+avoids repeated model loading, use the HTTP transport:
 
 ```sh
 # Foreground (Ctrl-C to stop)
@@ -128,10 +140,12 @@ qmd status                        # shows "MCP: running (PID ...)" when active
 ```
 
 The HTTP server exposes two endpoints:
+
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
 - `GET /health` — liveness check with uptime
 
-LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and
+transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
@@ -394,7 +408,8 @@ import {
 await store.close()
 ```
 
-The SDK requires explicit `dbPath` — no defaults are assumed. This makes it safe to embed in any application without side effects.
+The SDK requires explicit `dbPath` — no defaults are assumed. This makes it safe to embed in any application without
+side effects.
 
 ## Architecture
 
@@ -462,11 +477,11 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ### Search Backends
 
-| Backend | Raw Score | Conversion | Range |
-|---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
-| **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| Backend        | Raw Score        | Conversion           | Range      |
+| -------------- | ---------------- | -------------------- | ---------- |
+| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)`    | 0 to ~25+  |
+| **Vector**     | Cosine distance  | `1 / (1 + distance)` | 0.0 to 1.0 |
+| **Reranker**   | LLM 0-10 rating  | `score / 10`         | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
@@ -479,20 +494,23 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 5. **Top-K Selection**: Take top 30 candidates for reranking
 6. **Re-ranking**: LLM scores each document (yes/no with logprobs confidence)
 7. **Position-Aware Blending**:
-   - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
-   - RRF rank 4-10: 60% retrieval, 40% reranker
-   - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
 
-**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that score #1 for the original query. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
+- RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
+- RRF rank 4-10: 60% retrieval, 40% reranker
+- RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
+
+**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves
+documents that score #1 for the original query. Position-aware blending prevents the reranker from destroying
+high-confidence retrieval results.
 
 ### Score Interpretation
 
-| Score | Meaning |
-|-------|---------|
-| 0.8 - 1.0 | Highly relevant |
+| Score     | Meaning             |
+| --------- | ------------------- |
+| 0.8 - 1.0 | Highly relevant     |
 | 0.5 - 0.8 | Moderately relevant |
-| 0.2 - 0.5 | Somewhat relevant |
-| 0.0 - 0.2 | Low relevance |
+| 0.2 - 0.5 | Somewhat relevant   |
+| 0.0 - 0.2 | Low relevance       |
 
 ## Requirements
 
@@ -501,6 +519,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 - **Node.js** >= 22
 - **Bun** >= 1.0.0
 - **macOS**: Homebrew SQLite (for extension support)
+
   ```sh
   brew install sqlite
   ```
@@ -509,19 +528,18 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 QMD uses three local GGUF models (auto-downloaded on first use):
 
-| Model | Purpose | Size |
-|-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
-| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
+| Model                             | Purpose                      | Size   |
+| --------------------------------- | ---------------------------- | ------ |
+| `embeddinggemma-300M-Q8_0`        | Vector embeddings (default)  | ~300MB |
+| `qwen3-reranker-0.6b-q8_0`        | Re-ranking                   | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ### Custom Embedding Model
 
-Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
-This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
-`embeddinggemma-300M` has limited coverage.
+Override the default embedding model via the `QMD_EMBED_MODEL` environment variable. This is useful for multilingual
+corpora (e.g. Chinese, Japanese, Korean) where `embeddinggemma-300M` has limited coverage.
 
 ```sh
 # Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
@@ -532,6 +550,7 @@ qmd embed -f
 ```
 
 Supported model families:
+
 - **embeddinggemma** (default) — English-optimized, small footprint
 - **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
 
@@ -612,14 +631,12 @@ qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
 ```
 
-**AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
-files at function, class, and import boundaries instead of arbitrary text
-positions. This produces higher-quality chunks and better search results for
-codebases. Markdown and other file types always use regex-based chunking
-regardless of strategy.
+**AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code files at function, class, and import
+boundaries instead of arbitrary text positions. This produces higher-quality chunks and better search results for
+codebases. Markdown and other file types always use regex-based chunking regardless of strategy.
 
-The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
-opt in. Run `qmd status` to verify which grammars are available.
+The default is `regex` (existing behavior). Use `--chunk-strategy auto` to opt in. Run `qmd status` to verify which
+grammars are available.
 
 > **Note:** Tree-sitter grammars are optional dependencies. If they are not
 > installed, `--chunk-strategy auto` falls back to regex-only chunking
@@ -729,9 +746,11 @@ explicitly with `-c`.
 
 Default output is colorized CLI format (respects `NO_COLOR` env).
 
-When stdout is a TTY, result paths are emitted as clickable terminal hyperlinks (OSC 8). Clicking a path opens the file in your editor using an editor URI template.
+When stdout is a TTY, result paths are emitted as clickable terminal hyperlinks (OSC 8). Clicking a path opens the file
+in your editor using an editor URI template.
 
-When stdout is not a TTY (for example piped to another command or redirected to a file), QMD emits plain text paths with no escape sequences.
+When stdout is not a TTY (for example piped to another command or redirected to a file), QMD emits plain text paths with
+no escape sequences.
 
 TTY example:
 
@@ -772,6 +791,7 @@ export QMD_EDITOR_URI="subl://open?url=file://{path}&line={line}"
 ```
 
 Template placeholders:
+
 - `{path}` absolute filesystem path (URI-encoded)
 - `{line}` 1-based line number
 - `{col}` or `{column}` 1-based column number
@@ -964,12 +984,12 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
-| `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
-| `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
-| `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| Variable                | Default    | Description                                                                                                                                                                                                   |
+| ----------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XDG_CACHE_HOME`        | `~/.cache` | Cache directory location                                                                                                                                                                                      |
+| `QMD_LLAMA_GPU`         | `auto`     | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false`                                                                                                                           |
+| `QMD_FORCE_CPU`         | unset      | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`.                                                                                                    |
+| `QMD_EMBED_PARALLELISM` | automatic  | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 
 ## How It Works
 
@@ -1004,23 +1024,24 @@ Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──�
 
 ### Smart Chunking
 
-Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to find natural markdown break points. This keeps semantic units (sections, paragraphs, code blocks) together.
+Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to find natural markdown break points. This
+keeps semantic units (sections, paragraphs, code blocks) together.
 
 **Break Point Scores:**
 
-| Pattern | Score | Description |
-|---------|-------|-------------|
-| `# Heading` | 100 | H1 - major section |
-| `## Heading` | 90 | H2 - subsection |
-| `### Heading` | 80 | H3 |
-| `#### Heading` | 70 | H4 |
-| `##### Heading` | 60 | H5 |
-| `###### Heading` | 50 | H6 |
-| ` ``` ` | 80 | Code block boundary |
-| `---` / `***` | 60 | Horizontal rule |
-| Blank line | 20 | Paragraph boundary |
-| `- item` / `1. item` | 5 | List item |
-| Line break | 1 | Minimal break |
+| Pattern              | Score | Description         |
+| -------------------- | ----- | ------------------- |
+| `# Heading`          | 100   | H1 - major section  |
+| `## Heading`         | 90    | H2 - subsection     |
+| `### Heading`        | 80    | H3                  |
+| `#### Heading`       | 70    | H4                  |
+| `##### Heading`      | 60    | H5                  |
+| `###### Heading`     | 50    | H6                  |
+| ` ``` `              | 80    | Code block boundary |
+| `---` / `***`        | 60    | Horizontal rule     |
+| Blank line           | 20    | Paragraph boundary  |
+| `- item` / `1. item` | 5     | List item           |
+| Line break           | 1     | Minimal break       |
 
 **Algorithm:**
 
@@ -1029,22 +1050,26 @@ Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to fin
 3. Score each break point: `finalScore = baseScore × (1 - (distance/window)² × 0.7)`
 4. Cut at the highest-scoring break point
 
-The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target (score 1), but a closer heading wins over a distant one.
+The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target
+(score 1), but a closer heading wins over a distant one.
 
-**Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the chunk size, it's kept whole when possible.
+**Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the
+chunk size, it's kept whole when possible.
 
 **AST-Aware Chunking (Code Files):**
 
-For supported code files, QMD also parses the source with [tree-sitter](https://tree-sitter.github.io/) and adds AST-derived break points that are merged with the regex scores above:
+For supported code files, QMD also parses the source with [tree-sitter](https://tree-sitter.github.io/) and adds
+AST-derived break points that are merged with the regex scores above:
 
-| AST Node | Score | Languages |
-|----------|-------|-----------|
-| Class / interface / struct / impl / trait | 100 | All |
-| Function / method | 90 | All |
-| Type alias / enum | 80 | All |
-| Import / use declaration | 60 | All |
+| AST Node                                  | Score | Languages |
+| ----------------------------------------- | ----- | --------- |
+| Class / interface / struct / impl / trait | 100   | All       |
+| Function / method                         | 90    | All       |
+| Type alias / enum                         | 80    | All       |
+| Import / use declaration                  | 60    | All       |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown
+and other file types always use regex chunking.
 
 ### Query Flow (Hybrid)
 
@@ -1106,11 +1131,81 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 
 ### Qwen3-Reranker
 
-Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents
+sorted by relevance score (0.0 - 1.0).
 
 ### Qwen3 (Query Expansion)
 
 Used for generating query variations via `LlamaChatSession`.
+
+## Remote Model Server
+
+Share embedding, reranking, and query expansion models across multiple QMD clients over HTTP. Load models once, serve
+many clients.
+
+### Problem
+
+When running multiple QMD instances (e.g. agents in LXC containers, Docker, or separate machines), each loads its own
+copy of the embedding, reranker, and query expansion models into RAM. On memory-constrained devices, this is wasteful.
+On ARM64 or headless servers without GPU drivers, `node-llama-cpp` can't compile at all.
+
+### Solution
+
+Run `qmd serve` once on a host with GPU/NPU access, then point clients at it:
+
+```sh
+# On the host (loads models once)
+qmd serve --port 7832
+qmd serve --port 7832 --bind 0.0.0.0    # expose to network
+
+# With rkllama NPU backend (RK3588)
+qmd serve --backend rkllama --rkllama-url http://localhost:8080
+
+# On each client (no local models needed, no compilation)
+QMD_REMOTE_URL=http://your-host:7832 qmd query "how does auth work"
+
+# Or per-command
+qmd query --remote-url http://your-host:7832 "search terms"
+```
+
+### Server Endpoints
+
+| Endpoint       | Method | Description                                                              |
+| -------------- | ------ | ------------------------------------------------------------------------ |
+| `/embed`       | POST   | Embed a single text                                                      |
+| `/embed-batch` | POST   | Batch embed multiple texts                                               |
+| `/rerank`      | POST   | Rerank documents by relevance                                            |
+| `/expand`      | POST   | Expand a query (lex/vec/hyde)                                            |
+| `/tokenize`    | POST   | Count tokens in text                                                     |
+| `/health`      | GET    | Server status + loaded models                                            |
+| `/status`      | GET    | Index health (doc counts, embedding status)                              |
+| `/collections` | GET    | List collections with doc counts                                         |
+| `/search?q=X`  | GET    | FTS5 keyword search (optional `&collection=`, `&limit=`)                 |
+| `/browse`      | GET    | Paginated chunk listing (optional `&collection=`, `&limit=`, `&offset=`) |
+
+The index endpoints (`/status`, `/collections`, `/search`, `/browse`) require a QMD database to be present. They return
+503 if no database is loaded.
+
+### Agent/Container Integration
+
+Set the `QMD_REMOTE_URL` environment variable so clients use the remote server automatically:
+
+```bash
+export QMD_REMOTE_URL=http://your-host:7832
+
+# Or in a systemd service
+Environment=QMD_REMOTE_URL=http://your-host:7832
+```
+
+### Use Cases
+
+- **Multi-agent setups**: Multiple agents sharing one embedding server
+- **LXC/Docker containers**: Agents in isolated containers accessing host-level GPU/NPU models
+- **ARM64/headless servers**: No local GPU drivers needed — bypass `node-llama-cpp` compilation entirely
+- **Low-memory devices**: ARM SBCs (Orange Pi, Raspberry Pi) where RAM is scarce
+- **Full pipeline**: Unlike Ollama (embeddings only), `qmd serve` handles embed + rerank + query expansion
+
+```
 
 ## License
 

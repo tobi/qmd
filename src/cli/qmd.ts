@@ -81,7 +81,27 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  setDefaultLlamaCpp,
+  setDefaultLLM,
+  LlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_MODEL_CACHE_DIR,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveRerankModel,
+  resolveModels,
+  inspectGgufFile,
+  isDarwinMetalMitigationActive,
+} from "../llm.js";
+import { RemoteLLM } from "../llm-remote.js";
+import { startServer } from "../serve.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2886,6 +2906,11 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Remote model server options
+      "remote-url": { type: "string" },  // URL of a qmd serve instance (e.g. http://host:7832)
+      bind: { type: "string" },    // Bind address for qmd serve (default: 0.0.0.0)
+      backend: { type: "string" }, // Backend for qmd serve: "local" or "rkllama"
+      "rkllama-url": { type: "string" }, // URL of rkllama server (default: http://localhost:8080)
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3411,6 +3436,13 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("Model server (shared models over network):");
+  console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
+  console.log("  qmd serve --backend rkllama               - Use RK3588 NPU via rkllama");
+  console.log("  qmd serve --backend rkllama --rkllama-url http://host:8080");
+  console.log("  qmd query --remote-url http://host:7832 <q>  - Use remote models instead of local");
+  console.log("  QMD_REMOTE_URL=http://host:7832 qmd query <q> - Same via env var");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4141,6 +4173,12 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  // Configure remote model server if --remote-url is set or QMD_REMOTE_URL env var
+  const remoteUrl = (cli.values["remote-url"] as string) || process.env.QMD_REMOTE_URL;
+  if (remoteUrl && cli.command !== "serve") {
+    setDefaultLLM(new RemoteLLM({ serverUrl: remoteUrl }));
+  }
+
   switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
@@ -4502,6 +4540,26 @@ if (isMain) {
         collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
         dbPath: getDbPath(),
         configPath: configExists() ? getConfigPath() : undefined,
+      });
+      break;
+    }
+
+    case "serve": {
+      // Remove top-level cursor handlers so shutdown handlers work
+      process.removeAllListeners("SIGTERM");
+      process.removeAllListeners("SIGINT");
+      const servePort = Number(cli.values.port) || 7832;
+      const serveBind = (cli.values.bind as string) || "0.0.0.0";
+      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "rkllama";
+      const rkllamaUrl = (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:8080";
+      await startServer({
+        port: servePort,
+        bind: serveBind,
+        backend: serveBackend,
+        rkllamaUrl: serveBackend === "rkllama" ? rkllamaUrl : undefined,
+        config: {
+          embedModel: process.env.QMD_EMBED_MODEL || undefined,
+        },
       });
       break;
     }

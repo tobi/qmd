@@ -4,6 +4,14 @@
 
 ### Features
 
+- `qmd serve` runs qmd as an HTTP model server that other qmd processes (and external tools) can share, instead of every
+  process loading its own copy of the embed/rerank/expansion models. Endpoints cover embed, rerank, and query expansion;
+  `local` (node-llama-cpp) and `rkllama` (Rockchip NPU) backends are supported. Point clients at the daemon with
+  `QMD_REMOTE_URL`.
+- `qmd serve` also exposes read-only index endpoints (`/status`, `/collections`, `/search?q=X`, `/browse`) so agents and
+  other tools can reach indexed memory over HTTP without touching SQLite directly.
+- `qmd serve` `POST /embed-batch` embeds all chunks for a document in a single round trip, avoiding the per-chunk HTTP
+  overhead that dominated large-corpus embeds against a remote daemon.
 - `qmd query`, `qmd mcp`, and other commands that load the full model trio now accept `--low-vram` (and
   `QMD_LOW_VRAM=1`), which disposes the ~2 GB generate and ~2.3 GB rerank models immediately after each use while
   keeping the ~320 MB embed model resident. Peak VRAM drops from ~5.4 GB to ~2.6 GB at the cost of per-stage load
@@ -92,13 +100,13 @@
   cleans up before libc's static destructor runs. Defense-in-depth: the launcher (`bin/qmd`) and the npm test driver
   (`scripts/test-all.mjs`
 - the `test:bun` / `test:unit` package.json scripts) also set `GGML_METAL_NO_RESIDENCY=1` on darwin before spawning
-    node/bun, covering error paths and tests that still terminate via `process.exit()`. The env var must be set before
-    node/bun start — libggml-metal reads it via libc `getenv` at module-load time, and Bun does not propagate
-    `process.env` mutations to libc `setenv` — so it lives in the launcher rather than in test-preload. Residency sets
-    give no measurable speedup for QMD's short-lived CLI workflow (benchmarked on M3 Pro). Opt back in with
-    `QMD_METAL_KEEP_RESIDENCY=1` for long-lived qmd processes (e.g. the MCP daemon may benefit on hot reload) or to
-    triage the upstream fix. `qmd doctor` reports the mitigation state. Minimal reproduction:
-    `scripts/repro-metal-rsets-crash.mjs`.
+  node/bun, covering error paths and tests that still terminate via `process.exit()`. The env var must be set before
+  node/bun start — libggml-metal reads it via libc `getenv` at module-load time, and Bun does not propagate
+  `process.env` mutations to libc `setenv` — so it lives in the launcher rather than in test-preload. Residency sets
+  give no measurable speedup for QMD's short-lived CLI workflow (benchmarked on M3 Pro). Opt back in with
+  `QMD_METAL_KEEP_RESIDENCY=1` for long-lived qmd processes (e.g. the MCP daemon may benefit on hot reload) or to triage
+  the upstream fix. `qmd doctor` reports the mitigation state. Minimal reproduction:
+  `scripts/repro-metal-rsets-crash.mjs`.
 
 ### Docs
 
