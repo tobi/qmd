@@ -952,6 +952,12 @@ qmd query --server http://192.168.6.123:7832 "search terms"
 | `/expand` | POST | Expand a query (lex/vec/hyde) |
 | `/tokenize` | POST | Count tokens in text |
 | `/health` | GET | Server status + loaded models |
+| `/status` | GET | Index health (doc counts, embedding status) |
+| `/collections` | GET | List collections with doc counts |
+| `/search?q=X` | GET | FTS5 keyword search (optional `&collection=`, `&limit=`) |
+| `/browse` | GET | Paginated chunk listing (optional `&collection=`, `&limit=`, `&offset=`) |
+
+The index endpoints (`/status`, `/collections`, `/search`, `/browse`) require a QMD database to be present. They return 503 if no database is loaded.
 
 ### OpenClaw Integration
 

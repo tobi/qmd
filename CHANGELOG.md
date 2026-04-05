@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Remote model server** (`qmd serve`): HTTP server for embedding,
+  reranking, and query expansion. Supports `local` (node-llama-cpp)
+  and `rkllama` (Rockchip NPU) backends.
+- **Index endpoints** on `qmd serve`: `/status`, `/collections`,
+  `/search?q=X`, `/browse` for remote memory browsing. Enables
+  TinyAgentOS and other tools to access agent memory over HTTP
+  without direct SQLite access.
+- **Batch embedding**: `POST /embed-batch` sends all chunks in one
+  rkllama API call, reducing HTTP overhead.
 - AST-aware chunking for code files via `web-tree-sitter`. Supported
   languages: TypeScript/JavaScript, Python, Go, and Rust. Code files
   are chunked at function, class, and import boundaries instead of
