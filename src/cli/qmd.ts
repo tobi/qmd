@@ -1904,8 +1904,8 @@ export function buildEditorUri(template: string, absolutePath: string, line: num
     .replace(/\{column\}/g, String(safeCol));
 }
 
-function termLink(text: string, url: string): string {
-  if (!process.stdout.isTTY) return text;
+export function termLink(text: string, url: string, isTTY: boolean = !!process.stdout.isTTY): string {
+  if (!isTTY) return text;
   return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
 }
 
