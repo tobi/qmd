@@ -178,12 +178,29 @@ class RKLlamaBackend implements ModelBackend {
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    // rkllama processes one at a time, so we serialize
-    const results: (EmbeddingResult | null)[] = [];
-    for (const text of texts) {
-      results.push(await this.embed(text));
+    if (texts.length === 0) return [];
+
+    // Send all texts in one rkllama /api/embed call — it accepts arrays
+    // and returns one embedding per input, saving HTTP round-trips.
+    try {
+      const result = await this.post<{ embeddings: number[][] }>("/api/embed", {
+        model: this.embedModel,
+        input: texts,
+      });
+
+      if (!result.embeddings) return texts.map(() => null);
+
+      return result.embeddings.map((emb) =>
+        emb ? { embedding: emb, model: this.embedModel } : null,
+      );
+    } catch {
+      // Fallback to individual embeds if batch fails
+      const results: (EmbeddingResult | null)[] = [];
+      for (const text of texts) {
+        results.push(await this.embed(text));
+      }
+      return results;
     }
-    return results;
   }
 
   async rerank(query: string, documents: RerankDocument[]): Promise<RerankResult> {
