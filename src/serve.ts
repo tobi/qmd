@@ -21,6 +21,10 @@
  *   POST /expand          { query: string, options?: ExpandOptions }             -> Queryable[]
  *   POST /tokenize        { text: string }                                      -> { tokens: number }
  *   GET  /health          -> { ok: true, models: { embed, rerank, generate } }
+ *   GET  /status          -> IndexStatus (collection counts, embedding status)
+ *   GET  /collections     -> CollectionInfo[] (names, doc counts, last modified)
+ *   GET  /search?q=...    -> { results: SearchResult[], total: number }
+ *   GET  /browse?limit=N  -> { chunks: [...], total, limit, offset }
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
@@ -37,6 +41,14 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
 } from "./llm.js";
+
+import {
+  createStore,
+  enableProductionMode,
+  searchFTS,
+  listCollections,
+  type Store,
+} from "./store.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -325,6 +337,7 @@ export interface ServeOptions {
   backend?: "local" | "rkllama";
   rkllamaUrl?: string;
   config?: LlamaCppConfig;
+  dbPath?: string;
 }
 
 export async function startServer(options: ServeOptions = {}): Promise<void> {
@@ -351,6 +364,17 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
   }));
   console.log(`  Models: ${Object.values(healthInfo.models).join(", ")}`);
 
+  // Open the QMD index database for search/browse/collections endpoints.
+  // If no dbPath is specified, uses the default (~/.cache/qmd/index.sqlite).
+  enableProductionMode();
+  let store: Store | null = null;
+  try {
+    store = createStore(options.dbPath);
+    console.log(`[qmd serve] Index: ${store.dbPath}`);
+  } catch (err) {
+    console.warn(`[qmd serve] No index database found — search/browse endpoints disabled`);
+  }
+
   const server = createServer(async (req, res) => {
     // CORS for local network
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -371,6 +395,68 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       if (path === "/health" && req.method === "GET") {
         const info = await backend.health();
         json(res, 200, { ok: true, version: "2", backend: backendType, ...info });
+        return;
+      }
+
+      // ----- Index endpoints (require store) -----------------------------------
+
+      if (path === "/status" && req.method === "GET") {
+        if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
+        const status = store.getStatus();
+        json(res, 200, status);
+        return;
+      }
+
+      if (path === "/collections" && req.method === "GET") {
+        if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
+        const collections = listCollections(store.db);
+        json(res, 200, collections);
+        return;
+      }
+
+      if (path === "/search" && req.method === "GET") {
+        if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
+        const query = url.searchParams.get("q") || url.searchParams.get("query");
+        if (!query) { json(res, 400, { error: "q or query parameter is required" }); return; }
+        const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+        const collection = url.searchParams.get("collection") || undefined;
+        const results = searchFTS(store.db, query, limit, collection);
+        json(res, 200, { results, total: results.length });
+        return;
+      }
+
+      if (path === "/browse" && req.method === "GET") {
+        if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
+        const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+        const offset = parseInt(url.searchParams.get("offset") || "0", 10);
+        const collection = url.searchParams.get("collection") || undefined;
+
+        let sql = `
+          SELECT c.hash, substr(c.doc, 1, 500) as snippet, c.created_at,
+                 d.collection, d.path, d.title
+          FROM content c
+          JOIN documents d ON d.hash = c.hash AND d.active = 1
+        `;
+        const params: (string | number)[] = [];
+        if (collection) {
+          sql += ` WHERE d.collection = ?`;
+          params.push(collection);
+        }
+        sql += ` ORDER BY c.created_at DESC LIMIT ? OFFSET ?`;
+        params.push(limit, offset);
+
+        const rows = store.db.prepare(sql).all(...params);
+
+        // Get total count
+        let countSql = `SELECT COUNT(*) as total FROM content c JOIN documents d ON d.hash = c.hash AND d.active = 1`;
+        const countParams: string[] = [];
+        if (collection) {
+          countSql += ` WHERE d.collection = ?`;
+          countParams.push(collection);
+        }
+        const countRow = store.db.prepare(countSql).get(...countParams) as { total: number };
+
+        json(res, 200, { chunks: rows, total: countRow.total, limit, offset });
         return;
       }
 
@@ -464,6 +550,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
     const shutdown = async () => {
       console.log("\n[qmd serve] Shutting down...");
       server.close();
+      if (store) store.close();
       await backend.dispose();
       resolve();
     };
@@ -473,6 +560,9 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
     server.listen(port, bind, () => {
       console.log(`[qmd serve] Listening on http://${bind}:${port}`);
       console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
+      if (store) {
+        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse`);
+      }
     });
   });
 }
