@@ -1323,8 +1323,8 @@ describe("mcp http daemon", () => {
   }
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
-  function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+  function spawnHttpServer(port: number, host: string = "localhost"): import("child_process").ChildProcess {
+    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port), "--host", host], {
       cwd: fixturesDir,
       env: {
         ...process.env,
@@ -1397,6 +1397,42 @@ describe("mcp http daemon", () => {
       expect(ready).toBe(true);
 
       const res = await fetch(`http://localhost:${port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("ok");
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("foreground HTTP server starts on host 127.0.0.1 and responds to health check", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "127.0.0.1");
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("ok");
+    } finally {
+      proc.kill("SIGTERM");
+      await new Promise(r => proc.on("close", r));
+    }
+  });
+
+  test("foreground HTTP server starts on host 0.0.0.0 and responds to health check", async () => {
+    const port = randomPort();
+    const proc = spawnHttpServer(port, "0.0.0.0");
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://0.0.0.0:${port}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.status).toBe("ok");
