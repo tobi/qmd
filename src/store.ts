@@ -1489,10 +1489,11 @@ export async function generateEmbeddings(
           break;
         }
 
-        // Abort early if error rate is too high (>95% of processed chunks failed)
-        // Generous threshold for SBC/NPU backends where intermittent failures are common
+        // Abort early if error rate is too high (>99% of processed chunks failed)
+        // Very generous for SBC/NPU: individual chunks already retry 3x with backoff.
+        // Only abort if nearly everything is failing (server truly down).
         const processed = chunksEmbedded + errors;
-        if (processed >= BATCH_SIZE * 2 && errors > processed * 0.95) {
+        if (processed >= BATCH_SIZE * 4 && errors > processed * 0.99) {
           const remaining = batchChunks.length - batchStart;
           errors += remaining;
           console.warn(`⚠ Error rate too high (${errors}/${processed}) — aborting embedding`);
@@ -1524,18 +1525,23 @@ export async function generateEmbeddings(
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
-              try {
-                const text = formatDocForEmbedding(chunk.text, chunk.title);
-                const result = await session.embed(text);
-                if (result) {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                  chunksEmbedded++;
-                } else {
-                  errors++;
+              let embedded = false;
+              const text = formatDocForEmbedding(chunk.text, chunk.title);
+              // Retry up to 3 times with backoff for SBC/NPU intermittent failures
+              for (let attempt = 0; attempt < 3 && !embedded; attempt++) {
+                try {
+                  if (attempt > 0) await new Promise(r => setTimeout(r, 1000 * attempt));
+                  const result = await session.embed(text);
+                  if (result) {
+                    insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                    chunksEmbedded++;
+                    embedded = true;
+                  }
+                } catch {
+                  // Retry on next iteration
                 }
-              } catch {
-                errors++;
               }
+              if (!embedded) errors++;
               batchChunkBytesProcessed += chunk.bytes;
             }
           }
