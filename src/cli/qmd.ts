@@ -77,7 +77,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { RemoteLLM } from "../llm-remote.js";
+import { startServer } from "../serve.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -453,8 +455,12 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
 
-  // Device / GPU info
+  // Device / GPU info (skip if using remote server - no local GPU to report)
   try {
+    if (process.env.QMD_SERVER) {
+      console.log(`\n${c.bold}Device${c.reset}`);
+      console.log(`  Remote:   ${c.green}${process.env.QMD_SERVER}${c.reset} (QMD_SERVER)`);
+    } else {
     const llm = getDefaultLlamaCpp();
     const device = await llm.getDeviceInfo();
     console.log(`\n${c.bold}Device${c.reset}`);
@@ -479,6 +485,7 @@ async function showStatus(): Promise<void> {
       console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
     }
     console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } // close else block for non-remote
   } catch {
     // Don't fail status if LLM init fails
   }
@@ -2416,6 +2423,11 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Remote model server options
+      server: { type: "string" },  // URL of qmd serve instance (e.g. http://host:7832)
+      bind: { type: "string" },    // Bind address for qmd serve (default: 0.0.0.0)
+      backend: { type: "string" }, // Backend for qmd serve: "local" or "rkllama"
+      "rkllama-url": { type: "string" }, // URL of rkllama server (default: http://localhost:8080)
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2620,6 +2632,13 @@ function showHelp(): void {
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
+  console.log("Model server (shared models over network):");
+  console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
+  console.log("  qmd serve --backend rkllama               - Use RK3588 NPU via rkllama");
+  console.log("  qmd serve --backend rkllama --rkllama-url http://host:8080");
+  console.log("  qmd query --server http://host:7832 <q>   - Use remote models instead of local");
+  console.log("  QMD_SERVER=http://host:7832 qmd query <q> - Same via env var");
+  console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
   console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
@@ -2740,6 +2759,12 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Configure remote model server if --server is set or QMD_SERVER env var
+  const serverUrl = (cli.values.server as string) || process.env.QMD_SERVER;
+  if (serverUrl && cli.command !== "serve") {
+    setDefaultLLM(new RemoteLLM({ serverUrl }));
   }
 
   switch (cli.command) {
@@ -3062,6 +3087,26 @@ if (isMain) {
       }
       await querySearch(cli.query, cli.opts);
       break;
+
+    case "serve": {
+      // Remove top-level cursor handlers so shutdown handlers work
+      process.removeAllListeners("SIGTERM");
+      process.removeAllListeners("SIGINT");
+      const servePort = Number(cli.values.port) || 7832;
+      const serveBind = (cli.values.bind as string) || "0.0.0.0";
+      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "rkllama";
+      const rkllamaUrl = (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:8080";
+      await startServer({
+        port: servePort,
+        bind: serveBind,
+        backend: serveBackend,
+        rkllamaUrl: serveBackend === "rkllama" ? rkllamaUrl : undefined,
+        config: {
+          embedModel: process.env.QMD_EMBED_MODEL || undefined,
+        },
+      });
+      break;
+    }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
