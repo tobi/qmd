@@ -2426,8 +2426,9 @@ function parseCLI() {
       // Remote model server options
       server: { type: "string" },  // URL of qmd serve instance (e.g. http://host:7832)
       bind: { type: "string" },    // Bind address for qmd serve (default: 0.0.0.0)
-      backend: { type: "string" }, // Backend for qmd serve: "local" or "rkllama"
-      "rkllama-url": { type: "string" }, // URL of rkllama server (default: http://localhost:8080)
+      backend: { type: "string" }, // Backend for qmd serve: "local" or "ollama"
+      "backend-url": { type: "string" }, // URL of Ollama-compatible server
+      "rkllama-url": { type: "string" }, // Deprecated alias for --backend-url
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2634,8 +2635,8 @@ function showHelp(): void {
   console.log("");
   console.log("Model server (shared models over network):");
   console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
-  console.log("  qmd serve --backend rkllama               - Use RK3588 NPU via rkllama");
-  console.log("  qmd serve --backend rkllama --rkllama-url http://host:8080");
+  console.log("  qmd serve --backend ollama                - Use Ollama-compatible server");
+  console.log("  qmd serve --backend ollama --backend-url http://host:11434");
   console.log("  qmd query --server http://host:7832 <q>   - Use remote models instead of local");
   console.log("  QMD_SERVER=http://host:7832 qmd query <q> - Same via env var");
   console.log("");
@@ -3094,13 +3095,13 @@ if (isMain) {
       process.removeAllListeners("SIGINT");
       const servePort = Number(cli.values.port) || 7832;
       const serveBind = (cli.values.bind as string) || "0.0.0.0";
-      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "rkllama";
-      const rkllamaUrl = (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:8080";
+      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "ollama";
+      const backendUrl = (cli.values["backend-url"] as string) || (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:11434";
       await startServer({
         port: servePort,
         bind: serveBind,
         backend: serveBackend,
-        rkllamaUrl: serveBackend === "rkllama" ? rkllamaUrl : undefined,
+        backendUrl: serveBackend === "ollama" ? backendUrl : undefined,
         config: {
           embedModel: process.env.QMD_EMBED_MODEL || undefined,
         },

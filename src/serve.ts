@@ -8,11 +8,11 @@
  *
  * Supports two backends:
  *   - "local"   (default) — loads GGUF models via node-llama-cpp (CPU/Vulkan)
- *   - "rkllama" — proxies to an rkllama NPU server (RK3588/RK3576)
+ *   - "ollama" — proxies to an Ollama-compatible server (ollama, rkllama, etc.)
  *
  * Usage:
  *   qmd serve [--port 7832] [--bind 0.0.0.0]
- *   qmd serve --backend rkllama [--rkllama-url http://localhost:8080]
+ *   qmd serve --backend ollama [--backend-url http://localhost:11434]
  *
  * Endpoints:
  *   POST /embed           { text: string, options?: EmbedOptions }              -> EmbeddingResult
@@ -152,7 +152,7 @@ class LocalBackend implements ModelBackend {
 // RKLLama NPU backend
 // ---------------------------------------------------------------------------
 
-class RKLlamaBackend implements ModelBackend {
+class OllamaCompatBackend implements ModelBackend {
   private baseUrl: string;
   private embedModel: string;
   private rerankModel: string;
@@ -178,7 +178,7 @@ class RKLlamaBackend implements ModelBackend {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`rkllama ${path} returned ${res.status}: ${text}`);
+      throw new Error(`ollama-compat ${path} returned ${res.status}: ${text}`);
     }
     return (await res.json()) as T;
   }
@@ -205,7 +205,7 @@ class RKLlamaBackend implements ModelBackend {
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
-    // Send all texts in one rkllama /api/embed call — it accepts arrays
+    // Send all texts in one /api/embed call — Ollama API accepts arrays
     // and returns one embedding per input, saving HTTP round-trips.
     try {
       const result = await this.post<{ embeddings: number[][] }>("/api/embed", {
@@ -229,7 +229,7 @@ class RKLlamaBackend implements ModelBackend {
   }
 
   async rerank(query: string, documents: RerankDocument[]): Promise<RerankResult> {
-    // Use rkllama's native /api/rerank endpoint which uses logit-based
+    // Use the /api/rerank endpoint which uses logit-based
     // cross-encoder scoring (softmax over yes/no token probabilities).
     // This produces accurate relevance scores directly from the NPU.
     const docTexts = documents.map((d) => d.text);
@@ -243,7 +243,7 @@ class RKLlamaBackend implements ModelBackend {
       documents: docTexts,
     });
 
-    // Map rkllama's response format to QMD's RerankResult format
+    // Map the response format to QMD's RerankResult format
     const results: RerankDocumentResult[] = result.results.map((r) => ({
       file: documents[r.index]?.file ?? `doc-${r.index}`,
       score: r.relevance_score,
@@ -264,7 +264,7 @@ class RKLlamaBackend implements ModelBackend {
     //   lex: keyword terms for BM25
     //   vec: semantic rephrasing for vector search
     //   hyde: hypothetical document for HyDE search
-    // Without grammar constraints (rkllama doesn't support GBNF), we use
+    // Without grammar constraints (Ollama doesn't support GBNF), we use
     // the model's training + a clear prompt to get structured output.
     const intent = options?.intent;
     const prompt = intent
@@ -318,7 +318,7 @@ class RKLlamaBackend implements ModelBackend {
   }
 
   async tokenize(text: string): Promise<number> {
-    // No tokenizer endpoint in rkllama - estimate
+    // No tokenizer endpoint in Ollama API - estimate
     return Math.ceil(text.length / 4);
   }
 
@@ -336,7 +336,7 @@ class RKLlamaBackend implements ModelBackend {
   }
 
   async dispose() {
-    // Nothing to dispose - we don't own the rkllama process
+    // Nothing to dispose - we don't own the external process
   }
 }
 
@@ -347,7 +347,9 @@ class RKLlamaBackend implements ModelBackend {
 export interface ServeOptions {
   port?: number;
   bind?: string;
-  backend?: "local" | "rkllama";
+  backend?: "local" | "ollama";
+  backendUrl?: string;
+  /** @deprecated Use backendUrl instead */
   rkllamaUrl?: string;
   config?: LlamaCppConfig;
   dbPath?: string;
@@ -360,10 +362,10 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
 
   let backend: ModelBackend;
 
-  if (backendType === "rkllama") {
-    const url = options.rkllamaUrl ?? "http://localhost:8080";
-    backend = new RKLlamaBackend({ url });
-    console.log(`[qmd serve] Backend: rkllama NPU (${url})`);
+  if (backendType === "ollama") {
+    const url = options.backendUrl ?? options.rkllamaUrl ?? "http://localhost:11434";
+    backend = new OllamaCompatBackend({ url });
+    console.log(`[qmd serve] Backend: ollama-compatible (${url})`);
   } else {
     backend = new LocalBackend(options.config ?? {});
     console.log(`[qmd serve] Backend: local (node-llama-cpp)`);
