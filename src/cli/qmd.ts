@@ -5,7 +5,7 @@ import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join as pathJoin, relative as relativePath } from "path";
 import { parseArgs } from "util";
-import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync } from "fs";
+import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, watch as fsWatch } from "fs";
 import { createInterface } from "readline/promises";
 import {
   getPwd,
@@ -619,6 +619,100 @@ async function updateCollections(): Promise<void> {
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
+}
+
+/**
+ * Watch all collection directories for file changes and auto-reindex.
+ * Debounces rapid changes per collection (500ms).
+ */
+async function watchCollections(autoEmbed: boolean): Promise<void> {
+  const db = getDb();
+  const storeInstance = getStore();
+  const collections = listCollections(db);
+
+  if (collections.length === 0) {
+    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const watchers: ReturnType<typeof fsWatch>[] = [];
+
+  console.log(`${c.bold}Watching ${collections.length} collection(s) for changes...${c.reset}`);
+  for (const col of collections) {
+    if (!col) continue;
+    console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}${col.pwd}${c.reset}`);
+  }
+  console.log(`\n${c.dim}Press Ctrl+C to stop.${c.reset}\n`);
+
+  for (const col of collections) {
+    if (!col) continue;
+    if (!existsSync(col.pwd)) {
+      console.log(`${c.yellow}⚠${c.reset} ${col.name}: directory not found (${col.pwd}), skipping`);
+      continue;
+    }
+
+    try {
+      const watcher = fsWatch(col.pwd, { recursive: true }, (_event, filename) => {
+        if (!filename) return;
+        // Only trigger for files matching the collection glob pattern
+        const ext = filename.split('.').pop()?.toLowerCase();
+        const pattern = col.glob_pattern || "**/*.md";
+        // Simple extension check from glob pattern
+        const globExts = pattern.match(/\*\.(\w+)/g)?.map(m => m.slice(2)) || ["md"];
+        if (ext && !globExts.includes(ext)) return;
+
+        // Debounce per collection
+        const existing = debounceTimers.get(col.name);
+        if (existing) clearTimeout(existing);
+
+        debounceTimers.set(col.name, setTimeout(async () => {
+          debounceTimers.delete(col.name);
+          const timestamp = new Date().toLocaleTimeString();
+          console.log(`${c.dim}[${timestamp}]${c.reset} ${c.cyan}${col.name}${c.reset} changed: ${filename}`);
+
+          try {
+            const yamlCol = getCollectionFromYaml(col.name);
+            const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
+              ignorePatterns: yamlCol?.ignore,
+            });
+            console.log(`  Indexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+
+            if (autoEmbed) {
+              const needsEmbedding = getHashesNeedingEmbedding(db);
+              if (needsEmbedding > 0) {
+                console.log(`  Embedding ${needsEmbedding} new hash(es)...`);
+                await vectorIndex(DEFAULT_EMBED_MODEL_URI, false, {});
+                console.log(`  ${c.green}✓${c.reset} Embeddings updated`);
+              }
+            } else {
+              const needsEmbedding = getHashesNeedingEmbedding(db);
+              if (needsEmbedding > 0) {
+                console.log(`  ${c.dim}${needsEmbedding} hash(es) need embedding. Run 'qmd embed' to update vectors.${c.reset}`);
+              }
+            }
+          } catch (err) {
+            console.error(`  ${c.yellow}⚠${c.reset} Reindex failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }, 500));
+      });
+      watchers.push(watcher);
+    } catch (err) {
+      console.log(`${c.yellow}⚠${c.reset} ${col.name}: could not watch (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+
+  // Keep the process alive and handle clean shutdown
+  await new Promise<void>((resolve) => {
+    process.on("SIGINT", () => {
+      console.log(`\n${c.green}✓${c.reset} Stopped watching.`);
+      for (const w of watchers) w.close();
+      for (const t of debounceTimers.values()) clearTimeout(t);
+      closeDb();
+      resolve();
+    });
+  });
 }
 
 /**
@@ -2473,8 +2567,9 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
-      // Update options
+      // Update/watch options
       pull: { type: "boolean" },  // git pull before update
+      embed: { type: "boolean" },  // auto-embed after watch update
       refresh: { type: "boolean" },
       // Get options
       l: { type: "string" },  // max lines
@@ -2691,6 +2786,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd watch [--embed]           - Watch collections for changes, auto-reindex");
   console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -3314,13 +3410,17 @@ if (isMain) {
       break;
     }
 
+    case "watch":
+      await watchCollections(!!cli.values.embed);
+      break;
+
     default:
       console.error(`Unknown command: ${cli.command}`);
       console.error("Run 'qmd --help' for usage.");
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
+  if (cli.command !== "mcp" && cli.command !== "watch") {
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }

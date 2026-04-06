@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `qmd watch [--embed]` monitors collection directories for file changes
+  and auto-reindexes affected collections with 500ms debouncing. Pass
+  `--embed` to also regenerate vector embeddings after each update.
+
 ## [2.1.0] - 2026-04-05
 
 Code files now chunk at function and class boundaries via tree-sitter,
