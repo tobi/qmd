@@ -2492,6 +2492,10 @@ function parseCLI() {
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // Decay options
       run: { type: "boolean" },
+      "base-lambda": { type: "string" },
+      "prune-threshold": { type: "string" },
+      disable: { type: "boolean" },
+      enable: { type: "boolean" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -3417,6 +3421,64 @@ if (isMain) {
       } else {
         console.error(`Error: document not found: ${filepath}`);
         process.exit(1);
+      }
+      closeDb();
+      break;
+    }
+
+    case "decay-collection": {
+      const collectionName = cli.args[0];
+      if (!collectionName) {
+        // List all collections with their decay settings
+        const store = getStore();
+        const collections = store.listCollections();
+        if (collections.length === 0) {
+          console.log("No collections found");
+        } else {
+          console.log(`${c.bold}Collection Decay Strategies:${c.reset}\n`);
+          for (const coll of collections) {
+            const decay = coll.decay;
+            const status = decay?.enabled === false ? `${c.dim}(disabled)${c.reset}` : `${c.green}active${c.reset}`;
+            const baseLambda = decay?.baseLambda ?? 0.16;
+            const threshold = decay?.pruneThreshold ?? 0.05;
+            console.log(`  ${c.cyan}${coll.name.padEnd(20)}${c.reset} λ=${baseLambda.toFixed(2)}  threshold=${threshold.toFixed(2)}  ${status}`);
+          }
+        }
+        closeDb();
+        break;
+      }
+
+      const store = getStore();
+      const collection = store.getCollection(collectionName);
+      if (!collection) {
+        console.error(`Error: collection not found: ${collectionName}`);
+        process.exit(1);
+      }
+
+      const baseLambda = cli.values["base-lambda"] ? parseFloat(cli.values["base-lambda"] as string) : undefined;
+      const pruneThreshold = cli.values["prune-threshold"] ? parseFloat(cli.values["prune-threshold"] as string) : undefined;
+      const disable = cli.values.disable;
+      const enable = cli.values.enable;
+
+      if (baseLambda === undefined && pruneThreshold === undefined && !disable && !enable) {
+        // Show current settings
+        const decay = collection.decay;
+        console.log(`${c.bold}Collection: ${collectionName}${c.reset}`);
+        console.log(`  Enabled: ${decay?.enabled !== false ? "yes" : "no"}`);
+        console.log(`  Base lambda: ${decay?.baseLambda ?? 0.16}`);
+        console.log(`  Prune threshold: ${decay?.pruneThreshold ?? 0.05}`);
+      } else {
+        // Update settings
+        const newDecay = {
+          enabled: disable ? false : (enable ? true : (collection.decay?.enabled ?? true)),
+          baseLambda: baseLambda ?? collection.decay?.baseLambda ?? 0.16,
+          pruneThreshold: pruneThreshold ?? collection.decay?.pruneThreshold ?? 0.05,
+        };
+        store.setCollectionDecay(collectionName, newDecay);
+        console.log(`${c.green}✓${c.reset} Updated decay strategy for ${collectionName}`);
+        console.log(`  Enabled: ${newDecay.enabled}`);
+        console.log(`  Base lambda: ${newDecay.baseLambda}`);
+        console.log(`  Prune threshold: ${newDecay.pruneThreshold}`);
       }
       closeDb();
       break;

@@ -32,9 +32,10 @@ export const PRUNE_THRESHOLD = 0.05;
  * λ_eff = base_lambda × (1 − importance × 0.8)
  *
  * @param importance    Document importance weight (0..1)
- * @param category      Document category (determines base decay rate)
+ * @param category      Document category (determines base decay rate fallback)
  * @param createdAt     ISO datetime of document creation
  * @param recallCount   Number of times this document has been recalled
+ * @param baseLambda    Optional collection-level base lambda (overrides category default)
  * @returns Strength score (higher = more relevant)
  */
 export function computeStrength(
@@ -42,10 +43,11 @@ export function computeStrength(
   category: Category,
   createdAt: string,
   recallCount: number,
-  now?: number
+  now?: number,
+  baseLambda?: number
 ): number {
-  const baseLambda = BASE_LAMBDA[category];
-  const lambdaEff = baseLambda * (1 - importance * 0.8);
+  const lambda = baseLambda ?? BASE_LAMBDA[category];
+  const lambdaEff = lambda * (1 - importance * 0.8);
   const days = Math.max(0, ((now ?? Date.now()) - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24));
   return importance * Math.exp(-lambdaEff * days) * (1 + recallCount * 0.2);
 }

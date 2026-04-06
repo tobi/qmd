@@ -39,6 +39,7 @@ import type {
   Collection,
   CollectionConfig,
   ContextMap,
+  DecayConfig,
 } from "./collections.js";
 
 // =============================================================================
@@ -851,6 +852,19 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // Collection-level decay strategy migration
+  const collCols = db.prepare(`PRAGMA table_info(store_collections)`).all() as { name: string }[];
+  const collColNames = new Set(collCols.map(c => c.name));
+  if (!collColNames.has("decay_enabled")) {
+    db.exec(`ALTER TABLE store_collections ADD COLUMN decay_enabled INTEGER DEFAULT 1`);
+  }
+  if (!collColNames.has("decay_base_lambda")) {
+    db.exec(`ALTER TABLE store_collections ADD COLUMN decay_base_lambda REAL DEFAULT 0.16`);
+  }
+  if (!collColNames.has("decay_prune_threshold")) {
+    db.exec(`ALTER TABLE store_collections ADD COLUMN decay_prune_threshold REAL DEFAULT 0.05`);
+  }
+
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_config (
@@ -918,6 +932,9 @@ type StoreCollectionRow = {
   include_by_default: number;
   update_command: string | null;
   context: string | null;
+  decay_enabled: number | null;
+  decay_base_lambda: number | null;
+  decay_prune_threshold: number | null;
 };
 
 function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
@@ -929,6 +946,15 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
+    ...(row.decay_enabled !== null || row.decay_base_lambda !== null || row.decay_prune_threshold !== null
+      ? {
+          decay: {
+            enabled: row.decay_enabled === 1 ? true : row.decay_enabled === 0 ? false : undefined,
+            baseLambda: row.decay_base_lambda ?? 0.16,
+            pruneThreshold: row.decay_prune_threshold ?? 0.05,
+          }
+        }
+      : {}),
   };
 }
 
@@ -941,6 +967,18 @@ export function getStoreCollection(db: Database, name: string): NamedCollection 
   const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
   if (row == null) return null;
   return rowToNamedCollection(row);
+}
+
+export function setCollectionDecay(db: Database, name: string, decay: DecayConfig): void {
+  const enabled = decay.enabled !== false ? 1 : 0;
+  const baseLambda = decay.baseLambda ?? 0.16;
+  const pruneThreshold = decay.pruneThreshold ?? 0.05;
+
+  db.prepare(`
+    UPDATE store_collections
+    SET decay_enabled = ?, decay_base_lambda = ?, decay_prune_threshold = ?
+    WHERE name = ?
+  `).run(enabled, baseLambda, pruneThreshold, name);
 }
 
 export function getStoreGlobalContext(db: Database): string | undefined {
@@ -1191,6 +1229,11 @@ export type Store = {
   pruneLowStrength: () => number;
   getDocumentDecayInfo: (filepath: string) => DecayDocInfo | null;
   getDecayStrengthForFile: (filepath: string) => number;
+
+  // Collection decay strategy
+  listCollections: () => NamedCollection[];
+  getCollection: (name: string) => NamedCollection | null;
+  setCollectionDecay: (name: string, decay: DecayConfig) => void;
 };
 
 // =============================================================================
@@ -1774,18 +1817,37 @@ function getDocumentDecayInfo(db: Database, filepath: string): DecayDocInfo | nu
 
 /**
  * Compute decay strength for a document by its filepath.
+ * Uses collection-level decay strategy if configured, otherwise category defaults.
  * Returns 1.0 if the document is not found (no penalty for unknown docs).
  */
 function getDecayStrengthForFile(db: Database, filepath: string): number {
-  const row = db.prepare(`
-    SELECT importance, recall_count, category, created_at
-    FROM documents WHERE active = 1 AND (collection || '/' || path = ? OR path = ?)
+  // Get document info including collection
+  const docRow = db.prepare(`
+    SELECT d.importance, d.recall_count, d.category, d.created_at, d.collection,
+           sc.decay_enabled, sc.decay_base_lambda
+    FROM documents d
+    LEFT JOIN store_collections sc ON d.collection = sc.name
+    WHERE d.active = 1 AND (d.collection || '/' || d.path = ? OR d.path = ?)
     LIMIT 1
-  `).get(filepath, filepath) as { importance: number; recall_count: number; category: string; created_at: string } | undefined;
+  `).get(filepath, filepath) as {
+    importance: number;
+    recall_count: number;
+    category: string;
+    created_at: string;
+    collection: string;
+    decay_enabled: number | null;
+    decay_base_lambda: number | null;
+  } | undefined;
 
-  if (!row) return 1.0;
-  const cat = isValidCategory(row.category) ? row.category : "fact";
-  return computeStrength(row.importance, cat, row.created_at, row.recall_count);
+  if (!docRow) return 1.0;
+
+  // If decay is disabled for this collection, return full strength
+  if (docRow.decay_enabled === 0) return 1.0;
+
+  const cat = isValidCategory(docRow.category) ? docRow.category : "fact";
+  const baseLambda = docRow.decay_base_lambda ?? undefined; // Use collection override or undefined for category default
+
+  return computeStrength(docRow.importance, cat, docRow.created_at, docRow.recall_count, undefined, baseLambda);
 }
 
 /**
@@ -1878,6 +1940,11 @@ export function createStore(dbPath?: string): Store {
     pruneLowStrength: () => pruneLowStrength(db),
     getDocumentDecayInfo: (filepath: string) => getDocumentDecayInfo(db, filepath),
     getDecayStrengthForFile: (filepath: string) => getDecayStrengthForFile(db, filepath),
+
+    // Collection decay strategy
+    listCollections: () => getStoreCollections(db),
+    getCollection: (name: string) => getStoreCollection(db, name),
+    setCollectionDecay: (name: string, decay: DecayConfig) => setCollectionDecay(db, name, decay),
   };
 
   return store;
