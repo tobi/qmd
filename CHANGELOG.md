@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `qmd similar <path|#docid>` finds semantically similar documents using
+  embedding cosine similarity. Also exposed as an MCP `similar` tool and
+  `store.findSimilarByEmbedding()` SDK method. Supports `-c` collection
+  filter and all output formats.
+
 ## [2.1.0] - 2026-04-05
 
 Code files now chunk at function and class boundaries via tree-sitter,

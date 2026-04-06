@@ -1128,6 +1128,7 @@ export type Store = {
 
   // Fuzzy matching and docid lookup
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
+  findSimilarByEmbedding: (pathOrDocid: string, limit?: number, collectionName?: string) => SearchResult[];
   matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
   findDocumentByDocid: (docid: string) => { filepath: string; hash: string } | null;
 
@@ -1641,6 +1642,7 @@ export function createStore(dbPath?: string): Store {
 
     // Fuzzy matching and docid lookup
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
+    findSimilarByEmbedding: (pathOrDocid: string, limit?: number, collectionName?: string) => findSimilarByEmbedding(db, pathOrDocid, limit, collectionName),
     matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
     findDocumentByDocid: (docid: string) => findDocumentByDocid(db, docid),
 
@@ -3079,6 +3081,122 @@ export async function searchVec(db: Database, query: string, model: string, limi
         body: row.body,
         context: getContextForFile(db, row.filepath),
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        source: "vec" as const,
+        chunkPos: row.pos,
+      };
+    });
+}
+
+// =============================================================================
+// Similar Documents (by embedding cosine similarity)
+// =============================================================================
+
+export function findSimilarByEmbedding(db: Database, pathOrDocid: string, limit: number = 5, collectionName?: string): SearchResult[] {
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return [];
+
+  // Resolve the target document
+  let targetHash: string | undefined;
+  let targetFilepath: string | undefined;
+
+  if (isDocid(pathOrDocid)) {
+    const doc = findDocumentByDocid(db, pathOrDocid);
+    if (doc) {
+      targetHash = doc.hash;
+      targetFilepath = doc.filepath;
+    }
+  }
+
+  if (!targetHash) {
+    // Try to find by path
+    const doc = findDocument(db, pathOrDocid);
+    if (doc && !('error' in doc)) {
+      targetHash = doc.hash;
+      targetFilepath = doc.filepath;
+    }
+  }
+
+  if (!targetHash || !targetFilepath) return [];
+
+  // Get the first chunk's embedding for this document
+  const vecRow = db.prepare(`
+    SELECT embedding FROM vectors_vec WHERE hash_seq = ?
+  `).get(`${targetHash}_0`) as { embedding: Float32Array } | undefined;
+
+  if (!vecRow) return [];
+
+  // Query for nearest neighbors (same two-step pattern as searchVec)
+  const vecResults = db.prepare(`
+    SELECT hash_seq, distance
+    FROM vectors_vec
+    WHERE embedding MATCH ? AND k = ?
+  `).all(vecRow.embedding, (limit + 1) * 3) as { hash_seq: string; distance: number }[];
+
+  if (vecResults.length === 0) return [];
+
+  // Filter out the source document and build results
+  const hashSeqs = vecResults
+    .filter(r => !r.hash_seq.startsWith(targetHash + '_'))
+    .map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+
+  if (hashSeqs.length === 0) return [];
+
+  const placeholders = hashSeqs.map(() => '?').join(',');
+  let docSql = `
+    SELECT
+      cv.hash || '_' || cv.seq as hash_seq,
+      cv.hash,
+      cv.pos,
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      content.doc as body
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN content ON content.hash = d.hash
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+  `;
+  const params: string[] = [...hashSeqs];
+
+  if (collectionName) {
+    docSql += ` AND d.collection = ?`;
+    params.push(collectionName);
+  }
+
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash_seq: string; hash: string; pos: number; filepath: string;
+    display_path: string; title: string; body: string;
+  }[];
+
+  // Dedupe by filepath, keep best distance
+  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  for (const row of docRows) {
+    if (row.filepath === targetFilepath) continue; // Skip source document
+    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const existing = seen.get(row.filepath);
+    if (!existing || distance < existing.bestDist) {
+      seen.set(row.filepath, { row, bestDist: distance });
+    }
+  }
+
+  return Array.from(seen.values())
+    .sort((a, b) => a.bestDist - b.bestDist)
+    .slice(0, limit)
+    .map(({ row, bestDist }) => {
+      const colName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      return {
+        filepath: row.filepath,
+        displayPath: row.display_path,
+        title: row.title,
+        hash: row.hash,
+        docid: getDocid(row.hash),
+        collectionName: colName,
+        modifiedAt: "",
+        bodyLength: row.body.length,
+        body: row.body,
+        context: getContextForFile(db, row.filepath),
+        score: 1 - bestDist,
         source: "vec" as const,
         chunkPos: row.pos,
       };
