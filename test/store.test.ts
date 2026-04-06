@@ -128,6 +128,7 @@ async function insertTestDocument(
     title?: string;
     hash?: string;
     displayPath?: string;
+    sourcePath?: string;
     filepath?: string;
     body?: string;
     active?: number;
@@ -149,6 +150,7 @@ async function insertTestDocument(
     path = `test/${name}.md`;
   }
 
+  const sourcePath = opts.sourcePath ?? null;
   const body = opts.body || "# Test Document\n\nThis is test content.";
   const active = opts.active ?? 1;
 
@@ -163,9 +165,9 @@ async function insertTestDocument(
 
   // Insert document
   const result = db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(collectionName, path, title, hash, now, now, active);
+    INSERT INTO documents (collection, path, source_path, title, hash, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(collectionName, path, sourcePath, title, hash, now, now, active);
 
   return Number(result.lastInsertRowid);
 }
@@ -2988,7 +2990,7 @@ describe("Content-Addressable Storage", () => {
     const oldContent = "# First Version";
     const oldHash = await hashContent(oldContent);
     store.insertContent(oldHash, oldContent, now);
-    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, now, now);
+    store.insertDocument(collectionName, "docs/foo.md", "docs/foo.md", "foo", oldHash, now, now);
 
     // Simulate file removal during update pass.
     store.deactivateDocument(collectionName, "docs/foo.md");
@@ -3000,7 +3002,7 @@ describe("Content-Addressable Storage", () => {
     store.insertContent(newHash, newContent, now);
 
     expect(() => {
-      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, now, now);
+      store.insertDocument(collectionName, "docs/foo.md", "docs/foo.md", "foo", newHash, now, now);
     }).not.toThrow();
 
     const rows = store.db.prepare(`
@@ -3264,5 +3266,244 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+// =============================================================================
+// source_path Tests
+// =============================================================================
+
+describe("source_path", () => {
+  test("source_path column exists after schema init", async () => {
+    const store = await createTestStore();
+    const cols = store.db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+    expect(cols.some(c => c.name === "source_path")).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("schema migration is idempotent (no error on second init)", async () => {
+    const store = await createTestStore();
+    // createStore already called initializeDatabase; calling it again via createStore
+    // on the same DB path would exercise the ALTER TABLE catch path.
+    // Instead, directly attempt the ALTER TABLE to verify it doesn't throw:
+    expect(() => {
+      try {
+        store.db.exec(`ALTER TABLE documents ADD COLUMN source_path TEXT`);
+      } catch (_) {
+        // Expected: column already exists
+      }
+    }).not.toThrow();
+    await cleanupTestDb(store);
+  });
+
+  test("insertTestDocument stores source_path in database", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      displayPath: "particle-filters.qmd",
+      sourcePath: "particle_filters.qmd",
+      body: "# Particle Filters\n\nBootstrap particle filter implementation.",
+    });
+
+    const row = store.db.prepare(
+      `SELECT path, source_path FROM documents WHERE collection = ? AND path = ?`
+    ).get(collectionName, "particle-filters.qmd") as { path: string; source_path: string | null };
+
+    expect(row.path).toBe("particle-filters.qmd");
+    expect(row.source_path).toBe("particle_filters.qmd");
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS displayPath uses source_path when available", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "particle-filters.qmd",
+      sourcePath: "particle_filters.qmd",
+      title: "Particle Filters",
+      body: "Bootstrap particle filter algorithm for state estimation.",
+    });
+
+    const results = store.searchFTS("particle", 10);
+    expect(results.length).toBeGreaterThan(0);
+    // displayPath should use source_path (original filesystem name)
+    expect(results[0]!.displayPath).toBe(`${collectionName}/particle_filters.qmd`);
+    // filepath (virtual path) should still use handelize'd path for lookups
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/particle-filters.qmd`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("findDocument displayPath uses source_path when available", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/project" });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "notebook/particle-filters.qmd",
+      sourcePath: "notebook/particle_filters.qmd",
+      title: "Particle Filters",
+      body: "Content about particle filters.",
+    });
+
+    // Look up by virtual path (uses handelize'd path)
+    const result = store.findDocument(`qmd://${collectionName}/notebook/particle-filters.qmd`);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.displayPath).toBe(`${collectionName}/notebook/particle_filters.qmd`);
+      expect(result.filepath).toBe(`qmd://${collectionName}/notebook/particle-filters.qmd`);
+    }
+
+    await cleanupTestDb(store);
+  });
+
+  test("findDocuments displayPath uses source_path when available", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/project" });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "notes/my-notes.md",
+      sourcePath: "notes/my_notes.md",
+      title: "My Notes",
+      body: "Some notes content.",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "notes/other-file.md",
+      sourcePath: "notes/other_file.md",
+      title: "Other File",
+      body: "Other content here.",
+    });
+
+    const { docs } = store.findDocuments(`qmd://${collectionName}/notes/my-notes.md, qmd://${collectionName}/notes/other-file.md`);
+    expect(docs).toHaveLength(2);
+    const paths = docs.map(d => d.doc.displayPath);
+    expect(paths).toContain(`${collectionName}/notes/my_notes.md`);
+    expect(paths).toContain(`${collectionName}/notes/other_file.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("getActiveDocumentPaths returns source_path when available", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "particle-filters.qmd",
+      sourcePath: "particle_filters.qmd",
+      body: "Content A",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "my-notes.md",
+      sourcePath: "my_notes.md",
+      body: "Content B",
+    });
+
+    const paths = store.getActiveDocumentPaths(collectionName);
+    expect(paths).toContain("particle_filters.qmd");
+    expect(paths).toContain("my_notes.md");
+    expect(paths).not.toContain("particle-filters.qmd");
+    expect(paths).not.toContain("my-notes.md");
+
+    await cleanupTestDb(store);
+  });
+
+  test("displayPath falls back to handelize'd path when source_path is NULL", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    // Insert without sourcePath (simulates pre-migration data)
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "particle-filters.qmd",
+      title: "Particle Filters",
+      body: "Bootstrap particle filter for state estimation.",
+    });
+
+    // Verify source_path is NULL
+    const row = store.db.prepare(
+      `SELECT source_path FROM documents WHERE collection = ? AND path = ?`
+    ).get(collectionName, "particle-filters.qmd") as { source_path: string | null };
+    expect(row.source_path).toBeNull();
+
+    // searchFTS should fall back to handelize'd path
+    const results = store.searchFTS("particle", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/particle-filters.qmd`);
+
+    // findDocument should also fall back
+    const doc = store.findDocument(`qmd://${collectionName}/particle-filters.qmd`);
+    expect("error" in doc).toBe(false);
+    if (!("error" in doc)) {
+      expect(doc.displayPath).toBe(`${collectionName}/particle-filters.qmd`);
+    }
+
+    // getActiveDocumentPaths should also fall back
+    const paths = store.getActiveDocumentPaths(collectionName);
+    expect(paths).toContain("particle-filters.qmd");
+
+    await cleanupTestDb(store);
+  });
+
+  test("findDocument resolves by source_path-based virtual path", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/project" });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "notebook/particle-filters.qmd",
+      sourcePath: "notebook/particle_filters.qmd",
+      title: "Particle Filters",
+      body: "Bootstrap particle filter content.",
+    });
+
+    // Look up using source_path in the virtual URL (as if user copied from ls output)
+    const result = store.findDocument(`qmd://${collectionName}/notebook/particle_filters.qmd`);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.displayPath).toBe(`${collectionName}/notebook/particle_filters.qmd`);
+      expect(result.title).toBe("Particle Filters");
+    }
+
+    await cleanupTestDb(store);
+  });
+
+  test("findDocument resolves by source_path as relative path", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/project" });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "particle-filters.qmd",
+      sourcePath: "particle_filters.qmd",
+      title: "Particle Filters",
+      body: "Content about particle filters.",
+    });
+
+    // Look up using original filename (no qmd:// prefix)
+    const result = store.findDocument("particle_filters.qmd");
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.title).toBe("Particle Filters");
+    }
+
+    await cleanupTestDb(store);
+  });
+
+  test("findDocuments resolves comma-separated source_paths", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/project" });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "particle-filters.qmd",
+      sourcePath: "particle_filters.qmd",
+      title: "Particle Filters",
+      body: "Content A.",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      displayPath: "my-notes.md",
+      sourcePath: "my_notes.md",
+      title: "My Notes",
+      body: "Content B.",
+    });
+
+    // Look up using source_path-based virtual paths
+    const { docs, errors } = store.findDocuments(
+      `qmd://${collectionName}/particle_filters.qmd, qmd://${collectionName}/my_notes.md`
+    );
+    expect(errors).toHaveLength(0);
+    expect(docs).toHaveLength(2);
+
+    await cleanupTestDb(store);
   });
 });

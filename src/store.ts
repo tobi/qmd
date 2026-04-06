@@ -754,6 +754,18 @@ function initializeDatabase(db: Database): void {
 
   // Documents table - file system layer mapping virtual paths to content hashes
   // Collections are now managed in ~/.config/qmd/index.yml
+  //
+  // Path columns:
+  //   path        — handelize'd (normalized) path. Used as the dedup key (UNIQUE constraint),
+  //                 FTS filepath token source, and qmd:// virtual path component.
+  //   source_path — original relative filesystem path, preserving case and underscores.
+  //                 Used for display (ls, search results, MCP) and as a lookup fallback.
+  //                 NULL for documents indexed before this column was added.
+  //
+  // All display code uses COALESCE(source_path, path) so pre-migration rows degrade
+  // gracefully. All lookup code tries path first, then source_path as fallback.
+  // Once all users have re-indexed (qmd update), the COALESCE fallbacks and
+  // source_path lookup fallbacks could be simplified to use source_path directly.
   db.exec(`
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -772,6 +784,14 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+
+  // Migration v1: add source_path column for original filesystem paths.
+  // handelize'd path is kept for FTS tokenization and dedup (see comment above).
+  try {
+    db.exec(`ALTER TABLE documents ADD COLUMN source_path TEXT`);
+  } catch (_) {
+    // Column already exists — ignore
+  }
 
   // Cache table for LLM API calls
   db.exec(`
@@ -1133,7 +1153,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, sourcePath: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
@@ -1246,7 +1266,7 @@ export async function reindexCollection(
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      insertDocument(db, collectionName, path, relativeFile, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
@@ -1646,7 +1666,7 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, sourcePath: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, sourcePath, title, hash, createdAt, modifiedAt),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
@@ -1671,8 +1691,8 @@ export function createStore(dbPath?: string): Store {
  * Body is optional - use getDocumentBody() to load it separately if needed.
  */
 export type DocumentResult = {
-  filepath: string;           // Full filesystem path
-  displayPath: string;        // Short display path (e.g., "docs/readme.md")
+  filepath: string;           // Full virtual path (qmd://collection/handelize'd-path) for lookups
+  displayPath: string;        // Short display path using original filename (e.g., "docs/readme.md")
   title: string;              // Document title (from first heading or filename)
   context: string | null;     // Folder context description if configured
   hash: string;               // Content hash for caching/change detection
@@ -2072,20 +2092,22 @@ export function insertDocument(
   db: Database,
   collectionName: string,
   path: string,
+  sourcePath: string,
   title: string,
   hash: string,
   createdAt: string,
   modifiedAt: string
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, source_path, title, hash, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(collection, path) DO UPDATE SET
+      source_path = excluded.source_path,
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, sourcePath, title, hash, createdAt, modifiedAt);
 }
 
 /**
@@ -2144,7 +2166,7 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
  */
 export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
   const rows = db.prepare(`
-    SELECT path FROM documents WHERE collection = ? AND active = 1
+    SELECT COALESCE(source_path, path) as path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
 }
@@ -2342,7 +2364,7 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
-    SELECT d.path
+    SELECT COALESCE(d.source_path, d.path) as path
     FROM documents d
     WHERE d.active = 1
   `).all() as { path: string }[];
@@ -2361,18 +2383,19 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
       'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
       d.path,
-      d.collection
+      d.collection,
+      COALESCE(d.source_path, d.path) as display_path
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
+  `).all() as { virtual_path: string; body_length: number; path: string; collection: string; display_path: string }[];
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path) || isMatch(f.display_path) || isMatch(f.collection + '/' + f.display_path))
     .map(f => ({
-      filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
+      filepath: f.virtual_path,      // Virtual path for precise lookup
+      displayPath: f.display_path,   // Original path for display
       bodyLength: f.body_length
     }));
 }
@@ -2950,7 +2973,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
+      d.collection || '/' || COALESCE(d.source_path, d.path) as display_path,
       d.title,
       content.doc as body,
       d.hash,
@@ -3032,7 +3055,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       cv.hash,
       cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
+      d.collection || '/' || COALESCE(d.source_path, d.path) as display_path,
       d.title,
       content.doc as body
     FROM content_vectors cv
@@ -3410,7 +3433,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
   // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
     'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    d.collection || '/' || COALESCE(d.source_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -3419,7 +3442,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     ${bodyCol}
   `;
 
-  // Try to match by virtual path first
+  // Try to match by virtual path first (handelize'd path)
   let doc = db.prepare(`
     SELECT ${selectCols}
     FROM documents d
@@ -3427,13 +3450,36 @@ export function findDocument(db: Database, filename: string, options: { includeB
     WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
   `).get(filepath) as DbDocRow | null;
 
-  // Try fuzzy match by virtual path
+  // Try virtual path match against source_path (original filesystem path)
+  if (!doc) {
+    doc = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.source_path IS NOT NULL
+        AND 'qmd://' || d.collection || '/' || d.source_path = ? AND d.active = 1
+    `).get(filepath) as DbDocRow | null;
+  }
+
+  // Try fuzzy match by virtual path (handelize'd)
   if (!doc) {
     doc = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
       WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      LIMIT 1
+    `).get(`%${filepath}`) as DbDocRow | null;
+  }
+
+  // Try fuzzy match by source_path
+  if (!doc) {
+    doc = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.source_path IS NOT NULL
+        AND 'qmd://' || d.collection || '/' || d.source_path LIKE ? AND d.active = 1
       LIMIT 1
     `).get(`%${filepath}`) as DbDocRow | null;
   }
@@ -3454,12 +3500,22 @@ export function findDocument(db: Database, filename: string, options: { includeB
       }
 
       if (relativePath) {
+        // Try handelize'd path first
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
           WHERE d.collection = ? AND d.path = ? AND d.active = 1
         `).get(coll.name, relativePath) as DbDocRow | null;
+        // Then try source_path (original filesystem path)
+        if (!doc) {
+          doc = db.prepare(`
+            SELECT ${selectCols}
+            FROM documents d
+            JOIN content ON content.hash = d.hash
+            WHERE d.collection = ? AND d.source_path = ? AND d.active = 1
+          `).get(coll.name, relativePath) as DbDocRow | null;
+        }
         if (doc) break;
       }
     }
@@ -3554,7 +3610,7 @@ export function findDocuments(
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
     'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    d.collection || '/' || COALESCE(d.source_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -3569,18 +3625,41 @@ export function findDocuments(
     const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
     fileRows = [];
     for (const name of names) {
+      // Try exact match on handelize'd path
       let doc = db.prepare(`
         SELECT ${selectCols}
         FROM documents d
         JOIN content ON content.hash = d.hash
         WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
       `).get(name) as DbDocRow | null;
+      // Try exact match on source_path
+      if (!doc) {
+        doc = db.prepare(`
+          SELECT ${selectCols}
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.source_path IS NOT NULL
+            AND 'qmd://' || d.collection || '/' || d.source_path = ? AND d.active = 1
+        `).get(name) as DbDocRow | null;
+      }
+      // Try fuzzy match on handelize'd path
       if (!doc) {
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
           WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+          LIMIT 1
+        `).get(`%${name}`) as DbDocRow | null;
+      }
+      // Try fuzzy match on source_path
+      if (!doc) {
+        doc = db.prepare(`
+          SELECT ${selectCols}
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.source_path IS NOT NULL
+            AND 'qmd://' || d.collection || '/' || d.source_path LIKE ? AND d.active = 1
           LIMIT 1
         `).get(`%${name}`) as DbDocRow | null;
       }

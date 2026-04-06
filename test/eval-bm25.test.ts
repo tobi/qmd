@@ -102,7 +102,7 @@ describe("BM25 Search (FTS)", () => {
       const now = new Date().toISOString();
 
       insertContent(db, hash, content, now);
-      insertDocument(db, "eval-docs", file, title, hash, now, now);
+      insertDocument(db, "eval-docs", file, file, title, hash, now, now);
     }
   });
 

@@ -837,8 +837,8 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    // handelize converts to lowercase
-    expect(stdout).toContain("qmd://fixtures/readme.md");
+    // source_path preserves original filenames
+    expect(stdout).toContain("qmd://fixtures/README.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
@@ -1557,5 +1557,51 @@ describe("mcp http daemon", () => {
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
+  });
+});
+
+// =============================================================================
+// source_path: end-to-end with underscored filenames
+// =============================================================================
+
+describe("source_path end-to-end", () => {
+  test("ls and get show original filenames with underscores", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("source-path");
+    const collectionDir = join(testDir, `source-path-fixtures-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+
+    // Create files with underscores in names
+    await writeFile(
+      join(collectionDir, "particle_filters.qmd"),
+      "# Particle Filters\n\nBootstrap particle filter implementation."
+    );
+    await writeFile(
+      join(collectionDir, "my_notes.md"),
+      "# My Notes\n\nSome important notes here."
+    );
+
+    // Index the collection
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "testcol", "--mask", "**/*.{qmd,md}"],
+      { dbPath, configDir }
+    );
+    expect(add.exitCode).toBe(0);
+
+    // ls should show original filenames with underscores
+    const ls = await runQmd(["ls", "testcol"], { dbPath, configDir });
+    expect(ls.exitCode).toBe(0);
+    expect(ls.stdout).toContain("particle_filters.qmd");
+    expect(ls.stdout).toContain("my_notes.md");
+    // Should NOT show handelize'd versions
+    expect(ls.stdout).not.toContain("particle-filters.qmd");
+    expect(ls.stdout).not.toContain("my-notes.md");
+
+    // get by virtual path (handelize'd) should still resolve and return content
+    const get = await runQmd(
+      ["get", "qmd://testcol/particle-filters.qmd"],
+      { dbPath, configDir }
+    );
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).toContain("Bootstrap particle filter");
   });
 });

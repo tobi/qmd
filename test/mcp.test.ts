@@ -53,6 +53,7 @@ function initTestDatabase(db: Database): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collection TEXT NOT NULL,
       path TEXT NOT NULL,
+      source_path TEXT,
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
