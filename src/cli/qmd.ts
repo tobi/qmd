@@ -360,6 +360,12 @@ async function showStatus(): Promise<void> {
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
+  const missingSourcePath = db.prepare(
+    `SELECT COUNT(*) as count FROM documents WHERE active = 1 AND source_path IS NULL`
+  ).get() as { count: number };
+  if (missingSourcePath.count > 0) {
+    console.log(`  ${c.yellow}Upgrade:  ${missingSourcePath.count} files missing original paths${c.reset} (run 'qmd update')`);
+  }
   if (mostRecent.latest) {
     const lastUpdate = new Date(mostRecent.latest);
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
@@ -1304,23 +1310,23 @@ function listFiles(pathArg?: string): void {
   let params: any[];
 
   if (pathPrefix) {
-    // List files under a specific path
+    // List files under a specific path (match against both handelize'd path and source_path)
     query = `
-      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
+      SELECT COALESCE(d.source_path, d.path) as path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-      ORDER BY d.path
+      WHERE d.collection = ? AND (d.path LIKE ? OR d.source_path LIKE ?) AND d.active = 1
+      ORDER BY path
     `;
-    params = [coll.name, `${pathPrefix}%`];
+    params = [coll.name, `${pathPrefix}%`, `${pathPrefix}%`];
   } else {
     // List all files in the collection
     query = `
-      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
+      SELECT COALESCE(d.source_path, d.path) as path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
       WHERE d.collection = ? AND d.active = 1
-      ORDER BY d.path
+      ORDER BY path
     `;
     params = [coll.name];
   }
@@ -1592,7 +1598,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      insertDocument(db, collectionName, path, relativeFile, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }

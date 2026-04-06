@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Store original filesystem paths (`source_path`) alongside handelize'd
+  paths. Search results, `qmd ls`, and MCP responses now display the
+  real filename (preserving underscores, case, etc.) instead of the
+  normalized version. Lookups accept both original and handelize'd paths.
+  Existing indexes degrade gracefully; run `qmd update` to populate
+  original paths. `qmd status` shows how many files need re-indexing.
+
 ## [2.1.0] - 2026-04-05
 
 Code files now chunk at function and class boundaries via tree-sitter,
