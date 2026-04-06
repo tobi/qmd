@@ -359,6 +359,31 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: qmd_similar (Find similar documents by embedding)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "similar",
+    {
+      title: "Find Similar Documents",
+      description: "Find documents semantically similar to a given document using embedding cosine similarity. Provide a file path or docid.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        path: z.string().describe("File path or docid (#abc123) of the source document"),
+        n: z.number().optional().default(5).describe("Max results (default 5)"),
+        collection: z.string().optional().describe("Restrict to a specific collection"),
+      },
+    },
+    async ({ path, n, collection }) => {
+      const results = store.findSimilarByEmbedding(path, n, collection);
+      if (results.length === 0) {
+        return { content: [{ type: "text" as const, text: "No similar documents found. Make sure embeddings exist (run 'qmd embed')." }] };
+      }
+      const formatted = results.map(r => `${r.displayPath} (${Math.round(r.score * 100)}% similar)\n  ${r.title || "(no title)"}`).join("\n\n");
+      return { content: [{ type: "text" as const, text: formatted }] };
+    }
+  );
+
   // Tool: qmd_get (Retrieve document)
   // ---------------------------------------------------------------------------
 
