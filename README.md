@@ -692,21 +692,28 @@ Discussion about code quality and craftsmanship
 in the development process.
 ```
 
-Configure the editor link target with `QMD_EDITOR_URI` (or `editor_uri` in config):
+By default, clickable paths use `file://` URIs. Use `--editor` or the `editor` config key to select a named preset:
 
 ```sh
-# VS Code (default)
-export QMD_EDITOR_URI="vscode://file/{path}:{line}:{col}"
+# CLI flag (highest priority)
+qmd search "query" --editor vscode
 
-# Cursor
-export QMD_EDITOR_URI="cursor://file/{path}:{line}:{col}"
-
-# Zed
-export QMD_EDITOR_URI="zed://file/{path}:{line}:{col}"
-
-# Sublime Text
-export QMD_EDITOR_URI="subl://open?url=file://{path}&line={line}"
+# Config file (~/.config/qmd/index.yml)
+editor: vscode
 ```
+
+Available presets: `file` (default), `vscode`, `cursor`, `zed`, `sublime`, `idea`.
+
+For custom editors, pass a raw URI template:
+
+```sh
+qmd search "query" --editor "myeditor://open?file={path}&line={line}"
+
+# Or via environment variable
+export QMD_EDITOR_URI="myeditor://open?file={path}&line={line}"
+```
+
+Resolution order: `--editor` flag > `QMD_EDITOR_URI` env > `editor` config key > default (`file`).
 
 Template placeholders:
 - `{path}` absolute filesystem path (URI-encoded)

@@ -13,7 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
+import { buildEditorUri, termLink, EDITOR_PRESETS, resolveEditorTemplate } from "../src/cli/qmd.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -1222,6 +1222,53 @@ describe("editor URI templates", () => {
     const linked = termLink("docs/api.md:12", "vscode://file//tmp/docs/api.md:12:1", true);
 
     expect(linked).toBe("\x1b]8;;vscode://file//tmp/docs/api.md:12:1\x07docs/api.md:12\x1b]8;;\x07");
+  });
+
+  test("buildEditorUri with file:// template omits unused line/col placeholders", () => {
+    const uri = buildEditorUri("file://{path}", "/tmp/test.md", 10, 1);
+
+    expect(uri).toBe("file:///tmp/test.md");
+  });
+});
+
+describe("editor presets", () => {
+  test("resolveEditorTemplate resolves known preset name", () => {
+    expect(resolveEditorTemplate("vscode")).toBe("vscode://file/{path}:{line}:{col}");
+  });
+
+  test("resolveEditorTemplate is case-insensitive", () => {
+    expect(resolveEditorTemplate("VSCode")).toBe("vscode://file/{path}:{line}:{col}");
+    expect(resolveEditorTemplate("CURSOR")).toBe("cursor://file/{path}:{line}:{col}");
+  });
+
+  test("resolveEditorTemplate passes through raw URI templates", () => {
+    const custom = "myeditor://open?file={path}&line={line}";
+    expect(resolveEditorTemplate(custom)).toBe(custom);
+  });
+
+  test("resolveEditorTemplate falls back to file:// for unknown preset", () => {
+    const stderrWrite = process.stderr.write;
+    const warnings: string[] = [];
+    process.stderr.write = ((chunk: string) => { warnings.push(chunk); return true; }) as typeof process.stderr.write;
+    try {
+      expect(resolveEditorTemplate("notepad")).toBe("file://{path}");
+      expect(warnings[0]).toContain("unknown editor");
+    } finally {
+      process.stderr.write = stderrWrite;
+    }
+  });
+
+  test("EDITOR_PRESETS contains expected editors", () => {
+    expect(EDITOR_PRESETS).toHaveProperty("file");
+    expect(EDITOR_PRESETS).toHaveProperty("vscode");
+    expect(EDITOR_PRESETS).toHaveProperty("cursor");
+    expect(EDITOR_PRESETS).toHaveProperty("zed");
+    expect(EDITOR_PRESETS).toHaveProperty("sublime");
+    expect(EDITOR_PRESETS).toHaveProperty("idea");
+  });
+
+  test("default preset is file://", () => {
+    expect(EDITOR_PRESETS["file"]).toBe("file://{path}");
   });
 });
 

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Editor link presets: `--editor <name>` CLI flag and `editor:` config key
+  replace the raw `editor_uri` template. Built-in presets: `file` (new default),
+  `vscode`, `cursor`, `zed`, `sublime`, `idea`. The `QMD_EDITOR_URI`
+  env var remains supported. Default changed from `vscode://` to `file://`.
+
 ## [2.1.0] - 2026-04-05
 
 Code files now chunk at function and class boundaries via tree-sitter,

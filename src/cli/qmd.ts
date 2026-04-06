@@ -1789,6 +1789,7 @@ type OutputOptions = {
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  editor?: string;       // Editor preset name or URI template (from --editor CLI flag)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1865,7 +1866,26 @@ type OutputRow = {
   explain?: HybridQueryExplain;
 };
 
-const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
+export const EDITOR_PRESETS: Record<string, string> = {
+  file:     "file://{path}",
+  vscode:   "vscode://file/{path}:{line}:{col}",
+  cursor:   "cursor://file/{path}:{line}:{col}",
+  zed:      "zed://file/{path}:{line}:{col}",
+  sublime:  "subl://open?url=file://{path}&line={line}",
+  idea:     "idea://open?file={path}&line={line}&column={col}",
+};
+
+const DEFAULT_EDITOR_PRESET = "file";
+
+export function resolveEditorTemplate(value: string): string {
+  const trimmed = value.trim();
+  const preset = EDITOR_PRESETS[trimmed.toLowerCase()];
+  if (preset) return preset;
+  if (trimmed.includes("{path}") || trimmed.includes("://")) return trimmed;
+  const names = Object.keys(EDITOR_PRESETS).join(", ");
+  process.stderr.write(`Warning: unknown editor "${trimmed}". Valid presets: ${names}\n`);
+  return EDITOR_PRESETS[DEFAULT_EDITOR_PRESET]!;
+}
 
 function encodePathForEditorUri(absolutePath: string): string {
   return encodeURI(absolutePath)
@@ -1873,30 +1893,31 @@ function encodePathForEditorUri(absolutePath: string): string {
     .replace(/#/g, "%23");
 }
 
-function getEditorUriTemplate(): string {
-  const envTemplate = process.env.QMD_EDITOR_URI?.trim();
-  if (envTemplate) return envTemplate;
+function getEditorUriTemplate(cliEditor?: string): string {
+  // 1. CLI --editor flag (highest priority)
+  if (cliEditor?.trim()) {
+    return resolveEditorTemplate(cliEditor);
+  }
 
+  // 2. QMD_EDITOR_URI env var (accepts preset names or raw templates)
+  const envValue = process.env.QMD_EDITOR_URI?.trim();
+  if (envValue) {
+    return resolveEditorTemplate(envValue);
+  }
+
+  // 3. Config file "editor" key
   try {
-    const config = loadConfig() as unknown as {
-      editor_uri?: string;
-      editor_uri_template?: string;
-      editorUri?: string;
-      [key: string]: unknown;
-    };
-    const configTemplate = (
-      config.editor_uri
-      || config.editor_uri_template
-      || config.editorUri
-      || (typeof config["editor-uri"] === "string" ? config["editor-uri"] : undefined)
-    )?.trim();
-
-    if (configTemplate) return configTemplate;
+    const config = loadConfig();
+    const editorValue = config.editor?.trim();
+    if (editorValue) {
+      return resolveEditorTemplate(editorValue);
+    }
   } catch {
     // Ignore config parsing issues and use default template.
   }
 
-  return DEFAULT_EDITOR_URI_TEMPLATE;
+  // 4. Default
+  return EDITOR_PRESETS[DEFAULT_EDITOR_PRESET]!;
 }
 
 export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
@@ -1957,7 +1978,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
-    const editorUriTemplate = getEditorUriTemplate();
+    const editorUriTemplate = getEditorUriTemplate(opts.editor);
     const linkDb = getDb();
 
     for (let i = 0; i < filtered.length; i++) {
@@ -2487,6 +2508,8 @@ function parseCLI() {
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
+      // Editor options
+      editor: { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2529,6 +2552,7 @@ function parseCLI() {
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
+    editor: values.editor as string | undefined,
   };
 
   return {
@@ -2739,7 +2763,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
-  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
+  console.log("  --editor <name|template>   - Editor for clickable links (file, vscode, cursor, zed, sublime, idea)");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
