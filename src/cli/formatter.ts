@@ -101,8 +101,11 @@ export function searchResultsToJson(
   const query = opts.query || "";
   const output = results.map(row => {
     const bodyStr = row.body || "";
+    const snippetInfo = bodyStr
+      ? extractSnippet(bodyStr, query, 300, row.chunkPos, undefined, opts.intent)
+      : undefined;
     let body = opts.full ? bodyStr : undefined;
-    let snippet = !opts.full ? extractSnippet(bodyStr, query, 300, row.chunkPos, undefined, opts.intent).snippet : undefined;
+    let snippet = !opts.full ? snippetInfo?.snippet : undefined;
 
     if (opts.lineNumbers) {
       if (body) body = addLineNumbers(body);
@@ -113,6 +116,7 @@ export function searchResultsToJson(
       docid: `#${row.docid}`,
       score: Math.round(row.score * 100) / 100,
       file: row.displayPath,
+      ...(snippetInfo && { line: snippetInfo.line }),
       title: row.title,
       ...(row.context && { context: row.context }),
       ...(body && { body }),

@@ -80,7 +80,7 @@ import {
   type DecayDocInfo,
 } from "../store.js";
 import { isValidCategory, PRUNE_THRESHOLD, CATEGORIES, type Category } from "../decay.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -121,6 +121,13 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      if (config.models) {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: config.models.embed,
+          generateModel: config.models.generate,
+          rerankModel: config.models.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -998,7 +1005,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
@@ -1655,7 +1662,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL,
+  model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
@@ -1861,6 +1868,57 @@ type OutputRow = {
   explain?: HybridQueryExplain;
 };
 
+const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
+
+function encodePathForEditorUri(absolutePath: string): string {
+  return encodeURI(absolutePath)
+    .replace(/\?/g, "%3F")
+    .replace(/#/g, "%23");
+}
+
+function getEditorUriTemplate(): string {
+  const envTemplate = process.env.QMD_EDITOR_URI?.trim();
+  if (envTemplate) return envTemplate;
+
+  try {
+    const config = loadConfig() as unknown as {
+      editor_uri?: string;
+      editor_uri_template?: string;
+      editorUri?: string;
+      [key: string]: unknown;
+    };
+    const configTemplate = (
+      config.editor_uri
+      || config.editor_uri_template
+      || config.editorUri
+      || (typeof config["editor-uri"] === "string" ? config["editor-uri"] : undefined)
+    )?.trim();
+
+    if (configTemplate) return configTemplate;
+  } catch {
+    // Ignore config parsing issues and use default template.
+  }
+
+  return DEFAULT_EDITOR_URI_TEMPLATE;
+}
+
+export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
+  const safeLine = Number.isFinite(line) && line > 0 ? Math.floor(line) : 1;
+  const safeCol = Number.isFinite(col) && col > 0 ? Math.floor(col) : 1;
+  const encodedPath = encodePathForEditorUri(absolutePath);
+
+  return template
+    .replace(/\{path\}/g, encodedPath)
+    .replace(/\{line\}/g, String(safeLine))
+    .replace(/\{col\}/g, String(safeCol))
+    .replace(/\{column\}/g, String(safeCol));
+}
+
+export function termLink(text: string, url: string, isTTY: boolean = !!process.stdout.isTTY): string {
+  if (!isTTY) return text;
+  return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+}
+
 function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
@@ -1902,6 +1960,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
+    const editorUriTemplate = getEditorUriTemplate();
+    const linkDb = getDb();
+
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
@@ -1909,13 +1970,27 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const path = toQmdPath(row.displayPath);
+      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      const parsed = parseVirtualPath(virtualPath);
+      const absolutePath = resolveVirtualPath(linkDb, virtualPath);
+
+      const legacyPath = toQmdPath(row.displayPath);
+      const displayPath = parsed?.path || row.displayPath;
+
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
-      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+
+      if (process.stdout.isTTY && absolutePath && parsed?.path) {
+        const linkLine = hasMatch ? line : 1;
+        const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
+        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
+      } else {
+        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+      }
 
       // Line 2: Title (if available)
       if (row.title) {
@@ -2611,6 +2686,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -2674,6 +2750,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
@@ -3013,7 +3090,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, {
+        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -3073,6 +3150,24 @@ if (isMain) {
       }
       await querySearch(cli.query, cli.opts);
       break;
+
+    case "bench": {
+      const fixturePath = cli.args[0];
+      if (!fixturePath) {
+        console.error("Usage: qmd bench <fixture.json> [--json] [-c collection]");
+        console.error("");
+        console.error("Run search quality benchmarks against a fixture file.");
+        console.error("See src/bench/fixtures/example.json for the fixture format.");
+        process.exit(1);
+      }
+      const { runBenchmark } = await import("../bench/bench.js");
+      const benchCollection = cli.opts.collection;
+      await runBenchmark(fixturePath, {
+        json: !!(cli.opts as { json?: boolean }).json,
+        collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+      });
+      break;
+    }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined

@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -1174,16 +1175,53 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
-  test("search default CLI format includes qmd:// path, docid, and context", async () => {
+  test("search default CLI format includes plain qmd:// path, docid, and context in non-TTY mode", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
 
-    // First line should have qmd:// path and docid
+    // runQmd uses piped stdio, so stdout is non-TTY and should not contain OSC 8 links.
     expect(stdout).toMatch(new RegExp(`^qmd://${collName}/.*#[a-f0-9]{6}`, "m"));
     expect(stdout).toContain("Context: Test fixtures for QMD");
+    expect(stdout).not.toContain("\x1b]8;;");
     // Ensure no full filesystem paths
     expect(stdout).not.toMatch(/\/Users\//);
     expect(stdout).not.toMatch(/\/home\//);
+  });
+});
+
+describe("editor URI templates", () => {
+  test("buildEditorUri expands path, line, and col placeholders", () => {
+    const uri = buildEditorUri(
+      "vscode://file/{path}:{line}:{col}",
+      "/tmp/my notes/readme.md",
+      42,
+      1,
+    );
+
+    expect(uri).toBe("vscode://file//tmp/my%20notes/readme.md:42:1");
+  });
+
+  test("buildEditorUri supports {column} alias", () => {
+    const uri = buildEditorUri(
+      "cursor://file/{path}:{line}:{column}",
+      "/tmp/docs/api.md",
+      7,
+      3,
+    );
+
+    expect(uri).toBe("cursor://file//tmp/docs/api.md:7:3");
+  });
+
+  test("termLink returns plain text when stdout is not a TTY", () => {
+    const linked = termLink("docs/api.md:12", "vscode://file//tmp/docs/api.md:12:1", false);
+
+    expect(linked).toBe("docs/api.md:12");
+  });
+
+  test("termLink emits OSC 8 hyperlinks when stdout is a TTY", () => {
+    const linked = termLink("docs/api.md:12", "vscode://file//tmp/docs/api.md:12:1", true);
+
+    expect(linked).toBe("\x1b]8;;vscode://file//tmp/docs/api.md:12:1\x07docs/api.md:12\x1b]8;;\x07");
   });
 });
 

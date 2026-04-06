@@ -351,21 +351,26 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   const hasYamlConfig = !!options.configPath;
 
   // Sync config into SQLite store_collections
+  let config: CollectionConfig | undefined;
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    const config = loadConfig();
+    config = loadConfig();
     syncConfigToDb(db, config);
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
-    syncConfigToDb(db, options.config);
+    config = options.config;
+    syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
   const llm = new LlamaCpp({
+    embedModel: config?.models?.embed,
+    generateModel: config?.models?.generate,
+    rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });

@@ -7,9 +7,34 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
+    {
+      homeModules.default = { config, lib, pkgs, ... }:
+        with lib;
+        let
+          cfg = config.programs.qmd;
+        in
+        {
+          options.programs.qmd = {
+            enable = mkEnableOption "QMD - on-device search engine for markdown notes";
+
+            package = mkOption {
+              type = types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = literalExpression "inputs.qmd.packages.\${pkgs.stdenv.hostPlatform.system}.default";
+              description = "The qmd package to use.";
+            };
+          };
+
+          config = mkIf cfg.enable {
+            home.packages = [ cfg.package ];
+          };
+        };
+    } //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        packageJson = builtins.fromJSON (builtins.readFile ./package.json);
+        version = packageJson.version;
 
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
@@ -18,15 +43,66 @@
           ];
         });
 
+        nodeModulesHashes = {
+          x86_64-linux = "sha256-D0ezO4vqq4iswcAMU2DCql9ZAQvh3me6N9aDB5roq4w=";
+          aarch64-darwin = "sha256-qU+9KdR/nTocelyANS09I/4yaQ+7s1LvJNqB27IOK/c=";
+
+          # Populate these on first build for additional hosts if/when needed.
+          aarch64-linux = pkgs.lib.fakeHash;
+          x86_64-darwin = pkgs.lib.fakeHash;
+        };
+
+        nodeModules = pkgs.stdenvNoCC.mkDerivation {
+          pname = "qmd-node-modules";
+          inherit version;
+
+          src = ./.;
+
+          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [
+            "GIT_PROXY_COMMAND"
+            "SOCKS_SERVER"
+          ];
+
+          nativeBuildInputs = [
+            pkgs.bun
+          ];
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            export HOME=$(mktemp -d)
+
+            bun install \
+              --backend copyfile \
+              --frozen-lockfile \
+              --ignore-scripts \
+              --no-progress \
+              --production
+          '';
+
+          installPhase = ''
+            mkdir -p $out
+            cp -R node_modules $out/
+          '';
+
+          dontFixup = true;
+
+          outputHash = nodeModulesHashes.${system};
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+        };
+
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
-          version = "1.0.0";
+          inherit version;
 
           src = ./.;
 
           nativeBuildInputs = [
             pkgs.bun
             pkgs.makeWrapper
+            pkgs.nodejs
+            pkgs.node-gyp
             pkgs.python3  # needed by node-gyp to compile better-sqlite3
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
@@ -36,7 +112,11 @@
 
           buildPhase = ''
             export HOME=$(mktemp -d)
-            bun install --frozen-lockfile
+
+            cp -R ${nodeModules}/node_modules ./
+            chmod -R u+w node_modules
+
+            (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
           '';
 
           installPhase = ''
@@ -86,4 +166,5 @@
         };
       }
     );
+
 }

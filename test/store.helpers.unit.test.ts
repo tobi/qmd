@@ -7,6 +7,7 @@ import {
   homedir,
   resolve,
   getDefaultDbPath,
+  _resetProductionModeForTesting,
   getPwd,
   getRealPath,
   isVirtualPath,
@@ -16,6 +17,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  sanitizeFTS5Term,
 } from "../src/store";
 
 // =============================================================================
@@ -47,6 +49,9 @@ describe("Path Utilities", () => {
   test("getDefaultDbPath throws in test mode without INDEX_PATH", () => {
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
+    // Reset production mode in case another test file set it (bun runs all
+    // files in a single process, so module state leaks between files).
+    _resetProductionModeForTesting();
 
     expect(() => getDefaultDbPath()).toThrow("Database path not set");
 
@@ -114,14 +119,14 @@ describe("cleanupOrphanedVectors", () => {
 // =============================================================================
 
 describe("handelize", () => {
-  test("preserves original case", () => {
-    expect(handelize("README.md")).toBe("README.md");
-    expect(handelize("MyFile.MD")).toBe("MyFile.MD");
+  test("converts to lowercase", () => {
+    expect(handelize("README.md")).toBe("readme.md");
+    expect(handelize("MyFile.MD")).toBe("myfile.md");
   });
 
   test("preserves folder structure", () => {
     expect(handelize("a/b/c/d.md")).toBe("a/b/c/d.md");
-    expect(handelize("docs/api/README.md")).toBe("docs/api/README.md");
+    expect(handelize("docs/api/README.md")).toBe("docs/api/readme.md");
   });
 
   test("replaces non-word characters with dash", () => {
@@ -151,7 +156,7 @@ describe("handelize", () => {
   test("handles complex real-world meeting notes", () => {
     const complexName = "Money Movement Licensing Review - 2025／11／19 10:25 EST - Notes by Gemini.md";
     const result = handelize(complexName);
-    expect(result).toBe("Money-Movement-Licensing-Review-2025-11-19-10-25-EST-Notes-by-Gemini.md");
+    expect(result).toBe("money-movement-licensing-review-2025-11-19-10-25-est-notes-by-gemini.md");
     expect(result).not.toContain(" ");
     expect(result).not.toContain("／");
     expect(result).not.toContain(":");
@@ -159,7 +164,7 @@ describe("handelize", () => {
 
   test("handles unicode characters", () => {
     expect(handelize("日本語.md")).toBe("日本語.md");
-    expect(handelize("Зоны и проекты.md")).toBe("Зоны-и-проекты.md");
+    expect(handelize("Зоны и проекты.md")).toBe("зоны-и-проекты.md");
     expect(handelize("café-notes.md")).toBe("café-notes.md");
     expect(handelize("naïve.md")).toBe("naïve.md");
     expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
@@ -181,13 +186,13 @@ describe("handelize", () => {
   test("handles dates and times in filenames", () => {
     expect(handelize("meeting-2025-01-15.md")).toBe("meeting-2025-01-15.md");
     expect(handelize("notes 2025/01/15.md")).toBe("notes-2025/01/15.md");
-    expect(handelize("call_10:30_AM.md")).toBe("call-10-30-AM.md");
+    expect(handelize("call_10:30_AM.md")).toBe("call-10-30-am.md");
   });
 
   test("handles special project naming patterns", () => {
-    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("PROJECT-ABC-v2.0.md");
-    expect(handelize("[WIP] Feature Request.md")).toBe("WIP-Feature-Request.md");
-    expect(handelize("(DRAFT) Proposal v1.md")).toBe("DRAFT-Proposal-v1.md");
+    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("project-abc-v2-0.md");
+    expect(handelize("[WIP] Feature Request.md")).toBe("wip-feature-request.md");
+    expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
   });
 
   test("handles symbol-only route filenames", () => {
@@ -242,5 +247,43 @@ describe("handelize", () => {
     expect(isDocid("#123456")).toBe(true);
     expect(isDocid("bad-id")).toBe(false);
     expect(isDocid("12345")).toBe(false);
+  });
+});
+
+// =============================================================================
+// sanitizeFTS5Term Tests
+// =============================================================================
+
+describe("sanitizeFTS5Term", () => {
+  test("preserves underscores in snake_case identifiers", () => {
+    expect(sanitizeFTS5Term("my_variable")).toBe("my_variable");
+    expect(sanitizeFTS5Term("MAX_RETRIES")).toBe("max_retries");
+    expect(sanitizeFTS5Term("__init__")).toBe("__init__");
+  });
+
+  test("preserves alphanumeric characters", () => {
+    expect(sanitizeFTS5Term("hello123")).toBe("hello123");
+    expect(sanitizeFTS5Term("test")).toBe("test");
+  });
+
+  test("preserves apostrophes for contractions", () => {
+    expect(sanitizeFTS5Term("don't")).toBe("don't");
+    expect(sanitizeFTS5Term("it's")).toBe("it's");
+  });
+
+  test("strips other punctuation", () => {
+    expect(sanitizeFTS5Term("hello!")).toBe("hello");
+    expect(sanitizeFTS5Term("test@value")).toBe("testvalue");
+    expect(sanitizeFTS5Term("a.b")).toBe("ab");
+  });
+
+  test("lowercases output", () => {
+    expect(sanitizeFTS5Term("Hello")).toBe("hello");
+    expect(sanitizeFTS5Term("MY_VAR")).toBe("my_var");
+  });
+
+  test("handles unicode letters and numbers", () => {
+    expect(sanitizeFTS5Term("café")).toBe("café");
+    expect(sanitizeFTS5Term("日本語")).toBe("日本語");
   });
 });

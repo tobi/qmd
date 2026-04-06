@@ -95,6 +95,20 @@ describe("search results include context in all formats", () => {
     expect(parsed[0].context).toBe(TEST_CONTEXT);
   });
 
+  test("JSON format includes line", () => {
+    const output = searchResultsToJson(results, { query: "keynote" });
+    const parsed = JSON.parse(output);
+    expect(parsed[0].line).toBeTypeOf("number");
+    expect(parsed[0].line).toBeGreaterThan(0);
+  });
+
+  test("JSON format includes line with --full", () => {
+    const output = searchResultsToJson(results, { query: "keynote", full: true });
+    const parsed = JSON.parse(output);
+    expect(parsed[0].line).toBeTypeOf("number");
+    expect(parsed[0].line).toBeGreaterThan(0);
+  });
+
   test("CSV format includes context", () => {
     const output = searchResultsToCsv(results, { query: "keynote" });
     // Header should have context column

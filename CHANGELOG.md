@@ -2,24 +2,101 @@
 
 ## [Unreleased]
 
-### Added
+## [2.1.0] - 2026-04-05
+
+Code files now chunk at function and class boundaries via tree-sitter,
+clickable editor links land you at the right line from search results,
+and per-collection model configuration means you can point different
+collections at different embedding models. 25+ community PRs fix
+embedding stability, BM25 accuracy, and cross-platform launcher issues.
+
+### Changes
 
 - AST-aware chunking for code files via `web-tree-sitter`. Supported
   languages: TypeScript/JavaScript, Python, Go, and Rust. Code files
   are chunked at function, class, and import boundaries instead of
   arbitrary text positions. Markdown and unknown file types are unchanged.
-- `--chunk-strategy <auto|regex>` flag for `qmd embed` and `qmd query`.
-  Default is `regex` (existing behavior). Use `auto` to enable AST-aware
-  chunking for code files.
-- `qmd status` now shows AST grammar availability.
-- SDK: `chunkStrategy` option on `embed()` and `search()` methods.
+  `--chunk-strategy <auto|regex>` flag on `qmd embed` and `qmd query`
+  (default `regex`). SDK: `chunkStrategy` option on `embed()` and
+  `search()`. `qmd status` shows grammar availability.
+- `qmd bench <fixture.json>` command for search quality benchmarks.
+  Measures precision@k, recall, MRR, and F1 across BM25, vector, hybrid,
+  and full pipeline backends. Ships with an example fixture against
+  the eval-docs test collection. #470 (thanks @jmilinovich)
+- `models:` section in `index.yml` lets you configure `embed`, `rerank`,
+  and `generate` model URIs per collection. Resolution order is
+  config > env var (`QMD_EMBED_MODEL`, `QMD_RERANK_MODEL`,
+  `QMD_GENERATE_MODEL`) > built-in default. #502
+  (thanks @JohnRichardEnders)
+- CLI search output now emits clickable OSC 8 terminal hyperlinks when
+  stdout is a TTY. Links resolve `qmd://` paths to absolute filesystem
+  paths and open in editors via URI templates (default:
+  `vscode://file/{path}:{line}:{col}`). Configure with `QMD_EDITOR_URI`
+  or `editor_uri` in the YAML config. #508 (thanks @danmackinlay)
+- `--no-rerank` flag skips the reranking step in `qmd query` — useful
+  when you want fast results or don't have a GPU. Also exposed as
+  `rerank: false` on the MCP `query` tool. #370 (thanks @mvanhorn),
+  #478 (thanks @zestyboy)
+- ONNX conversion script for deploying embedding models via
+  Transformers.js. #399 (thanks @shreyaskarnik)
+- GitHub Actions workflow to build the Nix flake on Linux and macOS.
 
 ### Fixes
 
-- Fix paths in nix flake 
+- Embedding: prevent `qmd embed` from running indefinitely when the
+  embedding loop stalls. #458 (thanks @ccc-fff)
+- Embedding: truncate oversized text before embedding to prevent GGML
+  crash, and bound memory usage during batch embedding. #393
+  (thanks @lskun), #395 (thanks @ProgramCaiCai)
+- Embedding: set explicit embed context size (default 2048, configurable
+  via `QMD_EMBED_CONTEXT_SIZE`) instead of using the model's full
+  window. #500
+- Embedding: error on dimension mismatch instead of silently rebuilding
+  the vec0 table. #501
+- Embedding: handle vec0 `OR REPLACE` limitation in `insertEmbedding`.
+  #456 (thanks @antonio-mello-ai)
+- Embedding: fix model selection when multiple models are configured.
+  #494
+- BM25: correct field weights to include all 3 FTS columns — title,
+  body, and path were not weighted correctly. #462 (thanks @goldsr09)
+- BM25: handle hyphenated tokens in FTS5 lex queries so terms like
+  "real-time" match correctly. #463 (thanks @goldsr09)
+- BM25: preserve underscores in search terms instead of stripping them.
+  #404
+- BM25: use CTE in `searchFTS` to prevent query planner regression with
+  collection filter.
+- Reranker: increase default context size 2048→4096 and make
+  configurable via `QMD_RERANK_CONTEXT_SIZE`. Fix template overhead
+  underestimate 200→512. #453 (thanks @builderjarvis)
+- GPU: catch initialization failures and fall back to CPU instead of
+  crashing.
+- MCP: read version from `package.json` instead of hardcoding. #431
+- MCP: include collection name in status output. #416
+- Multi-get: support brace expansion patterns in glob matching. #424
+- Launcher: prioritize `package-lock.json` to prevent Bun false
+  positive. #385 (thanks @rymalia)
+- Launcher: remove `$BUN_INSTALL` check that caused false Bun detection.
+  #362 (thanks @syedair)
+- Launcher: skip Git Bash path detection on WSL. #371
+  (thanks @oysteinkrog)
+- Model cache: respect `XDG_CACHE_HOME` for model cache directory. #457
+  (thanks @antonio-mello-ai)
+- SQLite: add macOS Homebrew SQLite support for Bun and restore
+  actionable errors. #377 (thanks @serhii12)
+- Pin zod to exact 4.2.1 to fix `tsc` build failure. #382
+  (thanks @rymalia)
+- Preserve dots and original case in `handelize()` — filenames like
+  `MEMORY.md` no longer become `memory-md`. #475 (thanks @alexei-led)
+- Include `line` in `--json` search output so editor integrations can
+  jump directly to `file:line`. #506 (thanks @danmackinlay)
+- Nix: fix paths in flake and make Bun dependency a fixed-output
+  derivation so sandboxed Linux builds work offline. #479
+  (thanks @surma-dump)
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
+- Approve native build scripts in pnpm so `better-sqlite3` and
+  tree-sitter modules compile correctly. Update vitest ^3.0.0 → ^3.2.4.
 
 ## [2.0.1] - 2026-03-10
 

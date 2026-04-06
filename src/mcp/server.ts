@@ -9,6 +9,8 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -16,6 +18,7 @@ import { WebStandardStreamableHTTPServerTransport }
   from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { existsSync } from "fs";
 import {
   createStore,
   extractSnippet,
@@ -26,6 +29,7 @@ import {
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
+import { getConfigPath } from "../collections.js";
 
 // =============================================================================
 // Types for structured content
@@ -78,6 +82,16 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   return lines.join('\n');
+}
+
+function getPackageVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 // =============================================================================
@@ -157,7 +171,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  */
 async function createMcpServer(store: QMDStore): Promise<McpServer> {
   const server = new McpServer(
-    { name: "qmd", version: "0.9.9" },
+    { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
   );
 
@@ -506,7 +520,7 @@ Intent-aware lex (C++ performance, not sports):
       ];
 
       for (const col of status.collections) {
-        summary.push(`    - ${col.path} (${col.documents} docs)`);
+        summary.push(`    - ${col.name}: ${col.path} (${col.documents} docs)`);
       }
 
       return {
@@ -524,7 +538,11 @@ Intent-aware lex (C++ performance, not sports):
 // =============================================================================
 
 export async function startMcpServer(): Promise<void> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+  const configPath = getConfigPath();
+  const store = await createStore({
+    dbPath: getDefaultDbPath(),
+    ...(existsSync(configPath) ? { configPath } : {}),
+  });
   const server = await createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -545,7 +563,11 @@ export type HttpServerHandle = {
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+  const configPath = getConfigPath();
+  const store = await createStore({
+    dbPath: getDefaultDbPath(),
+    ...(existsSync(configPath) ? { configPath } : {}),
+  });
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();

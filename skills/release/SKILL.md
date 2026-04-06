@@ -46,7 +46,20 @@ When the user triggers `/release <version>`:
    ```
    The agent will be notified when CI completes and should report the result.
 
+7. **Check dependency updates** — before cutting the release, check for
+   updates to `sqlite-vec` (and platform packages), `node-llama-cpp`,
+   and `better-sqlite3`. Run `pnpm outdated` and report any available
+   updates for these packages. If updates exist, bump them (pinned, no
+   `^` ranges) and re-run tests before proceeding.
+
 If any step fails, stop and explain. Never force-push or skip validation.
+
+## Dependency Policy
+
+All dependencies must be pinned to exact versions (no `^` or `~` ranges).
+The lockfile ensures reproducible installs. When adding or updating any
+dependency, always use the exact version string (e.g. `"3.18.1"` not
+`"^3.18.1"`).
 
 ## Changelog Standard
 
