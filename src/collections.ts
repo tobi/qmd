@@ -47,8 +47,7 @@ export interface ModelsConfig {
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
-  editor_uri?: string;                        // Editor URI template for terminal hyperlinks
-  editor_uri_template?: string;               // Alias for editor_uri
+  editor?: string;                            // Editor preset name or URI template for terminal hyperlinks
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
 }

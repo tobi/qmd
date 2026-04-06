@@ -4,6 +4,10 @@
 # This file defines all collections and their contexts.
 # You can manually edit this file - changes take effect immediately.
 
+# Editor for clickable terminal links (preset name or URI template)
+# Presets: file (default), vscode, cursor, zed, sublime, idea
+# editor: vscode
+
 # Global context applied to all collections
 # Use this for universal search instructions or patterns
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
