@@ -939,6 +939,41 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 
 Used for generating query variations via `LlamaChatSession`.
 
+### Remote Embedding & Reranking
+
+QMD can offload embedding and reranking to a remote OpenAI-compatible server (vLLM, Ollama, LM Studio, OpenAI, etc.) while keeping query expansion local.
+
+**Environment variables** (presence of `QMD_EMBED_API_URL` activates remote mode):
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `QMD_EMBED_API_URL` | Yes | Base URL, e.g. `http://gpu-host:8000/v1` |
+| `QMD_EMBED_API_MODEL` | Yes | Model name, e.g. `BAAI/bge-m3` |
+| `QMD_EMBED_API_KEY` | No | Bearer token for auth |
+| `QMD_RERANK_API_URL` | No | Rerank endpoint (defaults to embed URL) |
+| `QMD_RERANK_API_MODEL` | No | Rerank model name |
+| `QMD_RERANK_API_KEY` | No | Rerank auth (defaults to embed key) |
+
+**YAML config** (`~/.config/qmd/index.yml`):
+```yaml
+models:
+  embed_api_url: "http://gpu-host:8000/v1"
+  embed_api_model: "BAAI/bge-m3"
+  rerank_api_model: "BAAI/bge-reranker-v2-m3"
+```
+
+**Example with vLLM:**
+```sh
+# Start vLLM with an embedding model
+vllm serve BAAI/bge-m3 --task embed
+
+# Point QMD at it
+export QMD_EMBED_API_URL=http://localhost:8000/v1
+export QMD_EMBED_API_MODEL=BAAI/bge-m3
+qmd embed
+qmd query "your search query"
+```
+
 ## License
 
 MIT
