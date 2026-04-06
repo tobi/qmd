@@ -24,6 +24,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  DEFAULT_EMBED_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -39,7 +40,17 @@ import type {
 // =============================================================================
 
 const HOME = process.env.HOME || "/tmp";
-export const DEFAULT_EMBED_MODEL = "embeddinggemma";
+/** Derive a short model label from an hf: URI or return as-is for plain names. */
+export function embedModelLabel(uri: string): string {
+  // hf:org/repo/filename.gguf → filename (without extension and quantization)
+  if (uri.startsWith("hf:")) {
+    const file = uri.split("/").pop() ?? uri;
+    return file.replace(/[-.](?:Q\d[^.]*)?\.gguf$/i, "").replace(/\.gguf$/i, "");
+  }
+  return uri;
+}
+
+export const DEFAULT_EMBED_MODEL = embedModelLabel(DEFAULT_EMBED_MODEL_URI);
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";

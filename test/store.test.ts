@@ -49,12 +49,41 @@ import {
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   generateEmbeddings,
+  embedModelLabel,
   type Store,
   type DocumentResult,
   type SearchResult,
   type RankedResult,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
+
+// =============================================================================
+// embedModelLabel
+// =============================================================================
+
+describe("embedModelLabel", () => {
+  test("extracts model name from hf: URI, stripping quantization and .gguf", () => {
+    expect(embedModelLabel("hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"))
+      .toBe("embeddinggemma-300M");
+    expect(embedModelLabel("hf:nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q8_0.gguf"))
+      .toBe("nomic-embed-text-v1.5");
+    expect(embedModelLabel("hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"))
+      .toBe("Qwen3-Embedding-0.6B");
+  });
+
+  test("produces same label for different quantizations of the same model", () => {
+    const q8 = embedModelLabel("hf:nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q8_0.gguf");
+    const q6 = embedModelLabel("hf:nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q6_K.gguf");
+    const q4 = embedModelLabel("hf:nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5-Q4_K_M.gguf");
+    expect(q8).toBe(q6);
+    expect(q6).toBe(q4);
+  });
+
+  test("passes through plain model names unchanged", () => {
+    expect(embedModelLabel("embeddinggemma")).toBe("embeddinggemma");
+    expect(embedModelLabel("my-custom-model")).toBe("my-custom-model");
+  });
+});
 
 // =============================================================================
 // LlamaCpp Setup
