@@ -1700,6 +1700,9 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
+  // Use the actual model name from the configured LLM (may be remote, not the default GGUF URI)
+  model = getDefaultLLM().embedModelName;
+
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
   }
