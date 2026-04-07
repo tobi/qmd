@@ -6,20 +6,39 @@ public static class Program
 {
     public static async Task<int> Main()
     {
-        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         await using var input = Console.OpenStandardInput();
-        var request = await JsonSerializer.DeserializeAsync<AnalysisRequest>(input, options);
+        await using var output = Console.OpenStandardOutput();
+        return await RunAsync(input, output, Console.Error);
+    }
+
+    public static async Task<int> RunAsync(Stream input, Stream output, TextWriter error)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(error);
+
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        AnalysisRequest? request;
+
+        try
+        {
+            request = await JsonSerializer.DeserializeAsync<AnalysisRequest>(input, options);
+        }
+        catch (JsonException)
+        {
+            await error.WriteLineAsync("Invalid request payload.");
+            return 1;
+        }
 
         if (request is null)
         {
-            await Console.Error.WriteLineAsync("Request payload was null.");
+            await error.WriteLineAsync("Invalid request payload.");
             return 1;
         }
 
         var service = new CSharpAnalysisService();
         var response = service.Analyze(request);
 
-        await using var output = Console.OpenStandardOutput();
         await JsonSerializer.SerializeAsync(output, response, options);
         return 0;
     }

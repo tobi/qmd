@@ -11,12 +11,15 @@ public sealed class CSharpAnalysisService
         ArgumentNullException.ThrowIfNull(request);
 
         var tree = CSharpSyntaxTree.ParseText(request.Content, path: request.FilePath);
-        var root = tree.GetRoot();
+        var root = tree.GetCompilationUnitRoot();
 
         return new AnalysisResponse
         {
+            Version = 1,
+            Language = "csharp",
             Breakpoints = request.Features?.Breakpoints == true ? CollectBreakpoints(root) : [],
-            Symbols = request.Features?.Symbols == true ? CollectSymbols(root) : []
+            Symbols = request.Features?.Symbols == true ? CollectSymbols(root) : [],
+            Diagnostics = []
         };
     }
 
@@ -66,7 +69,7 @@ public sealed class CSharpAnalysisService
     private static void AddOrUpdateBreakpoint(
         IDictionary<int, BreakpointDto> breakpoints,
         int pos,
-        string kind,
+        string type,
         int score)
     {
         if (!breakpoints.TryGetValue(pos, out var existing) || score > existing.Score)
@@ -74,7 +77,7 @@ public sealed class CSharpAnalysisService
             breakpoints[pos] = new BreakpointDto
             {
                 Pos = pos,
-                Kind = kind,
+                Type = type,
                 Score = score
             };
         }
