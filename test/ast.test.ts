@@ -383,4 +383,9 @@ describe("extractSymbols", () => {
     const symbols = extractSymbols("function foo() {}", "typescript", 0, 18);
     expect(symbols).toEqual([]);
   });
+
+  test("returns an array for C# content", () => {
+    const symbols = extractSymbols("public class InventoryService {}", "csharp", 0, 32);
+    expect(Array.isArray(symbols)).toBe(true);
+  });
 });

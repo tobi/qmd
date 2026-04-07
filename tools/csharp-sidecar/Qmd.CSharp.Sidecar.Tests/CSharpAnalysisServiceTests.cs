@@ -52,6 +52,41 @@ public sealed class CSharpAnalysisServiceTests
     }
 
     [Fact]
+    public void Analyze_returns_class_and_method_symbols_when_requested()
+    {
+        const string content = """
+            namespace Demo.App;
+
+            public class InventoryService
+            {
+                public void Rebuild()
+                {
+                }
+            }
+            """;
+
+        var service = new CSharpAnalysisService();
+        var request = new AnalysisRequest
+        {
+            FilePath = "/workspace/InventoryService.cs",
+            Content = content,
+            Features = new AnalysisFeatures
+            {
+                Symbols = true
+            }
+        };
+
+        var response = service.Analyze(request);
+
+        Assert.Contains(
+            response.Symbols,
+            static symbol => symbol.Name == "InventoryService" && symbol.Kind == "class");
+        Assert.Contains(
+            response.Symbols,
+            static symbol => symbol.Name == "Rebuild" && symbol.Kind == "method");
+    }
+
+    [Fact]
     public void Analyze_serializes_response_with_expected_protocol_property_names()
     {
         const string content = "using System;";

@@ -63,7 +63,41 @@ public sealed class CSharpAnalysisService
     public IReadOnlyList<SymbolDto> CollectSymbols(SyntaxNode root)
     {
         ArgumentNullException.ThrowIfNull(root);
-        return [];
+
+        var symbols = new List<SymbolDto>();
+
+        foreach (var node in root.DescendantNodesAndSelf())
+        {
+            switch (node)
+            {
+                case ClassDeclarationSyntax classDeclaration:
+                    symbols.Add(CreateSymbol(classDeclaration.Identifier.ValueText, "class", classDeclaration));
+                    break;
+                case StructDeclarationSyntax structDeclaration:
+                    symbols.Add(CreateSymbol(structDeclaration.Identifier.ValueText, "struct", structDeclaration));
+                    break;
+                case InterfaceDeclarationSyntax interfaceDeclaration:
+                    symbols.Add(CreateSymbol(interfaceDeclaration.Identifier.ValueText, "interface", interfaceDeclaration));
+                    break;
+                case RecordDeclarationSyntax recordDeclaration:
+                    symbols.Add(CreateSymbol(recordDeclaration.Identifier.ValueText, "record", recordDeclaration));
+                    break;
+                case EnumDeclarationSyntax enumDeclaration:
+                    symbols.Add(CreateSymbol(enumDeclaration.Identifier.ValueText, "enum", enumDeclaration));
+                    break;
+                case ConstructorDeclarationSyntax constructorDeclaration:
+                    symbols.Add(CreateSymbol(constructorDeclaration.Identifier.ValueText, "constructor", constructorDeclaration));
+                    break;
+                case MethodDeclarationSyntax methodDeclaration:
+                    symbols.Add(CreateSymbol(methodDeclaration.Identifier.ValueText, "method", methodDeclaration));
+                    break;
+                case PropertyDeclarationSyntax propertyDeclaration:
+                    symbols.Add(CreateSymbol(propertyDeclaration.Identifier.ValueText, "property", propertyDeclaration));
+                    break;
+            }
+        }
+
+        return symbols;
     }
 
     private static void AddOrUpdateBreakpoint(
@@ -82,4 +116,60 @@ public sealed class CSharpAnalysisService
             };
         }
     }
+
+    private static SymbolDto CreateSymbol(string name, string kind, MemberDeclarationSyntax declaration)
+    {
+        var line = declaration.SyntaxTree.GetLineSpan(declaration.Span).StartLinePosition.Line + 1;
+        var containerName = GetContainerName(declaration.Parent);
+        var signature = declaration.ToString()
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)[0]
+            .Trim();
+
+        return new SymbolDto
+        {
+            Name = name,
+            Kind = kind,
+            Line = line,
+            ContainerName = containerName,
+            Signature = string.IsNullOrWhiteSpace(signature) ? null : signature,
+            Modifiers = declaration.GetModifierTexts()
+        };
+    }
+
+    private static string? GetContainerName(SyntaxNode? parent)
+    {
+        while (parent is not null)
+        {
+            switch (parent)
+            {
+                case BaseNamespaceDeclarationSyntax namespaceDeclaration:
+                    return namespaceDeclaration.Name.ToString();
+                case BaseTypeDeclarationSyntax typeDeclaration:
+                    return typeDeclaration.Identifier.ValueText;
+            }
+
+            parent = parent.Parent;
+        }
+
+        return null;
+    }
+}
+
+internal static class MemberDeclarationSyntaxExtensions
+{
+    public static IReadOnlyList<string> GetModifierTexts(this MemberDeclarationSyntax declaration) =>
+        GetModifiers(declaration).Select(static modifier => modifier.ValueText).ToArray();
+
+    private static SyntaxTokenList GetModifiers(MemberDeclarationSyntax declaration) =>
+        declaration switch
+        {
+            BaseTypeDeclarationSyntax typeDeclaration => typeDeclaration.Modifiers,
+            BaseMethodDeclarationSyntax methodDeclaration => methodDeclaration.Modifiers,
+            PropertyDeclarationSyntax propertyDeclaration => propertyDeclaration.Modifiers,
+            EventDeclarationSyntax eventDeclaration => eventDeclaration.Modifiers,
+            FieldDeclarationSyntax fieldDeclaration => fieldDeclaration.Modifiers,
+            DelegateDeclarationSyntax delegateDeclaration => delegateDeclaration.Modifiers,
+            EnumMemberDeclarationSyntax => default,
+            _ => default
+        };
 }

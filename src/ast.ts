@@ -421,7 +421,8 @@ export interface SymbolInfo {
 
 /**
  * Extract symbol metadata for code within a byte range.
- * Stubbed for Phase 2 — returns empty array.
+ * C# symbol extraction lives in extractSymbolsAsync via the sidecar.
+ * This synchronous helper stays as a compatibility stub for non-C# callers.
  */
 export function extractSymbols(
   _content: string,
@@ -430,4 +431,26 @@ export function extractSymbols(
   _endPos: number,
 ): SymbolInfo[] {
   return [];
+}
+
+export async function extractSymbolsAsync(
+  content: string,
+  language: string,
+  filepath: string,
+): Promise<SymbolInfo[]> {
+  if (language !== "csharp") {
+    return [];
+  }
+
+  try {
+    const enhanced = await callCSharpSidecar(filepath, content);
+    return enhanced?.symbols.map(symbol => ({
+      name: symbol.name,
+      kind: symbol.kind,
+      signature: symbol.signature,
+      line: symbol.line,
+    })) ?? [];
+  } catch {
+    return [];
+  }
 }
