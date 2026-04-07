@@ -10,6 +10,7 @@ import {
   LlamaChatSession,
   LlamaLogLevel,
   type Llama,
+  type LlamaGpuType,
   type LlamaModel,
   type LlamaEmbeddingContext,
   type Token as LlamaToken,
@@ -384,6 +385,8 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+const CPU_ONLY_GPU_OVERRIDES = new Set(["false", "off", "none", "disable", "disabled", "0"]);
+const EXPLICIT_GPU_OVERRIDES = new Set<LlamaGpuType>(["metal", "cuda", "vulkan"]);
 
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
@@ -404,6 +407,14 @@ function resolveExpandContextSize(configValue?: number): number {
     return DEFAULT_EXPAND_CONTEXT_SIZE;
   }
   return parsed;
+}
+
+export function resolveLlamaGpuMode(rawValue = process.env.QMD_LLAMA_GPU): "auto" | false | LlamaGpuType {
+  const normalized = rawValue?.trim().toLowerCase();
+  if (!normalized || normalized === "auto") return "auto";
+  if (CPU_ONLY_GPU_OVERRIDES.has(normalized)) return false;
+  if (EXPLICIT_GPU_OVERRIDES.has(normalized as LlamaGpuType)) return normalized as LlamaGpuType;
+  return "auto";
 }
 
 export class LlamaCpp implements LLM {
@@ -552,11 +563,9 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Allow override via QMD_LLAMA_GPU: "false" | "off" | "none" forces CPU
-      const gpuOverride = (process.env.QMD_LLAMA_GPU ?? "").toLowerCase();
-      const forceCpu = ["false", "off", "none", "disable", "disabled", "0"].includes(gpuOverride);
+      const gpuMode = resolveLlamaGpuMode();
 
-      const loadLlama = async (gpu: "auto" | false) =>
+      const loadLlama = async (gpu: "auto" | false | LlamaGpuType) =>
         await getLlama({
           build: "autoAttempt",
           logLevel: LlamaLogLevel.error,
@@ -564,8 +573,17 @@ export class LlamaCpp implements LLM {
         });
 
       let llama: Llama;
-      if (forceCpu) {
+      if (gpuMode === false) {
         llama = await loadLlama(false);
+      } else if (gpuMode !== "auto") {
+        try {
+          llama = await loadLlama(gpuMode);
+        } catch (err) {
+          process.stderr.write(
+            `QMD Warning: GPU init failed for ${gpuMode} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
+          );
+          llama = await loadLlama(false);
+        }
       } else {
         try {
           llama = await loadLlama("auto");

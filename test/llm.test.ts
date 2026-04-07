@@ -14,6 +14,7 @@ import {
   disposeDefaultLlamaCpp,
   withLLMSession,
   canUnloadLLM,
+  resolveLlamaGpuMode,
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
@@ -158,6 +159,25 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
       else process.env.QMD_EMBED_MODEL = prev;
     }
+  });
+});
+
+describe("resolveLlamaGpuMode", () => {
+  test("preserves explicit GPU backend overrides", () => {
+    expect(resolveLlamaGpuMode("metal")).toBe("metal");
+    expect(resolveLlamaGpuMode("cuda")).toBe("cuda");
+    expect(resolveLlamaGpuMode("vulkan")).toBe("vulkan");
+  });
+
+  test("keeps CPU-only overrides as false", () => {
+    expect(resolveLlamaGpuMode("false")).toBe(false);
+    expect(resolveLlamaGpuMode("off")).toBe(false);
+  });
+
+  test("falls back to auto for empty or unknown overrides", () => {
+    expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    expect(resolveLlamaGpuMode("auto")).toBe("auto");
+    expect(resolveLlamaGpuMode("mystery-backend")).toBe("auto");
   });
 });
 
