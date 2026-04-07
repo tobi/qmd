@@ -175,9 +175,20 @@ const SCORE_MAP: Record<string, number> = {
   method:     90,
   ctor:       90,
   decorated:  90,
-  type:      100,
+  type:       80,
   enum:       80,
   import:     60,
+};
+
+/**
+ * Language-specific score overrides for capture names.
+ * Keep baseline scores stable across existing languages and only
+ * elevate scores where the language semantics require it.
+ */
+const LANGUAGE_SCORE_OVERRIDES: Partial<Record<SupportedLanguage, Partial<Record<string, number>>>> = {
+  csharp: {
+    type: 100,
+  },
 };
 
 // =============================================================================
@@ -307,7 +318,7 @@ export async function getASTBreakPoints(
 
     for (const cap of captures) {
       const pos = cap.node.startIndex;
-      const score = SCORE_MAP[cap.name] ?? 20;
+      const score = LANGUAGE_SCORE_OVERRIDES[language]?.[cap.name] ?? SCORE_MAP[cap.name] ?? 20;
       const type = `ast:${cap.name}`;
 
       const existing = seen.get(pos);
