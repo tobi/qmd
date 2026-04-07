@@ -20,7 +20,8 @@
 
 import { createRequire } from "node:module";
 import { extname } from "node:path";
-import type { BreakPoint } from "./store.js";
+import { callCSharpSidecar } from "./csharp-sidecar.js";
+import { mergeBreakPoints, type BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
 type ParserType = import("web-tree-sitter").Parser;
@@ -330,7 +331,21 @@ export async function getASTBreakPoints(
     tree.delete();
     parser.delete();
 
-    return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+    const points = Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+    if (language !== "csharp") {
+      return points;
+    }
+
+    try {
+      const enhanced = await callCSharpSidecar(filepath, content);
+      if (enhanced?.breakpoints.length) {
+        return mergeBreakPoints(points, enhanced.breakpoints);
+      }
+    } catch {
+      // Fall back to baseline tree-sitter breakpoints if the sidecar is unavailable.
+    }
+
+    return points;
   } catch (err) {
     console.warn(`[qmd] AST parse failed for ${filepath}, falling back to regex: ${err instanceof Error ? err.message : err}`);
     return [];

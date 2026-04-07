@@ -6,7 +6,8 @@
  * and the chunking pipeline — areas not tested by the unit-level ast.test.ts.
  */
 
-import { describe, test, expect } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { callCSharpSidecar } from "../src/csharp-sidecar.js";
 import { getASTBreakPoints } from "../src/ast.js";
 import {
   chunkDocument,
@@ -16,6 +17,15 @@ import {
   scanBreakPoints,
   findCodeFences,
 } from "../src/store.js";
+
+vi.mock("../src/csharp-sidecar.js", () => ({
+  callCSharpSidecar: vi.fn(async () => null),
+}));
+
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(callCSharpSidecar).mockResolvedValue(null);
+});
 
 // ==========================================================================
 // mergeBreakPoints
@@ -49,6 +59,78 @@ describe("mergeBreakPoints", () => {
       [{ pos: 5, score: 50, type: "b" }],
     );
     expect(merged[0]!.pos).toBeLessThan(merged[1]!.pos);
+  });
+
+  test("merges baseline and enhanced C# break points and preserves roslyn-only method points", () => {
+    const baselinePoints = [
+      { pos: 0, score: 60, type: "ast:import" },
+      { pos: 32, score: 100, type: "ast:type" },
+    ];
+    const enhancedPoints = [
+      { pos: 32, score: 100, type: "roslyn:type" },
+      { pos: 78, score: 90, type: "roslyn:method" },
+    ];
+
+    const merged = mergeBreakPoints(baselinePoints, enhancedPoints);
+
+    expect(merged).toEqual([
+      { pos: 0, score: 60, type: "ast:import" },
+      { pos: 32, score: 100, type: "ast:type" },
+      { pos: 78, score: 90, type: "roslyn:method" },
+    ]);
+  });
+});
+
+// ==========================================================================
+// C# sidecar integration
+// ==========================================================================
+
+describe("C# sidecar integration", () => {
+  const CSHARP_SAMPLE = `using System;
+
+namespace Inventory.App;
+
+public sealed class InventoryService
+{
+  public int Recount(string sku)
+  {
+    return sku.Length;
+  }
+}
+`;
+
+  test("falls back to baseline C# AST break points when sidecar analysis fails", async () => {
+    vi.mocked(callCSharpSidecar).mockResolvedValue(null);
+
+    const points = await getASTBreakPoints(CSHARP_SAMPLE, "InventoryService.cs");
+
+    expect(callCSharpSidecar).toHaveBeenCalledWith("InventoryService.cs", CSHARP_SAMPLE);
+    expect(points.some(point => point.type === "ast:import")).toBe(true);
+    expect(points.some(point => point.type === "ast:namespace")).toBe(true);
+    expect(points.some(point => point.type === "ast:type")).toBe(true);
+    expect(points.some(point => point.type === "ast:method")).toBe(true);
+  });
+
+  test("merges enhanced C# sidecar break points with baseline AST results", async () => {
+    vi.mocked(callCSharpSidecar).mockResolvedValue({
+      breakpoints: [
+        {
+          pos: CSHARP_SAMPLE.indexOf("Recount"),
+          score: 90,
+          type: "roslyn:method",
+        },
+      ],
+      symbols: [],
+    });
+
+    const points = await getASTBreakPoints(CSHARP_SAMPLE, "InventoryService.cs");
+
+    expect(points.some(point => point.type === "ast:type")).toBe(true);
+    expect(points).toContainEqual({
+      pos: CSHARP_SAMPLE.indexOf("Recount"),
+      score: 90,
+      type: "roslyn:method",
+    });
   });
 });
 
