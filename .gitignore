@@ -8,6 +8,7 @@ archive/
 texts/
 .cursor/
 .github/copilot/
+.worktrees/
 *.md
 !README.md
 !CLAUDE.md
