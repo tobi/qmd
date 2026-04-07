@@ -173,8 +173,19 @@ public sealed class InventoryService${i}
     }
     const largeCS = csharpParts.join("\n");
 
-    const chunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "auto");
-    expect(chunks.length).toBeGreaterThan(0);
+    const autoChunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "auto");
+    const regexChunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "regex");
+
+    expect(autoChunks.length).toBeGreaterThan(0);
+
+    let hasDifference = autoChunks.length !== regexChunks.length;
+    for (let i = 0; i < Math.min(autoChunks.length, regexChunks.length); i++) {
+      if (autoChunks[i]?.pos !== regexChunks[i]?.pos || autoChunks[i]?.text !== regexChunks[i]?.text) {
+        hasDifference = true;
+        break;
+      }
+    }
+    expect(hasDifference).toBe(true);
   });
 
   test("C# regex mode matches sync chunkDocument output", async () => {

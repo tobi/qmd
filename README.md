@@ -573,7 +573,7 @@ qmd embed --chunk-strategy auto
 qmd query "auth flow" --chunk-strategy auto
 ```
 
-**AST-aware chunking** (`--chunk-strategy auto`) uses AST parsers to chunk code
+**AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, namespace, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for
 codebases. Markdown and other file types always use regex-based chunking
@@ -871,7 +871,7 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 | Type alias / enum | 80 | All |
 | Import / use declaration | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.cs` files. Enable with `--chunk-strategy auto`. For C#, QMD can optionally use a Roslyn sidecar for enhanced breakpoints and symbol metadata; if unavailable, it falls back to tree-sitter C# and then regex-only chunking. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.cs` files. Enable with `--chunk-strategy auto`. Today, C# chunking uses tree-sitter C# and falls back to regex-only chunking when grammars are unavailable. A future optional Roslyn sidecar may provide enhanced breakpoints and symbol metadata for C# while preserving the same regex fallback behavior.
 
 ### Query Flow (Hybrid)
 
