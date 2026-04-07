@@ -586,6 +586,36 @@ opt in. Run `qmd status` to verify which grammars are available.
 > installed, `--chunk-strategy auto` falls back to regex-only chunking
 > automatically. Tested on both Node.js and Bun.
 
+### Optional C# Roslyn Sidecar
+
+QMD can optionally use a Roslyn sidecar for C# enhanced breakpoints and symbol
+metadata when you run `qmd embed --chunk-strategy auto` (or the equivalent
+`npx @tobilu/qmd ...` / `bunx @tobilu/qmd ...` command).
+
+Build the sidecar:
+
+```sh
+dotnet build tools/csharp-sidecar/Qmd.CSharp.Sidecar/Qmd.CSharp.Sidecar.csproj -c Release
+```
+
+Point QMD at the built sidecar executable:
+
+```sh
+export QMD_CSHARP_SIDECAR="$PWD/tools/csharp-sidecar/Qmd.CSharp.Sidecar/bin/Release/net9.0/Qmd.CSharp.Sidecar"
+qmd embed --chunk-strategy auto
+```
+
+On Windows PowerShell, set the `.exe` path instead:
+
+```powershell
+$env:QMD_CSHARP_SIDECAR = "$PWD\\tools\\csharp-sidecar\\Qmd.CSharp.Sidecar\\bin\\Release\\net9.0\\Qmd.CSharp.Sidecar.exe"
+qmd embed --chunk-strategy auto
+```
+
+If the sidecar is unset, missing, times out, or returns invalid output, QMD
+falls back to tree-sitter C# breakpoints and then to regex-only chunking when
+the C# grammar is unavailable.
+
 ### Context Management
 
 Context adds descriptive metadata to collections and paths, helping search understand your content.
@@ -871,7 +901,7 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 | Type alias / enum | 80 | All |
 | Import / use declaration | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.cs` files. Enable with `--chunk-strategy auto`. Today, C# chunking uses tree-sitter C# and falls back to regex-only chunking when grammars are unavailable. A future optional Roslyn sidecar may provide enhanced breakpoints and symbol metadata for C# while preserving the same regex fallback behavior.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.cs` files. Enable with `--chunk-strategy auto`. By default, C# chunking uses tree-sitter C#. If `QMD_CSHARP_SIDECAR` points to a working Roslyn sidecar, QMD can add enhanced breakpoints and symbol metadata for C# while preserving the same regex fallback behavior when the sidecar or grammar is unavailable.
 
 ### Query Flow (Hybrid)
 
