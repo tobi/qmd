@@ -417,6 +417,8 @@ export interface SymbolInfo {
   kind: string;
   signature?: string;
   line: number;
+  containerName?: string;
+  modifiers?: string[];
 }
 
 /**
@@ -449,6 +451,8 @@ export async function extractSymbolsAsync(
       kind: symbol.kind,
       signature: symbol.signature,
       line: symbol.line,
+      containerName: symbol.containerName,
+      modifiers: symbol.modifiers,
     })) ?? [];
   } catch {
     return [];

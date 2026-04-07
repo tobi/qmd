@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Text.RegularExpressions;
 
 namespace Qmd.CSharp.Sidecar;
 
@@ -121,9 +122,7 @@ public sealed class CSharpAnalysisService
     {
         var line = declaration.SyntaxTree.GetLineSpan(declaration.Span).StartLinePosition.Line + 1;
         var containerName = GetContainerName(declaration.Parent);
-        var signature = declaration.ToString()
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)[0]
-            .Trim();
+        var signature = GetSignature(declaration);
 
         return new SymbolDto
         {
@@ -152,6 +151,43 @@ public sealed class CSharpAnalysisService
         }
 
         return null;
+    }
+
+    private static string? GetSignature(MemberDeclarationSyntax declaration)
+    {
+        var headerLines = declaration
+            .ToString()
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .SkipWhile(static line => line.StartsWith("[", StringComparison.Ordinal));
+
+        var header = Regex.Replace(string.Join(" ", headerLines), "\\s+", " ").Trim();
+        if (string.IsNullOrWhiteSpace(header))
+        {
+            return null;
+        }
+
+        var cutIndex = FindHeaderTerminator(header);
+        return cutIndex >= 0
+            ? header[..cutIndex].TrimEnd()
+            : header;
+    }
+
+    private static int FindHeaderTerminator(string header)
+    {
+        var arrowIndex = header.IndexOf("=>", StringComparison.Ordinal);
+        if (arrowIndex >= 0)
+        {
+            return arrowIndex;
+        }
+
+        var blockIndex = header.IndexOf('{');
+        if (blockIndex >= 0)
+        {
+            return blockIndex;
+        }
+
+        var semicolonIndex = header.IndexOf(';');
+        return semicolonIndex;
     }
 }
 

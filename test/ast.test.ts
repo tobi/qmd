@@ -5,9 +5,20 @@
  * supported language, and graceful fallback on errors.
  */
 
-import { describe, test, expect } from "vitest";
-import { detectLanguage, getASTBreakPoints, extractSymbols } from "../src/ast.js";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { callCSharpSidecar } from "../src/csharp-sidecar.js";
+import { detectLanguage, getASTBreakPoints, extractSymbols, extractSymbolsAsync } from "../src/ast.js";
 import type { SupportedLanguage } from "../src/ast.js";
+
+vi.mock("../src/csharp-sidecar.js", () => ({
+  callCSharpSidecar: vi.fn(),
+}));
+
+const mockedCallCSharpSidecar = vi.mocked(callCSharpSidecar);
+
+afterEach(() => {
+  mockedCallCSharpSidecar.mockReset();
+});
 
 // =============================================================================
 // Language Detection
@@ -387,5 +398,36 @@ describe("extractSymbols", () => {
   test("returns an array for C# content", () => {
     const symbols = extractSymbols("public class InventoryService {}", "csharp", 0, 32);
     expect(Array.isArray(symbols)).toBe(true);
+  });
+});
+
+describe("extractSymbolsAsync", () => {
+  test("surfaces containerName and modifiers from sidecar symbols", async () => {
+    mockedCallCSharpSidecar.mockResolvedValue({
+      breakpoints: [],
+      symbols: [
+        {
+          name: "Rebuild",
+          kind: "method",
+          signature: "public void Rebuild()",
+          line: 6,
+          containerName: "InventoryService",
+          modifiers: ["public", "static"],
+        },
+      ],
+    });
+
+    await expect(
+      extractSymbolsAsync("public class InventoryService {}", "csharp", "src/InventoryService.cs"),
+    ).resolves.toEqual([
+      {
+        name: "Rebuild",
+        kind: "method",
+        signature: "public void Rebuild()",
+        line: 6,
+        containerName: "InventoryService",
+        modifiers: ["public", "static"],
+      },
+    ]);
   });
 });

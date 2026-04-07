@@ -59,9 +59,8 @@ public sealed class CSharpAnalysisServiceTests
 
             public class InventoryService
             {
-                public void Rebuild()
-                {
-                }
+                [Obsolete]
+                public void Rebuild() { }
             }
             """;
 
@@ -77,13 +76,20 @@ public sealed class CSharpAnalysisServiceTests
         };
 
         var response = service.Analyze(request);
+        var classSymbol = Assert.Single(response.Symbols, static symbol => symbol.Name == "InventoryService");
+        var methodSymbol = Assert.Single(response.Symbols, static symbol => symbol.Name == "Rebuild");
 
-        Assert.Contains(
-            response.Symbols,
-            static symbol => symbol.Name == "InventoryService" && symbol.Kind == "class");
-        Assert.Contains(
-            response.Symbols,
-            static symbol => symbol.Name == "Rebuild" && symbol.Kind == "method");
+        Assert.Equal("class", classSymbol.Kind);
+        Assert.Equal(3, classSymbol.Line);
+        Assert.Equal("Demo.App", classSymbol.ContainerName);
+        Assert.Equal("public class InventoryService", classSymbol.Signature);
+        Assert.Equal(["public"], classSymbol.Modifiers);
+
+        Assert.Equal("method", methodSymbol.Kind);
+        Assert.Equal(5, methodSymbol.Line);
+        Assert.Equal("InventoryService", methodSymbol.ContainerName);
+        Assert.Equal("public void Rebuild()", methodSymbol.Signature);
+        Assert.Equal(["public"], methodSymbol.Modifiers);
     }
 
     [Fact]
