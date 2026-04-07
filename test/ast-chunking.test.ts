@@ -147,6 +147,70 @@ export function handler${i}(req: Request, res: Response): void {
     const smallChunks = await chunkDocumentAsync("export const x = 1;", undefined, undefined, undefined, "s.ts", "auto");
     expect(smallChunks).toHaveLength(1);
   });
+
+  test("C# files use AST-aware chunking in auto mode", async () => {
+    const csharpParts: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      csharpParts.push(`
+using System;
+using System.Collections.Generic;
+
+namespace Inventory.App.Services;
+
+public sealed class InventoryService${i}
+{
+  public int GetAvailableStock${i}(string sku)
+  {
+    if (string.IsNullOrWhiteSpace(sku))
+    {
+      throw new ArgumentException("sku is required", nameof(sku));
+    }
+
+    return sku.Length + ${i};
+  }
+}
+`);
+    }
+    const largeCS = csharpParts.join("\n");
+
+    const chunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "auto");
+    expect(chunks.length).toBeGreaterThan(0);
+  });
+
+  test("C# regex mode matches sync chunkDocument output", async () => {
+    const csharpParts: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      csharpParts.push(`
+using System;
+using System.Collections.Generic;
+
+namespace Inventory.App.Services;
+
+public sealed class InventoryService${i}
+{
+  public int GetAvailableStock${i}(string sku)
+  {
+    if (string.IsNullOrWhiteSpace(sku))
+    {
+      throw new ArgumentException("sku is required", nameof(sku));
+    }
+
+    return sku.Length + ${i};
+  }
+}
+`);
+    }
+    const largeCS = csharpParts.join("\n");
+
+    const regexAsync = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "regex");
+    const regexSync = chunkDocument(largeCS);
+
+    expect(regexAsync).toHaveLength(regexSync.length);
+    for (let i = 0; i < regexSync.length; i++) {
+      expect(regexAsync[i]?.text).toBe(regexSync[i]?.text);
+      expect(regexAsync[i]?.pos).toBe(regexSync[i]?.pos);
+    }
+  });
 });
 
 // ==========================================================================
