@@ -1990,7 +1990,7 @@ export class RemoteLLM implements LLM {
     }
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (this.config.embedProvider === 'openai') {
       return this.embedBatchWithOpenAI(texts);
     }
