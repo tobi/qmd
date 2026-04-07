@@ -1443,8 +1443,7 @@ export async function generateEmbeddings(
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
-      // Abort early if session has been invalidated
-      if (!session.isValid) {
+      if (!isValid()) {
         console.warn(`⚠ Session expired — skipping remaining document batches`);
         break;
       }
@@ -1462,7 +1461,7 @@ export async function generateEmbeddings(
           undefined, undefined, undefined,
           doc.path,
           options?.chunkStrategy,
-          session.signal,
+          signal,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -1489,7 +1488,7 @@ export async function generateEmbeddings(
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await session.embed(firstText, { model });
+        const firstResult = await embedFn(firstText);
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -1501,15 +1500,13 @@ export async function generateEmbeddings(
       let batchChunkBytesProcessed = 0;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
-        if (!session.isValid) {
+        if (!isValid()) {
           const remaining = batchChunks.length - batchStart;
           errors += remaining;
           console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
           break;
         }
 
-        // Abort early if error rate is too high (>80% of processed chunks failed)
         const processed = chunksEmbedded + errors;
         if (processed >= BATCH_SIZE && errors > processed * 0.8) {
           const remaining = batchChunks.length - batchStart;
@@ -1523,7 +1520,7 @@ export async function generateEmbeddings(
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
-          const embeddings = await session.embedBatch(texts, { model });
+          const embeddings = await embedBatchFn(texts);
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
@@ -1536,16 +1533,14 @@ export async function generateEmbeddings(
             batchChunkBytesProcessed += chunk.bytes;
           }
         } catch {
-          // Batch failed — try individual embeddings as fallback
-          // But skip if session is already invalid (avoids N doomed retries)
-          if (!session.isValid) {
+          if (!isValid()) {
             errors += chunkBatch.length;
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
               try {
                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-                const result = await session.embed(text, { model });
+                const result = await embedFn(text);
                 if (result) {
                   insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
                   chunksEmbedded++;
@@ -3375,6 +3370,17 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  // Use OpenAI query expansion when configured (fast, ~200ms via gpt-4o-mini)
+  if (isUsingOpenAI()) {
+    const openaiLLM = getDefaultEmbeddingLLM();
+    const results = await openaiLLM.expandQuery(query, { context: intent, includeLexical: true });
+    const expanded = results
+      .filter(r => r.text !== query)
+      .map(r => ({ type: r.type, query: r.text }));
+    if (expanded.length > 0) return expanded;
+    return [{ type: 'lex' as const, query }];
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
