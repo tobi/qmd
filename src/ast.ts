@@ -31,7 +31,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "csharp";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +45,7 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".cs": "csharp",
 };
 
 /**
@@ -70,6 +71,7 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
   rust:       { pkg: "tree-sitter-rust",        wasm: "tree-sitter-rust.wasm" },
+  csharp:     { pkg: "tree-sitter-c-sharp",    wasm: "tree-sitter-c_sharp.wasm" },
 };
 
 // =============================================================================
@@ -141,6 +143,18 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  csharp: `
+    (using_directive) @import
+    (namespace_declaration) @namespace
+    (file_scoped_namespace_declaration) @namespace
+    (class_declaration) @type
+    (struct_declaration) @type
+    (interface_declaration) @type
+    (record_declaration) @type
+    (enum_declaration) @enum
+    (constructor_declaration) @ctor
+    (method_declaration) @method
+  `,
 };
 
 /**
@@ -155,11 +169,13 @@ const SCORE_MAP: Record<string, number> = {
   trait:     100,
   impl:      100,
   mod:       100,
+  namespace: 100,
   export:     90,
   func:       90,
   method:     90,
+  ctor:       90,
   decorated:  90,
-  type:       80,
+  type:      100,
   enum:       80,
   import:     60,
 };
