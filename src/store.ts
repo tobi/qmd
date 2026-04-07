@@ -1443,7 +1443,7 @@ export async function generateEmbeddings(
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
-      if (!isValid()) {
+      if (!session.isValid) {
         console.warn(`⚠ Session expired — skipping remaining document batches`);
         break;
       }
@@ -1461,7 +1461,7 @@ export async function generateEmbeddings(
           undefined, undefined, undefined,
           doc.path,
           options?.chunkStrategy,
-          signal,
+          session.signal,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -1488,7 +1488,7 @@ export async function generateEmbeddings(
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await embedFn(firstText);
+        const firstResult = await session.embed(firstText);
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -1500,7 +1500,7 @@ export async function generateEmbeddings(
       let batchChunkBytesProcessed = 0;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        if (!isValid()) {
+        if (!session.isValid) {
           const remaining = batchChunks.length - batchStart;
           errors += remaining;
           console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
@@ -1520,7 +1520,7 @@ export async function generateEmbeddings(
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
-          const embeddings = await embedBatchFn(texts);
+          const embeddings = await session.embedBatch(texts);
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
@@ -1533,14 +1533,14 @@ export async function generateEmbeddings(
             batchChunkBytesProcessed += chunk.bytes;
           }
         } catch {
-          if (!isValid()) {
+          if (!session.isValid) {
             errors += chunkBatch.length;
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
               try {
                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-                const result = await embedFn(text);
+                const result = await session.embed(text);
                 if (result) {
                   insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
                   chunksEmbedded++;

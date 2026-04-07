@@ -6,9 +6,10 @@
  */
 
 import OpenAI from 'openai';
-import type { 
-  LLM, 
-  EmbedOptions, 
+import { get_encoding } from 'tiktoken';
+import type {
+  LLM,
+  EmbedOptions,
   EmbeddingResult,
   GenerateOptions,
   GenerateResult,
@@ -29,7 +30,32 @@ export type OpenAIConfig = {
   chatApiKey?: string;
   rerankBaseURL?: string;
   rerankApiKey?: string;
+  maxInputTokens?: number;
 };
+
+// Lazy tiktoken encoder (cl100k_base covers most OpenAI-compatible models)
+let _enc: ReturnType<typeof get_encoding> | null = null;
+function getEncoder() {
+  if (!_enc) _enc = get_encoding('cl100k_base');
+  return _enc;
+}
+
+function resolveMaxInputTokens(config?: number): number {
+  if (config !== undefined) return config;
+  const env = parseInt(process.env.QMD_OPENAI_MAX_INPUT_TOKENS ?? '', 10);
+  return Number.isFinite(env) && env > 0 ? env : 512;
+}
+
+/**
+ * Truncate text to at most maxTokens tokens using tiktoken.
+ * Returns the original string if it's already within the limit.
+ */
+function truncateToTokenLimit(text: string, maxTokens: number): string {
+  const enc = getEncoder();
+  const tokens = enc.encode(text);
+  if (tokens.length <= maxTokens) return text;
+  return new TextDecoder().decode(enc.decode(tokens.slice(0, maxTokens)));
+}
 
 const DEFAULT_EMBED_MODEL = 'text-embedding-3-small';
 const DEFAULT_EXPANSION_MODEL = 'gpt-4o-mini';
@@ -111,6 +137,7 @@ export class OpenAIEmbedding implements LLM {
   private embedModel: string;
   private expansionModel: string;
   private rerankModel: string;
+  private maxInputTokens: number;
 
   constructor(config: OpenAIConfig = {}) {
     const apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
@@ -134,13 +161,15 @@ export class OpenAIEmbedding implements LLM {
     this.embedModel = config.embedModel || DEFAULT_EMBED_MODEL;
     this.expansionModel = config.expansionModel || DEFAULT_EXPANSION_MODEL;
     this.rerankModel = config.rerankModel || config.expansionModel || DEFAULT_EXPANSION_MODEL;
+    this.maxInputTokens = resolveMaxInputTokens(config.maxInputTokens);
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    const input = truncateToTokenLimit(text, this.maxInputTokens);
     return withRetry(async () => {
       const response = await this.client.embeddings.create({
         model: this.embedModel,
-        input: text,
+        input,
       });
       const data = response.data[0];
       if (!data) {
@@ -158,11 +187,12 @@ export class OpenAIEmbedding implements LLM {
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    const inputs = texts.map(t => truncateToTokenLimit(t, this.maxInputTokens));
     return withRetry(async () => {
       // OpenAI supports batch embedding natively
       const response = await this.client.embeddings.create({
         model: this.embedModel,
-        input: texts,
+        input: inputs,
       });
       return response.data.map(item => ({
         embedding: item.embedding,
