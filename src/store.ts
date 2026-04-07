@@ -1399,7 +1399,7 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const model = options?.model ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();

@@ -13,7 +13,8 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
+import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
+import { DEFAULT_EMBED_MODEL_URI } from "../src/llm.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -243,6 +244,30 @@ describe("CLI Help", () => {
 });
 
 describe("CLI Embed", () => {
+  test("prefers QMD_EMBED_MODEL for qmd embed", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:env/embed-model.gguf";
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe("hf:env/embed-model.gguf");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("falls back to the default embed model when QMD_EMBED_MODEL is unset", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe(DEFAULT_EMBED_MODEL_URI);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
   test("rejects invalid --max-docs-per-batch", async () => {
     const { stderr, exitCode } = await runQmd(["embed", "--max-docs-per-batch", "0"]);
     expect(exitCode).toBe(1);
