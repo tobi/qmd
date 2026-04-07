@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 
 export interface CSharpSidecarOptions {
   command?: string;
@@ -22,6 +22,60 @@ type RawSidecarResponse = {
   breakpoints?: unknown;
   symbols?: unknown;
 };
+
+function parseSidecarResponse(value: unknown): CSharpSidecarResult | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const response = value as RawSidecarResponse;
+  if (response.version !== 1 || !Array.isArray(response.breakpoints) || !Array.isArray(response.symbols)) {
+    return null;
+  }
+
+  const breakpoints = response.breakpoints.filter(isBreakpoint);
+  const symbols = response.symbols.filter(isSymbol);
+
+  if (breakpoints.length !== response.breakpoints.length || symbols.length !== response.symbols.length) {
+    return null;
+  }
+
+  return { breakpoints, symbols };
+}
+
+async function terminateChildProcess(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (!pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) => {
+      const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+
+      killer.on("error", () => {
+        resolve();
+      });
+      killer.on("close", () => {
+        resolve();
+      });
+    });
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Ignore cleanup failures; the wrapper still degrades to null.
+    }
+  }
+}
 
 function isBreakpoint(value: unknown): value is CSharpSidecarResult["breakpoints"][number] {
   if (!value || typeof value !== "object") return false;
@@ -86,14 +140,16 @@ export async function callCSharpSidecar(
     };
 
     const child = spawn(command, [], {
+      detached: process.platform !== "win32",
       shell: true,
       stdio: "pipe",
       windowsHide: true,
     });
 
     const timer = setTimeout(() => {
-      child.kill();
-      finish(null);
+      void terminateChildProcess(child).finally(() => {
+        finish(null);
+      });
     }, timeoutMs);
 
     child.stdout.setEncoding("utf8");
@@ -111,28 +167,21 @@ export async function callCSharpSidecar(
         return;
       }
 
-      let response: RawSidecarResponse;
+      let response: unknown;
       try {
-        response = JSON.parse(stdout) as RawSidecarResponse;
+        response = JSON.parse(stdout) as unknown;
       } catch {
         finish(null);
         return;
       }
 
-      if (response.version !== 1) {
+      const parsedResponse = parseSidecarResponse(response);
+      if (!parsedResponse) {
         finish(null);
         return;
       }
 
-      const breakpoints = Array.isArray(response.breakpoints) ? response.breakpoints.filter(isBreakpoint) : null;
-      const symbols = Array.isArray(response.symbols) ? response.symbols.filter(isSymbol) : null;
-
-      if (!breakpoints || !symbols || breakpoints.length !== response.breakpoints.length || symbols.length !== response.symbols.length) {
-        finish(null);
-        return;
-      }
-
-      finish({ breakpoints, symbols });
+      finish(parsedResponse);
     });
 
     child.stdin.on("error", () => {
