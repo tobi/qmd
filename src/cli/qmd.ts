@@ -461,33 +461,41 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+  const shouldProbeLlmDevice =
+    process.platform !== "freebsd" || process.env.QMD_STATUS_LLM_PROBE === "1";
+
+  if (shouldProbeLlmDevice) {
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo();
+      console.log(`\n${c.bold}Device${c.reset}`);
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch {
+      // Don't fail status if LLM init fails
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
+  } else {
+    console.log(`\n${c.bold}Device${c.reset}`);
+    console.log(`  ${c.dim}LLM device probe skipped on FreeBSD. Set QMD_STATUS_LLM_PROBE=1 to probe node-llama-cpp.${c.reset}`);
   }
 
   // Tips section
@@ -3091,21 +3099,26 @@ if (isMain) {
       break;
 
     case "pull": {
-      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
-      ];
-      console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      try {
+        const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+        const models = [
+          DEFAULT_EMBED_MODEL_URI,
+          DEFAULT_GENERATE_MODEL_URI,
+          DEFAULT_RERANK_MODEL_URI,
+        ];
+        console.log(`${c.bold}Pulling models${c.reset}`);
+        const results = await pullModels(models, {
+          refresh,
+          cacheDir: DEFAULT_MODEL_CACHE_DIR,
+        });
+        for (const result of results) {
+          const size = formatBytes(result.sizeBytes);
+          const note = result.refreshed ? "refreshed" : "cached/checked";
+          console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
       }
       break;
     }

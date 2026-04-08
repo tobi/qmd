@@ -4,19 +4,17 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
-} from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  NodeLlamaCppUnavailableError,
+  loadNodeLlamaCpp,
+  type Llama,
+  type LlamaEmbeddingContext,
+  type LlamaModel,
+  type LlamaToken,
+} from "./platform/node-llama-cpp.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -252,6 +250,7 @@ export async function pullModels(
   models: string[],
   options: { refresh?: boolean; cacheDir?: string } = {}
 ): Promise<PullResult[]> {
+  const nodeLlamaCpp = await loadNodeLlamaCpp();
   const cacheDir = options.cacheDir || MODEL_CACHE_DIR;
   if (!existsSync(cacheDir)) {
     mkdirSync(cacheDir, { recursive: true });
@@ -292,7 +291,7 @@ export async function pullModels(
       }
     }
 
-    const path = await resolveModelFile(model, cacheDir);
+    const path = await nodeLlamaCpp.resolveModelFile(model, cacheDir);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -552,20 +551,26 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
+      const nodeLlamaCpp = await loadNodeLlamaCpp();
       // Allow override via QMD_LLAMA_GPU: "false" | "off" | "none" forces CPU
       const gpuOverride = (process.env.QMD_LLAMA_GPU ?? "").toLowerCase();
       const forceCpu = ["false", "off", "none", "disable", "disabled", "0"].includes(gpuOverride);
 
       const loadLlama = async (gpu: "auto" | false) =>
-        await getLlama({
-          build: "autoAttempt",
-          logLevel: LlamaLogLevel.error,
+        await nodeLlamaCpp.getLlama({
+          build: process.platform === "freebsd" ? "never" : "autoAttempt",
+          logLevel: nodeLlamaCpp.LlamaLogLevel.error,
           gpu,
+          skipDownload: process.platform !== "freebsd",
         });
 
       let llama: Llama;
       if (forceCpu) {
-        llama = await loadLlama(false);
+        try {
+          llama = await loadLlama(false);
+        } catch (error) {
+          throw new NodeLlamaCppUnavailableError(error);
+        }
       } else {
         try {
           llama = await loadLlama("auto");
@@ -575,7 +580,11 @@ export class LlamaCpp implements LLM {
           process.stderr.write(
             `QMD Warning: GPU init failed (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
           );
-          llama = await loadLlama(false);
+          try {
+            llama = await loadLlama(false);
+          } catch (cpuError) {
+            throw new NodeLlamaCppUnavailableError(cpuError);
+          }
         }
       }
 
@@ -594,8 +603,9 @@ export class LlamaCpp implements LLM {
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
+    const nodeLlamaCpp = await loadNodeLlamaCpp();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    return await nodeLlamaCpp.resolveModelFile(modelUri, this.modelCacheDir);
   }
 
   /**
@@ -914,6 +924,9 @@ export class LlamaCpp implements LLM {
         model: options.model ?? this.embedModelUri,
       };
     } catch (error) {
+      if (error instanceof NodeLlamaCppUnavailableError) {
+        throw error;
+      }
       console.error("Embedding error:", error);
       return null;
     }
@@ -985,6 +998,9 @@ export class LlamaCpp implements LLM {
 
       return chunkResults.flat();
     } catch (error) {
+      if (error instanceof NodeLlamaCppUnavailableError) {
+        throw error;
+      }
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
     }
@@ -995,13 +1011,14 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    const nodeLlamaCpp = await loadNodeLlamaCpp();
     // Ensure model is loaded
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const session = new nodeLlamaCpp.LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
     // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
@@ -1055,6 +1072,7 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    const nodeLlamaCpp = await loadNodeLlamaCpp();
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
 
@@ -1080,7 +1098,7 @@ export class LlamaCpp implements LLM {
       contextSize: this.expandContextSize,
     });
     const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const session = new nodeLlamaCpp.LlamaChatSession({ contextSequence: sequence });
 
     try {
       // Qwen3 recommended settings for non-thinking mode:
@@ -1129,6 +1147,9 @@ export class LlamaCpp implements LLM {
       ];
       return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
     } catch (error) {
+      if (error instanceof NodeLlamaCppUnavailableError) {
+        throw error;
+      }
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
       const fallback: Queryable[] = [{ type: 'vec', text: query }];
