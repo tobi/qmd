@@ -2491,6 +2491,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3161,6 +3162,27 @@ if (isMain) {
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
 
+      if (cli.values.help) {
+        console.log("Usage: qmd mcp [options]");
+        console.log("");
+        console.log("Start the QMD MCP server.");
+        console.log("");
+        console.log("Modes:");
+        console.log("  (default)         stdio transport (for MCP client integration)");
+        console.log("  --http            Streamable HTTP transport");
+        console.log("  --http --daemon   HTTP transport, backgrounded");
+        console.log("");
+        console.log("Options:");
+        console.log("  --port <number>   Port to listen on (default: 8181)");
+        console.log("  --host <address>  Bind address (default: localhost)");
+        console.log("                    Use 0.0.0.0 to listen on all interfaces");
+        console.log("");
+        console.log("Subcommands:");
+        console.log("  qmd mcp stop      Stop a running daemon");
+        console.log("  qmd mcp status    Show daemon status");
+        process.exit(0);
+      }
+
       // Cache dir for PID/log files — same dir as the index
       const cacheDir = process.env.XDG_CACHE_HOME
         ? resolve(process.env.XDG_CACHE_HOME, "qmd")
@@ -3188,6 +3210,7 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        const host = (cli.values.host as string) || "localhost";
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -3207,8 +3230,8 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port), "--host", host]
+            : [selfPath, "mcp", "--http", "--port", String(port), "--host", host];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3217,7 +3240,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${host}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -3228,10 +3251,10 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, host);
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            console.error(`${host}:${port} already in use. Try a different port with --port or address with --host.`);
             process.exit(1);
           }
           throw e;
