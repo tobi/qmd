@@ -19,6 +19,7 @@ import {
   createStore,
   verifySqliteVecLoaded,
   getDefaultDbPath,
+  _resetProductionModeForTesting,
   homedir,
   resolve,
   getPwd,
@@ -280,6 +281,10 @@ describe("Store Creation", () => {
     // In test mode, createStore without path should throw to prevent accidental writes
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
+    // Reset production mode in case another test file set it (bun runs all
+    // files in a single process, so module state leaks between files).
+    // Mirrors the fix applied to getDefaultDbPath's parallel test in 66e70c0.
+    _resetProductionModeForTesting();
 
     expect(() => createStore()).toThrow("Database path not set");
 
