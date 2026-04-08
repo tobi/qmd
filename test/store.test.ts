@@ -34,6 +34,7 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
+  findListBreakPoints,
   isInsideProtectedRegion,
   findBestCutoff,
   type BreakPoint,
@@ -614,17 +615,11 @@ describe("scanBreakPoints", () => {
     expect(blank!.score).toBe(20);
   });
 
-  test("detects list items", () => {
+  test("does not detect list items (handled by findListBreakPoints)", () => {
     const text = "Intro\n- Item 1\n- Item 2\n1. Numbered";
     const breaks = scanBreakPoints(text);
-
-    const lists = breaks.filter(b => b.type === 'list');
-    const numLists = breaks.filter(b => b.type === 'numlist');
-
-    expect(lists.length).toBe(2);
-    expect(numLists.length).toBe(1);
-    expect(lists[0]!.score).toBe(5);
-    expect(numLists[0]!.score).toBe(5);
+    expect(breaks.filter(b => b.type === 'list').length).toBe(0);
+    expect(breaks.filter(b => b.type === 'numlist').length).toBe(0);
   });
 
   test("detects newlines as fallback", () => {
@@ -798,6 +793,140 @@ describe("findCodeFences", () => {
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
     expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
+  });
+});
+
+describe("findListBreakPoints", () => {
+  test("empty input produces no break points", () => {
+    expect(findListBreakPoints("")).toEqual([]);
+  });
+
+  test("pure prose produces no break points", () => {
+    const text = "Just a paragraph.\nAnother line of prose.\nAnd more.";
+    expect(findListBreakPoints(text)).toEqual([]);
+  });
+
+  test("single unordered list: item + list-end break points", () => {
+    const text = "Intro\n- one\n- two\n- three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    // 3 item breaks (all depth 0, score 70) + 1 list-end (score 75)
+    const items = bps.filter(b => b.type === 'list-item-0');
+    const ends = bps.filter(b => b.type === 'list-end');
+    expect(items.length).toBe(3);
+    expect(ends.length).toBe(1);
+    expect(items.every(b => b.score === 70)).toBe(true);
+    expect(ends[0]!.score).toBe(75);
+  });
+
+  test("ordered list with 1.", () => {
+    const text = "Intro\n1. one\n2. two\n3. three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("ordered list with 1)", () => {
+    const text = "Intro\n1) one\n2) two\n3) three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("mixed marker characters at same indent are one list", () => {
+    const text = "Intro\n- one\n* two\n- three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("nested unordered list uses depth-based scores", () => {
+    const text = "Intro\n- one\n  - sub1\n  - sub2\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    const top = bps.filter(b => b.type === 'list-item-0');
+    const sub = bps.filter(b => b.type === 'list-item-1');
+    expect(top.length).toBe(2);
+    expect(sub.length).toBe(2);
+    expect(top.every(b => b.score === 70)).toBe(true);
+    expect(sub.every(b => b.score === 45)).toBe(true);
+  });
+
+  test("three-deep nesting produces depth 0/1/2 scores", () => {
+    const text = "Intro\n- one\n  - two\n    - three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.find(b => b.type === 'list-item-0')!.score).toBe(70);
+    expect(bps.find(b => b.type === 'list-item-1')!.score).toBe(45);
+    expect(bps.find(b => b.type === 'list-item-2')!.score).toBe(25);
+  });
+
+  test("mixed nesting: unordered top with ordered sublist", () => {
+    const text = "Intro\n- one\n  1. sub\n  2. sub\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(2);
+    expect(bps.filter(b => b.type === 'list-item-1').length).toBe(2);
+  });
+
+  test("list followed by prose emits list-end at position of prose line", () => {
+    const text = "- a\n- b\nprose";
+    const bps = findListBreakPoints(text);
+    const end = bps.find(b => b.type === 'list-end')!;
+    // list-end at the \n before "prose"
+    expect(end.pos).toBe(text.indexOf("\nprose"));
+  });
+
+  test("list at end of document emits list-end at text.length", () => {
+    const text = "- a\n- b\n- c";
+    const bps = findListBreakPoints(text);
+    const end = bps.find(b => b.type === 'list-end')!;
+    expect(end.pos).toBe(text.length);
+  });
+
+  test("single blank line between items does not terminate list", () => {
+    const text = "Intro\n- a\n\n- b\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(2);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("blank then non-list prose terminates list", () => {
+    const text = "- a\n- b\n\nSome prose here";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("+ markers are not detected as list items", () => {
+    const text = "Intro\n+ foo\n+ bar\n+ baz\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.length).toBe(0);
+  });
+
+  test("position convention: pos is the \\n before the line", () => {
+    const text = "Intro\n- one\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    const items = bps.filter(b => b.type === 'list-item-0');
+    // First item: \n before "- one" at index 5
+    expect(items[0]!.pos).toBe(text.indexOf("\n- one"));
+    expect(items[1]!.pos).toBe(text.indexOf("\n- two"));
+  });
+
+  test("integration: chunkDocument splits a long list at item boundaries", () => {
+    // Build a list long enough to force splitting
+    const items: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      items.push(`- list item number ${i} with some descriptive text here to consume characters`);
+    }
+    const text = "# Header\n\n" + items.join("\n") + "\n";
+    const chunks = chunkDocument(text, 1000, 100, 300);
+    expect(chunks.length).toBeGreaterThan(1);
+    // Each chunk except the last should end on a complete list item line,
+    // meaning the split landed at a list-item break point (the \n before
+    // the next item).
+    for (let i = 0; i < chunks.length - 1; i++) {
+      const chunkText = chunks[i]!.text;
+      const lines = chunkText.split("\n");
+      // Drop trailing empty from a terminal \n
+      const last = lines[lines.length - 1] === "" ? lines[lines.length - 2]! : lines[lines.length - 1]!;
+      expect(last.startsWith("- list item")).toBe(true);
+    }
   });
 });
 

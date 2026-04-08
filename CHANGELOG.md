@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changes
+
+- List-aware chunking. A new scanner tracks nested list items with a
+  stack-based state machine and emits weighted break points: top-level
+  items score 70, second-level 45, third-level and deeper 25, and the
+  transition from a list back to prose scores 75. Previously the naive
+  `list: 5` and `numlist: 5` patterns produced break points too weak to
+  influence chunking. Long lists now split cleanly at item boundaries
+  instead of mid-item. Ordered `1)` form is newly supported, as is
+  proper detection of nested sublists (which the old regex missed).
+
 ### Fixes
 
 - Code fence detection now follows CommonMark pairing rules. Fences
