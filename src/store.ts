@@ -106,8 +106,6 @@ export const BREAK_PATTERNS: [RegExp, number, string][] = [
   [/\n(?:`{3,}|~{3,})/g, 80, 'codeblock'],  // code block boundary (same as h3)
   [/\n(?:---|\*\*\*|___)\s*\n/g, 60, 'hr'],  // horizontal rule
   [/\n\n+/g, 20, 'blank'],         // paragraph boundary
-  [/\n[-*]\s/g, 5, 'list'],        // unordered list item
-  [/\n\d+\.\s/g, 5, 'numlist'],    // ordered list item
   [/\n/g, 1, 'newline'],           // minimal break
 ];
 
@@ -187,6 +185,145 @@ export function findCodeFences(text: string): ProtectedRegion[] {
  */
 export function isInsideProtectedRegion(pos: number, regions: ProtectedRegion[]): boolean {
   return regions.some(r => pos > r.start && pos < r.end);
+}
+
+interface ListFrame {
+  indent: number;       // column of marker character
+  contentCol: number;   // column where item body begins (after marker + space)
+}
+
+/**
+ * List-aware break point scanner. Walks the document line by line, tracking
+ * nested list frames on a stack. Emits break points at list item boundaries
+ * and when a list transitions back to non-list content.
+ *
+ * Scoring:
+ *   - list-end: 75
+ *   - depth 0 item: 70
+ *   - depth 1 item: 45
+ *   - depth 2+ item: 25
+ *
+ * Marker-type transitions at the same indent are ignored (not CommonMark).
+ * Only `-`, `*`, and `\d+[.)]` markers are recognized (no `+`).
+ * Positions match scanBreakPoints convention: the `\n` before the line.
+ */
+export function findListBreakPoints(text: string): BreakPoint[] {
+  const points: BreakPoint[] = [];
+  if (text.length === 0) return points;
+
+  const itemScores = [70, 45, 25];
+  const itemTypes = ['list-item-0', 'list-item-1', 'list-item-2'];
+  const scoreFor = (depth: number): number =>
+    depth < itemScores.length ? itemScores[depth]! : itemScores[itemScores.length - 1]!;
+  const typeFor = (depth: number): string =>
+    depth < itemTypes.length ? itemTypes[depth]! : itemTypes[itemTypes.length - 1]!;
+
+  const stack: ListFrame[] = [];
+
+  // Iterate lines. lineStart is the index of the first character of the line.
+  // The break-point position we emit is lineStart - 1 (the preceding `\n`),
+  // except for the first line where there's no preceding newline.
+  let lineStart = 0;
+  const n = text.length;
+
+  // Match list item: optional leading spaces, then marker + at least one space.
+  // Unordered: - or *  (NOT +)
+  // Ordered: digits followed by . or )
+  //
+  // Known limitations (deliberate, to keep the scanner simple):
+  //   - Space-separated markers only. `-\t` (dash followed by a literal tab)
+  //     is not recognized. This pattern does not occur in practice.
+  //   - Tab-indented lines are not recognized as list items. Modern markdown
+  //     uses spaces for indentation; tab indentation was never supported by
+  //     the previous regex either, so this is not a regression.
+  //   - Loose/tight list distinction, lazy continuation, and 4-space indented
+  //     code blocks inside items are not tracked — those are rendering-level
+  //     concerns that don't change where chunks should split.
+  const itemRegex = /^( *)(?:([-*])|(\d+)([.)]))( +)/;
+
+  while (lineStart <= n) {
+    // Find end of line
+    let lineEnd = text.indexOf('\n', lineStart);
+    if (lineEnd === -1) lineEnd = n;
+    const line = text.slice(lineStart, lineEnd);
+    const bpPos = lineStart === 0 ? 0 : lineStart - 1;
+
+    const isBlank = line.trim().length === 0;
+
+    if (isBlank) {
+      // Don't change state; next non-blank decides.
+      if (lineEnd === n) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const match = itemRegex.exec(line);
+    if (match) {
+      const leading = match[1]!;
+      const indent = leading.length;
+      const bullet = match[2];
+      const digits = match[3];
+      const ordPunct = match[4];
+      const spaces = match[5]!;
+      const markerLen = bullet ? 1 : (digits!.length + ordPunct!.length);
+      const contentCol = indent + markerLen + spaces.length;
+
+      // Pop frames whose indent exceeds this line's indent (dedent).
+      while (stack.length > 0 && indent < stack[stack.length - 1]!.indent) {
+        stack.pop();
+      }
+
+      let depth: number;
+      if (stack.length === 0) {
+        stack.push({ indent, contentCol });
+        depth = 0;
+      } else {
+        const top = stack[stack.length - 1]!;
+        if (indent >= top.contentCol) {
+          // Deeper nesting
+          stack.push({ indent, contentCol });
+          depth = stack.length - 1;
+        } else if (indent === top.indent) {
+          // Sibling
+          depth = stack.length - 1;
+        } else {
+          // Indent between top.indent and top.contentCol, or less than top.indent
+          // after popping. Treat as sibling at current level.
+          depth = stack.length - 1;
+        }
+      }
+
+      // Skip the first line of the document: position 0 can never be a
+      // chunk break (chunks always start at 0) and there's no preceding
+      // newline to point to anyway.
+      if (lineStart > 0) {
+        points.push({ pos: bpPos, score: scoreFor(depth), type: typeFor(depth) });
+      }
+    } else {
+      // Non-blank, non-list line.
+      if (stack.length > 0) {
+        const indent = line.length - line.trimStart().length;
+        const bottom = stack[0]!;
+        if (indent >= bottom.contentCol) {
+          // Continuation of outermost item; keep state.
+        } else {
+          // List ends.
+          stack.length = 0;
+          points.push({ pos: bpPos, score: 75, type: 'list-end' });
+        }
+      }
+    }
+
+    if (lineEnd === n) break;
+    lineStart = lineEnd + 1;
+  }
+
+  // End of document: if still in a list, emit a list-end at text.length.
+  if (stack.length > 0) {
+    points.push({ pos: n, score: 75, type: 'list-end' });
+  }
+
+  return points.sort((a, b) => a.pos - b.pos);
 }
 
 /**
@@ -2179,7 +2316,9 @@ export function chunkDocument(
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  const breakPoints = scanBreakPoints(content);
+  const regexPoints = scanBreakPoints(content);
+  const listPoints = findListBreakPoints(content);
+  const breakPoints = mergeBreakPoints(regexPoints, listPoints);
   const protectedRegions = findCodeFences(content);
   return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
@@ -2201,14 +2340,15 @@ export async function chunkDocumentAsync(
   chunkStrategy: ChunkStrategy = "regex",
 ): Promise<{ text: string; pos: number }[]> {
   const regexPoints = scanBreakPoints(content);
+  const listPoints = findListBreakPoints(content);
   const protectedRegions = findCodeFences(content);
 
-  let breakPoints = regexPoints;
+  let breakPoints = mergeBreakPoints(regexPoints, listPoints);
   if (chunkStrategy === "auto" && filepath) {
     const { getASTBreakPoints } = await import("./ast.js");
     const astPoints = await getASTBreakPoints(content, filepath);
     if (astPoints.length > 0) {
-      breakPoints = mergeBreakPoints(regexPoints, astPoints);
+      breakPoints = mergeBreakPoints(breakPoints, astPoints);
     }
   }
 
