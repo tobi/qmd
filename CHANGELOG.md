@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Changes
+
+- XML tag break points for agent-prompt markdown. The chunker now
+  recognizes line-anchored paired tags like `<example>…</example>`,
+  `<instructions>…</instructions>`, and `<thinking>…</thinking>` that
+  commonly appear in agent instruction files, and prefers to split at
+  the close of a tagged block (score 75) rather than mid-block. HTML5
+  element names (`<div>`, `<p>`, etc.) are blocked via a blocklist so
+  inline HTML in markdown is not confused for structural tags. Tags
+  inside code fences are ignored. Supports nested same-tag blocks,
+  namespaced tags (`<xsl:template>`), and custom elements
+  (`<my-widget>`).
+
 ### Fixes
 
 - Code fence detection now follows CommonMark pairing rules. Fences

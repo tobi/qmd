@@ -34,6 +34,7 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
+  findXmlTagBreakPoints,
   isInsideProtectedRegion,
   findBestCutoff,
   type BreakPoint,
@@ -798,6 +799,193 @@ describe("findCodeFences", () => {
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
     expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
+  });
+});
+
+describe("findXmlTagBreakPoints", () => {
+  test("empty input → no break points", () => {
+    expect(findXmlTagBreakPoints("", [])).toEqual([]);
+  });
+
+  test("pure prose → no break points", () => {
+    const text = "just some prose\nwith multiple lines\nand nothing special";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("single <example> block emits open (30) + close (75)", () => {
+    const text = "prologue\n<example>\ncontent\n</example>\nepilogue";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+    expect(bps[0]!.type).toBe("tag-open");
+    expect(bps[0]!.score).toBe(30);
+    expect(bps[1]!.type).toBe("tag-close");
+    expect(bps[1]!.score).toBe(75);
+    // Positions are the \n immediately before the tag line.
+    expect(text[bps[0]!.pos]).toBe("\n");
+    expect(text[bps[1]!.pos]).toBe("\n");
+    expect(text.slice(bps[0]!.pos + 1).startsWith("<example>")).toBe(true);
+    expect(text.slice(bps[1]!.pos + 1).startsWith("</example>")).toBe(true);
+  });
+
+  test("multiple sequential blocks", () => {
+    const text = "intro\n<example>\na\n</example>\nmid\n<note>\nb\n</note>\nend";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-close", "tag-open", "tag-close"]);
+    expect(bps.map(b => b.score)).toEqual([30, 75, 30, 75]);
+  });
+
+  test("nested same-name tags", () => {
+    const text = "p\n<example>\n<example>\ninner\n</example>\nouter\n</example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-open", "tag-close", "tag-close"]);
+  });
+
+  test("nested different-name tags emit all four break points in order", () => {
+    const text = "p\n<outer>\n<inner>\nx\n</inner>\ny\n</outer>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-open", "tag-close", "tag-close"]);
+    for (let i = 1; i < bps.length; i++) {
+      expect(bps[i]!.pos).toBeGreaterThan(bps[i - 1]!.pos);
+    }
+  });
+
+  test("self-closing tag emits nothing", () => {
+    const text = "p\n<thing/>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("self-closing with space emits nothing", () => {
+    const text = "p\n<thing />\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("tag with attributes is recognized", () => {
+    const text = "p\n<example name=\"foo\">\ncontent\n</example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+    expect(bps[0]!.type).toBe("tag-open");
+    expect(bps[1]!.type).toBe("tag-close");
+  });
+
+  test("HTML element blocked (div)", () => {
+    const text = "p\n<div>\ncontent\n</div>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("HTML element blocklist is case-insensitive", () => {
+    const text1 = "p\n<DIV>\nx\n</DIV>\nq";
+    const text2 = "p\n<Div>\nx\n</Div>\nq";
+    expect(findXmlTagBreakPoints(text1, [])).toEqual([]);
+    expect(findXmlTagBreakPoints(text2, [])).toEqual([]);
+  });
+
+  test("custom element with hyphen is recognized", () => {
+    const text = "p\n<my-widget>\nx\n</my-widget>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("namespaced tag is recognized", () => {
+    const text = "p\n<xsl:template>\nx\n</xsl:template>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("case-sensitive tag matching → malformed", () => {
+    // <Example> open, </example> close: names differ → malformed, zero breaks.
+    const text = "p\n<Example>\nx\n</example>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("unclosed tag emits no break points", () => {
+    const text = "p\n<example>\ncontent with no close";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("stray closing tag is ignored and does not crash", () => {
+    const text = "p\n</example>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("cross-tag interleaving is malformed → zero break points", () => {
+    const text = "p\n<a-foo>\n<b-bar>\n</a-foo>\n</b-bar>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("tag inside code fence is ignored", () => {
+    const text = "prologue\n```\n<example>\nfoo\n</example>\n```\nepilogue";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(findXmlTagBreakPoints(text, fences)).toEqual([]);
+  });
+
+  test("mid-line tag is ignored", () => {
+    const text = "Here's an <example>content</example> inline";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("leading whitespace on tag line is recognized", () => {
+    const text = "p\n  <example>\n  x\n  </example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("HTML comment is ignored", () => {
+    const text = "p\n<!-- comment -->\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("DOCTYPE is ignored", () => {
+    const text = "p\n<!DOCTYPE html>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("CDATA is ignored", () => {
+    const text = "p\n<![CDATA[some data]]>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("processing instruction is ignored", () => {
+    const text = "p\n<?xml version=\"1.0\"?>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("first-line tag skipped (open at position 0)", () => {
+    // Open at position 0 → no tag-open break. Close still emits.
+    const text = "<example>\ncontent\n</example>\nafter";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(1);
+    expect(bps[0]!.type).toBe("tag-close");
+  });
+
+  test("position convention: pos is the \\n before the tag line", () => {
+    const text = "abc\n<example>\ncontent\n</example>\ndef";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(text[bps[0]!.pos]).toBe("\n");
+    expect(text.charAt(bps[0]!.pos + 1)).toBe("<");
+  });
+
+  test("chunkDocument integration: prefers close positions when splitting a tagged document", () => {
+    // Build a document larger than CHUNK_SIZE_CHARS so splitting is forced,
+    // with a clearly closed <example> block near the split target. The close
+    // should be chosen over nearby weak breaks.
+    // Size chosen so the </example> close sits inside the first cutoff
+    // window (target ~3600, window back 800).
+    const pre = "pre ".repeat(750);
+    const block = "\n<example>\n" + "body ".repeat(80) + "\n</example>\n";
+    const post = "post ".repeat(500);
+    const text = pre + block + post;
+    const chunks = chunkDocument(text);
+    expect(chunks.length).toBeGreaterThan(1);
+    // The tag-close break point sits at the \n before </example>. A chunk
+    // boundary should land exactly there (or very close to it) since 75
+    // beats the nearby weak blank/newline breaks.
+    const closeBpPos = text.indexOf("\n</example>");
+    const hasBoundaryAtClose = chunks.some(c => {
+      const end = c.pos + c.text.length;
+      return end === closeBpPos;
+    });
+    expect(hasBoundaryAtClose).toBe(true);
   });
 });
 

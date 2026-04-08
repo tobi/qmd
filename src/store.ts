@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { HTML_ELEMENTS } from "./html-elements.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -187,6 +188,169 @@ export function findCodeFences(text: string): ProtectedRegion[] {
  */
 export function isInsideProtectedRegion(pos: number, regions: ProtectedRegion[]): boolean {
   return regions.some(r => pos > r.start && pos < r.end);
+}
+
+/**
+ * Find line-anchored XML-style tag break points.
+ *
+ * Agent instruction files and prompt docs frequently wrap structural blocks
+ * in XML tags like `<example>`, `<instructions>`, `<thinking>`, `<tool_use>`.
+ * We emit asymmetric break points at those boundaries so the chunker prefers
+ * to split at the close of a block rather than mid-block.
+ *
+ * Rules (see spec for full decisions):
+ *  - Tags must occupy their own line (leading whitespace allowed). Mid-line
+ *    tags and multi-line openers are ignored.
+ *  - Tag name grammar: `[A-Za-z_][A-Za-z0-9_.:-]*`.
+ *  - HTML5 element names are blocked (case-insensitive) so `<div>`, `<p>`, …
+ *    don't get treated as structural tags.
+ *  - Open/close name matching is case-sensitive (XML semantics).
+ *  - Self-closing `<tag/>` and `<tag />` produce no region.
+ *  - `<!-- … -->`, `<!DOCTYPE …>`, `<![CDATA[…]]>`, `<?xml … ?>` are skipped.
+ *  - Nesting is stack-based. Cross-tag interleaving is treated as malformed
+ *    and the affected tags emit zero break points.
+ *  - Unclosed tags emit nothing.
+ *  - Tags inside passed-in protected regions (code fences) are ignored.
+ *  - `pos` is the `\n` immediately before the tag line (matches
+ *    scanBreakPoints/findListBreakPoints convention). First-line tags at
+ *    position 0 emit no break point.
+ *
+ * Scoring: `tag-open` = 30 (weak — splitting right before content is bad),
+ *          `tag-close` = 75 (strong — splitting after a closed block is great).
+ *
+ * Known limitation: attribute parsing is lazy. The opener regex terminates
+ * at the first `>`, so a `>` inside a quoted attribute value will produce a
+ * malformed match. This is intentional — we don't tokenize attributes.
+ */
+export function findXmlTagBreakPoints(text: string, fences: ProtectedRegion[]): BreakPoint[] {
+  // Whole-line patterns. The line is everything between `\n`s (or start/end).
+  const NAME = '[A-Za-z_][A-Za-z0-9_.:-]*';
+  const openRe = new RegExp(`^\\s*<(${NAME})(?:\\s+[^>]*)?>\\s*$`);
+  const closeRe = new RegExp(`^\\s*</(${NAME})\\s*>\\s*$`);
+  const selfCloseRe = new RegExp(`^\\s*<(${NAME})(?:\\s+[^>]*)?/>\\s*$`);
+  // Non-tag angle-bracket constructs to ignore wholesale.
+  const commentRe = /^\s*<!--.*-->\s*$/;
+  const doctypeRe = /^\s*<!DOCTYPE\b[^>]*>\s*$/i;
+  const cdataRe = /^\s*<!\[CDATA\[.*\]\]>\s*$/;
+  const piRe = /^\s*<\?[\s\S]*\?>\s*$/;
+
+  interface Frame {
+    name: string;
+    checkpoint: number; // index into `pending` where this frame's breaks start
+  }
+
+  const stack: Frame[] = [];
+  // Buffered break points. Committed to `output` only when the outermost
+  // frame closes cleanly. Discarded back to a checkpoint on malformed close.
+  const pending: BreakPoint[] = [];
+  const output: BreakPoint[] = [];
+
+  const commit = () => {
+    if (stack.length === 0) {
+      for (const bp of pending) output.push(bp);
+      pending.length = 0;
+    }
+  };
+
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    // Find line end.
+    let lineEnd = text.indexOf('\n', lineStart);
+    if (lineEnd === -1) lineEnd = text.length;
+    const line = text.slice(lineStart, lineEnd);
+
+    // Fence precedence: if this line's start is inside a fence, skip it.
+    // Use the line start position; the fence region spans `\n` of the opener
+    // through end of close. lineStart > fence.start && lineStart < fence.end
+    // is exactly what isInsideProtectedRegion checks.
+    const insideFence = fences.some(r => lineStart > r.start && lineStart < r.end);
+    if (insideFence) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Skip non-tag angle-bracket constructs entirely.
+    if (commentRe.test(line) || doctypeRe.test(line) || cdataRe.test(line) || piRe.test(line)) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Self-closing: recognized but no state change, no break points.
+    // Checked before the plain open regex because `<tag />` would also
+    // match an opener with trailing `/` as an attribute.
+    if (selfCloseRe.test(line)) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const openMatch = line.match(openRe);
+    if (openMatch) {
+      const name = openMatch[1]!;
+      if (!HTML_ELEMENTS.has(name.toLowerCase())) {
+        // Push frame. Emit tag-open break point into pending (unless lineStart==0).
+        const frame: Frame = { name, checkpoint: pending.length };
+        stack.push(frame);
+        if (lineStart > 0) {
+          pending.push({ pos: lineStart - 1, score: 30, type: 'tag-open' });
+        }
+      }
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const closeMatch = line.match(closeRe);
+    if (closeMatch) {
+      const name = closeMatch[1]!;
+      if (!HTML_ELEMENTS.has(name.toLowerCase())) {
+        if (stack.length === 0) {
+          // Stray closing tag — ignore.
+        } else {
+          const top = stack[stack.length - 1]!;
+          if (top.name === name) {
+            // Clean close: emit tag-close break point, pop.
+            if (lineStart > 0) {
+              pending.push({ pos: lineStart - 1, score: 75, type: 'tag-close' });
+            }
+            stack.pop();
+            commit();
+          } else {
+            // Malformed interleaving. Discard all pending entries for the
+            // top frame and everything stacked above it. The simplest way
+            // given our checkpoint convention: truncate pending back to the
+            // top frame's checkpoint and pop just that frame. We do NOT try
+            // to cascade — the outer frames remain, but their pending buffer
+            // is now shorter (the inner frame contributed nothing).
+            //
+            // However the spec asks: "zero break points for all involved
+            // tags". The involved tags here are the unmatched opener(s) at
+            // the top of the stack AND the current close. To be safe and
+            // match the spec's interleaving example `<a><b></a></b>`, we
+            // unwind the entire stack and discard all pending.
+            pending.length = 0;
+            stack.length = 0;
+            // The trailing `</b>` in the example is now a stray close; any
+            // further malformed closes will also be ignored via the
+            // stack-empty branch above.
+          }
+        }
+      }
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Content line — no state change.
+    if (lineEnd === text.length) break;
+    lineStart = lineEnd + 1;
+  }
+
+  // Unclosed tags: discard anything still pending (decision 13).
+  // `output` already has only cleanly committed break points.
+  return output.sort((a, b) => a.pos - b.pos);
 }
 
 /**
@@ -2179,8 +2343,10 @@ export function chunkDocument(
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  const breakPoints = scanBreakPoints(content);
+  const regexPoints = scanBreakPoints(content);
   const protectedRegions = findCodeFences(content);
+  const tagPoints = findXmlTagBreakPoints(content, protectedRegions);
+  const breakPoints = mergeBreakPoints(regexPoints, tagPoints);
   return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
 
@@ -2202,13 +2368,14 @@ export async function chunkDocumentAsync(
 ): Promise<{ text: string; pos: number }[]> {
   const regexPoints = scanBreakPoints(content);
   const protectedRegions = findCodeFences(content);
+  const tagPoints = findXmlTagBreakPoints(content, protectedRegions);
 
-  let breakPoints = regexPoints;
+  let breakPoints = mergeBreakPoints(regexPoints, tagPoints);
   if (chunkStrategy === "auto" && filepath) {
     const { getASTBreakPoints } = await import("./ast.js");
     const astPoints = await getASTBreakPoints(content, filepath);
     if (astPoints.length > 0) {
-      breakPoints = mergeBreakPoints(regexPoints, astPoints);
+      breakPoints = mergeBreakPoints(breakPoints, astPoints);
     }
   }
 
