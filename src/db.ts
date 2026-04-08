@@ -11,10 +11,24 @@
  * SQLite build before creating any database instances.
  */
 
-export const isBun = typeof globalThis.Bun !== "undefined";
+import {
+  createSqliteVecUnavailableError,
+  resolveSqliteVecLoadablePath,
+} from "./platform/sqlite-vec.js";
+
+const bunGlobal = globalThis as typeof globalThis & { Bun?: unknown };
+export const isBun = typeof bunGlobal.Bun !== "undefined";
 
 let _Database: any;
 let _sqliteVecLoad: ((db: any) => void) | null;
+let _sqliteVecUnavailableReason: string | null = null;
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+const sqliteVec = resolveSqliteVecLoadablePath();
+const sqliteVecPath = sqliteVec.path;
 
 if (isBun) {
   // Dynamic string prevents tsc from resolving bun:sqlite on Node.js builds
@@ -38,21 +52,31 @@ if (isBun) {
   _Database = BunDatabase;
 
   // setCustomSQLite may have silently failed — test that extensions actually work.
-  try {
-    const { getLoadablePath } = await import("sqlite-vec");
-    const vecPath = getLoadablePath();
-    const testDb = new BunDatabase(":memory:");
-    testDb.loadExtension(vecPath);
-    testDb.close();
-    _sqliteVecLoad = (db: any) => db.loadExtension(vecPath);
-  } catch {
-    // Vector search won't work, but BM25 and other operations are unaffected.
+  if (sqliteVecPath) {
+    try {
+      const testDb = new BunDatabase(":memory:");
+      testDb.loadExtension(sqliteVecPath);
+      testDb.close();
+      _sqliteVecLoad = (db: any) => db.loadExtension(sqliteVecPath);
+      _sqliteVecUnavailableReason = null;
+    } catch (err) {
+      // Vector search won't work, but BM25 and other operations are unaffected.
+      _sqliteVecLoad = null;
+      _sqliteVecUnavailableReason = `sqlite-vec probe failed (${getErrorMessage(err)})`;
+    }
+  } else {
     _sqliteVecLoad = null;
+    _sqliteVecUnavailableReason = "No loadable sqlite-vec extension was found";
   }
 } else {
   _Database = (await import("better-sqlite3")).default;
-  const sqliteVec = await import("sqlite-vec");
-  _sqliteVecLoad = (db: any) => sqliteVec.load(db);
+  if (sqliteVecPath) {
+    _sqliteVecLoad = (db: any) => db.loadExtension(sqliteVecPath);
+    _sqliteVecUnavailableReason = null;
+  } else {
+    _sqliteVecLoad = null;
+    _sqliteVecUnavailableReason = "No loadable sqlite-vec extension was found";
+  }
 }
 
 /**
@@ -86,11 +110,17 @@ export interface Statement {
  */
 export function loadSqliteVec(db: Database): void {
   if (!_sqliteVecLoad) {
-    const hint = isBun && process.platform === "darwin"
-      ? "On macOS with Bun, install Homebrew SQLite: brew install sqlite\n" +
-        "Or install qmd with npm instead: npm install -g @tobilu/qmd"
-      : "Ensure the sqlite-vec native module is installed correctly.";
-    throw new Error(`sqlite-vec extension is unavailable. ${hint}`);
+    throw createSqliteVecUnavailableError(
+      _sqliteVecUnavailableReason ?? "No loadable sqlite-vec extension was found",
+      { isBun },
+    );
   }
-  _sqliteVecLoad(db);
+  try {
+    _sqliteVecLoad(db);
+  } catch (err) {
+    throw createSqliteVecUnavailableError(
+      `sqlite-vec load failed (${getErrorMessage(err)})`,
+      { isBun },
+    );
+  }
 }
