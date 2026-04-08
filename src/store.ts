@@ -80,12 +80,14 @@ export interface BreakPoint {
 }
 
 /**
- * A region where a code fence exists (between ``` markers).
- * We should never split inside a code fence.
+ * A region of the document that the chunker must not split inside.
+ * Code fences are the first producer; future passes may contribute
+ * other kinds (e.g. list items, XML tag regions) to the same shape.
  */
-export interface CodeFenceRegion {
-  start: number;  // position of opening ```
-  end: number;    // position of closing ``` (or document end if unclosed)
+export interface ProtectedRegion {
+  start: number;     // inclusive start position
+  end: number;       // exclusive end position
+  kind?: string;     // producer tag (e.g. 'fence'); optional for back-compat
 }
 
 /**
@@ -146,8 +148,8 @@ export function scanBreakPoints(text: string): BreakPoint[] {
  *
  * Only column-0 fences are recognized. Indented fences are not detected.
  */
-export function findCodeFences(text: string): CodeFenceRegion[] {
-  const regions: CodeFenceRegion[] = [];
+export function findCodeFences(text: string): ProtectedRegion[] {
+  const regions: ProtectedRegion[] = [];
   // Capture: fence char run, then the rest of the line (info string or close tail).
   const fencePattern = /\n(`{3,}|~{3,})([^\n]*)/g;
   let open: { char: string; len: number; start: number } | null = null;
@@ -166,7 +168,7 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
 
     // To close: same char, length >= opening, and no info string on the close line.
     if (char === open.char && len >= open.len && tail.trim() === '') {
-      regions.push({ start: open.start, end: pos + match[0].length });
+      regions.push({ start: open.start, end: pos + match[0].length, kind: 'fence' });
       open = null;
     }
     // Otherwise it's content inside the open fence; ignore.
@@ -174,17 +176,17 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
 
   // Handle unclosed fence - extends to end of document
   if (open) {
-    regions.push({ start: open.start, end: text.length });
+    regions.push({ start: open.start, end: text.length, kind: 'fence' });
   }
 
   return regions;
 }
 
 /**
- * Check if a position is inside a code fence region.
+ * Check if a position is inside any protected region.
  */
-export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
-  return fences.some(f => pos > f.start && pos < f.end);
+export function isInsideProtectedRegion(pos: number, regions: ProtectedRegion[]): boolean {
+  return regions.some(r => pos > r.start && pos < r.end);
 }
 
 /**
@@ -197,7 +199,7 @@ export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boole
  * @param targetCharPos - The ideal cut position (e.g., maxChars boundary)
  * @param windowChars - How far back to search for break points (default ~200 tokens)
  * @param decayFactor - How much to penalize distance (0.7 = 30% score at window edge)
- * @param codeFences - Code fence regions to avoid splitting inside
+ * @param protectedRegions - Regions to avoid splitting inside (code fences, etc.)
  * @returns The best position to cut at
  */
 export function findBestCutoff(
@@ -205,7 +207,7 @@ export function findBestCutoff(
   targetCharPos: number,
   windowChars: number = CHUNK_WINDOW_CHARS,
   decayFactor: number = 0.7,
-  codeFences: CodeFenceRegion[] = []
+  protectedRegions: ProtectedRegion[] = []
 ): number {
   const windowStart = targetCharPos - windowChars;
   let bestScore = -1;
@@ -215,8 +217,8 @@ export function findBestCutoff(
     if (bp.pos < windowStart) continue;
     if (bp.pos > targetCharPos) break;  // sorted, so we can stop
 
-    // Skip break points inside code fences
-    if (isInsideCodeFence(bp.pos, codeFences)) continue;
+    // Skip break points inside protected regions
+    if (isInsideProtectedRegion(bp.pos, protectedRegions)) continue;
 
     const distance = targetCharPos - bp.pos;
     // Squared distance decay: gentle early, steep late
@@ -266,13 +268,14 @@ export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[]
 }
 
 /**
- * Core chunk algorithm that operates on precomputed break points and code fences.
- * This is the shared implementation used by both regex-only and AST-aware chunking.
+ * Core chunk algorithm that operates on precomputed break points and
+ * protected regions. This is the shared implementation used by both
+ * regex-only and AST-aware chunking.
  */
 export function chunkDocumentWithBreakPoints(
   content: string,
   breakPoints: BreakPoint[],
-  codeFences: CodeFenceRegion[],
+  protectedRegions: ProtectedRegion[],
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
@@ -294,7 +297,7 @@ export function chunkDocumentWithBreakPoints(
         targetEndPos,
         windowChars,
         0.7,
-        codeFences
+        protectedRegions
       );
 
       if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
@@ -2177,8 +2180,8 @@ export function chunkDocument(
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
   const breakPoints = scanBreakPoints(content);
-  const codeFences = findCodeFences(content);
-  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  const protectedRegions = findCodeFences(content);
+  return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
 
 /**
@@ -2198,7 +2201,7 @@ export async function chunkDocumentAsync(
   chunkStrategy: ChunkStrategy = "regex",
 ): Promise<{ text: string; pos: number }[]> {
   const regexPoints = scanBreakPoints(content);
-  const codeFences = findCodeFences(content);
+  const protectedRegions = findCodeFences(content);
 
   let breakPoints = regexPoints;
   if (chunkStrategy === "auto" && filepath) {
@@ -2209,7 +2212,7 @@ export async function chunkDocumentAsync(
     }
   }
 
-  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
 
 /**
