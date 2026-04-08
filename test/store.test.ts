@@ -33,10 +33,10 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
-  isInsideCodeFence,
+  isInsideProtectedRegion,
   findBestCutoff,
   type BreakPoint,
-  type CodeFenceRegion,
+  type ProtectedRegion,
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
@@ -686,8 +686,8 @@ describe("findCodeFences", () => {
     // Inner ``` positions must be inside the single fence region
     const innerOpen = text.indexOf("```js");
     const innerClose = text.indexOf("```\n````");
-    expect(isInsideCodeFence(innerOpen, fences)).toBe(true);
-    expect(isInsideCodeFence(innerClose, fences)).toBe(true);
+    expect(isInsideProtectedRegion(innerOpen, fences)).toBe(true);
+    expect(isInsideProtectedRegion(innerClose, fences)).toBe(true);
   });
 
   test("recognizes tilde fences", () => {
@@ -710,7 +710,7 @@ describe("findCodeFences", () => {
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
     const strayClose = text.indexOf("```\nstill");
-    expect(isInsideCodeFence(strayClose, fences)).toBe(true);
+    expect(isInsideProtectedRegion(strayClose, fences)).toBe(true);
   });
 
   test("does not close when closing line has info string", () => {
@@ -720,7 +720,7 @@ describe("findCodeFences", () => {
     expect(fences.length).toBe(1);
     // The stray "``` trailing" should still be inside the fence
     const stray = text.indexOf("``` trailing");
-    expect(isInsideCodeFence(stray, fences)).toBe(true);
+    expect(isInsideProtectedRegion(stray, fences)).toBe(true);
     // Real close is the bare ``` line near the end
     expect(fences[0]!.end).toBe(text.indexOf("\nAfter"));
   });
@@ -743,7 +743,7 @@ describe("findCodeFences", () => {
     expect(fences.length).toBe(1);
     // Every inner fence run must be inside the single region.
     for (const needle of ["````\n```", "```\ncode", "```\n````", "````\n`````"]) {
-      expect(isInsideCodeFence(text.indexOf(needle), fences)).toBe(true);
+      expect(isInsideProtectedRegion(text.indexOf(needle), fences)).toBe(true);
     }
   });
 
@@ -751,7 +751,7 @@ describe("findCodeFences", () => {
     const text = "Before\n`````\ncode\n``````\nAfter";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
-    expect(isInsideCodeFence(text.indexOf("code"), fences)).toBe(true);
+    expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
   });
 
   test("same-length fences do not nest (CommonMark)", () => {
@@ -760,7 +760,7 @@ describe("findCodeFences", () => {
     const text = "Before\n````\n````\ncontent\n````\n````\nAfter";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(2);
-    expect(isInsideCodeFence(text.indexOf("content"), fences)).toBe(false);
+    expect(isInsideProtectedRegion(text.indexOf("content"), fences)).toBe(false);
   });
 
   test("mixed fence chars do not interact", () => {
@@ -768,14 +768,14 @@ describe("findCodeFences", () => {
     const text = "Before\n````\n~~~~\ninner\n~~~~\n````\nAfter";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
-    expect(isInsideCodeFence(text.indexOf("inner"), fences)).toBe(true);
+    expect(isInsideProtectedRegion(text.indexOf("inner"), fences)).toBe(true);
   });
 
   test("handles info strings on outer and inner fences", () => {
     const text = "Before\n```` wrap\n```js\ncode\n```\n````\nAfter";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
-    expect(isInsideCodeFence(text.indexOf("```js"), fences)).toBe(true);
+    expect(isInsideProtectedRegion(text.indexOf("```js"), fences)).toBe(true);
   });
 
   test("tilde fences support 5/4/3 nesting", () => {
@@ -792,37 +792,37 @@ describe("findCodeFences", () => {
     ].join("\n");
     const fences = findCodeFences(text);
     expect(fences.length).toBe(1);
-    expect(isInsideCodeFence(text.indexOf("code"), fences)).toBe(true);
+    expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
   });
 });
 
-describe("isInsideCodeFence", () => {
+describe("isInsideProtectedRegion", () => {
   test("returns true for position inside fence", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(15, fences)).toBe(true);
-    expect(isInsideCodeFence(20, fences)).toBe(true);
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(15, fences)).toBe(true);
+    expect(isInsideProtectedRegion(20, fences)).toBe(true);
   });
 
   test("returns false for position outside fence", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(5, fences)).toBe(false);
-    expect(isInsideCodeFence(35, fences)).toBe(false);
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(5, fences)).toBe(false);
+    expect(isInsideProtectedRegion(35, fences)).toBe(false);
   });
 
   test("returns false for position at fence boundaries", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(10, fences)).toBe(false); // at start
-    expect(isInsideCodeFence(30, fences)).toBe(false); // at end
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(10, fences)).toBe(false); // at start
+    expect(isInsideProtectedRegion(30, fences)).toBe(false); // at end
   });
 
   test("handles multiple fences", () => {
-    const fences: CodeFenceRegion[] = [
+    const fences: ProtectedRegion[] = [
       { start: 10, end: 30 },
       { start: 50, end: 70 }
     ];
-    expect(isInsideCodeFence(20, fences)).toBe(true);
-    expect(isInsideCodeFence(60, fences)).toBe(true);
-    expect(isInsideCodeFence(40, fences)).toBe(false);
+    expect(isInsideProtectedRegion(20, fences)).toBe(true);
+    expect(isInsideProtectedRegion(60, fences)).toBe(true);
+    expect(isInsideProtectedRegion(40, fences)).toBe(false);
   });
 });
 
@@ -876,8 +876,8 @@ describe("findBestCutoff", () => {
       { pos: 150, score: 100, type: 'h1' },  // inside fence
       { pos: 180, score: 20, type: 'blank' }, // outside fence
     ];
-    const codeFences: CodeFenceRegion[] = [{ start: 140, end: 160 }];
-    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7, codeFences);
+    const regions: ProtectedRegion[] = [{ start: 140, end: 160 }];
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7, regions);
     expect(cutoff).toBe(180); // blank wins since h1 is inside fence
   });
 
@@ -1017,10 +1017,10 @@ describe("chunkDocumentWithBreakPoints", () => {
   test("produces same output as chunkDocument for same input", () => {
     const content = "a".repeat(5000) + "\n\n" + "b".repeat(5000);
     const breakPoints = scanBreakPoints(content);
-    const codeFences = findCodeFences(content);
+    const regions = findCodeFences(content);
 
     const chunksOriginal = chunkDocument(content);
-    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, codeFences);
+    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, regions);
 
     expect(chunksNew.length).toBe(chunksOriginal.length);
     for (let i = 0; i < chunksNew.length; i++) {
