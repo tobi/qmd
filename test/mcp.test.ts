@@ -20,6 +20,8 @@ import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
 
+const llmIntegrationTimeoutMs = process.platform === "win32" ? 60000 : 30000;
+
 // =============================================================================
 // Test Database Setup
 // =============================================================================
@@ -251,7 +253,7 @@ describe("MCP Server", () => {
     };
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
-    testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
+    testDbPath = join(tmpdir(), `qmd-mcp-test-${Date.now()}.sqlite`);
     testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
@@ -358,7 +360,7 @@ describe("MCP Server", () => {
         expect(['lex', 'vec', 'hyde']).toContain(q.type);
         expect(q.query.length).toBeGreaterThan(0);
       }
-    }, 30000); // 30s timeout for model loading
+    }, llmIntegrationTimeoutMs);
 
     test("performs RRF fusion on multiple result lists", () => {
       const list1: RankedResult[] = [
@@ -908,7 +910,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
   beforeAll(async () => {
     // Create isolated test database with seeded data
-    httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
+    httpTestDbPath = join(tmpdir(), `qmd-mcp-http-test-${Date.now()}.sqlite`);
     const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);

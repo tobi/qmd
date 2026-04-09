@@ -20,7 +20,8 @@
 
 import { createRequire } from "node:module";
 import { extname } from "node:path";
-import type { BreakPoint } from "./store.js";
+import { callCSharpSidecar } from "./csharp-sidecar.js";
+import { mergeBreakPoints, type BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
 type ParserType = import("web-tree-sitter").Parser;
@@ -31,7 +32,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "csharp";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +46,7 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".cs": "csharp",
 };
 
 /**
@@ -70,6 +72,7 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
   rust:       { pkg: "tree-sitter-rust",        wasm: "tree-sitter-rust.wasm" },
+  csharp:     { pkg: "tree-sitter-c-sharp",    wasm: "tree-sitter-c_sharp.wasm" },
 };
 
 // =============================================================================
@@ -141,6 +144,18 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  csharp: `
+    (using_directive) @import
+    (namespace_declaration) @namespace
+    (file_scoped_namespace_declaration) @namespace
+    (class_declaration) @type
+    (struct_declaration) @type
+    (interface_declaration) @type
+    (record_declaration) @type
+    (enum_declaration) @enum
+    (constructor_declaration) @ctor
+    (method_declaration) @method
+  `,
 };
 
 /**
@@ -155,13 +170,26 @@ const SCORE_MAP: Record<string, number> = {
   trait:     100,
   impl:      100,
   mod:       100,
+  namespace: 100,
   export:     90,
   func:       90,
   method:     90,
+  ctor:       90,
   decorated:  90,
   type:       80,
   enum:       80,
   import:     60,
+};
+
+/**
+ * Language-specific score overrides for capture names.
+ * Keep baseline scores stable across existing languages and only
+ * elevate scores where the language semantics require it.
+ */
+const LANGUAGE_SCORE_OVERRIDES: Partial<Record<SupportedLanguage, Partial<Record<string, number>>>> = {
+  csharp: {
+    type: 100,
+  },
 };
 
 // =============================================================================
@@ -291,7 +319,7 @@ export async function getASTBreakPoints(
 
     for (const cap of captures) {
       const pos = cap.node.startIndex;
-      const score = SCORE_MAP[cap.name] ?? 20;
+      const score = LANGUAGE_SCORE_OVERRIDES[language]?.[cap.name] ?? SCORE_MAP[cap.name] ?? 20;
       const type = `ast:${cap.name}`;
 
       const existing = seen.get(pos);
@@ -303,7 +331,21 @@ export async function getASTBreakPoints(
     tree.delete();
     parser.delete();
 
-    return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+    const points = Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+    if (language !== "csharp") {
+      return points;
+    }
+
+    try {
+      const enhanced = await callCSharpSidecar(filepath, content);
+      if (enhanced?.breakpoints.length) {
+        return mergeBreakPoints(points, enhanced.breakpoints);
+      }
+    } catch {
+      // Fall back to baseline tree-sitter breakpoints if the sidecar is unavailable.
+    }
+
+    return points;
   } catch (err) {
     console.warn(`[qmd] AST parse failed for ${filepath}, falling back to regex: ${err instanceof Error ? err.message : err}`);
     return [];
@@ -375,11 +417,14 @@ export interface SymbolInfo {
   kind: string;
   signature?: string;
   line: number;
+  containerName?: string;
+  modifiers?: string[];
 }
 
 /**
  * Extract symbol metadata for code within a byte range.
- * Stubbed for Phase 2 — returns empty array.
+ * C# symbol extraction lives in extractSymbolsAsync via the sidecar.
+ * This synchronous helper stays as a compatibility stub for non-C# callers.
  */
 export function extractSymbols(
   _content: string,
@@ -388,4 +433,28 @@ export function extractSymbols(
   _endPos: number,
 ): SymbolInfo[] {
   return [];
+}
+
+export async function extractSymbolsAsync(
+  content: string,
+  language: string,
+  filepath: string,
+): Promise<SymbolInfo[]> {
+  if (language !== "csharp") {
+    return [];
+  }
+
+  try {
+    const enhanced = await callCSharpSidecar(filepath, content);
+    return enhanced?.symbols.map(symbol => ({
+      name: symbol.name,
+      kind: symbol.kind,
+      signature: symbol.signature,
+      line: symbol.line,
+      containerName: symbol.containerName,
+      modifiers: symbol.modifiers,
+    })) ?? [];
+  } catch {
+    return [];
+  }
 }

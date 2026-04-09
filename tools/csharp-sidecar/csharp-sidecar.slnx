@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Qmd.CSharp.Sidecar.Tests/Qmd.CSharp.Sidecar.Tests.csproj" />
+  <Project Path="Qmd.CSharp.Sidecar/Qmd.CSharp.Sidecar.csproj" />
+</Solution>

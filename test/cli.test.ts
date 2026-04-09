@@ -11,7 +11,7 @@ import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlink
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
 
@@ -26,6 +26,7 @@ let testCounter = 0; // Unique counter for each test run
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
+const tsxCliScript = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
 // Resolve tsx binary from project's node_modules (not cwd-dependent)
 const tsxBin = (() => {
   const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
@@ -1362,7 +1363,7 @@ describe("mcp http daemon", () => {
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
   function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+    const proc = spawn(process.execPath, [tsxCliScript, qmdScript, "mcp", "--http", "--port", String(port)], {
       cwd: fixturesDir,
       env: {
         ...process.env,
@@ -1373,6 +1374,29 @@ describe("mcp http daemon", () => {
     });
     if (proc.pid) spawnedPids.push(proc.pid);
     return proc;
+  }
+
+  function killProcessTree(pid: number): void {
+    if (process.platform === "win32") {
+      execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
+      return;
+    }
+    process.kill(pid, "SIGTERM");
+  }
+
+  async function stopProcess(proc: import("child_process").ChildProcess): Promise<void> {
+    if (proc.pid) {
+      try { killProcessTree(proc.pid); } catch { /* already dead */ }
+    }
+
+    if (proc.exitCode !== null) {
+      return;
+    }
+
+    await Promise.race([
+      new Promise<void>((resolve) => proc.once("close", () => resolve())),
+      sleep(2000).then(() => undefined),
+    ]);
   }
 
   /** Wait for HTTP server to become ready */
@@ -1407,14 +1431,14 @@ describe("mcp http daemon", () => {
   afterAll(async () => {
     // Kill any leftover spawned processes
     for (const pid of spawnedPids) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+      try { killProcessTree(pid); } catch { /* already dead */ }
     }
     // Also clean up via PID file if present
     try {
       const pf = pidPath();
       if (existsSync(pf)) {
         const pid = parseInt(readFileSync(pf, "utf-8").trim());
-        try { process.kill(pid, "SIGTERM"); } catch {}
+        try { killProcessTree(pid); } catch {}
         unlinkSync(pf);
       }
     } catch {}
@@ -1439,8 +1463,7 @@ describe("mcp http daemon", () => {
       const body = await res.json();
       expect(body.status).toBe("ok");
     } finally {
-      proc.kill("SIGTERM");
-      await new Promise(r => proc.on("close", r));
+      await stopProcess(proc);
     }
   });
 
@@ -1467,7 +1490,7 @@ describe("mcp http daemon", () => {
     expect(ready).toBe(true);
 
     // Clean up
-    process.kill(pid, "SIGTERM");
+    killProcessTree(pid);
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
   });
@@ -1531,7 +1554,7 @@ describe("mcp http daemon", () => {
     expect(stderr).toContain("Already running");
 
     // Clean up first daemon
-    process.kill(pid, "SIGTERM");
+    killProcessTree(pid);
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
   });
@@ -1554,7 +1577,7 @@ describe("mcp http daemon", () => {
     // Clean up
     const ready = await waitForServer(port);
     expect(ready).toBe(true);
-    process.kill(pid, "SIGTERM");
+    killProcessTree(pid);
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
   });

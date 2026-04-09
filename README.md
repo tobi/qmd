@@ -566,7 +566,7 @@ qmd embed
 # Force re-embed everything
 qmd embed -f
 
-# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
+# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust, C#)
 qmd embed --chunk-strategy auto
 
 # Also works with query for consistent chunk selection
@@ -574,7 +574,7 @@ qmd query "auth flow" --chunk-strategy auto
 ```
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
-files at function, class, and import boundaries instead of arbitrary text
+files at function, class, namespace, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for
 codebases. Markdown and other file types always use regex-based chunking
 regardless of strategy.
@@ -585,6 +585,36 @@ opt in. Run `qmd status` to verify which grammars are available.
 > **Note:** Tree-sitter grammars are optional dependencies. If they are not
 > installed, `--chunk-strategy auto` falls back to regex-only chunking
 > automatically. Tested on both Node.js and Bun.
+
+### Optional C# Roslyn Sidecar
+
+QMD can optionally use a Roslyn sidecar for C# enhanced breakpoints and symbol
+metadata when you run `qmd embed --chunk-strategy auto` (or the equivalent
+`npx @tobilu/qmd ...` / `bunx @tobilu/qmd ...` command).
+
+Build the sidecar:
+
+```sh
+dotnet build tools/csharp-sidecar/Qmd.CSharp.Sidecar/Qmd.CSharp.Sidecar.csproj -c Release
+```
+
+Point QMD at the built sidecar executable:
+
+```sh
+export QMD_CSHARP_SIDECAR="$PWD/tools/csharp-sidecar/Qmd.CSharp.Sidecar/bin/Release/net9.0/Qmd.CSharp.Sidecar"
+qmd embed --chunk-strategy auto
+```
+
+On Windows PowerShell, set the `.exe` path instead:
+
+```powershell
+$env:QMD_CSHARP_SIDECAR = "$PWD\\tools\\csharp-sidecar\\Qmd.CSharp.Sidecar\\bin\\Release\\net9.0\\Qmd.CSharp.Sidecar.exe"
+qmd embed --chunk-strategy auto
+```
+
+If the sidecar is unset, missing, times out, or returns invalid output, QMD
+falls back to tree-sitter C# breakpoints and then to regex-only chunking when
+the C# grammar is unavailable.
 
 ### Context Management
 
@@ -871,7 +901,7 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 | Type alias / enum | 80 | All |
 | Import / use declaration | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.cs` files. Enable with `--chunk-strategy auto`. By default, C# chunking uses tree-sitter C#. If `QMD_CSHARP_SIDECAR` points to a working Roslyn sidecar, QMD can add enhanced breakpoints and symbol metadata for C# while preserving the same regex fallback behavior when the sidecar or grammar is unavailable.
 
 ### Query Flow (Hybrid)
 

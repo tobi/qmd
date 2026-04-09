@@ -493,6 +493,19 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * Best-effort disposal for short-lived contexts. Native dispose can hang after
+   * aborted/disposed prompts, so bound cleanup time instead of stalling callers.
+   */
+  private async disposeTransientContext(
+    context: { dispose(): Promise<void> },
+    timeoutMs: number = 1000
+  ): Promise<void> {
+    const disposePromise = context.dispose();
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+    await Promise.race([disposePromise, timeoutPromise]);
+  }
+
+  /**
    * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
    */
   private hasLoadedContexts(): boolean {
@@ -1038,7 +1051,7 @@ export class LlamaCpp implements LLM {
       };
     } finally {
       // Dispose context (which disposes dependent sequences/sessions per lifecycle rules)
-      await context.dispose();
+      await this.disposeTransientContext(context);
     }
   }
 
@@ -1146,7 +1159,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      await genContext.dispose();
+      await this.disposeTransientContext(genContext);
     }
   }
 

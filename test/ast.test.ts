@@ -5,9 +5,20 @@
  * supported language, and graceful fallback on errors.
  */
 
-import { describe, test, expect } from "vitest";
-import { detectLanguage, getASTBreakPoints, extractSymbols } from "../src/ast.js";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { callCSharpSidecar } from "../src/csharp-sidecar.js";
+import { detectLanguage, getASTBreakPoints, extractSymbols, extractSymbolsAsync } from "../src/ast.js";
 import type { SupportedLanguage } from "../src/ast.js";
+
+vi.mock("../src/csharp-sidecar.js", () => ({
+  callCSharpSidecar: vi.fn(),
+}));
+
+const mockedCallCSharpSidecar = vi.mocked(callCSharpSidecar);
+
+afterEach(() => {
+  mockedCallCSharpSidecar.mockReset();
+});
 
 // =============================================================================
 // Language Detection
@@ -44,6 +55,10 @@ describe("detectLanguage", () => {
 
   test("recognizes Rust extension", () => {
     expect(detectLanguage("src/auth.rs")).toBe("rust");
+  });
+
+  test("recognizes C# extension", () => {
+    expect(detectLanguage("src/AuthService.cs")).toBe("csharp");
   });
 
   test("returns null for markdown", () => {
@@ -289,6 +304,59 @@ fn hash_password(password: &str) -> String {
 });
 
 // =============================================================================
+// AST Break Points - C#
+// =============================================================================
+
+describe("getASTBreakPoints - C#", () => {
+  const CS_SAMPLE = `using System;
+using System.Collections.Generic;
+
+namespace Qmd.Auth;
+
+public class AuthService
+{
+    public AuthService(IDictionary<string, string> config)
+    {
+    }
+
+    public bool Authenticate(string token)
+    {
+        return token.Length > 0;
+    }
+}
+
+public record AuthResult(bool Success, string? Error);
+`;
+
+  test("produces break points for using, namespace, type, constructor, and method", async () => {
+    const points = await getASTBreakPoints(CS_SAMPLE, "src/AuthService.cs");
+    const types = points.map(p => p.type);
+
+    expect(types).toContain("ast:import");
+    expect(types).toContain("ast:namespace");
+    expect(types).toContain("ast:type");
+    expect(types).toContain("ast:ctor");
+    expect(types).toContain("ast:method");
+  });
+
+  test("scores align with expected hierarchy", async () => {
+    const points = await getASTBreakPoints(CS_SAMPLE, "src/AuthService.cs");
+
+    const namespacePoint = points.find(p => p.type === "ast:namespace");
+    const typePoint = points.find(p => p.type === "ast:type");
+    const ctorPoint = points.find(p => p.type === "ast:ctor");
+    const methodPoint = points.find(p => p.type === "ast:method");
+    const importPoint = points.find(p => p.type === "ast:import");
+
+    expect(namespacePoint?.score).toBe(100);
+    expect(typePoint?.score).toBe(100);
+    expect(ctorPoint?.score).toBe(90);
+    expect(methodPoint?.score).toBe(90);
+    expect(importPoint?.score).toBe(60);
+  });
+});
+
+// =============================================================================
 // Error Handling & Fallback
 // =============================================================================
 
@@ -325,5 +393,41 @@ describe("extractSymbols", () => {
   test("returns empty array (Phase 2 stub)", () => {
     const symbols = extractSymbols("function foo() {}", "typescript", 0, 18);
     expect(symbols).toEqual([]);
+  });
+
+  test("returns an array for C# content", () => {
+    const symbols = extractSymbols("public class InventoryService {}", "csharp", 0, 32);
+    expect(Array.isArray(symbols)).toBe(true);
+  });
+});
+
+describe("extractSymbolsAsync", () => {
+  test("surfaces containerName and modifiers from sidecar symbols", async () => {
+    mockedCallCSharpSidecar.mockResolvedValue({
+      breakpoints: [],
+      symbols: [
+        {
+          name: "Rebuild",
+          kind: "method",
+          signature: "public void Rebuild()",
+          line: 6,
+          containerName: "InventoryService",
+          modifiers: ["public", "static"],
+        },
+      ],
+    });
+
+    await expect(
+      extractSymbolsAsync("public class InventoryService {}", "csharp", "src/InventoryService.cs"),
+    ).resolves.toEqual([
+      {
+        name: "Rebuild",
+        kind: "method",
+        signature: "public void Rebuild()",
+        line: 6,
+        containerName: "InventoryService",
+        modifiers: ["public", "static"],
+      },
+    ]);
   });
 });

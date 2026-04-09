@@ -259,6 +259,7 @@ describe("LlamaCpp.getDeviceInfo", () => {
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
+  const expandQueryTimeoutMs = process.platform === "win32" ? 60000 : 30000;
 
   afterAll(async () => {
     // Ensure native resources are released to avoid ggml-metal asserts on process exit.
@@ -643,7 +644,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
         expect(["lex", "vec", "hyde"]).toContain(q.type);
         expect(q.text.length).toBeGreaterThan(0);
       }
-    }, 30000); // 30s timeout for model loading
+    }, expandQueryTimeoutMs);
 
     test("can exclude lexical queries", async () => {
       const result = await llm.expandQuery("authentication setup", { includeLexical: false });

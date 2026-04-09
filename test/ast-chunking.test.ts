@@ -6,7 +6,8 @@
  * and the chunking pipeline — areas not tested by the unit-level ast.test.ts.
  */
 
-import { describe, test, expect } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { callCSharpSidecar } from "../src/csharp-sidecar.js";
 import { getASTBreakPoints } from "../src/ast.js";
 import {
   chunkDocument,
@@ -16,6 +17,15 @@ import {
   scanBreakPoints,
   findCodeFences,
 } from "../src/store.js";
+
+vi.mock("../src/csharp-sidecar.js", () => ({
+  callCSharpSidecar: vi.fn(async () => null),
+}));
+
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(callCSharpSidecar).mockResolvedValue(null);
+});
 
 // ==========================================================================
 // mergeBreakPoints
@@ -49,6 +59,78 @@ describe("mergeBreakPoints", () => {
       [{ pos: 5, score: 50, type: "b" }],
     );
     expect(merged[0]!.pos).toBeLessThan(merged[1]!.pos);
+  });
+
+  test("merges baseline and enhanced C# break points and preserves roslyn-only method points", () => {
+    const baselinePoints = [
+      { pos: 0, score: 60, type: "ast:import" },
+      { pos: 32, score: 100, type: "ast:type" },
+    ];
+    const enhancedPoints = [
+      { pos: 32, score: 100, type: "roslyn:type" },
+      { pos: 78, score: 90, type: "roslyn:method" },
+    ];
+
+    const merged = mergeBreakPoints(baselinePoints, enhancedPoints);
+
+    expect(merged).toEqual([
+      { pos: 0, score: 60, type: "ast:import" },
+      { pos: 32, score: 100, type: "ast:type" },
+      { pos: 78, score: 90, type: "roslyn:method" },
+    ]);
+  });
+});
+
+// ==========================================================================
+// C# sidecar integration
+// ==========================================================================
+
+describe("C# sidecar integration", () => {
+  const CSHARP_SAMPLE = `using System;
+
+namespace Inventory.App;
+
+public sealed class InventoryService
+{
+  public int Recount(string sku)
+  {
+    return sku.Length;
+  }
+}
+`;
+
+  test("falls back to baseline C# AST break points when sidecar analysis fails", async () => {
+    vi.mocked(callCSharpSidecar).mockResolvedValue(null);
+
+    const points = await getASTBreakPoints(CSHARP_SAMPLE, "InventoryService.cs");
+
+    expect(callCSharpSidecar).toHaveBeenCalledWith("InventoryService.cs", CSHARP_SAMPLE);
+    expect(points.some(point => point.type === "ast:import")).toBe(true);
+    expect(points.some(point => point.type === "ast:namespace")).toBe(true);
+    expect(points.some(point => point.type === "ast:type")).toBe(true);
+    expect(points.some(point => point.type === "ast:method")).toBe(true);
+  });
+
+  test("merges enhanced C# sidecar break points with baseline AST results", async () => {
+    vi.mocked(callCSharpSidecar).mockResolvedValue({
+      breakpoints: [
+        {
+          pos: CSHARP_SAMPLE.indexOf("Recount"),
+          score: 90,
+          type: "roslyn:method",
+        },
+      ],
+      symbols: [],
+    });
+
+    const points = await getASTBreakPoints(CSHARP_SAMPLE, "InventoryService.cs");
+
+    expect(points.some(point => point.type === "ast:type")).toBe(true);
+    expect(points).toContainEqual({
+      pos: CSHARP_SAMPLE.indexOf("Recount"),
+      score: 90,
+      type: "roslyn:method",
+    });
   });
 });
 
@@ -146,6 +228,81 @@ export function handler${i}(req: Request, res: Response): void {
   test("small file produces single chunk", async () => {
     const smallChunks = await chunkDocumentAsync("export const x = 1;", undefined, undefined, undefined, "s.ts", "auto");
     expect(smallChunks).toHaveLength(1);
+  });
+
+  test("C# files use AST-aware chunking in auto mode", async () => {
+    const csharpParts: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      csharpParts.push(`
+using System;
+using System.Collections.Generic;
+
+namespace Inventory.App.Services;
+
+public sealed class InventoryService${i}
+{
+  public int GetAvailableStock${i}(string sku)
+  {
+    if (string.IsNullOrWhiteSpace(sku))
+    {
+      throw new ArgumentException("sku is required", nameof(sku));
+    }
+
+    return sku.Length + ${i};
+  }
+}
+`);
+    }
+    const largeCS = csharpParts.join("\n");
+
+    const autoChunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "auto");
+    const regexChunks = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "regex");
+
+    expect(autoChunks.length).toBeGreaterThan(0);
+
+    let hasDifference = autoChunks.length !== regexChunks.length;
+    for (let i = 0; i < Math.min(autoChunks.length, regexChunks.length); i++) {
+      if (autoChunks[i]?.pos !== regexChunks[i]?.pos || autoChunks[i]?.text !== regexChunks[i]?.text) {
+        hasDifference = true;
+        break;
+      }
+    }
+    expect(hasDifference).toBe(true);
+  });
+
+  test("C# regex mode matches sync chunkDocument output", async () => {
+    const csharpParts: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      csharpParts.push(`
+using System;
+using System.Collections.Generic;
+
+namespace Inventory.App.Services;
+
+public sealed class InventoryService${i}
+{
+  public int GetAvailableStock${i}(string sku)
+  {
+    if (string.IsNullOrWhiteSpace(sku))
+    {
+      throw new ArgumentException("sku is required", nameof(sku));
+    }
+
+    return sku.Length + ${i};
+  }
+}
+`);
+    }
+    const largeCS = csharpParts.join("\n");
+
+    const regexAsync = await chunkDocumentAsync(largeCS, undefined, undefined, undefined, "InventoryService.cs", "regex");
+    const regexSync = chunkDocument(largeCS);
+
+    expect(regexAsync).toHaveLength(regexSync.length);
+    for (let i = 0; i < regexSync.length; i++) {
+      expect(regexAsync[i]?.text).toBe(regexSync[i]?.text);
+      expect(regexAsync[i]?.pos).toBe(regexSync[i]?.pos);
+    }
   });
 });
 

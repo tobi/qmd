@@ -308,6 +308,19 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function stopProcessTree(pid: number): void {
+  if (process.platform === "win32") {
+    execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    process.kill(pid, "SIGTERM");
+  }
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -1415,7 +1428,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   // If name not provided, generate from pwd basename
   let collName = name;
   if (!collName) {
-    const parts = pwd.split('/').filter(Boolean);
+    const parts = pwd.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
     collName = parts[parts.length - 1] || 'root';
   }
 
@@ -2547,14 +2560,14 @@ function parseCLI() {
 
 function getSkillInstallDir(globalInstall: boolean): string {
   return globalInstall
-    ? resolve(homedir(), ".agents", "skills", "qmd")
-    : resolve(getPwd(), ".agents", "skills", "qmd");
+    ? pathJoin(homedir(), ".agents", "skills", "qmd")
+    : pathJoin(getPwd(), ".agents", "skills", "qmd");
 }
 
 function getClaudeSkillLinkPath(globalInstall: boolean): string {
   return globalInstall
-    ? resolve(homedir(), ".claude", "skills", "qmd")
-    : resolve(getPwd(), ".claude", "skills", "qmd");
+    ? pathJoin(homedir(), ".claude", "skills", "qmd")
+    : pathJoin(getPwd(), ".claude", "skills", "qmd");
 }
 
 function pathExists(path: string): boolean {
@@ -3181,7 +3194,7 @@ if (isMain) {
         const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
         try {
           process.kill(pid, 0); // alive?
-          process.kill(pid, "SIGTERM");
+          stopProcessTree(pid);
           unlinkSync(pidPath);
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
@@ -3211,8 +3224,9 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const tsxCliPath = pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "cli.mjs");
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
+            ? [tsxCliPath, selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
