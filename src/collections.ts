@@ -70,6 +70,22 @@ let currentIndexName: string = "index";
 // SDK mode: optional in-memory config or custom config path
 let configSource: { type: 'file'; path?: string } | { type: 'inline'; config: CollectionConfig } = { type: 'file' };
 
+export function normalizeIndexName(name: string): string {
+  const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\\\/.test(name);
+  const isPathLike = isWindowsAbsolute || /[\\/]/.test(name);
+
+  if (!isPathLike) return name;
+
+  let absolutePath = name;
+  if (!isWindowsAbsolute) {
+    const { resolve } = require("path");
+    const { cwd } = require("process");
+    absolutePath = resolve(cwd(), name);
+  }
+
+  return absolutePath.replace(/[:\\/]+/g, "_").replace(/^_+/, "");
+}
+
 /**
  * Set the config source for SDK mode.
  * - File path: load/save from a specific YAML file
@@ -99,16 +115,7 @@ export function setConfigSource(source?: { configPath?: string; config?: Collect
  * Config file will be ~/.config/qmd/{indexName}.yml
  */
 export function setConfigIndexName(name: string): void {
-  // Resolve relative paths to absolute paths and sanitize for use as filename
-  if (name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
-  } else {
-    currentIndexName = name;
-  }
+  currentIndexName = normalizeIndexName(name);
 }
 
 function getConfigDir(): string {

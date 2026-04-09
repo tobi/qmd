@@ -8,7 +8,7 @@
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import { join } from "path";
 import { homedir } from "os";
-import { getConfigPath, setConfigIndexName } from "../src/collections.js";
+import { getConfigPath, normalizeIndexName, setConfigIndexName } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -70,5 +70,17 @@ describe("getConfigDir via getConfigPath", () => {
     process.env.XDG_CONFIG_HOME = "/xdg/config";
     setConfigIndexName("myindex");
     expect(getConfigPath()).toBe(join("/xdg/config", "qmd", "myindex.yml"));
+  });
+
+  test("normalizes Windows absolute paths into safe index names", () => {
+    expect(normalizeIndexName("C:\\Users\\axulo\\Documents\\ppttest")).toBe(
+      "C_Users_axulo_Documents_ppttest"
+    );
+  });
+
+  test("uses a normalized filename when QMD_CONFIG_DIR is set and index name is a Windows path", () => {
+    process.env.QMD_CONFIG_DIR = "/custom/qmd-config";
+    setConfigIndexName("C:\\Users\\axulo\\Documents\\ppttest");
+    expect(getConfigPath()).toBe(join("/custom/qmd-config", "C_Users_axulo_Documents_ppttest.yml"));
   });
 });

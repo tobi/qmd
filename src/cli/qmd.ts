@@ -96,6 +96,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  normalizeIndexName,
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
@@ -161,15 +162,7 @@ function getDbPath(): string {
 }
 
 function setIndexName(name: string | null): void {
-  let normalizedName = name;
-  // Normalize relative paths to prevent malformed database paths
-  if (name && name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
-  }
+  const normalizedName = name ? normalizeIndexName(name) : name;
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
