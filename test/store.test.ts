@@ -339,6 +339,20 @@ describe("Store Creation", () => {
     }
   });
 
+  test("ensureVecTable surfaces actionable sqlite-vec guidance", async () => {
+    const store = await createTestStore();
+    try {
+      if (typeof process.getBuiltinModule === "function") {
+        expect(() => store.ensureVecTable(768)).not.toThrow();
+      } else {
+        expect(() => store.ensureVecTable(768)).toThrow(/sqlite-vec extension is unavailable/);
+        expect(() => store.ensureVecTable(768)).toThrow(/Install Homebrew SQLite/);
+      }
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("store.close closes the database connection", async () => {
     const store = await createTestStore();
     store.close();
