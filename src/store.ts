@@ -11,13 +11,14 @@
  *   const store = createStore();
  */
 
-import { openDatabase, loadSqliteVec } from "./db.js";
+import { isBun, openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import { createSqliteVecUnavailableError as createPlatformSqliteVecUnavailableError } from "./platform/sqlite-vec.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -700,12 +701,7 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 
 
 function createSqliteVecUnavailableError(reason: string): Error {
-  return new Error(
-    "sqlite-vec extension is unavailable. " +
-    `${reason}. ` +
-    "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
-    "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
-  );
+  return createPlatformSqliteVecUnavailableError(reason, { isBun });
 }
 
 function getErrorMessage(err: unknown): string {

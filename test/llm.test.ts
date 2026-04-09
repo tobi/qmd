@@ -7,17 +7,62 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, afterAll, afterEach, vi } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   withLLMSession,
+  pullModels,
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+import {
+  _setNodeLlamaCppLoaderForTesting,
+  type NodeLlamaCppModule,
+  NodeLlamaCppUnavailableError,
+} from "../src/platform/node-llama-cpp.js";
+
+afterEach(() => {
+  _setNodeLlamaCppLoaderForTesting(null);
+});
+
+async function isLlamaCppRuntimeAvailable(): Promise<boolean> {
+  if (process.env.CI) return false;
+
+  const llm = new LlamaCpp({});
+  try {
+    await llm.getDeviceInfo();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await llm.dispose();
+  }
+}
+
+const llmRuntimeRequested = process.env.QMD_RUN_LLM_INTEGRATION_TESTS === "1";
+const llmRuntimeAvailable = llmRuntimeRequested && await isLlamaCppRuntimeAvailable();
+const runtimeTest = test.runIf(llmRuntimeAvailable);
+
+function createBrokenNodeLlamaCppModule(message: string): NodeLlamaCppModule {
+  return {
+    getLlama: async () => {
+      throw new Error(message);
+    },
+    resolveModelFile: async (modelUri: string) => modelUri,
+    LlamaChatSession: class {
+      async prompt(): Promise<string> {
+        return "";
+      }
+    },
+    LlamaLogLevel: {
+      error: "error",
+    },
+  };
+}
 
 // =============================================================================
 // Singleton Tests (no model loading required)
@@ -193,11 +238,91 @@ describe("LlamaCpp rerank deduping", () => {
   });
 });
 
+describe("node-llama-cpp availability", () => {
+  test("pullModels throws a backend unavailable error when the runtime loader fails", async () => {
+    _setNodeLlamaCppLoaderForTesting(async () => {
+      throw new Error("missing backend");
+    });
+
+    await expect(pullModels(["hf:org/repo/model.gguf"])).rejects.toBeInstanceOf(
+      NodeLlamaCppUnavailableError
+    );
+    await expect(pullModels(["hf:org/repo/model.gguf"])).rejects.toThrow(
+      /node-llama-cpp is unavailable/i
+    );
+  });
+
+  test("embed surfaces backend unavailable errors instead of returning null", async () => {
+    _setNodeLlamaCppLoaderForTesting(async () => createBrokenNodeLlamaCppModule("broken native addon"));
+
+    const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false;
+
+    await expect(llm.embed("hello")).rejects.toBeInstanceOf(NodeLlamaCppUnavailableError);
+  });
+
+  test("expandQuery surfaces backend unavailable errors instead of silently falling back", async () => {
+    _setNodeLlamaCppLoaderForTesting(async () => createBrokenNodeLlamaCppModule("broken native addon"));
+
+    const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false;
+
+    await expect(llm.expandQuery("hello")).rejects.toBeInstanceOf(NodeLlamaCppUnavailableError);
+  });
+
+  test("getDeviceInfo uses the platform build policy for node-llama-cpp", async () => {
+    const getLlamaCalls: Array<Record<string, unknown>> = [];
+
+    _setNodeLlamaCppLoaderForTesting(async () => ({
+      getLlama: async (options: Record<string, unknown>) => {
+        getLlamaCalls.push(options);
+        return {
+          gpu: false,
+          supportsGpuOffloading: false,
+          cpuMathCores: 8,
+          getGpuDeviceNames: async () => [],
+          getVramState: async () => ({ total: 0, used: 0, free: 0 }),
+          loadModel: async () => {
+            throw new Error("not used in this test");
+          },
+          createGrammar: async () => {
+            throw new Error("not used in this test");
+          },
+          dispose: async () => {},
+        } as any;
+      },
+      resolveModelFile: async (modelUri: string) => modelUri,
+      LlamaChatSession: class {
+        async prompt(): Promise<string> {
+          return "";
+        }
+      },
+      LlamaLogLevel: {
+        error: "error",
+      },
+    }) as NodeLlamaCppModule);
+
+    const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false;
+
+    await expect(llm.getDeviceInfo()).resolves.toMatchObject({
+      gpu: false,
+      gpuOffloading: false,
+      gpuDevices: [],
+      cpuCores: 8,
+    });
+    expect(getLlamaCalls[0]?.build).toBe(process.platform === "freebsd" ? "never" : "autoAttempt");
+    expect(getLlamaCalls[0]?.skipDownload).toBe(false);
+
+    await llm.dispose();
+  });
+});
+
 // =============================================================================
 // Integration Tests (require actual models)
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
+describe.skipIf(!llmRuntimeAvailable)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
 
@@ -602,7 +727,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
 describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
   describe("withLLMSession", () => {
-    test("session provides access to LLM operations", async () => {
+    runtimeTest("session provides access to LLM operations", async () => {
       const result = await withLLMSession(async (session) => {
         expect(session.isValid).toBe(true);
         const embedding = await session.embed("test text");
@@ -626,7 +751,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(capturedSession!.isValid).toBe(false);
     });
 
-    test("session prevents idle unload during operations", async () => {
+    runtimeTest("session prevents idle unload during operations", async () => {
       await withLLMSession(async (session) => {
         // While inside a session, canUnloadLLM should return false
         expect(canUnloadLLM()).toBe(false);
@@ -661,7 +786,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(canUnloadLLM()).toBe(true);
     });
 
-    test("session embedBatch works correctly", async () => {
+    runtimeTest("session embedBatch works correctly", async () => {
       await withLLMSession(async (session) => {
         const texts = ["Hello world", "Test text", "Another document"];
         const results = await session.embedBatch(texts);
@@ -674,7 +799,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       });
     });
 
-    test("session rerank works correctly", async () => {
+    runtimeTest("session rerank works correctly", async () => {
       await withLLMSession(async (session) => {
         const documents: RerankDocument[] = [
           { file: "a.txt", text: "The capital of France is Paris." },
@@ -748,7 +873,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
 
     test("returns value from callback", async () => {
       const result = await withLLMSession(async (session) => {
-        await session.embed("test");
+        expect(session.isValid).toBe(true);
         return { status: "complete", count: 42 };
       });
 

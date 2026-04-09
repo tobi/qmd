@@ -475,11 +475,12 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 ### System Requirements
 
 - **Node.js** >= 22
-- **Bun** >= 1.0.0
+- **Bun** >= 1.0.0 on supported Bun platforms
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
   brew install sqlite
   ```
+- **FreeBSD**: Node.js-only core path for now. BM25 and sqlite-vec search are supported immediately; embeddings, reranking, and query expansion follow the upstream node-llama-cpp FreeBSD fix. See [docs/FREEBSD.md](docs/FREEBSD.md) for the verified source-install path and current smoke/certification entrypoints.
 
 ### GGUF Models (via node-llama-cpp)
 
@@ -522,6 +523,18 @@ npm install -g @tobilu/qmd
 # or
 bun install -g @tobilu/qmd
 ```
+
+### FreeBSD
+
+The current FreeBSD upstream path is a Node.js source-install flow.
+
+See [docs/FREEBSD.md](docs/FREEBSD.md) for:
+
+- the core BM25 + sqlite-vec bring-up path
+- `sqlite-vec` / `vec0.so` build steps
+- `QMD_SQLITE_VEC_PATH` usage
+- the immediate `test/freebsd-smoke.sh --quick` verification path
+- the follow-up `--full` path once FreeBSD `node-llama-cpp` support lands upstream
 
 ### Development
 
