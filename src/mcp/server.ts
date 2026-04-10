@@ -30,6 +30,9 @@ import {
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
+import { enableProductionMode } from "../store.js";
+
+enableProductionMode();
 
 // =============================================================================
 // Types for structured content

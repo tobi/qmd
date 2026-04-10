@@ -12,7 +12,6 @@
   influence chunking. Long lists now split cleanly at item boundaries
   instead of mid-item. Ordered `1)` form is newly supported, as is
   proper detection of nested sublists (which the old regex missed).
-
 - XML tag break points for agent-prompt markdown. The chunker now
   recognizes line-anchored paired tags like `<example>…</example>`,
   `<instructions>…</instructions>`, and `<thinking>…</thinking>` that
@@ -30,6 +29,7 @@
   opened with 4 or more backticks (or tildes) are correctly recognized
   and paired, so chunks no longer split inside nested code blocks that
   wrap shorter fences. Tilde fences are now supported.
+- GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 
 ## [2.1.0] - 2026-04-05
 

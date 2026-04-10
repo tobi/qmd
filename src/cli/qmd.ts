@@ -461,10 +461,10 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
+  console.log(`\n${c.bold}Device${c.reset}`);
   try {
     const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
       if (device.gpuDevices.length > 0) {
@@ -486,8 +486,11 @@ async function showStatus(): Promise<void> {
       console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
     }
     console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
+  } catch (error) {
+    console.log(`  Status:   ${c.dim}skipped${c.reset} (status probe does not build llama.cpp backends)`);
+    if (error instanceof Error && error.message) {
+      console.log(`  ${c.dim}${error.message}${c.reset}`);
+    }
   }
 
   // Tips section
@@ -1932,7 +1935,8 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent).snippet : undefined;
+      const snippetInfo = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent) : undefined;
+      let snippet = snippetInfo?.snippet;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1941,6 +1945,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
         file: toQmdPath(row.displayPath),
+        ...(snippetInfo && { line: snippetInfo.line }),
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),

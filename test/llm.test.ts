@@ -12,6 +12,7 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  resolveLlamaGpuMode,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -52,6 +53,38 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("QMD_LLAMA_GPU resolution", () => {
+  test("uses auto when unset or blank", () => {
+    expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    expect(resolveLlamaGpuMode("   ")).toBe("auto");
+  });
+
+  test("maps CPU disable values to false", () => {
+    expect(resolveLlamaGpuMode("false")).toBe(false);
+    expect(resolveLlamaGpuMode("OFF")).toBe(false);
+    expect(resolveLlamaGpuMode(" none ")).toBe(false);
+    expect(resolveLlamaGpuMode("disabled")).toBe(false);
+    expect(resolveLlamaGpuMode("0")).toBe(false);
+  });
+
+  test("passes through supported GPU backends", () => {
+    expect(resolveLlamaGpuMode("metal")).toBe("metal");
+    expect(resolveLlamaGpuMode("VULKAN")).toBe("vulkan");
+    expect(resolveLlamaGpuMode(" cuda ")).toBe("cuda");
+  });
+
+  test("warns and falls back to auto for unsupported values", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      expect(resolveLlamaGpuMode("rocm")).toBe("auto");
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_LLAMA_GPU");
+    } finally {
+      stderrSpy.mockRestore();
+    }
   });
 });
 
@@ -190,6 +223,32 @@ describe("LlamaCpp rerank deduping", () => {
     expect(scoreByFile.get("a.md")).toBe(0.9);
     expect(scoreByFile.get("b.md")).toBe(0.9);
     expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
+describe("LlamaCpp.getDeviceInfo", () => {
+  test("can skip build attempts for status probes", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const fakeLlama = {
+      gpu: "metal",
+      supportsGpuOffloading: true,
+      cpuMathCores: 8,
+      getGpuDeviceNames: vi.fn().mockResolvedValue(["Apple GPU"]),
+      getVramState: vi.fn().mockResolvedValue({ total: 1024, used: 256, free: 768 }),
+    };
+
+    llm.ensureLlama = vi.fn().mockResolvedValue(fakeLlama);
+
+    const device = await llm.getDeviceInfo({ allowBuild: false });
+
+    expect(llm.ensureLlama).toHaveBeenCalledWith(false);
+    expect(device).toEqual({
+      gpu: "metal",
+      gpuOffloading: true,
+      gpuDevices: ["Apple GPU"],
+      vram: { total: 1024, used: 256, free: 768 },
+      cpuCores: 8,
+    });
   });
 });
 
