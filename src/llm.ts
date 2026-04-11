@@ -514,6 +514,14 @@ export class LlamaCpp implements LLM {
     return this.embedModelUri;
   }
 
+  get rerankModelName(): string {
+    return this.rerankModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
   /**
    * Reset the inactivity timer. Called after each model operation.
    * When timer fires, models are unloaded to free memory (if no active sessions).

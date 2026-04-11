@@ -461,10 +461,11 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const llamaCpp = getDefaultLlamaCpp();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(llamaCpp.embedModelName)}`);
+    console.log(`  Reranking:   ${hfLink(llamaCpp.rerankModelName)}`);
+    console.log(`  Generation:  ${hfLink(llamaCpp.generateModelName)}`);
   }
 
   // Device / GPU info
