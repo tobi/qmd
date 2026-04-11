@@ -49,6 +49,7 @@ import {
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   generateEmbeddings,
+  _resetProductionModeForTesting,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -280,6 +281,10 @@ describe("Store Creation", () => {
     // In test mode, createStore without path should throw to prevent accidental writes
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
+
+    // Bun runs test files in a shared process, so top-level CLI imports in other
+    // test files can flip store.ts into production mode.
+    _resetProductionModeForTesting();
 
     expect(() => createStore()).toThrow("Database path not set");
 
