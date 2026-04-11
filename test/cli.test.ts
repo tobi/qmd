@@ -837,8 +837,8 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    // handelize converts to lowercase
-    expect(stdout).toContain("qmd://fixtures/readme.md");
+    // handelize preserves original case
+    expect(stdout).toContain("qmd://fixtures/README.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
@@ -847,8 +847,8 @@ describe("CLI ls Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
     expect(stdout).toContain("qmd://fixtures/notes/ideas.md");
-    // Should not include files outside the prefix (handelize converts to lowercase)
-    expect(stdout).not.toContain("qmd://fixtures/readme.md");
+    // Should not include files outside the prefix (case preserved)
+    expect(stdout).not.toContain("qmd://fixtures/README.md");
   });
 
   test("lists files with virtual path", async () => {
@@ -1128,6 +1128,42 @@ describe("search output formats", () => {
     // Ensure no full filesystem paths
     expect(result.file).not.toMatch(/^\/Users\//);
     expect(result.file).not.toMatch(/^\/home\//);
+  });
+
+  test("custom-index search links include ?index= and can be passed back to qmd get", async () => {
+    const env = await createIsolatedTestEnv("custom-index-links");
+    const customColl = "fixtures-alt";
+    const customIndex = "release-notes";
+    const customCacheDir = join(testDir, `cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await mkdir(customCacheDir, { recursive: true });
+
+    const sharedEnv = {
+      INDEX_PATH: "",
+      XDG_CACHE_HOME: customCacheDir,
+    };
+
+    const addResult = await runQmd(
+      ["--index", customIndex, "collection", "add", fixturesDir, "--name", customColl],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const searchResult = await runQmd(
+      ["--index", customIndex, "search", "test", "--json", "-n", "1"],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(searchResult.exitCode).toBe(0);
+
+    const results = JSON.parse(searchResult.stdout);
+    const file = results[0]?.file;
+    expect(file).toMatch(new RegExp(`^qmd://${customColl}/.+\\?index=${customIndex}$`));
+
+    const getResult = await runQmd(
+      ["get", file, "-l", "2"],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(getResult.exitCode).toBe(0);
+    expect(getResult.stdout.trim().length).toBeGreaterThan(0);
   });
 
   test("search --files includes qmd:// path, docid, and context", async () => {

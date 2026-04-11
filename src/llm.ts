@@ -16,7 +16,7 @@ import {
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -248,6 +248,58 @@ async function getRemoteEtag(ref: HfRef): Promise<string | null> {
   }
 }
 
+const GGUF_MAGIC = Buffer.from("GGUF");
+
+/**
+ * Validate that a file is actually a GGUF model, not an HTML error page
+ * from a proxy, firewall, or failed download.
+ * Throws a descriptive error if the file is not valid GGUF.
+ */
+function validateGgufFile(filePath: string, modelUri: string): void {
+  if (!existsSync(filePath)) return; // let downstream handle missing files
+
+  // Read header + sniff bytes in one go, then close immediately
+  const fd = openSync(filePath, "r");
+  const sniff = Buffer.alloc(512);
+  try {
+    readSync(fd, sniff, 0, 512, 0);
+  } finally {
+    closeSync(fd);
+  }
+
+  const header = sniff.subarray(0, 4);
+  if (header.equals(GGUF_MAGIC)) return; // valid GGUF
+
+  const text = sniff.toString("utf-8").toLowerCase();
+  const isHtml = text.includes("<!doctype") || text.includes("<html");
+  const got = header.toString("utf-8");
+  const sizeKB = (statSync(filePath).size / 1024).toFixed(0);
+
+  // Remove the bad file so the next attempt re-downloads
+  unlinkSync(filePath);
+
+  if (isHtml) {
+    throw new Error(
+      `Downloaded model file is an HTML page, not a GGUF model (${sizeKB} KB).\n` +
+      `Something is intercepting the download from huggingface.co (a proxy, firewall, or captive portal).\n\n` +
+      `Model: ${modelUri}\n` +
+      `Path:  ${filePath}\n\n` +
+      `To fix this, either:\n` +
+      `  1. Try a HuggingFace mirror:  HF_ENDPOINT=https://hf-mirror.com qmd embed\n` +
+      `  2. Download the model manually and set the env var, e.g.:\n` +
+      `       QMD_EMBED_MODEL=/path/to/model.gguf qmd embed\n\n` +
+      `Note: 'qmd search' works without any model downloads.`
+    );
+  }
+
+  throw new Error(
+    `Model file is not valid GGUF (expected magic "GGUF", got "${got}", file is ${sizeKB} KB).\n` +
+    `Model: ${modelUri}\n` +
+    `Path:  ${filePath}\n\n` +
+    `The file has been removed. Run the command again to re-download.`
+  );
+}
+
 export async function pullModels(
   models: string[],
   options: { refresh?: boolean; cacheDir?: string } = {}
@@ -293,6 +345,7 @@ export async function pullModels(
     }
 
     const path = await resolveModelFile(model, cacheDir);
+    validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -601,12 +654,16 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Resolve a model URI to a local path, downloading if needed
+   * Resolve a model URI to a local path, downloading if needed.
+   * Validates the downloaded file is actually a GGUF model (not an HTML error page
+   * from a proxy or firewall).
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
+    validateGgufFile(modelPath, modelUri);
+    return modelPath;
   }
 
   /**
@@ -889,20 +946,30 @@ export class LlamaCpp implements LLM {
    * detokenizes back to text if truncation is needed.
    * Returns the (possibly truncated) text and whether truncation occurred.
    */
-  private async truncateToContextSize(text: string): Promise<{ text: string; truncated: boolean }> {
-    if (!this.embedModel) return { text, truncated: false };
+  private resolveEmbedTokenLimit(): number {
+    const trainedContextSize = this.embedModel?.trainContextSize;
+    if (typeof trainedContextSize === "number" && Number.isFinite(trainedContextSize) && trainedContextSize > 0) {
+      return Math.max(1, Math.min(LlamaCpp.EMBED_CONTEXT_SIZE, trainedContextSize));
+    }
+    return LlamaCpp.EMBED_CONTEXT_SIZE;
+  }
 
-    const maxTokens = this.embedModel.trainContextSize;
-    if (maxTokens <= 0) return { text, truncated: false };
+  private async truncateToContextSize(
+    text: string
+  ): Promise<{ text: string; truncated: boolean; limit: number }> {
+    if (!this.embedModel) return { text, truncated: false, limit: LlamaCpp.EMBED_CONTEXT_SIZE };
+
+    const maxTokens = this.resolveEmbedTokenLimit();
+    if (maxTokens <= 0) return { text, truncated: false, limit: maxTokens };
 
     const tokens = this.embedModel.tokenize(text);
-    if (tokens.length <= maxTokens) return { text, truncated: false };
+    if (tokens.length <= maxTokens) return { text, truncated: false, limit: maxTokens };
 
     // Leave a small margin (4 tokens) for BOS/EOS overhead
     const safeLimit = Math.max(1, maxTokens - 4);
     const truncatedTokens = tokens.slice(0, safeLimit);
     const truncatedText = this.embedModel.detokenize(truncatedTokens);
-    return { text: truncatedText, truncated: true };
+    return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
@@ -913,9 +980,9 @@ export class LlamaCpp implements LLM {
       const context = await this.ensureEmbedContext();
 
       // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated } = await this.truncateToContextSize(text);
+      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
       if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
       }
 
       const embedding = await context.getEmbeddingFor(safeText);
@@ -951,9 +1018,9 @@ export class LlamaCpp implements LLM {
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
           try {
-            const { text: safeText, truncated } = await this.truncateToContextSize(text);
+            const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
             if (truncated) {
-              console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+              console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
             const embedding = await context.getEmbeddingFor(safeText);
             this.touchActivity();
@@ -978,9 +1045,9 @@ export class LlamaCpp implements LLM {
           const results: (EmbeddingResult | null)[] = [];
           for (const text of chunk) {
             try {
-              const { text: safeText, truncated } = await this.truncateToContextSize(text);
+              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
               if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
               const embedding = await ctx.getEmbeddingFor(safeText);
               this.touchActivity();

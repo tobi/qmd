@@ -40,7 +40,7 @@ import type {
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || "/tmp";
+const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
@@ -608,6 +608,7 @@ export function getRealPath(path: string): string {
 export type VirtualPath = {
   collectionName: string;
   path: string;  // relative path within collection
+  indexName?: string;
 };
 
 /**
@@ -651,22 +652,26 @@ export function normalizeVirtualPath(input: string): string {
 export function parseVirtualPath(virtualPath: string): VirtualPath | null {
   // Normalize the path first
   const normalized = normalizeVirtualPath(virtualPath);
+  const [pathPart = normalized, queryString = ""] = normalized.split("?");
 
   // Match: qmd://collection-name[/optional-path]
   // Allows: qmd://name, qmd://name/, qmd://name/path
-  const match = normalized.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
+  const match = pathPart.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
   if (!match?.[1]) return null;
+  const indexName = new URLSearchParams(queryString).get("index")?.trim() || undefined;
   return {
     collectionName: match[1],
     path: match[2] ?? '',  // Empty string for collection root
+    ...(indexName ? { indexName } : {}),
   };
 }
 
 /**
  * Build a virtual path from collection name and relative path.
  */
-export function buildVirtualPath(collectionName: string, path: string): string {
-  return `qmd://${collectionName}/${path}`;
+export function buildVirtualPath(collectionName: string, path: string, indexName?: string): string {
+  const base = `qmd://${collectionName}/${path}`;
+  return indexName ? `${base}?index=${encodeURIComponent(indexName)}` : base;
 }
 
 /**
@@ -750,6 +755,8 @@ function createSqliteVecUnavailableError(reason: string): Error {
   );
 }
 
+let _sqliteVecUnavailableReason: string | null = null;
+
 function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -773,10 +780,12 @@ function initializeDatabase(db: Database): void {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
     _sqliteVecAvailable = true;
+    _sqliteVecUnavailableReason = null;
   } catch (err) {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
-    console.warn(getErrorMessage(err));
+    _sqliteVecUnavailableReason = getErrorMessage(err);
+    console.warn(_sqliteVecUnavailableReason);
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -1091,7 +1100,9 @@ export function isSqliteVecAvailable(): boolean {
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
-    throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
+    throw createSqliteVecUnavailableError(
+      _sqliteVecUnavailableReason ?? "vector operations require a SQLite build with extension loading support"
+    );
   }
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
@@ -1177,6 +1188,7 @@ export type Store = {
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
@@ -1267,7 +1279,7 @@ export async function reindexCollection(
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    const existing = findActiveDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1690,6 +1702,7 @@ export function createStore(dbPath?: string): Store {
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
     insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
+    findOrMigrateLegacyDocument: (collectionName: string, path: string) => findOrMigrateLegacyDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
@@ -1735,11 +1748,11 @@ export function getDocid(hash: string): string {
 /**
  * Handelize a filename to be more token-friendly.
  * - Convert triple underscore `___` to `/` (folder separator)
- * - Convert to lowercase
  * - Replace sequences of non-word chars (except /) with single dash
  * - Remove leading/trailing dashes from path segments
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
+ * - Preserve original case (important for case-sensitive filesystems)
  */
 /** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
 function emojiToHex(str: string): string {
@@ -1767,7 +1780,6 @@ export function handelize(path: string): string {
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
@@ -2231,6 +2243,57 @@ export function findActiveDocument(
 }
 
 /**
+ * Find an active document, falling back to a legacy lowercase path.
+ * If found under the legacy path, renames it in-place and rebuilds the
+ * FTS entry. Embeddings are keyed by content hash, so the rename is
+ * safe — no re-embedding required.
+ *
+ * @internal Used by reindexCollection and indexFiles during qmd update.
+ * Returns null if the document does not exist under either path.
+ */
+export function findOrMigrateLegacyDocument(
+  db: Database,
+  collectionName: string,
+  path: string
+): { id: number; hash: string; title: string } | null {
+  const existing = findActiveDocument(db, collectionName, path);
+  if (existing) return existing;
+
+  const legacyPath = path.toLowerCase();
+  if (legacyPath === path) return null;
+
+  const legacy = findActiveDocument(db, collectionName, legacyPath);
+  if (!legacy) return null;
+
+  // Wrap rename + FTS rebuild in a transaction for atomicity.
+  const migrate = db.transaction(() => {
+    // Use OR IGNORE so a UNIQUE conflict (e.g. both "readme.md" and
+    // "README.md" already exist) is a no-op rather than crashing.
+    const result = db.prepare(
+      `UPDATE OR IGNORE documents SET path = ? WHERE id = ? AND active = 1`
+    ).run(path, legacy.id);
+
+    if (result.changes === 0) return false;
+
+    // FTS5 does not reliably update via the documents_au trigger's
+    // INSERT OR REPLACE. Manually rebuild the FTS entry.
+    db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(legacy.id);
+    db.prepare(`
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT id, collection || '/' || path, title,
+             (SELECT doc FROM content WHERE hash = documents.hash)
+      FROM documents WHERE id = ?
+    `).run(legacy.id);
+
+    return true;
+  });
+
+  if (!migrate()) return null;
+
+  return findActiveDocument(db, collectionName, path);
+}
+
+/**
  * Update the title and modified_at timestamp for a document.
  */
 export function updateDocumentTitle(
@@ -2355,33 +2418,67 @@ export async function chunkDocumentByTokens(
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
+  const clampOverlapChars = (value: number, maxChars: number): number => {
+    if (maxChars <= 1) return 0;
+    return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
+  };
+
+  const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+    if (signal?.aborted) return;
+
+    const tokens = await llm.tokenize(text);
+    if (tokens.length <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokens.length });
+      return;
+    }
+
+    const actualCharsPerToken = text.length / tokens.length;
+    let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+    if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+      safeMaxChars = Math.floor(text.length / 2);
+    }
+    safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+    let nextOverlapChars = clampOverlapChars(
+      overlapChars * actualCharsPerToken / 2,
+      safeMaxChars,
+    );
+    let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+    let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+    // Pathological single-line blobs can produce no meaningful breakpoint progress.
+    // Fall back to a simple half split so every recursion step strictly shrinks.
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+      nextOverlapChars = 0;
+      nextWindowChars = 0;
+      subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+    }
+
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+      const truncatedText = await llm.detokenize(fallbackTokens);
+      results.push({
+        text: truncatedText,
+        pos,
+        tokens: fallbackTokens.length,
+      });
+      return;
+    }
+
+    for (const subChunk of subChunks) {
+      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+    }
+  };
 
   for (const chunk of charChunks) {
-    // Respect abort signal to avoid runaway tokenization
-    if (signal?.aborted) break;
-
-    const tokens = await llm.tokenize(chunk.text);
-
-    if (tokens.length <= maxTokens) {
-      results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
-    } else {
-      // Chunk is still too large - split it further
-      // Use actual token count to estimate better char limit
-      const actualCharsPerToken = chunk.text.length / tokens.length;
-      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
-
-      const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
-
-      for (const subChunk of subChunks) {
-        if (signal?.aborted) break;
-        const subTokens = await llm.tokenize(subChunk.text);
-        results.push({
-          text: subChunk.text,
-          pos: chunk.pos + subChunk.pos,
-          tokens: subTokens.length,
-        });
-      }
-    }
+    await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
   }
 
   return results;

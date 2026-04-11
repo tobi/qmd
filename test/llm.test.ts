@@ -194,6 +194,32 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   });
 });
 
+describe("LlamaCpp embedding truncation", () => {
+  test("truncates against the active embedding context limit, not the model train context", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const getEmbeddingFor = vi.fn(async (text: string) => ({
+      vector: new Float32Array([0.25, 0.5]),
+      text,
+    }));
+
+    llm.touchActivity = vi.fn();
+    llm.embedModel = {
+      trainContextSize: 8192,
+      tokenize: (text: string) => Array.from({ length: text.length }, () => 1),
+      detokenize: (tokens: readonly number[]) => "x".repeat(tokens.length),
+    };
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
+
+    const result = await llm.embed("x".repeat(3000));
+
+    expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
+    expect(result).toEqual({
+      embedding: [0.25, 0.5],
+      model: llm.embedModelUri,
+    });
+  });
+});
+
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
     const llm = new LlamaCpp({}) as any;

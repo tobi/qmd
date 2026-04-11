@@ -339,6 +339,20 @@ describe("Store Creation", () => {
     }
   });
 
+  test("ensureVecTable surfaces actionable sqlite-vec guidance", async () => {
+    const store = await createTestStore();
+    try {
+      if (typeof process.getBuiltinModule === "function") {
+        expect(() => store.ensureVecTable(768)).not.toThrow();
+      } else {
+        expect(() => store.ensureVecTable(768)).toThrow(/sqlite-vec extension is unavailable/);
+        expect(() => store.ensureVecTable(768)).toThrow(/Install Homebrew SQLite/);
+      }
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("store.close closes the database connection", async () => {
     const store = await createTestStore();
     store.close();
@@ -2871,6 +2885,31 @@ describe("Embedding batching", () => {
   });
 });
 
+describe("Token chunking guardrails", () => {
+  test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("x".repeat(1200), 100, 15, 20);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.tokens <= 100)).toBe(true);
+      for (let i = 1; i < chunks.length; i++) {
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+});
+
 // =============================================================================
 // Content-Addressable Storage Tests
 // =============================================================================
@@ -3080,6 +3119,75 @@ describe("Content-Addressable Storage", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("findOrMigrateLegacyDocument renames lowercase path to case-preserved", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const content = "# My Skill";
+    const hash = await hashContent(content);
+    store.insertContent(hash, content, now);
+    // Simulate legacy index: path stored as lowercase
+    store.insertDocument(collectionName, "skills/skill.md", "My Skill", hash, now, now);
+
+    // Migration: look up case-preserved path, expect rename
+    const result = store.findOrMigrateLegacyDocument(collectionName, "skills/SKILL.md");
+    expect(result).not.toBeNull();
+    expect(result!.hash).toBe(hash);
+
+    // Old lowercase path should no longer be findable
+    expect(store.findActiveDocument(collectionName, "skills/skill.md")).toBeNull();
+    // New case-preserved path should be active
+    const migrated = store.findActiveDocument(collectionName, "skills/SKILL.md");
+    expect(migrated).not.toBeNull();
+    expect(migrated!.hash).toBe(hash);
+
+    // FTS should reflect the new path (documents_au trigger)
+    const ftsRow = store.db.prepare(
+      `SELECT filepath FROM documents_fts WHERE rowid = ?`
+    ).get(result!.id) as { filepath: string } | undefined;
+    expect(ftsRow).toBeDefined();
+    expect(ftsRow!.filepath).toContain("SKILL.md");
+
+    await cleanupTestDb(store);
+  });
+
+  test("findOrMigrateLegacyDocument returns null when path is already lowercase", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // No document exists at all
+    const result = store.findOrMigrateLegacyDocument(collectionName, "readme.md");
+    expect(result).toBeNull();
+
+    await cleanupTestDb(store);
+  });
+
+  test("findOrMigrateLegacyDocument returns existing doc when canonical path already present", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const content = "# Content";
+    const hash = await hashContent(content);
+    store.insertContent(hash, content, now);
+    // Both lowercase and case-preserved paths exist (edge case from prior partial migration)
+    store.insertDocument(collectionName, "readme.md", "Readme", hash, now, now);
+    store.insertDocument(collectionName, "README.md", "README", hash, now, now);
+
+    // Should return the canonical-path document directly (fast path)
+    // The legacy "readme.md" row is untouched — no rename attempted.
+    const result = store.findOrMigrateLegacyDocument(collectionName, "README.md");
+    expect(result).not.toBeNull();
+    expect(result!.hash).toBe(hash);
+
+    // Both rows still exist (legacy row not migrated, not deactivated here)
+    expect(store.findActiveDocument(collectionName, "readme.md")).not.toBeNull();
+    expect(store.findActiveDocument(collectionName, "README.md")).not.toBeNull();
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
@@ -3217,6 +3325,14 @@ describe("parseVirtualPath", () => {
     expect(parseVirtualPath("qmd:////collection/path.md")).toEqual({
       collectionName: "collection",
       path: "path.md",
+    });
+  });
+
+  test("parses qmd:// paths with index query parameters", () => {
+    expect(parseVirtualPath("qmd://collection/path.md?index=docs-v2")).toEqual({
+      collectionName: "collection",
+      path: "path.md",
+      indexName: "docs-v2",
     });
   });
 
