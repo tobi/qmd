@@ -69,6 +69,7 @@ export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
+  transaction<T>(fn: () => T): () => T;
   close(): void;
 }
 

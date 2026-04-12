@@ -48,8 +48,12 @@ export interface ModelsConfig {
 export interface EmbeddingProviderConfig {
   provider?: 'local' | 'openai';  // Default: 'local'
   openai?: {
-    api_key?: string;             // Falls back to OPENAI_API_KEY env var
+    api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
     model?: string;               // Default: 'text-embedding-3-small'
+    expansion_model?: string;     // Default: 'gpt-4o-mini'
+    base_url?: string;            // Base URL for embeddings (OpenAI-compatible)
+    chat_base_url?: string;       // Separate base URL for expansion/reranking (falls back to base_url)
+    chat_api_key?: string;        // Separate API key for chat endpoint (falls back to api_key)
   };
 }
 

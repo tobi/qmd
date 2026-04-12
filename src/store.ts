@@ -3135,7 +3135,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // When filtering by collection, fetch extra candidates from the FTS index
   // since some will be filtered out. Without a collection filter we can
   // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  const ftsLimit = collections ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (

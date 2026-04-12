@@ -24,6 +24,8 @@ export type OpenAIConfig = {
   embedModel?: string;
   expansionModel?: string;
   baseURL?: string;
+  chatBaseURL?: string;
+  chatApiKey?: string;
 };
 
 const DEFAULT_EMBED_MODEL = 'text-embedding-3-small';
@@ -101,14 +103,22 @@ async function withRetry<T>(
  */
 export class OpenAIEmbedding implements LLM {
   private client: OpenAI;
+  private chatClient: OpenAI;
   private embedModel: string;
   private expansionModel: string;
 
   constructor(config: OpenAIConfig = {}) {
-    this.client = new OpenAI({ 
-      apiKey: config.apiKey || process.env.OPENAI_API_KEY,
-      baseURL: config.baseURL,
-    });
+    const apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+    const baseURL = config.baseURL || process.env.QMD_OPENAI_BASE_URL;
+
+    this.client = new OpenAI({ apiKey, baseURL });
+
+    const chatApiKey = config.chatApiKey || process.env.QMD_OPENAI_CHAT_API_KEY || apiKey;
+    const chatBaseURL = config.chatBaseURL || process.env.QMD_OPENAI_CHAT_BASE_URL || baseURL;
+    this.chatClient = (chatBaseURL !== baseURL || chatApiKey !== apiKey)
+      ? new OpenAI({ apiKey: chatApiKey, baseURL: chatBaseURL })
+      : this.client;
+
     this.embedModel = config.embedModel || DEFAULT_EMBED_MODEL;
     this.expansionModel = config.expansionModel || DEFAULT_EXPANSION_MODEL;
   }
@@ -166,7 +176,7 @@ export class OpenAIEmbedding implements LLM {
     const includeLexical = options?.includeLexical ?? true;
     
     try {
-      const response = await withRetry(() => this.client.chat.completions.create({
+      const response = await withRetry(() => this.chatClient.chat.completions.create({
         model: this.expansionModel,
         messages: [
           {
@@ -251,7 +261,7 @@ Generate 1-2 of each type. Be concise. Include the original query terms.`
         `[${i}] ${doc.title ? doc.title + ': ' : ''}${doc.text.slice(0, 500).replace(/\n+/g, ' ')}`
       );
 
-      const response = await withRetry(() => this.client.chat.completions.create({
+      const response = await withRetry(() => this.chatClient.chat.completions.create({
         model: this.expansionModel,
         messages: [
           {
