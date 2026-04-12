@@ -51,9 +51,12 @@ export interface EmbeddingProviderConfig {
     api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
     model?: string;               // Default: 'text-embedding-3-small'
     expansion_model?: string;     // Default: 'gpt-4o-mini'
+    rerank_model?: string;        // Default: falls back to expansion_model
     base_url?: string;            // Base URL for embeddings (OpenAI-compatible)
-    chat_base_url?: string;       // Separate base URL for expansion/reranking (falls back to base_url)
+    chat_base_url?: string;       // Separate base URL for expansion (falls back to base_url)
     chat_api_key?: string;        // Separate API key for chat endpoint (falls back to api_key)
+    rerank_base_url?: string;     // Separate base URL for reranking (falls back to chat_base_url)
+    rerank_api_key?: string;      // Separate API key for rerank endpoint (falls back to chat_api_key)
   };
 }
 

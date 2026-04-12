@@ -2855,9 +2855,12 @@ if (isMain) {
         apiKey: embeddingYamlConfig.openai?.api_key,
         embedModel: embeddingYamlConfig.openai?.model,
         expansionModel: embeddingYamlConfig.openai?.expansion_model,
+        rerankModel: embeddingYamlConfig.openai?.rerank_model,
         baseURL: embeddingYamlConfig.openai?.base_url,
         chatBaseURL: embeddingYamlConfig.openai?.chat_base_url,
         chatApiKey: embeddingYamlConfig.openai?.chat_api_key,
+        rerankBaseURL: embeddingYamlConfig.openai?.rerank_base_url,
+        rerankApiKey: embeddingYamlConfig.openai?.rerank_api_key,
       },
     });
   }

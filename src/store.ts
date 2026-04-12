@@ -27,6 +27,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  withEmbeddingSession,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -1432,12 +1433,7 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
-  const embedModelUri = llm.embedModelName;
-
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  const result = await withEmbeddingSession(async (session, embedModelUri) => {
     let chunksEmbedded = 0;
     let errors = 0;
     let bytesProcessed = 0;
@@ -1581,7 +1577,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings', storeLlm: store.llm ?? undefined });
 
   return {
     docsProcessed: totalDocs,
@@ -3379,12 +3375,6 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
-  // Skip query expansion when using OpenAI (avoids loading local model)
-  // Return a lex query to let BM25 handle it
-  if (isUsingOpenAI()) {
-    return [{ type: 'lex' as const, query }];
-  }
-
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3402,8 +3392,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : (llmOverride ?? getDefaultLlamaCpp());
   const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -4612,8 +4601,9 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.embedModelName));
+      const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
+      const modelName = isUsingOpenAI() ? llm.getModelName() : (llm as LlamaCpp).embedModelName;
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, modelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);

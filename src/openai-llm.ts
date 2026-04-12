@@ -23,9 +23,12 @@ export type OpenAIConfig = {
   apiKey?: string;
   embedModel?: string;
   expansionModel?: string;
+  rerankModel?: string;
   baseURL?: string;
   chatBaseURL?: string;
   chatApiKey?: string;
+  rerankBaseURL?: string;
+  rerankApiKey?: string;
 };
 
 const DEFAULT_EMBED_MODEL = 'text-embedding-3-small';
@@ -104,8 +107,10 @@ async function withRetry<T>(
 export class OpenAIEmbedding implements LLM {
   private client: OpenAI;
   private chatClient: OpenAI;
+  private rerankClient: OpenAI;
   private embedModel: string;
   private expansionModel: string;
+  private rerankModel: string;
 
   constructor(config: OpenAIConfig = {}) {
     const apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
@@ -119,8 +124,16 @@ export class OpenAIEmbedding implements LLM {
       ? new OpenAI({ apiKey: chatApiKey, baseURL: chatBaseURL })
       : this.client;
 
+    // Rerank client: falls back to chat client, then base client
+    const rerankApiKey = config.rerankApiKey || process.env.QMD_OPENAI_RERANK_API_KEY || chatApiKey;
+    const rerankBaseURL = config.rerankBaseURL || process.env.QMD_OPENAI_RERANK_BASE_URL || chatBaseURL;
+    this.rerankClient = (rerankBaseURL !== chatBaseURL || rerankApiKey !== chatApiKey)
+      ? new OpenAI({ apiKey: rerankApiKey, baseURL: rerankBaseURL })
+      : this.chatClient;
+
     this.embedModel = config.embedModel || DEFAULT_EMBED_MODEL;
     this.expansionModel = config.expansionModel || DEFAULT_EXPANSION_MODEL;
+    this.rerankModel = config.rerankModel || config.expansionModel || DEFAULT_EXPANSION_MODEL;
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
@@ -240,7 +253,7 @@ Generate 1-2 of each type. Be concise. Include the original query terms.`
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
     if (documents.length === 0) {
-      return { results: [], model: `${this.expansionModel}-rerank` };
+      return { results: [], model: `${this.rerankModel}-rerank` };
     }
 
     // For very small sets, skip the API call — not worth the latency
@@ -257,12 +270,12 @@ Generate 1-2 of each type. Be concise. Include the original query terms.`
 
     try {
       // Truncate documents for the prompt — 500 chars each is enough for relevance judgment
-      const truncated = documents.map((doc, i) => 
+      const truncated = documents.map((doc, i) =>
         `[${i}] ${doc.title ? doc.title + ': ' : ''}${doc.text.slice(0, 500).replace(/\n+/g, ' ')}`
       );
 
-      const response = await withRetry(() => this.chatClient.chat.completions.create({
-        model: this.expansionModel,
+      const response = await withRetry(() => this.rerankClient.chat.completions.create({
+        model: this.rerankModel,
         messages: [
           {
             role: 'system',
@@ -315,7 +328,7 @@ Example output for 5 documents: 2,0,4,1,3`
 
       return {
         results,
-        model: `${this.expansionModel}-rerank`,
+        model: `${this.rerankModel}-rerank`,
       };
     } catch (error) {
       // Fallback: preserve original order if reranking fails
