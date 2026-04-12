@@ -1,8 +1,9 @@
 /**
- * remote-llm.ts - OpenAI-compatible remote embedding & reranking backend
+ * remote-llm.ts - OpenAI-compatible remote embedding, reranking & query expansion backend
  *
  * Implements the LLM interface by calling HTTP endpoints (vLLM, Ollama, OpenAI, etc.).
- * Only supports embed/rerank operations — generate/expandQuery throw.
+ * Supports embed, rerank, and (when expandApiModel is set) query expansion via chat completions.
+ * generate() is not supported — use HybridLLM to pair with a local backend.
  */
 
 import type {
@@ -13,6 +14,7 @@ import type {
   GenerateResult,
   ModelInfo,
   Queryable,
+  QueryType,
   RerankDocument,
   RerankOptions,
   RerankResult,
@@ -35,6 +37,14 @@ export type RemoteLLMConfig = {
   rerankApiModel?: string;
   /** Optional bearer token for rerank endpoint */
   rerankApiKey?: string;
+  /** Base URL for query expansion endpoint (defaults to embedApiUrl) */
+  expandApiUrl?: string;
+  /** Model name for query expansion via chat completions (enables remote expansion when set) */
+  expandApiModel?: string;
+  /** Optional bearer token for expansion endpoint (defaults to embedApiKey) */
+  expandApiKey?: string;
+  /** Read timeout for query expansion in ms (default: 30000) */
+  expandReadTimeoutMs?: number;
   /** Connect timeout in ms (default: 5000) */
   connectTimeoutMs?: number;
   /** Read timeout for embedding in ms (default: 30000) */
@@ -105,6 +115,7 @@ export class RemoteLLM implements LLM {
 
   private readonly embedBreaker = new CircuitBreaker();
   private readonly rerankBreaker = new CircuitBreaker();
+  private readonly expandBreaker = new CircuitBreaker();
   private expectedDimensions: number | null = null;
 
   constructor(config: RemoteLLMConfig) {
@@ -119,6 +130,11 @@ export class RemoteLLM implements LLM {
 
   get embedModelName(): string {
     return this.config.embedApiModel;
+  }
+
+  /** True when expandApiModel is configured and remote query expansion is available. */
+  get supportsExpand(): boolean {
+    return !!this.config.expandApiModel;
   }
 
   // ---------------------------------------------------------------------------
@@ -282,8 +298,71 @@ export class RemoteLLM implements LLM {
     return { name: this.config.embedApiModel, exists: true };
   }
 
-  async expandQuery(_query: string, _options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
-    throw new Error("RemoteLLM does not support query expansion — use HybridLLM to route expansion to a local backend");
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
+    if (!this.config.expandApiModel) {
+      throw new Error("RemoteLLM: expandApiModel not configured — set expandApiUrl and expandApiModel to enable remote query expansion");
+    }
+
+    if (!this.expandBreaker.canAttempt()) {
+      throw new Error(
+        `Remote query expansion circuit breaker is open — endpoint unavailable. Will retry after cooldown.`
+      );
+    }
+
+    const expandUrl = this.config.expandApiUrl || this.config.embedApiUrl;
+    const expandKey = this.config.expandApiKey || this.config.embedApiKey;
+    const includeLexical = options?.includeLexical ?? true;
+    const intent = options?.intent;
+
+    const systemPrompt =
+      "You are a search query expansion assistant. " +
+      "Given a search query, produce expanded variants in EXACTLY this format:\n" +
+      "lex: <keyword/BM25 variant>\n" +
+      "vec: <semantic paraphrase>\n" +
+      "hyde: <one-sentence hypothetical document excerpt>\n\n" +
+      "Output only those three lines. No explanation, no extra text.";
+
+    const userPrompt = intent
+      ? `Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `Expand this search query: ${query}`;
+
+    const url = normalizeUrl(expandUrl, "/chat/completions");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (expandKey) headers["Authorization"] = `Bearer ${expandKey}`;
+
+    const body = JSON.stringify({
+      model: this.config.expandApiModel,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.7,
+      max_tokens: 200,
+    });
+
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers,
+        body,
+      }, this.config.expandReadTimeoutMs ?? 30000);
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`Query expansion API returned ${response.status}: ${errText}`);
+      }
+
+      const json = await response.json() as {
+        choices: { message: { content: string } }[];
+      };
+      const content = json.choices[0]?.message?.content ?? "";
+
+      this.expandBreaker.onSuccess();
+      return parseExpandResponse(content, query, includeLexical);
+    } catch (err) {
+      this.expandBreaker.onFailure();
+      throw err;
+    }
   }
 
   async dispose(): Promise<void> {
@@ -294,6 +373,45 @@ export class RemoteLLM implements LLM {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/**
+ * Parse the chat completion response from the expand endpoint into Queryable[].
+ * Expects lines in "type: content" format where type ∈ {lex, vec, hyde}.
+ */
+function parseExpandResponse(content: string, originalQuery: string, includeLexical: boolean): Queryable[] {
+  const lines = content.trim().split("\n");
+  const queryTerms = originalQuery.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const hasQueryTerm = (text: string): boolean => {
+    if (queryTerms.length === 0) return true;
+    const lower = text.toLowerCase();
+    return queryTerms.some(term => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines.flatMap(line => {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) return [];
+    const type = line.slice(0, colonIdx).trim() as QueryType;
+    if (type !== "lex" && type !== "vec" && type !== "hyde") return [];
+    const text = line.slice(colonIdx + 1).trim();
+    if (!text || !hasQueryTerm(text)) return [];
+    return [{ type, text }];
+  });
+
+  const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+  if (filtered.length > 0) return filtered;
+
+  // Fallback when model output couldn't be parsed
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${originalQuery}` },
+    { type: "lex", text: originalQuery },
+    { type: "vec", text: originalQuery },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
+}
 
 /**
  * Normalize a base URL and append a path, handling trailing slashes.
@@ -332,6 +450,9 @@ export function remoteConfigFromEnv(yamlModels?: {
   rerank_api_url?: string;
   rerank_api_model?: string;
   rerank_api_key?: string;
+  expand_api_url?: string;
+  expand_api_model?: string;
+  expand_api_key?: string;
 }): RemoteLLMConfig | null {
   const embedApiUrl = process.env.QMD_EMBED_API_URL || yamlModels?.embed_api_url;
   const embedApiModel = process.env.QMD_EMBED_API_MODEL || yamlModels?.embed_api_model;
@@ -345,9 +466,13 @@ export function remoteConfigFromEnv(yamlModels?: {
     rerankApiUrl: process.env.QMD_RERANK_API_URL || yamlModels?.rerank_api_url,
     rerankApiModel: process.env.QMD_RERANK_API_MODEL || yamlModels?.rerank_api_model,
     rerankApiKey: process.env.QMD_RERANK_API_KEY || yamlModels?.rerank_api_key,
+    expandApiUrl: process.env.QMD_EXPAND_API_URL || yamlModels?.expand_api_url,
+    expandApiModel: process.env.QMD_EXPAND_API_MODEL || yamlModels?.expand_api_model,
+    expandApiKey: process.env.QMD_EXPAND_API_KEY || yamlModels?.expand_api_key,
     connectTimeoutMs: parseEnvInt("QMD_REMOTE_CONNECT_TIMEOUT", 5000),
     embedReadTimeoutMs: parseEnvInt("QMD_REMOTE_READ_TIMEOUT", 30000),
     rerankReadTimeoutMs: parseEnvInt("QMD_REMOTE_RERANK_TIMEOUT", 60000),
+    expandReadTimeoutMs: parseEnvInt("QMD_REMOTE_EXPAND_TIMEOUT", 30000),
     maxBatchSize: parseEnvInt("QMD_REMOTE_BATCH_SIZE", 32),
   };
 }

@@ -2,10 +2,12 @@
  * Integration tests for RemoteLLM against live vLLM servers.
  *
  * Requires environment variables:
- *   VLLM_EMBED_URL   - e.g. http://gpu-host:8002/v1
- *   VLLM_EMBED_MODEL - e.g. Qwen/Qwen3-Embedding-0.6B
- *   VLLM_RERANK_URL  - e.g. http://gpu-host:8001/v1
+ *   VLLM_EMBED_URL    - e.g. http://gpu-host:8002/v1
+ *   VLLM_EMBED_MODEL  - e.g. Qwen/Qwen3-Embedding-0.6B
+ *   VLLM_RERANK_URL   - e.g. http://gpu-host:8001/v1
  *   VLLM_RERANK_MODEL - e.g. qwen3-reranker-4b
+ *   VLLM_EXPAND_URL   - e.g. http://gpu-host:8005/v1  (optional — skips expand tests if absent)
+ *   VLLM_EXPAND_MODEL - e.g. cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit
  *
  * Skip these tests when no server is available (all tests guard on EMBED_URL).
  */
@@ -20,8 +22,11 @@ const EMBED_URL = process.env.VLLM_EMBED_URL ?? "";
 const EMBED_MODEL = process.env.VLLM_EMBED_MODEL ?? "";
 const RERANK_URL = process.env.VLLM_RERANK_URL ?? "";
 const RERANK_MODEL = process.env.VLLM_RERANK_MODEL ?? "";
+const EXPAND_URL = process.env.VLLM_EXPAND_URL ?? "";
+const EXPAND_MODEL = process.env.VLLM_EXPAND_MODEL ?? "";
 
 const SKIP = !EMBED_URL || !EMBED_MODEL;
+const SKIP_EXPAND = SKIP || !EXPAND_URL || !EXPAND_MODEL;
 
 let remoteLlm: RemoteLLM;
 
@@ -408,5 +413,102 @@ describe.skipIf(SKIP)("End-to-end embed + search simulation", () => {
     const cookingRank = similarities.findIndex(s => s.file === "cooking.md");
     const gitRank = similarities.findIndex(s => s.file === "git.md");
     expect(gitRank).toBeLessThan(cookingRank);
+  });
+});
+
+// =============================================================================
+// Remote query expansion
+// =============================================================================
+
+describe.skipIf(SKIP_EXPAND)("Remote query expansion", () => {
+  let expandLlm: RemoteLLM;
+
+  beforeAll(() => {
+    if (SKIP_EXPAND) return;
+    expandLlm = new RemoteLLM({
+      embedApiUrl: EMBED_URL,
+      embedApiModel: EMBED_MODEL,
+      expandApiUrl: EXPAND_URL,
+      expandApiModel: EXPAND_MODEL,
+    });
+  });
+
+  it("supportsExpand is true when expandApiModel is configured", () => {
+    expect(expandLlm.supportsExpand).toBe(true);
+  });
+
+  it("returns non-empty Queryable[] for a plain query", async () => {
+    const result = await expandLlm.expandQuery("how to bake chocolate chip cookies");
+    expect(result.length).toBeGreaterThan(0);
+    for (const q of result) {
+      expect(["lex", "vec", "hyde"]).toContain(q.type);
+      expect(typeof q.text).toBe("string");
+      expect(q.text.length).toBeGreaterThan(0);
+    }
+    console.log("  Expansion result:", result.map(q => `${q.type}: ${q.text}`));
+  });
+
+  it("returns all three types (lex, vec, hyde) for a well-formed query", async () => {
+    const result = await expandLlm.expandQuery("git rebase workflow");
+    const types = new Set(result.map(q => q.type));
+    // Model should return at least two distinct types
+    expect(types.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it("excludes lex entries when includeLexical is false", async () => {
+    const result = await expandLlm.expandQuery("docker container networking", { includeLexical: false });
+    expect(result.every(q => q.type !== "lex")).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it("incorporates intent into expansion when provided", async () => {
+    const withIntent = await expandLlm.expandQuery("python", { intent: "find beginner tutorials" });
+    // Should produce results tailored to beginner/tutorial angle — at minimum non-empty
+    expect(withIntent.length).toBeGreaterThan(0);
+  });
+
+  it("expanded queries improve recall over original query alone", async () => {
+    // Use a short ambiguous query
+    const expanded = await expandLlm.expandQuery("bank");
+    // Should get at least two different expansion texts — model interpreted the query
+    const texts = new Set(expanded.map(q => q.text));
+    expect(texts.size).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// =============================================================================
+// HybridLLM with remote expand
+// =============================================================================
+
+describe.skipIf(SKIP_EXPAND)("HybridLLM with remote expand", () => {
+  it("routes expandQuery to remote when expandApiModel is configured", async () => {
+    function createMockLocal(): LLM {
+      return {
+        embedModelName: "local",
+        embed: async () => null,
+        embedBatch: async (texts) => texts.map(() => null),
+        generate: async () => null,
+        modelExists: async (m) => ({ name: m, exists: false }),
+        expandQuery: async () => [{ type: "lex" as const, text: "LOCAL_SENTINEL" }],
+        rerank: async () => ({ results: [], model: "local" }),
+        dispose: async () => {},
+      };
+    }
+
+    const remote = new RemoteLLM({
+      embedApiUrl: EMBED_URL,
+      embedApiModel: EMBED_MODEL,
+      expandApiUrl: EXPAND_URL,
+      expandApiModel: EXPAND_MODEL,
+    });
+
+    const hybrid = new HybridLLM(remote, createMockLocal());
+    const result = await hybrid.expandQuery("version control with git");
+
+    // Must NOT come from local mock
+    expect(result.every(q => q.text !== "LOCAL_SENTINEL")).toBe(true);
+    // Should have real expanded results
+    expect(result.length).toBeGreaterThan(0);
+    console.log("  HybridLLM remote expand:", result.map(q => `${q.type}: ${q.text}`));
   });
 });

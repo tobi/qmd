@@ -300,9 +300,148 @@ describe("RemoteLLM", () => {
       await expect(llm.generate("prompt")).rejects.toThrow("does not support text generation");
     });
 
-    it("should throw on expandQuery", async () => {
+    it("should throw on expandQuery when expandApiModel not configured", async () => {
       const llm = createRemoteLLM();
-      await expect(llm.expandQuery("query")).rejects.toThrow("does not support query expansion");
+      await expect(llm.expandQuery("query")).rejects.toThrow("expandApiModel not configured");
+    });
+  });
+
+  // ===========================================================================
+  // expandQuery
+  // ===========================================================================
+
+  describe("expandQuery", () => {
+    function createExpandLLM(overrides?: Partial<RemoteLLMConfig>): RemoteLLM {
+      return createRemoteLLM({ expandApiModel: "expand-model", ...overrides });
+    }
+
+    function expandResponse(content: string) {
+      return {
+        status: 200,
+        body: { choices: [{ message: { content } }] },
+      };
+    }
+
+    it("supportsExpand is false without expandApiModel", () => {
+      expect(createRemoteLLM().supportsExpand).toBe(false);
+    });
+
+    it("supportsExpand is true with expandApiModel", () => {
+      expect(createExpandLLM().supportsExpand).toBe(true);
+    });
+
+    it("calls /chat/completions with correct payload", async () => {
+      let capturedBody: any;
+      setMockHandler((req, body) => {
+        expect(req.url).toBe("/v1/chat/completions");
+        capturedBody = JSON.parse(body);
+        return expandResponse("lex: foo keywords\nvec: foo semantic\nhyde: A document about foo");
+      });
+
+      await createExpandLLM().expandQuery("foo");
+
+      expect(capturedBody.model).toBe("expand-model");
+      expect(capturedBody.messages).toHaveLength(2);
+      expect(capturedBody.messages[0].role).toBe("system");
+      expect(capturedBody.messages[1].role).toBe("user");
+      expect(capturedBody.messages[1].content).toContain("foo");
+    });
+
+    it("includes intent in user prompt when provided", async () => {
+      let userContent = "";
+      setMockHandler((_req, body) => {
+        userContent = JSON.parse(body).messages[1].content;
+        return expandResponse("lex: foo\nvec: foo semantic\nhyde: A document about foo");
+      });
+
+      await createExpandLLM().expandQuery("foo", { intent: "find documentation" });
+      expect(userContent).toContain("find documentation");
+    });
+
+    it("sends Authorization header for expand endpoint", async () => {
+      let authHeader: string | undefined;
+      setMockHandler((req) => {
+        authHeader = req.headers["authorization"] as string;
+        return expandResponse("lex: t\nvec: t semantic\nhyde: A document about t");
+      });
+
+      await createExpandLLM({ expandApiKey: "expand-secret" }).expandQuery("t");
+      expect(authHeader).toBe("Bearer expand-secret");
+    });
+
+    it("falls back to embedApiKey when expandApiKey not set", async () => {
+      let authHeader: string | undefined;
+      setMockHandler((req) => {
+        authHeader = req.headers["authorization"] as string;
+        return expandResponse("lex: t\nvec: t semantic\nhyde: A document about t");
+      });
+
+      await createExpandLLM({ embedApiKey: "embed-key" }).expandQuery("t");
+      expect(authHeader).toBe("Bearer embed-key");
+    });
+
+    it("parses lex/vec/hyde lines into Queryable[]", async () => {
+      setMockHandler(() =>
+        expandResponse(
+          "lex: chocolate chip cookies keywords\n" +
+          "vec: how to bake chocolate chip cookies\n" +
+          "hyde: Preheat oven to 375F and mix chocolate chips into the dough before baking"
+        )
+      );
+
+      const result = await createExpandLLM().expandQuery("chocolate chip cookies");
+
+      expect(result).toHaveLength(3);
+      expect(result.find(q => q.type === "lex")?.text).toBe("chocolate chip cookies keywords");
+      expect(result.find(q => q.type === "vec")?.text).toBe("how to bake chocolate chip cookies");
+      expect(result.find(q => q.type === "hyde")?.text).toContain("chocolate");
+    });
+
+    it("excludes lex entries when includeLexical is false", async () => {
+      setMockHandler(() =>
+        expandResponse("lex: foo keywords\nvec: foo semantic\nhyde: A document about foo")
+      );
+
+      const result = await createExpandLLM().expandQuery("foo", { includeLexical: false });
+
+      expect(result.every(q => q.type !== "lex")).toBe(true);
+      expect(result.length).toBeGreaterThan(0);
+    });
+
+    it("returns fallback Queryable[] when model output is unparseable", async () => {
+      setMockHandler(() => expandResponse("Sorry, I cannot help with that."));
+
+      const result = await createExpandLLM().expandQuery("cats");
+
+      expect(result.length).toBeGreaterThan(0);
+      expect(result.some(q => q.text === "cats")).toBe(true);
+    });
+
+    it("skips lines whose text shares no term with the original query", async () => {
+      setMockHandler(() =>
+        // "completely different" shares no words with "cats"
+        expandResponse("lex: completely different\nvec: cats semantic paraphrase\nhyde: A document about cats")
+      );
+
+      const result = await createExpandLLM().expandQuery("cats");
+
+      const lexEntry = result.find(q => q.type === "lex");
+      expect(lexEntry?.text).not.toBe("completely different");
+    });
+
+    it("opens circuit breaker after repeated expansion failures", async () => {
+      setMockHandler(() => ({ status: 503, body: { error: "unavailable" } }));
+
+      const llm = createExpandLLM();
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.expandQuery("query")).rejects.toThrow("503");
+      }
+      await expect(llm.expandQuery("query")).rejects.toThrow("circuit breaker");
+    });
+
+    it("throws on HTTP error response", async () => {
+      setMockHandler(() => ({ status: 500, body: { error: "server error" } }));
+      await expect(createExpandLLM().expandQuery("query")).rejects.toThrow("500");
     });
   });
 });
@@ -374,13 +513,39 @@ describe("HybridLLM", () => {
     expect(result!.model).toBe("local-model");
   });
 
-  it("should route expandQuery to local", async () => {
+  it("should route expandQuery to local when expandApiModel not set", async () => {
     const local = createMockLocalLLM();
-    const remote = createRemoteLLM();
+    const remote = createRemoteLLM(); // no expandApiModel
     const hybrid = new HybridLLM(remote, local);
 
     const result = await hybrid.expandQuery("test query");
-    expect(result[0]!.text).toBe("expanded query");
+    expect(result[0]!.text).toBe("expanded query"); // from mock local
+  });
+
+  it("should route expandQuery to remote when expandApiModel is set", async () => {
+    setMockHandler((_req, body) => {
+      const parsed = JSON.parse(body);
+      expect(parsed.model).toBe("remote-expand-model");
+      return {
+        status: 200,
+        body: {
+          choices: [{
+            message: {
+              content: "lex: test keywords\nvec: test semantic\nhyde: A document about test query",
+            },
+          }],
+        },
+      };
+    });
+
+    const remote = createRemoteLLM({ expandApiModel: "remote-expand-model" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    // Should come from remote, not local mock ("expanded query")
+    expect(result.some(q => q.text === "expanded query")).toBe(false);
+    expect(result.some(q => q.type === "lex")).toBe(true);
   });
 
   it("should use remote embedModelName", async () => {
@@ -453,6 +618,37 @@ describe("remoteConfigFromEnv", () => {
     });
     expect(config!.embedApiUrl).toBe("http://env:8000/v1");
     expect(config!.embedApiModel).toBe("env-model");
+  });
+
+  it("should parse expand env vars", () => {
+    process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "bge-m3";
+    process.env.QMD_EXPAND_API_URL = "http://gpu:8001/v1";
+    process.env.QMD_EXPAND_API_MODEL = "llama3-8b";
+    process.env.QMD_EXPAND_API_KEY = "expand-key";
+
+    const config = remoteConfigFromEnv();
+    expect(config!.expandApiUrl).toBe("http://gpu:8001/v1");
+    expect(config!.expandApiModel).toBe("llama3-8b");
+    expect(config!.expandApiKey).toBe("expand-key");
+  });
+
+  it("should parse expand fields from YAML config", () => {
+    const config = remoteConfigFromEnv({
+      embed_api_url: "http://gpu:8000/v1",
+      embed_api_model: "bge-m3",
+      expand_api_model: "yaml-expand-model",
+    });
+    expect(config!.expandApiModel).toBe("yaml-expand-model");
+    expect(config!.expandApiUrl).toBeUndefined();
+  });
+
+  it("expandApiModel not set when not in env or YAML", () => {
+    const config = remoteConfigFromEnv({
+      embed_api_url: "http://gpu:8000/v1",
+      embed_api_model: "bge-m3",
+    });
+    expect(config!.expandApiModel).toBeUndefined();
   });
 });
 
