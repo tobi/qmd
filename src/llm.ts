@@ -704,6 +704,14 @@ export class LlamaCpp implements LLM {
    *      half the math cores, with at least 4 threads per context.
    */
   private async computeParallelism(perContextMB: number): Promise<number> {
+    // QMD_MAX_PARALLEL_CONTEXTS: hard cap on context count.
+    // Set to 1 in MCP mode to prevent node-llama-cpp Metal deadlocks
+    // when multiple contexts call getEmbeddingFor/rankAll via Promise.all.
+    const maxOverride = parseInt(process.env.QMD_MAX_PARALLEL_CONTEXTS ?? "", 10);
+    if (Number.isFinite(maxOverride) && maxOverride > 0) {
+      return maxOverride;
+    }
+
     const llama = await this.ensureLlama();
 
     if (llama.gpu) {
