@@ -641,7 +641,8 @@ async function updateCollections(collectionFilter?: string[]): Promise<void> {
   const needsEmbedding = getHashesNeedingEmbedding(db);
   closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  const updatedLabel = collections.length === 1 ? `'${collections[0]!.name}'` : `${collections.length} collections`;
+  console.log(`${c.green}✓ ${updatedLabel} updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
@@ -3115,7 +3116,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections(cli.opts.collection);
+      await updateCollections(cli.opts.collection ? (Array.isArray(cli.opts.collection) ? cli.opts.collection : [cli.opts.collection]) : undefined);
       break;
 
     case "embed":
