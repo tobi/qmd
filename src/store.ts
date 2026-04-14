@@ -1424,7 +1424,7 @@ export async function generateEmbeddings(
   const encoder = new TextEncoder();
 
   if (options?.force) {
-    clearAllEmbeddings(db);
+    clearAllEmbeddings(db, options?.collection);
   }
 
   const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection);
@@ -3223,9 +3223,47 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Clear all embeddings from the database (force re-index).
  * Deletes all rows from content_vectors and drops the vectors_vec table.
  */
-export function clearAllEmbeddings(db: Database): void {
-  db.exec(`DELETE FROM content_vectors`);
-  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+/**
+ * Clear embeddings for the whole index, or just for one collection.
+ *
+ * When `collection` is omitted the entire content_vectors table is emptied and
+ * the vectors_vec virtual table is dropped (it is recreated with the right
+ * dimensions on the next embed run).
+ *
+ * When `collection` is provided only the vectors belonging to documents in
+ * that collection are removed; vectors_vec is preserved so other collections
+ * keep working. vec0 virtual tables do not reliably accept IN-subquery DELETEs,
+ * so we enumerate hash_seq values first and delete per row.
+ */
+export function clearAllEmbeddings(db: Database, collection?: string): void {
+  if (!collection) {
+    db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    return;
+  }
+
+  const vecTableExists = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
+    .get();
+
+  if (vecTableExists) {
+    const hashSeqRows = db.prepare(`
+      SELECT cv.hash, cv.seq
+      FROM content_vectors cv
+      JOIN documents d ON cv.hash = d.hash
+      WHERE d.collection = ?
+    `).all(collection) as { hash: string; seq: number }[];
+
+    const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    for (const row of hashSeqRows) {
+      delVec.run(`${row.hash}_${row.seq}`);
+    }
+  }
+
+  db.prepare(`
+    DELETE FROM content_vectors
+    WHERE hash IN (SELECT DISTINCT d.hash FROM documents d WHERE d.collection = ?)
+  `).run(collection);
 }
 
 /**

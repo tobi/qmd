@@ -2846,6 +2846,43 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings with force + collection only clears that collection", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nAlpha content" });
+      await insertTestDocument(db, "beta", { name: "b1", body: "# Beta 1\n\nBeta content" });
+
+      await generateEmbeddings(store);
+
+      const vectorsByCollection = (): Record<string, number> => {
+        const rows = db.prepare(`
+          SELECT d.collection, COUNT(DISTINCT cv.hash) as count
+          FROM content_vectors cv
+          JOIN documents d ON cv.hash = d.hash
+          WHERE d.active = 1
+          GROUP BY d.collection
+        `).all() as { collection: string; count: number }[];
+        return Object.fromEntries(rows.map(r => [r.collection, r.count]));
+      };
+
+      expect(vectorsByCollection()).toEqual({ alpha: 1, beta: 1 });
+
+      // Force re-embed scoped to alpha must NOT wipe beta's vectors.
+      const result = await generateEmbeddings(store, { force: true, collection: "alpha" });
+      expect(result.docsProcessed).toBe(1);
+      expect(vectorsByCollection()).toEqual({ alpha: 1, beta: 1 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
