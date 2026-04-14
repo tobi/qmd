@@ -92,6 +92,9 @@
           outputHashMode = "recursive";
         };
 
+        runtimeLibraryPath = pkgs.lib.makeLibraryPath ([ pkgs.sqlite ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.stdenv.cc.cc.lib ]);
+
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
           inherit version;
@@ -129,8 +132,8 @@
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/cli/qmd.ts" \
-              --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
-              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
+              --prefix DYLD_LIBRARY_PATH : "${runtimeLibraryPath}" \
+              --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}"
           '';
 
           meta = with pkgs.lib; {
