@@ -161,13 +161,58 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
-  test("-n <non-numeric> normalises to the default 5", async () => {
+  test("-n 1e2 matches CLI parseInt: takes leading digits only (1, not 100 or default)", async () => {
+    // parseInt("1e2", 10) === 1 — parseInt stops at the first non-digit.
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
     await runBin(["search", "foo", "-n", "1e2"], { QMD_DAEMON_URL: mock.url });
     const searchReq = mock.captures.find((c) => c.path === "/search");
     expect(searchReq).toBeDefined();
     const payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(1);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("-n 5abc takes leading digits only (= 5)", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "-n", "5abc"], { QMD_DAEMON_URL: mock.url });
+    const searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    const payload = JSON.parse(searchReq!.body);
     expect(payload.limit).toBe(5);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("-n abc has no leading digits and uses the default 5", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "-n", "abc"], { QMD_DAEMON_URL: mock.url });
+    const searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    const payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(5);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("-n 00 and 007 serialise as valid JSON integers (no leading zeros)", async () => {
+    // `"limit":00` would be invalid JSON. The fast-path must strip leading
+    // zeros via the integer coercion and use the default when the numeric
+    // value is 0.
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "a", "-n", "00"], { QMD_DAEMON_URL: mock.url });
+    let searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    // Must round-trip through JSON.parse without error, proving the payload
+    // was valid JSON (no "limit":00).
+    let payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(5);
+
+    // Zero-padded positive integer.
+    mock.captures.length = 0;
+    await runBin(["search", "b", "-n", "007"], { QMD_DAEMON_URL: mock.url });
+    searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(7);
+
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 

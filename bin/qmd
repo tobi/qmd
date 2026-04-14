@@ -137,13 +137,20 @@ _qmd_try_daemon() {
   [ -n "$_qmd_query" ] || return 1
 
   # Normalise -n to match src/cli/qmd.ts:
-  #   limit: isAll ? 100000 : (values.n ? parseInt(...) || defaultLimit : defaultLimit)
-  # Any non-positive-integer input (empty, zero, negative, decimals, "1e2",
-  # alphanumeric, etc.) collapses to the default of 5, exactly as the
-  # interactive CLI would resolve it.
-  case "$_qmd_limit" in
-    ''|0|*[!0-9]*) _qmd_limit=5 ;;
-  esac
+  #   limit: isAll ? 100000 : (values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit)
+  # parseInt(str, 10) reads leading digits and stops at the first non-digit,
+  # so "1e2" -> 1 and "5abc" -> 5. If the string has no leading digits, or
+  # the parsed value is 0 (or negative after the `||`), the CLI falls back
+  # to the default limit. JSON also forbids leading zeros, so an input like
+  # "00" must be coerced to a plain integer before we serialise.
+  _qmd_leading=$(printf '%s' "$_qmd_limit" | sed -n 's/^\([0-9][0-9]*\).*$/\1/p')
+  if [ -z "$_qmd_leading" ]; then
+    _qmd_limit=5
+  else
+    # `$(( ))` converts to an integer and drops leading zeros ("007" -> 7).
+    _qmd_limit=$((_qmd_leading))
+    [ "$_qmd_limit" -le 0 ] && _qmd_limit=5
+  fi
 
   _qmd_q_escaped=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
   if [ -z "$_qmd_collections_json" ]; then
