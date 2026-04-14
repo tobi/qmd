@@ -3230,10 +3230,14 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * the vectors_vec virtual table is dropped (it is recreated with the right
  * dimensions on the next embed run).
  *
- * When `collection` is provided only the vectors belonging to documents in
- * that collection are removed; vectors_vec is preserved so other collections
- * keep working. vec0 virtual tables do not reliably accept IN-subquery DELETEs,
- * so we enumerate hash_seq values first and delete per row.
+ * When `collection` is provided, only vectors whose hash is referenced
+ * exclusively by active documents in that collection are removed. Hashes
+ * shared with active documents in other collections are left in place so
+ * vector search keeps working there (content_vectors is keyed globally by
+ * content hash; identical document bodies across collections share a row).
+ * vectors_vec is preserved so other collections keep working. vec0 virtual
+ * tables do not reliably accept IN-subquery DELETEs, so hash_seq values are
+ * enumerated first and deleted per row.
  */
 export function clearAllEmbeddings(db: Database, collection?: string): void {
   if (!collection) {
@@ -3241,6 +3245,20 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
     return;
   }
+
+  // Hashes owned exclusively by active docs in the target collection —
+  // i.e. no active doc in a different collection references the same hash.
+  const exclusiveHashesQuery = `
+    SELECT DISTINCT d.hash
+    FROM documents d
+    WHERE d.collection = ? AND d.active = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM documents d2
+        WHERE d2.hash = d.hash
+          AND d2.active = 1
+          AND d2.collection != d.collection
+      )
+  `;
 
   const vecTableExists = db
     .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
@@ -3250,8 +3268,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     const hashSeqRows = db.prepare(`
       SELECT cv.hash, cv.seq
       FROM content_vectors cv
-      JOIN documents d ON cv.hash = d.hash
-      WHERE d.collection = ?
+      WHERE cv.hash IN (${exclusiveHashesQuery})
     `).all(collection) as { hash: string; seq: number }[];
 
     const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
@@ -3262,7 +3279,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
 
   db.prepare(`
     DELETE FROM content_vectors
-    WHERE hash IN (SELECT DISTINCT d.hash FROM documents d WHERE d.collection = ?)
+    WHERE hash IN (${exclusiveHashesQuery})
   `).run(collection);
 }
 

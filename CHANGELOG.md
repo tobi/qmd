@@ -11,7 +11,9 @@
   thread a SQL filter through `getPendingEmbeddingDocs` and
   `getHashesNeedingEmbedding`. When combined with `--force`,
   `clearAllEmbeddings` is also scoped to that collection so sibling
-  collections' vectors are preserved.
+  collections' vectors are preserved. Because `content_vectors` is
+  keyed by a global content hash, hashes shared with active documents
+  in other collections are left in place rather than re-deleted.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive

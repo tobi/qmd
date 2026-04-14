@@ -2883,6 +2883,44 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings with force + collection preserves shared hashes", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    // Identical body -> identical hash in two collections. content_vectors is
+    // keyed globally by hash so a naive delete-by-collection would drop the
+    // shared hash's vector and leave the non-targeted collection broken.
+    const sharedBody = "# Shared\n\nIdentical content across collections.";
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "shared", body: sharedBody });
+      await insertTestDocument(db, "alpha", { name: "alpha-only", body: "# Alpha Only\n\nUnique alpha." });
+      await insertTestDocument(db, "beta", { name: "shared", body: sharedBody });
+      await insertTestDocument(db, "beta", { name: "beta-only", body: "# Beta Only\n\nUnique beta." });
+
+      await generateEmbeddings(store);
+
+      const distinctHashes = (): number =>
+        (db.prepare(`SELECT COUNT(DISTINCT hash) as count FROM content_vectors`).get() as { count: number }).count;
+
+      // Three distinct content hashes: shared (1) + alpha-only (1) + beta-only (1).
+      expect(distinctHashes()).toBe(3);
+
+      // Force re-embed alpha. The shared hash must survive because beta still
+      // references it via an active document.
+      await generateEmbeddings(store, { force: true, collection: "alpha" });
+
+      expect(distinctHashes()).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
