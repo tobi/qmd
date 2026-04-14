@@ -136,20 +136,19 @@ _qmd_try_daemon() {
 
   [ -n "$_qmd_query" ] || return 1
 
-  # Normalise -n to match src/cli/qmd.ts:
-  #   limit: isAll ? 100000 : (values.n ? parseInt(values.n, 10) || defaultLimit : defaultLimit)
-  # parseInt(str, 10) reads leading digits and stops at the first non-digit,
-  # so "1e2" -> 1 and "5abc" -> 5. If the string has no leading digits, or
-  # the parsed value is 0 (or negative after the `||`), the CLI falls back
-  # to the default limit. JSON also forbids leading zeros, so an input like
-  # "00" must be coerced to a plain integer before we serialise.
-  _qmd_leading=$(printf '%s' "$_qmd_limit" | sed -n 's/^\([0-9][0-9]*\).*$/\1/p')
-  if [ -z "$_qmd_leading" ]; then
-    _qmd_limit=5
-  else
-    # `$(( ))` converts to an integer and drops leading zeros ("007" -> 7).
-    _qmd_limit=$((_qmd_leading))
-    [ "$_qmd_limit" -le 0 ] && _qmd_limit=5
+  # -n policy in the fast-path: accept ONLY a plain positive integer with
+  # no sign, no leading zeros, no trailing non-digits, no exponent, etc.
+  # Any other shape (`-1`, `+7`, `0`, `1e2`, `007`, `5abc`, empty) falls
+  # through to the cold-start CLI, which owns the edge-case semantics.
+  # This keeps the fast-path a strict subset of interactive behaviour
+  # without trying to emulate `parseInt(...) || default` in POSIX sh.
+  #
+  # An unset -n is the common case — we already defaulted `_qmd_limit=5`.
+  # Skip the strict check on that value.
+  if [ "$_qmd_limit" != "5" ]; then
+    case "$_qmd_limit" in
+      ''|0|0[0-9]*|*[!0-9]*) return 1 ;;
+    esac
   fi
 
   _qmd_q_escaped=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')

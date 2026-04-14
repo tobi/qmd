@@ -151,68 +151,33 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
-  test("-n 0 normalises to the default 5 (matches parseInt || default)", async () => {
+  test("strict -n validation: non-plain-positive-integer values fall through", async () => {
+    // Rather than emulate JS parseInt semantics in POSIX shell (and chase
+    // edge cases round after round), the fast-path only accepts -n values
+    // that are unambiguous plain positive integers. Anything else — signed,
+    // zero, zero-padded, alphanumeric, exponent notation, empty — falls
+    // through to the cold-start CLI, where parseInt || default applies.
+    const cases: string[] = ["0", "00", "007", "-1", "+7", "1e2", "5abc", "abc"];
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
-    await runBin(["search", "foo", "-n", "0"], { QMD_DAEMON_URL: mock.url });
-    const searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    const payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(5);
+    for (const value of cases) {
+      mock.captures.length = 0;
+      await runBin(["search", "foo", "-n", value], { QMD_DAEMON_URL: mock.url });
+      const searchReq = mock.captures.find((c) => c.path === "/search");
+      expect(searchReq, `-n ${value} should fall through`).toBeUndefined();
+    }
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
-  test("-n 1e2 matches CLI parseInt: takes leading digits only (1, not 100 or default)", async () => {
-    // parseInt("1e2", 10) === 1 — parseInt stops at the first non-digit.
+  test("plain positive integers in -n are forwarded as-is", async () => {
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
-    await runBin(["search", "foo", "-n", "1e2"], { QMD_DAEMON_URL: mock.url });
-    const searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    const payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(1);
-    await new Promise<void>((r) => mock.server.close(() => r()));
-  });
-
-  test("-n 5abc takes leading digits only (= 5)", async () => {
-    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
-    await runBin(["search", "foo", "-n", "5abc"], { QMD_DAEMON_URL: mock.url });
-    const searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    const payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(5);
-    await new Promise<void>((r) => mock.server.close(() => r()));
-  });
-
-  test("-n abc has no leading digits and uses the default 5", async () => {
-    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
-    await runBin(["search", "foo", "-n", "abc"], { QMD_DAEMON_URL: mock.url });
-    const searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    const payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(5);
-    await new Promise<void>((r) => mock.server.close(() => r()));
-  });
-
-  test("-n 00 and 007 serialise as valid JSON integers (no leading zeros)", async () => {
-    // `"limit":00` would be invalid JSON. The fast-path must strip leading
-    // zeros via the integer coercion and use the default when the numeric
-    // value is 0.
-    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
-    await runBin(["search", "a", "-n", "00"], { QMD_DAEMON_URL: mock.url });
-    let searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    // Must round-trip through JSON.parse without error, proving the payload
-    // was valid JSON (no "limit":00).
-    let payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(5);
-
-    // Zero-padded positive integer.
-    mock.captures.length = 0;
-    await runBin(["search", "b", "-n", "007"], { QMD_DAEMON_URL: mock.url });
-    searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    payload = JSON.parse(searchReq!.body);
-    expect(payload.limit).toBe(7);
-
+    for (const [input, expected] of [["1", 1], ["3", 3], ["20", 20], ["100", 100]] as [string, number][]) {
+      mock.captures.length = 0;
+      await runBin(["search", "foo", "-n", input], { QMD_DAEMON_URL: mock.url });
+      const searchReq = mock.captures.find((c) => c.path === "/search");
+      expect(searchReq, `-n ${input} should hit the daemon`).toBeDefined();
+      const payload = JSON.parse(searchReq!.body);
+      expect(payload.limit).toBe(expected);
+    }
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
