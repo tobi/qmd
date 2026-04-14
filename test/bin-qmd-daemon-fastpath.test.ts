@@ -151,6 +151,26 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
+  test("-n 0 normalises to the default 5 (matches parseInt || default)", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "-n", "0"], { QMD_DAEMON_URL: mock.url });
+    const searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    const payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(5);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("-n <non-numeric> normalises to the default 5", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "-n", "1e2"], { QMD_DAEMON_URL: mock.url });
+    const searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    const payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(5);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
   test("--index bypasses daemon entirely (no /health call)", async () => {
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
     await runBin(["--index", "library", "search", "foo"], { QMD_DAEMON_URL: mock.url });

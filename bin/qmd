@@ -136,6 +136,15 @@ _qmd_try_daemon() {
 
   [ -n "$_qmd_query" ] || return 1
 
+  # Normalise -n to match src/cli/qmd.ts:
+  #   limit: isAll ? 100000 : (values.n ? parseInt(...) || defaultLimit : defaultLimit)
+  # Any non-positive-integer input (empty, zero, negative, decimals, "1e2",
+  # alphanumeric, etc.) collapses to the default of 5, exactly as the
+  # interactive CLI would resolve it.
+  case "$_qmd_limit" in
+    ''|0|*[!0-9]*) _qmd_limit=5 ;;
+  esac
+
   _qmd_q_escaped=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
   if [ -z "$_qmd_collections_json" ]; then
     _qmd_collections_json="null"
