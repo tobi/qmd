@@ -82,6 +82,37 @@ describe("getStatus opt-in TTL cache", () => {
     }
   });
 
+  test("each caller's ttlMs is authoritative against the data's age", () => {
+    // If caller A populates the cache with a long TTL, caller B asking for a
+    // short TTL must get fresh data once the data's age exceeds B's window —
+    // regardless of A's window. The cache stores fetchedAt, not expiresAt.
+    vi.useFakeTimers();
+    try {
+      const prepareSpy = vi.spyOn(store.db, "prepare");
+      // Caller A seeds the cache with a 60s TTL.
+      const a = store.getStatus({ ttlMs: 60_000 });
+      const aPrepare = prepareSpy.mock.calls.length;
+      expect(aPrepare).toBeGreaterThan(0);
+
+      // 2 seconds later, caller B asks for at-most-1s-old data. Cached value
+      // is 2s old, so B must trigger a fresh query.
+      vi.advanceTimersByTime(2_000);
+      const b = store.getStatus({ ttlMs: 1_000 });
+      expect(b).not.toBe(a);
+      expect(prepareSpy.mock.calls.length).toBeGreaterThan(aPrepare);
+
+      // Caller C asks for at-most-60s-old data right after B. The cache was
+      // just refreshed by B, so C should reuse it.
+      const cPrepare = prepareSpy.mock.calls.length;
+      const c = store.getStatus({ ttlMs: 60_000 });
+      expect(c).toBe(b);
+      expect(prepareSpy.mock.calls.length).toBe(cPrepare);
+      prepareSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("a fresh (uncached) call invalidates the previous cache", () => {
     vi.useFakeTimers();
     try {

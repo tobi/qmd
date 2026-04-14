@@ -1610,12 +1610,12 @@ export function createStore(dbPath?: string): Store {
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
-  // Per-store getStatus cache. Only populated when a caller passes `ttlMs > 0`
-  // and only used for subsequent calls that also pass `ttlMs > 0`. The cache
-  // is invalidated when the stored value expires; writes to the DB do not
-  // explicitly invalidate it, so callers that mutate the index should pass
-  // `ttlMs: 0` (or omit the option) to force a fresh read on the next call.
-  let statusCache: { value: IndexStatus; expiresAt: number } | null = null;
+  // Per-store getStatus cache. Stores the snapshot's *fetch timestamp* (not an
+  // expiry) so each caller's `ttlMs` is evaluated against the data's actual
+  // age, not the TTL the first caller happened to pass. Only populated when a
+  // caller passes `ttlMs > 0`, and a call with no options (or `ttlMs: 0`)
+  // clears the cache so subsequent polling calls re-fetch.
+  let statusCache: { value: IndexStatus; fetchedAt: number } | null = null;
 
   const store: Store = {
     db,
@@ -1629,11 +1629,11 @@ export function createStore(dbPath?: string): Store {
     getStatus: (options?: { ttlMs?: number }) => {
       const ttl = options?.ttlMs ?? 0;
       const now = Date.now();
-      if (ttl > 0 && statusCache && statusCache.expiresAt > now) {
+      if (ttl > 0 && statusCache && (now - statusCache.fetchedAt) < ttl) {
         return statusCache.value;
       }
       const fresh = getStatus(db);
-      statusCache = ttl > 0 ? { value: fresh, expiresAt: now + ttl } : null;
+      statusCache = ttl > 0 ? { value: fresh, fetchedAt: now } : null;
       return fresh;
     },
 
