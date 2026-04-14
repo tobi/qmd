@@ -75,10 +75,17 @@ _qmd_try_daemon() {
   # the query text.
   while [ $# -gt 0 ]; do
     case "$1" in
-      -n)               _qmd_limit="$2"; shift 2 ;;
-      --n)              _qmd_limit="$2"; shift 2 ;;
+      -n|--n)
+        # Value-taking flag; bail out if the user left off the value
+        # (otherwise `shift 2` would abort the whole shell with
+        # "can't shift that many" instead of falling through).
+        [ $# -ge 2 ] || return 1
+        _qmd_limit="$2"
+        shift 2
+        ;;
       --n=*)            _qmd_limit="${1#*=}"; shift ;;
       -c|--collection)
+        [ $# -ge 2 ] || return 1
         _qmd_c_escaped=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
         if [ -z "$_qmd_collections_json" ]; then
           _qmd_collections_json="[\"${_qmd_c_escaped}\"]"

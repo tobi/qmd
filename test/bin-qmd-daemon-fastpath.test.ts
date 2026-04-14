@@ -173,6 +173,25 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
+  test("dangling value flag (-n with no argument) falls through without aborting shell", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    const run = await runBin(["search", "foo", "-n"], { QMD_DAEMON_URL: mock.url });
+    // The fast-path must return non-zero and let cold-start handle it.
+    // Most importantly it must NOT abort /bin/sh with
+    // "shift: can't shift that many" (exit 2 or higher from /bin/sh).
+    expect(run.stderr).not.toMatch(/can't shift|shift.*many/);
+    expect(mock.captures.find((c) => c.path === "/search")).toBeUndefined();
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("dangling -c with no argument also falls through cleanly", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    const run = await runBin(["search", "foo", "-c"], { QMD_DAEMON_URL: mock.url });
+    expect(run.stderr).not.toMatch(/can't shift|shift.*many/);
+    expect(mock.captures.find((c) => c.path === "/search")).toBeUndefined();
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
   test("health-check failure silently falls through (no /search attempted)", async () => {
     mock = await startMockServer(500, 200, "{}");
     await runBin(["search", "foo"], { QMD_DAEMON_URL: mock.url });
