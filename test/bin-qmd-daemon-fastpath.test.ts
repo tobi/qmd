@@ -155,6 +155,24 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
+  test("unknown flag falls through rather than eating its value into the query", async () => {
+    // --min-score is a real upstream option that takes a value. If the
+    // fast-path blindly skipped just the flag token, `0.8` would get
+    // appended to `_qmd_query`. Correct behavior is to bail so the
+    // cold-start CLI (which knows the full flag set) handles it.
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "--min-score", "0.8"], { QMD_DAEMON_URL: mock.url });
+    expect(mock.captures.find((c) => c.path === "/search")).toBeUndefined();
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
+  test("boolean flags also fall through (e.g. --json)", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo", "--json"], { QMD_DAEMON_URL: mock.url });
+    expect(mock.captures.find((c) => c.path === "/search")).toBeUndefined();
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
   test("health-check failure silently falls through (no /search attempted)", async () => {
     mock = await startMockServer(500, 200, "{}");
     await runBin(["search", "foo"], { QMD_DAEMON_URL: mock.url });

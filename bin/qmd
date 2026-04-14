@@ -107,7 +107,14 @@ _qmd_try_daemon() {
         done
         ;;
       -*)
-        shift ;;
+        # Unknown flag. The upstream CLI accepts several options this
+        # parser can't safely decode (--min-score, --candidate-limit,
+        # --intent, --full, --json, --files, --all, ...). Some take a
+        # value, some are booleans. Rather than guess and risk eating
+        # the next token as part of the query, fall through to the
+        # cold-start CLI which knows the full flag set. The opt-in
+        # fast-path stays a strict subset of the interactive CLI.
+        return 1 ;;
       *)
         if [ -z "$_qmd_query" ]; then _qmd_query="$1"
         else _qmd_query="$_qmd_query $1"; fi
