@@ -1095,7 +1095,17 @@ export type Store = {
   // Index health
   getHashesNeedingEmbedding: () => number;
   getIndexHealth: () => IndexHealthInfo;
-  getStatus: () => IndexStatus;
+  /**
+   * Snapshot of index and collection state.
+   *
+   * For most callers the default (no options) is correct — it runs the
+   * underlying `COUNT(*)` / `COUNT(DISTINCT)` queries every call. Long-lived
+   * processes that poll `getStatus` (MCP servers, HTTP wrappers, `qmd status`
+   * loops on large indexes) can pass `{ ttlMs }` to reuse a recent result
+   * within that window and avoid re-running the DISTINCT-count scan on every
+   * request. Cache scope is per-`Store` instance.
+   */
+  getStatus: (options?: { ttlMs?: number }) => IndexStatus;
 
   // Caching
   getCacheKey: typeof getCacheKey;
@@ -1600,6 +1610,13 @@ export function createStore(dbPath?: string): Store {
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
+  // Per-store getStatus cache. Only populated when a caller passes `ttlMs > 0`
+  // and only used for subsequent calls that also pass `ttlMs > 0`. The cache
+  // is invalidated when the stored value expires; writes to the DB do not
+  // explicitly invalidate it, so callers that mutate the index should pass
+  // `ttlMs: 0` (or omit the option) to force a fresh read on the next call.
+  let statusCache: { value: IndexStatus; expiresAt: number } | null = null;
+
   const store: Store = {
     db,
     dbPath: resolvedPath,
@@ -1609,7 +1626,16 @@ export function createStore(dbPath?: string): Store {
     // Index health
     getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
     getIndexHealth: () => getIndexHealth(db),
-    getStatus: () => getStatus(db),
+    getStatus: (options?: { ttlMs?: number }) => {
+      const ttl = options?.ttlMs ?? 0;
+      const now = Date.now();
+      if (ttl > 0 && statusCache && statusCache.expiresAt > now) {
+        return statusCache.value;
+      }
+      const fresh = getStatus(db);
+      statusCache = ttl > 0 ? { value: fresh, expiresAt: now + ttl } : null;
+      return fresh;
+    },
 
     // Caching
     getCacheKey,
