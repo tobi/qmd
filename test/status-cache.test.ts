@@ -10,13 +10,21 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { createStore, enableProductionMode, type Store } from "../src/store";
+import {
+  createStore,
+  enableProductionMode,
+  _resetProductionModeForTesting,
+  type Store,
+} from "../src/store";
 
 describe("getStatus opt-in TTL cache", () => {
   const baseDir = join(tmpdir(), `qmd-status-cache-${process.pid}`);
   let store: Store;
 
   beforeAll(() => {
+    // enableProductionMode() toggles a module-global flag. Reset it in
+    // afterAll so later test files in the same vitest process aren't
+    // affected (fileParallelism is off, so state leaks linearly).
     enableProductionMode();
     if (existsSync(baseDir)) rmSync(baseDir, { recursive: true, force: true });
     mkdirSync(baseDir, { recursive: true });
@@ -25,6 +33,7 @@ describe("getStatus opt-in TTL cache", () => {
   afterAll(() => {
     try { store?.close(); } catch { /* noop */ }
     if (existsSync(baseDir)) rmSync(baseDir, { recursive: true, force: true });
+    _resetProductionModeForTesting();
   });
 
   beforeEach(() => {
