@@ -123,14 +123,19 @@ qmd mcp --http --daemon --port 8181
 export QMD_DAEMON_URL="http://127.0.0.1:8181"
 
 qmd search "database migrations" -c engineering      # ~50 ms, returns JSON
-qmd vsearch "onboarding" -c handbook                 # ~80 ms, returns JSON
 ```
 
-`qmd search` / `qmd vsearch` route through the daemon's existing
-`POST /search` endpoint when `QMD_DAEMON_URL` is set. Responses are the
-structured JSON shape (`{results:[{docid,file,title,score,snippet,context}]}`)
-— convenient for agents and scripts parsing stdout. Interactive users
-who want the formatted-text output should leave `QMD_DAEMON_URL` unset.
+`qmd search` routes through the daemon's existing `POST /search` endpoint
+when `QMD_DAEMON_URL` is set. Responses are the structured JSON shape
+(`{results:[{docid,file,title,score,snippet,context}]}`) — convenient for
+agents and scripts parsing stdout. Interactive users who want the
+formatted-text output should leave `QMD_DAEMON_URL` unset.
+
+The fast-path handles only `qmd search` (BM25 + hybrid via the daemon's
+structured-query shape). `qmd vsearch` intentionally always runs the
+cold-start CLI: its vector-only pipeline, minScore default, and rerank
+behavior are not currently expressible on the daemon's `/search`
+endpoint, and routing it would silently change result ordering.
 
 Fall-through cases (silently use cold-start CLI):
 
@@ -138,6 +143,8 @@ Fall-through cases (silently use cold-start CLI):
 - Daemon health check fails within 1 s
 - Request returns a non-2xx
 - Invocation uses `--index <name>` (daemons serve one index at a time)
+- Unrecognised flag (e.g. `--min-score`, `--json`) — cold-start owns the full flag set
+- Non-plain-positive-integer `-n` value
 
 Use `curl` to test payload directly:
 

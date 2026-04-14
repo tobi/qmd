@@ -16,13 +16,20 @@ done
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 # ---------------------------------------------------------------------------
-# Daemon fast-path (opt-in, search + vsearch)
+# Daemon fast-path (opt-in, search only)
 #
 # When `QMD_DAEMON_URL` is set and points at a running `qmd mcp --http` daemon,
-# route `qmd search` / `qmd vsearch` through the daemon's existing REST
-# endpoint instead of bootstrapping a fresh Node + better-sqlite3 + sqlite-vec
-# process for every invocation. On large indexes this can be the difference
-# between ~80 ms and ~800 ms per query.
+# route `qmd search` through the daemon's existing REST endpoint instead of
+# bootstrapping a fresh Node + better-sqlite3 + sqlite-vec process for every
+# invocation. On large indexes this can be the difference between ~80 ms and
+# ~800 ms per query.
+#
+# Only `qmd search` is eligible. `qmd vsearch` is deliberately NOT handled
+# here: vsearch's cold-start path sets a different `minScore` default (0.3
+# vs 0) and uses a vector-only pipeline without reranking, and the daemon's
+# REST surface cannot currently express either choice. Routing vsearch
+# through the fast-path would silently change result ordering and filtering.
+# Cold-start remains the source of truth for vsearch semantics.
 #
 # Opt-in so the default interactive UX (formatted text output) is unchanged.
 # Callers that set `QMD_DAEMON_URL` get the daemon's JSON response shape on
@@ -35,7 +42,7 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 # exact command the user typed.
 #
 # Bypass rules:
-# - Only `search` and `vsearch` are eligible.
+# - Only `search` is eligible (vsearch deliberately excluded, see above).
 # - Any `--index` / `--index=...` forces fall-through — the daemon serves
 #   whichever index it was started with, so secondary-index queries must go
 #   through the cold-start CLI.
@@ -43,7 +50,7 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 #   falls back to cold-start silently.
 # ---------------------------------------------------------------------------
 _qmd_try_daemon() {
-  # $1 = subcommand ("search" or "vsearch"); $2.. = subcommand args.
+  # $1 = subcommand ("search"); $2.. = subcommand args.
   # Returns 0 on a successful daemon response (stdout already emitted),
   # non-zero on any reason to fall through to cold-start.
   [ -n "${QMD_DAEMON_URL:-}" ] || return 1
@@ -51,7 +58,6 @@ _qmd_try_daemon() {
 
   case "$1" in
     search)  _qmd_qtype="lex" ;;
-    vsearch) _qmd_qtype="vec" ;;
     *)       return 1 ;;
   esac
   shift
@@ -172,7 +178,7 @@ _qmd_try_daemon() {
 }
 
 case "${1:-}" in
-  search|vsearch)
+  search)
     if _qmd_try_daemon "$@"; then
       exit 0
     fi

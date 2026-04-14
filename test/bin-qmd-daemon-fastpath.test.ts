@@ -101,13 +101,16 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
-  test("vsearch uses type='vec'", async () => {
+  test("vsearch is intentionally NOT handled by the fast-path", async () => {
+    // vsearch's cold-start semantics (minScore: 0.3, vector-only, no rerank)
+    // aren't expressible on the daemon's /search endpoint. Routing it would
+    // silently change result ordering and filtering. Strict-subset
+    // principle: vsearch always goes through cold-start, even when
+    // QMD_DAEMON_URL is set.
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
     await runBin(["vsearch", "semantic query"], { QMD_DAEMON_URL: mock.url });
-    const searchReq = mock.captures.find((c) => c.path === "/search");
-    expect(searchReq).toBeDefined();
-    const payload = JSON.parse(searchReq!.body);
-    expect(payload.searches).toEqual([{ type: "vec", query: "semantic query" }]);
+    // No /health or /search requests should reach the daemon at all.
+    expect(mock.captures.length).toBe(0);
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
