@@ -1628,12 +1628,16 @@ export function createStore(dbPath?: string): Store {
     getIndexHealth: () => getIndexHealth(db),
     getStatus: (options?: { ttlMs?: number }) => {
       const ttl = options?.ttlMs ?? 0;
-      const now = Date.now();
-      if (ttl > 0 && statusCache && (now - statusCache.fetchedAt) < ttl) {
+      if (ttl > 0 && statusCache && (Date.now() - statusCache.fetchedAt) < ttl) {
         return statusCache.value;
       }
       const fresh = getStatus(db);
-      statusCache = ttl > 0 ? { value: fresh, fetchedAt: now } : null;
+      // Stamp fetchedAt *after* the query returns so the cached snapshot's
+      // "age" reflects when the data became available, not when the query
+      // started. The expensive large-index case is exactly where query time
+      // is non-negligible; stamping pre-query would shorten (or entirely
+      // negate) the TTL window of subsequent callers.
+      statusCache = ttl > 0 ? { value: fresh, fetchedAt: Date.now() } : null;
       return fresh;
     },
 

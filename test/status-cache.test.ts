@@ -113,6 +113,43 @@ describe("getStatus opt-in TTL cache", () => {
     }
   });
 
+  test("fetchedAt is stamped after the query completes, not before", () => {
+    // If the expensive getStatus query takes real wall-clock time, the cached
+    // snapshot's recorded fetchedAt must reflect when the data became
+    // available. Stamping pre-query would age the cache by the query duration
+    // and can negate a caller's TTL window on the very next call.
+    //
+    // Simulated via a Date.now spy whose returned "clock" advances by 100ms
+    // on every call. Inside store.getStatus(), the cache stamp is the last
+    // Date.now() the function executes, so with the fix the cached fetchedAt
+    // is strictly greater than 0 (the virtual clock at entry). A buggy
+    // pre-query stamp would be 0, which this test would detect by observing
+    // that a follow-up caller with a ttlMs just shorter than the elapsed
+    // time receives a cached snapshot rather than a fresh one.
+    let clock = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      const value = clock;
+      clock += 100;
+      return value;
+    });
+    try {
+      const first = store.getStatus({ ttlMs: 10_000 });
+      // At this point `clock` has advanced by 100ms * (number of Date.now
+      // calls during the store.getStatus body). fetchedAt was the value of
+      // `clock` at the moment of the post-query stamp — strictly > 0.
+
+      // Call again immediately; the next Date.now() return is `clock`, so
+      // the observed age is `clock - fetchedAt` = 100ms (one tick).
+      const prepareSpy = vi.spyOn(store.db, "prepare");
+      const second = store.getStatus({ ttlMs: 200 });
+      expect(second).toBe(first);
+      expect(prepareSpy.mock.calls.length).toBe(0);
+      prepareSpy.mockRestore();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   test("a fresh (uncached) call invalidates the previous cache", () => {
     vi.useFakeTimers();
     try {
