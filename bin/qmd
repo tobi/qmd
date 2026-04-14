@@ -24,79 +24,121 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 # process for every invocation. On large indexes this can be the difference
 # between ~80 ms and ~800 ms per query.
 #
-# This is opt-in so the default interactive UX (formatted text output) is
-# unchanged. Callers that set `QMD_DAEMON_URL` get the daemon's JSON response
-# shape on stdout — useful for scripts and agents. Unset the variable (or pass
+# Opt-in so the default interactive UX (formatted text output) is unchanged.
+# Callers that set `QMD_DAEMON_URL` get the daemon's JSON response shape on
+# stdout — useful for scripts and agents. Unset the variable (or pass
 # `--index <name>`) to fall back to the normal cold-start CLI.
+#
+# The fast-path logic lives in a shell function so its argument parsing
+# operates on a local copy of `$@`. If the POST ultimately fails, the outer
+# shell's original argv is untouched and the cold-start `exec` receives the
+# exact command the user typed.
 #
 # Bypass rules:
 # - Only `search` and `vsearch` are eligible.
 # - Any `--index` / `--index=...` forces fall-through — the daemon serves
 #   whichever index it was started with, so secondary-index queries must go
 #   through the cold-start CLI.
-# - Any curl/daemon error (health check fails, non-2xx response) falls back
-#   to cold-start silently.
+# - Any curl/daemon error (health check fails, non-2xx response, empty query)
+#   falls back to cold-start silently.
 # ---------------------------------------------------------------------------
-if [ -n "${QMD_DAEMON_URL:-}" ] && command -v curl >/dev/null 2>&1; then
-  _qmd_subcommand=""
-  _qmd_query_type=""
-  case "${1:-}" in
-    search)  _qmd_subcommand="search";  _qmd_query_type="lex" ;;
-    vsearch) _qmd_subcommand="vsearch"; _qmd_query_type="vec" ;;
+_qmd_try_daemon() {
+  # $1 = subcommand ("search" or "vsearch"); $2.. = subcommand args.
+  # Returns 0 on a successful daemon response (stdout already emitted),
+  # non-zero on any reason to fall through to cold-start.
+  [ -n "${QMD_DAEMON_URL:-}" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  case "$1" in
+    search)  _qmd_qtype="lex" ;;
+    vsearch) _qmd_qtype="vec" ;;
+    *)       return 1 ;;
   esac
+  shift
 
-  if [ -n "$_qmd_subcommand" ]; then
-    _qmd_has_index=0
-    for _arg in "$@"; do
-      case "$_arg" in
-        --index|--index=*) _qmd_has_index=1; break ;;
-      esac
-    done
+  # Detect --index before any destructive parsing.
+  for _arg in "$@"; do
+    case "$_arg" in
+      --index|--index=*) return 1 ;;
+    esac
+  done
 
-    if [ "$_qmd_has_index" -eq 0 ] && \
-       curl -sf --max-time 1 "${QMD_DAEMON_URL}/health" >/dev/null 2>&1; then
-      _qmd_limit=10
-      _qmd_collection=""
-      _qmd_query=""
-      shift  # drop the subcommand
-      while [ $# -gt 0 ]; do
-        case "$1" in
-          -l|--limit)       _qmd_limit="$2"; shift 2 ;;
-          --limit=*)        _qmd_limit="${1#*=}"; shift ;;
-          -c|--collection)  _qmd_collection="$2"; shift 2 ;;
-          --collection=*)   _qmd_collection="${1#*=}"; shift ;;
-          --)               shift; while [ $# -gt 0 ]; do
-                              if [ -z "$_qmd_query" ]; then _qmd_query="$1"
-                              else _qmd_query="$_qmd_query $1"; fi
-                              shift
-                            done ;;
-          -*)               shift ;;
-          *)                if [ -z "$_qmd_query" ]; then _qmd_query="$1"
-                            else _qmd_query="$_qmd_query $1"; fi
-                            shift ;;
-        esac
-      done
+  curl -sf --max-time 1 "${QMD_DAEMON_URL}/health" >/dev/null 2>&1 || return 1
 
-      if [ -n "$_qmd_query" ]; then
-        _qmd_escaped_query=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        if [ -n "$_qmd_collection" ]; then
-          _qmd_collections_json="[\"${_qmd_collection}\"]"
+  _qmd_limit=10
+  _qmd_collections_json=""  # "" = unset; later serialised as null
+  _qmd_query=""
+
+  # Upstream CLI flag shapes: -n <N> for limit, -c <name> for collection
+  # (collection supports `multiple: true`, so several -c flags must all be
+  # forwarded). Unknown dashed flags are dropped so we never leak them into
+  # the query text.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n)               _qmd_limit="$2"; shift 2 ;;
+      --n)              _qmd_limit="$2"; shift 2 ;;
+      --n=*)            _qmd_limit="${1#*=}"; shift ;;
+      -c|--collection)
+        _qmd_c_escaped=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -z "$_qmd_collections_json" ]; then
+          _qmd_collections_json="[\"${_qmd_c_escaped}\"]"
         else
-          _qmd_collections_json="null"
+          # Strip the closing `]`, append `,"<val>"]`. `${var%]}` is POSIX.
+          _qmd_collections_json="${_qmd_collections_json%]},\"${_qmd_c_escaped}\"]"
         fi
-        _qmd_payload="{\"searches\":[{\"type\":\"${_qmd_query_type}\",\"query\":\"${_qmd_escaped_query}\"}],\"collections\":${_qmd_collections_json},\"limit\":${_qmd_limit}}"
+        shift 2
+        ;;
+      --collection=*)
+        _qmd_c_val="${1#*=}"
+        _qmd_c_escaped=$(printf '%s' "$_qmd_c_val" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -z "$_qmd_collections_json" ]; then
+          _qmd_collections_json="[\"${_qmd_c_escaped}\"]"
+        else
+          _qmd_collections_json="${_qmd_collections_json%]},\"${_qmd_c_escaped}\"]"
+        fi
+        shift
+        ;;
+      --)
+        shift
+        while [ $# -gt 0 ]; do
+          if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+          else _qmd_query="$_qmd_query $1"; fi
+          shift
+        done
+        ;;
+      -*)
+        shift ;;
+      *)
+        if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+        else _qmd_query="$_qmd_query $1"; fi
+        shift ;;
+    esac
+  done
 
-        if curl -sf --max-time 30 -X POST \
-             -H "Content-Type: application/json" \
-             -d "$_qmd_payload" \
-             "${QMD_DAEMON_URL}/search"; then
-          echo
-          exit 0
-        fi
-      fi
-    fi
+  [ -n "$_qmd_query" ] || return 1
+
+  _qmd_q_escaped=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  if [ -z "$_qmd_collections_json" ]; then
+    _qmd_collections_json="null"
   fi
-fi
+
+  _qmd_payload="{\"searches\":[{\"type\":\"${_qmd_qtype}\",\"query\":\"${_qmd_q_escaped}\"}],\"collections\":${_qmd_collections_json},\"limit\":${_qmd_limit}}"
+
+  curl -sf --max-time 30 -X POST \
+    -H "Content-Type: application/json" \
+    -d "$_qmd_payload" \
+    "${QMD_DAEMON_URL}/search" || return 1
+  echo
+  return 0
+}
+
+case "${1:-}" in
+  search|vsearch)
+    if _qmd_try_daemon "$@"; then
+      exit 0
+    fi
+    ;;
+esac
 
 # Detect the package manager that installed dependencies by checking lockfiles.
 # $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
