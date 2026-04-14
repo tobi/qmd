@@ -232,6 +232,45 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
+  test("daemon that writes partial bytes then drops the connection leaks no output", async () => {
+    // A slow-failing /search must NOT emit partial JSON on stdout before the
+    // fast-path falls through, or scripts will see daemon-JSON + cold-start
+    // text concatenated on the same invocation.
+    const captures: Capture[] = [];
+    const partialServer = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captures.push({ method: req.method || "GET", path: req.url || "/", body: Buffer.concat(chunks).toString("utf8") });
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end('{"status":"ok"}');
+        return;
+      }
+      if (req.url === "/search") {
+        // Start writing then abruptly destroy the socket so curl sees a
+        // failed response after partial bytes.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write('{"partial":');
+        res.socket?.destroy();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((r) => partialServer.listen(0, "127.0.0.1", () => r()));
+    const port = (partialServer.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${port}`;
+    try {
+      const run = await runBin(["search", "foo"], { QMD_DAEMON_URL: url });
+      // The fast-path must not emit the partial `{"partial":` on stdout.
+      // The cold-start CLI may or may not also run in the test env; what
+      // matters is that daemon bytes do not appear when the daemon failed.
+      expect(run.stdout).not.toContain("partial");
+    } finally {
+      await new Promise<void>((r) => partialServer.close(() => r()));
+    }
+  });
+
   test("health-check failure silently falls through (no /search attempted)", async () => {
     mock = await startMockServer(500, 200, "{}");
     await runBin(["search", "foo"], { QMD_DAEMON_URL: mock.url });

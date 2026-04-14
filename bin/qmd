@@ -158,11 +158,16 @@ _qmd_try_daemon() {
 
   _qmd_payload="{\"searches\":[{\"type\":\"${_qmd_qtype}\",\"query\":\"${_qmd_q_escaped}\"}],\"collections\":${_qmd_collections_json},\"limit\":${_qmd_limit}}"
 
-  curl -sf --max-time 30 -X POST \
+  # Buffer the daemon response so a mid-stream failure (connection reset,
+  # --max-time elapsing after bytes have been written) can't leak a partial
+  # payload before we fall through to the cold-start CLI. Script consumers
+  # should see either the daemon's complete JSON response OR the cold-start
+  # output — never both concatenated.
+  _qmd_response=$(curl -sf --max-time 30 -X POST \
     -H "Content-Type: application/json" \
     -d "$_qmd_payload" \
-    "${QMD_DAEMON_URL}/search" || return 1
-  echo
+    "${QMD_DAEMON_URL}/search") || return 1
+  printf '%s\n' "$_qmd_response"
   return 0
 }
 
