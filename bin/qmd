@@ -65,7 +65,12 @@ _qmd_try_daemon() {
 
   curl -sf --max-time 1 "${QMD_DAEMON_URL}/health" >/dev/null 2>&1 || return 1
 
-  _qmd_limit=10
+  # Match the interactive CLI's default result count so scripts that rely
+  # on `qmd search <q>` without an explicit -n don't see cardinality change
+  # based on whether QMD_DAEMON_URL is set. The `--files`/`--json` special
+  # case (default 20) can't apply here — those flags fall through to
+  # cold-start via the unknown-flag branch below.
+  _qmd_limit=5
   _qmd_collections_json=""  # "" = unset; later serialised as null
   _qmd_query=""
 

@@ -141,6 +141,16 @@ describe("bin/qmd daemon fast-path", () => {
     await new Promise<void>((r) => mock.server.close(() => r()));
   });
 
+  test("unset -n uses 5 to match the interactive CLI default", async () => {
+    mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
+    await runBin(["search", "foo"], { QMD_DAEMON_URL: mock.url });
+    const searchReq = mock.captures.find((c) => c.path === "/search");
+    expect(searchReq).toBeDefined();
+    const payload = JSON.parse(searchReq!.body);
+    expect(payload.limit).toBe(5);
+    await new Promise<void>((r) => mock.server.close(() => r()));
+  });
+
   test("--index bypasses daemon entirely (no /health call)", async () => {
     mock = await startMockServer(200, 200, JSON.stringify({ results: [] }));
     await runBin(["--index", "library", "search", "foo"], { QMD_DAEMON_URL: mock.url });
