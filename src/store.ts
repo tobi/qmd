@@ -3281,6 +3281,17 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     DELETE FROM content_vectors
     WHERE hash IN (${exclusiveHashesQuery})
   `).run(collection);
+
+  // If the scoped clear emptied content_vectors, drop vectors_vec so the next
+  // embed run can recreate it with the new dimensions. Otherwise a follow-up
+  // `{ force, collection, model: <different-dim> }` run would fail on dimension
+  // mismatch because vectors_vec retains the old vec0 schema.
+  const remaining = db
+    .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
+    .get() as { n: number };
+  if (remaining.n === 0) {
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  }
 }
 
 /**

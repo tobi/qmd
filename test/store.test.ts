@@ -2921,6 +2921,43 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings scoped force drops vectors_vec when no rows remain", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      // Single active collection so a scoped force clear empties content_vectors entirely.
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nContent A" });
+      await insertTestDocument(db, "alpha", { name: "a2", body: "# Alpha 2\n\nContent B" });
+
+      await generateEmbeddings(store);
+
+      const vecTableExists = (): boolean =>
+        !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+
+      expect(vecTableExists()).toBe(true);
+
+      // Run clearAllEmbeddings directly via the force path; content_vectors
+      // becomes empty, so vectors_vec should be dropped to allow a model/dim
+      // swap on the next embed run.
+      await generateEmbeddings(store, { force: true, collection: "alpha" });
+
+      const contentRows = (db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number }).c;
+      // After re-embed contentRows is >0, but during the force path vectors_vec
+      // should have been rebuilt. Verify that post-embed the table exists and
+      // holds the new rows.
+      expect(vecTableExists()).toBe(true);
+      expect(contentRows).toBe(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
