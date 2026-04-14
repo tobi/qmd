@@ -2802,6 +2802,50 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings with options.collection only embeds that collection", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nAlpha content" });
+      await insertTestDocument(db, "alpha", { name: "a2", body: "# Alpha 2\n\nAlpha content" });
+      await insertTestDocument(db, "beta", { name: "b1", body: "# Beta 1\n\nBeta content" });
+      await insertTestDocument(db, "beta", { name: "b2", body: "# Beta 2\n\nBeta content" });
+
+      const alphaResult = await generateEmbeddings(store, { collection: "alpha" });
+      expect(alphaResult.docsProcessed).toBe(2);
+
+      const vectorsByCollection = (): Record<string, number> => {
+        const rows = db.prepare(`
+          SELECT d.collection, COUNT(DISTINCT cv.hash) as count
+          FROM content_vectors cv
+          JOIN documents d ON cv.hash = d.hash
+          WHERE d.active = 1
+          GROUP BY d.collection
+        `).all() as { collection: string; count: number }[];
+        return Object.fromEntries(rows.map(r => [r.collection, r.count]));
+      };
+
+      expect(vectorsByCollection()).toEqual({ alpha: 2 });
+
+      const betaResult = await generateEmbeddings(store, { collection: "beta" });
+      expect(betaResult.docsProcessed).toBe(2);
+
+      expect(vectorsByCollection()).toEqual({ alpha: 2, beta: 2 });
+
+      // A third run with an already-embedded collection is a no-op.
+      const reRun = await generateEmbeddings(store, { collection: "alpha" });
+      expect(reRun.docsProcessed).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 

@@ -1300,6 +1300,11 @@ export type EmbedResult = {
 export type EmbedOptions = {
   force?: boolean;
   model?: string;
+  /**
+   * Restrict embedding to documents in a single collection.
+   * When omitted, all unembedded documents across every collection are embedded.
+   */
+  collection?: string;
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
@@ -1341,16 +1346,18 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
   };
 }
 
-function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
-  return db.prepare(`
+function getPendingEmbeddingDocs(db: Database, collection?: string): PendingEmbeddingDoc[] {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const stmt = db.prepare(`
     SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND v.hash IS NULL ${collectionFilter}
     GROUP BY d.hash
     ORDER BY MIN(d.path)
-  `).all() as PendingEmbeddingDoc[];
+  `);
+  return (collection ? stmt.all(collection) : stmt.all()) as PendingEmbeddingDoc[];
 }
 
 function buildEmbeddingBatches(
@@ -1420,7 +1427,7 @@ export async function generateEmbeddings(
     clearAllEmbeddings(db);
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -1868,13 +1875,15 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
-  const result = db.prepare(`
+export function getHashesNeedingEmbedding(db: Database, collection?: string): number {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const stmt = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+    WHERE d.active = 1 AND v.hash IS NULL ${collectionFilter}
+  `);
+  const result = (collection ? stmt.get(collection) : stmt.get()) as { count: number };
   return result.count;
 }
 

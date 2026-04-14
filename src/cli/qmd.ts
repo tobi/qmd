@@ -1676,7 +1676,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 async function vectorIndex(
   model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1686,7 +1686,7 @@ async function vectorIndex(
   }
 
   // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db);
+  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection);
   if (hashesToEmbed === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();
@@ -1707,6 +1707,7 @@ async function vectorIndex(
   const result = await generateEmbeddings(storeInstance, {
     force,
     model,
+    collection: batchOptions?.collection,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
@@ -3107,10 +3108,15 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        const embedCollectionOpt = cli.opts.collection;
+        const embedCollection = Array.isArray(embedCollectionOpt)
+          ? embedCollectionOpt[0]
+          : embedCollectionOpt;
         await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
+          collection: embedCollection,
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
