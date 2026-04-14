@@ -112,6 +112,40 @@ Or configure MCP manually in `~/.claude/settings.json`:
 }
 ```
 
+#### Fast CLI via daemon (scripts / agents)
+
+For repeated scripted queries the per-call Node + SQLite + sqlite-vec
+bootstrap (~500 ms on large indexes) is wasted overhead. Start a daemon
+once and point `bin/qmd` at it:
+
+```sh
+qmd mcp --http --daemon --port 8181
+export QMD_DAEMON_URL="http://127.0.0.1:8181"
+
+qmd search "database migrations" -c engineering      # ~50 ms, returns JSON
+qmd vsearch "onboarding" -c handbook                 # ~80 ms, returns JSON
+```
+
+`qmd search` / `qmd vsearch` route through the daemon's existing
+`POST /search` endpoint when `QMD_DAEMON_URL` is set. Responses are the
+structured JSON shape (`{results:[{docid,file,title,score,snippet,context}]}`)
+— convenient for agents and scripts parsing stdout. Interactive users
+who want the formatted-text output should leave `QMD_DAEMON_URL` unset.
+
+Fall-through cases (silently use cold-start CLI):
+
+- `QMD_DAEMON_URL` unset
+- Daemon health check fails within 1 s
+- Request returns a non-2xx
+- Invocation uses `--index <name>` (daemons serve one index at a time)
+
+Use `curl` to test payload directly:
+
+```sh
+curl -s http://127.0.0.1:8181/search -H 'Content-Type: application/json' \
+  -d '{"searches":[{"type":"lex","query":"auth"}],"collections":["engineering"],"limit":5}'
+```
+
 #### HTTP Transport
 
 By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:

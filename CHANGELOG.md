@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `bin/qmd` gains an opt-in fast-path for `qmd search` / `qmd vsearch`.
+  When `QMD_DAEMON_URL` is set and points at a running
+  `qmd mcp --http --daemon`, these subcommands POST to the daemon's
+  existing `/search` REST endpoint instead of paying the per-call Node +
+  better-sqlite3 + sqlite-vec bootstrap. On large indexes this turns a
+  ~500–800 ms cold start into ~50–100 ms. Opt-in preserves the default
+  formatted-text output for interactive users; daemon mode prints the
+  JSON response for scripts/agents. `--index <name>` and any non-curl
+  error silently fall through to the cold-start CLI.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529

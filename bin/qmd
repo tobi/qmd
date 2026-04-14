@@ -15,6 +15,89 @@ done
 # to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
+# ---------------------------------------------------------------------------
+# Daemon fast-path (opt-in, search + vsearch)
+#
+# When `QMD_DAEMON_URL` is set and points at a running `qmd mcp --http` daemon,
+# route `qmd search` / `qmd vsearch` through the daemon's existing REST
+# endpoint instead of bootstrapping a fresh Node + better-sqlite3 + sqlite-vec
+# process for every invocation. On large indexes this can be the difference
+# between ~80 ms and ~800 ms per query.
+#
+# This is opt-in so the default interactive UX (formatted text output) is
+# unchanged. Callers that set `QMD_DAEMON_URL` get the daemon's JSON response
+# shape on stdout — useful for scripts and agents. Unset the variable (or pass
+# `--index <name>`) to fall back to the normal cold-start CLI.
+#
+# Bypass rules:
+# - Only `search` and `vsearch` are eligible.
+# - Any `--index` / `--index=...` forces fall-through — the daemon serves
+#   whichever index it was started with, so secondary-index queries must go
+#   through the cold-start CLI.
+# - Any curl/daemon error (health check fails, non-2xx response) falls back
+#   to cold-start silently.
+# ---------------------------------------------------------------------------
+if [ -n "${QMD_DAEMON_URL:-}" ] && command -v curl >/dev/null 2>&1; then
+  _qmd_subcommand=""
+  _qmd_query_type=""
+  case "${1:-}" in
+    search)  _qmd_subcommand="search";  _qmd_query_type="lex" ;;
+    vsearch) _qmd_subcommand="vsearch"; _qmd_query_type="vec" ;;
+  esac
+
+  if [ -n "$_qmd_subcommand" ]; then
+    _qmd_has_index=0
+    for _arg in "$@"; do
+      case "$_arg" in
+        --index|--index=*) _qmd_has_index=1; break ;;
+      esac
+    done
+
+    if [ "$_qmd_has_index" -eq 0 ] && \
+       curl -sf --max-time 1 "${QMD_DAEMON_URL}/health" >/dev/null 2>&1; then
+      _qmd_limit=10
+      _qmd_collection=""
+      _qmd_query=""
+      shift  # drop the subcommand
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -l|--limit)       _qmd_limit="$2"; shift 2 ;;
+          --limit=*)        _qmd_limit="${1#*=}"; shift ;;
+          -c|--collection)  _qmd_collection="$2"; shift 2 ;;
+          --collection=*)   _qmd_collection="${1#*=}"; shift ;;
+          --)               shift; while [ $# -gt 0 ]; do
+                              if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+                              else _qmd_query="$_qmd_query $1"; fi
+                              shift
+                            done ;;
+          -*)               shift ;;
+          *)                if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+                            else _qmd_query="$_qmd_query $1"; fi
+                            shift ;;
+        esac
+      done
+
+      if [ -n "$_qmd_query" ]; then
+        _qmd_escaped_query=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -n "$_qmd_collection" ]; then
+          _qmd_collections_json="[\"${_qmd_collection}\"]"
+        else
+          _qmd_collections_json="null"
+        fi
+        _qmd_payload="{\"searches\":[{\"type\":\"${_qmd_query_type}\",\"query\":\"${_qmd_escaped_query}\"}],\"collections\":${_qmd_collections_json},\"limit\":${_qmd_limit}}"
+
+        if curl -sf --max-time 30 -X POST \
+             -H "Content-Type: application/json" \
+             -d "$_qmd_payload" \
+             "${QMD_DAEMON_URL}/search"; then
+          echo
+          exit 0
+        fi
+      fi
+    fi
+  fi
+fi
+
 # Detect the package manager that installed dependencies by checking lockfiles.
 # $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
 # on the system, not that it was used to install this package (see #361).
