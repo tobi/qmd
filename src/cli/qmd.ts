@@ -78,7 +78,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
+import { RemoteLLM } from "../remote-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -105,6 +107,23 @@ import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedde
 // Tests must set INDEX_PATH or use createStore() with explicit path
 enableProductionMode();
 
+// Remote LLM: if QMD_REMOTE_EMBED_URL / QMD_REMOTE_RERANK_URL are set, route
+// embedding and reranking through the remote server instead of local GGUF models.
+const remoteEmbedUrl = process.env.QMD_REMOTE_EMBED_URL;
+const remoteRerankUrl = process.env.QMD_REMOTE_RERANK_URL;
+if (remoteEmbedUrl || remoteRerankUrl) {
+  if (!remoteEmbedUrl || !remoteRerankUrl) {
+    throw new Error("QMD_REMOTE_EMBED_URL and QMD_REMOTE_RERANK_URL must both be set to enable remote embedding/reranking");
+  }
+  const remote = new RemoteLLM({
+    embedUrl: remoteEmbedUrl,
+    rerankUrl: remoteRerankUrl,
+    genUrl: process.env.QMD_REMOTE_GEN_URL,
+    apiKey: process.env.QMD_REMOTE_API_KEY,
+  });
+  setDefaultLLM(new HybridLLM(null, remote));
+}
+
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
 // =============================================================================
@@ -120,7 +139,7 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
+      if (config.models && !getDefaultLLM().isRemote) {
         setDefaultLlamaCpp(new LlamaCpp({
           embedModel: config.models.embed,
           generateModel: config.models.generate,
@@ -456,21 +475,30 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
-    console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    const llmForStatus = getDefaultLLM();
+    if (llmForStatus.isRemote) {
+      console.log(`\n${c.bold}Models${c.reset}`);
+      console.log(`  Embedding:   ${remoteEmbedUrl ?? process.env.QMD_REMOTE_EMBED_URL ?? "(remote)"}`);
+      console.log(`  Reranking:   ${remoteRerankUrl ?? process.env.QMD_REMOTE_RERANK_URL ?? "(remote)"}`);
+      console.log(`  Generation:  ${process.env.QMD_REMOTE_GEN_URL ?? "(same as embedding)"}`);
+    } else {
+      // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+      const hfLink = (uri: string) => {
+        const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+        return match ? `https://huggingface.co/${match[1]}` : uri;
+      };
+      console.log(`\n${c.bold}Models${c.reset}`);
+      console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+      console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+      console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    }
   }
 
   // Device / GPU info
   console.log(`\n${c.bold}Device${c.reset}`);
   try {
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM() as Partial<LlamaCpp>;
+    if (typeof llm.getDeviceInfo !== "function") return;
     const device = await llm.getDeviceInfo({ allowBuild: false });
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);

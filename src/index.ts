@@ -64,9 +64,9 @@ import {
   type EmbedResult,
   type ChunkStrategy,
 } from "./store.js";
-import {
-  LlamaCpp,
-} from "./llm.js";
+import { LlamaCpp, type LLM } from "./llm.js";
+import { HybridLLM } from "./hybrid-llm.js";
+import { RemoteLLM } from "./remote-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -204,6 +204,12 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /**
+   * Custom LLM backend. Supports HybridLLM or RemoteLLM for remote mode.
+   * When omitted, QMD_REMOTE_EMBED_URL / QMD_REMOTE_RERANK_URL env vars are
+   * checked, then falls back to a local LlamaCpp instance.
+   */
+  llm?: LLM;
 }
 
 /**
@@ -365,16 +371,28 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-  internal.llm = llm;
+  // Determine LLM backend: explicit option > env-var remote > local LlamaCpp.
+  const remoteEmbedUrl = process.env.QMD_REMOTE_EMBED_URL;
+  const remoteRerankUrl = process.env.QMD_REMOTE_RERANK_URL;
+  if (options.llm) {
+    internal.llm = options.llm;
+  } else if (remoteEmbedUrl && remoteRerankUrl) {
+    const remote = new RemoteLLM({
+      embedUrl: remoteEmbedUrl,
+      rerankUrl: remoteRerankUrl,
+      genUrl: process.env.QMD_REMOTE_GEN_URL,
+      apiKey: process.env.QMD_REMOTE_API_KEY,
+    });
+    internal.llm = new HybridLLM(null, remote);
+  } else {
+    internal.llm = new LlamaCpp({
+      embedModel: config?.models?.embed,
+      generateModel: config?.models?.generate,
+      rerankModel: config?.models?.rerank,
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    });
+  }
 
   const store: QMDStore = {
     internal,
@@ -529,7 +547,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Lifecycle
     close: async () => {
-      await llm.dispose();
+      await internal.llm?.dispose();
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source

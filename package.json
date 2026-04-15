@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
+    "build": "tsc -p tsconfig.build.json; { echo '#!/usr/bin/env node'; cat dist/cli/qmd.js; } > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
     "test": "vitest run --reporter=verbose test/",
     "qmd": "tsx src/cli/qmd.ts",
     "index": "tsx src/cli/qmd.ts index",

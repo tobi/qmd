@@ -2,7 +2,36 @@
 
 ## [Unreleased]
 
+### Features
+
+- **Remote embedding/reranking** via OpenAI-compatible endpoints. Set
+  `QMD_REMOTE_EMBED_URL` and `QMD_REMOTE_RERANK_URL` to route embedding and
+  reranking to any OpenAI-compatible server (vLLM, TEI, LiteLLM, Ollama, etc.)
+  without running local GGUF models. Query expansion and generation are handled
+  by the same backend via `/v1/chat/completions`. To use a dedicated chat server
+  separate from the embedding server, set `QMD_REMOTE_GEN_URL`.
+  All endpoints support `QMD_REMOTE_API_KEY` for bearer authentication.
+  Circuit breakers protect each endpoint independently.
+  `qmd status` shows remote server URLs when in remote mode.
+- SDK: `createStore()` now accepts an `llm?` option to inject a custom LLM backend
+  (`HybridLLM`, `RemoteLLM`, or any `LLM` implementation). When omitted,
+  `QMD_REMOTE_EMBED_URL` / `QMD_REMOTE_RERANK_URL` are checked automatically.
+
 ### Fixes
+
+- Remote mode: `QMD_REMOTE_EMBED_URL` is no longer overwritten when a YAML
+  `models:` block is present — the override is skipped when remote mode is active.
+- Remote mode: `RemoteLLM.detokenize()` returns a character-length approximation
+  instead of empty string, preventing silent chunk loss in the fallback path.
+- `chunkDocumentByTokens` accepts an optional `llm?` parameter; internal callers
+  pass the store-scoped LLM instead of pulling from the global singleton.
+- `LLM` interface: `tokenize`, `countTokens`, `detokenize`, `embedBatch` are now
+  required members. `LLMSessionManager` and `withLLMSessionForLlm` accept `LLM`.
+- `RemoteLLM.modelExists()` logs a warning before returning the optimistic
+  fail-open result when neither server can verify model availability.
+
+### Fixes (existing)
+
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
