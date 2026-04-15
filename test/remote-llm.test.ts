@@ -102,7 +102,7 @@ afterAll(async () => {
 });
 
 afterEach(() => {
-  vi.unstubAllGlobals();
+  vi.unstubAllGlobals?.();
   vi.restoreAllMocks();
 });
 
@@ -333,6 +333,7 @@ describe("RemoteLLM", () => {
   });
 
   test("enforces connect timeout", async () => {
+    const originalFetch = globalThis.fetch;
     const fetchStub = vi.fn(async (_url: string, init?: RequestInit) => {
       const signal = init?.signal as AbortSignal | undefined;
       return await new Promise<Response>((resolve, reject) => {
@@ -340,21 +341,26 @@ describe("RemoteLLM", () => {
         void resolve;
       });
     });
-    vi.stubGlobal("fetch", fetchStub);
+    globalThis.fetch = fetchStub as typeof fetch;
 
-    const remote = new RemoteLLM({
-      embedUrl: "http://example.com",
-      rerankUrl: "http://example.com",
-      connectTimeoutMs: 20,
-      readTimeoutMs: 100,
-    });
+    try {
+      const remote = new RemoteLLM({
+        embedUrl: "http://example.com",
+        rerankUrl: "http://example.com",
+        connectTimeoutMs: 20,
+        readTimeoutMs: 100,
+      });
 
-    await expect(remote.embed("hello")).rejects.toThrow(
-      "connect timeout after 20ms",
-    );
+      await expect(remote.embed("hello")).rejects.toThrow(
+        "connect timeout after 20ms",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("enforces read timeout", async () => {
+    const originalFetch = globalThis.fetch;
     const fetchStub = vi.fn(
       async () =>
         new Response(null, {
@@ -368,19 +374,23 @@ describe("RemoteLLM", () => {
         return await new Promise<string>(() => {});
       });
 
-    vi.stubGlobal("fetch", fetchStub);
+    globalThis.fetch = fetchStub as typeof fetch;
 
-    const remote = new RemoteLLM({
-      embedUrl: "http://example.com",
-      rerankUrl: "http://example.com",
-      connectTimeoutMs: 50,
-      readTimeoutMs: 20,
-    });
+    try {
+      const remote = new RemoteLLM({
+        embedUrl: "http://example.com",
+        rerankUrl: "http://example.com",
+        connectTimeoutMs: 50,
+        readTimeoutMs: 20,
+      });
 
-    await expect(remote.embed("hello")).rejects.toThrow(
-      "read timeout after 20ms",
-    );
-    responseTextSpy.mockRestore();
+      await expect(remote.embed("hello")).rejects.toThrow(
+        "read timeout after 20ms",
+      );
+    } finally {
+      responseTextSpy.mockRestore();
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("generate calls chat completions and returns text", async () => {
