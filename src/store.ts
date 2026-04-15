@@ -2283,7 +2283,7 @@ export async function chunkDocumentByTokens(
   signal?: AbortSignal,
   llmOverride?: LLM,
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio

@@ -938,6 +938,9 @@ describe("embed", () => {
     const embedBatchCalls: string[][] = [];
     return {
       embedBatchCalls,
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
       async embed(_text: string) {
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },
