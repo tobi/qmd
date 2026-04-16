@@ -71,8 +71,9 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 }
 
 import { homedir } from "os";
-import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { dirname, join } from "path";
+import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { createRequire } from "module";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -111,6 +112,23 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+// =============================================================================
+// Build Writability Check
+// =============================================================================
+
+const require = createRequire(import.meta.url);
+
+/** Whether node-llama-cpp can write to its llama/ directory (false on NixOS). */
+function canWriteLlamaDir(): boolean {
+  try {
+    const pkgDir = dirname(require.resolve("node-llama-cpp/package.json"));
+    accessSync(join(pkgDir, "llama"), constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -851,9 +869,11 @@ export class LlamaCpp implements LLM {
   private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
+      // Skip source build when install dir is read-only (e.g. NixOS store).
+      const canBuild = allowBuild && canWriteLlamaDir();
 
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
-      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
+      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
           // node-llama-cpp documents gpu:"auto" as the best default: Metal on
