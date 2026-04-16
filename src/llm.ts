@@ -15,8 +15,9 @@ import {
   type Token as LlamaToken,
 } from "node-llama-cpp";
 import { homedir } from "os";
-import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { dirname, join } from "path";
+import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { createRequire } from "module";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -55,6 +56,23 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+// =============================================================================
+// Build Writability Check
+// =============================================================================
+
+const require = createRequire(import.meta.url);
+
+/** Whether node-llama-cpp can write to its llama/ directory (false on NixOS). */
+function canWriteLlamaDir(): boolean {
+  try {
+    const pkgDir = dirname(require.resolve("node-llama-cpp/package.json"));
+    accessSync(join(pkgDir, "llama"), constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -618,13 +636,14 @@ export class LlamaCpp implements LLM {
   private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
+      const buildMode = allowBuild && canWriteLlamaDir() ? "autoAttempt" : "never";
 
       const loadLlama = async (gpu: LlamaGpuMode) =>
         await getLlama({
-          build: allowBuild ? "autoAttempt" : "never",
+          build: buildMode,
           logLevel: LlamaLogLevel.error,
           gpu,
-          skipDownload: !allowBuild,
+          skipDownload: buildMode === "never",
         });
 
       let llama: Llama;

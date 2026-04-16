@@ -4,6 +4,12 @@
 
 ### Fixes
 
+- NixOS: fix `qmd embed` crash on immutable-root systems. Prebuilt
+  node-llama-cpp binaries expect FHS paths like `/lib64/libc.so.6`
+  which don't exist on NixOS. The flake wrapper sets `LD_LIBRARY_PATH`
+  to include Nix's glibc and libstdc++. When the install directory
+  is read-only, `getLlama()` uses `build: "never"` to skip source
+  builds that would fail with EACCES.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive
