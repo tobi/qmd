@@ -412,16 +412,7 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return {
-        content: [{
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.displayPath)}`,
-            name: result.displayPath,
-            title: result.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        }],
+        content: [{ type: "text", text }],
       };
     }
   );
@@ -453,7 +444,7 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      const content: ({ type: "text"; text: string } | { type: "resource"; resource: { uri: string; name: string; title?: string; mimeType: string; text: string } })[] = [];
+      const content: { type: "text"; text: string }[] = [];
 
       if (errors.length > 0) {
         content.push({ type: "text", text: `Errors:\n${errors.join('\n')}` });
@@ -483,16 +474,7 @@ Intent-aware lex (C++ performance, not sports):
           text = `<!-- Context: ${result.doc.context} -->\n\n` + text;
         }
 
-        content.push({
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.doc.displayPath)}`,
-            name: result.doc.displayPath,
-            title: result.doc.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        });
+        content.push({ type: "text", text });
       }
 
       return { content };
