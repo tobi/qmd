@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -53,6 +53,7 @@ import {
   type DocumentResult,
   type SearchResult,
   type RankedResult,
+  reindexCollection,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -3016,6 +3017,50 @@ describe("Content-Addressable Storage", () => {
     const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content`).get() as { count: number };
     expect(contentCount.count).toBe(2);
 
+    await cleanupTestDb(store);
+  });
+
+  test("reindexCollection soft-deletes orphaned docs and cleanupOrphanedContent preserves their content rows (#585)", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "qmd-585-"));
+    const collectionName = "testcoll-585";
+
+    const filenames = ["a.md", "b.md", "c.md", "d.md", "e.md"];
+    for (const name of filenames) {
+      await writeFile(join(collectionDir, name), `# ${name}\n\nbody ${name}`);
+    }
+
+    const first = await reindexCollection(store, collectionDir, "*.md", collectionName);
+    expect(first.indexed).toBe(5);
+    expect(first.removed).toBe(0);
+    expect(
+      (store.db
+        .prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ? AND active = 1`)
+        .get(collectionName) as { c: number }).c,
+    ).toBe(5);
+
+    await unlink(join(collectionDir, "a.md"));
+    await unlink(join(collectionDir, "b.md"));
+    await unlink(join(collectionDir, "c.md"));
+
+    const second = await reindexCollection(store, collectionDir, "*.md", collectionName);
+
+    expect(second.removed).toBe(3);
+    expect(
+      (store.db
+        .prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ? AND active = 1`)
+        .get(collectionName) as { c: number }).c,
+    ).toBe(2);
+    // Soft-deleted tombstones must survive the cleanupOrphanedContent pass so
+    // that `insertDocument`'s ON CONFLICT reactivation path still works when a
+    // file comes back.
+    expect(
+      (store.db
+        .prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ? AND active = 0`)
+        .get(collectionName) as { c: number }).c,
+    ).toBe(3);
+
+    await rm(collectionDir, { recursive: true, force: true });
     await cleanupTestDb(store);
   });
 
