@@ -3059,6 +3059,11 @@ describe("Content-Addressable Storage", () => {
         .prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ? AND active = 0`)
         .get(collectionName) as { c: number }).c,
     ).toBe(3);
+    // And the content rows the tombstones reference must still exist —
+    // otherwise `documents.hash ON DELETE CASCADE` would have removed them.
+    expect(
+      (store.db.prepare(`SELECT COUNT(*) AS c FROM content`).get() as { c: number }).c,
+    ).toBe(5);
 
     await rm(collectionDir, { recursive: true, force: true });
     await cleanupTestDb(store);
