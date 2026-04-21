@@ -1949,13 +1949,20 @@ export function deleteInactiveDocuments(db: Database): number {
 }
 
 /**
- * Remove orphaned content hashes that are not referenced by any active document.
+ * Remove orphaned content hashes that are not referenced by any document.
+ *
+ * Inactive (soft-deleted) documents still count as references — otherwise the
+ * `documents.hash ON DELETE CASCADE` foreign key would cascade-delete rows that
+ * `reindexCollection` has just marked `active = 0`, turning soft deletes into
+ * hard deletes and breaking the reactivation path in `insertDocument`.
+ * `deleteInactiveDocuments()` exists as the explicit hard-delete entry point.
+ *
  * Returns the number of orphaned content hashes deleted.
  */
 export function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
   `).run();
   return result.changes;
 }
