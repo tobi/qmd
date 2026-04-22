@@ -78,7 +78,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -121,11 +123,28 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
+        const localLlm = new LlamaCpp({
           embedModel: config.models.embed,
           generateModel: config.models.generate,
           rerankModel: config.models.rerank,
-        }));
+        });
+
+        // Check if remote embedding is configured (env vars take precedence over YAML)
+        const remoteConfig = remoteConfigFromEnv(config.models);
+        if (remoteConfig) {
+          const remoteLlm = new RemoteLLM(remoteConfig);
+          setDefaultLLM(new HybridLLM(remoteLlm, localLlm));
+        } else {
+          setDefaultLLM(localLlm);
+        }
+      } else {
+        // No YAML models config — still check env vars for remote embedding
+        const remoteConfig = remoteConfigFromEnv();
+        if (remoteConfig) {
+          const remoteLlm = new RemoteLLM(remoteConfig);
+          const localLlm = new LlamaCpp();
+          setDefaultLLM(new HybridLLM(remoteLlm, localLlm));
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -1685,6 +1704,9 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // Use the actual model name from the configured LLM (may be remote, not the default GGUF URI)
+  model = getDefaultLLM().embedModelName;
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
