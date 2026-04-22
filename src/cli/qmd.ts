@@ -112,23 +112,36 @@ enableProductionMode();
 let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
+/** Resolved model URIs: YAML config > env var > built-in default */
+const models = {
+  embed: DEFAULT_EMBED_MODEL_URI,
+  generate: DEFAULT_GENERATE_MODEL_URI,
+  rerank: DEFAULT_RERANK_MODEL_URI,
+};
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    // Resolve model URIs from config/env before anything else
     try {
       const config = loadConfig();
+      models.embed = config.models?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL_URI;
+      models.generate = config.models?.generate || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL_URI;
+      models.rerank = config.models?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL_URI;
+      // Sync YAML config into SQLite store_collections
       syncConfigToDb(store.db, config);
       if (config.models) {
         setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
+          embedModel: models.embed,
+          generateModel: models.generate,
+          rerankModel: models.rerank,
         }));
       }
     } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // Config may not exist yet — resolve from env/defaults
+      models.embed = process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL_URI;
+      models.generate = process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL_URI;
+      models.rerank = process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL_URI;
     }
   }
   return store;
@@ -462,9 +475,9 @@ async function showStatus(): Promise<void> {
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(models.embed)}`);
+    console.log(`  Reranking:   ${hfLink(models.rerank)}`);
+    console.log(`  Generation:  ${hfLink(models.generate)}`);
   }
 
   // Device / GPU info
@@ -3109,10 +3122,11 @@ if (isMain) {
 
     case "embed":
       try {
+        getStore(); // ensure models are resolved from config before reading
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        await vectorIndex(models.embed, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -3124,14 +3138,10 @@ if (isMain) {
       break;
 
     case "pull": {
+      getStore(); // ensure models are resolved from config
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
-      ];
       console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
+      const results = await pullModels(Object.values(models), {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,
       });
