@@ -1300,6 +1300,11 @@ export type EmbedResult = {
 export type EmbedOptions = {
   force?: boolean;
   model?: string;
+  /**
+   * Restrict embedding to documents in a single collection.
+   * When omitted, all unembedded documents across every collection are embedded.
+   */
+  collection?: string;
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
@@ -1341,16 +1346,18 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
   };
 }
 
-function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
-  return db.prepare(`
+function getPendingEmbeddingDocs(db: Database, collection?: string): PendingEmbeddingDoc[] {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const stmt = db.prepare(`
     SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND v.hash IS NULL ${collectionFilter}
     GROUP BY d.hash
     ORDER BY MIN(d.path)
-  `).all() as PendingEmbeddingDoc[];
+  `);
+  return (collection ? stmt.all(collection) : stmt.all()) as PendingEmbeddingDoc[];
 }
 
 function buildEmbeddingBatches(
@@ -1417,10 +1424,10 @@ export async function generateEmbeddings(
   const encoder = new TextEncoder();
 
   if (options?.force) {
-    clearAllEmbeddings(db);
+    clearAllEmbeddings(db, options?.collection);
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -1868,13 +1875,15 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
-  const result = db.prepare(`
+export function getHashesNeedingEmbedding(db: Database, collection?: string): number {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const stmt = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+    WHERE d.active = 1 AND v.hash IS NULL ${collectionFilter}
+  `);
+  const result = (collection ? stmt.get(collection) : stmt.get()) as { count: number };
   return result.count;
 }
 
@@ -3214,9 +3223,75 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Clear all embeddings from the database (force re-index).
  * Deletes all rows from content_vectors and drops the vectors_vec table.
  */
-export function clearAllEmbeddings(db: Database): void {
-  db.exec(`DELETE FROM content_vectors`);
-  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+/**
+ * Clear embeddings for the whole index, or just for one collection.
+ *
+ * When `collection` is omitted the entire content_vectors table is emptied and
+ * the vectors_vec virtual table is dropped (it is recreated with the right
+ * dimensions on the next embed run).
+ *
+ * When `collection` is provided, only vectors whose hash is referenced
+ * exclusively by active documents in that collection are removed. Hashes
+ * shared with active documents in other collections are left in place so
+ * vector search keeps working there (content_vectors is keyed globally by
+ * content hash; identical document bodies across collections share a row).
+ * vectors_vec is preserved so other collections keep working. vec0 virtual
+ * tables do not reliably accept IN-subquery DELETEs, so hash_seq values are
+ * enumerated first and deleted per row.
+ */
+export function clearAllEmbeddings(db: Database, collection?: string): void {
+  if (!collection) {
+    db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    return;
+  }
+
+  // Hashes owned exclusively by active docs in the target collection —
+  // i.e. no active doc in a different collection references the same hash.
+  const exclusiveHashesQuery = `
+    SELECT DISTINCT d.hash
+    FROM documents d
+    WHERE d.collection = ? AND d.active = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM documents d2
+        WHERE d2.hash = d.hash
+          AND d2.active = 1
+          AND d2.collection != d.collection
+      )
+  `;
+
+  const vecTableExists = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
+    .get();
+
+  if (vecTableExists) {
+    const hashSeqRows = db.prepare(`
+      SELECT cv.hash, cv.seq
+      FROM content_vectors cv
+      WHERE cv.hash IN (${exclusiveHashesQuery})
+    `).all(collection) as { hash: string; seq: number }[];
+
+    const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    for (const row of hashSeqRows) {
+      delVec.run(`${row.hash}_${row.seq}`);
+    }
+  }
+
+  db.prepare(`
+    DELETE FROM content_vectors
+    WHERE hash IN (${exclusiveHashesQuery})
+  `).run(collection);
+
+  // If the scoped clear emptied content_vectors, drop vectors_vec so the next
+  // embed run can recreate it with the new dimensions. Otherwise a follow-up
+  // `{ force, collection, model: <different-dim> }` run would fail on dimension
+  // mismatch because vectors_vec retains the old vec0 schema.
+  const remaining = db
+    .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
+    .get() as { n: number };
+  if (remaining.n === 0) {
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  }
 }
 
 /**

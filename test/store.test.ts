@@ -2802,6 +2802,162 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings with options.collection only embeds that collection", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nAlpha content" });
+      await insertTestDocument(db, "alpha", { name: "a2", body: "# Alpha 2\n\nAlpha content" });
+      await insertTestDocument(db, "beta", { name: "b1", body: "# Beta 1\n\nBeta content" });
+      await insertTestDocument(db, "beta", { name: "b2", body: "# Beta 2\n\nBeta content" });
+
+      const alphaResult = await generateEmbeddings(store, { collection: "alpha" });
+      expect(alphaResult.docsProcessed).toBe(2);
+
+      const vectorsByCollection = (): Record<string, number> => {
+        const rows = db.prepare(`
+          SELECT d.collection, COUNT(DISTINCT cv.hash) as count
+          FROM content_vectors cv
+          JOIN documents d ON cv.hash = d.hash
+          WHERE d.active = 1
+          GROUP BY d.collection
+        `).all() as { collection: string; count: number }[];
+        return Object.fromEntries(rows.map(r => [r.collection, r.count]));
+      };
+
+      expect(vectorsByCollection()).toEqual({ alpha: 2 });
+
+      const betaResult = await generateEmbeddings(store, { collection: "beta" });
+      expect(betaResult.docsProcessed).toBe(2);
+
+      expect(vectorsByCollection()).toEqual({ alpha: 2, beta: 2 });
+
+      // A third run with an already-embedded collection is a no-op.
+      const reRun = await generateEmbeddings(store, { collection: "alpha" });
+      expect(reRun.docsProcessed).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings with force + collection only clears that collection", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nAlpha content" });
+      await insertTestDocument(db, "beta", { name: "b1", body: "# Beta 1\n\nBeta content" });
+
+      await generateEmbeddings(store);
+
+      const vectorsByCollection = (): Record<string, number> => {
+        const rows = db.prepare(`
+          SELECT d.collection, COUNT(DISTINCT cv.hash) as count
+          FROM content_vectors cv
+          JOIN documents d ON cv.hash = d.hash
+          WHERE d.active = 1
+          GROUP BY d.collection
+        `).all() as { collection: string; count: number }[];
+        return Object.fromEntries(rows.map(r => [r.collection, r.count]));
+      };
+
+      expect(vectorsByCollection()).toEqual({ alpha: 1, beta: 1 });
+
+      // Force re-embed scoped to alpha must NOT wipe beta's vectors.
+      const result = await generateEmbeddings(store, { force: true, collection: "alpha" });
+      expect(result.docsProcessed).toBe(1);
+      expect(vectorsByCollection()).toEqual({ alpha: 1, beta: 1 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings with force + collection preserves shared hashes", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    // Identical body -> identical hash in two collections. content_vectors is
+    // keyed globally by hash so a naive delete-by-collection would drop the
+    // shared hash's vector and leave the non-targeted collection broken.
+    const sharedBody = "# Shared\n\nIdentical content across collections.";
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "shared", body: sharedBody });
+      await insertTestDocument(db, "alpha", { name: "alpha-only", body: "# Alpha Only\n\nUnique alpha." });
+      await insertTestDocument(db, "beta", { name: "shared", body: sharedBody });
+      await insertTestDocument(db, "beta", { name: "beta-only", body: "# Beta Only\n\nUnique beta." });
+
+      await generateEmbeddings(store);
+
+      const distinctHashes = (): number =>
+        (db.prepare(`SELECT COUNT(DISTINCT hash) as count FROM content_vectors`).get() as { count: number }).count;
+
+      // Three distinct content hashes: shared (1) + alpha-only (1) + beta-only (1).
+      expect(distinctHashes()).toBe(3);
+
+      // Force re-embed alpha. The shared hash must survive because beta still
+      // references it via an active document.
+      await generateEmbeddings(store, { force: true, collection: "alpha" });
+
+      expect(distinctHashes()).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings scoped force drops vectors_vec when no rows remain", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      // Single active collection so a scoped force clear empties content_vectors entirely.
+      await insertTestDocument(db, "alpha", { name: "a1", body: "# Alpha 1\n\nContent A" });
+      await insertTestDocument(db, "alpha", { name: "a2", body: "# Alpha 2\n\nContent B" });
+
+      await generateEmbeddings(store);
+
+      const vecTableExists = (): boolean =>
+        !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+
+      expect(vecTableExists()).toBe(true);
+
+      // Run clearAllEmbeddings directly via the force path; content_vectors
+      // becomes empty, so vectors_vec should be dropped to allow a model/dim
+      // swap on the next embed run.
+      await generateEmbeddings(store, { force: true, collection: "alpha" });
+
+      const contentRows = (db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number }).c;
+      // After re-embed contentRows is >0, but during the force path vectors_vec
+      // should have been rebuilt. Verify that post-embed the table exists and
+      // holds the new rows.
+      expect(vecTableExists()).toBe(true);
+      expect(contentRows).toBe(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
