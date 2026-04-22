@@ -68,6 +68,7 @@ export function openDatabase(path: string): Database {
 export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
+  transaction<T extends (...args: any[]) => any>(fn: T): T;
   loadExtension(path: string): void;
   close(): void;
 }
