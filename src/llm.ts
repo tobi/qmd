@@ -1139,15 +1139,8 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const grammar = await llama.createGrammar({
-      grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-    });
-
+    // Grammar-constrained generation disabled - crashes with node-llama-cpp 3.18.1
+    // Manual parsing (below) handles the output format reliably without grammar constraints
     const intent = options.intent;
     const prompt = intent
       ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
@@ -1165,7 +1158,6 @@ export class LlamaCpp implements LLM {
       // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
-        grammar,
         maxTokens: 600,
         temperature: 0.7,
         topK: 20,

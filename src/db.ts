@@ -70,6 +70,8 @@ export interface Database {
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
   close(): void;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+  transaction<T extends Function>(fn: T): T;
 }
 
 export interface Statement {
