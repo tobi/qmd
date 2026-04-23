@@ -31,7 +31,11 @@ import {
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import {
+  enableProductionMode,
+  hybridQuery,
+  structuredSearch,
+} from "../store.js";
 
 enableProductionMode();
 
@@ -706,6 +710,114 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: POST /v1/search — rich hybrid/structured search.
+      // Returns full HybridQueryResult[] (no snippet flattening).
+      // Designed for the daemon-aware CLI fast-path. Versioned so we can
+      // evolve the wire format without breaking installed CLIs.
+      //
+      // Calls hybridQuery / structuredSearch directly (not store.search)
+      // so candidateLimit is actually forwarded — store.search's
+      // SearchOptions doesn't include it.
+      if (pathname === "/v1/search" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let parsedBody: unknown;
+        try {
+          parsedBody = JSON.parse(rawBody);
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
+
+        const params =
+          parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+            ? parsedBody as Record<string, unknown>
+            : {};
+
+        const queryParam = params.query;
+        const searchesParam = Array.isArray(params.searches) ? params.searches : undefined;
+        const hasQuery = typeof queryParam === "string" && queryParam.length > 0;
+        const hasSearches = searchesParam !== undefined && searchesParam.length > 0;
+
+        if (!hasQuery && !hasSearches) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required field: 'query' (string) or 'searches' (array)" }));
+          return;
+        }
+        if (hasQuery && hasSearches) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Provide only one of 'query' or 'searches', not both" }));
+          return;
+        }
+
+        const collectionsParam = params.collections;
+        const effectiveCollections =
+          Array.isArray(collectionsParam) && collectionsParam.length > 0
+            ? collectionsParam.filter((collection): collection is string => typeof collection === "string")
+            : (defaultCollectionNames.length > 0 ? defaultCollectionNames : undefined);
+        const structuredSearches = searchesParam ?? [];
+
+        const limit = typeof params.limit === "number" ? params.limit : 10;
+        const minScore = typeof params.minScore === "number" ? params.minScore : 0;
+        const candidateLimit = typeof params.candidateLimit === "number" ? params.candidateLimit : undefined;
+        const explain = params.explain === true;
+        const intent = typeof params.intent === "string" ? params.intent : undefined;
+        const skipRerank = params.skipRerank === true;
+        const chunkStrategy = params.chunkStrategy === "auto" || params.chunkStrategy === "regex"
+          ? params.chunkStrategy
+          : undefined;
+
+        try {
+          let results;
+          if (hasQuery) {
+            results = await hybridQuery(store.internal, queryParam, {
+              collection: effectiveCollections ? effectiveCollections[0] : undefined,
+              limit,
+              minScore,
+              candidateLimit,
+              explain,
+              intent,
+              skipRerank,
+              chunkStrategy,
+            });
+          } else {
+            const queries: ExpandedQuery[] = structuredSearches.map((search): ExpandedQuery => {
+              if (!search || typeof search !== "object" || Array.isArray(search)) {
+                return { type: "lex", query: "" };
+              }
+
+              const typeValue = search.type;
+              const type = typeValue === "vec" || typeValue === "hyde" ? typeValue : "lex";
+              const searchQuery = typeof search.query === "string"
+                ? search.query
+                : String(search.query ?? "");
+              return { type, query: searchQuery };
+            });
+
+            results = await structuredSearch(store.internal, queries, {
+              collections: effectiveCollections,
+              limit,
+              minScore,
+              candidateLimit,
+              explain,
+              intent,
+              skipRerank,
+              chunkStrategy,
+            });
+          }
+
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results }));
+          log(`${ts()} POST /v1/search ${hasQuery ? "hybrid" : `structured(${structuredSearches.length})`} → ${results.length} (${Date.now() - reqStart}ms)`);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`/v1/search error:`, err);
+          nodeRes.writeHead(500, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: message }));
+        }
         return;
       }
 

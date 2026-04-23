@@ -983,6 +983,87 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // POST /v1/search (rich endpoint for daemon-aware CLI)
+  // ---------------------------------------------------------------------------
+
+  describe("POST /v1/search", () => {
+    test("rejects empty body", async () => {
+      const res = await fetch(`${baseUrl}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error).toMatch(/query|searches/);
+    });
+
+    test("hybrid: { query } returns array of HybridQueryResult-shaped objects", async () => {
+      const res = await fetch(`${baseUrl}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "test", limit: 3, skipRerank: true }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(Array.isArray(json.results)).toBe(true);
+
+      for (const r of json.results) {
+        expect(typeof r.file).toBe("string");
+        expect(typeof r.displayPath).toBe("string");
+        expect(typeof r.title).toBe("string");
+        expect(typeof r.body).toBe("string");
+        expect(typeof r.bestChunk).toBe("string");
+        expect(typeof r.bestChunkPos).toBe("number");
+        expect(typeof r.score).toBe("number");
+        expect(typeof r.docid).toBe("string");
+        expect(r.context === null || typeof r.context === "string").toBe(true);
+      }
+    });
+
+    test("structured: { searches } returns array with same shape", async () => {
+      const res = await fetch(`${baseUrl}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          searches: [
+            { type: "lex", query: "test" },
+            { type: "vec", query: "test content" },
+          ],
+          limit: 3,
+          skipRerank: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(Array.isArray(json.results)).toBe(true);
+    });
+
+    test("returns 400 when both query and searches are present", async () => {
+      const res = await fetch(`${baseUrl}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: "x",
+          searches: [{ type: "lex", query: "y" }],
+        }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    test("respects limit=0 → empty results, not crash", async () => {
+      const res = await fetch(`${baseUrl}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "test", limit: 0 }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.results).toEqual([]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // MCP protocol over HTTP
   // ---------------------------------------------------------------------------
 
