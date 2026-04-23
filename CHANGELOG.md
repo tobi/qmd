@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `store.getStatus(options?)` now accepts an optional `ttlMs`. Default
+  behavior is unchanged (every call runs a fresh query). Long-lived
+  processes that poll status (MCP servers, HTTP wrappers, monitoring
+  loops on large indexes) can pass `{ ttlMs: 5000 }` to reuse a recent
+  snapshot and avoid re-running the `COUNT(DISTINCT d.hash)` scan on
+  every request. Cache scope is per-`Store` instance; a subsequent
+  call without `ttlMs` (or with `ttlMs: 0`) invalidates the cache.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529

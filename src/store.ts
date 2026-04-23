@@ -1095,7 +1095,17 @@ export type Store = {
   // Index health
   getHashesNeedingEmbedding: () => number;
   getIndexHealth: () => IndexHealthInfo;
-  getStatus: () => IndexStatus;
+  /**
+   * Snapshot of index and collection state.
+   *
+   * For most callers the default (no options) is correct — it runs the
+   * underlying `COUNT(*)` / `COUNT(DISTINCT)` queries every call. Long-lived
+   * processes that poll `getStatus` (MCP servers, HTTP wrappers, `qmd status`
+   * loops on large indexes) can pass `{ ttlMs }` to reuse a recent result
+   * within that window and avoid re-running the DISTINCT-count scan on every
+   * request. Cache scope is per-`Store` instance.
+   */
+  getStatus: (options?: { ttlMs?: number }) => IndexStatus;
 
   // Caching
   getCacheKey: typeof getCacheKey;
@@ -1600,6 +1610,13 @@ export function createStore(dbPath?: string): Store {
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
+  // Per-store getStatus cache. Stores the snapshot's *fetch timestamp* (not an
+  // expiry) so each caller's `ttlMs` is evaluated against the data's actual
+  // age, not the TTL the first caller happened to pass. Only populated when a
+  // caller passes `ttlMs > 0`, and a call with no options (or `ttlMs: 0`)
+  // clears the cache so subsequent polling calls re-fetch.
+  let statusCache: { value: IndexStatus; fetchedAt: number } | null = null;
+
   const store: Store = {
     db,
     dbPath: resolvedPath,
@@ -1609,7 +1626,20 @@ export function createStore(dbPath?: string): Store {
     // Index health
     getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
     getIndexHealth: () => getIndexHealth(db),
-    getStatus: () => getStatus(db),
+    getStatus: (options?: { ttlMs?: number }) => {
+      const ttl = options?.ttlMs ?? 0;
+      if (ttl > 0 && statusCache && (Date.now() - statusCache.fetchedAt) < ttl) {
+        return statusCache.value;
+      }
+      const fresh = getStatus(db);
+      // Stamp fetchedAt *after* the query returns so the cached snapshot's
+      // "age" reflects when the data became available, not when the query
+      // started. The expensive large-index case is exactly where query time
+      // is non-negligible; stamping pre-query would shorten (or entirely
+      // negate) the TTL window of subsequent callers.
+      statusCache = ttl > 0 ? { value: fresh, fetchedAt: Date.now() } : null;
+      return fresh;
+    },
 
     // Caching
     getCacheKey,
