@@ -3321,15 +3321,26 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    try {
+      const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
+      // Cache results by chunk text so identical chunks across files are scored once.
+      const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+      for (const result of rerankResult.results) {
+        const chunk = textByFile.get(result.file) || "";
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
+    } catch (error) {
+      process.stderr.write(
+        `QMD Warning: rerank unavailable (${error instanceof Error ? error.message : String(error)}), using retrieval order.\n`
+      );
+
+      const total = Math.max(1, uncachedDocs.length);
+      uncachedDocs.forEach((doc, index) => {
+        cachedResults.set(doc.text, 1 - index / total);
+      });
     }
   }
 
