@@ -167,9 +167,23 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
 
 /**
  * Check if a position is inside a code fence region.
+ * Uses binary search since fences are sorted by start position.
  */
 export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
-  return fences.some(f => pos > f.start && pos < f.end);
+  if (fences.length === 0) return false;
+  // Binary search: find the last fence whose start < pos
+  let lo = 0, hi = fences.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (fences[mid]!.start < pos) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // hi is now the index of the last fence with start < pos (or -1 if none)
+  if (hi < 0) return false;
+  return pos < fences[hi]!.end;
 }
 
 /**
@@ -196,9 +210,21 @@ export function findBestCutoff(
   let bestScore = -1;
   let bestPos = targetCharPos;
 
-  for (const bp of breakPoints) {
-    if (bp.pos < windowStart) continue;
-    if (bp.pos > targetCharPos) break;  // sorted, so we can stop
+  // Binary search for the first break point >= windowStart
+  let lo = 0, hi = breakPoints.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (breakPoints[mid]!.pos < windowStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  // Iterate only within the [windowStart, targetCharPos] range
+  for (let i = lo; i < breakPoints.length; i++) {
+    const bp = breakPoints[i]!;
+    if (bp.pos > targetCharPos) break;
 
     // Skip break points inside code fences
     if (isInsideCodeFence(bp.pos, codeFences)) continue;
