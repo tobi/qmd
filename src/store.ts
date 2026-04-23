@@ -3003,8 +3003,10 @@ function buildFTS5Query(query: string): string | null {
  * Returns error message if invalid, null if valid.
  */
 export function validateSemanticQuery(query: string): string | null {
-  // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  // Check for negation syntax. Match -word or -"phrase" only at the start of the
+  // query or after whitespace so that mid-term hyphens (e.g. DEC-0054, ui-kit) do
+  // not trigger false positives.
+  if (/(?:^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;

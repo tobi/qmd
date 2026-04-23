@@ -364,8 +364,17 @@ describe("lex query syntax", () => {
     test("rejects negation syntax", () => {
       expect(validateSemanticQuery("performance -sports")).toContain("Negation");
       expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
+      expect(validateSemanticQuery("foo -bar baz")).toContain("Negation");
     });
 
+    test("accepts mid-term hyphens without false-positive negation", () => {
+      // Identifiers with embedded hyphens are common (doc ids, npm scopes,
+      // hyphenated compounds). They must not be flagged as negation syntax.
+      expect(validateSemanticQuery("DEC-0054 architecture decision")).toBeNull();
+      expect(validateSemanticQuery("how does @scope/ui-kit work")).toBeNull();
+      expect(validateSemanticQuery("state-of-the-art retrieval")).toBeNull();
+      expect(validateSemanticQuery("token-based chunking")).toBeNull();
+    });
 
     test("accepts hyde-style hypothetical answers", () => {
       expect(validateSemanticQuery(
