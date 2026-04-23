@@ -31,6 +31,8 @@ import {
   resolveRerankModel,
   resolveModels,
   pullModels,
+  resolveAppleMetalWorkarounds,
+  getAppleMetalWorkaroundEnv,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -555,6 +557,81 @@ describe("embedding context VRAM pool (#799)", () => {
     })).toBe(8);
   });
 });
+
+describe("QMD_APPLE_METAL_WORKAROUNDS resolution", () => {
+  test("defaults to enabled", () => {
+    expect(resolveAppleMetalWorkarounds(undefined)).toBe(true);
+    expect(resolveAppleMetalWorkarounds("   ")).toBe(true);
+  });
+
+  test("supports explicit disable values", () => {
+    expect(resolveAppleMetalWorkarounds("false")).toBe(false);
+    expect(resolveAppleMetalWorkarounds("OFF")).toBe(false);
+    expect(resolveAppleMetalWorkarounds("0")).toBe(false);
+  });
+});
+
+describe("Apple Silicon Metal workarounds", () => {
+  test("does nothing outside macOS arm64", () => {
+    expect(
+      getAppleMetalWorkaroundEnv({
+        platform: "linux",
+        arch: "x64",
+        env: {},
+        cpuBrand: null,
+      })
+    ).toEqual({});
+  });
+
+  test("disables residency sets by default on Apple Silicon", () => {
+    expect(
+      getAppleMetalWorkaroundEnv({
+        platform: "darwin",
+        arch: "arm64",
+        env: {},
+        cpuBrand: "Apple M3 Pro",
+      })
+    ).toEqual({
+      GGML_METAL_NO_RESIDENCY: "1",
+    });
+  });
+
+  test("disables tensor probe on M5-class chips", () => {
+    expect(
+      getAppleMetalWorkaroundEnv({
+        platform: "darwin",
+        arch: "arm64",
+        env: {},
+        cpuBrand: "Apple M5 Pro",
+      })
+    ).toEqual({
+      GGML_METAL_NO_RESIDENCY: "1",
+      GGML_METAL_TENSOR_DISABLE: "1",
+    });
+  });
+
+  test("respects explicit env overrides and opt-out", () => {
+    expect(
+      getAppleMetalWorkaroundEnv({
+        platform: "darwin",
+        arch: "arm64",
+        env: {
+          GGML_METAL_NO_RESIDENCY: "1",
+          GGML_METAL_TENSOR_DISABLE: "1",
+        },
+        cpuBrand: "Apple M5 Max",
+      })
+    ).toEqual({});
+
+    expect(
+      getAppleMetalWorkaroundEnv({
+        platform: "darwin",
+        arch: "arm64",
+        env: {},
+        cpuBrand: "Apple M5 Max",
+        enabled: false,
+      })
+    ).toEqual({});
 
 describe("LlamaCpp expand context size config", () => {
   const defaultExpandContextSize = 2048;
