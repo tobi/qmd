@@ -3,7 +3,13 @@ import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer, type Server } from "http";
-import { discoverDaemon, readPortFile } from "../src/daemon.js";
+import {
+  discoverDaemon,
+  readPortFile,
+  searchViaDaemon,
+  type SearchViaDaemonOptions,
+} from "../src/daemon.js";
+import type { HybridQueryResult } from "../src/store.js";
 
 describe("daemon discovery", () => {
   let cacheDir: string;
@@ -138,5 +144,128 @@ describe("daemon discovery", () => {
     await mkdir(join(cacheDir, "qmd"), { recursive: true });
     await wf(join(cacheDir, "qmd", "mcp.port"), "12345\n");
     expect(await readPortFile()).toBe(12345);
+  });
+});
+
+describe("searchViaDaemon", () => {
+  let cacheDir: string;
+  let origCache: string | undefined;
+  let httpServer: Server | undefined;
+  let baseUrl: string;
+
+  beforeEach(async () => {
+    cacheDir = await mkdtemp(join(tmpdir(), "qmd-daemon-client-test-"));
+    origCache = process.env.XDG_CACHE_HOME;
+    process.env.XDG_CACHE_HOME = cacheDir;
+  });
+
+  afterEach(async () => {
+    if (httpServer) {
+      await new Promise<void>((r) => httpServer!.close(() => r()));
+      httpServer = undefined;
+    }
+    if (origCache === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = origCache;
+    await rm(cacheDir, { recursive: true, force: true });
+  });
+
+  function startFakeDaemon(
+    handler: (url: string, body: string) => { status: number; body: string },
+  ): Promise<number> {
+    return new Promise((resolve, reject) => {
+      httpServer = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const { status, body: respBody } = handler(req.url || "/", body);
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(respBody);
+      });
+      httpServer.once("error", reject);
+      httpServer.listen(0, "127.0.0.1", () => {
+        const port = (httpServer!.address() as import("net").AddressInfo).port;
+        baseUrl = `http://localhost:${port}`;
+        resolve(port);
+      });
+    });
+  }
+
+  const stubResult: HybridQueryResult = {
+    file: "qmd://test/a.md",
+    displayPath: "test/a.md",
+    title: "a",
+    body: "hello",
+    bestChunk: "hello",
+    bestChunkPos: 0,
+    score: 0.9,
+    context: null,
+    docid: "abcdef",
+  };
+
+  test("returns parsed results on 200", async () => {
+    await startFakeDaemon((url) => {
+      if (url === "/v1/search") {
+        return { status: 200, body: JSON.stringify({ results: [stubResult] }) };
+      }
+      return { status: 404, body: "" };
+    });
+    const res = await searchViaDaemon(baseUrl, { query: "hi", limit: 1 });
+    expect(res).not.toBeNull();
+    expect(res!).toHaveLength(1);
+    expect(res![0]!.file).toBe("qmd://test/a.md");
+  });
+
+  test("returns null on 500", async () => {
+    await startFakeDaemon(() => ({ status: 500, body: JSON.stringify({ error: "boom" }) }));
+    const res = await searchViaDaemon(baseUrl, { query: "hi" });
+    expect(res).toBeNull();
+  });
+
+  test("returns null on 400", async () => {
+    await startFakeDaemon(() => ({ status: 400, body: JSON.stringify({ error: "bad" }) }));
+    const res = await searchViaDaemon(baseUrl, { query: "hi" });
+    expect(res).toBeNull();
+  });
+
+  test("returns null when server unreachable", async () => {
+    const res = await searchViaDaemon("http://localhost:1", { query: "hi" });
+    expect(res).toBeNull();
+  });
+
+  test("forwards all option fields", async () => {
+    let received: any = null;
+    await startFakeDaemon((url, body) => {
+      if (url === "/v1/search") {
+        received = JSON.parse(body);
+        return { status: 200, body: JSON.stringify({ results: [] }) };
+      }
+      return { status: 404, body: "" };
+    });
+
+    const options: SearchViaDaemonOptions = {
+      searches: [{ type: "lex", query: "foo" }],
+      limit: 7,
+      minScore: 0.25,
+      candidateLimit: 21,
+      skipRerank: true,
+      explain: true,
+      intent: "intent hint",
+      collections: ["x"],
+      chunkStrategy: "auto",
+    };
+
+    await searchViaDaemon(baseUrl, options);
+
+    expect(received).toEqual({
+      searches: [{ type: "lex", query: "foo" }],
+      limit: 7,
+      minScore: 0.25,
+      candidateLimit: 21,
+      skipRerank: true,
+      explain: true,
+      intent: "intent hint",
+      collections: ["x"],
+      chunkStrategy: "auto",
+    });
+    expect(received.query).toBeUndefined();
   });
 });

@@ -10,6 +10,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import type { HybridQueryResult, ExpandedQuery, ChunkStrategy } from "./store.js";
 
 /**
  * Default port the daemon listens on. Used only when mcp.port file is
@@ -155,4 +156,87 @@ export async function discoverDaemon(options: DiscoverOptions = {}): Promise<Dae
   if (!health || typeof health.dbPath !== "string") return null;
 
   return { baseUrl, pid, port, dbPath: health.dbPath };
+}
+
+const DEFAULT_CALL_TIMEOUT_MS = 60_000;
+
+export interface SearchViaDaemonOptions {
+  /** Hybrid search — server performs expansion + search + rerank. */
+  query?: string;
+  /** Structured search — caller provides pre-expanded sub-queries. */
+  searches?: ExpandedQuery[];
+  limit?: number;
+  minScore?: number;
+  candidateLimit?: number;
+  skipRerank?: boolean;
+  explain?: boolean;
+  intent?: string;
+  collections?: string[];
+  chunkStrategy?: ChunkStrategy;
+  /** Override call timeout (default 60s). */
+  timeoutMs?: number;
+}
+
+function debugDaemonSearch(message: string): void {
+  if (process.env.QMD_DEBUG === "1") {
+    process.stderr.write(`[qmd daemon] ${message}\n`);
+  }
+}
+
+/**
+ * POST /v1/search on the daemon.
+ *
+ * Returns HybridQueryResult[] on success, or null on any error (including
+ * network failure, timeout, 4xx, 5xx, or malformed JSON). Callers should
+ * fall back to the in-process pipeline when null is returned.
+ *
+ * This function never throws.
+ */
+export async function searchViaDaemon(
+  baseUrl: string,
+  options: SearchViaDaemonOptions,
+): Promise<HybridQueryResult[] | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS);
+
+  const body: Record<string, unknown> = {};
+  if (options.query !== undefined) body.query = options.query;
+  if (options.searches !== undefined) body.searches = options.searches;
+  if (options.limit !== undefined) body.limit = options.limit;
+  if (options.minScore !== undefined) body.minScore = options.minScore;
+  if (options.candidateLimit !== undefined) body.candidateLimit = options.candidateLimit;
+  if (options.skipRerank !== undefined) body.skipRerank = options.skipRerank;
+  if (options.explain !== undefined) body.explain = options.explain;
+  if (options.intent !== undefined) body.intent = options.intent;
+  if (options.collections !== undefined) body.collections = options.collections;
+  if (options.chunkStrategy !== undefined) body.chunkStrategy = options.chunkStrategy;
+
+  try {
+    const res = await fetch(`${baseUrl}/v1/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      debugDaemonSearch(`/v1/search -> ${res.status}`);
+      return null;
+    }
+
+    const json = await res.json() as { results?: unknown };
+    if (!Array.isArray(json.results)) {
+      debugDaemonSearch("/v1/search returned malformed JSON payload");
+      return null;
+    }
+
+    return json.results as HybridQueryResult[];
+  } catch (err) {
+    debugDaemonSearch(
+      `/v1/search failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
