@@ -1600,4 +1600,26 @@ describe("mcp http daemon", () => {
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
   });
+
+  test("--daemon writes mcp.port next to mcp.pid", async () => {
+    const port = randomPort();
+    const { exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    await waitForServer(port);
+
+    const portFile = join(daemonCacheDir, "qmd", "mcp.port");
+    expect(existsSync(portFile)).toBe(true);
+    expect(parseInt(readFileSync(portFile, "utf-8").trim())).toBe(port);
+
+    // Cleanup
+    await runDaemonQmd(["mcp", "stop"]);
+    await sleep(300);
+    expect(existsSync(portFile)).toBe(false);
+  });
 });

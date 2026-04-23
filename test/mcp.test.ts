@@ -969,6 +969,14 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(typeof body.uptime).toBe("number");
   });
 
+  test("GET /health includes dbPath for daemon discovery", async () => {
+    const res = await fetch(`${baseUrl}/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.dbPath).toBe("string");
+    expect(body.dbPath.length).toBeGreaterThan(0);
+  });
+
   test("GET /other returns 404", async () => {
     const res = await fetch(`${baseUrl}/other`);
     expect(res.status).toBe(404);

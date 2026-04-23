@@ -3211,9 +3211,18 @@ if (isMain) {
           process.kill(pid, 0); // alive?
           process.kill(pid, "SIGTERM");
           unlinkSync(pidPath);
+          // Best-effort port file cleanup — daemon also cleans on graceful shutdown
+          try {
+            const portFilePath = resolve(cacheDir, "mcp.port");
+            if (existsSync(portFilePath)) unlinkSync(portFilePath);
+          } catch { /* best effort */ }
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
           unlinkSync(pidPath);
+          try {
+            const portFilePath = resolve(cacheDir, "mcp.port");
+            if (existsSync(portFilePath)) unlinkSync(portFilePath);
+          } catch { /* best effort */ }
           console.log("Cleaned up stale PID file (server was not running).");
         }
         process.exit(0);

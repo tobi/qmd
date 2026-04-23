@@ -9,8 +9,9 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -643,7 +644,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
     try {
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        const body = JSON.stringify({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          dbPath: store.dbPath,
+          version: getPackageVersion(),
+        });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
@@ -803,6 +809,17 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
 
+  // Persist port for CLI daemon discovery (next to mcp.pid).
+  // Best-effort: failure here must not block server startup.
+  const cacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const portFile = resolve(cacheDir, "mcp.port");
+  try {
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(portFile, String(actualPort));
+  } catch { /* best effort */ }
+
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
@@ -812,6 +829,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     }
     sessions.clear();
     httpServer.close();
+    try {
+      unlinkSync(portFile);
+    } catch { /* already gone */ }
     await store.close();
   };
 
