@@ -2575,6 +2575,36 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("rerank falls back to retrieval order when reranker fails", async () => {
+    const store = await createTestStore();
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+      rerank: vi.fn(async () => {
+        throw new Error("Failed to create any rerank context");
+      }),
+    } as any);
+
+    try {
+      const docs = [
+        { file: "doc1.md", text: "First candidate" },
+        { file: "doc2.md", text: "Second candidate" },
+      ];
+
+      const results = await store.rerank("fallback", docs);
+
+      expect(results).toEqual([
+        { file: "doc1.md", score: 1 },
+        { file: "doc2.md", score: 0.5 },
+      ]);
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("rerank unavailable");
+    } finally {
+      stderrSpy.mockRestore();
+      llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 // =============================================================================

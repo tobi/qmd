@@ -14,6 +14,7 @@ import {
   type LlamaEmbeddingContext,
   type Token as LlamaToken,
 } from "node-llama-cpp";
+import { execSync } from "child_process";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -439,15 +440,86 @@ const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
 type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
+type AppleMetalWorkaroundEnv = Partial<Record<"GGML_METAL_NO_RESIDENCY" | "GGML_METAL_TENSOR_DISABLE", string>>;
+const DISABLE_ENV_VALUES = ["false", "off", "none", "disable", "disabled", "0"];
 
 export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): LlamaGpuMode {
   const normalized = envValue?.trim().toLowerCase() ?? "";
   if (!normalized) return "auto";
-  if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
+  if (DISABLE_ENV_VALUES.includes(normalized)) return false;
   if (normalized === "metal" || normalized === "vulkan" || normalized === "cuda") return normalized;
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
   return "auto";
+}
+
+export function resolveAppleMetalWorkarounds(envValue = process.env.QMD_APPLE_METAL_WORKAROUNDS): boolean {
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  if (!normalized) return true;
+  if (DISABLE_ENV_VALUES.includes(normalized)) return false;
+  return true;
+}
+
+function readAppleCpuBrand(): string | null {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return null;
+
+  try {
+    const output = execSync("sysctl -n machdep.cpu.brand_string", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+export function getAppleMetalWorkaroundEnv(opts: {
+  platform?: NodeJS.Platform;
+  arch?: string;
+  env?: NodeJS.ProcessEnv;
+  cpuBrand?: string | null;
+  enabled?: boolean;
+} = {}): AppleMetalWorkaroundEnv {
+  const {
+    platform = process.platform,
+    arch = process.arch,
+    env = process.env,
+    cpuBrand = readAppleCpuBrand(),
+    enabled = resolveAppleMetalWorkarounds(),
+  } = opts;
+
+  if (!enabled || platform !== "darwin" || arch !== "arm64") {
+    return {};
+  }
+
+  const patch: AppleMetalWorkaroundEnv = {};
+
+  // Apple Silicon currently hits ggml Metal cleanup assertions on process exit
+  // when residency sets remain active. Disabling residency sets trades a small
+  // optimization for predictable process shutdown.
+  if (env.GGML_METAL_NO_RESIDENCY == null) {
+    patch.GGML_METAL_NO_RESIDENCY = "1";
+  }
+
+  // M5/A19-class Metal 4 devices can fail the tensor API shader probe before
+  // node-llama-cpp falls back to the embedded library. Pre-disable the probe.
+  const normalizedBrand = (cpuBrand ?? "").toUpperCase();
+  if (
+    /(M5|M6|A19|A20)/.test(normalizedBrand) &&
+    env.GGML_METAL_TENSOR_DISABLE == null
+  ) {
+    patch.GGML_METAL_TENSOR_DISABLE = "1";
+  }
+
+  return patch;
+}
+
+function applyAppleMetalWorkaroundEnv(): void {
+  const patch = getAppleMetalWorkaroundEnv();
+  for (const [key, value] of Object.entries(patch)) {
+    process.env[key] = value;
+  }
 }
 
 function resolveExpandContextSize(configValue?: number): number {
@@ -617,6 +689,7 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
+      applyAppleMetalWorkaroundEnv();
       const gpuMode = resolveLlamaGpuMode();
 
       const loadLlama = async (gpu: LlamaGpuMode) =>

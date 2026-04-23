@@ -136,6 +136,7 @@ bun test --preload ./src/test-preload.ts test/
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- On macOS Apple Silicon, qmd applies Metal safety workarounds by default: disables residency sets on all arm64 Macs, and disables the tensor probe on M5/A19-class chips. Set `QMD_APPLE_METAL_WORKAROUNDS=off` to opt out.
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
