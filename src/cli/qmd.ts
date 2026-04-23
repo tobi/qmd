@@ -395,7 +395,17 @@ async function showStatus(): Promise<void> {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
     try {
       process.kill(mcpPid, 0);
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+      let portSuffix = "";
+      try {
+        const mcpPortPath = resolve(mcpCacheDir, "mcp.port");
+        if (existsSync(mcpPortPath)) {
+          const port = parseInt(readFileSync(mcpPortPath, "utf-8").trim());
+          if (Number.isInteger(port) && port > 0) {
+            portSuffix = ` at http://localhost:${port}`;
+          }
+        }
+      } catch { /* best effort */ }
+      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})${portSuffix}`);
     } catch {
       unlinkSync(mcpPidPath);
       // Stale PID file cleaned up silently
@@ -2626,6 +2636,8 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Daemon client opt-out for search commands
+      "no-daemon": { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2661,6 +2673,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    noDaemon: !!values["no-daemon"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -2876,13 +2889,18 @@ function showHelp(): void {
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
+  console.log("Env:");
+  console.log("  QMD_NO_DAEMON=1            - Disable daemon fast-path globally");
+  console.log("  QMD_DEBUG=1                - Log daemon discovery decisions to stderr");
+  console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
-  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only)");
+  console.log("  --no-daemon                - Ignore the MCP HTTP daemon; always run in-process");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");

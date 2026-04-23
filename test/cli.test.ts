@@ -234,6 +234,9 @@ describe("CLI Help", () => {
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("qmd skill show/install");
+    expect(stdout).toContain("--no-daemon");
+    expect(stdout).toContain("QMD_NO_DAEMON=1");
+    expect(stdout).toContain("QMD_DEBUG=1");
   });
 
   test("shows help with no arguments", async () => {
@@ -1363,6 +1366,22 @@ describe("status and collection list hide filesystem paths", () => {
     expect(pathLines.length).toBe(0);
   });
 
+  test("status shows daemon URL when mcp.port exists", async () => {
+    const cacheHome = join(testDir, `status-cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const qmdCacheDir = join(cacheHome, "qmd");
+    await mkdir(qmdCacheDir, { recursive: true });
+    writeFileSync(join(qmdCacheDir, "mcp.pid"), String(process.pid));
+    writeFileSync(join(qmdCacheDir, "mcp.port"), "43210");
+
+    const { stdout, exitCode } = await runQmd(["status"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      env: { XDG_CACHE_HOME: cacheHome },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`MCP:   running (PID ${process.pid}) at http://localhost:43210`);
+  });
+
   test("collection list does not show full filesystem paths", async () => {
     const { stdout, exitCode } = await runQmd(["collection", "list"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1463,6 +1482,13 @@ describe("mcp http daemon", () => {
     await mkdir(join(daemonCacheDir, "qmd"), { recursive: true });
     await mkdir(daemonConfigDir, { recursive: true });
     await writeFile(join(daemonConfigDir, "index.yml"), "collections: {}\n");
+
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", "fixtures"],
+      { dbPath: daemonDbPath, configDir: daemonConfigDir },
+    );
+    if (exitCode !== 0) console.error("daemon collection add failed:", stderr);
+    expect(exitCode).toBe(0);
   });
 
   afterAll(async () => {
@@ -1709,5 +1735,35 @@ describe("mcp http daemon", () => {
     fakeDaemonServer = undefined;
     unlinkSync(pidPath());
     unlinkSync(portFile);
+  });
+
+  test("--no-daemon forces in-process search even when daemon is running", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      const { stdout, stderr, exitCode } = await runQmd(
+        ["query", "lex:test", "--json", "--no-daemon", "--no-rerank"],
+        {
+          dbPath: daemonDbPath,
+          configDir: daemonConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain("Using daemon");
+      expect(() => JSON.parse(stdout)).not.toThrow();
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
   });
 });
