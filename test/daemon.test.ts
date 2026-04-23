@@ -145,6 +145,25 @@ describe("daemon discovery", () => {
     await wf(join(cacheDir, "qmd", "mcp.port"), "12345\n");
     expect(await readPortFile()).toBe(12345);
   });
+
+  test("returns null when QMD_NO_DAEMON=1 even with a live daemon", async () => {
+    const port = 17000 + Math.floor(Math.random() * 1000);
+    await startFakeDaemon(port, (url) => {
+      if (url === "/health") return { status: 200, body: healthBody };
+      return { status: 404, body: "" };
+    });
+    await writeCacheFiles(process.pid, port);
+
+    const origNoDaemon = process.env.QMD_NO_DAEMON;
+    process.env.QMD_NO_DAEMON = "1";
+    try {
+      const result = await discoverDaemon();
+      expect(result).toBeNull();
+    } finally {
+      if (origNoDaemon === undefined) delete process.env.QMD_NO_DAEMON;
+      else process.env.QMD_NO_DAEMON = origNoDaemon;
+    }
+  });
 });
 
 describe("searchViaDaemon", () => {
@@ -267,5 +286,20 @@ describe("searchViaDaemon", () => {
       chunkStrategy: "auto",
     });
     expect(received.query).toBeUndefined();
+  });
+
+  test("returns null when results is null (malformed response)", async () => {
+    await startFakeDaemon((_url, _body) => ({ status: 200, body: JSON.stringify({ results: null }) }));
+    expect(await searchViaDaemon(baseUrl, { query: "hi" })).toBeNull();
+  });
+
+  test("returns null when results is not an array", async () => {
+    await startFakeDaemon((_url, _body) => ({ status: 200, body: JSON.stringify({ results: "oops" }) }));
+    expect(await searchViaDaemon(baseUrl, { query: "hi" })).toBeNull();
+  });
+
+  test("returns null when results key is missing", async () => {
+    await startFakeDaemon((_url, _body) => ({ status: 200, body: JSON.stringify({ ok: true }) }));
+    expect(await searchViaDaemon(baseUrl, { query: "hi" })).toBeNull();
   });
 });
