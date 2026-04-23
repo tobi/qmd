@@ -112,6 +112,47 @@ Or configure MCP manually in `~/.claude/settings.json`:
 }
 ```
 
+#### Fast CLI via daemon (scripts / agents)
+
+For repeated scripted queries the per-call Node + SQLite + sqlite-vec
+bootstrap (~500 ms on large indexes) is wasted overhead. Start a daemon
+once and point `bin/qmd` at it:
+
+```sh
+qmd mcp --http --daemon --port 8181
+export QMD_DAEMON_URL="http://127.0.0.1:8181"
+
+qmd search "database migrations" -c engineering      # ~50 ms, returns JSON
+```
+
+`qmd search` routes through the daemon's existing `POST /search` endpoint
+when `QMD_DAEMON_URL` is set. Responses are the structured JSON shape
+(`{results:[{docid,file,title,score,snippet,context}]}`) — convenient for
+agents and scripts parsing stdout. Interactive users who want the
+formatted-text output should leave `QMD_DAEMON_URL` unset.
+
+The fast-path handles only `qmd search` (BM25 + hybrid via the daemon's
+structured-query shape). `qmd vsearch` intentionally always runs the
+cold-start CLI: its vector-only pipeline, minScore default, and rerank
+behavior are not currently expressible on the daemon's `/search`
+endpoint, and routing it would silently change result ordering.
+
+Fall-through cases (silently use cold-start CLI):
+
+- `QMD_DAEMON_URL` unset
+- Daemon health check fails within 1 s
+- Request returns a non-2xx
+- Invocation uses `--index <name>` (daemons serve one index at a time)
+- Unrecognised flag (e.g. `--min-score`, `--json`) — cold-start owns the full flag set
+- Non-plain-positive-integer `-n` value
+
+Use `curl` to test payload directly:
+
+```sh
+curl -s http://127.0.0.1:8181/search -H 'Content-Type: application/json' \
+  -d '{"searches":[{"type":"lex","query":"auth"}],"collections":["engineering"],"limit":5}'
+```
+
 #### HTTP Transport
 
 By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:

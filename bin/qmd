@@ -15,6 +15,176 @@ done
 # to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
+# ---------------------------------------------------------------------------
+# Daemon fast-path (opt-in, search only)
+#
+# When `QMD_DAEMON_URL` is set and points at a running `qmd mcp --http` daemon,
+# route `qmd search` through the daemon's existing REST endpoint instead of
+# bootstrapping a fresh Node + better-sqlite3 + sqlite-vec process for every
+# invocation. On large indexes this can be the difference between ~80 ms and
+# ~800 ms per query.
+#
+# Only `qmd search` is eligible. `qmd vsearch` is deliberately NOT handled
+# here: vsearch's cold-start path sets a different `minScore` default (0.3
+# vs 0) and uses a vector-only pipeline without reranking, and the daemon's
+# REST surface cannot currently express either choice. Routing vsearch
+# through the fast-path would silently change result ordering and filtering.
+# Cold-start remains the source of truth for vsearch semantics.
+#
+# Opt-in so the default interactive UX (formatted text output) is unchanged.
+# Callers that set `QMD_DAEMON_URL` get the daemon's JSON response shape on
+# stdout — useful for scripts and agents. Unset the variable (or pass
+# `--index <name>`) to fall back to the normal cold-start CLI.
+#
+# The fast-path logic lives in a shell function so its argument parsing
+# operates on a local copy of `$@`. If the POST ultimately fails, the outer
+# shell's original argv is untouched and the cold-start `exec` receives the
+# exact command the user typed.
+#
+# Bypass rules:
+# - Only `search` is eligible (vsearch deliberately excluded, see above).
+# - Any `--index` / `--index=...` forces fall-through — the daemon serves
+#   whichever index it was started with, so secondary-index queries must go
+#   through the cold-start CLI.
+# - Any curl/daemon error (health check fails, non-2xx response, empty query)
+#   falls back to cold-start silently.
+# ---------------------------------------------------------------------------
+_qmd_try_daemon() {
+  # $1 = subcommand ("search"); $2.. = subcommand args.
+  # Returns 0 on a successful daemon response (stdout already emitted),
+  # non-zero on any reason to fall through to cold-start.
+  [ -n "${QMD_DAEMON_URL:-}" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  case "$1" in
+    search)  _qmd_qtype="lex" ;;
+    *)       return 1 ;;
+  esac
+  shift
+
+  # Detect --index before any destructive parsing.
+  for _arg in "$@"; do
+    case "$_arg" in
+      --index|--index=*) return 1 ;;
+    esac
+  done
+
+  curl -sf --max-time 1 "${QMD_DAEMON_URL}/health" >/dev/null 2>&1 || return 1
+
+  # Match the interactive CLI's default result count so scripts that rely
+  # on `qmd search <q>` without an explicit -n don't see cardinality change
+  # based on whether QMD_DAEMON_URL is set. The `--files`/`--json` special
+  # case (default 20) can't apply here — those flags fall through to
+  # cold-start via the unknown-flag branch below.
+  _qmd_limit=5
+  _qmd_collections_json=""  # "" = unset; later serialised as null
+  _qmd_query=""
+
+  # Upstream CLI flag shapes: -n <N> for limit, -c <name> for collection
+  # (collection supports `multiple: true`, so several -c flags must all be
+  # forwarded). Unknown dashed flags are dropped so we never leak them into
+  # the query text.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--n)
+        # Value-taking flag; bail out if the user left off the value
+        # (otherwise `shift 2` would abort the whole shell with
+        # "can't shift that many" instead of falling through).
+        [ $# -ge 2 ] || return 1
+        _qmd_limit="$2"
+        shift 2
+        ;;
+      --n=*)            _qmd_limit="${1#*=}"; shift ;;
+      -c|--collection)
+        [ $# -ge 2 ] || return 1
+        _qmd_c_escaped=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -z "$_qmd_collections_json" ]; then
+          _qmd_collections_json="[\"${_qmd_c_escaped}\"]"
+        else
+          # Strip the closing `]`, append `,"<val>"]`. `${var%]}` is POSIX.
+          _qmd_collections_json="${_qmd_collections_json%]},\"${_qmd_c_escaped}\"]"
+        fi
+        shift 2
+        ;;
+      --collection=*)
+        _qmd_c_val="${1#*=}"
+        _qmd_c_escaped=$(printf '%s' "$_qmd_c_val" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -z "$_qmd_collections_json" ]; then
+          _qmd_collections_json="[\"${_qmd_c_escaped}\"]"
+        else
+          _qmd_collections_json="${_qmd_collections_json%]},\"${_qmd_c_escaped}\"]"
+        fi
+        shift
+        ;;
+      --)
+        shift
+        while [ $# -gt 0 ]; do
+          if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+          else _qmd_query="$_qmd_query $1"; fi
+          shift
+        done
+        ;;
+      -*)
+        # Unknown flag. The upstream CLI accepts several options this
+        # parser can't safely decode (--min-score, --candidate-limit,
+        # --intent, --full, --json, --files, --all, ...). Some take a
+        # value, some are booleans. Rather than guess and risk eating
+        # the next token as part of the query, fall through to the
+        # cold-start CLI which knows the full flag set. The opt-in
+        # fast-path stays a strict subset of the interactive CLI.
+        return 1 ;;
+      *)
+        if [ -z "$_qmd_query" ]; then _qmd_query="$1"
+        else _qmd_query="$_qmd_query $1"; fi
+        shift ;;
+    esac
+  done
+
+  [ -n "$_qmd_query" ] || return 1
+
+  # -n policy in the fast-path: accept ONLY a plain positive integer with
+  # no sign, no leading zeros, no trailing non-digits, no exponent, etc.
+  # Any other shape (`-1`, `+7`, `0`, `1e2`, `007`, `5abc`, empty) falls
+  # through to the cold-start CLI, which owns the edge-case semantics.
+  # This keeps the fast-path a strict subset of interactive behaviour
+  # without trying to emulate `parseInt(...) || default` in POSIX sh.
+  #
+  # An unset -n is the common case — we already defaulted `_qmd_limit=5`.
+  # Skip the strict check on that value.
+  if [ "$_qmd_limit" != "5" ]; then
+    case "$_qmd_limit" in
+      ''|0|0[0-9]*|*[!0-9]*) return 1 ;;
+    esac
+  fi
+
+  _qmd_q_escaped=$(printf '%s' "$_qmd_query" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  if [ -z "$_qmd_collections_json" ]; then
+    _qmd_collections_json="null"
+  fi
+
+  _qmd_payload="{\"searches\":[{\"type\":\"${_qmd_qtype}\",\"query\":\"${_qmd_q_escaped}\"}],\"collections\":${_qmd_collections_json},\"limit\":${_qmd_limit}}"
+
+  # Buffer the daemon response so a mid-stream failure (connection reset,
+  # --max-time elapsing after bytes have been written) can't leak a partial
+  # payload before we fall through to the cold-start CLI. Script consumers
+  # should see either the daemon's complete JSON response OR the cold-start
+  # output — never both concatenated.
+  _qmd_response=$(curl -sf --max-time 30 -X POST \
+    -H "Content-Type: application/json" \
+    -d "$_qmd_payload" \
+    "${QMD_DAEMON_URL}/search") || return 1
+  printf '%s\n' "$_qmd_response"
+  return 0
+}
+
+case "${1:-}" in
+  search)
+    if _qmd_try_daemon "$@"; then
+      exit 0
+    fi
+    ;;
+esac
+
 # Detect the package manager that installed dependencies by checking lockfiles.
 # $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
 # on the system, not that it was used to install this package (see #361).

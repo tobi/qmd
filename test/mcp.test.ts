@@ -975,6 +975,72 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // POST /search REST contract (consumed by bin/qmd daemon fast-path)
+  // ---------------------------------------------------------------------------
+
+  test("POST /search accepts the fast-path shape and returns structured results", async () => {
+    const res = await fetch(`${baseUrl}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "readme" }],
+        collections: ["docs"],
+        limit: 5,
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = await res.json();
+    expect(Array.isArray(body.results)).toBe(true);
+    // Each result should expose the fields bin/qmd's fast-path output relies on.
+    for (const r of body.results) {
+      expect(typeof r.docid).toBe("string");
+      expect(typeof r.file).toBe("string");
+      expect(typeof r.title).toBe("string");
+      expect(typeof r.score).toBe("number");
+    }
+  });
+
+  test("POST /search accepts null collections (fast-path's unset -c default)", async () => {
+    const res = await fetch(`${baseUrl}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "readme" }],
+        collections: null,
+        limit: 3,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.results)).toBe(true);
+  });
+
+  test("POST /search with missing `searches` returns 400", async () => {
+    const res = await fetch(`${baseUrl}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 1 }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("POST /search accepts type='vec' (vsearch fast-path)", async () => {
+    const res = await fetch(`${baseUrl}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "vec", query: "readme" }],
+        collections: ["docs"],
+        limit: 3,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.results)).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
   // MCP protocol over HTTP
   // ---------------------------------------------------------------------------
 
