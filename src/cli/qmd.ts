@@ -101,9 +101,12 @@ import {
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
-// Enable production mode - allows using default database path
-// Tests must set INDEX_PATH or use createStore() with explicit path
-enableProductionMode();
+// NOTE: enableProductionMode() is intentionally NOT called at module scope here.
+// Importing this module for its exports (e.g. buildEditorUri, termLink from
+// test/cli.test.ts) must not flip the global production flag, as that leaks
+// into unrelated tests that rely on the default (development) database path
+// resolution. The flag is flipped inside the CLI's main-module guard below so
+// it only fires when qmd is actually invoked as a script.
 
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
@@ -2821,6 +2824,11 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
+  // Flip to production mode only when this module is executed as the CLI
+  // entrypoint, not when imported for its exports. Tests must set INDEX_PATH
+  // or use createStore() with an explicit path.
+  enableProductionMode();
+
   const cli = parseCLI();
 
   if (cli.values.version) {
