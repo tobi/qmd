@@ -1766,4 +1766,89 @@ describe("mcp http daemon", () => {
       try { unlinkSync(pidPath()); } catch {}
     }
   });
+
+  test("qmd query --json output matches with and without daemon", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      // Use --no-rerank to keep the test deterministic and fast (avoids
+      // loading the reranker model in the --no-daemon leg).
+      const run = (extra: string[]) =>
+        runQmd(["query", "test content", "--json", "-n", "3", "--no-rerank", ...extra], {
+          dbPath: daemonDbPath,
+          configDir: daemonConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        });
+
+      const daemonResult = await run([]);
+      const directResult = await run(["--no-daemon"]);
+
+      expect(daemonResult.exitCode).toBe(0);
+      expect(directResult.exitCode).toBe(0);
+
+      // The daemon run MUST have actually routed through the daemon.
+      // Without this assertion the test would pass trivially even if
+      // the daemon fast-path were broken.
+      expect(daemonResult.stderr).toContain("Using daemon");
+      expect(directResult.stderr).not.toContain("Using daemon");
+
+      const daemonJson = JSON.parse(daemonResult.stdout);
+      const directJson = JSON.parse(directResult.stdout);
+
+      // Same files, same order, same docids, same titles.
+      expect(daemonJson.map((r: any) => r.docid)).toEqual(directJson.map((r: any) => r.docid));
+      expect(daemonJson.map((r: any) => r.file)).toEqual(directJson.map((r: any) => r.file));
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
+  }, 120_000);
+
+  test("daemon with mismatched dbPath falls back to in-process", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      // Point the CLI at a different DB. The daemon was started with
+      // daemonDbPath; this run uses altDbPath. maybeDiscoverDaemon
+      // should see the mismatch and return null.
+      const altDbPath = join(daemonTestDir, "alt.sqlite");
+      const altConfigDir = join(daemonTestDir, "alt-config");
+      const { mkdir, writeFile } = await import("fs/promises");
+      await mkdir(altConfigDir, { recursive: true });
+      await writeFile(join(altConfigDir, "index.yml"), "collections: {}\n");
+
+      const { stdout, stderr, exitCode } = await runQmd(
+        ["query", "test", "--json", "--no-rerank"],
+        {
+          dbPath: altDbPath,
+          configDir: altConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain("Using daemon");
+      expect(stderr).toContain("dbPath mismatch");
+      // Query runs in-process over an empty DB — JSON is valid (array).
+      expect(() => JSON.parse(stdout)).not.toThrow();
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
+  });
 });
