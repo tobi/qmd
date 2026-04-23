@@ -1,12 +1,26 @@
 {
   description = "QMD - Quick Markdown Search";
 
+  # Binary cache for bun2nix - fetches pre-built binaries instead of compiling from source
+  nixConfig = {
+    extra-substituters = [
+      "https://cache.nixos.org"
+      "https://nix-community.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    bun2nix.url = "github:nix-community/bun2nix";
+    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, bun2nix }:
     {
       homeModules.default = { config, lib, pkgs, ... }:
         with lib;
@@ -32,7 +46,10 @@
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ bun2nix.overlays.default ];
+        };
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
         version = packageJson.version;
 
@@ -43,89 +60,28 @@
           ];
         });
 
-        nodeModulesHashes = {
-          x86_64-linux = "sha256-D0ezO4vqq4iswcAMU2DCql9ZAQvh3me6N9aDB5roq4w=";
-          aarch64-darwin = "sha256-qU+9KdR/nTocelyANS09I/4yaQ+7s1LvJNqB27IOK/c=";
-
-          # Populate these on first build for additional hosts if/when needed.
-          aarch64-linux = pkgs.lib.fakeHash;
-          x86_64-darwin = pkgs.lib.fakeHash;
-        };
-
-        nodeModules = pkgs.stdenvNoCC.mkDerivation {
-          pname = "qmd-node-modules";
-          inherit version;
-
-          src = ./.;
-
-          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [
-            "GIT_PROXY_COMMAND"
-            "SOCKS_SERVER"
-          ];
-
-          nativeBuildInputs = [
-            pkgs.bun
-          ];
-
-          dontConfigure = true;
-
-          buildPhase = ''
-            export HOME=$(mktemp -d)
-
-            bun install \
-              --backend copyfile \
-              --frozen-lockfile \
-              --ignore-scripts \
-              --no-progress \
-              --production
-          '';
-
-          installPhase = ''
-            mkdir -p $out
-            cp -R node_modules $out/
-          '';
-
-          dontFixup = true;
-
-          outputHash = nodeModulesHashes.${system};
-          outputHashAlgo = "sha256";
-          outputHashMode = "recursive";
-        };
-
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
           inherit version;
 
           src = ./.;
 
-          nativeBuildInputs = [
-            pkgs.bun
-            pkgs.makeWrapper
-            pkgs.nodejs
-            pkgs.node-gyp
-            pkgs.python3  # needed by node-gyp to compile better-sqlite3
-          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
-          ];
+          nativeBuildInputs = [ pkgs.bun2nix.hook pkgs.makeWrapper ];
 
           buildInputs = [ pkgs.sqlite ];
 
-          buildPhase = ''
-            export HOME=$(mktemp -d)
+          bunDeps = pkgs.bun2nix.fetchBunDeps {
+            bunNix = ./bun.nix;
+          };
 
-            cp -R ${nodeModules}/node_modules ./
-            chmod -R u+w node_modules
-
-            (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
-          '';
+          # Skip build phase - qmd runs directly from TypeScript source
+          dontBuild = true;
 
           installPhase = ''
             mkdir -p $out/lib/qmd
             mkdir -p $out/bin
 
-            cp -r node_modules $out/lib/qmd/
-            cp -r src $out/lib/qmd/
-            cp package.json $out/lib/qmd/
+            cp -r . $out/lib/qmd/
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/cli/qmd.ts" \
