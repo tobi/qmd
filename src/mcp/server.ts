@@ -158,6 +158,12 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
 
+  // --- Index maintenance ---
+  lines.push("");
+  lines.push("Maintenance:");
+  lines.push("  - `refresh` — re-scan collections for file changes (call after writing notes via another tool).");
+  lines.push("  - `embed` — generate vector embeddings for new/changed documents.");
+
   // --- Non-obvious things that prevent mistakes ---
   lines.push("");
   lines.push("Tips:");
@@ -529,6 +535,80 @@ Intent-aware lex (C++ performance, not sports):
       return {
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: status,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: refresh (Re-scan collections for file changes)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "refresh",
+    {
+      title: "Refresh Index",
+      description: "Re-scan collection(s) for file changes and update the database and FTS index. " +
+        "Call this after writing or modifying notes via another tool (e.g., obsidian-mcp) so that " +
+        "subsequent searches reflect the latest content. " +
+        "If no collection is specified, refreshes all collections.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {
+        collection: z.string().optional().describe("Collection name to refresh (omit to refresh all)"),
+      },
+    },
+    async ({ collection }) => {
+      const collections = collection ? [collection] : undefined;
+      const result = await store.update({ collections });
+
+      const summary = [
+        `Refresh complete:`,
+        `  Collections scanned: ${result.collections}`,
+        `  New documents: ${result.indexed}`,
+        `  Updated: ${result.updated}`,
+        `  Unchanged: ${result.unchanged}`,
+        `  Removed: ${result.removed}`,
+      ];
+      if (result.needsEmbedding > 0) {
+        summary.push(`  Needs embedding: ${result.needsEmbedding} (call 'embed' tool to generate)`);
+      }
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: result,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: embed (Generate embeddings for documents that need them)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "embed",
+    {
+      title: "Generate Embeddings",
+      description: "Generate vector embeddings for any documents that need them. " +
+        "Call this after 'refresh' to enable semantic search (vec/hyde) on newly added or changed content. " +
+        "Only processes documents that don't already have up-to-date embeddings.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      const result = await store.embed();
+
+      const summary = [
+        `Embedding complete:`,
+        `  Documents processed: ${result.docsProcessed}`,
+        `  Chunks embedded: ${result.chunksEmbedded}`,
+        `  Duration: ${(result.durationMs / 1000).toFixed(1)}s`,
+      ];
+      if (result.errors > 0) {
+        summary.push(`  Errors: ${result.errors}`);
+      }
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: result,
       };
     }
   );
