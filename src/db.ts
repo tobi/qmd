@@ -59,7 +59,11 @@ if (isBun) {
  * Open a SQLite database. Works with both bun:sqlite and better-sqlite3.
  */
 export function openDatabase(path: string): Database {
-  return new _Database(path) as Database;
+  const db = new _Database(path) as Database;
+  // Allow up to 5 s for concurrent writers to release the lock instead of
+  // failing immediately with SQLITE_BUSY / SQLITE_BUSY_RECOVERY.
+  db.exec("PRAGMA busy_timeout = 5000");
+  return db;
 }
 
 /**
