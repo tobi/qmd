@@ -19,6 +19,7 @@ import {
   createStore,
   verifySqliteVecLoaded,
   getDefaultDbPath,
+  _resetProductionModeForTesting,
   homedir,
   resolve,
   getPwd,
@@ -33,10 +34,12 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
-  isInsideCodeFence,
+  findListBreakPoints,
+  findXmlTagBreakPoints,
+  isInsideProtectedRegion,
   findBestCutoff,
   type BreakPoint,
-  type CodeFenceRegion,
+  type ProtectedRegion,
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
@@ -280,6 +283,10 @@ describe("Store Creation", () => {
     // In test mode, createStore without path should throw to prevent accidental writes
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
+    // Reset production mode in case another test file set it (bun runs all
+    // files in a single process, so module state leaks between files).
+    // Mirrors the fix applied to getDefaultDbPath's parallel test in 66e70c0.
+    _resetProductionModeForTesting();
 
     expect(() => createStore()).toThrow("Database path not set");
 
@@ -623,17 +630,11 @@ describe("scanBreakPoints", () => {
     expect(blank!.score).toBe(20);
   });
 
-  test("detects list items", () => {
+  test("does not detect list items (handled by findListBreakPoints)", () => {
     const text = "Intro\n- Item 1\n- Item 2\n1. Numbered";
     const breaks = scanBreakPoints(text);
-
-    const lists = breaks.filter(b => b.type === 'list');
-    const numLists = breaks.filter(b => b.type === 'numlist');
-
-    expect(lists.length).toBe(2);
-    expect(numLists.length).toBe(1);
-    expect(lists[0]!.score).toBe(5);
-    expect(numLists[0]!.score).toBe(5);
+    expect(breaks.filter(b => b.type === 'list').length).toBe(0);
+    expect(breaks.filter(b => b.type === 'numlist').length).toBe(0);
   });
 
   test("detects newlines as fallback", () => {
@@ -691,35 +692,473 @@ describe("findCodeFences", () => {
     const fences = findCodeFences(text);
     expect(fences.length).toBe(0);
   });
+
+  test("handles 4-backtick fence containing 3-backtick block", () => {
+    // Outer ```` fence wraps an inner ``` that must not close it.
+    const text = "Before\n````md\n```js\ninner\n```\n````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    // Inner ``` positions must be inside the single fence region
+    const innerOpen = text.indexOf("```js");
+    const innerClose = text.indexOf("```\n````");
+    expect(isInsideProtectedRegion(innerOpen, fences)).toBe(true);
+    expect(isInsideProtectedRegion(innerClose, fences)).toBe(true);
+  });
+
+  test("recognizes tilde fences", () => {
+    const text = "Before\n~~~\ncode\n~~~\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+  });
+
+  test("does not close tilde fence with backticks", () => {
+    // Open ~~~, stray ``` should not close it; unclosed extends to end.
+    const text = "Before\n~~~\ncode\n```\nstill inside";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(fences[0]!.end).toBe(text.length);
+  });
+
+  test("does not close with shorter fence run", () => {
+    // Open ````, a ``` inside must not close it.
+    const text = "Before\n````\ncode\n```\nstill inside\n````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    const strayClose = text.indexOf("```\nstill");
+    expect(isInsideProtectedRegion(strayClose, fences)).toBe(true);
+  });
+
+  test("does not close when closing line has info string", () => {
+    // Close candidate has trailing text, so it's not a valid close.
+    const text = "Before\n```\ncode\n``` trailing\n```\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    // The stray "``` trailing" should still be inside the fence
+    const stray = text.indexOf("``` trailing");
+    expect(isInsideProtectedRegion(stray, fences)).toBe(true);
+    // Real close is the bare ``` line near the end
+    expect(fences[0]!.end).toBe(text.indexOf("\nAfter"));
+  });
+
+  test("handles 5/4/3 backtick nesting with bare inner fences", () => {
+    // Outer 5-bt wraps 4-bt wraps 3-bt, all inner fences with no info string.
+    // Only the final 5-bt run may close the outer fence.
+    const text = [
+      "Before",
+      "`````md",
+      "````",
+      "```",
+      "code",
+      "```",
+      "````",
+      "`````",
+      "After",
+    ].join("\n");
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    // Every inner fence run must be inside the single region.
+    for (const needle of ["````\n```", "```\ncode", "```\n````", "````\n`````"]) {
+      expect(isInsideProtectedRegion(text.indexOf(needle), fences)).toBe(true);
+    }
+  });
+
+  test("longer closing fence is valid (6-bt closes 5-bt)", () => {
+    const text = "Before\n`````\ncode\n``````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
+  });
+
+  test("same-length fences do not nest (CommonMark)", () => {
+    // ```` inside ```` cannot nest: the second ```` closes the first.
+    // Result is two empty-ish fences with "content" sitting outside both.
+    const text = "Before\n````\n````\ncontent\n````\n````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(2);
+    expect(isInsideProtectedRegion(text.indexOf("content"), fences)).toBe(false);
+  });
+
+  test("mixed fence chars do not interact", () => {
+    // Backtick outer, tilde inner — different chars, so the tildes stay inside.
+    const text = "Before\n````\n~~~~\ninner\n~~~~\n````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(isInsideProtectedRegion(text.indexOf("inner"), fences)).toBe(true);
+  });
+
+  test("handles info strings on outer and inner fences", () => {
+    const text = "Before\n```` wrap\n```js\ncode\n```\n````\nAfter";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(isInsideProtectedRegion(text.indexOf("```js"), fences)).toBe(true);
+  });
+
+  test("tilde fences support 5/4/3 nesting", () => {
+    const text = [
+      "Before",
+      "~~~~~",
+      "~~~~",
+      "~~~",
+      "code",
+      "~~~",
+      "~~~~",
+      "~~~~~",
+      "After",
+    ].join("\n");
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(isInsideProtectedRegion(text.indexOf("code"), fences)).toBe(true);
+  });
 });
 
-describe("isInsideCodeFence", () => {
+describe("findListBreakPoints", () => {
+  test("empty input produces no break points", () => {
+    expect(findListBreakPoints("")).toEqual([]);
+  });
+
+  test("pure prose produces no break points", () => {
+    const text = "Just a paragraph.\nAnother line of prose.\nAnd more.";
+    expect(findListBreakPoints(text)).toEqual([]);
+  });
+
+  test("single unordered list: item + list-end break points", () => {
+    const text = "Intro\n- one\n- two\n- three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    // 3 item breaks (all depth 0, score 70) + 1 list-end (score 75)
+    const items = bps.filter(b => b.type === 'list-item-0');
+    const ends = bps.filter(b => b.type === 'list-end');
+    expect(items.length).toBe(3);
+    expect(ends.length).toBe(1);
+    expect(items.every(b => b.score === 70)).toBe(true);
+    expect(ends[0]!.score).toBe(75);
+  });
+
+  test("ordered list with 1.", () => {
+    const text = "Intro\n1. one\n2. two\n3. three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("ordered list with 1)", () => {
+    const text = "Intro\n1) one\n2) two\n3) three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("mixed marker characters at same indent are one list", () => {
+    const text = "Intro\n- one\n* two\n- three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(3);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("nested unordered list uses depth-based scores", () => {
+    const text = "Intro\n- one\n  - sub1\n  - sub2\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    const top = bps.filter(b => b.type === 'list-item-0');
+    const sub = bps.filter(b => b.type === 'list-item-1');
+    expect(top.length).toBe(2);
+    expect(sub.length).toBe(2);
+    expect(top.every(b => b.score === 70)).toBe(true);
+    expect(sub.every(b => b.score === 45)).toBe(true);
+  });
+
+  test("three-deep nesting produces depth 0/1/2 scores", () => {
+    const text = "Intro\n- one\n  - two\n    - three\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.find(b => b.type === 'list-item-0')!.score).toBe(70);
+    expect(bps.find(b => b.type === 'list-item-1')!.score).toBe(45);
+    expect(bps.find(b => b.type === 'list-item-2')!.score).toBe(25);
+  });
+
+  test("mixed nesting: unordered top with ordered sublist", () => {
+    const text = "Intro\n- one\n  1. sub\n  2. sub\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(2);
+    expect(bps.filter(b => b.type === 'list-item-1').length).toBe(2);
+  });
+
+  test("list followed by prose emits list-end at position of prose line", () => {
+    const text = "- a\n- b\nprose";
+    const bps = findListBreakPoints(text);
+    const end = bps.find(b => b.type === 'list-end')!;
+    // list-end at the \n before "prose"
+    expect(end.pos).toBe(text.indexOf("\nprose"));
+  });
+
+  test("list at end of document emits list-end at text.length", () => {
+    const text = "- a\n- b\n- c";
+    const bps = findListBreakPoints(text);
+    const end = bps.find(b => b.type === 'list-end')!;
+    expect(end.pos).toBe(text.length);
+  });
+
+  test("single blank line between items does not terminate list", () => {
+    const text = "Intro\n- a\n\n- b\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-item-0').length).toBe(2);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("blank then non-list prose terminates list", () => {
+    const text = "- a\n- b\n\nSome prose here";
+    const bps = findListBreakPoints(text);
+    expect(bps.filter(b => b.type === 'list-end').length).toBe(1);
+  });
+
+  test("+ markers are not detected as list items", () => {
+    const text = "Intro\n+ foo\n+ bar\n+ baz\n\nAfter";
+    const bps = findListBreakPoints(text);
+    expect(bps.length).toBe(0);
+  });
+
+  test("position convention: pos is the \\n before the line", () => {
+    const text = "Intro\n- one\n- two\n\nAfter";
+    const bps = findListBreakPoints(text);
+    const items = bps.filter(b => b.type === 'list-item-0');
+    // First item: \n before "- one" at index 5
+    expect(items[0]!.pos).toBe(text.indexOf("\n- one"));
+    expect(items[1]!.pos).toBe(text.indexOf("\n- two"));
+  });
+
+  test("integration: chunkDocument splits a long list at item boundaries", () => {
+    // Build a list long enough to force splitting
+    const items: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      items.push(`- list item number ${i} with some descriptive text here to consume characters`);
+    }
+    const text = "# Header\n\n" + items.join("\n") + "\n";
+    const chunks = chunkDocument(text, 1000, 100, 300);
+    expect(chunks.length).toBeGreaterThan(1);
+    // Each chunk except the last should end on a complete list item line,
+    // meaning the split landed at a list-item break point (the \n before
+    // the next item).
+    for (let i = 0; i < chunks.length - 1; i++) {
+      const chunkText = chunks[i]!.text;
+      const lines = chunkText.split("\n");
+      // Drop trailing empty from a terminal \n
+      const last = lines[lines.length - 1] === "" ? lines[lines.length - 2]! : lines[lines.length - 1]!;
+      expect(last.startsWith("- list item")).toBe(true);
+    }
+  });
+});
+
+describe("findXmlTagBreakPoints", () => {
+  test("empty input → no break points", () => {
+    expect(findXmlTagBreakPoints("", [])).toEqual([]);
+  });
+
+  test("pure prose → no break points", () => {
+    const text = "just some prose\nwith multiple lines\nand nothing special";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("single <example> block emits open (30) + close (75)", () => {
+    const text = "prologue\n<example>\ncontent\n</example>\nepilogue";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+    expect(bps[0]!.type).toBe("tag-open");
+    expect(bps[0]!.score).toBe(30);
+    expect(bps[1]!.type).toBe("tag-close");
+    expect(bps[1]!.score).toBe(75);
+    // Positions are the \n immediately before the tag line.
+    expect(text[bps[0]!.pos]).toBe("\n");
+    expect(text[bps[1]!.pos]).toBe("\n");
+    expect(text.slice(bps[0]!.pos + 1).startsWith("<example>")).toBe(true);
+    expect(text.slice(bps[1]!.pos + 1).startsWith("</example>")).toBe(true);
+  });
+
+  test("multiple sequential blocks", () => {
+    const text = "intro\n<example>\na\n</example>\nmid\n<note>\nb\n</note>\nend";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-close", "tag-open", "tag-close"]);
+    expect(bps.map(b => b.score)).toEqual([30, 75, 30, 75]);
+  });
+
+  test("nested same-name tags", () => {
+    const text = "p\n<example>\n<example>\ninner\n</example>\nouter\n</example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-open", "tag-close", "tag-close"]);
+  });
+
+  test("nested different-name tags emit all four break points in order", () => {
+    const text = "p\n<outer>\n<inner>\nx\n</inner>\ny\n</outer>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.map(b => b.type)).toEqual(["tag-open", "tag-open", "tag-close", "tag-close"]);
+    for (let i = 1; i < bps.length; i++) {
+      expect(bps[i]!.pos).toBeGreaterThan(bps[i - 1]!.pos);
+    }
+  });
+
+  test("self-closing tag emits nothing", () => {
+    const text = "p\n<thing/>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("self-closing with space emits nothing", () => {
+    const text = "p\n<thing />\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("tag with attributes is recognized", () => {
+    const text = "p\n<example name=\"foo\">\ncontent\n</example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+    expect(bps[0]!.type).toBe("tag-open");
+    expect(bps[1]!.type).toBe("tag-close");
+  });
+
+  test("HTML element blocked (div)", () => {
+    const text = "p\n<div>\ncontent\n</div>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("HTML element blocklist is case-insensitive", () => {
+    const text1 = "p\n<DIV>\nx\n</DIV>\nq";
+    const text2 = "p\n<Div>\nx\n</Div>\nq";
+    expect(findXmlTagBreakPoints(text1, [])).toEqual([]);
+    expect(findXmlTagBreakPoints(text2, [])).toEqual([]);
+  });
+
+  test("custom element with hyphen is recognized", () => {
+    const text = "p\n<my-widget>\nx\n</my-widget>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("namespaced tag is recognized", () => {
+    const text = "p\n<xsl:template>\nx\n</xsl:template>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("case-sensitive tag matching → malformed", () => {
+    // <Example> open, </example> close: names differ → malformed, zero breaks.
+    const text = "p\n<Example>\nx\n</example>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("unclosed tag emits no break points", () => {
+    const text = "p\n<example>\ncontent with no close";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("stray closing tag is ignored and does not crash", () => {
+    const text = "p\n</example>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("cross-tag interleaving is malformed → zero break points", () => {
+    const text = "p\n<a-foo>\n<b-bar>\n</a-foo>\n</b-bar>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("tag inside code fence is ignored", () => {
+    const text = "prologue\n```\n<example>\nfoo\n</example>\n```\nepilogue";
+    const fences = findCodeFences(text);
+    expect(fences.length).toBe(1);
+    expect(findXmlTagBreakPoints(text, fences)).toEqual([]);
+  });
+
+  test("mid-line tag is ignored", () => {
+    const text = "Here's an <example>content</example> inline";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("leading whitespace on tag line is recognized", () => {
+    const text = "p\n  <example>\n  x\n  </example>\nq";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(2);
+  });
+
+  test("HTML comment is ignored", () => {
+    const text = "p\n<!-- comment -->\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("DOCTYPE is ignored", () => {
+    const text = "p\n<!DOCTYPE html>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("CDATA is ignored", () => {
+    const text = "p\n<![CDATA[some data]]>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("processing instruction is ignored", () => {
+    const text = "p\n<?xml version=\"1.0\"?>\nq";
+    expect(findXmlTagBreakPoints(text, [])).toEqual([]);
+  });
+
+  test("first-line tag skipped (open at position 0)", () => {
+    // Open at position 0 → no tag-open break. Close still emits.
+    const text = "<example>\ncontent\n</example>\nafter";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(bps.length).toBe(1);
+    expect(bps[0]!.type).toBe("tag-close");
+  });
+
+  test("position convention: pos is the \\n before the tag line", () => {
+    const text = "abc\n<example>\ncontent\n</example>\ndef";
+    const bps = findXmlTagBreakPoints(text, []);
+    expect(text[bps[0]!.pos]).toBe("\n");
+    expect(text.charAt(bps[0]!.pos + 1)).toBe("<");
+  });
+
+  test("chunkDocument integration: prefers close positions when splitting a tagged document", () => {
+    // Build a document larger than CHUNK_SIZE_CHARS so splitting is forced,
+    // with a clearly closed <example> block near the split target. The close
+    // should be chosen over nearby weak breaks.
+    // Size chosen so the </example> close sits inside the first cutoff
+    // window (target ~3600, window back 800).
+    const pre = "pre ".repeat(750);
+    const block = "\n<example>\n" + "body ".repeat(80) + "\n</example>\n";
+    const post = "post ".repeat(500);
+    const text = pre + block + post;
+    const chunks = chunkDocument(text);
+    expect(chunks.length).toBeGreaterThan(1);
+    // The tag-close break point sits at the \n before </example>. A chunk
+    // boundary should land exactly there (or very close to it) since 75
+    // beats the nearby weak blank/newline breaks.
+    const closeBpPos = text.indexOf("\n</example>");
+    const hasBoundaryAtClose = chunks.some(c => {
+      const end = c.pos + c.text.length;
+      return end === closeBpPos;
+    });
+    expect(hasBoundaryAtClose).toBe(true);
+  });
+});
+
+describe("isInsideProtectedRegion", () => {
   test("returns true for position inside fence", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(15, fences)).toBe(true);
-    expect(isInsideCodeFence(20, fences)).toBe(true);
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(15, fences)).toBe(true);
+    expect(isInsideProtectedRegion(20, fences)).toBe(true);
   });
 
   test("returns false for position outside fence", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(5, fences)).toBe(false);
-    expect(isInsideCodeFence(35, fences)).toBe(false);
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(5, fences)).toBe(false);
+    expect(isInsideProtectedRegion(35, fences)).toBe(false);
   });
 
   test("returns false for position at fence boundaries", () => {
-    const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
-    expect(isInsideCodeFence(10, fences)).toBe(false); // at start
-    expect(isInsideCodeFence(30, fences)).toBe(false); // at end
+    const fences: ProtectedRegion[] = [{ start: 10, end: 30 }];
+    expect(isInsideProtectedRegion(10, fences)).toBe(false); // at start
+    expect(isInsideProtectedRegion(30, fences)).toBe(false); // at end
   });
 
   test("handles multiple fences", () => {
-    const fences: CodeFenceRegion[] = [
+    const fences: ProtectedRegion[] = [
       { start: 10, end: 30 },
       { start: 50, end: 70 }
     ];
-    expect(isInsideCodeFence(20, fences)).toBe(true);
-    expect(isInsideCodeFence(60, fences)).toBe(true);
-    expect(isInsideCodeFence(40, fences)).toBe(false);
+    expect(isInsideProtectedRegion(20, fences)).toBe(true);
+    expect(isInsideProtectedRegion(60, fences)).toBe(true);
+    expect(isInsideProtectedRegion(40, fences)).toBe(false);
   });
 });
 
@@ -773,8 +1212,8 @@ describe("findBestCutoff", () => {
       { pos: 150, score: 100, type: 'h1' },  // inside fence
       { pos: 180, score: 20, type: 'blank' }, // outside fence
     ];
-    const codeFences: CodeFenceRegion[] = [{ start: 140, end: 160 }];
-    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7, codeFences);
+    const regions: ProtectedRegion[] = [{ start: 140, end: 160 }];
+    const cutoff = findBestCutoff(breakPoints, 200, 100, 0.7, regions);
     expect(cutoff).toBe(180); // blank wins since h1 is inside fence
   });
 
@@ -914,10 +1353,10 @@ describe("chunkDocumentWithBreakPoints", () => {
   test("produces same output as chunkDocument for same input", () => {
     const content = "a".repeat(5000) + "\n\n" + "b".repeat(5000);
     const breakPoints = scanBreakPoints(content);
-    const codeFences = findCodeFences(content);
+    const regions = findCodeFences(content);
 
     const chunksOriginal = chunkDocument(content);
-    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, codeFences);
+    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, regions);
 
     expect(chunksNew.length).toBe(chunksOriginal.length);
     for (let i = 0; i < chunksNew.length; i++) {
