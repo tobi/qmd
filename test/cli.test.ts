@@ -12,6 +12,7 @@ import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
+import { createServer, type Server } from "http";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
 
@@ -1382,6 +1383,7 @@ describe("mcp http daemon", () => {
   let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
   let daemonDbPath: string;
   let daemonConfigDir: string;
+  let fakeDaemonServer: Server | undefined;
 
   // Track spawned PIDs for cleanup
   const spawnedPids: number[] = [];
@@ -1435,6 +1437,23 @@ describe("mcp http daemon", () => {
     return 10000 + Math.floor(Math.random() * 50000);
   }
 
+  async function startFakeDaemon(
+    port: number,
+    handler: (url: string, body: string) => { status: number; body: string },
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      fakeDaemonServer = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const response = handler(req.url || "/", body);
+        res.writeHead(response.status, { "Content-Type": "application/json" });
+        res.end(response.body);
+      });
+      fakeDaemonServer.once("error", reject);
+      fakeDaemonServer.listen(port, "127.0.0.1", () => resolve());
+    });
+  }
+
   beforeAll(async () => {
     daemonTestDir = await mkdtemp(join(tmpdir(), "qmd-daemon-test-"));
     daemonCacheDir = join(daemonTestDir, "cache");
@@ -1447,6 +1466,11 @@ describe("mcp http daemon", () => {
   });
 
   afterAll(async () => {
+    if (fakeDaemonServer) {
+      await new Promise<void>((resolve) => fakeDaemonServer!.close(() => resolve()));
+      fakeDaemonServer = undefined;
+    }
+
     // Kill any leftover spawned processes
     for (const pid of spawnedPids) {
       try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
@@ -1621,5 +1645,69 @@ describe("mcp http daemon", () => {
     await runDaemonQmd(["mcp", "stop"]);
     await sleep(300);
     expect(existsSync(portFile)).toBe(false);
+  });
+
+  test("query uses daemon when health dbPath matches the CLI db", async () => {
+    const port = randomPort();
+    const portFile = join(daemonCacheDir, "qmd", "mcp.port");
+    const expectedResult = {
+      file: "qmd://fixtures/README.md",
+      displayPath: "fixtures/README.md",
+      title: "Remote Result",
+      body: "ignored body",
+      bestChunk: "remote best chunk",
+      bestChunkPos: 42,
+      score: 0.88,
+      context: "remote context",
+      docid: "abc123",
+    };
+
+    await startFakeDaemon(port, (url) => {
+      if (url === "/health") {
+        return {
+          status: 200,
+          body: JSON.stringify({ status: "ok", uptime: 1, dbPath: daemonDbPath }),
+        };
+      }
+      if (url === "/v1/search") {
+        return {
+          status: 200,
+          body: JSON.stringify({ results: [expectedResult] }),
+        };
+      }
+      return { status: 404, body: JSON.stringify({ error: "not found" }) };
+    });
+
+    writeFileSync(pidPath(), String(process.pid));
+    writeFileSync(portFile, String(port));
+
+    const { stdout, stderr, exitCode } = await runQmd(["query", "search performance", "--json"], {
+      dbPath: daemonDbPath,
+      configDir: daemonConfigDir,
+      env: {
+        XDG_CACHE_HOME: daemonCacheDir,
+        QMD_DEBUG: "1",
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain(`Using daemon at http://localhost:${port} (PID ${process.pid})`);
+
+    const parsed = JSON.parse(stdout);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      file: expectedResult.file,
+      title: expectedResult.title,
+      score: expectedResult.score,
+      context: expectedResult.context,
+      docid: `#${expectedResult.docid}`,
+      line: 1,
+    });
+    expect(parsed[0].snippet).toContain(expectedResult.bestChunk);
+
+    await new Promise<void>((resolve) => fakeDaemonServer!.close(() => resolve()));
+    fakeDaemonServer = undefined;
+    unlinkSync(pidPath());
+    unlinkSync(portFile);
   });
 });

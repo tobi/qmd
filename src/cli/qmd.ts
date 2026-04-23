@@ -100,6 +100,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { discoverDaemon, searchViaDaemon, type DaemonHandle } from "../daemon.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -234,6 +235,47 @@ function formatETA(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+/**
+ * Normalize a filesystem path for comparison — resolves symlinks and
+ * differing absolute representations. Returns the input unchanged on
+ * any error (file doesn't exist yet, permissions, etc.) so comparison
+ * falls back to string equality.
+ */
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Decide whether this CLI invocation may route through the daemon.
+ * Routes when:
+ *   - QMD_NO_DAEMON env is unset (checked inside discoverDaemon too).
+ *   - The daemon is reachable (PID alive, /health returns dbPath).
+ *   - The daemon's dbPath matches the CLI's resolved DB path.
+ *   - The caller didn't pass --no-daemon.
+ *
+ * Returns a DaemonHandle when safe, null otherwise.
+ */
+async function maybeDiscoverDaemon(opts: { noDaemon?: boolean } = {}): Promise<DaemonHandle | null> {
+  if (opts.noDaemon) return null;
+  const handle = await discoverDaemon();
+  if (!handle) return null;
+
+  const cliDb = canonicalPath(getDbPath());
+  const daemonDb = canonicalPath(handle.dbPath);
+  if (cliDb !== daemonDb) {
+    if (process.env.QMD_DEBUG === "1") {
+      process.stderr.write(
+        `[qmd daemon] skipped: dbPath mismatch (cli=${cliDb}, daemon=${daemonDb})\n`,
+      );
+    }
+    return null;
+  }
+  return handle;
+}
 
 // Check index health and print warnings/tips
 function checkIndexHealth(db: Database): void {
@@ -1808,6 +1850,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  noDaemon?: boolean;
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
 };
 
@@ -2347,6 +2390,65 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
+  // Daemon fast-path: the daemon serves both structured and hybrid search.
+  const daemon = await maybeDiscoverDaemon({ noDaemon: opts.noDaemon });
+  if (daemon) {
+    if (process.env.QMD_DEBUG === "1") {
+      process.stderr.write(`${c.dim}Using daemon at ${daemon.baseUrl} (PID ${daemon.pid})${c.reset}\n`);
+    }
+    const remote = await searchViaDaemon(daemon.baseUrl, {
+      ...(parsed
+        ? { searches: parsed.searches }
+        : { query }),
+      collections: singleCollection ? [singleCollection] : undefined,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0,
+      candidateLimit: opts.candidateLimit,
+      skipRerank: opts.skipRerank,
+      explain: !!opts.explain,
+      intent,
+      chunkStrategy: opts.chunkStrategy,
+    });
+    if (remote !== null) {
+      let results = remote;
+
+      // Post-filter for multi-collection (mirror the in-process path).
+      if (collectionNames.length > 1) {
+        results = results.filter(r => {
+          const prefixes = collectionNames.map(n => `qmd://${n}/`);
+          return prefixes.some(p => r.file.startsWith(p));
+        });
+      }
+
+      closeDb();
+
+      if (results.length === 0) {
+        printEmptySearchResults(opts.format);
+        return;
+      }
+
+      const structuredQueries = parsed?.searches;
+      const displayQuery = structuredQueries
+        ? (structuredQueries.find(s => s.type === 'lex')?.query ||
+           structuredQueries.find(s => s.type === 'vec')?.query || query)
+        : query;
+
+      outputResults(results.map(r => ({
+        file: r.file,
+        displayPath: r.displayPath,
+        title: r.title,
+        body: r.bestChunk,
+        chunkPos: r.bestChunkPos,
+        score: r.score,
+        context: r.context,
+        docid: r.docid,
+        ...(r.explain ? { explain: r.explain } : {}),
+      })), displayQuery, { ...opts, limit: results.length });
+      return;
+    }
+    // Remote failed → continue into the existing withLLMSession block
+  }
+
   await withLLMSession(async () => {
     let results;
 
@@ -2465,7 +2567,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
-      explain: r.explain,
+      ...(r.explain ? { explain: r.explain } : {}),
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
