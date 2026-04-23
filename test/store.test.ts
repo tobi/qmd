@@ -1090,6 +1090,39 @@ describe("Path Context", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("getContextForFile matches context with different case in path prefix", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/collection", glob: "**/*.md" });
+
+    // Context key uses mixed case (as typed by user)
+    await addPathContext(collectionName, "/L3/CacheService.md", "File-level context for CacheService");
+
+    // Document path stored in lowercase (as resolved from filesystem)
+    await insertTestDocument(store.db, collectionName, {
+      name: "cacheservice",
+      displayPath: "l3/cacheservice.md",
+    });
+
+    // Should match despite case difference
+    const context = store.getContextForFile("/test/collection/l3/cacheservice.md");
+    expect(context).toBe("File-level context for CacheService");
+
+    await cleanupTestDb(store);
+  });
+
+  test("getContextForPath matches context with different case", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ pwd: "/test/collection", glob: "**/*.md" });
+
+    await addPathContext(collectionName, "/Docs/API", "API docs context");
+
+    // Path in different case
+    const context = store.getContextForPath(collectionName, "docs/api/reference.md");
+    expect(context).toBe("API docs context");
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================

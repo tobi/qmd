@@ -2504,12 +2504,12 @@ export function getContextForPath(db: Database, collectionName: string, path: st
 
   // Add all matching path contexts (from most general to most specific)
   if (coll.context) {
-    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const normalizedPath = (path.startsWith("/") ? path : `/${path}`).toLowerCase();
 
-    // Collect all matching prefixes
+    // Collect all matching prefixes (case-insensitive)
     const matchingContexts: { prefix: string; context: string }[] = [];
     for (const [prefix, context] of Object.entries(coll.context)) {
-      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
+      const normalizedPrefix = (prefix.startsWith("/") ? prefix : `/${prefix}`).toLowerCase();
       if (normalizedPath.startsWith(normalizedPrefix)) {
         matchingContexts.push({ prefix: normalizedPrefix, context });
       }
@@ -2591,12 +2591,12 @@ export function getContextForFile(db: Database, filepath: string): string | null
 
   // Add all matching path contexts (from most general to most specific)
   if (coll.context) {
-    const normalizedPath = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
+    const normalizedPath = (relativePath.startsWith("/") ? relativePath : `/${relativePath}`).toLowerCase();
 
-    // Collect all matching prefixes
+    // Collect all matching prefixes (case-insensitive)
     const matchingContexts: { prefix: string; context: string }[] = [];
     for (const [prefix, context] of Object.entries(coll.context)) {
-      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
+      const normalizedPrefix = (prefix.startsWith("/") ? prefix : `/${prefix}`).toLowerCase();
       if (normalizedPath.startsWith(normalizedPrefix)) {
         matchingContexts.push({ prefix: normalizedPrefix, context });
       }
