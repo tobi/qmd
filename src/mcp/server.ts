@@ -236,7 +236,7 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
   });
 
   server.registerTool(
-    "query",
+    "hsearch",
     {
       title: "Query",
       description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
@@ -493,6 +493,130 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return { content };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: find (DSL filter)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "fsearch",
+    {
+      title: "Find Documents",
+      description: `Filter documents using a structured DSL expression. Returns documents matching frontmatter, tags, sections, dates, or word count criteria — without semantic search.
+
+## DSL Syntax
+
+**Comparisons** — \`field = value\`, \`field ~= value\` (contains), \`field > value\`, \`field < value\`, \`field ~/regex/\`
+**Boolean** — \`AND\`, \`OR\`, \`NOT\`, parentheses for grouping
+**Predicates** — \`missing:field\` (field absent), \`empty:field\` (field present but blank), \`no:headings\`, \`no:level=2\`
+
+## Special Fields
+
+| Field | Matches |
+|---|---|
+| \`tag\` | Tag values from frontmatter |
+| \`section\` | Heading text |
+| \`level\` | Heading depth (1–6) |
+| \`content\` | Section body text |
+| \`title\` | Document title |
+| \`collection\` | Collection name |
+| \`modified\` | Last modified date |
+| \`created\` | Creation date |
+| \`word_count\` | Total word count |
+| anything else | Frontmatter key |
+
+## Date Values
+
+Use ISO dates (\`2025-01-01\`) or relative durations (\`7d\`, \`2w\`, \`3m\`, \`1y\`).
+
+## Examples
+
+\`\`\`
+tag=productivity AND modified > 30d
+section ~= "Summary" AND missing:status
+collection=research_papers AND no:headings
+NOT (tag=draft) AND word_count > 500
+status = "complete" AND modified > 2025-01-01
+\`\`\``,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        filter: z.string().describe("DSL filter expression"),
+        collection: z.string().optional().describe("Restrict to a specific collection"),
+        limit: z.number().optional().default(50).describe("Max results (default: 50)"),
+      },
+    },
+    async ({ filter, collection, limit }) => {
+      let results;
+      try {
+        results = await store.findByFilter(filter, { collection, limit });
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Filter error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: "No documents matched the filter." }] };
+      }
+
+      const lines = results.map(r =>
+        `${r.collection}/${r.path} — ${r.title} (modified: ${r.modified_at?.slice(0, 10) ?? "?"})`
+      );
+      const summary = `Found ${results.length} document(s):\n${lines.join("\n")}`;
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: { results },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: toc (Table of contents)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "toc",
+    {
+      title: "Table of Contents",
+      description: "Return the heading tree (table of contents) for a document. Use paths or docids from search results.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        file: z.string().describe("File path (e.g. 'research_papers/my-paper.md') or docid (#abc123)"),
+      },
+    },
+    async ({ file }) => {
+      // Resolve docid → filepath first if needed
+      let lookup = file;
+      if (file.startsWith("#")) {
+        const doc = await store.get(file, { includeBody: false });
+        if ("error" in doc) {
+          return { content: [{ type: "text", text: `Document not found: ${file}` }], isError: true };
+        }
+        lookup = doc.displayPath;
+      }
+
+      const toc = await store.getDocumentToc(lookup);
+
+      if (!toc) {
+        return { content: [{ type: "text", text: `Document not found: ${file}` }], isError: true };
+      }
+      if (toc.length === 0) {
+        return { content: [{ type: "text", text: `No headings found in: ${file}` }] };
+      }
+
+      const lines = toc.map(entry => {
+        const indent = "  ".repeat(Math.max(0, entry.level - 1));
+        return `${indent}${"#".repeat(entry.level)} ${entry.heading}`;
+      });
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: { toc },
+      };
     }
   );
 

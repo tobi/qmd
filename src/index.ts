@@ -56,6 +56,8 @@ import {
   type StructuredSearchOptions,
   type MultiGetResult,
   type IndexStatus,
+  type FindResult,
+  type TocResult,
   type IndexHealthInfo,
   type SearchHooks,
   type ReindexProgress,
@@ -101,6 +103,8 @@ export type {
   ReindexResult,
   EmbedProgress,
   EmbedResult,
+  FindResult,
+  TocResult,
   Collection,
   CollectionConfig,
   NamedCollection,
@@ -297,6 +301,14 @@ export interface QMDStore {
     chunkStrategy?: ChunkStrategy;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
+
+  // ── DSL Filter and TOC ─────────────────────────────────────────────
+
+  /** Filter documents using the DSL expression language */
+  findByFilter(filterExpr: string, options?: { collection?: string; limit?: number }): Promise<FindResult[]>;
+
+  /** Get the table of contents (heading tree) for a document */
+  getDocumentToc(filepath: string): Promise<TocResult[] | null>;
 
   // ── Index Health ────────────────────────────────────────────────────
 
@@ -525,6 +537,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         onProgress: embedOpts?.onProgress,
       });
     },
+
+    // DSL Filter and TOC
+    findByFilter: async (filterExpr, opts) => internal.findByFilter(filterExpr, opts),
+    getDocumentToc: async (filepath) => internal.getDocumentToc(filepath),
 
     // Index Health
     getStatus: async () => internal.getStatus(),

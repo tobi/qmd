@@ -37,6 +37,10 @@ import type {
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 import type { Heading, Root } from "mdast";
+import { parseFrontmatter } from "./parse/frontmatter.js";
+import { parseStructure } from "./parse/structure.js";
+import { parseFilter } from "./query/parser.js";
+import { compileFilter, registerRegexpUDF } from "./query/compile.js";
 
 // =============================================================================
 // Configuration
@@ -938,6 +942,83 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  // Frontmatter key/value pairs (arrays exploded into multiple rows)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS frontmatter (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      key        TEXT NOT NULL,
+      value_text TEXT,
+      value_num  REAL,
+      value_date TEXT,
+      is_array   INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_frontmatter_doc_key ON frontmatter(doc_id, key);
+    CREATE INDEX IF NOT EXISTS idx_frontmatter_key     ON frontmatter(key);
+  `);
+
+  // Denormalized tags for fast tag queries
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tags (
+      doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      tag    TEXT NOT NULL,
+      PRIMARY KEY (doc_id, tag)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+  `);
+
+  // Heading-delimited sections with body text
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sections (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id           INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      seq              INTEGER NOT NULL,
+      parent_seq       INTEGER,
+      level            INTEGER NOT NULL,
+      heading          TEXT,
+      slug             TEXT,
+      body             TEXT NOT NULL DEFAULT '',
+      body_no_callouts TEXT NOT NULL DEFAULT '',
+      word_count       INTEGER NOT NULL DEFAULT 0,
+      char_offset      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_sections_doc_id  ON sections(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_sections_heading ON sections(heading);
+    CREATE INDEX IF NOT EXISTS idx_sections_level   ON sections(level);
+  `);
+
+  // Obsidian-style callout blocks (> [!kind] Title)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS callouts (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+      kind       TEXT NOT NULL,
+      title      TEXT,
+      body       TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_callouts_doc_id ON callouts(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_callouts_kind   ON callouts(kind);
+  `);
+
+  // Wikilinks [[target]] and [[target#anchor]]
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wikilinks (
+      id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      target TEXT NOT NULL,
+      anchor TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_wikilinks_doc_id ON wikilinks(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_wikilinks_target ON wikilinks(target);
+  `);
+
+  // Migration: add word_count to documents if missing
+  const docCols = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!docCols.some(c => c.name === 'word_count')) {
+    db.exec(`ALTER TABLE documents ADD COLUMN word_count INTEGER NOT NULL DEFAULT 0`);
+  }
 }
 
 // =============================================================================
@@ -1202,6 +1283,10 @@ export type Store = {
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
   findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
 
+  // DSL filter and TOC
+  findByFilter: (filterExpr: string, options?: { collection?: string; limit?: number }) => FindResult[];
+  getDocumentToc: (filepath: string) => TocResult[] | null;
+
   // Fuzzy matching and docid lookup
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
   matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
@@ -1312,32 +1397,36 @@ export async function reindexCollection(
     }
 
     const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+    const fm = parseFrontmatter(content);
+    const structure = parseStructure(fm.body);
+    const title = fm.title || extractTitle(content, relativeFile);
+    const stat = statSync(filepath);
+    const createdAt = fm.createdDate ?? new Date(stat.birthtime).toISOString();
+    const modifiedAt = fm.modifiedDate ?? new Date(stat.mtime).toISOString();
 
     const existing = findActiveDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
         if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
+          updateDocumentTitle(db, existing.id, title, modifiedAt);
           updated++;
         } else {
           unchanged++;
         }
+        upsertDocumentMetadata(db, existing.id, fm, structure);
       } else {
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        updateDocument(db, existing.id, title, hash, modifiedAt);
+        upsertDocumentMetadata(db, existing.id, fm, structure);
         updated++;
       }
     } else {
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+      insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt);
+      const inserted = findActiveDocument(db, collectionName, path);
+      if (inserted) upsertDocumentMetadata(db, inserted.id, fm, structure);
     }
 
     processed++;
@@ -1676,6 +1765,8 @@ export function createStore(dbPath?: string): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  registerRegexpUDF(db as any);
 
   const store: Store = {
     db,
@@ -1727,6 +1818,10 @@ export function createStore(dbPath?: string): Store {
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
     getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => getDocumentBody(db, doc, fromLine, maxLines),
     findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => findDocuments(db, pattern, options),
+
+    // DSL filter and TOC
+    findByFilter: (filterExpr: string, options?: { collection?: string; limit?: number }) => findByFilter(db, filterExpr, options),
+    getDocumentToc: (filepath: string) => getDocumentToc(db, filepath),
 
     // Fuzzy matching and docid lookup
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
@@ -2218,6 +2313,69 @@ export function updateDocument(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(title, hash, modifiedAt, documentId);
+}
+
+/**
+ * Upsert parsed frontmatter, tags, sections, callouts, and wikilinks for a document.
+ * Deletes existing rows first so re-indexing is idempotent.
+ */
+export function upsertDocumentMetadata(
+  db: Database,
+  docId: number,
+  fm: ReturnType<typeof parseFrontmatter>,
+  structure: ReturnType<typeof parseStructure>
+): void {
+
+  // Clear old rows (cascades handle callouts/wikilinks via section)
+  db.prepare(`DELETE FROM frontmatter WHERE doc_id = ?`).run(docId);
+  db.prepare(`DELETE FROM tags WHERE doc_id = ?`).run(docId);
+  db.prepare(`DELETE FROM sections WHERE doc_id = ?`).run(docId);
+  db.prepare(`DELETE FROM wikilinks WHERE doc_id = ?`).run(docId);
+
+  // word_count from all section bodies
+  const totalWords = structure.sections.reduce((s, sec) => s + sec.word_count, 0);
+  db.prepare(`UPDATE documents SET word_count = ? WHERE id = ?`).run(totalWords, docId);
+
+  // Frontmatter rows
+  const fmStmt = db.prepare(`
+    INSERT INTO frontmatter (doc_id, key, value_text, value_num, value_date, is_array)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of fm.rows) {
+    fmStmt.run(docId, row.key, row.value_text, row.value_num ?? null, row.value_date ?? null, row.is_array ? 1 : 0);
+  }
+
+  // Tags
+  const tagStmt = db.prepare(`INSERT OR IGNORE INTO tags (doc_id, tag) VALUES (?, ?)`);
+  for (const tag of fm.tags) {
+    tagStmt.run(docId, tag);
+  }
+
+  // Sections + callouts
+  const secStmt = db.prepare(`
+    INSERT INTO sections (doc_id, seq, parent_seq, level, heading, slug, body, body_no_callouts, word_count, char_offset)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const calStmt = db.prepare(`
+    INSERT INTO callouts (doc_id, section_id, kind, title, body) VALUES (?, ?, ?, ?, ?)
+  `);
+  for (const sec of structure.sections) {
+    const result = secStmt.run(
+      docId, sec.seq, sec.parent_seq ?? null, sec.level,
+      sec.heading ?? null, sec.slug ?? null,
+      sec.body, sec.body_no_callouts, sec.word_count, sec.char_offset
+    );
+    const sectionId = Number(result.lastInsertRowid);
+    for (const cal of sec.callouts) {
+      calStmt.run(docId, sectionId, cal.kind, cal.title ?? null, cal.body);
+    }
+  }
+
+  // Wikilinks
+  const wlStmt = db.prepare(`INSERT INTO wikilinks (doc_id, target, anchor) VALUES (?, ?, ?)`);
+  for (const wl of structure.wikilinks) {
+    wlStmt.run(docId, wl.target, wl.anchor ?? null);
+  }
 }
 
 /**
@@ -3735,6 +3893,92 @@ export function findDocuments(
   }
 
   return { docs: results, errors };
+}
+
+// =============================================================================
+// Find (DSL filter) and TOC
+// =============================================================================
+
+export interface FindResult {
+  collection: string;
+  path: string;
+  title: string;
+  created_at: string;
+  modified_at: string;
+  word_count: number;
+}
+
+/**
+ * Filter documents using the qmd DSL expression language.
+ * Supports field comparisons, tag/section predicates, missing/empty/no checks,
+ * and boolean operators (AND, OR, NOT) with parentheses.
+ *
+ * Examples:
+ *   'tag=productivity AND modified > 30d'
+ *   'section ~= "Summary" AND missing:status'
+ *   'collection=research_papers AND no:headings'
+ */
+export function findByFilter(
+  db: Database,
+  filterExpr: string,
+  options: { collection?: string; limit?: number } = {}
+): FindResult[] {
+  const node = parseFilter(filterExpr);
+  const { where, params } = compileFilter(node);
+
+  const collectionClause = options.collection
+    ? `AND d.collection = '${options.collection.replace(/'/g, "''")}'`
+    : "";
+  const limitClause = options.limit ? `LIMIT ${options.limit}` : "LIMIT 100";
+
+  const sql = `
+    SELECT d.collection, d.path, d.title, d.created_at, d.modified_at, d.word_count
+    FROM documents d
+    WHERE d.active = 1 ${collectionClause} AND (${where})
+    ORDER BY d.modified_at DESC
+    ${limitClause}
+  `;
+
+  return db.prepare(sql).all(...params) as FindResult[];
+}
+
+export interface TocResult {
+  seq: number;
+  parent_seq: number | null;
+  level: number;
+  heading: string;
+  slug: string;
+  char_offset: number;
+}
+
+/**
+ * Return the table of contents (heading tree) for a document.
+ * Looks up by virtual path (collection/path) or bare path suffix.
+ */
+export function getDocumentToc(db: Database, filepath: string): TocResult[] | null {
+  // Try exact match on collection/path, then suffix match
+  let doc = db.prepare(`
+    SELECT id FROM documents
+    WHERE (collection || '/' || path = ? OR path = ?) AND active = 1
+    LIMIT 1
+  `).get(filepath, filepath) as { id: number } | null;
+
+  if (!doc) {
+    doc = db.prepare(`
+      SELECT id FROM documents
+      WHERE (collection || '/' || path LIKE ? OR path LIKE ?) AND active = 1
+      LIMIT 1
+    `).get(`%${filepath}`, `%${filepath}`) as { id: number } | null;
+  }
+
+  if (!doc) return null;
+
+  return db.prepare(`
+    SELECT seq, parent_seq, level, heading, slug, char_offset
+    FROM sections
+    WHERE doc_id = ? AND level > 0 AND heading IS NOT NULL
+    ORDER BY seq
+  `).all(doc.id) as TocResult[];
 }
 
 // =============================================================================

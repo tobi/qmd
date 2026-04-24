@@ -49,8 +49,10 @@
     "@types/mdast": "^4.0.4",
     "better-sqlite3": "12.8.0",
     "fast-glob": "3.3.3",
+    "gray-matter": "^4.0.3",
     "node-llama-cpp": "3.18.1",
     "picomatch": "4.0.4",
+    "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
     "sqlite-vec": "0.1.9",
     "unified": "^11.0.5",
@@ -71,6 +73,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
+    "@types/picomatch": "^4.0.3",
     "tsx": "4.21.0",
     "vitest": "3.2.4"
   },

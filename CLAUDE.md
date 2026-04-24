@@ -19,8 +19,9 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
-qmd query <query>                 # Search with query expansion + reranking (recommended)
-qmd search <query>                # Full-text keyword search (BM25, no LLM)
+qmd hsearch <query>               # Search with query expansion + reranking (recommended)
+qmd tsearch <query>               # Full-text keyword search (BM25, no LLM)
+qmd fsearch <filter>              # Filter by frontmatter/tags/dates/sections (DSL, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
 qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
@@ -85,7 +86,7 @@ Docids are shown in search results as `#abc123` and can be used with `get` and `
 
 ```sh
 # Search returns docid in results
-qmd search "query" --json
+qmd tsearch "query" --json
 # Output: [{"docid": "#abc123", "score": 0.85, "file": "docs/readme.md", ...}]
 
 # Get document by docid

@@ -165,17 +165,17 @@ With intent:
 
 ```bash
 # Single line (implicit expand)
-qmd query "how does auth work"
+qmd hsearch "how does auth work"
 
 # Multi-line with types
-qmd query $'lex: auth token\nvec: how does authentication work'
+qmd hsearch $'lex: auth token\nvec: how does authentication work'
 
 # Structured
-qmd query $'lex: keywords\nvec: question\nhyde: hypothetical answer...'
+qmd hsearch $'lex: keywords\nvec: question\nhyde: hypothetical answer...'
 
 # With intent (inline)
-qmd query $'intent: web performance and latency\nlex: performance\nvec: how to improve performance'
+qmd hsearch $'intent: web performance and latency\nlex: performance\nvec: how to improve performance'
 
 # With intent (flag)
-qmd query --intent "web performance and latency" "performance"
+qmd hsearch --intent "web performance and latency" "performance"
 ```

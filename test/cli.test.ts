@@ -231,7 +231,7 @@ describe("CLI Help", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
-    expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("qmd tsearch");
     expect(stdout).toContain("qmd skill show/install");
   });
 

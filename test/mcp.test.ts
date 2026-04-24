@@ -1036,7 +1036,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(contentType).toContain("application/json");
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toContain("query");
+    expect(toolNames).toContain("hsearch");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
   });
@@ -1050,7 +1050,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      params: { name: "hsearch", arguments: { searches: [{ type: "lex", query: "readme" }] } },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();

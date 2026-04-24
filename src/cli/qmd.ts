@@ -74,6 +74,8 @@ import {
   reindexCollection,
   generateEmbeddings,
   syncConfigToDb,
+  findByFilter,
+  type FindResult,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
@@ -442,7 +444,7 @@ async function showStatus(): Promise<void> {
     }
     console.log(`  ${c.dim}# Search within a collection${c.reset}`);
     if (collections.length > 0 && collections[0]) {
-      console.log(`  qmd search "query" -c ${collections[0].name}`);
+      console.log(`  qmd tsearch "query" -c ${collections[0].name}`);
     }
   } else {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -2439,6 +2441,65 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
+function filterSearch(filterExpr: string, opts: OutputOptions): void {
+  const db = getDb();
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const limit = opts.all ? undefined : opts.limit;
+
+  let results: FindResult[];
+  try {
+    results = findByFilter(db, filterExpr, { collection: singleCollection, limit: limit ?? 50 });
+  } catch (err) {
+    console.error(`Filter error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  closeDb();
+
+  if (results.length === 0) {
+    printEmptySearchResults(opts.format);
+    return;
+  }
+
+  if (opts.format === "json") {
+    console.log(JSON.stringify(results.map(r => ({
+      file: `qmd://${r.collection}/${r.path}`,
+      title: r.title,
+      modified: r.modified_at?.slice(0, 10) ?? null,
+      word_count: r.word_count,
+    })), null, 2));
+    return;
+  }
+  if (opts.format === "files") {
+    for (const r of results) console.log(`qmd://${r.collection}/${r.path}`);
+    return;
+  }
+  if (opts.format === "csv") {
+    console.log("file,title,modified,word_count");
+    for (const r of results) {
+      console.log(`${escapeCSV(`qmd://${r.collection}/${r.path}`)},${escapeCSV(r.title)},${r.modified_at?.slice(0, 10) ?? ""},${r.word_count}`);
+    }
+    return;
+  }
+  if (opts.format === "md") {
+    console.log(`| File | Title | Modified | Words |`);
+    console.log(`|------|-------|----------|-------|`);
+    for (const r of results) {
+      console.log(`| qmd://${r.collection}/${r.path} | ${r.title} | ${r.modified_at?.slice(0, 10) ?? ""} | ${r.word_count} |`);
+    }
+    return;
+  }
+  // CLI (default)
+  console.log(`Found ${results.length} document(s):\n`);
+  for (const r of results) {
+    const modified = r.modified_at?.slice(0, 10) ?? "?";
+    const words = r.word_count ? ` (${r.word_count}w)` : "";
+    console.log(`  ${c.bold}${r.collection}/${r.path}${c.reset}${words}  ${c.dim}${modified}${c.reset}`);
+    if (r.title) console.log(`  ${r.title}`);
+    console.log();
+  }
+}
+
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -2677,10 +2738,11 @@ function showHelp(): void {
   console.log("  qmd <command> [options]");
   console.log("");
   console.log("Primary commands:");
-  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
-  console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
-  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
+  console.log("  qmd hsearch <query>           - Hybrid search with auto expansion + reranking (recommended)");
+  console.log("  qmd hsearch 'lex:..\\nvec:...' - Structured query document (you provide lex/vec/hyde lines)");
+  console.log("  qmd tsearch <query>           - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd fsearch <filter>          - Filter by frontmatter/tags/dates/sections (DSL, no LLM)");
   console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
@@ -2700,7 +2762,7 @@ function showHelp(): void {
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
-  console.log("Query syntax (qmd query):");
+  console.log("Query syntax (qmd hsearch):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
   console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
   console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
@@ -2724,10 +2786,10 @@ function showHelp(): void {
   }
   console.log("");
   console.log("  Examples:");
-  console.log("    qmd query \"how does auth work\"                # single-line → implicit expand");
-  console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
-  console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
-  console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
+  console.log("    qmd hsearch \"how does auth work\"              # single-line → implicit expand");
+  console.log("    qmd hsearch $'lex: CAP theorem\\nvec: consistency'  # typed query document");
+  console.log("    qmd hsearch $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
+  console.log("    qmd hsearch $'hyde: Hypothetical answer text'     # hyde-only document");
   console.log("");
   console.log("  Constraints:");
   console.log("    - Standalone expand queries cannot mix with typed lines.");
@@ -3127,9 +3189,9 @@ if (isMain) {
       break;
     }
 
-    case "search":
+    case "tsearch":
       if (!cli.query) {
-        console.error("Usage: qmd search [options] <query>");
+        console.error("Usage: qmd tsearch [options] <query>");
         process.exit(1);
       }
       search(cli.query, cli.opts);
@@ -3148,13 +3210,21 @@ if (isMain) {
       await vectorSearch(cli.query, cli.opts);
       break;
 
-    case "query":
-    case "deep-search": // undocumented alias
+    case "hsearch":
       if (!cli.query) {
-        console.error("Usage: qmd query [options] <query>");
+        console.error("Usage: qmd hsearch [options] <query>");
         process.exit(1);
       }
       await querySearch(cli.query, cli.opts);
+      break;
+
+    case "fsearch":
+      if (!cli.query) {
+        console.error("Usage: qmd fsearch [options] <filter>");
+        console.error("Example: qmd fsearch 'tag=productivity AND modified > 30d'");
+        process.exit(1);
+      }
+      filterSearch(cli.query, cli.opts);
       break;
 
     case "bench": {
