@@ -1778,10 +1778,13 @@ describe("mcp http daemon", () => {
     await waitForServer(port);
 
     try {
-      // Use --no-rerank to keep the test deterministic and fast (avoids
-      // loading the reranker model in the --no-daemon leg).
+      // Use a structured `lex:` query so the LLM query-expander is not
+      // invoked — the daemon process and the --no-daemon child both
+      // inherit CI=true from the test runner (which disables LLM calls).
+      // Use --no-rerank so the reranker isn't loaded either. This still
+      // exercises the daemon HTTP round-trip + FTS path end-to-end.
       const run = (extra: string[]) =>
-        runQmd(["query", "test content", "--json", "-n", "3", "--no-rerank", ...extra], {
+        runQmd(["query", "lex:test content", "--json", "-n", "3", "--no-rerank", ...extra], {
           dbPath: daemonDbPath,
           configDir: daemonConfigDir,
           env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
@@ -1832,8 +1835,10 @@ describe("mcp http daemon", () => {
       await mkdir(altConfigDir, { recursive: true });
       await writeFile(join(altConfigDir, "index.yml"), "collections: {}\n");
 
+      // Use structured lex syntax so the in-process fallback path
+      // doesn't invoke the LLM query-expander (disabled in CI).
       const { stdout, stderr, exitCode } = await runQmd(
-        ["query", "test", "--json", "--no-rerank"],
+        ["query", "lex:test", "--json", "--no-rerank"],
         {
           dbPath: altDbPath,
           configDir: altConfigDir,
