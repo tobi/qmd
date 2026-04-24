@@ -461,10 +461,11 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const llamaCpp = getDefaultLlamaCpp();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(llamaCpp.embedModelName)}`);
+    console.log(`  Reranking:   ${hfLink(llamaCpp.rerankModelName)}`);
+    console.log(`  Generation:  ${hfLink(llamaCpp.generateModelName)}`);
   }
 
   // Device / GPU info
@@ -1698,7 +1699,7 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${getDefaultLlamaCpp().embedModelName}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
