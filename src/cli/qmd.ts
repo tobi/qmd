@@ -543,7 +543,7 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(collectionFilter?: string[]): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -551,7 +551,23 @@ async function updateCollections(): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
+
+  if (collectionFilter && collectionFilter.length > 0) {
+    for (const name of collectionFilter) {
+      const found = getCollectionFromYaml(name);
+      if (!found) {
+        console.error(`Collection '${name}' not found.`);
+        process.exit(1);
+      }
+    }
+    collections = collections.filter(col => collectionFilter.includes(col.name));
+    if (collections.length === 0) {
+      console.log(`No matching collections found for filter: ${collectionFilter.join(", ")}`);
+      closeDb();
+      return;
+    }
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -630,7 +646,8 @@ async function updateCollections(): Promise<void> {
   const needsEmbedding = getHashesNeedingEmbedding(db);
   closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  const updatedLabel = collections.length === 1 ? `'${collections[0]!.name}'` : `${collections.length} collections`;
+  console.log(`${c.green}✓ ${updatedLabel} updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
@@ -3104,7 +3121,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(cli.opts.collection ? (Array.isArray(cli.opts.collection) ? cli.opts.collection : [cli.opts.collection]) : undefined);
       break;
 
     case "embed":
