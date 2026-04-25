@@ -78,7 +78,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, createLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveLLMProvider } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -117,18 +117,25 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    let config: ReturnType<typeof loadConfig> | undefined;
     try {
-      const config = loadConfig();
+      config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
-      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
+    }
+    if (config?.models) {
+      setDefaultLLM(createLLM({
+        provider: config.models.provider,
+        backend: config.models.backend,
+        baseUrl: config.models.baseUrl,
+        apiKeyEnv: config.models.apiKeyEnv,
+        embedModel: config.models.embed,
+        generateModel: config.models.generate,
+        rerankModel: config.models.rerank,
+        rerankUrl: config.models.rerankUrl,
+        timeoutMs: config.models.timeoutMs,
+      }));
     }
   }
   return store;
@@ -461,10 +468,26 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    let modelConfig: ReturnType<typeof loadConfig>["models"] | undefined;
+    try { modelConfig = loadConfig().models; } catch { /* config optional */ }
+    const provider = modelConfig?.provider || modelConfig?.backend
+      ? resolveLLMProvider(modelConfig.provider ?? modelConfig.backend)
+      : modelConfig?.baseUrl
+        ? "remote"
+        : resolveLLMProvider();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    if (provider === "remote") {
+      const llm = getDefaultLLM();
+      console.log(`  Backend:     remote OpenAI-compatible`);
+      console.log(`  Embedding:   ${modelConfig?.embed || llm.embedModelName}`);
+      console.log(`  Reranking:   ${modelConfig?.rerank || llm.rerankModelName || process.env.QMD_REMOTE_RERANK_MODEL || process.env.QMD_RERANK_MODEL || "remote default"}`);
+      console.log(`  Generation:  ${modelConfig?.generate || llm.generateModelName || process.env.QMD_REMOTE_GENERATE_MODEL || process.env.QMD_GENERATE_MODEL || "remote default"}`);
+    } else {
+      console.log(`  Backend:     local node-llama-cpp`);
+      console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+      console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+      console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    }
   }
 
   // Device / GPU info
@@ -1679,12 +1702,13 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL_URI,
+  model: string | undefined = undefined,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const activeModel = model ?? (storeInstance.llm?.embedModelName ?? getDefaultLLM().embedModelName);
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -1698,7 +1722,7 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${activeModel}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1711,7 +1735,7 @@ async function vectorIndex(
 
   const result = await generateEmbeddings(storeInstance, {
     force,
-    model,
+    model: activeModel,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
@@ -3112,7 +3136,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        await vectorIndex(undefined, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,

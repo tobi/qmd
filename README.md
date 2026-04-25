@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking. By default it runs locally via node-llama-cpp with GGUF models, and it can also use remotely deployed OpenAI-compatible LLM services.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -515,6 +515,39 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Remote LLM Backend
+
+Use a remotely deployed OpenAI-compatible service for embeddings, query expansion, and reranking:
+
+```sh
+export QMD_LLM_BACKEND=remote
+export QMD_REMOTE_BASE_URL="https://llm.example.com/v1"
+export QMD_REMOTE_API_KEY="..."   # optional
+export QMD_REMOTE_EMBED_MODEL="text-embedding-3-small"
+export QMD_REMOTE_GENERATE_MODEL="gpt-4o-mini"
+export QMD_REMOTE_RERANK_MODEL="gpt-4o-mini"
+
+qmd embed -f
+qmd query "authentication flow"
+```
+
+For a native reranker endpoint, set `QMD_REMOTE_RERANK_URL=/rerank` (or an absolute URL). Without it, QMD falls back to chat-based scoring via `/chat/completions`.
+
+YAML config is also supported (`provider: remote` is explicit; `baseUrl` also selects the remote backend):
+
+```yaml
+models:
+  provider: remote
+  baseUrl: https://llm.example.com/v1
+  apiKeyEnv: QMD_REMOTE_API_KEY
+  embed: text-embedding-3-small
+  generate: gpt-4o-mini
+  rerank: gpt-4o-mini
+  # rerankUrl: /rerank
+```
+
+Remote embedding models default to raw input formatting. Set `QMD_EMBED_FORMAT=raw|nomic|qwen3` if your remote model needs a specific prompt format.
+
 ## Installation
 
 ```sh
@@ -820,8 +853,8 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                           "title | text"        embedBatch()
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► LLM backend ──► Store Vectors
+                │                           "title | text"        local or remote embedBatch()
                 │
                 └─► Chunks stored with:
                     - hash: document hash
@@ -913,7 +946,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured in `src/llm.ts` as HuggingFace URIs:
+Local models are configured in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";

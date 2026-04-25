@@ -1,7 +1,8 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - LLM abstraction layer for QMD.
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking using local GGUF models
+ * (node-llama-cpp) or remotely deployed OpenAI-compatible services.
  */
 
 import {
@@ -30,28 +31,62 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+export type EmbeddingFormat = "nomic" | "qwen3" | "raw";
+
+function parseEmbeddingFormat(value?: string): EmbeddingFormat | null {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (["nomic", "embeddinggemma", "task"].includes(normalized)) return "nomic";
+  if (["qwen", "qwen3", "instruct"].includes(normalized)) return "qwen3";
+  if (["raw", "none", "plain"].includes(normalized)) return "raw";
+  process.stderr.write(`QMD Warning: invalid QMD_EMBED_FORMAT="${value}", inferring embedding format from model name.\n`);
+  return null;
+}
+
+/**
+ * Resolve the text formatting convention for an embedding model.
+ *
+ * Local GGUF defaults keep QMD's historical embeddinggemma/nomic-style prompts.
+ * Remotely deployed OpenAI-compatible embedding models usually expect raw input,
+ * so non-GGUF model names default to raw unless QMD_EMBED_FORMAT overrides it.
+ */
+export function resolveEmbeddingFormat(modelUri: string): EmbeddingFormat {
+  const explicit = parseEmbeddingFormat(process.env.QMD_EMBED_FORMAT);
+  if (explicit) return explicit;
+  if (isQwen3EmbeddingModel(modelUri)) return "qwen3";
+
+  const lower = modelUri.toLowerCase();
+  const looksLocalGguf = lower.startsWith("hf:") || lower.endsWith(".gguf") || lower.includes("embeddinggemma");
+  return looksLocalGguf ? "nomic" : "raw";
+}
+
 /**
  * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma (default).
+ * Uses nomic-style task prefix format for local embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * Uses raw text for remote/OpenAI-compatible embedding model names by default.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
-  if (isQwen3EmbeddingModel(uri)) {
+  const format = resolveEmbeddingFormat(uri);
+  if (format === "qwen3") {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
+  }
+  if (format === "raw") {
+    return query;
   }
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields (default).
- * Qwen3-Embedding encodes documents as raw text without special prefixes.
+ * Uses nomic-style format with title and text fields for local embeddinggemma.
+ * Qwen3 and remote/OpenAI-compatible embedding models encode documents as raw text.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
-  if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
+  const format = resolveEmbeddingFormat(uri);
+  if (format === "qwen3" || format === "raw") {
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
@@ -156,7 +191,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -367,10 +402,22 @@ export async function pullModels(
  * Abstract LLM interface - implement this for different backends
  */
 export interface LLM {
+  /** Active embedding model name/identifier. Used for formatting and index metadata. */
+  readonly embedModelName: string;
+  /** Active generation model name/identifier. Used for cache keys and status output. */
+  readonly generateModelName?: string;
+  /** Active rerank model name/identifier. Used for cache keys and status output. */
+  readonly rerankModelName?: string;
+
   /**
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for multiple texts.
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -386,13 +433,20 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Optional tokenizer hooks. Local LlamaCpp provides exact tokenization;
+   * remote implementations may provide approximations for chunk sizing.
+   */
+  tokenize?(text: string): Promise<readonly unknown[]>;
+  detokenize?(tokens: readonly unknown[]): Promise<string>;
 
   /**
    * Dispose of resources
@@ -512,6 +566,14 @@ export class LlamaCpp implements LLM {
 
   get embedModelName(): string {
     return this.embedModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelUri;
   }
 
   /**
@@ -928,12 +990,12 @@ export class LlamaCpp implements LLM {
   /**
    * Detokenize token IDs back to text
    */
-  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+  async detokenize(tokens: readonly LlamaToken[] | readonly unknown[]): Promise<string> {
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
     }
-    return this.embedModel.detokenize(tokens);
+    return this.embedModel.detokenize(tokens as readonly LlamaToken[]);
   }
 
   // ==========================================================================
@@ -1386,19 +1448,544 @@ export class LlamaCpp implements LLM {
 }
 
 // =============================================================================
+// Remote OpenAI-compatible implementation
+// =============================================================================
+
+export type LLMProvider = "local" | "remote";
+
+export type RemoteLLMConfig = {
+  /** OpenAI-compatible base URL, e.g. https://llm.example.com/v1 */
+  baseUrl?: string;
+  /** API key value. Prefer apiKeyEnv/env vars for configuration files. */
+  apiKey?: string;
+  /** Environment variable name that contains the API key. */
+  apiKeyEnv?: string;
+  /** OpenAI-compatible embedding model name. */
+  embedModel?: string;
+  /** OpenAI-compatible chat/completion model name for query expansion. */
+  generateModel?: string;
+  /** Rerank endpoint model name, or chat model name when no rerank endpoint is configured. */
+  rerankModel?: string;
+  /** Optional rerank endpoint. Absolute URL or path relative to baseUrl. */
+  rerankUrl?: string;
+  /** Request timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Documents per chat-scored rerank batch when no rerank endpoint is configured. */
+  maxRerankBatchSize?: number;
+  /** Extra HTTP headers for all remote requests. */
+  headers?: Record<string, string>;
+};
+
+export type LLMConfig = LlamaCppConfig & RemoteLLMConfig & {
+  /** Backend selector. "local" keeps node-llama-cpp; "remote" uses OpenAI-compatible HTTP. */
+  provider?: LLMProvider | string;
+  /** Alias for provider. */
+  backend?: LLMProvider | string;
+};
+
+const DEFAULT_REMOTE_EMBED_MODEL = "text-embedding-3-small";
+const DEFAULT_REMOTE_GENERATE_MODEL = "gpt-4o-mini";
+const DEFAULT_REMOTE_RERANK_MODEL = "gpt-4o-mini";
+const DEFAULT_REMOTE_TIMEOUT_MS = 60_000;
+const DEFAULT_REMOTE_RERANK_BATCH_SIZE = 6;
+
+function isProbablyLocalModelName(model?: string): boolean {
+  if (!model) return false;
+  const lower = model.toLowerCase();
+  return lower.startsWith("hf:") || lower.endsWith(".gguf") || lower.includes("gguf/");
+}
+
+function shouldUseRemoteModelOverride(model: string | undefined, logicalAliases: string[] = []): model is string {
+  return !!model && !isProbablyLocalModelName(model) && !logicalAliases.includes(model);
+}
+
+function resolveRemoteModel(
+  configValue: string | undefined,
+  remoteEnvName: string,
+  legacyEnvName: string,
+  fallback: string,
+): string {
+  if (configValue) return configValue;
+  const remoteEnvValue = process.env[remoteEnvName];
+  if (remoteEnvValue) return remoteEnvValue;
+  const legacyEnvValue = process.env[legacyEnvName];
+  if (legacyEnvValue && !isProbablyLocalModelName(legacyEnvValue)) return legacyEnvValue;
+  return fallback;
+}
+
+function resolveRemoteApiKey(config: RemoteLLMConfig): string | undefined {
+  const envName = config.apiKeyEnv ?? process.env.QMD_REMOTE_API_KEY_ENV;
+  return config.apiKey
+    ?? (envName ? process.env[envName] : undefined)
+    ?? process.env.QMD_REMOTE_API_KEY
+    ?? process.env.OPENAI_API_KEY;
+}
+
+function resolveRemoteBaseUrl(config: RemoteLLMConfig, apiKey?: string): string {
+  const baseUrl = config.baseUrl
+    ?? process.env.QMD_REMOTE_BASE_URL
+    ?? process.env.QMD_REMOTE_URL
+    ?? process.env.OPENAI_BASE_URL
+    ?? process.env.OPENAI_API_BASE
+    ?? (apiKey ? "https://api.openai.com/v1" : undefined);
+
+  if (!baseUrl) {
+    throw new Error(
+      "Remote LLM backend selected but no base URL is configured. " +
+      "Set QMD_REMOTE_BASE_URL (for example, https://llm.example.com/v1) " +
+      "or OPENAI_BASE_URL."
+    );
+  }
+
+  return baseUrl.replace(/\/+$/, "");
+}
+
+function clampScore(score: unknown): number {
+  const n = typeof score === "number" ? score : Number(score);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function stripCodeFence(text: string): string {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1]!.trim() : trimmed;
+}
+
+function parseScoreArray(text: string, expectedLength: number): number[] | null {
+  const cleaned = stripCodeFence(text);
+  const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+  const jsonText = arrayMatch?.[0] ?? cleaned;
+
+  try {
+    const parsed = JSON.parse(jsonText) as unknown;
+    const rawScores = Array.isArray(parsed)
+      ? parsed
+      : (parsed && typeof parsed === "object" && Array.isArray((parsed as any).scores))
+        ? (parsed as any).scores
+        : null;
+    if (!rawScores) return null;
+
+    const scores = rawScores.map((item: unknown) => {
+      if (typeof item === "number" || typeof item === "string") return clampScore(item);
+      if (item && typeof item === "object") return clampScore((item as any).score ?? (item as any).relevance_score);
+      return 0;
+    });
+
+    if (scores.length < expectedLength) {
+      return [...scores, ...Array(expectedLength - scores.length).fill(0)];
+    }
+    return scores.slice(0, expectedLength);
+  } catch {
+    return null;
+  }
+}
+
+function parseQueryExpansionText(query: string, text: string, includeLexical: boolean): Queryable[] {
+  const queryables: Queryable[] = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim().replace(/^[-*]\s*/, "").replace(/^\d+[.)]\s*/, "");
+    const match = line.match(/^(lex|vec|hyde)\s*:\s*(.+)$/i);
+    if (!match) continue;
+    const type = match[1]!.toLowerCase() as QueryType;
+    const content = match[2]!.trim();
+    if (!content) continue;
+    if (!includeLexical && type === "lex") continue;
+    queryables.push({ type, text: content });
+  }
+
+  if (queryables.length > 0) return queryables;
+
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${query}` },
+    { type: "lex", text: query },
+    { type: "vec", text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
+}
+
+function approximateTokenize(text: string): string[] {
+  // A conservative, dependency-free tokenizer approximation used only for chunk sizing
+  // with remote backends. Four characters per token mirrors QMD's existing fallback.
+  const tokens: string[] = [];
+  for (let i = 0; i < text.length; i += 4) {
+    tokens.push(text.slice(i, i + 4));
+  }
+  return tokens;
+}
+
+export class RemoteLLM implements LLM {
+  private readonly baseUrl: string;
+  private readonly apiKey?: string;
+  private readonly embedModel: string;
+  private readonly generateModel: string;
+  private readonly rerankModel: string;
+  private readonly rerankUrl?: string;
+  private readonly timeoutMs: number;
+  private readonly maxRerankBatchSize: number;
+  private readonly extraHeaders: Record<string, string>;
+
+  constructor(config: RemoteLLMConfig = {}) {
+    this.apiKey = resolveRemoteApiKey(config);
+    this.baseUrl = resolveRemoteBaseUrl(config, this.apiKey);
+    this.embedModel = resolveRemoteModel(config.embedModel, "QMD_REMOTE_EMBED_MODEL", "QMD_EMBED_MODEL", DEFAULT_REMOTE_EMBED_MODEL);
+    this.generateModel = resolveRemoteModel(config.generateModel, "QMD_REMOTE_GENERATE_MODEL", "QMD_GENERATE_MODEL", DEFAULT_REMOTE_GENERATE_MODEL);
+    this.rerankModel = resolveRemoteModel(config.rerankModel, "QMD_REMOTE_RERANK_MODEL", "QMD_RERANK_MODEL", DEFAULT_REMOTE_RERANK_MODEL);
+    this.rerankUrl = config.rerankUrl ?? process.env.QMD_REMOTE_RERANK_URL;
+    const envTimeoutMs = Number.parseInt(process.env.QMD_REMOTE_TIMEOUT_MS ?? "", 10);
+    this.timeoutMs = config.timeoutMs ?? (Number.isFinite(envTimeoutMs) && envTimeoutMs > 0 ? envTimeoutMs : DEFAULT_REMOTE_TIMEOUT_MS);
+    this.maxRerankBatchSize = config.maxRerankBatchSize ?? DEFAULT_REMOTE_RERANK_BATCH_SIZE;
+    this.extraHeaders = config.headers ?? {};
+  }
+
+  get embedModelName(): string {
+    return this.embedModel;
+  }
+
+  get generateModelName(): string {
+    return this.generateModel;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModel;
+  }
+
+  private endpoint(pathOrUrl: string): string {
+    if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+    return `${this.baseUrl}/${pathOrUrl.replace(/^\/+/, "")}`;
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      "content-type": "application/json",
+      "accept": "application/json",
+      ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
+      ...this.extraHeaders,
+    };
+  }
+
+  private async postJson<T>(pathOrUrl: string, body: unknown): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`Remote LLM request timed out after ${this.timeoutMs}ms`)), this.timeoutMs);
+    (timer as any).unref?.();
+
+    let response: Response;
+    try {
+      response = await fetch(this.endpoint(pathOrUrl), {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const responseText = await response.text();
+    if (!response.ok) {
+      const snippet = responseText.slice(0, 500);
+      throw new Error(`Remote LLM request failed (${response.status} ${response.statusText}): ${snippet}`);
+    }
+
+    if (!responseText.trim()) return {} as T;
+    try {
+      return JSON.parse(responseText) as T;
+    } catch (error) {
+      throw new Error(`Remote LLM returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const [result] = await this.embedBatch([text], options);
+    return result ?? null;
+  }
+
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    const model = shouldUseRemoteModelOverride(options.model, ["embeddinggemma"])
+      ? options.model
+      : this.embedModel;
+
+    try {
+      const response = await this.postJson<any>("/embeddings", {
+        model,
+        input: texts,
+      });
+
+      if (Array.isArray(response.embeddings)) {
+        return texts.map((_, i) => {
+          const embedding = response.embeddings[i];
+          return Array.isArray(embedding)
+            ? { embedding: embedding.map(Number), model: response.model ?? model }
+            : null;
+        });
+      }
+
+      const data = Array.isArray(response.data) ? response.data : [];
+      const byIndex = new Map<number, number[]>();
+      for (let i = 0; i < data.length; i++) {
+        const item = data[i];
+        const index = typeof item?.index === "number" ? item.index : i;
+        if (Array.isArray(item?.embedding)) {
+          byIndex.set(index, item.embedding.map(Number));
+        }
+      }
+
+      return texts.map((_, i) => {
+        const embedding = byIndex.get(i);
+        return embedding ? { embedding, model: response.model ?? model } : null;
+      });
+    } catch (error) {
+      console.error("Remote embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
+
+  private async chat(prompt: string, options: GenerateOptions = {}, system?: string): Promise<GenerateResult | null> {
+    const model = shouldUseRemoteModelOverride(options.model, ["Qwen/Qwen3-1.7B"])
+      ? options.model
+      : this.generateModel;
+    const messages = [
+      ...(system ? [{ role: "system", content: system }] : []),
+      { role: "user", content: prompt },
+    ];
+
+    const response = await this.postJson<any>("/chat/completions", {
+      model,
+      messages,
+      temperature: options.temperature ?? 0.2,
+      max_tokens: options.maxTokens ?? 150,
+      stream: false,
+    });
+
+    const text = response.choices?.[0]?.message?.content
+      ?? response.choices?.[0]?.text
+      ?? response.output_text
+      ?? "";
+
+    return {
+      text: String(text),
+      model: response.model ?? model,
+      done: true,
+    };
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    return this.chat(prompt, options);
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    // OpenAI-compatible servers do not consistently expose /models, and custom
+    // deployments may hide it. Treat configured remote model names as available
+    // and let the first actual request surface provider errors.
+    return { name: model, exists: true };
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean; intent?: string } = {}
+  ): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const prompt = [
+      "Expand the user search query for a hybrid markdown search engine.",
+      "Return only newline-separated typed search lines in this exact format:",
+      includeLexical ? "lex: concise keyword query" : undefined,
+      "vec: semantic query in natural language",
+      "hyde: short hypothetical passage that would appear in a relevant document",
+      "",
+      "Rules:",
+      "- Do not write explanations, bullets, JSON, or markdown fences.",
+      "- Keep each line on one line.",
+      "- Use terms from the original query where possible.",
+      options.context ? `Corpus context: ${options.context}` : undefined,
+      options.intent ? `Query intent: ${options.intent}` : undefined,
+      `User query: ${query}`,
+    ].filter(Boolean).join("\n");
+
+    try {
+      const result = await this.chat(prompt, { model: this.generateModel, maxTokens: 600, temperature: 0.2 }, "You expand search queries for retrieval.");
+      return parseQueryExpansionText(query, result?.text ?? "", includeLexical);
+    } catch (error) {
+      console.error("Remote query expansion failed:", error);
+      return parseQueryExpansionText(query, "", includeLexical);
+    }
+  }
+
+  private parseRerankResponse(response: any, documents: RerankDocument[], model: string): RerankResult | null {
+    if (Array.isArray(response.scores)) {
+      return {
+        model: response.model ?? model,
+        results: response.scores.map((score: unknown, index: number) => ({
+          file: documents[index]?.file ?? String(index),
+          index,
+          score: clampScore(score),
+        })).sort((a: RerankDocumentResult, b: RerankDocumentResult) => b.score - a.score),
+      };
+    }
+
+    const items = Array.isArray(response.results)
+      ? response.results
+      : Array.isArray(response.data)
+        ? response.data
+        : Array.isArray(response)
+          ? response
+          : null;
+    if (!items) return null;
+
+    const seen = new Set<number>();
+    const results: RerankDocumentResult[] = [];
+    for (let fallbackIndex = 0; fallbackIndex < items.length; fallbackIndex++) {
+      const item = items[fallbackIndex];
+      const index = typeof item?.index === "number"
+        ? item.index
+        : typeof item?.document?.index === "number"
+          ? item.document.index
+          : fallbackIndex;
+      if (index < 0 || index >= documents.length) continue;
+      seen.add(index);
+      results.push({
+        file: documents[index]!.file,
+        index,
+        score: clampScore(item?.relevance_score ?? item?.score ?? item?.document?.score),
+      });
+    }
+
+    for (let index = 0; index < documents.length; index++) {
+      if (!seen.has(index)) {
+        results.push({ file: documents[index]!.file, index, score: 0 });
+      }
+    }
+
+    return { model: response.model ?? model, results: results.sort((a, b) => b.score - a.score) };
+  }
+
+  private async rerankViaEndpoint(query: string, documents: RerankDocument[], model: string): Promise<RerankResult | null> {
+    if (!this.rerankUrl) return null;
+    const response = await this.postJson<any>(this.rerankUrl, {
+      model,
+      query,
+      documents: documents.map(doc => doc.text),
+      top_n: documents.length,
+      return_documents: false,
+    });
+    return this.parseRerankResponse(response, documents, model);
+  }
+
+  private async scoreRerankBatch(query: string, documents: RerankDocument[], model: string): Promise<number[]> {
+    const prompt = [
+      "Score each document for relevance to the query.",
+      "Return only a JSON array of numbers between 0 and 1, in the same order as the documents.",
+      "Use 1 for directly answering/relevant documents and 0 for unrelated documents.",
+      "",
+      `Query: ${query}`,
+      "",
+      "Documents:",
+      JSON.stringify(documents.map((doc, index) => ({
+        index,
+        title: doc.title ?? doc.file,
+        text: doc.text.slice(0, 4000),
+      }))),
+    ].join("\n");
+
+    const result = await this.chat(prompt, {
+      model,
+      temperature: 0,
+      maxTokens: Math.max(100, documents.length * 12 + 50),
+    }, "You are a strict search relevance scorer.");
+
+    return parseScoreArray(result?.text ?? "", documents.length) ?? documents.map(() => 0);
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    if (documents.length === 0) return { results: [], model: options.model ?? this.rerankModel };
+    const model = shouldUseRemoteModelOverride(options.model, ["ExpedientFalcon/qwen3-reranker:0.6b-q8_0"])
+      ? options.model
+      : this.rerankModel;
+
+    try {
+      const endpointResult = await this.rerankViaEndpoint(query, documents, model);
+      if (endpointResult) return endpointResult;
+    } catch (error) {
+      console.error("Remote rerank endpoint failed; falling back to chat scoring:", error);
+    }
+
+    const results: RerankDocumentResult[] = [];
+    for (let start = 0; start < documents.length; start += this.maxRerankBatchSize) {
+      const batch = documents.slice(start, start + this.maxRerankBatchSize);
+      try {
+        const scores = await this.scoreRerankBatch(query, batch, model);
+        for (let i = 0; i < batch.length; i++) {
+          results.push({
+            file: batch[i]!.file,
+            index: start + i,
+            score: clampScore(scores[i]),
+          });
+        }
+      } catch (error) {
+        console.error("Remote chat rerank failed for batch:", error);
+        for (let i = 0; i < batch.length; i++) {
+          results.push({ file: batch[i]!.file, index: start + i, score: 0 });
+        }
+      }
+    }
+
+    return { model, results: results.sort((a, b) => b.score - a.score) };
+  }
+
+  async tokenize(text: string): Promise<readonly string[]> {
+    return approximateTokenize(text);
+  }
+
+  async detokenize(tokens: readonly unknown[]): Promise<string> {
+    return tokens.map(token => String(token)).join("");
+  }
+
+  async dispose(): Promise<void> {
+    // Remote backend has no local resources to dispose.
+  }
+}
+
+export function resolveLLMProvider(configValue?: string): LLMProvider {
+  const raw = configValue ?? process.env.QMD_LLM_BACKEND ?? process.env.QMD_LLM_PROVIDER;
+  const normalized = raw?.trim().toLowerCase();
+  if (normalized) {
+    if (["remote", "openai", "http", "https"].includes(normalized)) return "remote";
+    if (["local", "llama", "llamacpp", "node-llama-cpp"].includes(normalized)) return "local";
+    process.stderr.write(`QMD Warning: invalid LLM backend "${raw}", using local node-llama-cpp.\n`);
+    return "local";
+  }
+
+  if (process.env.QMD_REMOTE_BASE_URL || process.env.QMD_REMOTE_URL) return "remote";
+  return "local";
+}
+
+export function createLLM(config: LLMConfig = {}): LLM {
+  const provider = config.provider || config.backend
+    ? resolveLLMProvider(config.provider ?? config.backend)
+    : config.baseUrl
+      ? "remote"
+      : resolveLLMProvider();
+  return provider === "remote" ? new RemoteLLM(config) : new LlamaCpp(config);
+}
+
+// =============================================================================
 // Session Management Layer
 // =============================================================================
 
 /**
  * Manages LLM session lifecycle with reference counting.
- * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
+ * Coordinates with local LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1434,7 +2021,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1451,7 +2038,7 @@ export class SessionReleasedError extends Error {
 
 /**
  * Scoped LLM session with automatic lifecycle management.
- * Wraps LlamaCpp methods with operation tracking and abort handling.
+ * Wraps LLM methods with operation tracking and abort handling.
  */
 class LLMSession implements ILLMSession {
   private manager: LLMSessionManager;
@@ -1537,18 +2124,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts, options));
   }
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean }
+    options?: { context?: string; includeLexical?: boolean; intent?: string }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1556,19 +2143,19 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
-// Session manager for the default LlamaCpp instance
+// Session manager for the configured default LLM instance
 let defaultSessionManager: LLMSessionManager | null = null;
 
 /**
- * Get the session manager for the default LlamaCpp instance.
+ * Get the session manager for the configured default LLM instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1603,11 +2190,11 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Execute a function with a scoped LLM session using a specific LLM instance.
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -1631,26 +2218,72 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for configured default LLM instances
 // =============================================================================
 
+let defaultLLM: LLM | null = null;
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the configured default LLM instance (local LlamaCpp or remote HTTP).
+ */
+export function getDefaultLLM(): LLM {
+  if (!defaultLLM) {
+    defaultLLM = createLLM();
+    if (defaultLLM instanceof LlamaCpp) {
+      defaultLlamaCpp = defaultLLM;
+    }
+  }
+  return defaultLLM;
+}
+
+/**
+ * Set a custom default LLM instance (useful for tests and config-driven CLI setup).
+ */
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLLM = llm;
+  defaultSessionManager = null;
+  defaultLlamaCpp = llm instanceof LlamaCpp ? llm : null;
+}
+
+/**
+ * Get the default local LlamaCpp instance (creates one if needed).
+ * Prefer getDefaultLLM() for search/indexing code that should honor remote config.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
   }
+  if (!defaultLLM && resolveLLMProvider() === "local") {
+    defaultLLM = defaultLlamaCpp;
+  }
   return defaultLlamaCpp;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LlamaCpp instance (useful for testing).
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+  defaultLLM = llm;
+  defaultSessionManager = null;
+}
+
+/**
+ * Dispose the configured default LLM instance if it exists.
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultLLM) {
+    await defaultLLM.dispose();
+    if (defaultLLM === defaultLlamaCpp) {
+      defaultLlamaCpp = null;
+    }
+    defaultLLM = null;
+  } else if (defaultLlamaCpp) {
+    await defaultLlamaCpp.dispose();
+    defaultLlamaCpp = null;
+  }
+  defaultSessionManager = null;
 }
 
 /**
@@ -1658,8 +2291,5 @@ export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
-  }
+  await disposeDefaultLLM();
 }

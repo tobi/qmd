@@ -7,12 +7,17 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
   LlamaCpp,
+  RemoteLLM,
+  createLLM,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
+  resolveLLMProvider,
+  formatQueryForEmbedding,
+  formatDocForEmbedding,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -217,6 +222,103 @@ describe("LlamaCpp embedding truncation", () => {
       embedding: [0.25, 0.5],
       model: llm.embedModelUri,
     });
+  });
+});
+
+describe("Remote LLM backend", () => {
+  const originalFetch = globalThis.fetch;
+  const originalRemoteBaseUrl = process.env.QMD_REMOTE_BASE_URL;
+
+  afterEach(() => {
+    (globalThis as any).fetch = originalFetch;
+    if (originalRemoteBaseUrl === undefined) delete process.env.QMD_REMOTE_BASE_URL;
+    else process.env.QMD_REMOTE_BASE_URL = originalRemoteBaseUrl;
+    vi.restoreAllMocks();
+  });
+
+  test("raw embedding formatting is used for OpenAI-style model names", () => {
+    expect(formatQueryForEmbedding("auth flow", "text-embedding-3-small")).toBe("auth flow");
+    expect(formatDocForEmbedding("body", "Title", "text-embedding-3-small")).toBe("Title\nbody");
+  });
+
+  test("provider selection supports remote env and explicit local override", () => {
+    process.env.QMD_REMOTE_BASE_URL = "https://llm.example.com/v1";
+    expect(resolveLLMProvider()).toBe("remote");
+    expect(resolveLLMProvider("local")).toBe("local");
+  });
+
+  test("createLLM returns RemoteLLM for remote provider or configured baseUrl", () => {
+    const explicit = createLLM({ provider: "remote", baseUrl: "https://llm.example.com/v1" });
+    const inferred = createLLM({ baseUrl: "https://llm.example.com/v1" });
+    expect(explicit).toBeInstanceOf(RemoteLLM);
+    expect(inferred).toBeInstanceOf(RemoteLLM);
+  });
+
+  test("RemoteLLM embeds batches via OpenAI-compatible /embeddings", async () => {
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body).toEqual({ model: "remote-embed", input: ["one", "two"] });
+      return new Response(JSON.stringify({
+        model: "remote-embed",
+        data: [
+          { index: 0, embedding: [0.1, 0.2] },
+          { index: 1, embedding: [0.3, 0.4] },
+        ],
+      }));
+    });
+    (globalThis as any).fetch = fetchMock;
+
+    const llm = new RemoteLLM({ baseUrl: "https://llm.example.com/v1", embedModel: "remote-embed" });
+    const embeddings = await llm.embedBatch(["one", "two"]);
+
+    expect(fetchMock).toHaveBeenCalledWith("https://llm.example.com/v1/embeddings", expect.any(Object));
+    expect(embeddings.map(item => item?.embedding)).toEqual([[0.1, 0.2], [0.3, 0.4]]);
+  });
+
+  test("RemoteLLM expands queries from chat completions", async () => {
+    (globalThis as any).fetch = vi.fn(async () => new Response(JSON.stringify({
+      model: "remote-chat",
+      choices: [{ message: { content: "lex: auth login\nvec: how users authenticate\nhyde: Users sign in with credentials and receive a session token." } }],
+    })));
+
+    const llm = new RemoteLLM({ baseUrl: "https://llm.example.com/v1", generateModel: "remote-chat" });
+    const expanded = await llm.expandQuery("auth flow");
+
+    expect(expanded).toEqual([
+      { type: "lex", text: "auth login" },
+      { type: "vec", text: "how users authenticate" },
+      { type: "hyde", text: "Users sign in with credentials and receive a session token." },
+    ]);
+  });
+
+  test("RemoteLLM parses rerank endpoint responses", async () => {
+    (globalThis as any).fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body.query).toBe("capital of France");
+      expect(body.documents).toEqual(["Paris is the capital.", "Butterflies fly."]);
+      return new Response(JSON.stringify({
+        model: "remote-rerank",
+        results: [
+          { index: 1, relevance_score: 0.1 },
+          { index: 0, relevance_score: 0.95 },
+        ],
+      }));
+    });
+
+    const llm = new RemoteLLM({
+      baseUrl: "https://llm.example.com/v1",
+      rerankUrl: "/rerank",
+      rerankModel: "remote-rerank",
+    });
+    const reranked = await llm.rerank("capital of France", [
+      { file: "france.md", text: "Paris is the capital." },
+      { file: "bugs.md", text: "Butterflies fly." },
+    ]);
+
+    expect(reranked.results.map(r => [r.file, r.score])).toEqual([
+      ["france.md", 0.95],
+      ["bugs.md", 0.1],
+    ]);
   });
 });
 

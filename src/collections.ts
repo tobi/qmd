@@ -34,9 +34,18 @@ export interface Collection {
 }
 
 /**
- * Model configuration for embedding, reranking, and generation
+ * Model/backend configuration for embedding, reranking, and generation.
+ *
+ * Defaults to the local node-llama-cpp GGUF backend. Set provider/backend to
+ * "remote" plus baseUrl for an OpenAI-compatible remote deployment.
  */
 export interface ModelsConfig {
+  provider?: "local" | "remote" | string;
+  backend?: "local" | "remote" | string;
+  baseUrl?: string;
+  apiKeyEnv?: string;
+  timeoutMs?: number;
+  rerankUrl?: string;
   embed?: string;
   rerank?: string;
   generate?: string;

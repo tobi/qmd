@@ -65,7 +65,7 @@ import {
   type ChunkStrategy,
 } from "./store.js";
 import {
-  LlamaCpp,
+  createLLM as createLLMBackend,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -112,6 +112,10 @@ export type { InternalStore };
 // Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
 export type { ChunkStrategy } from "./store.js";
+
+// Re-export LLM backend helpers for advanced SDK consumers
+export { createLLM, LlamaCpp, RemoteLLM, resolveLLMProvider } from "./llm.js";
+export type { LLM, LLMConfig, LLMProvider, RemoteLLMConfig } from "./llm.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
 export { getDefaultDbPath } from "./store.js";
@@ -210,8 +214,8 @@ export interface StoreOptions {
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
  *
- * All methods are async. The store manages its own LlamaCpp instance
- * (lazy-loaded, auto-unloaded after inactivity) — no global singletons.
+ * All methods are async. The store manages its own LLM instance
+ * (local LlamaCpp by default, or a configured remote backend) — no global singletons.
  */
 export interface QMDStore {
   /** The underlying internal store (for advanced use) */
@@ -306,7 +310,7 @@ export interface QMDStore {
 
   // ── Lifecycle ───────────────────────────────────────────────────────
 
-  /** Close the store and release all resources (LLM models, DB connection) */
+  /** Close the store and release all resources (LLM backend, DB connection) */
   close(): Promise<void>;
 }
 
@@ -365,12 +369,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Create a per-store LLM instance — local node-llama-cpp by default, or a
+  // remote OpenAI-compatible backend when configured via models.provider/env.
+  const llm = createLLMBackend({
+    provider: config?.models?.provider,
+    backend: config?.models?.backend,
+    baseUrl: config?.models?.baseUrl,
+    apiKeyEnv: config?.models?.apiKeyEnv,
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    rerankUrl: config?.models?.rerankUrl,
+    timeoutMs: config?.models?.timeoutMs,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
