@@ -9,6 +9,9 @@
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive
   filesystems (Linux). `qmd update` automatically migrates legacy
   lowercase paths without re-embedding.
+- CLI: make `qmd status` skip native `node-llama-cpp` device probing by
+  default so status stays safe on machines with broken or unsupported GPU
+  drivers. Set `QMD_STATUS_DEVICE_PROBE=1` to opt in.
 
 ## [2.1.0] - 2026-04-05
 

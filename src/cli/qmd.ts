@@ -473,7 +473,11 @@ async function showStatus(): Promise<void> {
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
 
-    // Device / GPU info (local mode only — skip in OpenAI mode to avoid triggering compilation)
+  // Device / GPU info (local mode only — skip in OpenAI mode to avoid triggering compilation
+  // Important: probing node-llama-cpp can abort the whole process on machines with
+  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
+  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
+  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
     console.log(`\n${c.bold}Device${c.reset}`);
     try {
       const llm = getDefaultLlamaCpp();
@@ -481,6 +485,7 @@ async function showStatus(): Promise<void> {
       if (device.gpu) {
         console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
         if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
           const counts = new Map<string, number>();
           for (const name of device.gpuDevices) {
             counts.set(name, (counts.get(name) || 0) + 1);

@@ -381,6 +381,12 @@ describe("CLI Status Command", () => {
     // Should show collection info
     expect(stdout).toContain("Collection");
   });
+
+  test("skips device probing by default", async () => {
+    const { stdout, exitCode } = await runQmd(["status"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("Device");
+  });
 });
 
 describe("CLI Search Command", () => {
