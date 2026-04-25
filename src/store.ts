@@ -782,6 +782,12 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
+  // Migration: add disk_mtime column for sync optimization (mtime-first diffing)
+  const docColumns = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!docColumns.some(col => col.name === 'disk_mtime')) {
+    db.exec(`ALTER TABLE documents ADD COLUMN disk_mtime TEXT`);
+  }
+
   // Cache table for LLM API calls
   db.exec(`
     CREATE TABLE IF NOT EXISTS llm_cache (
@@ -1144,11 +1150,11 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, diskMtime?: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
-  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, diskMtime?: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
@@ -1250,17 +1256,18 @@ export async function reindexCollection(
       } else {
         insertContent(db, hash, content, now);
         const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        const mtime = stat ? new Date(stat.mtime).toISOString() : now;
+        updateDocument(db, existing.id, title, hash, mtime, mtime);
         updated++;
       }
     } else {
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
+      const mtime = stat ? new Date(stat.mtime).toISOString() : now;
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        mtime, mtime);
     }
 
     processed++;
@@ -1280,6 +1287,237 @@ export async function reindexCollection(
   const orphanedCleaned = cleanupOrphanedContent(db);
 
   return { indexed, updated, unchanged, removed, orphanedCleaned };
+}
+
+// =============================================================================
+// Sync — mtime-first differential re-indexing
+// =============================================================================
+
+export type SyncProgress = {
+  phase: 'scanning' | 'diffing' | 'processing' | 'cleanup';
+  file?: string;
+  current: number;
+  total: number;
+};
+
+export type SyncResult = {
+  added: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  renamed: number;
+  skippedMtime: number;
+  skippedHash: number;
+  orphanedCleaned: number;
+  filesScanned: number;
+};
+
+/**
+ * Get all active documents for a collection with their disk_mtime and hash.
+ * Returns a map of path → { id, hash, disk_mtime, title } for efficient lookup.
+ */
+function getActiveDocumentsWithMtime(
+  db: Database,
+  collectionName: string
+): Map<string, { id: number; hash: string; disk_mtime: string | null; title: string }> {
+  const rows = db.prepare(`
+    SELECT id, path, hash, disk_mtime, title
+    FROM documents
+    WHERE collection = ? AND active = 1
+  `).all(collectionName) as { id: number; path: string; hash: string; disk_mtime: string | null; title: string }[];
+
+  const map = new Map<string, { id: number; hash: string; disk_mtime: string | null; title: string }>();
+  for (const row of rows) {
+    map.set(row.path, { id: row.id, hash: row.hash, disk_mtime: row.disk_mtime, title: row.title });
+  }
+  return map;
+}
+
+/**
+ * Sync a collection using mtime-first differential strategy.
+ *
+ * Instead of reading every file to compute hashes (O(N) disk reads),
+ * this checks filesystem mtime first (nearly free OS metadata lookup).
+ * Only files whose mtime changed get read and hashed.
+ *
+ * For renamed files (same content hash, different path), the embedding
+ * is reused since embeddings are keyed by content hash.
+ */
+export async function syncCollection(
+  store: Store,
+  collectionPath: string,
+  globPattern: string,
+  collectionName: string,
+  options?: {
+    ignorePatterns?: string[];
+    onProgress?: (info: SyncProgress) => void;
+  }
+): Promise<SyncResult> {
+  const db = store.db;
+  const now = new Date().toISOString();
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+
+  // Phase 1: Scan filesystem
+  options?.onProgress?.({ phase: 'scanning', current: 0, total: 0 });
+
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(options?.ignorePatterns || []),
+  ];
+  const allFiles: string[] = await fastGlob(globPattern, {
+    cwd: collectionPath,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+    ignore: allIgnore,
+  });
+  const files = allFiles.filter(file => {
+    const parts = file.split("/");
+    return !parts.some(part => part.startsWith("."));
+  });
+
+  // Phase 2: Load stored index and build diff
+  options?.onProgress?.({ phase: 'diffing', current: 0, total: files.length });
+
+  const storedDocs = getActiveDocumentsWithMtime(db, collectionName);
+  // Build reverse map: hash → paths (for rename detection)
+  const hashToPaths = new Map<string, string[]>();
+  for (const [path, doc] of storedDocs) {
+    const paths = hashToPaths.get(doc.hash) || [];
+    paths.push(path);
+    hashToPaths.set(doc.hash, paths);
+  }
+
+  const seenPaths = new Set<string>();
+  let added = 0, updated = 0, unchanged = 0, renamed = 0;
+  let skippedMtime = 0, skippedHash = 0;
+  let processed = 0;
+
+  // Phase 3: Process files
+  for (const relativeFile of files) {
+    const filepath = getRealPath(resolve(collectionPath, relativeFile));
+    const path = handelize(relativeFile);
+    seenPaths.add(path);
+
+    let stat: ReturnType<typeof statSync> | null = null;
+    try {
+      stat = statSync(filepath);
+    } catch {
+      processed++;
+      options?.onProgress?.({ phase: 'processing', file: relativeFile, current: ++processed, total: files.length });
+      continue;
+    }
+
+    const diskMtime = new Date(stat.mtime).toISOString();
+    const stored = storedDocs.get(path);
+
+    if (stored) {
+      // File exists in index — check mtime first
+      if (stored.disk_mtime && stored.disk_mtime === diskMtime) {
+        // mtime unchanged → SKIP (don't even read the file)
+        skippedMtime++;
+        unchanged++;
+      } else {
+        // mtime changed → read file, compute hash
+        let content: string;
+        try {
+          content = readFileSync(filepath, "utf-8");
+        } catch {
+          processed++;
+          options?.onProgress?.({ phase: 'processing', file: relativeFile, current: processed, total: files.length });
+          continue;
+        }
+
+        if (!content.trim()) {
+          processed++;
+          continue;
+        }
+
+        const hash = await hashContent(content);
+        const title = extractTitle(content, relativeFile);
+
+        if (hash === stored.hash) {
+          // Hash unchanged → update mtime only, skip embedding
+          db.prepare(`UPDATE documents SET disk_mtime = ? WHERE id = ?`)
+            .run(diskMtime, stored.id);
+          if (title !== stored.title) {
+            updateDocumentTitle(db, stored.id, title, now);
+          }
+          skippedHash++;
+          unchanged++;
+        } else {
+          // Hash changed → UPDATED → re-index (embedding auto-triggered via missing content_vectors)
+          insertContent(db, hash, content, now);
+          updateDocument(db, stored.id, title, hash, now, diskMtime);
+          updated++;
+        }
+      }
+    } else {
+      // File on disk but NOT in index → check if it's a rename (same hash, different path)
+      let content: string;
+      try {
+        content = readFileSync(filepath, "utf-8");
+      } catch {
+        processed++;
+        options?.onProgress?.({ phase: 'processing', file: relativeFile, current: processed, total: files.length });
+        continue;
+      }
+
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
+
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+
+      // Check for rename: same hash exists in stored docs at a path not on disk
+      const existingPaths = hashToPaths.get(hash) || [];
+      const renamedFrom = existingPaths.find(p => !seenPaths.has(p) && storedDocs.has(p));
+
+      if (renamedFrom) {
+        // Rename detected: update path reference, reuse embedding
+        const oldDoc = storedDocs.get(renamedFrom)!;
+        db.prepare(`
+          UPDATE documents SET path = ?, title = ?, modified_at = ?, disk_mtime = ?
+          WHERE id = ?
+        `).run(path, title, now, diskMtime, oldDoc.id);
+        // Mark old path as processed so it won't be deleted
+        seenPaths.add(renamedFrom);
+        // Remove old path from storedDocs so it's not found again
+        storedDocs.delete(renamedFrom);
+        renamed++;
+      } else {
+        // Genuinely new file
+        insertContent(db, hash, content, now);
+        insertDocument(db, collectionName, path, title, hash,
+          stat ? new Date(stat.birthtime).toISOString() : now,
+          now, diskMtime);
+        added++;
+      }
+    }
+
+    processed++;
+    options?.onProgress?.({ phase: 'processing', file: relativeFile, current: processed, total: files.length });
+  }
+
+  // Phase 4: Handle deletions — files in index but not on disk
+  options?.onProgress?.({ phase: 'cleanup', current: 0, total: storedDocs.size });
+  let removed = 0;
+  for (const [path] of storedDocs) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionName, path);
+      removed++;
+    }
+  }
+
+  const orphanedCleaned = cleanupOrphanedContent(db);
+
+  return {
+    added, updated, unchanged, removed, renamed,
+    skippedMtime, skippedHash, orphanedCleaned,
+    filesScanned: files.length,
+  };
 }
 
 export type EmbedProgress = {
@@ -1658,11 +1896,11 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, diskMtime?: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, diskMtime),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findOrMigrateLegacyDocument: (collectionName: string, path: string) => findOrMigrateLegacyDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
-    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
+    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, diskMtime?: string) => updateDocument(db, documentId, title, hash, modifiedAt, diskMtime),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
@@ -2087,17 +2325,19 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  diskMtime?: string
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, disk_mtime, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(collection, path) DO UPDATE SET
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
+      disk_mtime = excluded.disk_mtime,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, title, hash, createdAt, modifiedAt, diskMtime ?? modifiedAt);
 }
 
 /**
@@ -2188,10 +2428,11 @@ export function updateDocument(
   documentId: number,
   title: string,
   hash: string,
-  modifiedAt: string
+  modifiedAt: string,
+  diskMtime?: string
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ?, disk_mtime = ? WHERE id = ?`)
+    .run(title, hash, modifiedAt, diskMtime ?? modifiedAt, documentId);
 }
 
 /**
