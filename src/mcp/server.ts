@@ -119,7 +119,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   // --- What's searchable? ---
   if (status.collections.length > 0) {
     lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
+    lines.push("Collections (scope with `collections` parameter — array of names):");
     for (const col of status.collections) {
       // Find root context for this collection
       const rootCtx = contexts.find(c => c.collection === col.name && (c.path === "" || c.path === "/"));
