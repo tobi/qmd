@@ -4,19 +4,24 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
+import type {
+  Llama,
+  LlamaModel,
+  LlamaEmbeddingContext,
+  Token as LlamaToken,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+
+type NodeLlamaCppModule = typeof import("node-llama-cpp");
+
+let nodeLlamaCppModulePromise: Promise<NodeLlamaCppModule> | null = null;
+
+function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
+  nodeLlamaCppModulePromise ??= import("node-llama-cpp");
+  return nodeLlamaCppModulePromise;
+}
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -344,6 +349,7 @@ export async function pullModels(
       }
     }
 
+    const { resolveModelFile } = await loadNodeLlamaCpp();
     const path = await resolveModelFile(model, cacheDir);
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
@@ -619,6 +625,7 @@ export class LlamaCpp implements LLM {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
+      const { getLlama, LlamaLogLevel } = await loadNodeLlamaCpp();
       const loadLlama = async (gpu: LlamaGpuMode) =>
         await getLlama({
           build: allowBuild ? "autoAttempt" : "never",
@@ -661,6 +668,7 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
+    const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
     return modelPath;
@@ -1079,6 +1087,7 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
+    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -1158,6 +1167,7 @@ export class LlamaCpp implements LLM {
       contextSize: this.expandContextSize,
     });
     const sequence = genContext.getSequence();
+    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
