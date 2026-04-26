@@ -142,3 +142,19 @@ npm install -g @tobilu/qmd
 qmd collection add ~/notes --name notes
 qmd embed
 ```
+
+## Maintenance & Lifecycle
+
+### New File Discovery & Vector Update
+`qmd embed` only vectorizes files the index already knows about. To find new or modified files, use:
+```bash
+qmd update              # Update all collections
+qmd update -c docs      # Update a specific collection
+qmd embed               # Vectorize all pending chunks
+```
+
+### Health Check
+Verify the state of your collections and see when they were last indexed:
+```bash
+qmd status
+```
