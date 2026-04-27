@@ -43,6 +43,24 @@ export interface ModelsConfig {
 }
 
 /**
+ * Embedding provider configuration (optional in config file)
+ */
+export interface EmbeddingProviderConfig {
+  provider?: 'local' | 'openai';  // Default: 'local'
+  openai?: {
+    api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
+    model?: string;               // Default: 'text-embedding-3-small'
+    expansion_model?: string;     // Default: 'gpt-4o-mini'
+    rerank_model?: string;        // Default: falls back to expansion_model
+    base_url?: string;            // Base URL for embeddings (OpenAI-compatible)
+    chat_base_url?: string;       // Separate base URL for expansion (falls back to base_url)
+    chat_api_key?: string;        // Separate API key for chat endpoint (falls back to api_key)
+    rerank_base_url?: string;     // Separate base URL for reranking (falls back to chat_base_url)
+    rerank_api_key?: string;      // Separate API key for rerank endpoint (falls back to chat_api_key)
+  };
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
@@ -51,6 +69,7 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  embedding?: EmbeddingProviderConfig;        // Optional embedding provider settings
 }
 
 /**
@@ -509,4 +528,13 @@ export function configExists(): boolean {
 export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+/**
+ * Get embedding configuration from config file
+ * Returns default (local) config if not specified
+ */
+export function getEmbeddingConfig(): EmbeddingProviderConfig {
+  const config = loadConfig();
+  return config.embedding || { provider: 'local' };
 }

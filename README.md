@@ -515,6 +515,30 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### OpenAI Embeddings (Optional)
+
+As an alternative to local embedding models, you can use OpenAI's API for faster, more reliable embeddings:
+
+```yaml
+# ~/.config/qmd/index.yml
+embedding:
+  provider: openai
+  openai:
+    api_key: sk-...  # Optional, falls back to QMD_OPENAI_API_KEY or OPENAI_API_KEY env var
+    model: text-embedding-3-small  # Optional, this is the default
+    expansion_model: gpt-4o-mini  # Optional, model for query expansion/reranking
+    base_url: https://api.openai.com/v1  # Optional, for OpenAI-compatible APIs (Ollama, vLLM, etc.)
+```
+
+Benefits:
+- **~10x faster** than local CPU inference
+- **No GPU required** - works on any machine
+- **More reliable** - no local model loading issues
+- **Cost:** ~$0.02 per 1M tokens (very cheap)
+- **OpenAI-compatible** - works with Ollama, vLLM, Azure, and other compatible APIs via `base_url`
+
+When using OpenAI embeddings, query expansion and reranking use the OpenAI API instead of local models.
+
 ## Installation
 
 ```sh

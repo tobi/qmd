@@ -66,6 +66,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  setEmbeddingConfig,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -335,6 +336,33 @@ export interface QMDStore {
  * await store.close()
  * ```
  */
+function configureEmbeddingProvider(config?: CollectionConfig): void {
+  const embeddingYamlConfig = config?.embedding || { provider: 'local' as const };
+  const useOpenAI = embeddingYamlConfig.provider === 'openai'
+    || !!process.env.QMD_OPENAI_BASE_URL
+    || process.env.QMD_OPENAI === '1';
+
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
+        embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
+        expansionModel: embeddingYamlConfig.openai?.expansion_model,
+        rerankModel: embeddingYamlConfig.openai?.rerank_model,
+        baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
+        chatBaseURL: embeddingYamlConfig.openai?.chat_base_url,
+        chatApiKey: embeddingYamlConfig.openai?.chat_api_key,
+        rerankBaseURL: embeddingYamlConfig.openai?.rerank_base_url,
+        rerankApiKey: embeddingYamlConfig.openai?.rerank_api_key,
+      },
+    });
+    return;
+  }
+
+  setEmbeddingConfig({ provider: 'local' });
+}
+
 export async function createStore(options: StoreOptions): Promise<QMDStore> {
   if (!options.dbPath) {
     throw new Error("dbPath is required");
@@ -364,6 +392,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
+
+  configureEmbeddingProvider(config);
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
