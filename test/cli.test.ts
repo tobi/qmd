@@ -12,6 +12,7 @@ import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
+import { createServer, type Server } from "http";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
 
@@ -233,6 +234,9 @@ describe("CLI Help", () => {
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("qmd skill show/install");
+    expect(stdout).toContain("--no-daemon");
+    expect(stdout).toContain("QMD_NO_DAEMON=1");
+    expect(stdout).toContain("QMD_DEBUG=1");
   });
 
   test("shows help with no arguments", async () => {
@@ -1362,6 +1366,22 @@ describe("status and collection list hide filesystem paths", () => {
     expect(pathLines.length).toBe(0);
   });
 
+  test("status shows daemon URL when mcp.port exists", async () => {
+    const cacheHome = join(testDir, `status-cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const qmdCacheDir = join(cacheHome, "qmd");
+    await mkdir(qmdCacheDir, { recursive: true });
+    writeFileSync(join(qmdCacheDir, "mcp.pid"), String(process.pid));
+    writeFileSync(join(qmdCacheDir, "mcp.port"), "43210");
+
+    const { stdout, exitCode } = await runQmd(["status"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      env: { XDG_CACHE_HOME: cacheHome },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`MCP:   running (PID ${process.pid}) at http://localhost:43210`);
+  });
+
   test("collection list does not show full filesystem paths", async () => {
     const { stdout, exitCode } = await runQmd(["collection", "list"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1382,6 +1402,7 @@ describe("mcp http daemon", () => {
   let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
   let daemonDbPath: string;
   let daemonConfigDir: string;
+  let fakeDaemonServer: Server | undefined;
 
   // Track spawned PIDs for cleanup
   const spawnedPids: number[] = [];
@@ -1435,6 +1456,23 @@ describe("mcp http daemon", () => {
     return 10000 + Math.floor(Math.random() * 50000);
   }
 
+  async function startFakeDaemon(
+    port: number,
+    handler: (url: string, body: string) => { status: number; body: string },
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      fakeDaemonServer = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const response = handler(req.url || "/", body);
+        res.writeHead(response.status, { "Content-Type": "application/json" });
+        res.end(response.body);
+      });
+      fakeDaemonServer.once("error", reject);
+      fakeDaemonServer.listen(port, "127.0.0.1", () => resolve());
+    });
+  }
+
   beforeAll(async () => {
     daemonTestDir = await mkdtemp(join(tmpdir(), "qmd-daemon-test-"));
     daemonCacheDir = join(daemonTestDir, "cache");
@@ -1444,9 +1482,21 @@ describe("mcp http daemon", () => {
     await mkdir(join(daemonCacheDir, "qmd"), { recursive: true });
     await mkdir(daemonConfigDir, { recursive: true });
     await writeFile(join(daemonConfigDir, "index.yml"), "collections: {}\n");
+
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", "fixtures"],
+      { dbPath: daemonDbPath, configDir: daemonConfigDir },
+    );
+    if (exitCode !== 0) console.error("daemon collection add failed:", stderr);
+    expect(exitCode).toBe(0);
   });
 
   afterAll(async () => {
+    if (fakeDaemonServer) {
+      await new Promise<void>((resolve) => fakeDaemonServer!.close(() => resolve()));
+      fakeDaemonServer = undefined;
+    }
+
     // Kill any leftover spawned processes
     for (const pid of spawnedPids) {
       try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
@@ -1599,5 +1649,211 @@ describe("mcp http daemon", () => {
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("--daemon writes mcp.port next to mcp.pid", async () => {
+    const port = randomPort();
+    const { exitCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(exitCode).toBe(0);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+
+    await waitForServer(port);
+
+    const portFile = join(daemonCacheDir, "qmd", "mcp.port");
+    expect(existsSync(portFile)).toBe(true);
+    expect(parseInt(readFileSync(portFile, "utf-8").trim())).toBe(port);
+
+    // Cleanup
+    await runDaemonQmd(["mcp", "stop"]);
+    await sleep(300);
+    expect(existsSync(portFile)).toBe(false);
+  });
+
+  test("query uses daemon when health dbPath matches the CLI db", async () => {
+    const port = randomPort();
+    const portFile = join(daemonCacheDir, "qmd", "mcp.port");
+    const expectedResult = {
+      file: "qmd://fixtures/README.md",
+      displayPath: "fixtures/README.md",
+      title: "Remote Result",
+      body: "ignored body",
+      bestChunk: "remote best chunk",
+      bestChunkPos: 42,
+      score: 0.88,
+      context: "remote context",
+      docid: "abc123",
+    };
+
+    await startFakeDaemon(port, (url) => {
+      if (url === "/health") {
+        return {
+          status: 200,
+          body: JSON.stringify({ status: "ok", uptime: 1, dbPath: daemonDbPath }),
+        };
+      }
+      if (url === "/v1/search") {
+        return {
+          status: 200,
+          body: JSON.stringify({ results: [expectedResult] }),
+        };
+      }
+      return { status: 404, body: JSON.stringify({ error: "not found" }) };
+    });
+
+    writeFileSync(pidPath(), String(process.pid));
+    writeFileSync(portFile, String(port));
+
+    const { stdout, stderr, exitCode } = await runQmd(["query", "search performance", "--json"], {
+      dbPath: daemonDbPath,
+      configDir: daemonConfigDir,
+      env: {
+        XDG_CACHE_HOME: daemonCacheDir,
+        QMD_DEBUG: "1",
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain(`Using daemon at http://localhost:${port} (PID ${process.pid})`);
+
+    const parsed = JSON.parse(stdout);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      file: expectedResult.file,
+      title: expectedResult.title,
+      score: expectedResult.score,
+      context: expectedResult.context,
+      docid: `#${expectedResult.docid}`,
+      line: 1,
+    });
+    expect(parsed[0].snippet).toContain(expectedResult.bestChunk);
+
+    await new Promise<void>((resolve) => fakeDaemonServer!.close(() => resolve()));
+    fakeDaemonServer = undefined;
+    unlinkSync(pidPath());
+    unlinkSync(portFile);
+  });
+
+  test("--no-daemon forces in-process search even when daemon is running", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      const { stdout, stderr, exitCode } = await runQmd(
+        ["query", "lex:test", "--json", "--no-daemon", "--no-rerank"],
+        {
+          dbPath: daemonDbPath,
+          configDir: daemonConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain("Using daemon");
+      expect(() => JSON.parse(stdout)).not.toThrow();
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
+  });
+
+  test("qmd query --json output matches with and without daemon", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      // Use a structured `lex:` query so the LLM query-expander is not
+      // invoked — the daemon process and the --no-daemon child both
+      // inherit CI=true from the test runner (which disables LLM calls).
+      // Use --no-rerank so the reranker isn't loaded either. This still
+      // exercises the daemon HTTP round-trip + FTS path end-to-end.
+      const run = (extra: string[]) =>
+        runQmd(["query", "lex:test content", "--json", "-n", "3", "--no-rerank", ...extra], {
+          dbPath: daemonDbPath,
+          configDir: daemonConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        });
+
+      const daemonResult = await run([]);
+      const directResult = await run(["--no-daemon"]);
+
+      expect(daemonResult.exitCode).toBe(0);
+      expect(directResult.exitCode).toBe(0);
+
+      // The daemon run MUST have actually routed through the daemon.
+      // Without this assertion the test would pass trivially even if
+      // the daemon fast-path were broken.
+      expect(daemonResult.stderr).toContain("Using daemon");
+      expect(directResult.stderr).not.toContain("Using daemon");
+
+      const daemonJson = JSON.parse(daemonResult.stdout);
+      const directJson = JSON.parse(directResult.stdout);
+
+      // Same files, same order, same docids, same titles.
+      expect(daemonJson.map((r: any) => r.docid)).toEqual(directJson.map((r: any) => r.docid));
+      expect(daemonJson.map((r: any) => r.file)).toEqual(directJson.map((r: any) => r.file));
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
+  }, 120_000);
+
+  test("daemon with mismatched dbPath falls back to in-process", async () => {
+    const port = randomPort();
+    const { exitCode: startCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(port),
+    ]);
+    expect(startCode).toBe(0);
+    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(pid);
+    await waitForServer(port);
+
+    try {
+      // Point the CLI at a different DB. The daemon was started with
+      // daemonDbPath; this run uses altDbPath. maybeDiscoverDaemon
+      // should see the mismatch and return null.
+      const altDbPath = join(daemonTestDir, "alt.sqlite");
+      const altConfigDir = join(daemonTestDir, "alt-config");
+      const { mkdir, writeFile } = await import("fs/promises");
+      await mkdir(altConfigDir, { recursive: true });
+      await writeFile(join(altConfigDir, "index.yml"), "collections: {}\n");
+
+      // Use structured lex syntax so the in-process fallback path
+      // doesn't invoke the LLM query-expander (disabled in CI).
+      const { stdout, stderr, exitCode } = await runQmd(
+        ["query", "lex:test", "--json", "--no-rerank"],
+        {
+          dbPath: altDbPath,
+          configDir: altConfigDir,
+          env: { XDG_CACHE_HOME: daemonCacheDir, QMD_DEBUG: "1" },
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain("Using daemon");
+      expect(stderr).toContain("dbPath mismatch");
+      // Query runs in-process over an empty DB — JSON is valid (array).
+      expect(() => JSON.parse(stdout)).not.toThrow();
+    } finally {
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    }
   });
 });

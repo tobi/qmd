@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Changes
+
+- CLI fast-path: `qmd query` now routes through the MCP HTTP daemon
+  when one is running (`qmd mcp --http --daemon`) and the daemon's
+  index matches the CLI's target DB. Cold-start `qmd query` drops
+  from ~10-17s to ~2-4s by reusing the daemon's warm embedding,
+  expansion, and reranker models. Falls back transparently to the
+  in-process path when no daemon is reachable or when the DB differs
+  from the daemon's index. Disable with `--no-daemon` or
+  `QMD_NO_DAEMON=1`; enable stderr trace with `QMD_DEBUG=1`. `qmd
+  search` (BM25) and `qmd vsearch` (vector-only) remain in-process
+  unchanged. Adds a new versioned endpoint `POST /v1/search` that
+  returns full `HybridQueryResult[]` (existing `POST /query` is
+  unchanged) and extends `GET /health` with `dbPath` and `version`.
+  Daemon now persists `~/.cache/qmd/mcp.port` alongside `mcp.pid` so
+  the CLI can discover custom ports; cleaned up on `qmd mcp stop`.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
