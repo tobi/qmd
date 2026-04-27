@@ -472,6 +472,7 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+  }
 
   // Device / GPU info (local mode only — skip in OpenAI mode to avoid triggering compilation
   // Important: probing node-llama-cpp can abort the whole process on machines with
