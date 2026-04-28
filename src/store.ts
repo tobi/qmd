@@ -1401,6 +1401,24 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   }));
 }
 
+const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000;
+
+/**
+ * Resolve the max duration for an embedding session.
+ * Override with QMD_EMBED_MAX_DURATION_MS (milliseconds) — useful for large
+ * backlogs that can't finish inside the 30-minute default. Set to 0 to disable
+ * the timeout entirely.
+ */
+export function getEmbedMaxDurationMs(): number {
+  const raw = process.env.QMD_EMBED_MAX_DURATION_MS;
+  if (raw === undefined || raw === "") return DEFAULT_EMBED_MAX_DURATION_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_EMBED_MAX_DURATION_MS;
+  }
+  return parsed;
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -1578,7 +1596,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: getEmbedMaxDurationMs(), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,

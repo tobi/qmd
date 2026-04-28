@@ -18,6 +18,7 @@ import {
   handelize,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
+  getEmbedMaxDurationMs,
 } from "../src/store";
 
 // =============================================================================
@@ -285,5 +286,62 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
+  });
+});
+
+// =============================================================================
+// Embedding session duration override
+// =============================================================================
+
+describe("getEmbedMaxDurationMs", () => {
+  const DEFAULT = 30 * 60 * 1000;
+  const ENV = "QMD_EMBED_MAX_DURATION_MS";
+
+  function withEnv(value: string | undefined, fn: () => void) {
+    const prior = process.env[ENV];
+    if (value === undefined) delete process.env[ENV];
+    else process.env[ENV] = value;
+    try {
+      fn();
+    } finally {
+      if (prior === undefined) delete process.env[ENV];
+      else process.env[ENV] = prior;
+    }
+  }
+
+  test("returns 30 minutes when env var is unset", () => {
+    withEnv(undefined, () => {
+      expect(getEmbedMaxDurationMs()).toBe(DEFAULT);
+    });
+  });
+
+  test("returns 30 minutes when env var is empty", () => {
+    withEnv("", () => {
+      expect(getEmbedMaxDurationMs()).toBe(DEFAULT);
+    });
+  });
+
+  test("respects a numeric override", () => {
+    withEnv(String(4 * 60 * 60 * 1000), () => {
+      expect(getEmbedMaxDurationMs()).toBe(4 * 60 * 60 * 1000);
+    });
+  });
+
+  test("allows 0 to disable the timeout", () => {
+    withEnv("0", () => {
+      expect(getEmbedMaxDurationMs()).toBe(0);
+    });
+  });
+
+  test("falls back to default for non-numeric values", () => {
+    withEnv("forever", () => {
+      expect(getEmbedMaxDurationMs()).toBe(DEFAULT);
+    });
+  });
+
+  test("falls back to default for negative values", () => {
+    withEnv("-1", () => {
+      expect(getEmbedMaxDurationMs()).toBe(DEFAULT);
+    });
   });
 });
