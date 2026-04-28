@@ -512,6 +512,22 @@ Supported model families:
 - **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
 
 > **Note:** When switching embedding models, you must re-index with `qmd embed -f`
+
+### Embedding Session Duration
+
+`qmd embed` aborts after 30 minutes by default to bound long-running sessions.
+On a large backlog this leaves chunks unprocessed (look for `Session expired —
+skipping N remaining chunks` in the output). Override with
+`QMD_EMBED_MAX_DURATION_MS` (in milliseconds), or set it to `0` to disable the
+timeout entirely:
+
+```sh
+# Allow up to 4 hours per embed run
+export QMD_EMBED_MAX_DURATION_MS=14400000
+
+# Disable the timeout entirely
+export QMD_EMBED_MAX_DURATION_MS=0
+```
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
