@@ -220,6 +220,99 @@ describe("LlamaCpp embedding truncation", () => {
   });
 });
 
+describe("LlamaCpp Vulkan memory budget fallback", () => {
+  function mockUnreliableVulkan(llm: any) {
+    const fakeLlama = {
+      gpu: "vulkan",
+      cpuMathCores: 8,
+      getVramState: vi.fn().mockResolvedValue({
+        total: 24 * 1024 * 1024 * 1024,
+        used: 0,
+        free: 24 * 1024 * 1024 * 1024,
+        unifiedSize: 0,
+      }),
+    };
+    llm.llama = fakeLlama;
+    llm.ensureLlama = vi.fn().mockResolvedValue(fakeLlama);
+  }
+
+  test("caps context parallelism when Vulkan memory budget is unreliable", async () => {
+    const llm = new LlamaCpp({}) as any;
+    mockUnreliableVulkan(llm);
+
+    await expect(llm.computeParallelism(150)).resolves.toBe(1);
+  });
+
+  test("uses pooled contexts when Vulkan memory budget is reliable", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const fakeLlama = {
+      gpu: "vulkan",
+      cpuMathCores: 8,
+      getVramState: vi.fn().mockResolvedValue({
+        total: 24 * 1024 * 1024 * 1024,
+        used: 4 * 1024 * 1024 * 1024,
+        free: 20 * 1024 * 1024 * 1024,
+        unifiedSize: 0,
+      }),
+    };
+    llm.llama = fakeLlama;
+    llm.ensureLlama = vi.fn().mockResolvedValue(fakeLlama);
+
+    await expect(llm.computeParallelism(150)).resolves.toBe(8);
+  });
+
+  test("uses a fresh embedding context per embed when Vulkan memory budget is unreliable", async () => {
+    const llm = new LlamaCpp({}) as any;
+    mockUnreliableVulkan(llm);
+
+    const dispose = vi.fn(async () => {});
+    const getEmbeddingFor = vi.fn(async () => ({
+      vector: new Float32Array([0.25, 0.5]),
+    }));
+    const createEmbeddingContext = vi.fn(async () => ({
+      getEmbeddingFor,
+      dispose,
+    }));
+
+    llm.touchActivity = vi.fn();
+    llm.ensureEmbedContext = vi.fn();
+    llm.ensureEmbedModel = vi.fn().mockResolvedValue({ createEmbeddingContext });
+
+    await llm.embed("first");
+    await llm.embed("second");
+
+    expect(llm.ensureEmbedContext).not.toHaveBeenCalled();
+    expect(createEmbeddingContext).toHaveBeenCalledTimes(2);
+    expect(getEmbeddingFor).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(2);
+  });
+
+  test("runs embedBatch sequentially with fresh contexts when Vulkan memory budget is unreliable", async () => {
+    const llm = new LlamaCpp({}) as any;
+    mockUnreliableVulkan(llm);
+    llm._ciMode = false;
+
+    const dispose = vi.fn(async () => {});
+    const createEmbeddingContext = vi.fn(async () => ({
+      getEmbeddingFor: vi.fn(async (text: string) => ({
+        vector: new Float32Array([text.length]),
+      })),
+      dispose,
+    }));
+
+    llm.touchActivity = vi.fn();
+    llm.ensureEmbedContexts = vi.fn();
+    llm.ensureEmbedModel = vi.fn().mockResolvedValue({ createEmbeddingContext });
+
+    const results = await llm.embedBatch(["one", "two"]);
+
+    expect(llm.ensureEmbedContexts).not.toHaveBeenCalled();
+    expect(createEmbeddingContext).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(results.map((result: any) => result?.embedding[0])).toEqual([3, 3]);
+  });
+});
+
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
     const llm = new LlamaCpp({}) as any;
