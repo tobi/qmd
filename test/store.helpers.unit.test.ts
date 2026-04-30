@@ -18,6 +18,8 @@ import {
   handelize,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
+  hasCjk,
+  cjkNgrams,
 } from "../src/store";
 
 // =============================================================================
@@ -285,5 +287,35 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
+  });
+});
+
+// =============================================================================
+// CJK n-gram Tests
+// =============================================================================
+
+describe("CJK n-gram helpers", () => {
+  test("detects Han text", () => {
+    expect(hasCjk("中文关键词")).toBe(true);
+    expect(hasCjk("API keyword recall")).toBe(false);
+  });
+
+  test("generates 2-gram and 3-gram tokens for continuous Chinese text", () => {
+    const grams = cjkNgrams("中文关键词召回").split(/\s+/);
+    expect(grams).toContain("中文");
+    expect(grams).toContain("关键");
+    expect(grams).toContain("键词");
+    expect(grams).toContain("召回");
+    expect(grams).toContain("中文关");
+    expect(grams).toContain("关键词");
+    expect(grams).toContain("词召回");
+  });
+
+  test("only tokenizes Chinese runs in mixed text", () => {
+    const grams = cjkNgrams("API关键词召回v2").split(/\s+/);
+    expect(grams).toContain("关键");
+    expect(grams).toContain("召回");
+    expect(grams).not.toContain("API");
+    expect(grams).not.toContain("v2");
   });
 });

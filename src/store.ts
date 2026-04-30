@@ -733,6 +733,41 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
+const CJK_RUN_PATTERN = /\p{Script=Han}+/gu;
+
+export function hasCjk(text: string): boolean {
+  return /\p{Script=Han}/u.test(text);
+}
+
+export function extractCjkRuns(text: string): string[] {
+  return text.match(CJK_RUN_PATTERN) ?? [];
+}
+
+export function cjkNgrams(text: string, sizes: number[] = [2, 3]): string {
+  const grams: string[] = [];
+  for (const run of extractCjkRuns(text)) {
+    const chars = Array.from(run);
+    for (const size of sizes) {
+      if (size < 1 || chars.length < size) continue;
+      for (let i = 0; i <= chars.length - size; i++) {
+        grams.push(chars.slice(i, i + size).join(""));
+      }
+    }
+  }
+  return grams.join(" ");
+}
+
+function registerCjkNgramsFunction(db: Database): boolean {
+  const register = (db as unknown as { function?: (name: string, fn: (value: unknown) => string) => void }).function;
+  if (typeof register !== "function") return false;
+  try {
+    register.call(db, "qmd_cjk_ngrams", (value: unknown) => cjkNgrams(String(value ?? "")));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function initializeDatabase(db: Database): void {
   try {
     loadSqliteVec(db);
@@ -747,6 +782,7 @@ function initializeDatabase(db: Database): void {
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  const cjkNgramsRegistered = registerCjkNgramsFunction(db);
 
   // Drop legacy tables that are now managed in YAML
   db.exec(`DROP TABLE IF EXISTS path_contexts`);
@@ -838,6 +874,16 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  const hadCjkFts = !!db.prepare(`
+    SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts_cjk'
+  `).get();
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts_cjk USING fts5(
+      filepath, title, body,
+      tokenize='unicode61'
+    )
+  `);
+
   // Triggers to keep FTS in sync
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
@@ -853,11 +899,39 @@ function initializeDatabase(db: Database): void {
     END
   `);
 
+  if (cjkNgramsRegistered) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS documents_cjk_ai AFTER INSERT ON documents
+      WHEN new.active = 1
+      BEGIN
+        INSERT INTO documents_fts_cjk(rowid, filepath, title, body)
+        SELECT
+          new.id,
+          qmd_cjk_ngrams(new.collection || '/' || new.path),
+          qmd_cjk_ngrams(new.title),
+          qmd_cjk_ngrams((SELECT doc FROM content WHERE hash = new.hash))
+        WHERE new.active = 1;
+      END
+    `);
+  } else {
+    db.exec(`DROP TRIGGER IF EXISTS documents_cjk_ai`);
+  }
+
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
       DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
+
+  if (cjkNgramsRegistered) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS documents_cjk_ad AFTER DELETE ON documents BEGIN
+        DELETE FROM documents_fts_cjk WHERE rowid = old.id;
+      END
+    `);
+  } else {
+    db.exec(`DROP TRIGGER IF EXISTS documents_cjk_ad`);
+  }
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
@@ -875,6 +949,40 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  if (cjkNgramsRegistered) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS documents_cjk_au AFTER UPDATE ON documents
+      BEGIN
+        DELETE FROM documents_fts_cjk WHERE rowid = old.id AND new.active = 0;
+
+        INSERT OR REPLACE INTO documents_fts_cjk(rowid, filepath, title, body)
+        SELECT
+          new.id,
+          qmd_cjk_ngrams(new.collection || '/' || new.path),
+          qmd_cjk_ngrams(new.title),
+          qmd_cjk_ngrams((SELECT doc FROM content WHERE hash = new.hash))
+        WHERE new.active = 1;
+      END
+    `);
+
+    const cjkRows = (db.prepare(`SELECT COUNT(*) AS c FROM documents_fts_cjk`).get() as { c: number }).c;
+    if (!hadCjkFts || cjkRows === 0) {
+      db.exec(`
+        INSERT OR REPLACE INTO documents_fts_cjk(rowid, filepath, title, body)
+        SELECT
+          d.id,
+          qmd_cjk_ngrams(d.collection || '/' || d.path),
+          qmd_cjk_ngrams(d.title),
+          qmd_cjk_ngrams(content.doc)
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.active = 1
+      `);
+    }
+  } else {
+    db.exec(`DROP TRIGGER IF EXISTS documents_cjk_au`);
+  }
 }
 
 // =============================================================================
@@ -1126,6 +1234,8 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
+  searchCjkFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
+  searchKeyword: (query: string, limit?: number, collectionName?: string) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -1640,6 +1750,8 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
+    searchCjkFTS: (query: string, limit?: number, collectionName?: string) => searchCjkFTS(db, query, limit, collectionName),
+    searchKeyword: (query: string, limit?: number, collectionName?: string) => searchKeyword(db, query, limit, collectionName),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
@@ -1796,7 +1908,7 @@ export type RankedResult = {
 export type RRFContributionTrace = {
   listIndex: number;
   source: "fts" | "vec";
-  queryType: "original" | "lex" | "vec" | "hyde";
+  queryType: "original" | "lex" | "cjk" | "vec" | "hyde";
   query: string;
   rank: number;            // 1-indexed rank within list
   weight: number;
@@ -2157,6 +2269,24 @@ export function findOrMigrateLegacyDocument(
              (SELECT doc FROM content WHERE hash = documents.hash)
       FROM documents WHERE id = ?
     `).run(legacy.id);
+
+    const cjkRow = db.prepare(`
+      SELECT id, collection || '/' || path as filepath, title,
+             (SELECT doc FROM content WHERE hash = documents.hash) as body
+      FROM documents WHERE id = ?
+    `).get(legacy.id) as { id: number; filepath: string; title: string; body: string } | null;
+    if (cjkRow) {
+      db.prepare(`DELETE FROM documents_fts_cjk WHERE rowid = ?`).run(legacy.id);
+      db.prepare(`
+        INSERT INTO documents_fts_cjk(rowid, filepath, title, body)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        cjkRow.id,
+        cjkNgrams(cjkRow.filepath),
+        cjkNgrams(cjkRow.title),
+        cjkNgrams(cjkRow.body),
+      );
+    }
 
     return true;
   });
@@ -2998,6 +3128,14 @@ function buildFTS5Query(query: string): string | null {
   return result;
 }
 
+function buildCjkFTS5Query(query: string): string | null {
+  if (!hasCjk(query)) return null;
+  const grams = cjkNgrams(query).split(/\s+/).filter(Boolean);
+  if (grams.length === 0) return null;
+  const uniqueGrams = Array.from(new Set(grams)).slice(0, 96);
+  return uniqueGrams.map(gram => `"${gram.replace(/"/g, '""')}"`).join(" AND ");
+}
+
 /**
  * Validate that a vec/hyde query doesn't use lex-only syntax.
  * Returns error message if invalid, null if valid.
@@ -3088,6 +3226,101 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
+    };
+  });
+}
+
+export function searchCjkFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+  const ftsQuery = buildCjkFTS5Query(query);
+  if (!ftsQuery) return [];
+
+  const tableExists = db.prepare(`
+    SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts_cjk'
+  `).get();
+  if (!tableExists) return [];
+
+  const params: (string | number)[] = [ftsQuery];
+  const ftsLimit = collectionName ? limit * 10 : limit;
+
+  let sql = `
+    WITH fts_matches AS (
+      SELECT rowid, bm25(documents_fts_cjk, 1.2, 4.0, 1.0) as bm25_score
+      FROM documents_fts_cjk
+      WHERE documents_fts_cjk MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ${ftsLimit}
+    )
+    SELECT
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      content.doc as body,
+      d.hash,
+      fm.bm25_score
+    FROM fts_matches fm
+    JOIN documents d ON d.id = fm.rowid
+    JOIN content ON content.hash = d.hash
+    WHERE d.active = 1
+  `;
+
+  if (collectionName) {
+    sql += ` AND d.collection = ?`;
+    params.push(String(collectionName));
+  }
+
+  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
+  params.push(limit);
+
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  return rows.map(row => {
+    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+    return {
+      filepath: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      hash: row.hash,
+      docid: getDocid(row.hash),
+      collectionName,
+      modifiedAt: "",
+      bodyLength: row.body.length,
+      body: row.body,
+      context: getContextForFile(db, row.filepath),
+      score,
+      source: "fts" as const,
+    };
+  });
+}
+
+export function searchKeyword(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+  const ftsResults = searchFTS(db, query, limit, collectionName);
+  const cjkResults = searchCjkFTS(db, query, limit, collectionName);
+  if (cjkResults.length === 0) return ftsResults;
+  if (ftsResults.length === 0) return cjkResults;
+
+  const resultByFile = new Map<string, SearchResult>();
+  for (const result of [...ftsResults, ...cjkResults]) {
+    const existing = resultByFile.get(result.filepath);
+    if (!existing || result.score > existing.score) {
+      resultByFile.set(result.filepath, result);
+    }
+  }
+
+  const rankedLists = [ftsResults, cjkResults].map(list => list.map(r => ({
+    file: r.filepath,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body || "",
+    score: r.score,
+  })));
+  const fused = reciprocalRankFusion(rankedLists, [2.0, 0.8]);
+  const topScore = fused[0]?.score || 1;
+
+  return fused.slice(0, limit).map(result => {
+    const original = resultByFile.get(result.file)!;
+    return {
+      ...original,
+      score: Math.min(1, result.score / topScore),
     };
   });
 }
@@ -3983,9 +4216,30 @@ export interface HybridQueryResult {
 
 export type RankedListMeta = {
   source: "fts" | "vec";
-  queryType: "original" | "lex" | "vec" | "hyde";
+  queryType: "original" | "lex" | "cjk" | "vec" | "hyde";
   query: string;
 };
+
+function rankedResultsFromSearch(results: SearchResult[]): RankedResult[] {
+  return results.map(r => ({
+    file: r.filepath,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body || "",
+    score: r.score,
+  }));
+}
+
+function hybridRrfWeight(meta: RankedListMeta): number {
+  if (meta.queryType === "cjk") return 0.8;
+  if (meta.queryType === "original") return 2.0;
+  return 1.0;
+}
+
+function structuredRrfWeight(meta: RankedListMeta, index: number): number {
+  if (meta.queryType === "cjk") return 0.8;
+  return index === 0 ? 2.0 : 1.0;
+}
 
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
@@ -4047,11 +4301,14 @@ export async function hybridQuery(
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
     for (const r of initialFts) docidMap.set(r.filepath, r.docid);
-    rankedLists.push(initialFts.map(r => ({
-      file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
-    })));
+    rankedLists.push(rankedResultsFromSearch(initialFts));
     rankedListMeta.push({ source: "fts", queryType: "original", query });
+  }
+  const initialCjkFts = store.searchCjkFTS(query, 20, collection);
+  if (initialCjkFts.length > 0) {
+    for (const r of initialCjkFts) docidMap.set(r.filepath, r.docid);
+    rankedLists.push(rankedResultsFromSearch(initialCjkFts));
+    rankedListMeta.push({ source: "fts", queryType: "cjk", query });
   }
 
   // Step 3: Route searches by query type
@@ -4066,11 +4323,14 @@ export async function hybridQuery(
       const ftsResults = store.searchFTS(q.query, 20, collection);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(ftsResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
+        rankedLists.push(rankedResultsFromSearch(ftsResults));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
+      }
+      const cjkResults = store.searchCjkFTS(q.query, 20, collection);
+      if (cjkResults.length > 0) {
+        for (const r of cjkResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(rankedResultsFromSearch(cjkResults));
+        rankedListMeta.push({ source: "fts", queryType: "cjk", query: q.query });
       }
     }
   }
@@ -4118,8 +4378,9 @@ export async function hybridQuery(
     }
   }
 
-  // Step 4: RRF fusion — first 2 lists (original FTS + first vec) get 2x weight
-  const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+  // Step 4: RRF fusion — original lexical/vector queries get 2x weight;
+  // CJK n-gram lists are auxiliary recall signals.
+  const weights = rankedListMeta.map(hybridRrfWeight);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
@@ -4449,13 +4710,20 @@ export async function structuredSearch(
         const ftsResults = store.searchFTS(search.query, 20, coll);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
+          rankedLists.push(rankedResultsFromSearch(ftsResults));
           rankedListMeta.push({
             source: "fts",
             queryType: "lex",
+            query: search.query,
+          });
+        }
+        const cjkResults = store.searchCjkFTS(search.query, 20, coll);
+        if (cjkResults.length > 0) {
+          for (const r of cjkResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(rankedResultsFromSearch(cjkResults));
+          rankedListMeta.push({
+            source: "fts",
+            queryType: "cjk",
             query: search.query,
           });
         }
@@ -4505,8 +4773,8 @@ export async function structuredSearch(
 
   if (rankedLists.length === 0) return [];
 
-  // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
-  const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
+  // Step 3: RRF fusion — first non-auxiliary list gets 2x weight.
+  const weights = rankedListMeta.map(structuredRrfWeight);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);

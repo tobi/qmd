@@ -13,7 +13,7 @@ import {
   homedir,
   resolve,
   enableProductionMode,
-  searchFTS,
+  searchKeyword,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -2241,7 +2241,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchKeyword(db, query, fetchLimit, singleCollection),
     collectionNames
   );
 

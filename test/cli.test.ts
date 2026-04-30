@@ -187,6 +187,14 @@ Index new documents.
 `
   );
 
+  await writeFile(
+    join(fixturesDir, "docs", "chinese.md"),
+    `# 中文检索
+
+中文关键词召回效果不好。
+`
+  );
+
   // Create test files for path normalization tests
   await writeFile(
     join(fixturesDir, "test1.md"),
@@ -400,6 +408,13 @@ describe("CLI Search Command", () => {
     expect(exitCode).toBe(0);
     // Should find meeting.md
     expect(stdout.toLowerCase()).toContain("meeting");
+  });
+
+  test("searches continuous Chinese text through CJK n-gram recall", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "召回", "--json"]);
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout) as Array<{ file: string; snippet?: string }>;
+    expect(results.some(r => r.file.includes("chinese.md"))).toBe(true);
   });
 
   test("searches with limit option", async () => {

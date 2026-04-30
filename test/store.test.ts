@@ -1267,6 +1267,72 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchCjkFTS finds two-character words inside continuous Chinese text", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "cjk",
+      title: "中文检索",
+      body: "中文关键词召回效果不好",
+      displayPath: "docs/cjk.md",
+    });
+
+    expect(store.searchFTS("召回", 10)).toHaveLength(0);
+
+    const cjkResults = store.searchCjkFTS("召回", 10);
+    expect(cjkResults.length).toBeGreaterThan(0);
+    expect(cjkResults[0]!.displayPath).toBe(`${collectionName}/docs/cjk.md`);
+
+    const keywordResults = store.searchKeyword("召回", 10);
+    expect(keywordResults.length).toBeGreaterThan(0);
+    expect(keywordResults[0]!.displayPath).toBe(`${collectionName}/docs/cjk.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchCjkFTS finds three-character Chinese keywords", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "cjk-keyword",
+      title: "召回链路",
+      body: "这个文档记录中文关键词召回链路的行为。",
+      displayPath: "docs/cjk-keyword.md",
+    });
+
+    const results = store.searchCjkFTS("关键词", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/docs/cjk-keyword.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("CJK FTS updates and deactivates with documents", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+    const oldBody = "旧的中文召回问题";
+    const oldHash = await hashContent(oldBody);
+    store.insertContent(oldHash, oldBody, now);
+    store.insertDocument(collectionName, "docs/cjk-update.md", "中文文档", oldHash, now, now);
+
+    expect(store.searchCjkFTS("召回", 10)).toHaveLength(1);
+
+    const newBody = "新的中文索引内容";
+    const newHash = await hashContent(newBody);
+    store.insertContent(newHash, newBody, now);
+    const doc = store.findActiveDocument(collectionName, "docs/cjk-update.md")!;
+    store.updateDocument(doc.id, "中文文档", newHash, now);
+
+    expect(store.searchCjkFTS("召回", 10)).toHaveLength(0);
+    expect(store.searchCjkFTS("索引", 10)).toHaveLength(1);
+
+    store.deactivateDocument(collectionName, "docs/cjk-update.md");
+    expect(store.searchCjkFTS("索引", 10)).toHaveLength(0);
+
+    await cleanupTestDb(store);
+  });
+
   // BM25 IDF requires corpus depth — helper adds non-matching docs so term frequency
   // differentiation produces meaningful scores (2-doc corpus has near-zero IDF).
   async function addNoiseDocuments(db: Database, collectionName: string, count = 8) {

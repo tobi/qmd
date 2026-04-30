@@ -345,6 +345,21 @@ describe("structuredSearch", () => {
       { type: "lex", query: "\"unfinished phrase", line: 2 }
     ])).rejects.toThrow(/unmatched double quote/);
   });
+
+  test("lex queries use CJK n-gram recall for continuous Chinese text", async () => {
+    const now = new Date().toISOString();
+    const body = "# 中文检索\n\n中文关键词召回效果不好";
+    const hash = "structured-cjk-recall";
+    store.insertContent(hash, body, now);
+    store.insertDocument("docs", "cjk.md", "中文检索", hash, now, now);
+
+    const results = await structuredSearch(store, [
+      { type: "lex", query: "召回" }
+    ], { limit: 5, skipRerank: true });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe("docs/cjk.md");
+  });
 });
 
 // =============================================================================
