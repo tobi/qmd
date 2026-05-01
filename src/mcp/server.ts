@@ -946,9 +946,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         return;
       }
 
-      // REST endpoint: GET /reindex — re-index all collections
+      // REST endpoint: GET /reindex — re-index all collections and generate embeddings
       if (pathname === "/reindex" && nodeReq.method === "GET") {
-        // Check if already re-indexing
         if (isReindexing()) {
           nodeRes.writeHead(409, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({ error: "Re-index already in progress" }));
@@ -958,12 +957,21 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         const start = Date.now();
         log(`${ts()} GET /reindex (re-indexing all collections)`);
 
-        // Start reindex and store the promise
-        const reindexPromise = store.update();
+        const reindexPromise = (async () => {
+          const result = await store.update();
+
+          let embedResult;
+          if (result.needsEmbedding > 0) {
+            log(`${ts()} GET /reindex (embedding ${result.needsEmbedding} docs)`);
+            embedResult = await store.embed();
+          }
+
+          return { result, embedResult };
+        })();
         reindexInProgress = reindexPromise;
 
         try {
-          const result = await reindexPromise;
+          const { result, embedResult } = await reindexPromise;
 
           const body = JSON.stringify({
             collections: result.collections,
@@ -971,10 +979,14 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             updated: result.updated,
             unchanged: result.unchanged,
             removed: result.removed,
+            docsProcessed: embedResult?.docsProcessed ?? 0,
+            chunksEmbedded: embedResult?.chunksEmbedded ?? 0,
+            embedErrors: embedResult?.errors ?? 0,
             durationMs: Date.now() - start,
           });
           nodeRes.writeHead(200, { "Content-Type": "application/json" });
           nodeRes.end(body);
+          log(`${ts()} GET /reindex complete (${Date.now() - start}ms)`);
         } finally {
           reindexInProgress = null;
         }
