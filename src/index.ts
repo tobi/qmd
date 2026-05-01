@@ -17,6 +17,8 @@
  *   await store.close()
  */
 
+import fastGlob from "fast-glob";
+import { existsSync } from "fs";
 import {
   createStore as createStoreInternal,
   hybridQuery,
@@ -298,6 +300,9 @@ export interface QMDStore {
 
   // ── Index Health ────────────────────────────────────────────────────
 
+  /** Count files on disk not yet in the index */
+  getPendingFiles(): Promise<number>;
+
   /** Get index status (document counts, collections, embedding state) */
   getStatus(): Promise<IndexStatus>;
 
@@ -524,6 +529,32 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
 
     // Index Health
+    getPendingFiles: async () => {
+      const collections = getStoreCollections(db);
+      let pending = 0;
+      const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+      for (const col of collections) {
+        if (!col.path || !existsSync(col.path)) continue;
+        const pattern = col.pattern || "**/*.md";
+        const allFiles: string[] = await fastGlob(pattern, {
+          cwd: col.path,
+          onlyFiles: true,
+          followSymbolicLinks: false,
+          dot: false,
+          ignore: [...excludeDirs.map(d => `**/${d}/**`), ...(col.ignore || [])],
+        });
+        const files = allFiles.filter(file => {
+          const parts = file.split("/");
+          return !parts.some(part => part.startsWith("."));
+        });
+        const activeCount = (db.prepare(
+          "SELECT COUNT(*) as cnt FROM documents WHERE active = 1 AND collection = ?"
+        ).get(col.name) as { cnt: number }).cnt;
+        const diff = files.length - activeCount;
+        if (diff > 0) pending += diff;
+      }
+      return pending;
+    },
     getStatus: async () => internal.getStatus(),
     getIndexHealth: async () => internal.getIndexHealth(),
 

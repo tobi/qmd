@@ -932,10 +932,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     try {
       if (pathname === "/health" && nodeReq.method === "GET") {
         const status = await store.getStatus();
+        const pendingFiles = await store.getPendingFiles();
         const body = JSON.stringify({
           status: "ok",
           uptime: Math.floor((Date.now() - startTime) / 1000),
           indexedDocuments: status.totalDocuments,
+          pendingFiles,
           needsEmbedding: status.needsEmbedding,
           reindexInProgress: isReindexing(),
           collections: status.collections,
