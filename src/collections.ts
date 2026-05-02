@@ -42,6 +42,12 @@ export interface ModelsConfig {
   generate?: string;
 }
 
+export interface LLMBackendConfig {
+  provider?: "llama-cpp" | "openai-compatible";
+  baseUrl?: string;
+  apiKey?: string;
+}
+
 /**
  * The complete configuration file structure
  */
@@ -51,6 +57,7 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  llm?: LLMBackendConfig;
 }
 
 /**

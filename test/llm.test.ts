@@ -7,12 +7,15 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
   LlamaCpp,
+  OpenAICompatibleLLM,
+  createLLM,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
+  resolveLlmProvider,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -194,6 +197,157 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   });
 });
 
+describe("OpenAI-compatible backend", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("auto-selects the OpenAI-compatible backend when a base URL is configured", () => {
+    expect(resolveLlmProvider(undefined, "http://127.0.0.1:8080/v1")).toBe("openai-compatible");
+    expect(createLLM({ baseUrl: "http://127.0.0.1:8080/v1" })).toBeInstanceOf(OpenAICompatibleLLM);
+  });
+
+  test("embedBatch maps embeddings by response index", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { index: 1, embedding: [0.2, 0.3] },
+          { index: 0, embedding: [0.1] },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      embedModel: "qmd-embed",
+    });
+
+    const results = await llm.embedBatch(["first", "second"]);
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080/v1/embeddings",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(results).toEqual([
+      { embedding: [0.1], model: "qmd-embed" },
+      { embedding: [0.2, 0.3], model: "qmd-embed" },
+    ]);
+  });
+
+  test("expandQuery parses newline-prefixed completions", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "lex: bof3 docs\nvec: bof3 battle system\nhyde: Information about bof3 docs",
+            },
+          },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      generateModel: "qmd-query",
+    });
+
+    const results = await llm.expandQuery("bof3 docs");
+
+    expect(results).toEqual([
+      { type: "lex", text: "bof3 docs" },
+      { type: "vec", text: "bof3 battle system" },
+      { type: "hyde", text: "Information about bof3 docs" },
+    ]);
+  });
+
+  test("rerank maps remote indices back to source files", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        results: [
+          { index: 1, relevance_score: 0.9 },
+          { index: 0, relevance_score: 0.4 },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      rerankModel: "qmd-rerank",
+    });
+
+    const result = await llm.rerank("capital", [
+      { file: "a.md", text: "alpha" },
+      { file: "b.md", text: "beta" },
+    ]);
+
+    expect(result).toEqual({
+      model: "qmd-rerank",
+      results: [
+        { file: "b.md", score: 0.9, index: 1 },
+        { file: "a.md", score: 0.4, index: 0 },
+      ],
+    });
+  });
+
+  test("recovers from oversized rerank requests by splitting and truncating", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const documents = Array.isArray(body.documents) ? body.documents : [];
+      const tooManyDocs = documents.length > 1;
+      const oversizedSingle = documents.some((doc: string) => typeof doc === "string" && doc.length > 64);
+
+      if (tooManyDocs || oversizedSingle) {
+        return {
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          text: async () => JSON.stringify({
+            error: {
+              code: 500,
+              message: "input is too large to process",
+              type: "server_error",
+            },
+          }),
+        } as any;
+      }
+
+      return {
+        ok: true,
+        json: async () => ({
+          results: documents.map((_: unknown, index: number) => ({
+            index,
+            relevance_score: 1 - index * 0.1,
+          })),
+        }),
+      } as any;
+    });
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      rerankModel: "qmd-rerank",
+    });
+
+    const documents = [
+      { file: "a.md", text: "a".repeat(6000) },
+      { file: "b.md", text: "b".repeat(6000) },
+      { file: "c.md", text: "c".repeat(6000) },
+    ];
+
+    const result = await llm.rerank("capital", documents);
+
+    expect(fetchSpy).toHaveBeenCalled();
+    const requestBodies = fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
+    expect(requestBodies[0]?.documents.length).toBe(documents.length);
+    expect(requestBodies.some((body) => body.documents.length === 1)).toBe(true);
+    expect(requestBodies.some((body) => body.documents[0]?.length < documents[0]!.text.length)).toBe(true);
+    expect(result.results).toHaveLength(documents.length);
+  });
+});
+
 describe("LlamaCpp embedding truncation", () => {
   test("truncates against the active embedding context limit, not the model train context", async () => {
     const llm = new LlamaCpp({}) as any;
@@ -274,6 +428,7 @@ describe("LlamaCpp.getDeviceInfo", () => {
       gpuDevices: ["Apple GPU"],
       vram: { total: 1024, used: 256, free: 768 },
       cpuCores: 8,
+      backend: "llama-cpp",
     });
   });
 });

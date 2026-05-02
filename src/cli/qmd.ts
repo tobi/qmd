@@ -78,7 +78,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { createLLM, disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -120,11 +120,14 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
+      if (config.models || config.llm) {
+        setDefaultLLM(createLLM({
+          embedModel: config.models?.embed,
+          generateModel: config.models?.generate,
+          rerankModel: config.models?.rerank,
+          provider: config.llm?.provider,
+          baseUrl: config.llm?.baseUrl,
+          apiKey: config.llm?.apiKey,
         }));
       }
     } catch {
@@ -205,6 +208,28 @@ const cursor = {
   hide() { process.stderr.write('\x1b[?25l'); },
   show() { process.stderr.write('\x1b[?25h'); },
 };
+
+function getActiveLlmConfig(): {
+  embedModel: string;
+  rerankModel: string;
+  generateModel: string;
+  provider?: "llama-cpp" | "openai-compatible";
+  baseUrl?: string;
+} {
+  const config = loadConfig();
+  return {
+    embedModel: config.models?.embed || DEFAULT_EMBED_MODEL_URI,
+    rerankModel: config.models?.rerank || DEFAULT_RERANK_MODEL_URI,
+    generateModel: config.models?.generate || DEFAULT_GENERATE_MODEL_URI,
+    provider: config.llm?.provider,
+    baseUrl: config.llm?.baseUrl,
+  };
+}
+
+function formatConfiguredModel(uri: string): string {
+  const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+  return match ? `https://huggingface.co/${match[1]}` : uri;
+}
 
 // Ensure cursor is restored on exit
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
@@ -456,15 +481,11 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
+    const { embedModel, rerankModel, generateModel } = getActiveLlmConfig();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${formatConfiguredModel(embedModel)}`);
+    console.log(`  Reranking:   ${formatConfiguredModel(rerankModel)}`);
+    console.log(`  Generation:  ${formatConfiguredModel(generateModel)}`);
   }
 
   // Device / GPU info
@@ -474,9 +495,16 @@ async function showStatus(): Promise<void> {
   if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
     console.log(`\n${c.bold}Device${c.reset}`);
     try {
-      const llm = getDefaultLlamaCpp();
-      const device = await llm.getDeviceInfo({ allowBuild: false });
-      if (device.gpu) {
+      const llm = getDefaultLLM();
+      const device = await llm.getDeviceInfo?.({ allowBuild: false });
+      if (!device) {
+        console.log(`  Backend:  unavailable`);
+      } else if (device.backend === "openai-compatible") {
+        console.log(`  Backend:  ${c.green}openai-compatible${c.reset}`);
+        if (device.endpoint) {
+          console.log(`  Endpoint: ${device.endpoint}`);
+        }
+      } else if (device.gpu) {
         console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
         if (device.gpuDevices.length > 0) {
           // Deduplicate and count GPUs
@@ -496,7 +524,9 @@ async function showStatus(): Promise<void> {
         console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
         console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      console.log(`  CPU:      ${device.cpuCores} math cores`);
+      if (device && device.backend !== "openai-compatible") {
+        console.log(`  CPU:      ${device.cpuCores} math cores`);
+      }
     } catch (error) {
       console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
       if (error instanceof Error && error.message) {
@@ -1679,12 +1709,13 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL_URI,
+  model: string | undefined = undefined,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const embedModel = model ?? getDefaultLLM().embedModelName;
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -1698,7 +1729,7 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${embedModel}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1711,7 +1742,7 @@ async function vectorIndex(
 
   const result = await generateEmbeddings(storeInstance, {
     force,
-    model,
+    model: embedModel,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
@@ -2700,6 +2731,7 @@ async function installSkill(globalInstall: boolean, force: boolean, autoYes: boo
 }
 
 function showHelp(): void {
+  const { embedModel, rerankModel, generateModel, provider, baseUrl } = getActiveLlmConfig();
   console.log("qmd — Quick Markdown Search");
   console.log("");
   console.log("Usage:");
@@ -2724,10 +2756,21 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log(`  qmd embed [-f]                - Generate/refresh vector embeddings (current: ${embedModel})`);
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("Active config:");
+  console.log(`  Embedding model:   ${formatConfiguredModel(embedModel)}`);
+  console.log(`  Reranking model:   ${formatConfiguredModel(rerankModel)}`);
+  console.log(`  Generation model:  ${formatConfiguredModel(generateModel)}`);
+  if (provider) {
+    console.log(`  Backend:           ${provider}`);
+  }
+  if (provider === "openai-compatible" && baseUrl) {
+    console.log(`  Endpoint:          ${baseUrl}`);
+  }
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -3112,7 +3155,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        await vectorIndex(undefined, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,

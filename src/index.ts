@@ -65,7 +65,7 @@ import {
   type ChunkStrategy,
 } from "./store.js";
 import {
-  LlamaCpp,
+  createLLM,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -210,7 +210,7 @@ export interface StoreOptions {
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
  *
- * All methods are async. The store manages its own LlamaCpp instance
+ * All methods are async. The store manages its own LLM instance
  * (lazy-loaded, auto-unloaded after inactivity) — no global singletons.
  */
 export interface QMDStore {
@@ -365,12 +365,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
+  // Create a per-store LLM instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  const llm = createLLM({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    provider: config?.llm?.provider,
+    baseUrl: config?.llm?.baseUrl,
+    apiKey: config?.llm?.apiKey,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
@@ -417,7 +420,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
