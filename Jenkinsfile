@@ -28,8 +28,8 @@ pipeline {
         '''
         script {
           def pkgJson = readFile('package.json')
-          def matcher = pkgJson =~ /"version"\s*:\s*"([^"]+)"/
-          env.DOCKER_TAG = matcher.find() ? matcher.group(1) : 'unknown'
+          def parsed = new groovy.json.JsonSlurperClassic().parseText(pkgJson)
+          env.DOCKER_TAG = (parsed?.version ?: 'unknown').toString()
           echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
         }
       }
