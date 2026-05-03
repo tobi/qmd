@@ -27,15 +27,9 @@ pipeline {
           ls -la
         '''
         script {
-          env.DOCKER_TAG = sh(script: "grep '\"version\"' package.json | head -1 | sed 's/.*: *\"//' | sed 's/\".*//'", returnStdout: true).trim()
+          env.DOCKER_TAG = sh(script: "awk -F'\"' '/\"version\"/{print \$4;exit}' package.json", returnStdout: true).trim()
           echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
         }
-      }
-    }
-
-    stage('Build') {
-      steps {
-        echo 'Build stage disabled'
       }
     }
 
