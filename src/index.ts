@@ -18,7 +18,8 @@
  */
 
 import fastGlob from "fast-glob";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
+import { resolve } from "path";
 import {
   createStore as createStoreInternal,
   hybridQuery,
@@ -547,10 +548,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           const parts = file.split("/");
           return !parts.some(part => part.startsWith("."));
         });
+        const indexableFiles = files.filter(file => {
+          try {
+            const content = readFileSync(resolve(col.path!, file), "utf-8");
+            return content.trim().length > 0;
+          } catch {
+            return false;
+          }
+        });
         const activeCount = (db.prepare(
           "SELECT COUNT(*) as cnt FROM documents WHERE active = 1 AND collection = ?"
         ).get(col.name) as { cnt: number }).cnt;
-        const diff = files.length - activeCount;
+        const diff = indexableFiles.length - activeCount;
         if (diff > 0) pending += diff;
       }
       return pending;
