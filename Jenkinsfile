@@ -27,7 +27,9 @@ pipeline {
           ls -la
         '''
         script {
-          env.DOCKER_TAG = sh(script: "awk -F'\"' '/\"version\"/{print \$4;exit}' package.json", returnStdout: true).trim()
+          def pkgJson = readFile('package.json')
+          def matcher = pkgJson =~ /"version"\s*:\s*"([^"]+)"/
+          env.DOCKER_TAG = matcher.find() ? matcher[0][1] : 'unknown'
           echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
         }
       }
