@@ -48,7 +48,7 @@ pipeline {
           sh '''
             DOCKER_TAG="$(tr -d '\r\n' < docker-tag.txt)"
             echo "Logging into Docker Hub..."
-            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            printf '%s' "$DOCKER_PASS" | tr -d '\r\n' | docker login -u "$DOCKER_USER" --password-stdin
             echo "Building and pushing multi-arch image..."
             echo "Repository: ${DOCKER_REPO}"
             echo "Tag: ${DOCKER_TAG}"
