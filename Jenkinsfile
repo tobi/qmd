@@ -48,6 +48,7 @@ pipeline {
           sh '''
             DOCKER_TAG="$(tr -d '\r\n' < docker-tag.txt)"
             echo "Logging into Docker Hub..."
+            USER_CLEAN="$(printf '%s' "$DOCKER_USER" | tr -d '\r\n[:space:]')"
             TOKEN_CLEAN="$(printf '%s' "$DOCKER_PASS" | tr -d '\r\n')"
             TOKEN_LEN="$(printf '%s' "$TOKEN_CLEAN" | wc -c | tr -d ' ')"
             TOKEN_FINGERPRINT="$(printf '%s' "$TOKEN_CLEAN" | sha256sum | cut -c1-12)"
@@ -56,9 +57,15 @@ pipeline {
               echo "Check Jenkins credential 'docker-hub-credentials' scope and value."
               exit 1
             fi
+            if [ -z "$USER_CLEAN" ]; then
+              echo "Docker username is empty after trimming."
+              echo "Check Jenkins credential 'docker-hub-credentials' username value."
+              exit 1
+            fi
+            echo "Docker user: ${USER_CLEAN}"
             echo "Docker token length: ${TOKEN_LEN}"
             echo "Docker token fingerprint (sha256 prefix): ${TOKEN_FINGERPRINT}"
-            printf '%s' "$TOKEN_CLEAN" | docker login -u "$DOCKER_USER" --password-stdin
+            printf '%s' "$TOKEN_CLEAN" | docker login -u "$USER_CLEAN" --password-stdin
             echo "Building and pushing multi-arch image..."
             echo "Repository: ${DOCKER_REPO}"
             echo "Tag: ${DOCKER_TAG}"
