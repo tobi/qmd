@@ -69,9 +69,8 @@ pipeline {
             echo "Building and pushing multi-arch image..."
             echo "Repository: ${DOCKER_REPO}"
             echo "Tag: ${DOCKER_TAG}"
-            docker buildx build --platform linux/amd64,linux/arm64 \
-              -t ${DOCKER_REPO}:${DOCKER_TAG} \
-              --push .
+            docker build -t ${DOCKER_REPO}:${DOCKER_TAG} .
+            docker push ${DOCKER_REPO}:${DOCKER_TAG}
             echo "Docker image built and pushed successfully!"
             echo "Image: ${DOCKER_REPO}:${DOCKER_TAG}"
             docker logout
