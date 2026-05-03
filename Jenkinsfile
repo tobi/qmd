@@ -27,9 +27,11 @@ pipeline {
           ls -la
         '''
         script {
-          def pkgJson = readFile('package.json')
-          def parsed = new groovy.json.JsonSlurperClassic().parseText(pkgJson)
-          env.DOCKER_TAG = (parsed?.version ?: 'unknown').toString()
+          def version = sh(
+            script: "grep -m1 '\"version\"' package.json | sed -E 's/.*\"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/'",
+            returnStdout: true
+          ).trim()
+          env.DOCKER_TAG = version ? version : 'unknown'
           echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
         }
       }
