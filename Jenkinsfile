@@ -28,7 +28,7 @@ pipeline {
         '''
         script {
           def version = sh(
-            script: "grep -m1 '\"version\"' package.json | sed -E 's/.*\"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/'",
+            script: 'awk -F\'"\' \'/"version"[[:space:]]*:/ { print $4; exit }\' package.json',
             returnStdout: true
           ).trim()
           env.DOCKER_TAG = version ? version : 'unknown'
