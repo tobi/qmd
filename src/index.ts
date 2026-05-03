@@ -532,9 +532,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Index Health
     getPendingFiles: async () => {
       const collections = getStoreCollections(db);
-      let pending = 0;
       const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+      const stmt = db.prepare("SELECT 1 FROM documents WHERE active = 1 AND collection = ? AND path = ? LIMIT 1");
+      const activeCollections = new Set(
+        (db.prepare("SELECT DISTINCT collection FROM documents WHERE active = 1").all() as { collection: string }[]).map(r => r.collection)
+      );
+      const { handelize } = await import("./store.js");
+      let pending = 0;
       for (const col of collections) {
+        if (!activeCollections.has(col.name)) continue;
         if (!col.path || !existsSync(col.path)) continue;
         const pattern = col.pattern || "**/*.md";
         const allFiles: string[] = await fastGlob(pattern, {
@@ -548,19 +554,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           const parts = file.split("/");
           return !parts.some(part => part.startsWith("."));
         });
-        const indexableFiles = files.filter(file => {
+        for (const file of files) {
           try {
-            const content = readFileSync(resolve(col.path!, file), "utf-8");
-            return content.trim().length > 0;
+            const filepath = resolve(col.path!, file);
+            const content = readFileSync(filepath, "utf-8");
+            if (!content.trim()) continue;
+            const path = handelize(file);
+            const existing = stmt.get(col.name, path);
+            if (!existing) pending++;
           } catch {
-            return false;
+            continue;
           }
-        });
-        const activeCount = (db.prepare(
-          "SELECT COUNT(*) as cnt FROM documents WHERE active = 1 AND collection = ?"
-        ).get(col.name) as { cnt: number }).cnt;
-        const diff = indexableFiles.length - activeCount;
-        if (diff > 0) pending += diff;
+        }
       }
       return pending;
     },
