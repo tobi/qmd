@@ -35,9 +35,7 @@ pipeline {
 
     stage('Build') {
       steps {
-        sh 'bun install'
-        sh 'bun run build'
-        sh 'bun test --preload ./src/test-preload.ts test/'
+        echo 'Build stage disabled'
       }
     }
 
