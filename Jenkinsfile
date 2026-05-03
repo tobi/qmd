@@ -9,7 +9,7 @@ pipeline {
 
   environment {
     DOCKER_REPO = 'daviddwyer1987/qmd-cicadia'
-    DOCKER_TAG = ''
+    DOCKER_TAG = 'unknown'
   }
 
   stages {
@@ -33,9 +33,11 @@ pipeline {
             ''',
             returnStdout: true
           ).trim()
-          env.DOCKER_TAG = (version && version != 'null') ? version : 'unknown'
+          def dockerTag = (version && version != 'null') ? version : 'unknown'
+          env.DOCKER_TAG = "${dockerTag}"
+          writeFile file: 'docker-tag.txt', text: "${dockerTag}\n"
           echo "Parsed version: '${version}'"
-          echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
+          echo "Setting DOCKER_TAG to: ${dockerTag}"
         }
       }
     }
@@ -44,6 +46,7 @@ pipeline {
       steps {
         withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
           sh '''
+            DOCKER_TAG="$(tr -d '\r\n' < docker-tag.txt)"
             echo "Logging into Docker Hub..."
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
             echo "Building and pushing multi-arch image..."
