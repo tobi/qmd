@@ -29,11 +29,12 @@ pipeline {
         script {
           def version = sh(
             script: '''
-              awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' package.json
+              python3 -c "import json; print(json.load(open('package.json'))['version'])"
             ''',
             returnStdout: true
           ).trim()
-          env.DOCKER_TAG = version ? version : 'unknown'
+          env.DOCKER_TAG = (version && version != 'null') ? version : 'unknown'
+          echo "Parsed version: '${version}'"
           echo "Setting DOCKER_TAG to: ${env.DOCKER_TAG}"
         }
       }
