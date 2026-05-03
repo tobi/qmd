@@ -83,9 +83,20 @@ pipeline {
   post {
     success {
       echo "Pipeline completed successfully! Docker image pushed as: ${env.DOCKER_TAG}"
+      sh '''
+        DOCKER_TAG="$(tr -d '\r\n' < docker-tag.txt)"
+        curl -s -H "Content-Type: application/json" \
+          -d "{\\"content\\": \\"QMD image **${DOCKER_REPO}:${DOCKER_TAG}** published! Build [#${BUILD_NUMBER}](${BUILD_URL}) succeeded.\\"}" \
+          https://discord.com/api/webhooks/1499458006394343465/D_NgQ9L5Rpo2hXCcAXjsPs_h7WggDYO1YaAayEw59OxCHaeWxxIybRBcSNVah08_vif6
+      '''
     }
     failure {
       echo "Pipeline failed!"
+      sh '''
+        curl -s -H "Content-Type: application/json" \
+          -d "{\\"content\\": \\":x: QMD build [#${BUILD_NUMBER}](${BUILD_URL}) failed.\\"}" \
+          https://discord.com/api/webhooks/1499458006394343465/D_NgQ9L5Rpo2hXCcAXjsPs_h7WggDYO1YaAayEw59OxCHaeWxxIybRBcSNVah08_vif6
+      '''
     }
   }
 }
