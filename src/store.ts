@@ -16,8 +16,10 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import YAML from "yaml";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -254,7 +256,7 @@ export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[]
  * Core chunk algorithm that operates on precomputed break points and code fences.
  * This is the shared implementation used by both regex-only and AST-aware chunking.
  */
-export function chunkDocumentWithBreakPoints(
+function chunkDocumentCore(
   content: string,
   breakPoints: BreakPoint[],
   codeFences: CodeFenceRegion[],
@@ -304,6 +306,46 @@ export function chunkDocumentWithBreakPoints(
   }
 
   return chunks;
+}
+
+export function chunkDocumentWithBreakPoints(
+  content: string,
+  breakPoints: BreakPoint[],
+  codeFences: CodeFenceRegion[],
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS
+): { text: string; pos: number }[] {
+  const frontmatter = extractFrontmatter(content);
+  if (!frontmatter) {
+    return chunkDocumentCore(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  }
+
+  if (frontmatter.raw.length >= content.length) {
+    return [{ text: content, pos: 0 }];
+  }
+
+  const offset = frontmatter.raw.length;
+  const bodyBreakPoints = breakPoints
+    .filter(bp => bp.pos >= offset)
+    .map(bp => ({ ...bp, pos: bp.pos - offset }));
+  const bodyCodeFences = codeFences
+    .filter(fence => fence.end > offset)
+    .map(fence => ({
+      start: Math.max(0, fence.start - offset),
+      end: Math.max(0, fence.end - offset),
+    }))
+    .filter(fence => fence.end > 0);
+  const bodyChunks = chunkDocumentCore(
+    frontmatter.body,
+    bodyBreakPoints,
+    bodyCodeFences,
+    maxChars,
+    overlapChars,
+    windowChars,
+  ).map(chunk => ({ text: chunk.text, pos: chunk.pos + offset }));
+
+  return [{ text: frontmatter.raw, pos: 0 }, ...bodyChunks];
 }
 
 // Hybrid query: strong BM25 signal detection thresholds
@@ -1686,7 +1728,7 @@ export function createStore(dbPath?: string): Store {
 export type DocumentResult = {
   filepath: string;           // Full filesystem path
   displayPath: string;        // Short display path (e.g., "docs/readme.md")
-  title: string;              // Document title (from first heading or filename)
+  title: string;              // Document title (from frontmatter, first heading, or filename)
   context: string | null;     // Folder context description if configured
   hash: string;               // Content hash for caching/change detection
   docid: string;              // Short docid (first 6 chars of hash) for quick reference
@@ -2032,6 +2074,84 @@ export async function hashContent(content: string): Promise<string> {
   return hash.digest("hex");
 }
 
+const require = createRequire(import.meta.url);
+const grayMatter = require("gray-matter") as typeof import("gray-matter");
+const PLUS_FRONTMATTER_OPTIONS = { delimiters: "+++" } as const;
+
+interface FrontmatterInfo {
+  raw: string;
+  body: string;
+  matter: string;
+  data: Record<string, unknown> | null;
+  language: string | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseFrontmatterData(raw: string): Record<string, unknown> | null {
+  for (const parser of [() => YAML.parse(raw) as unknown, () => JSON.parse(raw) as unknown]) {
+    try {
+      const parsed = parser();
+      if (isRecord(parsed)) return parsed;
+    } catch {
+      // Try the next parser.
+    }
+  }
+  return null;
+}
+
+function extractFrontmatterWithOptions(content: string, options?: { delimiters: string }): FrontmatterInfo | null {
+  if (!grayMatter.test(content, options)) return null;
+
+  try {
+    const parsed = grayMatter(content, options);
+    const rawLength = content.length - parsed.content.length;
+    if (rawLength <= 0) return null;
+
+    return {
+      raw: content.slice(0, rawLength),
+      body: parsed.content,
+      matter: parsed.matter,
+      data: isRecord(parsed.data) ? parsed.data : parseFrontmatterData(parsed.matter),
+      language: parsed.language || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractFrontmatterByDelimiter(content: string): FrontmatterInfo | null {
+  const patterns = [
+    /^(?:\uFEFF)?---[^\r\n]*\r?\n([\s\S]*?)\r?\n---[^\S\r\n]*(?:\r?\n|$)/,
+    /^(?:\uFEFF)?\+\+\+[^\r\n]*\r?\n([\s\S]*?)\r?\n\+\+\+[^\S\r\n]*(?:\r?\n|$)/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = content.match(pattern);
+    if (!match) continue;
+
+    const raw = match[0];
+    const matter = match[1] ?? "";
+    return {
+      raw,
+      body: content.slice(raw.length),
+      matter,
+      data: parseFrontmatterData(matter),
+      language: null,
+    };
+  }
+
+  return null;
+}
+
+function extractFrontmatter(content: string): FrontmatterInfo | null {
+  return extractFrontmatterWithOptions(content)
+    ?? extractFrontmatterWithOptions(content, PLUS_FRONTMATTER_OPTIONS)
+    ?? extractFrontmatterByDelimiter(content);
+}
+
 const titleExtractors: Record<string, (content: string) => string | null> = {
   '.md': (content) => {
     const match = content.match(/^##?\s+(.+)$/m);
@@ -2055,10 +2175,17 @@ const titleExtractors: Record<string, (content: string) => string | null> = {
 };
 
 export function extractTitle(content: string, filename: string): string {
+  const frontmatter = extractFrontmatter(content);
+  const frontmatterTitle = frontmatter?.data?.title;
+  if (typeof frontmatterTitle === "string" && frontmatterTitle.trim().length > 0) {
+    return frontmatterTitle.trim();
+  }
+
   const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
   const extractor = titleExtractors[ext];
+  const bodyContent = frontmatter?.body ?? content;
   if (extractor) {
-    const title = extractor(content);
+    const title = extractor(bodyContent);
     if (title) return title;
   }
   return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
