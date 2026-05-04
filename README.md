@@ -222,6 +222,10 @@ const results3 = await store.search({
 
 // Skip reranking for faster results
 const fast = await store.search({ query: "auth", rerank: false })
+
+// Skip LLM query expansion — useful for non-English corpora where the
+// expansion model translates the query into English and tanks recall
+const verbatim = await store.search({ query: "テレグラム 設定", expand: false })
 ```
 
 For direct backend access:

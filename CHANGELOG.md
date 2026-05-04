@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `--no-expand` flag on `qmd query` skips LLM query expansion and
+  searches the original query verbatim. Mirrors the existing
+  `--no-rerank` flag and is also exposed as `expand: false` on the
+  SDK `search()` method. Useful for non-English corpora where the
+  expansion model translates the query into English and degrades
+  vector recall, and as a faster path when you trust your query
+  wording.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529

@@ -233,6 +233,8 @@ describe("CLI Help", () => {
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("qmd skill show/install");
+    expect(stdout).toContain("--no-rerank");
+    expect(stdout).toContain("--no-expand");
   });
 
   test("shows help with no arguments", async () => {
