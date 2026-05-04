@@ -4,6 +4,7 @@
 
 ### Fixes
 
+- Windows: ship `bin/qmd.cmd` — a native CMD launcher that invokes `node`/`bun` directly without requiring `/bin/sh`. The npm-generated wrapper calls `/bin/sh` to run `bin/qmd`, which fails silently when MCP clients spawn qmd as a stdio subprocess via Node.js `child_process.spawn()` (Git for Windows is absent from the subprocess PATH even when available in interactive shells).
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive
