@@ -703,6 +703,43 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
+const DEFAULT_FTS_TOKENIZER = "porter unicode61";
+
+// FTS5 tokenizer values that are safe to interpolate into the CREATE VIRTUAL
+// TABLE statement. Built-in SQLite FTS5 tokenizers only — extension-loaded
+// tokenizers (e.g. via QMD_FTS_EXTENSION) are not validated here.
+const ALLOWED_FTS_TOKENIZERS: ReadonlySet<string> = new Set([
+  "porter unicode61",
+  "porter ascii",
+  "unicode61",
+  "ascii",
+  "trigram",
+]);
+
+/**
+ * Resolve the FTS5 tokenizer to use for documents_fts.
+ *
+ * Defaults to "porter unicode61" (English-tuned). Set QMD_FTS_TOKENIZER to
+ * "trigram" for usable BM25 on CJK / mixed-language corpora — unicode61
+ * splits on Unicode whitespace, which leaves CJK content as a single token
+ * per sentence.
+ *
+ * Changing this value only affects newly created documents_fts tables.
+ * Existing indexes must be rebuilt (drop the database file or run
+ * `qmd embed -f` after deleting the FTS table) for the change to take
+ * effect.
+ */
+export function getFtsTokenizer(): string {
+  const value = process.env.QMD_FTS_TOKENIZER?.trim();
+  if (!value) return DEFAULT_FTS_TOKENIZER;
+  if (!ALLOWED_FTS_TOKENIZERS.has(value)) {
+    throw new Error(
+      `Invalid QMD_FTS_TOKENIZER value: "${value}". ` +
+      `Allowed: ${[...ALLOWED_FTS_TOKENIZERS].map(t => `"${t}"`).join(", ")}.`
+    );
+  }
+  return value;
+}
 
 function createSqliteVecUnavailableError(reason: string): Error {
   return new Error(
@@ -831,12 +868,15 @@ function initializeDatabase(db: Database): void {
   `);
 
   // FTS - index filepath (collection/path), title, and content
-  db.exec(`
+  // tokenize is interpolated from a strict whitelist (see getFtsTokenizer)
+  const tokenizer = getFtsTokenizer();
+  const createFtsSql = `
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
       filepath, title, body,
-      tokenize='porter unicode61'
+      tokenize='${tokenizer}'
     )
-  `);
+  `;
+  db.exec(createFtsSql);
 
   // Triggers to keep FTS in sync
   db.exec(`

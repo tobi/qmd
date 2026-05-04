@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `QMD_FTS_TOKENIZER` env var lets you swap the FTS5 tokenizer used for
+  `documents_fts`. Defaults to the existing `porter unicode61`. Set to
+  `trigram` to make BM25 usable on CJK / mixed-language corpora —
+  `unicode61` splits on whitespace and indexes whole CJK sentences as a
+  single token, so substring queries return zero hits. Allowed values:
+  `porter unicode61`, `porter ascii`, `unicode61`, `ascii`, `trigram`.
+  Only affects newly created indexes; existing databases need a rebuild.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529

@@ -797,6 +797,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_FTS_TOKENIZER` | `porter unicode61` | FTS5 tokenizer for `documents_fts`. Set to `trigram` for usable BM25 on CJK / mixed-language corpora — `unicode61` splits on whitespace and indexes whole CJK sentences as a single token, so substring queries return zero hits. Allowed values: `porter unicode61`, `porter ascii`, `unicode61`, `ascii`, `trigram`. Only affects newly created indexes — existing databases need a rebuild (delete `~/.cache/qmd/index.sqlite`, then re-index) for the change to take effect. |
 
 ## How It Works
 

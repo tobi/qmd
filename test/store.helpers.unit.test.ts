@@ -18,6 +18,7 @@ import {
   handelize,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
+  getFtsTokenizer,
 } from "../src/store";
 
 // =============================================================================
@@ -285,5 +286,69 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
+  });
+});
+
+// =============================================================================
+// FTS Tokenizer Selection
+// =============================================================================
+
+describe("getFtsTokenizer", () => {
+  const ENV_KEY = "QMD_FTS_TOKENIZER";
+
+  function withEnv(value: string | undefined, fn: () => void): void {
+    const prev = process.env[ENV_KEY];
+    if (value === undefined) {
+      delete process.env[ENV_KEY];
+    } else {
+      process.env[ENV_KEY] = value;
+    }
+    try {
+      fn();
+    } finally {
+      if (prev === undefined) {
+        delete process.env[ENV_KEY];
+      } else {
+        process.env[ENV_KEY] = prev;
+      }
+    }
+  }
+
+  test("returns the porter unicode61 default when the env var is unset", () => {
+    withEnv(undefined, () => {
+      expect(getFtsTokenizer()).toBe("porter unicode61");
+    });
+  });
+
+  test("returns the porter unicode61 default when the env var is empty", () => {
+    withEnv("", () => {
+      expect(getFtsTokenizer()).toBe("porter unicode61");
+    });
+  });
+
+  test("trims surrounding whitespace before validating", () => {
+    withEnv("  trigram  ", () => {
+      expect(getFtsTokenizer()).toBe("trigram");
+    });
+  });
+
+  test("accepts each whitelisted tokenizer", () => {
+    for (const tokenizer of ["porter unicode61", "porter ascii", "unicode61", "ascii", "trigram"]) {
+      withEnv(tokenizer, () => {
+        expect(getFtsTokenizer()).toBe(tokenizer);
+      });
+    }
+  });
+
+  test("rejects unknown values", () => {
+    withEnv("icu", () => {
+      expect(() => getFtsTokenizer()).toThrow(/Invalid QMD_FTS_TOKENIZER/);
+    });
+  });
+
+  test("rejects values that try to inject extra SQL", () => {
+    withEnv("trigram') --", () => {
+      expect(() => getFtsTokenizer()).toThrow(/Invalid QMD_FTS_TOKENIZER/);
+    });
   });
 });
