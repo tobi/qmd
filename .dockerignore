@@ -1,0 +1,16 @@
+node_modules
+.git
+.gitignore
+test/
+docs/
+*.md
+!CHANGELOG.md
+skills/
+finetune/
+assets/
+bun.lock
+flake.lock
+flake.nix
+example-index.yml
+vitest.config.ts
+migrate-schema.ts

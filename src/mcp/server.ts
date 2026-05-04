@@ -8,7 +8,6 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
@@ -16,7 +15,6 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport }
   from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { existsSync } from "fs";
 import {
@@ -531,6 +529,290 @@ Intent-aware lex (C++ performance, not sports):
     }
   );
 
+  // ---------------------------------------------------------------------------
+  // Tool: collections (List all collections)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "collections",
+    {
+      title: "List Collections",
+      description: "List all collections with their paths, glob patterns, document counts, and last modified dates.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      const collections = await store.listCollections();
+
+      if (collections.length === 0) {
+        return {
+          content: [{ type: "text", text: "No collections configured." }],
+          structuredContent: { collections: [] },
+        };
+      }
+
+      const lines = [`Collections (${collections.length}):`];
+      for (const col of collections) {
+        const pattern = col.glob_pattern || "**/*.md";
+        lines.push(`  - ${col.name}: ${col.pwd} (${pattern}, ${col.doc_count} docs, last modified: ${col.last_modified || "never"})`);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join('\n') }],
+        structuredContent: { collections },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: add_collection (Add a new collection)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "add_collection",
+    {
+      title: "Add Collection",
+      description: "Add a new collection by pointing it at a directory path. Optionally specify a glob pattern and ignore patterns.",
+      inputSchema: {
+        name: z.string().describe("Name for the new collection"),
+        path: z.string().describe("Filesystem path to the collection directory"),
+        pattern: z.string().optional().describe("Glob pattern for matching files (default: '**/*.md')"),
+        ignore: z.array(z.string()).optional().describe("List of paths/patterns to ignore"),
+      },
+    },
+    async ({ name, path, pattern, ignore }) => {
+      await store.addCollection(name, { path, pattern, ignore });
+      return {
+        content: [{ type: "text", text: `Collection "${name}" added at ${path}. Run update_index to index documents.` }],
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: remove_collection (Remove a collection)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "remove_collection",
+    {
+      title: "Remove Collection",
+      description: "Remove a collection by name. This removes it from the index but does not delete files on disk.",
+      inputSchema: {
+        name: z.string().describe("Name of the collection to remove"),
+      },
+    },
+    async ({ name }) => {
+      const removed = await store.removeCollection(name);
+      if (removed) {
+        return {
+          content: [{ type: "text", text: `Collection "${name}" removed.` }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Collection "${name}" not found.` }],
+        isError: true,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: rename_collection (Rename a collection)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "rename_collection",
+    {
+      title: "Rename Collection",
+      description: "Rename an existing collection.",
+      inputSchema: {
+        old_name: z.string().describe("Current name of the collection"),
+        new_name: z.string().describe("New name for the collection"),
+      },
+    },
+    async ({ old_name, new_name }) => {
+      const renamed = await store.renameCollection(old_name, new_name);
+      if (renamed) {
+        return {
+          content: [{ type: "text", text: `Collection "${old_name}" renamed to "${new_name}".` }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Collection "${old_name}" not found.` }],
+        isError: true,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: contexts (List all contexts)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "contexts",
+    {
+      title: "List Contexts",
+      description: "List all path contexts across collections, plus the global context if set.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      const contexts = await store.listContexts();
+      const globalCtx = await store.getGlobalContext();
+
+      const lines: string[] = [];
+
+      if (globalCtx) {
+        lines.push(`Global context: ${globalCtx}`);
+      }
+
+      if (contexts.length === 0 && !globalCtx) {
+        return {
+          content: [{ type: "text", text: "No contexts configured." }],
+          structuredContent: { globalContext: undefined, contexts: [] },
+        };
+      }
+
+      if (contexts.length > 0) {
+        lines.push(`Path contexts (${contexts.length}):`);
+        for (const ctx of contexts) {
+          lines.push(`  - ${ctx.collection}:${ctx.path} — ${ctx.context}`);
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join('\n') }],
+        structuredContent: { globalContext: globalCtx ?? null, contexts },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: add_context (Add context to a collection path)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "add_context",
+    {
+      title: "Add Context",
+      description: "Add context text for a path within a collection. This helps the LLM understand what content is in that area.",
+      inputSchema: {
+        collection: z.string().describe("Collection name to add context to"),
+        path: z.string().default("/").describe("Path prefix within the collection (default: '/')"),
+        context: z.string().describe("Descriptive context text for this path"),
+      },
+    },
+    async ({ collection, path, context }) => {
+      const added = await store.addContext(collection, path, context);
+      if (added) {
+        return {
+          content: [{ type: "text", text: `Context added for ${collection}:${path}.` }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Failed to add context for ${collection}:${path}. Collection may not exist.` }],
+        isError: true,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: remove_context (Remove context from a collection path)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "remove_context",
+    {
+      title: "Remove Context",
+      description: "Remove context from a specific path within a collection.",
+      inputSchema: {
+        collection: z.string().describe("Collection name"),
+        path: z.string().describe("Path prefix to remove context from"),
+      },
+    },
+    async ({ collection, path }) => {
+      const removed = await store.removeContext(collection, path);
+      if (removed) {
+        return {
+          content: [{ type: "text", text: `Context removed from ${collection}:${path}.` }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `No context found at ${collection}:${path}.` }],
+        isError: true,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: update_index (Re-index collections)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "update_index",
+    {
+      title: "Update Index",
+      description: "Re-index collections by scanning the filesystem for new, changed, or removed files. If no collections specified, re-indexes all.",
+      inputSchema: {
+        collections: z.array(z.string()).optional().describe("Specific collections to re-index (default: all)"),
+      },
+    },
+    async ({ collections }) => {
+      const result = await store.update({
+        ...(collections && collections.length > 0 ? { collections } : {}),
+      });
+
+      const summary = [
+        `Index updated:`,
+        `  Collections: ${result.collections}`,
+        `  Indexed: ${result.indexed}`,
+        `  Updated: ${result.updated}`,
+        `  Unchanged: ${result.unchanged}`,
+        `  Removed: ${result.removed}`,
+        `  Needs embedding: ${result.needsEmbedding}`,
+      ];
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: result,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: embed (Generate vector embeddings)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "embed",
+    {
+      title: "Generate Embeddings",
+      description: "Generate vector embeddings for documents that need them. Requires node-llama-cpp and a model. Use force=true to re-embed all documents.",
+      inputSchema: {
+        force: z.boolean().optional().default(false).describe("Re-embed all documents, not just new ones (default: false)"),
+        model: z.string().optional().describe("Embedding model to use (default: embeddinggemma)"),
+      },
+    },
+    async ({ force, model }) => {
+      const result = await store.embed({
+        ...(force ? { force } : {}),
+        ...(model ? { model } : {}),
+      });
+
+      const summary = [
+        `Embedding complete:`,
+        `  Documents processed: ${result.docsProcessed}`,
+        `  Chunks embedded: ${result.chunksEmbedded}`,
+        `  Errors: ${result.errors}`,
+        `  Duration: ${(result.durationMs / 1000).toFixed(1)}s`,
+      ];
+
+      return {
+        content: [{ type: "text", text: summary.join('\n') }],
+        structuredContent: result,
+      };
+    }
+  );
+
   return server;
 }
 
@@ -583,30 +865,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
 
-  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
-  // The store is shared — it's stateless SQLite, safe for concurrent access.
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
-
-  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
-      onsessioninitialized: (sessionId: string) => {
-        sessions.set(sessionId, transport);
-        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
-      },
-    });
-    const server = await createMcpServer(store);
-    await server.connect(transport);
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
-
-    return transport;
-  }
+  // Reindex mutex - prevents concurrent reindexing
+  let reindexInProgress: Promise<unknown> | null = null;
+  const isReindexing = () => reindexInProgress !== null;
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -651,10 +912,106 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
     try {
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        const status = await store.getStatus();
+        const pendingFiles = await store.getPendingFiles();
+        const body = JSON.stringify({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          indexedDocuments: status.totalDocuments,
+          pendingFiles,
+          needsEmbedding: status.needsEmbedding,
+          reindexInProgress: isReindexing(),
+          collections: status.collections,
+        });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: GET /reindex — re-index all collections and generate embeddings
+      if (pathname === "/reindex" && nodeReq.method === "GET") {
+        if (isReindexing()) {
+          nodeRes.writeHead(409, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Re-index already in progress" }));
+          return;
+        }
+
+        const start = Date.now();
+        log(`${ts()} GET /reindex (re-indexing all collections)`);
+
+        const reindexPromise = (async () => {
+          const result = await store.update();
+
+          let embedResult;
+          if (result.needsEmbedding > 0) {
+            log(`${ts()} GET /reindex (embedding ${result.needsEmbedding} docs)`);
+            embedResult = await store.embed();
+          }
+
+          return { result, embedResult };
+        })();
+        reindexInProgress = reindexPromise;
+
+        try {
+          const { result, embedResult } = await reindexPromise;
+
+          const body = JSON.stringify({
+            collections: result.collections,
+            indexed: result.indexed,
+            updated: result.updated,
+            unchanged: result.unchanged,
+            removed: result.removed,
+            docsProcessed: embedResult?.docsProcessed ?? 0,
+            chunksEmbedded: embedResult?.chunksEmbedded ?? 0,
+            embedErrors: embedResult?.errors ?? 0,
+            durationMs: Date.now() - start,
+          });
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(body);
+          log(`${ts()} GET /reindex complete (${Date.now() - start}ms)`);
+        } finally {
+          reindexInProgress = null;
+        }
+        return;
+      }
+
+      // REST endpoint: POST /collections — add a collection
+      if (pathname === "/collections" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const params = JSON.parse(rawBody);
+
+        if (!params.name || !params.path) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required fields: name, path" }));
+          return;
+        }
+
+        log(`${ts()} POST /collections (name: ${params.name}, path: ${params.path})`);
+
+        try {
+          await store.addCollection(params.name, {
+            path: params.path,
+            pattern: params.pattern || "**/*.md",
+            ignore: params.ignore,
+          });
+
+          // Trigger reindex for the new collection
+          const result = await store.update({ collections: [params.name] });
+
+          const body = JSON.stringify({
+            name: params.name,
+            path: params.path,
+            pattern: params.pattern || "**/*.md",
+            indexed: result.indexed,
+            updated: result.updated,
+          });
+          nodeRes.writeHead(201, { "Content-Type": "application/json" });
+          nodeRes.end(body);
+        } catch (e: any) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: e.message }));
+        }
         return;
       }
 
@@ -721,33 +1078,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           if (typeof v === "string") headers[k] = v;
         }
 
-        // Route to existing session or create new one on initialize
-        const sessionId = headers["mcp-session-id"];
-        let transport: WebStandardStreamableHTTPServerTransport;
-
-        if (sessionId) {
-          const existing = sessions.get(sessionId);
-          if (!existing) {
-            nodeRes.writeHead(404, { "Content-Type": "application/json" });
-            nodeRes.end(JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32001, message: "Session not found" },
-              id: body?.id ?? null,
-            }));
-            return;
-          }
-          transport = existing;
-        } else if (isInitializeRequest(body)) {
-          transport = await createSession();
-        } else {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: body?.id ?? null,
-          }));
-          return;
-        }
+        const server = await createMcpServer(store);
+        const transport = new WebStandardStreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+          enableJsonResponse: true,
+        });
+        await server.connect(transport);
 
         const request = new Request(url, { method: "POST", headers, body: rawBody });
         const response = await transport.handleRequest(request, { parsedBody: body });
@@ -755,43 +1091,19 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
         log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
+
+        await transport.close();
+        server.close();
         return;
       }
 
       if (pathname === "/mcp") {
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(nodeReq.headers)) {
-          if (typeof v === "string") headers[k] = v;
-        }
-
-        // GET/DELETE must have a valid session
-        const sessionId = headers["mcp-session-id"];
-        if (!sessionId) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: null,
-          }));
-          return;
-        }
-        const transport = sessions.get(sessionId);
-        if (!transport) {
-          nodeRes.writeHead(404, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32001, message: "Session not found" },
-            id: null,
-          }));
-          return;
-        }
-
-        const url = `http://localhost:${port}${pathname}`;
-        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
-        const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
-        const response = await transport.handleRequest(request);
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        nodeRes.writeHead(405, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Method not allowed. Stateless server — use POST only." },
+          id: null,
+        }));
         return;
       }
 
@@ -806,7 +1118,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    const host = process.env.QMD_MCP_HOST || "0.0.0.0";
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -815,10 +1128,6 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    for (const transport of sessions.values()) {
-      await transport.close();
-    }
-    sessions.clear();
     httpServer.close();
     await store.close();
   };
@@ -834,7 +1143,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  const displayHost = process.env.QMD_MCP_HOST || "0.0.0.0";
+  log(`QMD MCP server listening on http://${displayHost}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 

@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { OllamaLLM } from "./ollama.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -20,10 +21,11 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import {
   LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -59,11 +61,11 @@ export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
- * falls back to the global singleton.
+ * Get the LLM instance for a store — prefers the store's own instance,
+ * falls back to the global singleton (Ollama or LlamaCpp based on config).
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1087,8 +1089,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1404,7 +1406,7 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
- * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ * Uses the store's LLM instance if set, otherwise the global singleton.
  */
 export async function generateEmbeddings(
   store: Store,
@@ -1415,6 +1417,80 @@ export async function generateEmbeddings(
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+
+  // --- Ollama embed path ---
+  if (process.env.QMD_LLM_BACKEND === 'ollama') {
+    const ollama = new OllamaLLM();
+    const embedModel = ollama.embedModelId;
+    console.log(`${String.fromCharCode(27)}[2mModel: ollama/${embedModel}${String.fromCharCode(27)}[0m`);
+
+    if (options?.force) {
+      clearAllEmbeddings(db);
+    }
+
+    const docsToEmbed = getPendingEmbeddingDocs(db);
+    if (docsToEmbed.length === 0) {
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    }
+    const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+    const startTime2 = Date.now();
+    let chunksEmbedded = 0;
+    let errors = 0;
+    let bytesProcessed = 0;
+    let vectorTableInitialized = false;
+
+    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+    for (const batchMeta of batches) {
+      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+      const batchChunks: ChunkItem[] = [];
+      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+
+      for (const doc of batchDocs) {
+        if (!doc.body.trim()) continue;
+        const title = extractTitle(doc.body, doc.path);
+        const chunks = await chunkDocumentByTokens(doc.body, undefined, undefined, undefined, doc.path, options?.chunkStrategy);
+        for (let seq = 0; seq < chunks.length; seq++) {
+          batchChunks.push({
+            hash: doc.hash, title, text: chunks[seq]!.text, seq,
+            pos: chunks[seq]!.pos, tokens: chunks[seq]!.tokens,
+            bytes: encoder.encode(chunks[seq]!.text).length,
+          });
+        }
+      }
+
+      if (batchChunks.length === 0) {
+        bytesProcessed += batchBytes;
+        options?.onProgress?.({ chunksEmbedded, totalChunks: batchChunks.length, bytesProcessed, totalBytes, errors });
+        continue;
+      }
+
+      for (const chunk of batchChunks) {
+        try {
+          const text = formatDocForEmbedding(chunk.text, chunk.title, embedModel);
+          const result = await ollama.embed(text, { model: embedModel });
+          if (result && result.embedding) {
+            if (!vectorTableInitialized) {
+              store.ensureVecTable(result.embedding.length);
+              vectorTableInitialized = true;
+            }
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), embedModel, now);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+        } catch (e) {
+          console.warn(`⚠ Embedding error: ${e instanceof Error ? e.message : String(e)}`);
+          errors++;
+        }
+        bytesProcessed += chunk.bytes;
+        options?.onProgress?.({ chunksEmbedded, totalChunks: batchChunks.length, bytesProcessed, totalBytes, errors });
+      }
+      bytesProcessed += batchBytes;
+    }
+    await ollama.dispose();
+    return { docsProcessed: docsToEmbed.length, chunksEmbedded, errors, durationMs: Date.now() - startTime2 };
+  }
+  // --- End Ollama embed path ---
 
   if (options?.force) {
     clearAllEmbeddings(db);
@@ -1429,7 +1505,7 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's LLM or global singleton, wrapped in a session
   const llm = getLlm(store);
   const embedModelUri = llm.embedModelName;
 
@@ -2276,7 +2352,10 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
+
+  // Tokenization is only available on LlamaCpp; OllamaLLM uses char-based approximation
+  const llamaCpp = llm instanceof LlamaCpp ? llm : null;
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -2299,54 +2378,104 @@ export async function chunkDocumentByTokens(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
-    if (tokens.length <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokens.length });
-      return;
-    }
+    if (llamaCpp) {
+      // Token-based verification using LlamaCpp tokenizer
+      const tokens = await llamaCpp.tokenize(text);
+      if (tokens.length <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: tokens.length });
+        return;
+      }
 
-    const actualCharsPerToken = text.length / tokens.length;
-    let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
-    if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
-      safeMaxChars = Math.floor(text.length / 2);
-    }
-    safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+      const actualCharsPerToken = text.length / tokens.length;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+      if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+        safeMaxChars = Math.floor(text.length / 2);
+      }
+      safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
 
-    let nextOverlapChars = clampOverlapChars(
-      overlapChars * actualCharsPerToken / 2,
-      safeMaxChars,
-    );
-    let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
-    let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+      let nextOverlapChars = clampOverlapChars(
+        overlapChars * actualCharsPerToken / 2,
+        safeMaxChars,
+      );
+      let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+      let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
 
-    // Pathological single-line blobs can produce no meaningful breakpoint progress.
-    // Fall back to a simple half split so every recursion step strictly shrinks.
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
-      safeMaxChars = Math.max(1, Math.floor(text.length / 2));
-      nextOverlapChars = 0;
-      nextWindowChars = 0;
-      subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
-    }
+      // Pathological single-line blobs can produce no meaningful breakpoint progress.
+      // Fall back to a simple half split so every recursion step strictly shrinks.
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+        nextOverlapChars = 0;
+        nextWindowChars = 0;
+        subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+      }
 
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      const truncatedText = await llm.detokenize(fallbackTokens);
-      results.push({
-        text: truncatedText,
-        pos,
-        tokens: fallbackTokens.length,
-      });
-      return;
-    }
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+        const truncatedText = await llamaCpp.detokenize(fallbackTokens);
+        results.push({
+          text: truncatedText,
+          pos,
+          tokens: fallbackTokens.length,
+        });
+        return;
+      }
 
-    for (const subChunk of subChunks) {
-      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+      for (const subChunk of subChunks) {
+        await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+      }
+    } else {
+      // Char-based approximation for non-LlamaCpp backends (e.g. Ollama)
+      const approxTokenCount = Math.ceil(text.length / avgCharsPerToken);
+      if (approxTokenCount <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: approxTokenCount });
+        return;
+      }
+
+      // Re-split using char-based estimate
+      const actualCharsPerTokenEst = text.length / approxTokenCount;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerTokenEst * 0.95);
+      safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+      let nextOverlapChars = clampOverlapChars(
+        overlapChars * actualCharsPerTokenEst / 2,
+        safeMaxChars,
+      );
+      let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerTokenEst / 2));
+      let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+        nextOverlapChars = 0;
+        nextWindowChars = 0;
+        subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+      }
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        // Last resort: hard truncate at char boundary
+        const truncChars = Math.floor(maxTokens * avgCharsPerToken);
+        results.push({
+          text: text.slice(0, truncChars),
+          pos,
+          tokens: maxTokens,
+        });
+        return;
+      }
+
+      for (const subChunk of subChunks) {
+        await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+      }
     }
   };
 
@@ -3187,12 +3316,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -3256,7 +3385,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3274,7 +3403,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
@@ -3295,7 +3424,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3318,9 +3447,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents using LLM
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLLM();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 

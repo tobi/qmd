@@ -71,6 +71,7 @@ export interface Database {
   loadExtension(path: string): void;
   transaction<T extends (...args: any[]) => any>(fn: T): T;
   close(): void;
+  transaction<F extends (...args: any[]) => any>(fn: F): (...args: Parameters<F>) => ReturnType<F>;
 }
 
 export interface Statement {

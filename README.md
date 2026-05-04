@@ -129,7 +129,7 @@ qmd status                        # shows "MCP: running (PID ...)" when active
 
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
-- `GET /health` — liveness check with uptime
+- `GET /health` — liveness check with uptime, indexedDocuments count, and needsEmbedding count
 
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 

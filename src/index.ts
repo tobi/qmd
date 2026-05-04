@@ -17,6 +17,9 @@
  *   await store.close()
  */
 
+import fastGlob from "fast-glob";
+import { existsSync, readFileSync } from "fs";
+import { resolve } from "path";
 import {
   createStore as createStoreInternal,
   hybridQuery,
@@ -298,6 +301,9 @@ export interface QMDStore {
 
   // ── Index Health ────────────────────────────────────────────────────
 
+  /** Count files on disk not yet in the index */
+  getPendingFiles(): Promise<number>;
+
   /** Get index status (document counts, collections, embedding state) */
   getStatus(): Promise<IndexStatus>;
 
@@ -524,6 +530,45 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
 
     // Index Health
+    getPendingFiles: async () => {
+      const collections = getStoreCollections(db);
+      const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+      const stmt = db.prepare("SELECT 1 FROM documents WHERE active = 1 AND collection = ? AND path = ? LIMIT 1");
+      const activeCollections = new Set(
+        (db.prepare("SELECT DISTINCT collection FROM documents WHERE active = 1").all() as { collection: string }[]).map(r => r.collection)
+      );
+      const { handelize } = await import("./store.js");
+      let pending = 0;
+      for (const col of collections) {
+        if (!activeCollections.has(col.name)) continue;
+        if (!col.path || !existsSync(col.path)) continue;
+        const pattern = col.pattern || "**/*.md";
+        const allFiles: string[] = await fastGlob(pattern, {
+          cwd: col.path,
+          onlyFiles: true,
+          followSymbolicLinks: false,
+          dot: false,
+          ignore: [...excludeDirs.map(d => `**/${d}/**`), ...(col.ignore || [])],
+        });
+        const files = allFiles.filter(file => {
+          const parts = file.split("/");
+          return !parts.some(part => part.startsWith("."));
+        });
+        for (const file of files) {
+          try {
+            const filepath = resolve(col.path!, file);
+            const content = readFileSync(filepath, "utf-8");
+            if (!content.trim()) continue;
+            const path = handelize(file);
+            const existing = stmt.get(col.name, path);
+            if (!existing) pending++;
+          } catch {
+            continue;
+          }
+        }
+      }
+      return pending;
+    },
     getStatus: async () => internal.getStatus(),
     getIndexHealth: async () => internal.getIndexHealth(),
 

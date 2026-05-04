@@ -967,6 +967,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const body = await res.json();
     expect(body.status).toBe("ok");
     expect(typeof body.uptime).toBe("number");
+    expect(typeof body.indexedDocuments).toBe("number");
+    expect(typeof body.needsEmbedding).toBe("number");
   });
 
   test("GET /other returns 404", async () => {
