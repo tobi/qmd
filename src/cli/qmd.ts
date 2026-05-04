@@ -464,10 +464,14 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const statusConfig = (() => { try { return loadConfig(); } catch { return {}; } })();
+    const activeEmbedModel = statusConfig?.models?.embed ?? DEFAULT_EMBED_MODEL_URI;
+    const activeRerankModel = statusConfig?.models?.rerank ?? DEFAULT_RERANK_MODEL_URI;
+    const activeGenerateModel = statusConfig?.models?.generate ?? DEFAULT_GENERATE_MODEL_URI;
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(activeEmbedModel)}`);
+    console.log(`  Reranking:   ${hfLink(activeRerankModel)}`);
+    console.log(`  Generation:  ${hfLink(activeGenerateModel)}`);
   }
 
   // Device / GPU info
