@@ -2,8 +2,33 @@
 
 ## [Unreleased]
 
+### Changes
+
+- List-aware chunking. A new scanner tracks nested list items with a
+  stack-based state machine and emits weighted break points: top-level
+  items score 70, second-level 45, third-level and deeper 25, and the
+  transition from a list back to prose scores 75. Previously the naive
+  `list: 5` and `numlist: 5` patterns produced break points too weak to
+  influence chunking. Long lists now split cleanly at item boundaries
+  instead of mid-item. Ordered `1)` form is newly supported, as is
+  proper detection of nested sublists (which the old regex missed).
+- XML tag break points for agent-prompt markdown. The chunker now
+  recognizes line-anchored paired tags like `<example>…</example>`,
+  `<instructions>…</instructions>`, and `<thinking>…</thinking>` that
+  commonly appear in agent instruction files, and prefers to split at
+  the close of a tagged block (score 75) rather than mid-block. HTML5
+  element names (`<div>`, `<p>`, etc.) are blocked via a blocklist so
+  inline HTML in markdown is not confused for structural tags. Tags
+  inside code fences are ignored. Supports nested same-tag blocks,
+  namespaced tags (`<xsl:template>`), and custom elements
+  (`<my-widget>`).
+
 ### Fixes
 
+- Code fence detection now follows CommonMark pairing rules. Fences
+  opened with 4 or more backticks (or tildes) are correctly recognized
+  and paired, so chunks no longer split inside nested code blocks that
+  wrap shorter fences. Tilde fences are now supported.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive

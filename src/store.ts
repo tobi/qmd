@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { HTML_ELEMENTS } from "./html-elements.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -80,12 +81,14 @@ export interface BreakPoint {
 }
 
 /**
- * A region where a code fence exists (between ``` markers).
- * We should never split inside a code fence.
+ * A region of the document that the chunker must not split inside.
+ * Code fences are the first producer; future passes may contribute
+ * other kinds (e.g. list items, XML tag regions) to the same shape.
  */
-export interface CodeFenceRegion {
-  start: number;  // position of opening ```
-  end: number;    // position of closing ``` (or document end if unclosed)
+export interface ProtectedRegion {
+  start: number;     // inclusive start position
+  end: number;       // exclusive end position
+  kind?: string;     // producer tag (e.g. 'fence'); optional for back-compat
 }
 
 /**
@@ -101,11 +104,9 @@ export const BREAK_PATTERNS: [RegExp, number, string][] = [
   [/\n#{4}(?!#)/g, 70, 'h4'],      // #### but not #####
   [/\n#{5}(?!#)/g, 60, 'h5'],      // ##### but not ######
   [/\n#{6}(?!#)/g, 50, 'h6'],      // ######
-  [/\n```/g, 80, 'codeblock'],     // code block boundary (same as h3)
+  [/\n(?:`{3,}|~{3,})/g, 80, 'codeblock'],  // code block boundary (same as h3)
   [/\n(?:---|\*\*\*|___)\s*\n/g, 60, 'hr'],  // horizontal rule
   [/\n\n+/g, 20, 'blank'],         // paragraph boundary
-  [/\n[-*]\s/g, 5, 'list'],        // unordered list item
-  [/\n\d+\.\s/g, 5, 'numlist'],    // ordered list item
   [/\n/g, 1, 'newline'],           // minimal break
 ];
 
@@ -139,37 +140,354 @@ export function scanBreakPoints(text: string): BreakPoint[] {
 
 /**
  * Find all code fence regions in the text.
- * Code fences are delimited by ``` and we should never split inside them.
+ * Code fences are delimited by runs of ``` or ~~~ (3 or more), and we should
+ * never split inside them. Follows CommonMark pairing rules: the closing fence
+ * must use the same character as the opening fence, be at least as long, and
+ * carry no info string.
+ *
+ * Only column-0 fences are recognized. Indented fences are not detected.
  */
-export function findCodeFences(text: string): CodeFenceRegion[] {
-  const regions: CodeFenceRegion[] = [];
-  const fencePattern = /\n```/g;
-  let inFence = false;
-  let fenceStart = 0;
+export function findCodeFences(text: string): ProtectedRegion[] {
+  const regions: ProtectedRegion[] = [];
+  // Capture: fence char run, then the rest of the line (info string or close tail).
+  const fencePattern = /\n(`{3,}|~{3,})([^\n]*)/g;
+  let open: { char: string; len: number; start: number } | null = null;
 
   for (const match of text.matchAll(fencePattern)) {
-    if (!inFence) {
-      fenceStart = match.index!;
-      inFence = true;
-    } else {
-      regions.push({ start: fenceStart, end: match.index! + match[0].length });
-      inFence = false;
+    const run = match[1]!;
+    const tail = match[2]!;
+    const char = run[0]!;
+    const len = run.length;
+    const pos = match.index!;
+
+    if (!open) {
+      open = { char, len, start: pos };
+      continue;
     }
+
+    // To close: same char, length >= opening, and no info string on the close line.
+    if (char === open.char && len >= open.len && tail.trim() === '') {
+      regions.push({ start: open.start, end: pos + match[0].length, kind: 'fence' });
+      open = null;
+    }
+    // Otherwise it's content inside the open fence; ignore.
   }
 
   // Handle unclosed fence - extends to end of document
-  if (inFence) {
-    regions.push({ start: fenceStart, end: text.length });
+  if (open) {
+    regions.push({ start: open.start, end: text.length, kind: 'fence' });
   }
 
   return regions;
 }
 
 /**
- * Check if a position is inside a code fence region.
+ * Check if a position is inside any protected region.
  */
-export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
-  return fences.some(f => pos > f.start && pos < f.end);
+export function isInsideProtectedRegion(pos: number, regions: ProtectedRegion[]): boolean {
+  return regions.some(r => pos > r.start && pos < r.end);
+}
+
+interface ListFrame {
+  indent: number;       // column of marker character
+  contentCol: number;   // column where item body begins (after marker + space)
+}
+
+/**
+ * List-aware break point scanner. Walks the document line by line, tracking
+ * nested list frames on a stack. Emits break points at list item boundaries
+ * and when a list transitions back to non-list content.
+ *
+ * Scoring:
+ *   - list-end: 75
+ *   - depth 0 item: 70
+ *   - depth 1 item: 45
+ *   - depth 2+ item: 25
+ *
+ * Marker-type transitions at the same indent are ignored (not CommonMark).
+ * Only `-`, `*`, and `\d+[.)]` markers are recognized (no `+`).
+ * Positions match scanBreakPoints convention: the `\n` before the line.
+ */
+export function findListBreakPoints(text: string): BreakPoint[] {
+  const points: BreakPoint[] = [];
+  if (text.length === 0) return points;
+
+  const itemScores = [70, 45, 25];
+  const itemTypes = ['list-item-0', 'list-item-1', 'list-item-2'];
+  const scoreFor = (depth: number): number =>
+    depth < itemScores.length ? itemScores[depth]! : itemScores[itemScores.length - 1]!;
+  const typeFor = (depth: number): string =>
+    depth < itemTypes.length ? itemTypes[depth]! : itemTypes[itemTypes.length - 1]!;
+
+  const stack: ListFrame[] = [];
+
+  // Iterate lines. lineStart is the index of the first character of the line.
+  // The break-point position we emit is lineStart - 1 (the preceding `\n`),
+  // except for the first line where there's no preceding newline.
+  let lineStart = 0;
+  const n = text.length;
+
+  // Match list item: optional leading spaces, then marker + at least one space.
+  // Unordered: - or *  (NOT +)
+  // Ordered: digits followed by . or )
+  //
+  // Known limitations (deliberate, to keep the scanner simple):
+  //   - Space-separated markers only. `-\t` (dash followed by a literal tab)
+  //     is not recognized. This pattern does not occur in practice.
+  //   - Tab-indented lines are not recognized as list items. Modern markdown
+  //     uses spaces for indentation; tab indentation was never supported by
+  //     the previous regex either, so this is not a regression.
+  //   - Loose/tight list distinction, lazy continuation, and 4-space indented
+  //     code blocks inside items are not tracked — those are rendering-level
+  //     concerns that don't change where chunks should split.
+  const itemRegex = /^( *)(?:([-*])|(\d+)([.)]))( +)/;
+
+  while (lineStart <= n) {
+    // Find end of line
+    let lineEnd = text.indexOf('\n', lineStart);
+    if (lineEnd === -1) lineEnd = n;
+    const line = text.slice(lineStart, lineEnd);
+    const bpPos = lineStart === 0 ? 0 : lineStart - 1;
+
+    const isBlank = line.trim().length === 0;
+
+    if (isBlank) {
+      // Don't change state; next non-blank decides.
+      if (lineEnd === n) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const match = itemRegex.exec(line);
+    if (match) {
+      const leading = match[1]!;
+      const indent = leading.length;
+      const bullet = match[2];
+      const digits = match[3];
+      const ordPunct = match[4];
+      const spaces = match[5]!;
+      const markerLen = bullet ? 1 : (digits!.length + ordPunct!.length);
+      const contentCol = indent + markerLen + spaces.length;
+
+      // Pop frames whose indent exceeds this line's indent (dedent).
+      while (stack.length > 0 && indent < stack[stack.length - 1]!.indent) {
+        stack.pop();
+      }
+
+      let depth: number;
+      if (stack.length === 0) {
+        stack.push({ indent, contentCol });
+        depth = 0;
+      } else {
+        const top = stack[stack.length - 1]!;
+        if (indent >= top.contentCol) {
+          // Deeper nesting
+          stack.push({ indent, contentCol });
+          depth = stack.length - 1;
+        } else if (indent === top.indent) {
+          // Sibling
+          depth = stack.length - 1;
+        } else {
+          // Indent between top.indent and top.contentCol, or less than top.indent
+          // after popping. Treat as sibling at current level.
+          depth = stack.length - 1;
+        }
+      }
+
+      // Skip the first line of the document: position 0 can never be a
+      // chunk break (chunks always start at 0) and there's no preceding
+      // newline to point to anyway.
+      if (lineStart > 0) {
+        points.push({ pos: bpPos, score: scoreFor(depth), type: typeFor(depth) });
+      }
+    } else {
+      // Non-blank, non-list line.
+      if (stack.length > 0) {
+        const indent = line.length - line.trimStart().length;
+        const bottom = stack[0]!;
+        if (indent >= bottom.contentCol) {
+          // Continuation of outermost item; keep state.
+        } else {
+          // List ends.
+          stack.length = 0;
+          points.push({ pos: bpPos, score: 75, type: 'list-end' });
+        }
+      }
+    }
+
+    if (lineEnd === n) break;
+    lineStart = lineEnd + 1;
+  }
+
+  // End of document: if still in a list, emit a list-end at text.length.
+  if (stack.length > 0) {
+    points.push({ pos: n, score: 75, type: 'list-end' });
+  }
+
+  return points.sort((a, b) => a.pos - b.pos);
+}
+
+/**
+ * Find line-anchored XML-style tag break points.
+ *
+ * Agent instruction files and prompt docs frequently wrap structural blocks
+ * in XML tags like `<example>`, `<instructions>`, `<thinking>`, `<tool_use>`.
+ * We emit asymmetric break points at those boundaries so the chunker prefers
+ * to split at the close of a block rather than mid-block.
+ *
+ * Rules (see spec for full decisions):
+ *  - Tags must occupy their own line (leading whitespace allowed). Mid-line
+ *    tags and multi-line openers are ignored.
+ *  - Tag name grammar: `[A-Za-z_][A-Za-z0-9_.:-]*`.
+ *  - HTML5 element names are blocked (case-insensitive) so `<div>`, `<p>`, …
+ *    don't get treated as structural tags.
+ *  - Open/close name matching is case-sensitive (XML semantics).
+ *  - Self-closing `<tag/>` and `<tag />` produce no region.
+ *  - `<!-- … -->`, `<!DOCTYPE …>`, `<![CDATA[…]]>`, `<?xml … ?>` are skipped.
+ *  - Nesting is stack-based. Cross-tag interleaving is treated as malformed
+ *    and the affected tags emit zero break points.
+ *  - Unclosed tags emit nothing.
+ *  - Tags inside passed-in protected regions (code fences) are ignored.
+ *  - `pos` is the `\n` immediately before the tag line (matches
+ *    scanBreakPoints/findListBreakPoints convention). First-line tags at
+ *    position 0 emit no break point.
+ *
+ * Scoring: `tag-open` = 30 (weak — splitting right before content is bad),
+ *          `tag-close` = 75 (strong — splitting after a closed block is great).
+ *
+ * Known limitation: attribute parsing is lazy. The opener regex terminates
+ * at the first `>`, so a `>` inside a quoted attribute value will produce a
+ * malformed match. This is intentional — we don't tokenize attributes.
+ */
+export function findXmlTagBreakPoints(text: string, fences: ProtectedRegion[]): BreakPoint[] {
+  // Whole-line patterns. The line is everything between `\n`s (or start/end).
+  const NAME = '[A-Za-z_][A-Za-z0-9_.:-]*';
+  const openRe = new RegExp(`^\\s*<(${NAME})(?:\\s+[^>]*)?>\\s*$`);
+  const closeRe = new RegExp(`^\\s*</(${NAME})\\s*>\\s*$`);
+  const selfCloseRe = new RegExp(`^\\s*<(${NAME})(?:\\s+[^>]*)?/>\\s*$`);
+  // Non-tag angle-bracket constructs to ignore wholesale.
+  const commentRe = /^\s*<!--.*-->\s*$/;
+  const doctypeRe = /^\s*<!DOCTYPE\b[^>]*>\s*$/i;
+  const cdataRe = /^\s*<!\[CDATA\[.*\]\]>\s*$/;
+  const piRe = /^\s*<\?[\s\S]*\?>\s*$/;
+
+  interface Frame {
+    name: string;
+    checkpoint: number; // index into `pending` where this frame's breaks start
+  }
+
+  const stack: Frame[] = [];
+  // Buffered break points. Committed to `output` only when the outermost
+  // frame closes cleanly. Discarded back to a checkpoint on malformed close.
+  const pending: BreakPoint[] = [];
+  const output: BreakPoint[] = [];
+
+  const commit = () => {
+    if (stack.length === 0) {
+      for (const bp of pending) output.push(bp);
+      pending.length = 0;
+    }
+  };
+
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    // Find line end.
+    let lineEnd = text.indexOf('\n', lineStart);
+    if (lineEnd === -1) lineEnd = text.length;
+    const line = text.slice(lineStart, lineEnd);
+
+    // Fence precedence: if this line's start is inside a fence, skip it.
+    // Use the line start position; the fence region spans `\n` of the opener
+    // through end of close. lineStart > fence.start && lineStart < fence.end
+    // is exactly what isInsideProtectedRegion checks.
+    const insideFence = fences.some(r => lineStart > r.start && lineStart < r.end);
+    if (insideFence) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Skip non-tag angle-bracket constructs entirely.
+    if (commentRe.test(line) || doctypeRe.test(line) || cdataRe.test(line) || piRe.test(line)) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Self-closing: recognized but no state change, no break points.
+    // Checked before the plain open regex because `<tag />` would also
+    // match an opener with trailing `/` as an attribute.
+    if (selfCloseRe.test(line)) {
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const openMatch = line.match(openRe);
+    if (openMatch) {
+      const name = openMatch[1]!;
+      if (!HTML_ELEMENTS.has(name.toLowerCase())) {
+        // Push frame. Emit tag-open break point into pending (unless lineStart==0).
+        const frame: Frame = { name, checkpoint: pending.length };
+        stack.push(frame);
+        if (lineStart > 0) {
+          pending.push({ pos: lineStart - 1, score: 30, type: 'tag-open' });
+        }
+      }
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    const closeMatch = line.match(closeRe);
+    if (closeMatch) {
+      const name = closeMatch[1]!;
+      if (!HTML_ELEMENTS.has(name.toLowerCase())) {
+        if (stack.length === 0) {
+          // Stray closing tag — ignore.
+        } else {
+          const top = stack[stack.length - 1]!;
+          if (top.name === name) {
+            // Clean close: emit tag-close break point, pop.
+            if (lineStart > 0) {
+              pending.push({ pos: lineStart - 1, score: 75, type: 'tag-close' });
+            }
+            stack.pop();
+            commit();
+          } else {
+            // Malformed interleaving. Discard all pending entries for the
+            // top frame and everything stacked above it. The simplest way
+            // given our checkpoint convention: truncate pending back to the
+            // top frame's checkpoint and pop just that frame. We do NOT try
+            // to cascade — the outer frames remain, but their pending buffer
+            // is now shorter (the inner frame contributed nothing).
+            //
+            // However the spec asks: "zero break points for all involved
+            // tags". The involved tags here are the unmatched opener(s) at
+            // the top of the stack AND the current close. To be safe and
+            // match the spec's interleaving example `<a><b></a></b>`, we
+            // unwind the entire stack and discard all pending.
+            pending.length = 0;
+            stack.length = 0;
+            // The trailing `</b>` in the example is now a stray close; any
+            // further malformed closes will also be ignored via the
+            // stack-empty branch above.
+          }
+        }
+      }
+      if (lineEnd === text.length) break;
+      lineStart = lineEnd + 1;
+      continue;
+    }
+
+    // Content line — no state change.
+    if (lineEnd === text.length) break;
+    lineStart = lineEnd + 1;
+  }
+
+  // Unclosed tags: discard anything still pending (decision 13).
+  // `output` already has only cleanly committed break points.
+  return output.sort((a, b) => a.pos - b.pos);
 }
 
 /**
@@ -182,7 +500,7 @@ export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boole
  * @param targetCharPos - The ideal cut position (e.g., maxChars boundary)
  * @param windowChars - How far back to search for break points (default ~200 tokens)
  * @param decayFactor - How much to penalize distance (0.7 = 30% score at window edge)
- * @param codeFences - Code fence regions to avoid splitting inside
+ * @param protectedRegions - Regions to avoid splitting inside (code fences, etc.)
  * @returns The best position to cut at
  */
 export function findBestCutoff(
@@ -190,7 +508,7 @@ export function findBestCutoff(
   targetCharPos: number,
   windowChars: number = CHUNK_WINDOW_CHARS,
   decayFactor: number = 0.7,
-  codeFences: CodeFenceRegion[] = []
+  protectedRegions: ProtectedRegion[] = []
 ): number {
   const windowStart = targetCharPos - windowChars;
   let bestScore = -1;
@@ -200,8 +518,8 @@ export function findBestCutoff(
     if (bp.pos < windowStart) continue;
     if (bp.pos > targetCharPos) break;  // sorted, so we can stop
 
-    // Skip break points inside code fences
-    if (isInsideCodeFence(bp.pos, codeFences)) continue;
+    // Skip break points inside protected regions
+    if (isInsideProtectedRegion(bp.pos, protectedRegions)) continue;
 
     const distance = targetCharPos - bp.pos;
     // Squared distance decay: gentle early, steep late
@@ -251,13 +569,14 @@ export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[]
 }
 
 /**
- * Core chunk algorithm that operates on precomputed break points and code fences.
- * This is the shared implementation used by both regex-only and AST-aware chunking.
+ * Core chunk algorithm that operates on precomputed break points and
+ * protected regions. This is the shared implementation used by both
+ * regex-only and AST-aware chunking.
  */
 export function chunkDocumentWithBreakPoints(
   content: string,
   breakPoints: BreakPoint[],
-  codeFences: CodeFenceRegion[],
+  protectedRegions: ProtectedRegion[],
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
@@ -279,7 +598,7 @@ export function chunkDocumentWithBreakPoints(
         targetEndPos,
         windowChars,
         0.7,
-        codeFences
+        protectedRegions
       );
 
       if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
@@ -2224,9 +2543,12 @@ export function chunkDocument(
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  const breakPoints = scanBreakPoints(content);
-  const codeFences = findCodeFences(content);
-  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  const regexPoints = scanBreakPoints(content);
+  const listPoints = findListBreakPoints(content);
+  const protectedRegions = findCodeFences(content);
+  const tagPoints = findXmlTagBreakPoints(content, protectedRegions);
+  const breakPoints = mergeBreakPoints(mergeBreakPoints(regexPoints, listPoints), tagPoints);
+  return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
 
 /**
@@ -2246,18 +2568,20 @@ export async function chunkDocumentAsync(
   chunkStrategy: ChunkStrategy = "regex",
 ): Promise<{ text: string; pos: number }[]> {
   const regexPoints = scanBreakPoints(content);
-  const codeFences = findCodeFences(content);
+  const listPoints = findListBreakPoints(content);
+  const protectedRegions = findCodeFences(content);
+  const tagPoints = findXmlTagBreakPoints(content, protectedRegions);
 
-  let breakPoints = regexPoints;
+  let breakPoints = mergeBreakPoints(mergeBreakPoints(regexPoints, listPoints), tagPoints);
   if (chunkStrategy === "auto" && filepath) {
     const { getASTBreakPoints } = await import("./ast.js");
     const astPoints = await getASTBreakPoints(content, filepath);
     if (astPoints.length > 0) {
-      breakPoints = mergeBreakPoints(regexPoints, astPoints);
+      breakPoints = mergeBreakPoints(breakPoints, astPoints);
     }
   }
 
-  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  return chunkDocumentWithBreakPoints(content, breakPoints, protectedRegions, maxChars, overlapChars, windowChars);
 }
 
 /**
