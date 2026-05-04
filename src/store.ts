@@ -1174,6 +1174,7 @@ export type ReindexResult = {
   unchanged: number;
   removed: number;
   orphanedCleaned: number;
+  skippedFiles: string[];
 };
 
 /**
@@ -1214,6 +1215,7 @@ export async function reindexCollection(
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  const skippedFiles: string[] = [];
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
@@ -1223,7 +1225,16 @@ export async function reindexCollection(
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
+    } catch (err: any) {
+      const code = err?.code || "UNKNOWN";
+      const msg = `Skipped ${relativeFile}: ${code} (${err?.message || "unknown error"})`;
+      if (code === "ETIMEDOUT" || code === "ENOENT" || code === "EAGAIN" || code === "EPERM") {
+        // Expected transient/access errors — warn and continue
+        process.stderr.write(`\n  warning: ${msg}\n`);
+      } else {
+        process.stderr.write(`\n  warning: ${msg}\n`);
+      }
+      skippedFiles.push(relativeFile);
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
@@ -1279,7 +1290,7 @@ export async function reindexCollection(
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned };
+  return { indexed, updated, unchanged, removed, orphanedCleaned, skippedFiles };
 }
 
 export type EmbedProgress = {
