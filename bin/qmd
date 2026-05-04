@@ -1,32 +1,66 @@
-#!/bin/sh
-# Resolve symlinks so global installs (npm link / npm install -g) can find the
-# actual package directory instead of the global bin directory.
-SOURCE="$0"
-while [ -L "$SOURCE" ]; do
-  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-  TARGET="$(readlink "$SOURCE")"
-  case "$TARGET" in
-    /*) SOURCE="$TARGET" ;;
-    *) SOURCE="$SOURCE_DIR/$TARGET" ;;
-  esac
-done
+#!/usr/bin/env node
+// Cross-platform launcher for qmd.
+//
+// Previously this was a POSIX shell script with `#!/bin/sh`, which meant npm
+// on Windows generated shims that tried to route through `/bin/sh` — a path
+// that doesn't exist on Windows, so `qmd` failed immediately after a global
+// install. Rewriting the launcher in Node.js lets npm generate native
+// cmd/ps1/sh shims that invoke `node` directly on every platform.
 
-# Detect the runtime used to install this package and use the matching one
-# to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
-DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+import { spawn } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-# Detect the package manager that installed dependencies by checking lockfiles.
-# $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
-# on the system, not that it was used to install this package (see #361).
-#
-# package-lock.json takes priority: if it exists, npm installed the native
-# modules for Node.  The repo ships bun.lock, so without this check, source
-# builds that use npm would be incorrectly routed to bun, causing ABI
-# mismatches with better-sqlite3 / sqlite-vec (see #381).
-if [ -f "$DIR/package-lock.json" ]; then
-  exec node "$DIR/dist/cli/qmd.js" "$@"
-elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
-  exec bun "$DIR/dist/cli/qmd.js" "$@"
-else
-  exec node "$DIR/dist/cli/qmd.js" "$@"
-fi
+// Resolve symlinks so global installs (npm link / npm install -g) can find
+// the actual package directory instead of the global bin directory.
+const self = realpathSync(fileURLToPath(import.meta.url));
+const pkgDir = resolve(dirname(self), "..");
+const entry = resolve(pkgDir, "dist/cli/qmd.js");
+
+// Detect the runtime used to install this package and use the matching one
+// to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for
+// bun vs node).
+//
+// Detect the package manager that installed dependencies by checking
+// lockfiles. $BUN_INSTALL is intentionally NOT checked — it only indicates
+// that bun exists on the system, not that it was used to install this
+// package (see #361).
+//
+// package-lock.json takes priority: if it exists, npm installed the native
+// modules for Node. The repo ships bun.lock, so without this check, source
+// builds that use npm would be incorrectly routed to bun, causing ABI
+// mismatches with better-sqlite3 / sqlite-vec (see #381).
+function detectRunner(dir) {
+  if (existsSync(resolve(dir, "package-lock.json"))) return "node";
+  if (
+    existsSync(resolve(dir, "bun.lock")) ||
+    existsSync(resolve(dir, "bun.lockb"))
+  ) {
+    return "bun";
+  }
+  return "node";
+}
+
+const runnerName = detectRunner(pkgDir);
+// For Node, use process.execPath — guaranteed to exist and avoids relying on
+// PATH resolution. For bun, we have to look it up on PATH, which on Windows
+// requires shell: true so PATHEXT (.exe, .cmd) is honored.
+const runnerCmd = runnerName === "node" ? process.execPath : "bun";
+const needsShell = runnerName === "bun" && process.platform === "win32";
+
+const child = spawn(runnerCmd, [entry, ...process.argv.slice(2)], {
+  stdio: "inherit",
+  shell: needsShell,
+});
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+  } else {
+    process.exit(code ?? 0);
+  }
+});
+child.on("error", (err) => {
+  console.error(`qmd: failed to launch ${runnerName}: ${err.message}`);
+  process.exit(1);
+});
