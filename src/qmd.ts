@@ -2340,6 +2340,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    context: values.context as string | undefined,
   };
 
   return {
