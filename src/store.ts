@@ -1432,6 +1432,7 @@ export async function generateEmbeddings(
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
   const embedModelUri = llm.embedModelName;
+  const usesRemoteEmbedding = llm.usesRemoteEmbedding === true;
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -1458,13 +1459,21 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(
-          doc.body,
-          undefined, undefined, undefined,
-          doc.path,
-          options?.chunkStrategy,
-          session.signal,
-        );
+        const chunks = usesRemoteEmbedding
+          ? await chunkDocumentByApproxTokens(
+            doc.body,
+            undefined, undefined, undefined,
+            doc.path,
+            options?.chunkStrategy,
+            session.signal,
+          )
+          : await chunkDocumentByTokens(
+            doc.body,
+            undefined, undefined, undefined,
+            doc.path,
+            options?.chunkStrategy,
+            session.signal,
+          );
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -2358,6 +2367,35 @@ export async function chunkDocumentByTokens(
   }
 
   return results;
+}
+
+/**
+ * Chunk a document using only character-space heuristics.
+ * Used when the active embedding backend is remote and we want to avoid
+ * initializing a local tokenizer/model just for preprocessing.
+ */
+export async function chunkDocumentByApproxTokens(
+  content: string,
+  maxTokens: number = CHUNK_SIZE_TOKENS,
+  overlapTokens: number = CHUNK_OVERLAP_TOKENS,
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+  signal?: AbortSignal
+): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (signal?.aborted) return [];
+
+  const avgCharsPerToken = 3;
+  const maxChars = maxTokens * avgCharsPerToken;
+  const overlapChars = overlapTokens * avgCharsPerToken;
+  const windowChars = windowTokens * avgCharsPerToken;
+  const charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+
+  return charChunks.map((chunk) => ({
+    text: chunk.text,
+    pos: chunk.pos,
+    tokens: Math.max(1, Math.ceil(chunk.text.length / avgCharsPerToken)),
+  }));
 }
 
 // =============================================================================

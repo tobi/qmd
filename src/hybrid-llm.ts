@@ -32,6 +32,10 @@ export class HybridLLM implements LLM {
     return this.remote.embedModelName;
   }
 
+  get usesRemoteEmbedding(): boolean {
+    return this.remote.usesRemoteEmbedding === true;
+  }
+
   // Route to remote
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
     return this.remote.embed(text, options);

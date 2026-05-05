@@ -133,6 +133,10 @@ export class RemoteLLM implements LLM {
     return this.config.embedApiModel;
   }
 
+  get usesRemoteEmbedding(): boolean {
+    return true;
+  }
+
   /** True when expandApiModel is configured and remote query expansion is available. */
   get supportsExpand(): boolean {
     return !!this.config.expandApiModel;

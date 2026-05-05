@@ -406,6 +406,12 @@ export interface LLM {
   readonly embedModelName: string;
 
   /**
+   * True when embedding requests are served by a remote backend and callers may
+   * want to avoid local tokenizer/model initialization for preprocessing.
+   */
+  readonly usesRemoteEmbedding?: boolean;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
