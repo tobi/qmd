@@ -78,7 +78,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -124,11 +126,28 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
+        const localLlm = new LlamaCpp({
           embedModel: config.models.embed,
           generateModel: config.models.generate,
           rerankModel: config.models.rerank,
-        }));
+        });
+
+        // Check if remote embedding is configured (env vars take precedence over YAML)
+        const remoteConfig = remoteConfigFromEnv(config.models);
+        if (remoteConfig) {
+          const remoteLlm = new RemoteLLM(remoteConfig);
+          setDefaultLLM(new HybridLLM(remoteLlm, localLlm));
+        } else {
+          setDefaultLLM(localLlm);
+        }
+      } else {
+        // No YAML models config — still check env vars for remote embedding
+        const remoteConfig = remoteConfigFromEnv();
+        if (remoteConfig) {
+          const remoteLlm = new RemoteLLM(remoteConfig);
+          const localLlm = new LlamaCpp();
+          setDefaultLLM(new HybridLLM(remoteLlm, localLlm));
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -477,29 +496,33 @@ async function showStatus(): Promise<void> {
   if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
     console.log(`\n${c.bold}Device${c.reset}`);
     try {
-      const llm = getDefaultLlamaCpp();
-      const device = await llm.getDeviceInfo({ allowBuild: false });
-      if (device.gpu) {
-        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-        if (device.gpuDevices.length > 0) {
-          // Deduplicate and count GPUs
-          const counts = new Map<string, number>();
-          for (const name of device.gpuDevices) {
-            counts.set(name, (counts.get(name) || 0) + 1);
+      const llm = getDefaultLLM();
+      if (llm instanceof LlamaCpp) {
+        const device = await llm.getDeviceInfo({ allowBuild: false });
+        if (device.gpu) {
+          console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+          if (device.gpuDevices.length > 0) {
+            // Deduplicate and count GPUs
+            const counts = new Map<string, number>();
+            for (const name of device.gpuDevices) {
+              counts.set(name, (counts.get(name) || 0) + 1);
+            }
+            const deviceStr = Array.from(counts.entries())
+              .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+              .join(', ');
+            console.log(`  Devices:  ${deviceStr}`);
           }
-          const deviceStr = Array.from(counts.entries())
-            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-            .join(', ');
-          console.log(`  Devices:  ${deviceStr}`);
+          if (device.vram) {
+            console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+          }
+        } else {
+          console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+          console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
         }
-        if (device.vram) {
-          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-        }
+        console.log(`  CPU:      ${device.cpuCores} math cores`);
       } else {
-        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+        console.log(`  ${c.dim}device probe unavailable for non-local LLM backend${c.reset}`);
       }
-      console.log(`  CPU:      ${device.cpuCores} math cores`);
     } catch (error) {
       console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
       if (error instanceof Error && error.message) {
@@ -1688,6 +1711,9 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // Use the actual model name from the configured LLM (may be remote, not the default GGUF URI)
+  model = getDefaultLLM().embedModelName;
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
