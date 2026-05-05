@@ -2802,6 +2802,45 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings avoids local tokenization when embeddings are remote", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = {
+      ...createFakeEmbedLlm(),
+      usesRemoteEmbedding: true,
+    };
+
+    setDefaultLlamaCpp({
+      async tokenize() {
+        throw new Error("local tokenize should not be called");
+      },
+      async detokenize() {
+        throw new Error("local detokenize should not be called");
+      },
+    } as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", {
+        name: "remote-only",
+        body: "# Remote\n\n" + "Alpha beta gamma ".repeat(1200),
+      });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+      });
+
+      expect(result.docsProcessed).toBe(1);
+      expect(result.chunksEmbedded).toBeGreaterThan(0);
+      expect(fakeLlm.embedBatchCalls.length).toBeGreaterThan(0);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: result.chunksEmbedded });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
