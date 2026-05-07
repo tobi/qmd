@@ -1290,5 +1290,34 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     fs.unlinkSync(sentinelPath);
   });
 
+  test("tools/call update with failing update_command marks collection skipped", async () => {
+    await initSession();
+
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+          update: `false`, // exits with code 1
+        },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: { runUpdateCommand: true } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.collections).toHaveLength(1);
+    expect(sc.collections[0].name).toBe("notes");
+    expect(sc.collections[0].skipped).toBeDefined();
+    expect(sc.collections[0].skipped.reason).toBe("update-command-failed");
+  });
+
   // tests go here in subsequent tasks
 });
