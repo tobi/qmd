@@ -1377,5 +1377,35 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(sc.force).toBe(false);
   }, 60000);
 
+  test("tools/call embed with force=true regenerates all embeddings", async () => {
+    await initSession();
+
+    // Index documents first so there is something to embed
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Ensure baseline is fully embedded
+    await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    // Force: clears all vectors and regenerates
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "embed", arguments: { force: true } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.force).toBe(true);
+    expect(sc.chunksEmbedded).toBeGreaterThan(0); // re-embedded everything
+    expect(sc.docsEmbedded).toBeGreaterThan(0);
+  }, 120000);
+
   // tests go here in subsequent tasks
 });
