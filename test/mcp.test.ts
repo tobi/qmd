@@ -1352,5 +1352,30 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(sc.force).toBe(false);
   }, 60000); // longer timeout — real llamacpp embed
 
+  test("tools/call embed with nothing pending returns zero counts", async () => {
+    await initSession();
+
+    // Run embed once to make sure everything is embedded
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    // Second call — nothing pending now
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.chunksEmbedded).toBe(0);
+    expect(sc.docsEmbedded).toBe(0);
+    expect(sc.errors).toBe(0);
+    expect(sc.force).toBe(false);
+  }, 60000);
+
   // tests go here in subsequent tasks
 });
