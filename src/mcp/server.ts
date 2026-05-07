@@ -984,6 +984,10 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
  * Run a shell command in `cwd`. Resolves on exit code 0; rejects otherwise.
  * Used by the MCP `update` tool when the caller opts into running the
  * configured update_command (e.g. `git pull`).
+ *
+ * Security: `cmd` originates from the user-owned YAML config
+ * (`collections[].update`). It is treated as trusted input. Never pass
+ * untrusted strings here — they would execute as shell commands via `sh -c`.
  */
 function runShellCommand(cmd: string, cwd: string): Promise<void> {
   return new Promise((resolve, reject) => {
