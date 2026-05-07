@@ -1212,5 +1212,19 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(json.result.structuredContent.collections[0].name).toBe("notes");
   });
 
+  test("tools/call update with unknown collection returns isError", async () => {
+    await initSession();
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: { collection: "doesnotexist" } },
+    });
+
+    expect(status).toBe(200);
+    // McpServer wraps thrown errors into result.isError = true with content[0].text
+    expect(json.result.isError).toBe(true);
+    expect(json.result.content[0].text).toContain("Collection not found: doesnotexist");
+  });
+
   // tests go here in subsequent tasks
 });
