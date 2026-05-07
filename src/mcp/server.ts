@@ -130,10 +130,10 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   // --- Capability gaps ---
   if (!status.hasVectorIndex) {
     lines.push("");
-    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
+    lines.push("Note: No vector embeddings yet. Call the `embed` tool to enable semantic search (vec/hyde).");
   } else if (status.needsEmbedding > 0) {
     lines.push("");
-    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
+    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Call the \`embed\` tool to update.`);
   }
 
   // --- Search tool ---
@@ -156,6 +156,11 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("Retrieval:");
   lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+
+  lines.push("");
+  lines.push("Maintenance:");
+  lines.push("  - `update` — re-index collection(s) (optionally per-collection via `collection` param)");
+  lines.push("  - `embed`  — generate vector embeddings for documents that need them");
 
   // --- Non-obvious things that prevent mistakes ---
   lines.push("");
