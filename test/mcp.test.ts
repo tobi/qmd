@@ -1039,6 +1039,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
+    expect(toolNames).toContain("update");
+    expect(toolNames).toContain("embed");
   });
 
   test("POST /mcp tools/call query returns results", async () => {
