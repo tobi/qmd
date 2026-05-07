@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- MCP tools `update` and `embed` for re-indexing and embedding via the MCP server.
+  - `update` accepts optional `collection` and `runUpdateCommand` parameters.
+  - `embed` accepts optional `force` parameter for full re-embedding.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
