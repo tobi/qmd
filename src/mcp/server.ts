@@ -29,8 +29,9 @@ import {
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import { getConfigPath, getCollection as getCollectionFromYaml } from "../collections.js";
+import { enableProductionMode, reindexCollection, generateEmbeddings, listCollections } from "../store.js";
+import { spawn } from "node:child_process";
 
 // =============================================================================
 // Types for structured content
@@ -528,6 +529,53 @@ Intent-aware lex (C++ performance, not sports):
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: status,
       };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: update (Re-index collection(s))
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "update",
+    {
+      title: "Update Index",
+      description:
+        "Re-index markdown files in one or all collections. Updates the FTS5 index, document table, and cleans up orphaned content. Returns counts per collection.",
+      annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        collection: z.string().optional().describe(
+          "Collection name to re-index. Omit to re-index all collections."
+        ),
+        runUpdateCommand: z.boolean().optional().describe(
+          "Run the configured update_command (e.g. 'git pull') before indexing each collection. Default: false."
+        ),
+      },
+    },
+    async () => {
+      throw new Error("update: not implemented");
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: embed (Generate vector embeddings)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "embed",
+    {
+      title: "Generate Embeddings",
+      description:
+        "Generate vector embeddings for documents that don't yet have them. Default: incremental. Set force=true to wipe and regenerate all embeddings (long-running).",
+      annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        force: z.boolean().optional().describe(
+          "Wipe all existing embeddings and regenerate from scratch. Long-running. Default: false."
+        ),
+      },
+    },
+    async () => {
+      throw new Error("embed: not implemented");
     }
   );
 
