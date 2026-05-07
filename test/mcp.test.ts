@@ -1226,5 +1226,37 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(json.result.content[0].text).toContain("Collection not found: doesnotexist");
   });
 
+  test("tools/call update with runUpdateCommand omitted does NOT execute the configured command", async () => {
+    await initSession();
+
+    const sentinelPath = join(collectionDir, "sentinel-no-run.txt");
+
+    // Configure update_command for "notes" via the YAML config that the running
+    // server is reading. We write a fresh YAML that includes an update command
+    // creating the sentinel, then call update.
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+          update: `touch ${sentinelPath}`,
+        },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} }, // no runUpdateCommand
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    // Sentinel should NOT exist
+    const fs = await import("node:fs");
+    expect(fs.existsSync(sentinelPath)).toBe(false);
+  });
+
   // tests go here in subsequent tasks
 });
