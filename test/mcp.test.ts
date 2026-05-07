@@ -1077,3 +1077,99 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 });
+
+// =============================================================================
+// HTTP Transport — update/embed Tools
+// =============================================================================
+
+describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
+  let handle: HttpServerHandle;
+  let baseUrl: string;
+  let testDbPath: string;
+  let testConfigDir: string;
+  let collectionDir: string;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  /** Fresh session ID per test — initialize() always runs first. */
+  let sessionId: string | null = null;
+
+  async function mcpRequest(body: object): Promise<{ status: number; json: any }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+    const json = await res.json();
+    return { status: res.status, json };
+  }
+
+  async function initSession(): Promise<void> {
+    sessionId = null;
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+  }
+
+  beforeAll(async () => {
+    // Real on-disk collection directory with markdown files
+    collectionDir = await mkdtemp(join(tmpdir(), `qmd-mcp-update-coll-`));
+    await writeFile(join(collectionDir, "alpha.md"), "# Alpha\n\nFirst test document.\n");
+    await writeFile(join(collectionDir, "beta.md"), "# Beta\n\nSecond test document.\n");
+
+    // Empty database (we re-index from the collection dir, not seed data)
+    testDbPath = `/tmp/qmd-mcp-update-test-${Date.now()}.sqlite`;
+    const db = openDatabase(testDbPath);
+    initTestDatabase(db);
+
+    const config: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+        },
+      },
+    };
+    syncConfigToDb(db, config);
+    db.close();
+
+    testConfigDir = await mkdtemp(join(tmpdir(), `qmd-mcp-update-config-`));
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(config));
+
+    process.env.INDEX_PATH = testDbPath;
+    process.env.QMD_CONFIG_DIR = testConfigDir;
+
+    handle = await startMcpHttpServer(0, { quiet: true });
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    await handle.stop();
+
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    try { unlinkSync(testDbPath); } catch {}
+    for (const dir of [testConfigDir, collectionDir]) {
+      try {
+        const files = await readdir(dir);
+        for (const f of files) await unlink(join(dir, f));
+        await rmdir(dir);
+      } catch {}
+    }
+  });
+
+  // tests go here in subsequent tasks
+  test.todo("update/embed tests — implemented in subsequent tasks");
+});
