@@ -644,8 +644,27 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async () => {
-      throw new Error("embed: not implemented");
+    async ({ force }) => {
+      const useForce = force === true;
+      const result = await generateEmbeddings(store.internal, { force: useForce });
+
+      const summary = [
+        `Embed: ${result.chunksEmbedded} chunks across ${result.docsProcessed} doc(s)`,
+        result.errors > 0 ? `  errors: ${result.errors}` : null,
+        `  durationMs: ${result.durationMs}`,
+        useForce ? `  (force: regenerated all embeddings)` : null,
+      ].filter(Boolean).join("\n");
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: {
+          chunksEmbedded: result.chunksEmbedded,
+          docsEmbedded: result.docsProcessed,
+          errors: result.errors,
+          durationMs: result.durationMs,
+          force: useForce,
+        },
+      };
     }
   );
 

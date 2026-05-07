@@ -1319,5 +1319,38 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(sc.collections[0].skipped.reason).toBe("update-command-failed");
   });
 
+  test("tools/call embed embeds pending documents", async () => {
+    await initSession();
+
+    // Make sure documents are indexed first (creates rows that need embeddings)
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Reset YAML to plain (no update_command) for cleanliness in subsequent tests
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: { path: collectionDir, pattern: "**/*.md" },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.chunksEmbedded).toBeGreaterThan(0);
+    expect(sc.docsEmbedded).toBeGreaterThan(0);
+    expect(sc.errors).toBe(0);
+    expect(typeof sc.durationMs).toBe("number");
+    expect(sc.force).toBe(false);
+  }, 60000); // longer timeout — real llamacpp embed
+
   // tests go here in subsequent tasks
 });
