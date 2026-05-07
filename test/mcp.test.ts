@@ -1192,5 +1192,25 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     expect(typeof sc.needsEmbedding).toBe("number");
   });
 
+  test("tools/call update with collection arg only re-indexes that collection", async () => {
+    await initSession();
+
+    // First, ensure all collections are indexed (no-op for already-indexed)
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Now call update for the single existing collection — should report exactly that one
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "update", arguments: { collection: "notes" } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.structuredContent.collections).toHaveLength(1);
+    expect(json.result.structuredContent.collections[0].name).toBe("notes");
+  });
+
   // tests go here in subsequent tasks
 });
