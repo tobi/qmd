@@ -552,8 +552,78 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async () => {
-      throw new Error("update: not implemented");
+    async ({ collection, runUpdateCommand }) => {
+      const allCols = listCollections(store.internal.db);
+      const targets = collection
+        ? allCols.filter(c => c.name === collection)
+        : allCols;
+
+      if (collection && targets.length === 0) {
+        throw new Error(`Collection not found: ${collection}`);
+      }
+
+      type UpdateRow = {
+        name: string;
+        indexed: number;
+        updated: number;
+        unchanged: number;
+        removed: number;
+        orphanedCleaned: number;
+        durationMs: number;
+        skipped?: { reason: string; error: string };
+      };
+
+      const results: UpdateRow[] = [];
+
+      for (const col of targets) {
+        const start = Date.now();
+        const yamlCol = getCollectionFromYaml(col.name);
+
+        if (runUpdateCommand && yamlCol?.update) {
+          try {
+            await runShellCommand(yamlCol.update, col.pwd);
+          } catch (err) {
+            results.push({
+              name: col.name,
+              indexed: 0, updated: 0, unchanged: 0, removed: 0, orphanedCleaned: 0,
+              durationMs: Date.now() - start,
+              skipped: { reason: "update-command-failed", error: String(err) },
+            });
+            continue;
+          }
+        }
+
+        const r = await reindexCollection(store.internal, col.pwd, col.glob_pattern, col.name, {
+          ignorePatterns: yamlCol?.ignore,
+        });
+
+        results.push({
+          name: col.name,
+          indexed: r.indexed,
+          updated: r.updated,
+          unchanged: r.unchanged,
+          removed: r.removed,
+          orphanedCleaned: r.orphanedCleaned,
+          durationMs: Date.now() - start,
+        });
+      }
+
+      const status = await store.getStatus();
+
+      const summary = [
+        `Updated ${results.length} collection(s):`,
+        ...results.map(r =>
+          r.skipped
+            ? `  - ${r.name}: skipped (${r.skipped.reason})`
+            : `  - ${r.name}: ${r.indexed} new, ${r.updated} updated, ${r.unchanged} unchanged, ${r.removed} removed`
+        ),
+        `Needs embedding: ${status.needsEmbedding}`,
+      ].join("\n");
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: { collections: results, needsEmbedding: status.needsEmbedding },
+      };
     }
   );
 
@@ -884,6 +954,22 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
+}
+
+/**
+ * Run a shell command in `cwd`. Resolves on exit code 0; rejects otherwise.
+ * Used by the MCP `update` tool when the caller opts into running the
+ * configured update_command (e.g. `git pull`).
+ */
+function runShellCommand(cmd: string, cwd: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", cmd], { cwd, stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", code => {
+      if (code === 0) resolve();
+      else reject(new Error(`command exited with code ${code}`));
+    });
+  });
 }
 
 // Run if this is the main module

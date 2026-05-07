@@ -1126,10 +1126,9 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     await writeFile(join(collectionDir, "alpha.md"), "# Alpha\n\nFirst test document.\n");
     await writeFile(join(collectionDir, "beta.md"), "# Beta\n\nSecond test document.\n");
 
-    // Empty database (we re-index from the collection dir, not seed data)
+    // Write YAML config — startMcpHttpServer will create the DB with the correct
+    // schema via createStore({ configPath }) and sync the collection from YAML.
     testDbPath = `/tmp/qmd-mcp-update-test-${Date.now()}.sqlite`;
-    const db = openDatabase(testDbPath);
-    initTestDatabase(db);
 
     const config: CollectionConfig = {
       collections: {
@@ -1139,8 +1138,6 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
         },
       },
     };
-    syncConfigToDb(db, config);
-    db.close();
 
     testConfigDir = await mkdtemp(join(tmpdir(), `qmd-mcp-update-config-`));
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(config));
@@ -1170,6 +1167,30 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
     }
   });
 
+  test("tools/call update with no args re-indexes all collections", async () => {
+    await initSession();
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.isError).toBeFalsy();
+    expect(json.result.structuredContent).toBeDefined();
+
+    const sc = json.result.structuredContent;
+    expect(Array.isArray(sc.collections)).toBe(true);
+    expect(sc.collections).toHaveLength(1);
+    expect(sc.collections[0].name).toBe("notes");
+    expect(sc.collections[0].indexed).toBe(2); // alpha.md + beta.md
+    expect(sc.collections[0].updated).toBe(0);
+    expect(sc.collections[0].unchanged).toBe(0);
+    expect(sc.collections[0].removed).toBe(0);
+    expect(typeof sc.collections[0].durationMs).toBe("number");
+    expect(typeof sc.needsEmbedding).toBe("number");
+  });
+
   // tests go here in subsequent tasks
-  test.todo("update/embed tests — implemented in subsequent tasks");
 });
