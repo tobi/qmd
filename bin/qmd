@@ -16,9 +16,6 @@ done
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 # Detect the package manager that installed dependencies by checking lockfiles.
-# $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
-# on the system, not that it was used to install this package (see #361).
-#
 # package-lock.json takes priority: if it exists, npm installed the native
 # modules for Node.  The repo ships bun.lock, so without this check, source
 # builds that use npm would be incorrectly routed to bun, causing ABI
@@ -27,6 +24,10 @@ if [ -f "$DIR/package-lock.json" ]; then
   exec node "$DIR/dist/cli/qmd.js" "$@"
 elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
   exec bun "$DIR/dist/cli/qmd.js" "$@"
+elif command -v bun >/dev/null 2>&1; then
+  exec bun "$DIR/dist/cli/qmd.js" "$@"
+elif [ -x "$HOME/.bun/bin/bun" ]; then
+  exec "$HOME/.bun/bin/bun" "$DIR/dist/cli/qmd.js" "$@"
 else
   exec node "$DIR/dist/cli/qmd.js" "$@"
 fi

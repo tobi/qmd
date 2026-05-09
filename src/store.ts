@@ -25,6 +25,7 @@ import {
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
+  localModelsDisabled,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -4012,7 +4013,7 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = options?.skipRerank ?? localModelsDisabled();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -4407,7 +4408,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = options?.skipRerank ?? localModelsDisabled();
   const hooks = options?.hooks;
 
   const collections = options?.collections;

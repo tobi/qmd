@@ -150,7 +150,7 @@ describe("LlamaCpp expand context size config", () => {
 });
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
-  const HARDCODED_EMBED = "text-embedding-3-small";
+  const HARDCODED_EMBED = "nvidia/llama-3.2-nv-embedqa-1b-v2";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
   const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -192,13 +192,17 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     }
   });
 
-  test("default embedding uses external OpenAI-compatible API", async () => {
+  test("default embedding uses NVIDIA OpenAI-compatible API", async () => {
     const prevKey = process.env.QMD_EMBED_API_KEY;
+    const prevNvidiaKey = process.env.NVIDIA_API_KEY;
+    const prevBaseUrl = process.env.QMD_EMBED_API_BASE_URL;
     process.env.QMD_EMBED_API_KEY = "test-key";
+    delete process.env.NVIDIA_API_KEY;
+    delete process.env.QMD_EMBED_API_BASE_URL;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
-        model: "text-embedding-3-small",
+        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
         data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
       }),
     } as Response);
@@ -206,17 +210,27 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     try {
       const llm = new LlamaCpp({});
       const result = await llm.embed("hello");
-      expect(fetchMock).toHaveBeenCalledWith("https://api.openai.com/v1/embeddings", expect.objectContaining({
+      expect(fetchMock).toHaveBeenCalledWith("https://integrate.api.nvidia.com/v1/embeddings", expect.objectContaining({
         method: "POST",
       }));
+      const [, init] = fetchMock.mock.calls[0]!;
+      expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        input: ["hello"],
+        input_type: "passage",
+      });
       expect(result).toEqual({
         embedding: [0.1, 0.2, 0.3],
-        model: "text-embedding-3-small",
+        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
       });
     } finally {
       fetchMock.mockRestore();
       if (prevKey === undefined) delete process.env.QMD_EMBED_API_KEY;
       else process.env.QMD_EMBED_API_KEY = prevKey;
+      if (prevNvidiaKey === undefined) delete process.env.NVIDIA_API_KEY;
+      else process.env.NVIDIA_API_KEY = prevNvidiaKey;
+      if (prevBaseUrl === undefined) delete process.env.QMD_EMBED_API_BASE_URL;
+      else process.env.QMD_EMBED_API_BASE_URL = prevBaseUrl;
     }
   });
 
@@ -258,6 +272,23 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   test("hf embedding model opts into local embedding", () => {
     const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" });
     expect(llm.usesLocalEmbedding).toBe(true);
+  });
+
+  test("QMD_DISABLE_LOCAL_MODELS rejects local embedding models and bypasses local LLMs", async () => {
+    const prev = process.env.QMD_DISABLE_LOCAL_MODELS;
+    process.env.QMD_DISABLE_LOCAL_MODELS = "1";
+    try {
+      const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" });
+      await expect(llm.embed("hello")).rejects.toThrow("Local embedding models are disabled");
+      await expect(llm.expandQuery("hello")).resolves.toEqual([]);
+      await expect(llm.rerank("hello", [{ file: "doc.md", text: "hello" }])).resolves.toEqual({
+        model: "disabled",
+        results: [{ file: "doc.md", score: 0, index: 0 }],
+      });
+    } finally {
+      if (prev === undefined) delete process.env.QMD_DISABLE_LOCAL_MODELS;
+      else process.env.QMD_DISABLE_LOCAL_MODELS = prev;
+    }
   });
 });
 

@@ -20,10 +20,16 @@ fail() { printf "  %-60s FAIL\n" "$1 (got: $2, expected: $3)"; FAIL=$((FAIL + 1)
 # Instead of exec-ing a runtime, we echo which one would be chosen.
 detect_runtime() {
   local DIR="$1"
+  local BUN_AVAILABLE="${2:-1}"
+  local HOME_BUN_AVAILABLE="${3:-1}"
   if [ -f "$DIR/package-lock.json" ]; then
     echo "node"
   elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
     echo "bun"
+  elif [[ "$BUN_AVAILABLE" == "1" ]]; then
+    echo "bun"
+  elif [[ "$HOME_BUN_AVAILABLE" == "1" ]]; then
+    echo "home-bun"
   else
     echo "node"
   fi
@@ -45,10 +51,24 @@ echo "=== bin/qmd runtime detection tests ==="
 
 # --- Test cases ---
 
-# 1. No lockfiles → default to node
+# 1. No lockfiles → default to bun when bun is available
 d="$TMPDIR_BASE/no-lockfiles"
 mkdir -p "$d"
-assert_runtime "no lockfiles → node" "$d" "node"
+assert_runtime "no lockfiles + bun available → bun" "$d" "bun"
+
+got=$(detect_runtime "$d" 0 0)
+if [[ "$got" == "node" ]]; then
+  ok "no lockfiles + no bun → node"
+else
+  fail "no lockfiles + no bun → node" "$got" "node"
+fi
+
+got=$(detect_runtime "$d" 0 1)
+if [[ "$got" == "home-bun" ]]; then
+  ok "no lockfiles + home bun → home-bun"
+else
+  fail "no lockfiles + home bun → home-bun" "$got" "home-bun"
+fi
 
 # 2. Only bun.lock → bun
 d="$TMPDIR_BASE/bun-lock-only"
