@@ -220,6 +220,41 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     }
   });
 
+  test("NVIDIA embedding API uses NVIDIA_API_KEY and input_type", async () => {
+    const prevEmbedKey = process.env.QMD_EMBED_API_KEY;
+    const prevNvidiaKey = process.env.NVIDIA_API_KEY;
+    const prevBaseUrl = process.env.QMD_EMBED_API_BASE_URL;
+    delete process.env.QMD_EMBED_API_KEY;
+    process.env.NVIDIA_API_KEY = "nvidia-test-key";
+    process.env.QMD_EMBED_API_BASE_URL = "https://integrate.api.nvidia.com/v1";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({ embedModel: "nvidia/llama-3.2-nv-embedqa-1b-v2" });
+      await llm.embed("hello", { isQuery: true });
+      const [, init] = fetchMock.mock.calls[0]!;
+      expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        input: ["hello"],
+        input_type: "query",
+      });
+    } finally {
+      fetchMock.mockRestore();
+      if (prevEmbedKey === undefined) delete process.env.QMD_EMBED_API_KEY;
+      else process.env.QMD_EMBED_API_KEY = prevEmbedKey;
+      if (prevNvidiaKey === undefined) delete process.env.NVIDIA_API_KEY;
+      else process.env.NVIDIA_API_KEY = prevNvidiaKey;
+      if (prevBaseUrl === undefined) delete process.env.QMD_EMBED_API_BASE_URL;
+      else process.env.QMD_EMBED_API_BASE_URL = prevBaseUrl;
+    }
+  });
+
   test("hf embedding model opts into local embedding", () => {
     const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" });
     expect(llm.usesLocalEmbedding).toBe(true);

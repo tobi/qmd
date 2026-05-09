@@ -513,7 +513,7 @@ export class LlamaCpp implements LLM {
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
     this.embedApiBaseUrl = (config.embedApiBaseUrl || process.env.QMD_EMBED_API_BASE_URL || process.env.OPENAI_BASE_URL || DEFAULT_EMBED_API_BASE_URL).replace(/\/+$/, "");
-    this.embedApiKey = config.embedApiKey || process.env.QMD_EMBED_API_KEY || process.env.OPENAI_API_KEY;
+    this.embedApiKey = config.embedApiKey || process.env.QMD_EMBED_API_KEY || process.env.NVIDIA_API_KEY || process.env.OPENAI_API_KEY;
     this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -991,7 +991,11 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
-  private async embedExternal(texts: string[], model: string): Promise<(EmbeddingResult | null)[]> {
+  private isNvidiaEmbedApi(): boolean {
+    return /(^|\.)nvidia\.com$/i.test(new URL(this.embedApiBaseUrl).hostname);
+  }
+
+  private async embedExternal(texts: string[], model: string, options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
     if (!this.embedApiKey) {
       throw new Error(
@@ -1006,7 +1010,11 @@ export class LlamaCpp implements LLM {
         "Authorization": `Bearer ${this.embedApiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model, input: texts }),
+      body: JSON.stringify({
+        model,
+        input: texts,
+        ...(this.isNvidiaEmbedApi() ? { input_type: options.isQuery ? "query" : "passage" } : {}),
+      }),
     });
 
     if (!response.ok) {
@@ -1036,7 +1044,7 @@ export class LlamaCpp implements LLM {
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     const model = options.model ?? this.embedModelUri;
     if (!isLocalEmbeddingModel(model)) {
-      const results = await this.embedExternal([text], model);
+      const results = await this.embedExternal([text], model, options);
       return results[0] ?? null;
     }
 
@@ -1071,7 +1079,7 @@ export class LlamaCpp implements LLM {
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const model = options.model ?? this.embedModelUri;
     if (!isLocalEmbeddingModel(model)) {
-      return this.embedExternal(texts, model);
+      return this.embedExternal(texts, model, options);
     }
 
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");

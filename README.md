@@ -492,6 +492,16 @@ export QMD_EMBED_API_BASE_URL="https://api.openai.com/v1"
 export QMD_EMBED_MODEL="text-embedding-3-small"
 ```
 
+NVIDIA NIM's OpenAI-compatible endpoint can be used directly. QMD reads
+`NVIDIA_API_KEY` when `QMD_EMBED_API_KEY` is not set and sends NVIDIA's required
+`input_type` automatically (`passage` while indexing, `query` while searching):
+
+```sh
+export NVIDIA_API_KEY="..."
+export QMD_EMBED_API_BASE_URL="https://integrate.api.nvidia.com/v1"
+export QMD_EMBED_MODEL="nvidia/llama-3.2-nv-embedqa-1b-v2"
+```
+
 Reranking and query expansion still use local GGUF models via node-llama-cpp:
 
 | Model | Purpose | Size |
