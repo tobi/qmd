@@ -153,6 +153,13 @@ export interface SearchOptions {
   intent?: string;
   /** Rerank results using LLM (default: true) */
   rerank?: boolean;
+  /**
+   * Run LLM query expansion before search (default: true). Set to false to
+   * search the original query verbatim — useful for non-English corpora
+   * where the expansion model translates the query into English and
+   * degrades vector recall.
+   */
+  expand?: boolean;
   /** Filter to a specific collection */
   collection?: string;
   /** Filter to specific collections */
@@ -393,6 +400,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collections ?? []),
       ];
       const skipRerank = opts.rerank === false;
+      const skipExpansion = opts.expand === false;
 
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
@@ -415,6 +423,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         explain: opts.explain,
         intent: opts.intent,
         skipRerank,
+        skipExpansion,
         chunkStrategy: opts.chunkStrategy,
       });
     },

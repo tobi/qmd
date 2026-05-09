@@ -1814,6 +1814,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  skipExpansion?: boolean;  // Skip LLM query expansion, search verbatim
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
 };
 
@@ -2407,6 +2408,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        skipExpansion: opts.skipExpansion,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -2418,6 +2420,10 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
           },
           onExpand: (original, expanded, ms) => {
+            if (opts.skipExpansion) {
+              process.stderr.write(`${c.dim}Expansion disabled (--no-expand) — searching original query only${c.reset}\n`);
+              return;
+            }
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
             logExpansionTree(original, expanded);
             process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
@@ -2523,6 +2529,7 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "no-expand": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -2565,6 +2572,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    skipExpansion: !!values["no-expand"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -2787,6 +2795,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-expand                - Skip LLM query expansion (search original query verbatim; useful for non-English corpora)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
