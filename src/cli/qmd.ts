@@ -463,7 +463,8 @@ async function showStatus(): Promise<void> {
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    const activeEmbedModel = resolveEmbedModelForCli();
+    console.log(`  Embedding:   ${hfLink(activeEmbedModel)}${activeEmbedModel !== DEFAULT_EMBED_MODEL_URI ? ' (config)' : ''}`);
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
@@ -1680,6 +1681,11 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 export function resolveEmbedModelForCli(): string {
+  // Resolution order: config > env > default
+  try {
+    const config = loadConfig();
+    if (config.models?.embed) return config.models.embed;
+  } catch { /* config may not exist */ }
   return process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL_URI;
 }
 
