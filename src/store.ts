@@ -22,9 +22,11 @@ import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -62,8 +64,8 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1161,8 +1163,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1511,8 +1513,11 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's configured LLM or the global singleton, wrapped in a session
   const embedModelUri = model;
+  const formatDoc = llm.isRemote
+    ? (text: string, title?: string) => title ? `${title}\n${text}` : text
+    : (text: string, title?: string) => formatDocForEmbedding(text, title, embedModelUri);
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -1545,6 +1550,7 @@ export async function generateEmbeddings(
           doc.path,
           options?.chunkStrategy,
           session.signal,
+          llm,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -1570,7 +1576,7 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
+        const firstText = formatDoc(firstChunk.text, firstChunk.title);
         const firstResult = await session.embed(firstText, { model });
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1602,7 +1608,7 @@ export async function generateEmbeddings(
 
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+        const texts = chunkBatch.map(chunk => formatDoc(chunk.text, chunk.title));
 
         try {
           const embeddings = await session.embedBatch(texts, { model });
@@ -1626,7 +1632,7 @@ export async function generateEmbeddings(
           } else {
             for (const chunk of chunkBatch) {
               try {
-                const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
+                const text = formatDoc(chunk.text, chunk.title);
                 const result = await session.embed(text, { model });
                 if (result) {
                   insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
@@ -1833,8 +1839,8 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep letters, numbers, "$"; dash-separate rest (including dots)
-          .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
+          .replace(/[^\p{L}\p{N}$]+/gu, "-") // Keep letters, numbers, "$"; dash-separate rest (including dots)
+          .replace(/^-+|-+$/g, ""); // Remove leading/trailing dashes
 
         return cleanedName + ext;
       } else {
@@ -2380,9 +2386,10 @@ export async function chunkDocumentByTokens(
   windowTokens: number = CHUNK_WINDOW_TOKENS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  llmOverride?: LLM,
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3303,7 +3310,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -3428,7 +3435,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3467,7 +3474,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -4276,8 +4283,10 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
+    const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+    const textsToEmbed = llm.isRemote
+      ? vecQueries.map(q => q.text)
+      : vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
@@ -4520,7 +4529,7 @@ export async function vectorSearchQuery(
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
+  const embedModel = getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL;
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
@@ -4662,8 +4671,10 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
+      const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+      const textsToEmbed = llm.isRemote
+        ? vecSearches.map(s => s.query)
+        : vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);

@@ -291,6 +291,7 @@ describe("Store Creation", () => {
     _resetProductionModeForTesting();
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
+    _resetProductionModeForTesting();
 
     expect(() => createStore()).toThrow("Database path not set");
 
@@ -2924,6 +2925,9 @@ describe("Embedding batching", () => {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
       async embed(text: string, options?: { model?: string }) {
         embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
