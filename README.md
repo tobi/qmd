@@ -135,6 +135,27 @@ LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
+##### Daemon Fast-Path for the CLI
+
+When the HTTP daemon is running, `qmd query` automatically routes its
+search pipeline through the daemon instead of cold-loading the
+embedding, expansion, and reranker models for each invocation. On a warm
+daemon, `qmd query` drops from ~10-17s to ~2-4s (cold) or sub-second (warm
+rerank cache). `qmd search` (BM25) and `qmd vsearch` (vector-only)
+remain in-process — BM25 is already fast, and vsearch's pipeline is
+semantically different from the daemon's hybrid path.
+
+No configuration needed: the CLI discovers the daemon via
+`~/.cache/qmd/mcp.pid` + `~/.cache/qmd/mcp.port`. If the daemon is
+unreachable or the CLI is using a non-default index (`--index` or
+`INDEX_PATH`), it silently falls back to the existing in-process path.
+
+Escape hatches:
+- `--no-daemon` on a single invocation
+- `QMD_NO_DAEMON=1` environment variable (global)
+- `QMD_DEBUG=1` to log daemon discovery decisions to stderr
+- `qmd status` shows the daemon URL when running
+
 ### SDK / Library Usage
 
 Use QMD as a library in your own Node.js or Bun applications.

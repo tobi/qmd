@@ -127,6 +127,19 @@ qmd multi-get "journals/2026-*.md" -l 40  # Batch pull snippets by glob
 qmd multi-get notes/foo.md,notes/bar.md   # Comma-separated list, preserves order
 ```
 
+## Making `qmd query` Faster
+
+On machines where query speed matters (agents, IDE integrations),
+start the MCP daemon once:
+
+```bash
+qmd mcp --http --daemon
+```
+
+The CLI transparently routes through the daemon — no flag changes
+needed. Cold `qmd query` drops from ~15s to ~3s. Stop with
+`qmd mcp stop`. See `qmd status` to check if it's running.
+
 ## HTTP API
 
 ```bash
