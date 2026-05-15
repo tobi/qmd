@@ -100,6 +100,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { parseDurationMs, runWatchLoop } from "../watch.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -544,7 +545,29 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+interface UpdateOptions {
+  /** Suppress informational logging; still surface errors and meaningful changes. */
+  quiet?: boolean;
+  /** Skip closeDb() at end (caller owns DB lifecycle, e.g. watch loop). */
+  keepDbOpen?: boolean;
+}
+
+interface UpdateSummary {
+  /** Number of newly indexed docs across all collections. */
+  indexed: number;
+  /** Number of docs whose content changed. */
+  updated: number;
+  /** Number of docs removed from the filesystem. */
+  removed: number;
+  /** True if at least one collection had any change. */
+  anyChange: boolean;
+  /** Number of unique content hashes that still need embeddings. */
+  needsEmbedding: number;
+}
+
+async function updateCollections(updateOpts: UpdateOptions = {}): Promise<UpdateSummary> {
+  const quiet = !!updateOpts.quiet;
+  const logInfo = (msg: string) => { if (!quiet) console.log(msg); };
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -554,23 +577,31 @@ async function updateCollections(): Promise<void> {
 
   const collections = listCollections(db);
 
+  const summary: UpdateSummary = {
+    indexed: 0,
+    updated: 0,
+    removed: 0,
+    anyChange: false,
+    needsEmbedding: 0,
+  };
+
   if (collections.length === 0) {
-    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
-    closeDb();
-    return;
+    logInfo(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    if (!updateOpts.keepDbOpen) closeDb();
+    return summary;
   }
 
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  logInfo(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
     if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+    logInfo(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
     if (yamlCol?.update) {
-      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      logInfo(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
           cwd: col.pwd,
@@ -587,29 +618,37 @@ async function updateCollections(): Promise<void> {
         });
 
         if (output.trim()) {
-          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
+          logInfo(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
         }
         if (errorOutput.trim()) {
-          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+          // Custom update command stderr is always shown — it's a likely error signal.
+          console.error(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
         }
 
         if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
+          console.error(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
+          if (quiet) {
+            // In watch mode, surface the error but don't kill the process — the
+            // watch loop's circuit breaker handles repeated failures.
+            throw new Error(`Update command for collection '${col.name}' exited ${exitCode}`);
+          }
           process.exit(exitCode);
         }
       } catch (err) {
-        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
+        console.error(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
+        if (quiet) throw err;
         process.exit(1);
       }
     }
 
     const startTime = Date.now();
-    console.log(`Collection: ${col.pwd} (${col.glob_pattern})`);
-    progress.indeterminate();
+    logInfo(`Collection: ${col.pwd} (${col.glob_pattern})`);
+    if (!quiet) progress.indeterminate();
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
       onProgress: (info) => {
+        if (quiet) return;
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
         const rate = info.current / elapsed;
@@ -619,22 +658,39 @@ async function updateCollections(): Promise<void> {
       },
     });
 
-    progress.clear();
-    console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
-    if (result.orphanedCleaned > 0) {
-      console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+    if (!quiet) progress.clear();
+    summary.indexed += result.indexed;
+    summary.updated += result.updated;
+    summary.removed += result.removed;
+    if (result.indexed > 0 || result.updated > 0 || result.removed > 0) {
+      summary.anyChange = true;
+      // In quiet mode, surface changes so watch logs are actionable.
+      if (quiet) {
+        console.log(
+          `[${new Date().toISOString()}] ${col.name}: ${result.indexed} new, ${result.updated} updated, ${result.removed} removed`,
+        );
+      }
     }
-    console.log("");
+    if (!quiet) {
+      console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+      if (result.orphanedCleaned > 0) {
+        console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+      }
+      console.log("");
+    }
   }
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  closeDb();
+  summary.needsEmbedding = needsEmbedding;
+  if (!updateOpts.keepDbOpen) closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  logInfo(`${c.green}✓ All collections updated.${c.reset}`);
   if (needsEmbedding > 0) {
-    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+    logInfo(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
+
+  return summary;
 }
 
 /**
@@ -2515,6 +2571,10 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
+      // Watch options (update --watch)
+      watch: { type: "boolean" },
+      interval: { type: "string" },  // e.g. "30s", "5m", "1h"
+      embed: { type: "boolean" },    // auto-embed after each update tick
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2730,6 +2790,8 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("    --watch [--interval <dur>]  - Re-index periodically (default 5m). Use 30s, 5m, 1h.");
+  console.log("    --watch --embed             - Also auto-embed after each tick if new hashes appear");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -3114,9 +3176,42 @@ if (isMain) {
       await showStatus();
       break;
 
-    case "update":
+    case "update": {
+      if (cli.values.watch) {
+        const intervalRaw = (cli.values.interval as string | undefined) ?? "5m";
+        let intervalMs: number;
+        try {
+          intervalMs = parseDurationMs(intervalRaw);
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          process.exit(1);
+        }
+        const runEmbed = !!cli.values.embed;
+        const embedModel = runEmbed ? resolveEmbedModelForCli() : undefined;
+        // Remove the top-level cursor-restoring signal handlers so the watch
+        // loop can install its own and exit cleanly between ticks.
+        process.removeAllListeners("SIGINT");
+        process.removeAllListeners("SIGTERM");
+        console.error(
+          `${c.bold}qmd watch:${c.reset} re-indexing every ${intervalRaw}${runEmbed ? " (auto-embed enabled)" : ""}. Ctrl-C to stop.`,
+        );
+        const result = await runWatchLoop({
+          intervalMs,
+          tick: async () => {
+            const summary = await updateCollections({ quiet: true });
+            if (runEmbed && summary.needsEmbedding > 0) {
+              console.log(
+                `[${new Date().toISOString()}] embedding ${summary.needsEmbedding} new hash(es)...`,
+              );
+              await vectorIndex(embedModel!, false, {});
+            }
+          },
+        });
+        process.exit(result.stoppedBy === "max-failures" ? 1 : 0);
+      }
       await updateCollections();
       break;
+    }
 
     case "embed":
       try {

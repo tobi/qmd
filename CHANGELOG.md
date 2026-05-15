@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Features
+
+- `qmd update --watch`: re-index collections on a fixed interval without an external scheduler. Configure with `--interval 30s|5m|1h` (default 5m). Combine with `--embed` to also generate vector embeddings whenever new hashes appear. Designed for "drop into mcp.json and forget" workflows where the MCP server is paired with a sibling watcher process. Quiet by default: ticks only log when documents actually change, and a 3-strike circuit breaker exits non-zero if reindexing fails repeatedly.
+
 ### Fixes
 
 - Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
