@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Features
+
+- `qmd update --watch`: re-index collections on a fixed interval without an external scheduler. Configure with `--interval 30s|5m|1h` (default 5m). Combine with `--embed` to also generate vector embeddings whenever new hashes appear. Designed for "drop into mcp.json and forget" workflows where the MCP server is paired with a sibling watcher process. Quiet by default: ticks only log when documents actually change, and a 3-strike circuit breaker exits non-zero if reindexing fails repeatedly.
+
 ### Fixes
 
 - GPU: add `QMD_FORCE_CPU=1` / `--no-gpu` to bypass CUDA/Vulkan/Metal probing entirely, and route native llama.cpp stdout noise to stderr so JSON output stays parseable during search/query commands.

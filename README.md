@@ -135,6 +135,20 @@ LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
+#### Keeping the Index Fresh
+
+When QMD is running as an MCP server, pair it with `qmd update --watch` so the index stays current as your notes change:
+
+```sh
+# Terminal 1 — MCP server
+qmd mcp --http --daemon
+
+# Terminal 2 — sibling watcher (re-index every 5 minutes, auto-embed new hashes)
+qmd update --watch --embed
+```
+
+For a more permanent setup, run `qmd update --watch --embed` from a launchd job (macOS), systemd user unit (Linux), or scheduled task (Windows).
+
 ### SDK / Library Usage
 
 Use QMD as a library in your own Node.js or Bun applications.
@@ -750,6 +764,15 @@ qmd update
 
 # Re-index with git pull first (for remote repos)
 qmd update --pull
+
+# Watch mode: re-index periodically (default every 5 minutes)
+qmd update --watch
+
+# Watch with a custom interval (units: ms, s, m, h)
+qmd update --watch --interval 30s
+
+# Watch and auto-embed new hashes after each tick
+qmd update --watch --interval 5m --embed
 
 # Get document by filepath (with fuzzy matching suggestions)
 qmd get notes/meeting.md
