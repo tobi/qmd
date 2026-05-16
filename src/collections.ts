@@ -22,6 +22,16 @@ import YAML from "yaml";
 export type ContextMap = Record<string, string>;
 
 /**
+ * Decay strategy for a collection
+ * Controls how quickly documents in this collection are forgotten
+ */
+export interface DecayConfig {
+  enabled?: boolean;         // Whether decay is active (default: true)
+  baseLambda?: number;       // Base decay rate (default: 0.16 = fact category)
+  pruneThreshold?: number;   // Strength below which docs are pruned (default: 0.05)
+}
+
+/**
  * A single collection configuration
  */
 export interface Collection {
@@ -31,6 +41,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  decay?: DecayConfig;       // Optional decay strategy for this collection
 }
 
 /**
