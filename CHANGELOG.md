@@ -4,6 +4,7 @@
 
 ### Fixes
 
+- GPU: add `QMD_FORCE_CPU=1` / `--no-gpu` to bypass CUDA/Vulkan/Metal probing entirely, and route native llama.cpp stdout noise to stderr so JSON output stays parseable during search/query commands.
 - Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
   to the requested collection instead of embedding global pending work.
   Scoped `--force` clears only collection-owned vectors, preserves shared

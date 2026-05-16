@@ -13,6 +13,8 @@ import {
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
+  setNodeLlamaCppModuleForTest,
+  withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
   withLLMSession,
@@ -78,6 +80,29 @@ describe("QMD_LLAMA_GPU resolution", () => {
     expect(resolveLlamaGpuMode(" cuda ")).toBe("cuda");
   });
 
+  test("QMD_FORCE_CPU disables GPU before QMD_LLAMA_GPU auto-detection", () => {
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_FORCE_CPU = "1";
+    try {
+      expect(resolveLlamaGpuMode(undefined)).toBe(false);
+      expect(resolveLlamaGpuMode("cuda")).toBe(false);
+    } finally {
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
+  test("QMD_FORCE_CPU ignores false-ish values", () => {
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_FORCE_CPU = "0";
+    try {
+      expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    } finally {
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
   test("warns and falls back to auto for unsupported values", () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     try {
@@ -86,6 +111,71 @@ describe("QMD_LLAMA_GPU resolution", () => {
       expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_LLAMA_GPU");
     } finally {
       stderrSpy.mockRestore();
+    }
+  });
+});
+
+describe("native llama stdout containment", () => {
+  test("redirects native stdout noise to stderr while JSON callers are initializing llama", async () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      await withNativeStdoutRedirectedToStderr(async () => {
+        process.stdout.write("cmake build spam\n");
+        return "ok";
+      });
+
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith("cmake build spam\n", undefined, undefined);
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("keeps native GPU failure noise off stdout and caches failed GPU init", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_LLAMA_GPU = "cuda";
+    delete process.env.QMD_FORCE_CPU;
+
+    const calls: unknown[] = [];
+    const fakeLlama = { gpu: false, cpuMathCores: 4 };
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options.gpu);
+        if (options.gpu === "cuda") {
+          process.stdout.write("cmake build spam\n");
+          throw new Error("CUDA unavailable");
+        }
+        return fakeLlama as any;
+      }),
+    });
+
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const first = new LlamaCpp();
+      const second = new LlamaCpp();
+
+      await (first as any).ensureLlama();
+      await (second as any).ensureLlama();
+
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith("cmake build spam\n", undefined, undefined);
+      expect(calls).toEqual(["cuda", false, false]);
+      expect(String(stderrSpy.mock.calls.map(call => call[0]).join(""))).toContain("skipping previously failed GPU init");
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
     }
   });
 });
