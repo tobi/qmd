@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- MCP tools `update` and `embed` for re-indexing and embedding via the MCP server.
+  - `update` accepts optional `collection` and `runUpdateCommand` parameters.
+  - `embed` accepts optional `force` parameter for full re-embedding.
+
 ### Fixes
 
 - GPU: add `QMD_FORCE_CPU=1` / `--no-gpu` to bypass CUDA/Vulkan/Metal probing entirely, and route native llama.cpp stdout noise to stderr so JSON output stays parseable during search/query commands.

@@ -1055,6 +1055,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
+    expect(toolNames).toContain("update");
+    expect(toolNames).toContain("embed");
   });
 
   test("POST /mcp tools/call query returns results", async () => {
@@ -1115,4 +1117,336 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(hit.line).toBe(301);
     expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
   });
+});
+
+// =============================================================================
+// HTTP Transport — update/embed Tools
+// =============================================================================
+
+describe.skipIf(!!process.env.CI)("MCP HTTP Transport — update/embed", () => {
+  let handle: HttpServerHandle;
+  let baseUrl: string;
+  let testDbPath: string;
+  let testConfigDir: string;
+  let collectionDir: string;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  /** Fresh session ID per test — initialize() always runs first. */
+  let sessionId: string | null = null;
+
+  async function mcpRequest(body: object): Promise<{ status: number; json: any }> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) sessionId = sid;
+    const json = await res.json();
+    return { status: res.status, json };
+  }
+
+  async function initSession(): Promise<void> {
+    sessionId = null;
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+  }
+
+  beforeAll(async () => {
+    // Real on-disk collection directory with markdown files
+    collectionDir = await mkdtemp(join(tmpdir(), `qmd-mcp-update-coll-`));
+    await writeFile(join(collectionDir, "alpha.md"), "# Alpha\n\nFirst test document.\n");
+    await writeFile(join(collectionDir, "beta.md"), "# Beta\n\nSecond test document.\n");
+
+    // Write YAML config — startMcpHttpServer will create the DB with the correct
+    // schema via createStore({ configPath }) and sync the collection from YAML.
+    testDbPath = `/tmp/qmd-mcp-update-test-${Date.now()}.sqlite`;
+
+    const config: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+        },
+      },
+    };
+
+    testConfigDir = await mkdtemp(join(tmpdir(), `qmd-mcp-update-config-`));
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(config));
+
+    process.env.INDEX_PATH = testDbPath;
+    process.env.QMD_CONFIG_DIR = testConfigDir;
+
+    handle = await startMcpHttpServer(0, { quiet: true });
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    await handle.stop();
+
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+
+    try { unlinkSync(testDbPath); } catch {}
+    for (const dir of [testConfigDir, collectionDir]) {
+      try {
+        const files = await readdir(dir);
+        for (const f of files) await unlink(join(dir, f));
+        await rmdir(dir);
+      } catch {}
+    }
+  });
+
+  test("tools/call update with no args re-indexes all collections", async () => {
+    await initSession();
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    expect(json.result.isError).toBeFalsy();
+    expect(json.result.structuredContent).toBeDefined();
+
+    const sc = json.result.structuredContent;
+    expect(Array.isArray(sc.collections)).toBe(true);
+    expect(sc.collections).toHaveLength(1);
+    expect(sc.collections[0].name).toBe("notes");
+    expect(sc.collections[0].indexed).toBe(2); // alpha.md + beta.md
+    expect(sc.collections[0].updated).toBe(0);
+    expect(sc.collections[0].unchanged).toBe(0);
+    expect(sc.collections[0].removed).toBe(0);
+    expect(typeof sc.collections[0].durationMs).toBe("number");
+    expect(typeof sc.needsEmbedding).toBe("number");
+  });
+
+  test("tools/call update with collection arg only re-indexes that collection", async () => {
+    await initSession();
+
+    // First, ensure all collections are indexed (no-op for already-indexed)
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Now call update for the single existing collection — should report exactly that one
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "update", arguments: { collection: "notes" } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.structuredContent.collections).toHaveLength(1);
+    expect(json.result.structuredContent.collections[0].name).toBe("notes");
+  });
+
+  test("tools/call update with unknown collection returns isError", async () => {
+    await initSession();
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: { collection: "doesnotexist" } },
+    });
+
+    expect(status).toBe(200);
+    // McpServer wraps thrown errors into result.isError = true with content[0].text
+    expect(json.result.isError).toBe(true);
+    expect(json.result.content[0].text).toContain("Collection not found: doesnotexist");
+  });
+
+  test("tools/call update with runUpdateCommand omitted does NOT execute the configured command", async () => {
+    await initSession();
+
+    const sentinelPath = join(collectionDir, "sentinel-no-run.txt");
+
+    // Configure update_command for "notes" via the YAML config that the running
+    // server is reading. We write a fresh YAML that includes an update command
+    // creating the sentinel, then call update.
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+          update: `touch ${sentinelPath}`,
+        },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} }, // no runUpdateCommand
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    // Sentinel should NOT exist
+    const fs = await import("node:fs");
+    expect(fs.existsSync(sentinelPath)).toBe(false);
+  });
+
+  test("tools/call update with runUpdateCommand=true executes configured command", async () => {
+    await initSession();
+
+    const sentinelPath = join(collectionDir, "sentinel-with-run.txt");
+
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+          update: `touch ${sentinelPath}`,
+        },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: { runUpdateCommand: true } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+    expect(json.result.structuredContent.collections[0].skipped).toBeUndefined();
+
+    const fs = await import("node:fs");
+    expect(fs.existsSync(sentinelPath)).toBe(true);
+
+    // Cleanup so it doesn't pollute the next test
+    fs.unlinkSync(sentinelPath);
+  });
+
+  test("tools/call update with failing update_command marks collection skipped", async () => {
+    await initSession();
+
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: {
+          path: collectionDir,
+          pattern: "**/*.md",
+          update: `false`, // exits with code 1
+        },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: { runUpdateCommand: true } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.collections).toHaveLength(1);
+    expect(sc.collections[0].name).toBe("notes");
+    expect(sc.collections[0].skipped).toBeDefined();
+    expect(sc.collections[0].skipped.reason).toBe("update-command-failed");
+  });
+
+  test("tools/call embed embeds pending documents", async () => {
+    await initSession();
+
+    // Make sure documents are indexed first (creates rows that need embeddings)
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Reset YAML to plain (no update_command) for cleanliness in subsequent tests
+    const cfg: CollectionConfig = {
+      collections: {
+        notes: { path: collectionDir, pattern: "**/*.md" },
+      },
+    };
+    await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(cfg));
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.chunksEmbedded).toBeGreaterThan(0);
+    expect(sc.docsEmbedded).toBeGreaterThan(0);
+    expect(sc.errors).toBe(0);
+    expect(typeof sc.durationMs).toBe("number");
+    expect(sc.force).toBe(false);
+  }, 60000); // longer timeout — real llamacpp embed
+
+  test("tools/call embed with nothing pending returns zero counts", async () => {
+    await initSession();
+
+    // Run embed once to make sure everything is embedded
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    // Second call — nothing pending now
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.chunksEmbedded).toBe(0);
+    expect(sc.docsEmbedded).toBe(0);
+    expect(sc.errors).toBe(0);
+    expect(sc.force).toBe(false);
+  }, 60000);
+
+  test("tools/call embed with force=true regenerates all embeddings", async () => {
+    await initSession();
+
+    // Index documents first so there is something to embed
+    await mcpRequest({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "update", arguments: {} },
+    });
+
+    // Ensure baseline is fully embedded
+    await mcpRequest({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "embed", arguments: {} },
+    });
+
+    // Force: clears all vectors and regenerates
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "embed", arguments: { force: true } },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+
+    const sc = json.result.structuredContent;
+    expect(sc.force).toBe(true);
+    expect(sc.chunksEmbedded).toBeGreaterThan(0); // re-embedded everything
+    expect(sc.docsEmbedded).toBeGreaterThan(0);
+  }, 120000);
+
+  // tests go here in subsequent tasks
 });

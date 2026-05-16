@@ -23,6 +23,7 @@ qmd query <query>                 # Search with query expansion + reranking (rec
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
 qmd mcp                           # Start MCP server (stdio transport)
+                                  # MCP tools: query, get, multi_get, status, update, embed
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
