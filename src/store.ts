@@ -1391,6 +1391,9 @@ export type EmbedOptions = {
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
   onProgress?: (info: EmbedProgress) => void;
+  /** Maximum wall-clock duration for the embedding session in milliseconds.
+   *  0 (default) disables the timeout entirely. */
+  maxDuration?: number;
 };
 
 type PendingEmbeddingDoc = {
@@ -1687,7 +1690,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDuration ?? 0, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,

@@ -297,6 +297,9 @@ export interface QMDStore {
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
     onProgress?: (info: EmbedProgress) => void;
+    /** Maximum wall-clock duration for the embedding session in milliseconds.
+     *  0 (default) disables the timeout entirely. */
+    maxDuration?: number;
   }): Promise<EmbedResult>;
 
   // ── Index Health ────────────────────────────────────────────────────
@@ -526,6 +529,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
         onProgress: embedOpts?.onProgress,
+        maxDuration: embedOpts?.maxDuration,
       });
     },
 
