@@ -625,6 +625,7 @@ export class LlamaCpp implements LLM {
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
+  private unreliableVulkanMemoryBudget: boolean | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -851,6 +852,40 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * Some Vulkan drivers do not expose VK_EXT_memory_budget. node-llama-cpp can
+   * still return a heap size in that case, but live allocation accounting is not
+   * useful: `used` remains 0 and `free === total` even after loading a model.
+   * Treat that as unreliable instead of deriving concurrency from it.
+   */
+  private async hasUnreliableVulkanMemoryBudget(llama: Llama | null = this.llama): Promise<boolean> {
+    if (this.unreliableVulkanMemoryBudget != null) {
+      return this.unreliableVulkanMemoryBudget;
+    }
+
+    // Do not initialize llama just to probe this. Callers that need a fresh
+    // decision first initialize llama through their normal load path, which also
+    // keeps mocked unit tests from accidentally loading native bindings.
+    if (!llama || llama.gpu !== "vulkan") {
+      return false;
+    }
+
+    try {
+      const vram = await llama.getVramState();
+      const unifiedSize = (vram as { unifiedSize?: number }).unifiedSize ?? 0;
+      this.unreliableVulkanMemoryBudget = (
+        vram.total > 0 &&
+        vram.used === 0 &&
+        vram.free === vram.total &&
+        unifiedSize === 0
+      );
+    } catch {
+      this.unreliableVulkanMemoryBudget = true;
+    }
+
+    return this.unreliableVulkanMemoryBudget;
+  }
+
+  /**
    * Compute how many parallel contexts to create.
    *
    * GPU: constrained by VRAM (25% of free, capped at 8).
@@ -862,6 +897,10 @@ export class LlamaCpp implements LLM {
     const llama = await this.ensureLlama();
 
     if (llama.gpu) {
+      if (await this.hasUnreliableVulkanMemoryBudget(llama)) {
+        return 1;
+      }
+
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
@@ -1129,9 +1168,50 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
+  private async embedWithFreshContext(
+    text: string,
+    options: EmbedOptions,
+    errorLabel: string,
+  ): Promise<EmbeddingResult | null> {
+    let context: LlamaEmbeddingContext | null = null;
+
+    try {
+      const model = await this.ensureEmbedModel();
+      context = await model.createEmbeddingContext({
+        contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+      });
+
+      // Guard: truncate text that exceeds model context window to prevent GGML crash
+      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+      if (truncated) {
+        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+      }
+
+      const embedding = await context.getEmbeddingFor(safeText);
+      this.touchActivity();
+
+      return {
+        embedding: Array.from(embedding.vector),
+        model: options.model ?? this.embedModelUri,
+      };
+    } catch (error) {
+      console.error(errorLabel, error);
+      return null;
+    } finally {
+      await context?.dispose();
+    }
+  }
+
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
+
+    if (await this.hasUnreliableVulkanMemoryBudget()) {
+      // Some Vulkan drivers without memory-budget reporting fail when an
+      // embedding context is reused for later inputs. Keep the model loaded but
+      // use a fresh context per embedding on those drivers.
+      return await this.embedWithFreshContext(text, options, "Embedding error:");
+    }
 
     try {
       const context = await this.ensureEmbedContext();
@@ -1165,8 +1245,24 @@ export class LlamaCpp implements LLM {
 
     if (texts.length === 0) return [];
 
+    if (await this.hasUnreliableVulkanMemoryBudget()) {
+      const embeddings: (EmbeddingResult | null)[] = [];
+      for (const text of texts) {
+        embeddings.push(await this.embedWithFreshContext(text, options, "Embedding error for text:"));
+      }
+      return embeddings;
+    }
+
     try {
       const contexts = await this.ensureEmbedContexts();
+      if (await this.hasUnreliableVulkanMemoryBudget()) {
+        const embeddings: (EmbeddingResult | null)[] = [];
+        for (const text of texts) {
+          embeddings.push(await this.embedWithFreshContext(text, options, "Embedding error for text:"));
+        }
+        return embeddings;
+      }
+
       const n = contexts.length;
 
       if (n === 1) {
