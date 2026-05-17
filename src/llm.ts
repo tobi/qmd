@@ -10,6 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import { patchLlamaReleaseIfNeeded } from "./utils/llama-version.js";
 
 type NodeLlamaCppModule = {
   getLlama: (options: Record<string, unknown>) => Promise<Llama>;
@@ -61,10 +62,6 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
     }
   }
 }
-
-import { homedir } from "os";
-import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -762,6 +759,9 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
+      // Check if we need to update the llama.cpp release version
+      patchLlamaReleaseIfNeeded();
+
       const gpuMode = resolveLlamaGpuMode();
 
       const { getLlama, LlamaLogLevel } = await loadNodeLlamaCpp();
