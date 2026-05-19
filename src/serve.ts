@@ -362,16 +362,28 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
 
   let backend: ModelBackend;
 
+  // `--low-vram` (or QMD_LOW_VRAM=1) is a global flag that the LlamaCpp engine
+  // honours directly. It only affects the local backend — the ollama backend
+  // delegates inference to a separate process whose model lifecycle we can't
+  // control, so warn rather than silently ignore.
+  const lowVramRequested = process.env.QMD_LOW_VRAM === "1";
+
   if (backendType === "ollama") {
+    if (lowVramRequested) {
+      console.warn(`[qmd serve] --low-vram is ignored with --backend ollama (configure keep-alive on the upstream server instead)`);
+    }
     const url = options.backendUrl ?? options.rkllamaUrl ?? "http://localhost:11434";
     backend = new OllamaCompatBackend({ url });
     console.log(`[qmd serve] Backend: ollama-compatible (${url})`);
   } else {
     backend = new LocalBackend(options.config ?? {});
-    console.log(`[qmd serve] Backend: local (node-llama-cpp)`);
-    console.log(`  embed:    ${options.config?.embedModel ?? DEFAULT_EMBED_MODEL_URI}`);
-    console.log(`  rerank:   ${options.config?.rerankModel ?? DEFAULT_RERANK_MODEL_URI}`);
-    console.log(`  generate: ${options.config?.generateModel ?? DEFAULT_GENERATE_MODEL_URI}`);
+    const modeLabel = lowVramRequested ? "local low-vram (one heavy model at a time)" : "local (node-llama-cpp)";
+    console.log(`[qmd serve] Backend: ${modeLabel}`);
+    const residentNote = lowVramRequested ? " (resident)" : "";
+    const onDemandNote = lowVramRequested ? " (on demand)" : "";
+    console.log(`  embed:    ${options.config?.embedModel ?? DEFAULT_EMBED_MODEL_URI}${residentNote}`);
+    console.log(`  rerank:   ${options.config?.rerankModel ?? DEFAULT_RERANK_MODEL_URI}${onDemandNote}`);
+    console.log(`  generate: ${options.config?.generateModel ?? DEFAULT_GENERATE_MODEL_URI}${onDemandNote}`);
   }
 
   const healthInfo = await backend.health().catch(() => ({

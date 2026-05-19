@@ -3440,6 +3440,7 @@ function showHelp(): void {
   console.log("");
   console.log("Model server (shared models over network):");
   console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
+  console.log("  qmd serve --low-vram                      - Local backend, one heavy model at a time (~2.6 GB peak)");
   console.log("  qmd serve --backend ollama                - Use Ollama-compatible server");
   console.log("  qmd serve --backend ollama --backend-url http://host:11434");
   console.log("  qmd query --remote-url http://host:7832 <q>  - Use remote models instead of local");
