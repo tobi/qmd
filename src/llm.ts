@@ -581,6 +581,26 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Low-VRAM mode (default: false).
+   *
+   * The pipeline stages (expand → embed → search → rerank) are inherently sequential,
+   * so when this is enabled the heavy generate (~2 GB) and rerank (~2.3 GB) models are
+   * disposed immediately after each use, while the tiny embed model (~320 MB) stays
+   * resident. Peak VRAM drops from ~5.4 GB to ~2.6 GB at the cost of per-stage load
+   * latency (~3 s → ~5.6 s on a typical GPU).
+   *
+   * Use when the GPU is shared with another large model (e.g. Ollama) or on
+   * memory-constrained GPUs where loading all three at once fails. Addresses #275
+   * for both `qmd serve` and one-shot commands like `qmd query`.
+   *
+   * Concurrency: `expandQuery` and `rerank` calls are serialized internally so a
+   * dispose can never race with another caller's in-flight use of the same model.
+   * `embed` / `embedBatch` continue to run in parallel.
+   *
+   * Can also be set via QMD_LOW_VRAM=1.
+   */
+  lowVram?: boolean;
 };
 
 /**
@@ -715,6 +735,14 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
+  // Low-VRAM mode: dispose generate/rerank models after each use so peak VRAM
+  // stays under ~2.6 GB instead of ~5.4 GB. Calls to expandQuery and rerank
+  // serialize through per-method chains to prevent dispose from racing with
+  // another caller's in-flight use of the same model.
+  private lowVram: boolean;
+  private generateChain: Promise<unknown> = Promise.resolve();
+  private rerankChain: Promise<unknown> = Promise.resolve();
+
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
@@ -733,6 +761,7 @@ export class LlamaCpp implements LLM {
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.lowVram = config.lowVram ?? process.env.QMD_LOW_VRAM === "1";
   }
 
   get embedModelName(): string {
@@ -1432,6 +1461,23 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (!this.lowVram) {
+      return this.expandQueryImpl(query, options);
+    }
+    // Low-VRAM: serialize and dispose the generate model after each call so
+    // peak VRAM stays bounded. Concurrent callers queue through generateChain.
+    const next = this.generateChain.then(async () => {
+      try {
+        return await this.expandQueryImpl(query, options);
+      } finally {
+        await this.disposeGenerateModel();
+      }
+    });
+    this.generateChain = next.catch(() => undefined);
+    return next as Promise<Queryable[]>;
+  }
+
+  private async expandQueryImpl(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1528,6 +1574,26 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    if (!this.lowVram) {
+      return this.rerankImpl(query, documents, options);
+    }
+    // Low-VRAM: serialize and dispose the rerank model after each call.
+    const next = this.rerankChain.then(async () => {
+      try {
+        return await this.rerankImpl(query, documents, options);
+      } finally {
+        await this.disposeRerankModel();
+      }
+    });
+    this.rerankChain = next.catch(() => undefined);
+    return next as Promise<RerankResult>;
+  }
+
+  private async rerankImpl(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}
@@ -1650,6 +1716,40 @@ export class LlamaCpp implements LLM {
       vram,
       cpuCores: llama.cpuMathCores,
     };
+  }
+
+  /**
+   * Dispose the generate model and reset its load promise so the next call
+   * to expandQuery lazily reloads it. Only safe to call between serialized
+   * expandQuery calls — the lowVram chain handles that.
+   */
+  private async disposeGenerateModel(): Promise<void> {
+    if (this.disposed) return;
+    const model = this.generateModel;
+    this.generateModel = null;
+    this.generateModelLoadPromise = null;
+    if (model) {
+      await model.dispose();
+    }
+  }
+
+  /**
+   * Dispose the rerank model and its ranking contexts, then reset the load
+   * promise. Only safe to call between serialized rerank calls.
+   */
+  private async disposeRerankModel(): Promise<void> {
+    if (this.disposed) return;
+    const contexts = this.rerankContexts;
+    const model = this.rerankModel;
+    this.rerankContexts = [];
+    this.rerankModel = null;
+    this.rerankModelLoadPromise = null;
+    for (const ctx of contexts) {
+      await ctx.dispose();
+    }
+    if (model) {
+      await model.dispose();
+    }
   }
 
   async dispose(): Promise<void> {
