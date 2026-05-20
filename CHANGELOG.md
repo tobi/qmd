@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- CLI: accept `--glob` as an alias for `--mask` in `qmd collection add` so tools that pass `--glob <pattern>` (e.g. OpenClaw) are not silently ignored and do not fall back to the default `**/*.md` pattern. Fixes #536.
+
 ## [2.5.1] - 2026-05-20
 
 ### Changes
