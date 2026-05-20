@@ -18,6 +18,8 @@ import {
   handelize,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
+  getTitleBoostTerms,
+  getTitleMatchBoost,
 } from "../src/store";
 
 // =============================================================================
@@ -111,6 +113,48 @@ describe("cleanupOrphanedVectors", () => {
     } as any;
 
     expect(cleanupOrphanedVectors(db)).toBe(0);
+  });
+});
+
+// =============================================================================
+// Ranking Helpers
+// =============================================================================
+
+describe("title match boost", () => {
+  test("extracts useful title-boost terms and drops common words", () => {
+    expect(getTitleBoostTerms("Where is the API SQL guide?", "LLM routing")).toEqual([
+      "api",
+      "sql",
+      "guide",
+      "llm",
+      "routing",
+    ]);
+  });
+
+  test("boosts titles with query-term overlap and caps the multiplier", () => {
+    expect(getTitleMatchBoost("API routing guide", ["api", "routing", "guide"])).toBeCloseTo(3.0);
+    expect(getTitleMatchBoost("API reference", ["api", "routing"])).toBeCloseTo(1.7);
+    expect(getTitleMatchBoost("Unrelated", ["api", "routing"])).toBe(1);
+    expect(getTitleMatchBoost(undefined, ["api"])).toBe(1);
+  });
+
+  test("matches title terms exactly, not arbitrary substrings", () => {
+    expect(getTitleMatchBoost("Brain routing", ["ai"])).toBe(1);
+    expect(getTitleMatchBoost("AI routing", ["ai"])).toBeCloseTo(1.7);
+  });
+
+  test("matches title terms across common technical separators", () => {
+    expect(getTitleBoostTerms("API/SQL qmd:title-match LLM-RAG")).toEqual([
+      "api",
+      "sql",
+      "qmd",
+      "title",
+      "match",
+      "llm",
+      "rag",
+    ]);
+    expect(getTitleMatchBoost("API-routing guide", ["api", "routing"])).toBeCloseTo(2.4);
+    expect(getTitleMatchBoost("LLM/RAG notes", ["llm", "rag"])).toBeCloseTo(2.4);
   });
 });
 
