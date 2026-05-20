@@ -2715,6 +2715,7 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      glob: { type: "string" },  // alias for --mask
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -4060,7 +4061,7 @@ if (isMain) {
         case "add": {
           const pwd = cli.args[1] || getPwd();
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const globPattern = (cli.values.mask ?? cli.values.glob) as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
 
           await collectionAdd(resolvedPwd, globPattern, name);
@@ -4167,7 +4168,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--glob PATTERN]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");

@@ -487,6 +487,23 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("notes/*.md");
   });
 
+  test("--glob is accepted as an alias for --mask", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", ".", "--name", "glob-alias", "--glob", "notes/*.md"]);
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("notes/*.md");
+  });
+
+  test("two collections on the same path with different globs are both accepted", async () => {
+    const { exitCode: e1 } = await runQmd(["collection", "add", ".", "--name", "col-md", "--glob", "**/*.md"]);
+    expect(e1).toBe(0);
+    const { exitCode: e2, stderr } = await runQmd(["collection", "add", ".", "--name", "col-specific", "--glob", "notes/*.md"]);
+    expect(e2).toBe(0);
+    expect(stderr).not.toContain("already exists");
+  });
+
   test("can recreate collection with remove and add", async () => {
     // First add
     await runQmd(["collection", "add", "."]);
