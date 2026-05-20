@@ -2063,7 +2063,7 @@ export type HybridQueryExplain = {
   ftsScores: number[];
   vectorScores: number[];
   rrf: {
-    rank: number;          // Rank after RRF fusion (1-indexed)
+    rank: number;          // Rank after RRF fusion and title-boost ordering (1-indexed)
     positionScore: number; // 1 / rank used in position-aware blending
     weight: number;        // Position-aware RRF weight (0.75 / 0.60 / 0.40)
     baseScore: number;
@@ -2072,6 +2072,7 @@ export type HybridQueryExplain = {
     contributions: RRFContributionTrace[];
   };
   rerankScore: number;
+  titleBoost: number;
   blendedScore: number;
 };
 
@@ -4481,6 +4482,57 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
 }
 
 /**
+ * Build normalized query terms used for title-match boosting.
+ *
+ * This intentionally reuses the intent-term tokenizer so short domain terms
+ * such as API/SQL/LLM survive while common function words are ignored.
+ */
+export function getTitleBoostTerms(...texts: (string | undefined)[]): string[] {
+  const terms = new Set<string>();
+  for (const text of texts) {
+    if (!text) continue;
+    for (const term of extractTitleMatchTerms(text)) terms.add(term);
+  }
+  return [...terms];
+}
+
+function extractTitleMatchTerms(text: string): string[] {
+  return text.toLowerCase()
+    .split(/[^\p{L}\p{N}]+/gu)
+    .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
+}
+
+function getTitleTerms(title: string | undefined): Set<string> {
+  return new Set(extractTitleMatchTerms(title || ""));
+}
+
+/**
+ * Small, capped boost for candidates whose document title contains query terms.
+ *
+ * The boost is deliberately modest per term and capped at 3x: title matches
+ * should help recover convention/lookup-style queries, not overwhelm retrieval
+ * and reranker evidence.
+ */
+export function getTitleMatchBoost(title: string | undefined, terms: string[]): number {
+  if (!title || terms.length === 0) return 1;
+  const titleTerms = getTitleTerms(title);
+  const overlap = terms.filter(term => titleTerms.has(term)).length;
+  return Math.min(3.0, 1 + 0.7 * overlap);
+}
+
+function applyTitleMatchBoost<T extends RankedResult>(results: T[], terms: string[]): T[] {
+  if (terms.length === 0) return results;
+  return results
+    .map((result, index) => ({
+      result,
+      index,
+      rankScore: result.score * getTitleMatchBoost(result.title, terms),
+    }))
+    .sort((a, b) => (b.rankScore - a.rankScore) || (a.index - b.index))
+    .map(entry => entry.result);
+}
+
+/**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
  * Pipeline:
@@ -4490,7 +4542,7 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 4. RRF fusion → slice to candidateLimit
  * 5. chunkDocument() + keyword-best-chunk selection
  * 6. rerank on chunks (NOT full bodies — O(tokens) trap)
- * 7. Position-aware score blending (RRF rank × reranker score)
+ * 7. Position-aware score blending (RRF rank × reranker score) + capped title boost
  * 8. Dedup by file, filter by minScore, slice to limit
  */
 export async function hybridQuery(
@@ -4536,6 +4588,7 @@ export async function hybridQuery(
     : await store.expandQuery(query, undefined, intent);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  const titleBoostTerms = getTitleBoostTerms(query, intent);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -4615,7 +4668,7 @@ export async function hybridQuery(
   // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
   // expansion-derived lists stay at 1x independent of insertion order.
   const weights = getHybridRrfWeights(rankedListMeta);
-  const fused = reciprocalRankFusion(rankedLists, weights);
+  const fused = applyTitleMatchBoost(reciprocalRankFusion(rankedLists, weights), titleBoostTerms);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
@@ -4673,6 +4726,7 @@ export async function hybridQuery(
             contributions: trace?.contributions ?? [],
           },
           rerankScore: 0,
+          titleBoost: getTitleMatchBoost(cand.title, titleBoostTerms),
           blendedScore: rrfScore,
         } : undefined;
 
@@ -4747,6 +4801,7 @@ export async function hybridQuery(
         contributions: trace?.contributions ?? [],
       },
       rerankScore: r.score,
+      titleBoost: getTitleMatchBoost(candidate?.title, titleBoostTerms),
       blendedScore,
     } : undefined;
 
@@ -5002,9 +5057,11 @@ export async function structuredSearch(
 
   if (rankedLists.length === 0) return [];
 
+  const titleBoostTerms = getTitleBoostTerms(intent, ...searches.map(s => s.query));
+
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
-  const fused = reciprocalRankFusion(rankedLists, weights);
+  const fused = applyTitleMatchBoost(reciprocalRankFusion(rankedLists, weights), titleBoostTerms);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
@@ -5067,6 +5124,7 @@ export async function structuredSearch(
             contributions: trace?.contributions ?? [],
           },
           rerankScore: 0,
+          titleBoost: getTitleMatchBoost(cand.title, titleBoostTerms),
           blendedScore: rrfScore,
         } : undefined;
 
@@ -5140,6 +5198,7 @@ export async function structuredSearch(
         contributions: trace?.contributions ?? [],
       },
       rerankScore: r.score,
+      titleBoost: getTitleMatchBoost(candidate?.title, titleBoostTerms),
       blendedScore,
     } : undefined;
 
