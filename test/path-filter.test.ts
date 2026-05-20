@@ -7,6 +7,8 @@ import {
   hashContent,
   insertContent,
   insertDocument,
+  findDocument,
+  findDocuments,
   searchFTS,
   structuredSearch,
   __testPathPrefixHelpers,
@@ -120,6 +122,63 @@ describe("searchFTS pathPrefix", () => {
   test("lexicographicSuccessor invariant", () => {
     expect(__testPathPrefixHelpers.lexicographicSuccessor("stack/")).toBe("stack0");
     expect(() => __testPathPrefixHelpers.lexicographicSuccessor("stack")).toThrow(/must end with '\/'/);
+  });
+});
+
+describe("original path roundtrip", () => {
+  test("findDocument accepts original, virtual original, collection-prefixed original, and slug paths", async () => {
+    const store = await makeStore();
+    await addDoc(
+      store,
+      "projects/04-dashboard/docs/infra-tab.md",
+      "fcose graph layout",
+      "Infra Tab",
+      "+projects/04 Dashboard/docs/infra-tab.md"
+    );
+
+    const lookups = [
+      "+projects/04 Dashboard/docs/infra-tab.md",
+      "docs/+projects/04 Dashboard/docs/infra-tab.md",
+      "qmd://docs/+projects/04 Dashboard/docs/infra-tab.md",
+      "projects/04-dashboard/docs/infra-tab.md",
+      "qmd://docs/projects/04-dashboard/docs/infra-tab.md",
+    ];
+
+    for (const lookup of lookups) {
+      const doc = findDocument(store.db, lookup, { includeBody: true });
+      expect("error" in doc ? doc.error : null, lookup).toBeNull();
+      if (!("error" in doc)) {
+        expect(doc.filepath).toBe("qmd://docs/+projects/04 Dashboard/docs/infra-tab.md");
+        expect(doc.displayPath).toBe("docs/+projects/04 Dashboard/docs/infra-tab.md");
+        expect(doc.body).toContain("fcose graph layout");
+      }
+    }
+  });
+
+  test("findDocuments glob matches original paths and returns original display paths", async () => {
+    const store = await makeStore();
+    await addDoc(
+      store,
+      "projects/04-dashboard/docs/a.md",
+      "fcose graph layout",
+      "A",
+      "+projects/04 Dashboard/docs/a.md"
+    );
+    await addDoc(
+      store,
+      "projects/04-dashboard/docs/b.md",
+      "fcose graph layout",
+      "B",
+      "+projects/04 Dashboard/docs/b.md"
+    );
+
+    const result = findDocuments(store.db, "+projects/04 Dashboard/docs/*.md", { includeBody: true });
+    expect(result.errors).toEqual([]);
+    expect(result.docs.map(r => r.doc.filepath).sort()).toEqual([
+      "qmd://docs/+projects/04 Dashboard/docs/a.md",
+      "qmd://docs/+projects/04 Dashboard/docs/b.md",
+    ]);
+    expect(result.docs.every(r => !r.skipped && r.doc.body?.includes("fcose graph layout"))).toBe(true);
   });
 });
 
