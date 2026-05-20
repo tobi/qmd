@@ -358,7 +358,7 @@ Utility exports:
 import {
   extractSnippet,              // Extract a relevant snippet from text
   addLineNumbers,              // Add line numbers to text
-  DEFAULT_MULTI_GET_MAX_BYTES, // Default max file size for multiGet (10KB)
+  DEFAULT_MULTI_GET_MAX_BYTES, // Default max file size for multiGet (64KB)
   Maintenance,                 // Database maintenance operations
 } from '@tobilu/qmd'
 ```
@@ -659,7 +659,7 @@ qmd get <file>[:line]  # Get document, optionally starting at line
 
 # Multi-get options
 -l <num>           # Maximum lines per file
---max-bytes <num>  # Skip files larger than N bytes (default: 10KB)
+--max-bytes <num>  # Skip files larger than N bytes (default: 64KB)
 ```
 
 ### Output Format

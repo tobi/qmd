@@ -540,6 +540,13 @@ describe("MCP Server", () => {
       expect(errors[0]).toContain("not found");
     });
 
+    test("default maxBytes includes normal wiki-sized files", () => {
+      expect(DEFAULT_MULTI_GET_MAX_BYTES).toBe(64 * 1024);
+      const { docs } = findDocuments(testDb, "large-file.md", { includeBody: true });
+      expect(docs.length).toBe(1);
+      expect(docs[0]!.skipped).toBe(false);
+    });
+
     test("skips files larger than maxBytes", () => {
       const { docs } = findDocuments(testDb, "*.md", { includeBody: true, maxBytes: 1000 }); // 1KB limit
       const large = docs.find(d => d.doc.displayPath === "docs/large-file.md");
