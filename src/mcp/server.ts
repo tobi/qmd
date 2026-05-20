@@ -199,7 +199,10 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
       const result = await store.get(decodedPath, { includeBody: true });
 
       if ("error" in result) {
-        return { contents: [{ uri: uri.href, text: `Document not found: ${decodedPath}` }] };
+        const text = result.error === "excluded_by_ignore"
+          ? `Document excluded by ignore rule: ${decodedPath}\nCollection: ${result.collection}\nMatched path: ${result.path}\nIgnore rule: ${result.rule}`
+          : `Document not found: ${decodedPath}`;
+        return { contents: [{ uri: uri.href, text }] };
       }
 
       let text = addLineNumbers(result.body || "");  // Default to line numbers
@@ -392,8 +395,10 @@ Intent-aware lex (C++ performance, not sports):
       const result = await store.get(lookup, { includeBody: false });
 
       if ("error" in result) {
-        let msg = `Document not found: ${file}`;
-        if (result.similarFiles.length > 0) {
+        let msg = result.error === "excluded_by_ignore"
+          ? `Document excluded by ignore rule: ${file}\nCollection: ${result.collection}\nMatched path: ${result.path}\nIgnore rule: ${result.rule}`
+          : `Document not found: ${file}`;
+        if (result.error === "not_found" && result.similarFiles.length > 0) {
           msg += `\n\nDid you mean one of these?\n${result.similarFiles.map(s => `  - ${s}`).join('\n')}`;
         }
         return {
