@@ -2837,7 +2837,7 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
-    SELECT d.path
+    SELECT COALESCE(d.original_path, d.path) AS path
     FROM documents d
     WHERE d.active = 1
   `).all() as { path: string }[];
@@ -2853,21 +2853,29 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
   const allFiles = db.prepare(`
     SELECT
-      'qmd://' || d.collection || '/' || d.path as virtual_path,
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
       LENGTH(content.doc) as body_length,
       d.path,
+      d.original_path,
       d.collection
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
+  `).all() as { virtual_path: string; body_length: number; path: string; original_path: string | null; collection: string }[];
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
+    .filter(f => {
+      const displayPath = f.original_path || f.path;
+      return isMatch(f.virtual_path)
+        || isMatch(f.path)
+        || isMatch(displayPath)
+        || isMatch(f.collection + '/' + f.path)
+        || isMatch(f.collection + '/' + displayPath);
+    })
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
+      displayPath: f.original_path || f.path, // Relative path for display
       bodyLength: f.body_length
     }));
 }
@@ -2972,9 +2980,11 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const doc = db.prepare(`
     SELECT d.path
     FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    WHERE d.collection = ?
+      AND (d.path = ? OR d.original_path = ?)
+      AND d.active = 1
     LIMIT 1
-  `).get(collectionName, relativePath) as { path: string } | null;
+  `).get(collectionName, relativePath, relativePath) as { path: string } | null;
 
   if (!doc) return null;
 
@@ -4090,8 +4100,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
   // Build computed columns
   // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
+    d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -4105,8 +4115,11 @@ export function findDocument(db: Database, filename: string, options: { includeB
     SELECT ${selectCols}
     FROM documents d
     JOIN content ON content.hash = d.hash
-    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-  `).get(filepath) as DbDocRow | null;
+    WHERE (
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+      OR 'qmd://' || d.collection || '/' || d.path = ?
+    ) AND d.active = 1
+  `).get(filepath, filepath) as DbDocRow | null;
 
   // Try fuzzy match by virtual path
   if (!doc) {
@@ -4114,9 +4127,12 @@ export function findDocument(db: Database, filename: string, options: { includeB
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) LIKE ?
+        OR 'qmd://' || d.collection || '/' || d.path LIKE ?
+      ) AND d.active = 1
       LIMIT 1
-    `).get(`%${filepath}`) as DbDocRow | null;
+    `).get(`%${filepath}`, `%${filepath}`) as DbDocRow | null;
   }
 
   // Try to match by absolute path (requires looking up collection paths from DB)
@@ -4131,7 +4147,10 @@ export function findDocument(db: Database, filename: string, options: { includeB
       }
       // Otherwise treat filepath as relative to collection
       else if (!filepath.startsWith('/')) {
-        relativePath = filepath;
+        const collectionPrefix = `${coll.name}/`;
+        relativePath = filepath.startsWith(collectionPrefix)
+          ? filepath.slice(collectionPrefix.length)
+          : filepath;
       }
 
       if (relativePath) {
@@ -4139,8 +4158,10 @@ export function findDocument(db: Database, filename: string, options: { includeB
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as DbDocRow | null;
+          WHERE d.collection = ?
+            AND (d.path = ? OR d.original_path = ?)
+            AND d.active = 1
+        `).get(coll.name, relativePath, relativePath) as DbDocRow | null;
         if (doc) break;
       }
     }
@@ -4185,8 +4206,11 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
       SELECT content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-    `).get(filepath) as { body: string } | null;
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+        OR 'qmd://' || d.collection || '/' || d.path = ?
+      ) AND d.active = 1
+    `).get(filepath, filepath) as { body: string } | null;
   }
 
   // Try absolute path by looking up in DB store_collections
@@ -4199,8 +4223,10 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
           SELECT content.doc as body
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as { body: string } | null;
+          WHERE d.collection = ?
+            AND (d.path = ? OR d.original_path = ?)
+            AND d.active = 1
+        `).get(coll.name, relativePath, relativePath) as { body: string } | null;
         if (row) break;
       }
     }
@@ -4234,8 +4260,8 @@ export function findDocuments(
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
+    d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -4254,16 +4280,22 @@ export function findDocuments(
         SELECT ${selectCols}
         FROM documents d
         JOIN content ON content.hash = d.hash
-        WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-      `).get(name) as DbDocRow | null;
+        WHERE (
+          'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+          OR 'qmd://' || d.collection || '/' || d.path = ?
+        ) AND d.active = 1
+      `).get(name, name) as DbDocRow | null;
       if (!doc) {
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+          WHERE (
+            'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) LIKE ?
+            OR 'qmd://' || d.collection || '/' || d.path LIKE ?
+          ) AND d.active = 1
           LIMIT 1
-        `).get(`%${name}`) as DbDocRow | null;
+        `).get(`%${name}`, `%${name}`) as DbDocRow | null;
       }
       if (doc) {
         fileRows.push(doc);
@@ -4289,8 +4321,11 @@ export function findDocuments(
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
-    `).all(...virtualPaths) as DbDocRow[];
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) IN (${placeholders})
+        OR 'qmd://' || d.collection || '/' || d.path IN (${placeholders})
+      ) AND d.active = 1
+    `).all(...virtualPaths, ...virtualPaths) as DbDocRow[];
   }
 
   const results: MultiGetResult[] = [];
