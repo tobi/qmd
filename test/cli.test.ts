@@ -932,6 +932,80 @@ describe("CLI Multi-Get Command", () => {
   });
 });
 
+describe("CLI original path roundtrip", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let roundtripDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("cli-original-roundtrip");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    roundtripDir = join(testDir, "cli-original-roundtrip-fixtures");
+
+    await mkdir(join(roundtripDir, "+Projects", "Some Folder"), { recursive: true });
+    await writeFile(join(roundtripDir, "+Projects", "Some Folder", "Case File.md"), "# Case File\nroundtrip-special-token");
+
+    await writeFile(
+      join(localConfigDir, "index.yml"),
+      `collections:
+  vault:
+    path: ${roundtripDir}
+    pattern: "**/*.md"
+`
+    );
+
+    const { exitCode, stderr } = await runQmd(["update"], {
+      cwd: roundtripDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    if (exitCode !== 0) console.error("update failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("search result paths can be passed back to get", async () => {
+    const search = await runQmd(["search", "roundtrip-special-token", "--json", "-n", "1"], {
+      cwd: roundtripDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(search.exitCode).toBe(0);
+    const results = JSON.parse(search.stdout) as { file: string }[];
+    expect(results[0]!.file).toBe("qmd://vault/+Projects/Some Folder/Case File.md");
+
+    const get = await runQmd(["get", results[0]!.file, "-l", "1"], {
+      cwd: roundtripDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).toContain("# Case File");
+  });
+
+  test("get and multi-get accept original paths with spaces and symbols", async () => {
+    const originalPath = "+Projects/Some Folder/Case File.md";
+    const get = await runQmd(["get", originalPath, "-l", "1"], {
+      cwd: roundtripDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).toContain("# Case File");
+
+    const multi = await runQmd(["multi-get", "+Projects/Some Folder/*.md", "--json"], {
+      cwd: roundtripDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    expect(multi.exitCode).toBe(0);
+    const docs = JSON.parse(multi.stdout) as { file: string; body: string }[];
+    expect(docs).toHaveLength(1);
+    expect(docs[0]!.file).toBe("+Projects/Some Folder/Case File.md");
+    expect(docs[0]!.body).toContain("roundtrip-special-token");
+  });
+});
+
 describe("CLI Update Command", () => {
   let localDbPath: string;
 
