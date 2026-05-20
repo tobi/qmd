@@ -2114,6 +2114,7 @@ type OutputOptions = {
   minScore: number;
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
+  path?: string;  // Filter by folder-prefix within collection(s)
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
@@ -2596,7 +2597,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchFTS(db, query, fetchLimit, singleCollection, opts.path),
     collectionNames
   );
 
@@ -2649,6 +2650,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
+      pathPrefix: opts.path,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2724,6 +2726,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
       results = await structuredSearch(store, structuredQueries, {
         collections: singleCollection ? [singleCollection] : undefined,
+        pathPrefix: opts.path,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2752,6 +2755,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
         collection: singleCollection,
+        pathPrefix: opts.path,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2857,6 +2861,7 @@ function parseCLI() {
       json: { type: "boolean" },
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      path: { type: "string", short: "p" },  // Filter by folder-prefix within collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2944,6 +2949,7 @@ function parseCLI() {
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string[] | undefined,
+    path: values.path as string | undefined,
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
@@ -3464,6 +3470,7 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
   console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  -p, --path <folder-prefix>  - Filter to folder-prefix within collection(s) (folder-only)");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
