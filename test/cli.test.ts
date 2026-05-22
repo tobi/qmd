@@ -2103,10 +2103,14 @@ describe("mcp stdio launcher", () => {
       await writeFile(join(tempPackage, "package-lock.json"), "{}\n");
       const fakeNode = join(tempPackage, "fake-bin", "node");
       await writeFile(fakeNode, `#!/bin/sh
-if [ "\${GGML_BACKEND_SILENT:-}" != "1" ]; then
-  printf 'llama.cpp native log on stdout\\n'
+if [ "$(basename "$1")" = "qmd" ]; then
+  exec "${process.execPath}" "$@"
+else
+  if [ "\${GGML_BACKEND_SILENT:-}" != "1" ]; then
+    printf 'llama.cpp native log on stdout\\n'
+  fi
+  printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n'
 fi
-printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n'
 `);
       await chmod(fakeNode, 0o755);
 

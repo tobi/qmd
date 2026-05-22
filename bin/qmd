@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// 2>/dev/null; exec node "$0" "$@"
 // Cross-platform launcher for qmd.
 //
 // Previously this was a POSIX shell script with `#!/bin/sh`, which meant npm
@@ -24,9 +25,9 @@ const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
 // log handlers are attached, so seed the native quiet env before Node/Bun imports
 // the CLI and its LLM modules. Preserve explicit user values when provided.
 if (process.argv[2] === "mcp") {
-  process.env.LLAMA_LOG_LEVEL = process.env.LLAMA_LOG_LEVEL ?? "error";
-  process.env.GGML_LOG_LEVEL = process.env.GGML_LOG_LEVEL ?? "error";
-  process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT ?? "1";
+  process.env.LLAMA_LOG_LEVEL = process.env.LLAMA_LOG_LEVEL || "error";
+  process.env.GGML_LOG_LEVEL = process.env.GGML_LOG_LEVEL || "error";
+  process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
 }
 
 function hasBun() {
