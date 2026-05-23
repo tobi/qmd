@@ -490,19 +490,20 @@ by default. Configure it with:
 export NVIDIA_API_KEY="..."
 export QMD_EMBED_API_BASE_URL="https://integrate.api.nvidia.com/v1"
 export QMD_EMBED_MODEL="nvidia/llama-3.2-nv-embedqa-1b-v2"
-export QMD_DISABLE_LOCAL_MODELS=1
 ```
 
 QMD reads `NVIDIA_API_KEY` when `QMD_EMBED_API_KEY` is not set and sends
 NVIDIA's required `input_type` automatically (`passage` while indexing, `query`
 while searching).
 
-`QMD_DISABLE_LOCAL_MODELS=1` is recommended for deployments that must not load
-local GGUF models. In that mode QMD rejects local embedding model URIs, skips
-local query expansion, and defaults search reranking off while still using the
-configured external embedding service for vector search.
+Local GGUF models are disabled by default. In the default mode QMD rejects local
+embedding model URIs, skips local query expansion, and search reranking uses RRF
+scores only while still using the configured external embedding service for
+vector search.
 
-Reranking and query expansion still use local GGUF models via node-llama-cpp:
+Set `QMD_ENABLE_LOCAL_MODELS=1` to opt into local GGUF model loading. The first
+query expansion or reranking call can download and load the configured local
+model, which may take a while.
 
 | Model | Purpose | Size |
 |-------|---------|------|
@@ -513,10 +514,12 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ### Local Embedding Model
 
-Set `QMD_EMBED_MODEL` to an `hf:` URI or `.gguf` path to opt into local node-llama-cpp embeddings.
+Set `QMD_ENABLE_LOCAL_MODELS=1` and `QMD_EMBED_MODEL` to an `hf:` URI or `.gguf`
+path to opt into local node-llama-cpp embeddings.
 
 ```sh
 # Use Qwen3-Embedding-0.6B locally
+export QMD_ENABLE_LOCAL_MODELS=1
 export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
 
 # After changing the model, re-embed all collections:
@@ -943,8 +946,9 @@ YAML configuration can override those defaults; see `example-index.yml` for a co
 ```yaml
 models:
   embed: nvidia/llama-3.2-nv-embedqa-1b-v2
-  rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
-  generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  # Optional local models, used only when QMD_ENABLE_LOCAL_MODELS=1:
+  # rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  # generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
 ```
 
 ### EmbeddingGemma Prompt Format

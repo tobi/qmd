@@ -463,8 +463,8 @@ async function showStatus(): Promise<void> {
     };
     console.log(`\n${c.bold}Models${c.reset}`);
     console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
+    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
   }
 
   // Device / GPU info
@@ -3125,11 +3125,13 @@ if (isMain) {
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const isLocalModelUri = (uri: string) =>
+        uri.startsWith("hf:") || uri.endsWith(".gguf") || uri.startsWith("/") || uri.startsWith("./") || uri.startsWith("../");
       const models = [
         DEFAULT_EMBED_MODEL_URI,
         DEFAULT_GENERATE_MODEL_URI,
         DEFAULT_RERANK_MODEL_URI,
-      ];
+      ].filter(isLocalModelUri);
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,

@@ -193,9 +193,11 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   });
 
   test("default embedding uses NVIDIA OpenAI-compatible API", async () => {
+    const prevModel = process.env.QMD_EMBED_MODEL;
     const prevKey = process.env.QMD_EMBED_API_KEY;
     const prevNvidiaKey = process.env.NVIDIA_API_KEY;
     const prevBaseUrl = process.env.QMD_EMBED_API_BASE_URL;
+    delete process.env.QMD_EMBED_MODEL;
     process.env.QMD_EMBED_API_KEY = "test-key";
     delete process.env.NVIDIA_API_KEY;
     delete process.env.QMD_EMBED_API_BASE_URL;
@@ -225,6 +227,8 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       });
     } finally {
       fetchMock.mockRestore();
+      if (prevModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prevModel;
       if (prevKey === undefined) delete process.env.QMD_EMBED_API_KEY;
       else process.env.QMD_EMBED_API_KEY = prevKey;
       if (prevNvidiaKey === undefined) delete process.env.NVIDIA_API_KEY;
@@ -274,9 +278,9 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     expect(llm.usesLocalEmbedding).toBe(true);
   });
 
-  test("QMD_DISABLE_LOCAL_MODELS rejects local embedding models and bypasses local LLMs", async () => {
-    const prev = process.env.QMD_DISABLE_LOCAL_MODELS;
-    process.env.QMD_DISABLE_LOCAL_MODELS = "1";
+  test("local models are disabled by default", async () => {
+    const prev = process.env.QMD_ENABLE_LOCAL_MODELS;
+    delete process.env.QMD_ENABLE_LOCAL_MODELS;
     try {
       const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" });
       await expect(llm.embed("hello")).rejects.toThrow("Local embedding models are disabled");
@@ -286,14 +290,54 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
         results: [{ file: "doc.md", score: 0, index: 0 }],
       });
     } finally {
-      if (prev === undefined) delete process.env.QMD_DISABLE_LOCAL_MODELS;
-      else process.env.QMD_DISABLE_LOCAL_MODELS = prev;
+      if (prev === undefined) delete process.env.QMD_ENABLE_LOCAL_MODELS;
+      else process.env.QMD_ENABLE_LOCAL_MODELS = prev;
     }
+  });
+
+  test("QMD_ENABLE_LOCAL_MODELS allows explicit local embedding models", async () => {
+    const prev = process.env.QMD_ENABLE_LOCAL_MODELS;
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
+    try {
+      const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" }) as any;
+      llm._ciMode = false;
+      llm.touchActivity = vi.fn();
+      llm.ensureEmbedContext = vi.fn().mockResolvedValue({
+        getEmbeddingFor: vi.fn(async () => ({ vector: new Float32Array([0.1, 0.2]) })),
+      });
+      llm.truncateToContextSize = vi.fn(async (text: string) => ({
+        text,
+        truncated: false,
+        limit: 2048,
+      }));
+
+      await expect(llm.embed("hello")).resolves.toEqual({
+        embedding: [expect.closeTo(0.1), expect.closeTo(0.2)],
+        model: "hf:custom/embed.gguf",
+      });
+      expect(llm.ensureEmbedContext).toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.QMD_ENABLE_LOCAL_MODELS;
+      else process.env.QMD_ENABLE_LOCAL_MODELS = prev;
+    }
+  });
+
+  test("external embedding token counting does not load a local tokenizer", async () => {
+    const llm = new LlamaCpp({ embedModel: "nvidia/llama-3.2-nv-embedqa-1b-v2" }) as any;
+    llm.ensureEmbedContext = vi.fn(async () => {
+      throw new Error("should not load local tokenizer");
+    });
+
+    await expect(llm.countTokens("abcdef")).resolves.toBe(2);
+    await expect(llm.tokenize("abcdef")).resolves.toHaveLength(2);
+    expect(llm.ensureEmbedContext).not.toHaveBeenCalled();
   });
 });
 
 describe("LlamaCpp embedding truncation", () => {
   test("truncates against the active embedding context limit, not the model train context", async () => {
+    const prev = process.env.QMD_ENABLE_LOCAL_MODELS;
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
     const llm = new LlamaCpp({ embedModel: "hf:test/embed.gguf" }) as any;
     const getEmbeddingFor = vi.fn(async (text: string) => ({
       vector: new Float32Array([0.25, 0.5]),
@@ -308,18 +352,25 @@ describe("LlamaCpp embedding truncation", () => {
     };
     llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
 
-    const result = await llm.embed("x".repeat(3000));
+    try {
+      const result = await llm.embed("x".repeat(3000));
 
-    expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
-    expect(result).toEqual({
-      embedding: [0.25, 0.5],
-      model: llm.embedModelUri,
-    });
+      expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
+      expect(result).toEqual({
+        embedding: [0.25, 0.5],
+        model: llm.embedModelUri,
+      });
+    } finally {
+      if (prev === undefined) delete process.env.QMD_ENABLE_LOCAL_MODELS;
+      else process.env.QMD_ENABLE_LOCAL_MODELS = prev;
+    }
   });
 });
 
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
+    const prev = process.env.QMD_ENABLE_LOCAL_MODELS;
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
     const llm = new LlamaCpp({}) as any;
     llm._ciMode = false; // allow unit test even in CI (mocked, no real models)
     const rankAll = vi.fn(async (_query: string, docs: string[]) =>
@@ -333,20 +384,25 @@ describe("LlamaCpp rerank deduping", () => {
       detokenize: (tokens: string[]) => tokens.join(""),
     });
 
-    const result = await llm.rerank("query", [
-      { file: "a.md", text: "shared chunk" },
-      { file: "b.md", text: "shared chunk" },
-      { file: "c.md", text: "different chunk" },
-    ]);
+    try {
+      const result = await llm.rerank("query", [
+        { file: "a.md", text: "shared chunk" },
+        { file: "b.md", text: "shared chunk" },
+        { file: "c.md", text: "different chunk" },
+      ]);
 
-    expect(rankAll).toHaveBeenCalledTimes(1);
-    expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
-    expect(result.results).toHaveLength(3);
+      expect(rankAll).toHaveBeenCalledTimes(1);
+      expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
+      expect(result.results).toHaveLength(3);
 
-    const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
-    expect(scoreByFile.get("a.md")).toBe(0.9);
-    expect(scoreByFile.get("b.md")).toBe(0.9);
-    expect(scoreByFile.get("c.md")).toBe(0.2);
+      const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
+      expect(scoreByFile.get("a.md")).toBe(0.9);
+      expect(scoreByFile.get("b.md")).toBe(0.9);
+      expect(scoreByFile.get("c.md")).toBe(0.2);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_ENABLE_LOCAL_MODELS;
+      else process.env.QMD_ENABLE_LOCAL_MODELS = prev;
+    }
   });
 });
 

@@ -192,7 +192,7 @@ export type RerankDocument = {
 // =============================================================================
 
 // Embeddings use NVIDIA's OpenAI-compatible API by default.
-// Override QMD_EMBED_MODEL with hf:/path/.gguf to opt into local node-llama-cpp embeddings.
+// Set QMD_ENABLE_LOCAL_MODELS=1 before using any local node-llama-cpp GGUF models.
 const DEFAULT_EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
@@ -216,12 +216,22 @@ export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
 
 const DEFAULT_EMBED_API_BASE_URL = "https://integrate.api.nvidia.com/v1";
 
-export function localModelsDisabled(): boolean {
-  return /^(1|true|yes|on)$/i.test(process.env.QMD_DISABLE_LOCAL_MODELS ?? "");
+export function localModelsEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.QMD_ENABLE_LOCAL_MODELS ?? "");
 }
 
 function isLocalEmbeddingModel(model: string): boolean {
   return model.startsWith("hf:") || model.endsWith(".gguf") || model.startsWith("/") || model.startsWith("./") || model.startsWith("../");
+}
+
+export function approximateTokenCount(text: string): number {
+  if (text.length === 0) return 0;
+  return Math.max(1, Math.ceil(text.length / 3));
+}
+
+export function truncateByApproxTokens(text: string, maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  return text.slice(0, Math.max(1, maxTokens * 3));
 }
 
 export type PullResult = {
@@ -929,10 +939,17 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   /**
-   * Tokenize text using the embedding model's tokenizer
-   * Returns tokenizer tokens (opaque type from node-llama-cpp)
+   * Tokenize text using the embedding model's tokenizer when local embeddings
+   * are explicitly active. External embedding mode uses a conservative
+   * approximation and must not load a local tokenizer.
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    if (!this.usesLocalEmbedding) {
+      return Array.from(
+        { length: approximateTokenCount(text) },
+        (_, index) => index as unknown as LlamaToken,
+      );
+    }
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -941,17 +958,25 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Count tokens in text using the embedding model's tokenizer
+   * Count tokens in text. External embedding mode uses an approximation so
+   * chunking never pulls in a local GGUF tokenizer by accident.
    */
   async countTokens(text: string): Promise<number> {
+    if (!this.usesLocalEmbedding) {
+      return approximateTokenCount(text);
+    }
     const tokens = await this.tokenize(text);
     return tokens.length;
   }
 
   /**
-   * Detokenize token IDs back to text
+   * Detokenize token IDs back to text. External embedding mode has no local
+   * tokenizer, so return an approximate-width placeholder for guardrail paths.
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    if (!this.usesLocalEmbedding) {
+      return " ".repeat(tokens.length * 3);
+    }
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1047,8 +1072,8 @@ export class LlamaCpp implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     const model = options.model ?? this.embedModelUri;
-    if (localModelsDisabled() && isLocalEmbeddingModel(model)) {
-      throw new Error("Local embedding models are disabled. Set QMD_EMBED_MODEL to an external API model.");
+    if (!localModelsEnabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_ENABLE_LOCAL_MODELS=1 to use local GGUF models.");
     }
     if (!isLocalEmbeddingModel(model)) {
       const results = await this.embedExternal([text], model, options);
@@ -1085,8 +1110,8 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const model = options.model ?? this.embedModelUri;
-    if (localModelsDisabled() && isLocalEmbeddingModel(model)) {
-      throw new Error("Local embedding models are disabled. Set QMD_EMBED_MODEL to an external API model.");
+    if (!localModelsEnabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_ENABLE_LOCAL_MODELS=1 to use local GGUF models.");
     }
     if (!isLocalEmbeddingModel(model)) {
       return this.embedExternal(texts, model, options);
@@ -1219,7 +1244,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
-    if (localModelsDisabled()) return [];
+    if (!localModelsEnabled()) return [];
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1319,7 +1344,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
-    if (localModelsDisabled()) {
+    if (!localModelsEnabled()) {
       return {
         model: "disabled",
         results: documents.map((doc, index) => ({ file: doc.file, score: 0, index })),
