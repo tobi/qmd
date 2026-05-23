@@ -196,4 +196,10 @@ describe("AST break point scores", () => {
     const points = await getASTBreakPoints(code, "a.rs");
     expect(points.find(p => p.type === "ast:enum")?.score).toBe(80);
   });
+
+  test("Java field scores 60", async () => {
+    const code = `class Foo {\n  private int x;\n}\n`;
+    const points = await getASTBreakPoints(code, "Foo.java");
+    expect(points.find(p => p.type === "ast:field")?.score).toBe(60);
+  });
 });

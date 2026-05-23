@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { detectLanguage, getASTBreakPoints, extractSymbols, formatGrammarLoadError } from "../src/ast.js";
+import { detectLanguage, getASTBreakPoints, getASTStatus, extractSymbols, formatGrammarLoadError } from "../src/ast.js";
 import type { SupportedLanguage } from "../src/ast.js";
 
 // =============================================================================
@@ -44,6 +44,12 @@ describe("detectLanguage", () => {
 
   test("recognizes Rust extension", () => {
     expect(detectLanguage("src/auth.rs")).toBe("rust");
+  });
+
+  test("recognizes Java extension", () => {
+    expect(detectLanguage("src/AuthService.java")).toBe("java");
+    expect(detectLanguage("src/AuthService.JAVA")).toBe("java");
+    expect(detectLanguage("qmd://proj/src/AuthService.java")).toBe("java");
   });
 
   test("returns null for markdown", () => {
@@ -285,6 +291,93 @@ fn hash_password(password: &str) -> String {
     expect(structPoint?.score).toBe(100);
     expect(implPoint?.score).toBe(100);
     expect(traitPoint?.score).toBe(100);
+  });
+});
+
+// =============================================================================
+// AST Break Points - Java
+// =============================================================================
+
+describe("getASTBreakPoints - Java", () => {
+  const JAVA_SAMPLE = `package com.example.app;
+
+import java.util.List;
+import java.util.Map;
+
+@Service
+public class AuthService {
+    private final Database db;
+    public static final String PREFIX = "auth";
+
+    public AuthService(Database db) {
+        this.db = db;
+    }
+
+    @Override
+    public boolean authenticate(User user, String token) {
+        return db.find(token) != null;
+    }
+}
+
+interface Greeter {
+    String GREETING = "hello";
+    String greet();
+}
+
+enum Color { RED, GREEN, BLUE }
+
+record Point(int x, int y) {}
+
+@interface Audited {}
+`;
+
+  test("produces break points for package, import, class, interface, enum, method, and field", async () => {
+    const points = await getASTBreakPoints(JAVA_SAMPLE, "src/AuthService.java");
+    const types = points.map(p => p.type);
+    expect(types.some(t => t.includes("import"))).toBe(true);
+    expect(types.some(t => t.includes("class"))).toBe(true);
+    expect(types.some(t => t.includes("iface"))).toBe(true);
+    expect(types.some(t => t.includes("enum"))).toBe(true);
+    expect(types.some(t => t.includes("method"))).toBe(true);
+    expect(types.some(t => t.includes("field"))).toBe(true);
+    expect(types.some(t => t.includes("type"))).toBe(true);
+    expect(points.find(p => p.type === "ast:class" && JAVA_SAMPLE.slice(p.pos).startsWith("record"))).toBeDefined();
+  });
+
+  test("scores align with expected hierarchy", async () => {
+    const points = await getASTBreakPoints(JAVA_SAMPLE, "src/AuthService.java");
+    expect(points.find(p => p.type === "ast:class")?.score).toBe(100);
+    expect(points.find(p => p.type === "ast:iface")?.score).toBe(100);
+    expect(points.find(p => p.type === "ast:enum")?.score).toBe(80);
+    expect(points.find(p => p.type === "ast:method")?.score).toBe(90);
+    expect(points.find(p => p.type === "ast:field")?.score).toBe(60);
+    expect(points.find(p => p.type === "ast:import")?.score).toBe(60);
+    expect(points.find(p => p.type === "ast:type")?.score).toBe(80);
+  });
+
+  test("break points are sorted by position", async () => {
+    const points = await getASTBreakPoints(JAVA_SAMPLE, "src/AuthService.java");
+    for (let i = 1; i < points.length; i++) {
+      expect(points[i]!.pos).toBeGreaterThanOrEqual(points[i - 1]!.pos);
+    }
+  });
+
+  test("annotated declarations break at the annotation, not after it", async () => {
+    const points = await getASTBreakPoints(JAVA_SAMPLE, "src/AuthService.java");
+    const annotatedClass = points
+      .filter(p => p.type === "ast:class")
+      .find(p => JAVA_SAMPLE.slice(p.pos, p.pos + 8) === "@Service");
+    expect(annotatedClass).toBeDefined();
+    const annotatedMethod = points
+      .filter(p => p.type === "ast:method")
+      .find(p => JAVA_SAMPLE.slice(p.pos, p.pos + 9) === "@Override");
+    expect(annotatedMethod).toBeDefined();
+  });
+
+  test("getASTStatus reports java available", async () => {
+    const status = await getASTStatus();
+    const java = status.languages.find(l => l.language === "java");
+    expect(java?.available).toBe(true);
   });
 });
 

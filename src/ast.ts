@@ -31,7 +31,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "java";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +45,7 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".java": "java",
 };
 
 /**
@@ -70,6 +71,7 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; versio
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.23.4" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.23.4" },
   rust:       { pkg: "tree-sitter-rust",       wasm: "tree-sitter-rust.wasm",       version: "0.24.0" },
+  java:       { pkg: "tree-sitter-java",       wasm: "tree-sitter-java.wasm",       version: "0.23.5" },
 };
 
 export function formatGrammarLoadError(language: SupportedLanguage, err: unknown): string {
@@ -148,6 +150,21 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  java: `
+    (class_declaration) @class
+    (interface_declaration) @iface
+    (record_declaration) @class
+    (enum_declaration) @enum
+    (annotation_type_declaration) @type
+    (method_declaration) @method
+    (constructor_declaration) @method
+    (compact_constructor_declaration) @method
+    (field_declaration) @field
+    (constant_declaration) @field
+    (enum_constant) @field
+    (package_declaration) @import
+    (import_declaration) @import
+  `,
 };
 
 /**
@@ -168,6 +185,7 @@ const SCORE_MAP: Record<string, number> = {
   decorated:  90,
   type:       80,
   enum:       80,
+  field:      60,
   import:     60,
 };
 
