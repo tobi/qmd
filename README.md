@@ -566,7 +566,7 @@ qmd embed
 # Force re-embed everything
 qmd embed -f
 
-# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
+# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust, Java)
 qmd embed --chunk-strategy auto
 
 # Also works with query for consistent chunk selection
@@ -872,9 +872,10 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 | Class / interface / struct / impl / trait | 100 | All |
 | Function / method | 90 | All |
 | Type alias / enum | 80 | All |
+| Field / constant / enum constant | 60 | Java |
 | Import / use declaration | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.java` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
 
 ### Query Flow (Hybrid)
 

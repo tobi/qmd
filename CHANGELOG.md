@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Features
+
+- AST-aware chunking now supports Java (`.java`) files via `tree-sitter-java`. `--chunk-strategy auto` breaks Java at class/interface/method/field boundaries. (#565)
+
 ## [2.5.2] - 2026-05-22
 
 ### Fixes
