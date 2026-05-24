@@ -11,10 +11,16 @@
  * SQLite build before creating any database instances.
  */
 
-export const isBun = typeof globalThis.Bun !== "undefined";
+export const isBun = "Bun" in globalThis;
 
-let _Database: any;
-let _sqliteVecLoad: ((db: any) => void) | null;
+export type SQLiteValue = string | number | bigint | Buffer | Uint8Array | Float32Array | null;
+export type SQLiteParams = readonly SQLiteValue[];
+
+type DatabaseConstructor = new (path: string) => Database;
+type LoadableSqliteDatabase = Pick<Database, "loadExtension">;
+
+let _Database: DatabaseConstructor;
+let _sqliteVecLoad: ((db: LoadableSqliteDatabase) => void) | null;
 
 if (isBun) {
   // Dynamic string prevents tsc from resolving bun:sqlite on Node.js builds
@@ -44,15 +50,15 @@ if (isBun) {
     const testDb = new BunDatabase(":memory:");
     testDb.loadExtension(vecPath);
     testDb.close();
-    _sqliteVecLoad = (db: any) => db.loadExtension(vecPath);
+    _sqliteVecLoad = (db: LoadableSqliteDatabase) => db.loadExtension(vecPath);
   } catch {
     // Vector search won't work, but BM25 and other operations are unaffected.
     _sqliteVecLoad = null;
   }
 } else {
-  _Database = (await import("better-sqlite3")).default;
+  _Database = (await import("better-sqlite3")).default as unknown as DatabaseConstructor;
   const sqliteVec = await import("sqlite-vec");
-  _sqliteVecLoad = (db: any) => sqliteVec.load(db);
+  _sqliteVecLoad = (db: LoadableSqliteDatabase) => sqliteVec.load(db as Parameters<typeof sqliteVec.load>[0]);
 }
 
 /**
@@ -69,13 +75,14 @@ export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
+  transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
   close(): void;
 }
 
 export interface Statement {
-  run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
-  get(...params: any[]): any;
-  all(...params: any[]): any[];
+  run(...params: SQLiteValue[]): { changes: number; lastInsertRowid: number | bigint };
+  get<T = unknown>(...params: SQLiteValue[]): T | undefined;
+  all<T = unknown>(...params: SQLiteValue[]): T[];
 }
 
 /**

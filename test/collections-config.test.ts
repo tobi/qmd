@@ -6,15 +6,19 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
 import { join } from "path";
-import { homedir } from "os";
-import { getConfigPath, setConfigIndexName } from "../src/collections.js";
+import { qmdHomedir } from "../src/paths.js";
+import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {
   savedEnv = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
     QMD_CONFIG_DIR: process.env.QMD_CONFIG_DIR,
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
   };
@@ -38,7 +42,16 @@ describe("getConfigDir via getConfigPath", () => {
   test("defaults to ~/.config/qmd when no env vars are set", () => {
     delete process.env.QMD_CONFIG_DIR;
     delete process.env.XDG_CONFIG_HOME;
-    expect(getConfigPath()).toBe(join(homedir(), ".config", "qmd", "index.yml"));
+    expect(getConfigPath()).toBe(join(qmdHomedir(), ".config", "qmd", "index.yml"));
+  });
+
+  test("uses the same USERPROFILE fallback as default DB path when HOME is unset", () => {
+    delete process.env.HOME;
+    delete process.env.QMD_CONFIG_DIR;
+    delete process.env.XDG_CONFIG_HOME;
+    process.env.USERPROFILE = "/Users/windows-user";
+
+    expect(getConfigPath()).toBe(join("/Users/windows-user", ".config", "qmd", "index.yml"));
   });
 
   test("QMD_CONFIG_DIR takes highest priority", () => {
@@ -70,5 +83,16 @@ describe("getConfigDir via getConfigPath", () => {
     process.env.XDG_CONFIG_HOME = "/xdg/config";
     setConfigIndexName("myindex");
     expect(getConfigPath()).toBe(join("/xdg/config", "qmd", "myindex.yml"));
+  });
+
+  test("loadConfig treats an empty YAML file as an empty config", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-empty-config-"));
+    try {
+      process.env.QMD_CONFIG_DIR = dir;
+      await writeFile(join(dir, "index.yml"), "");
+      expect(loadConfig()).toEqual({ collections: {} });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

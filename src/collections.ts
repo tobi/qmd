@@ -6,8 +6,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { homedir } from "os";
+import { join, dirname, resolve } from "path";
+import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
 
 // ============================================================================
@@ -101,9 +101,7 @@ export function setConfigSource(source?: { configPath?: string; config?: Collect
 export function setConfigIndexName(name: string): void {
   // Resolve relative paths to absolute paths and sanitize for use as filename
   if (name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
+    const absolutePath = resolve(process.cwd(), name);
     // Replace path separators with underscores to create a valid filename
     currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
   } else {
@@ -120,11 +118,39 @@ function getConfigDir(): string {
   if (process.env.XDG_CONFIG_HOME) {
     return join(process.env.XDG_CONFIG_HOME, "qmd");
   }
-  return join(homedir(), ".config", "qmd");
+  return join(qmdHomedir(), ".config", "qmd");
 }
 
 function getConfigFilePath(): string {
   return join(getConfigDir(), `${currentIndexName}.yml`);
+}
+
+/**
+ * Find a project-local QMD config by walking upward from startDir.
+ * The local config lives at .qmd/index.yaml or .qmd/index.yml and,
+ * when used by the CLI, keeps both config and index DB writes inside
+ * the project instead of the global ~/.config / ~/.cache locations.
+ */
+export function findLocalConfigPath(startDir: string = process.cwd()): string | undefined {
+  let dir = resolve(startDir);
+
+  while (true) {
+    const qmdDir = join(dir, ".qmd");
+    const yamlPath = join(qmdDir, "index.yaml");
+    if (existsSync(yamlPath)) return yamlPath;
+
+    const ymlPath = join(qmdDir, "index.yml");
+    if (existsSync(ymlPath)) return ymlPath;
+
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/** Return the local SQLite index path paired with a local .qmd/index.yaml file. */
+export function getLocalDbPath(configPath: string): string {
+  return join(dirname(configPath), "index.sqlite");
 }
 
 /**
@@ -161,7 +187,8 @@ export function loadConfig(): CollectionConfig {
 
   try {
     const content = readFileSync(configPath, "utf-8");
-    const config = YAML.parse(content) as CollectionConfig;
+    const parsed = YAML.parse(content) as CollectionConfig | null | undefined;
+    const config = parsed ?? { collections: {} };
 
     // Ensure collections object exists
     if (!config.collections) {

@@ -1,11 +1,11 @@
-import { openDatabase } from "../db.js";
-import type { Database } from "../db.js";
+import { isBun, openDatabase } from "../db.js";
+import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
-import { dirname, join as pathJoin, relative as relativePath } from "path";
+import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
-import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync } from "fs";
+import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
 import {
   getPwd,
@@ -31,6 +31,7 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
+  getEmbeddingFingerprint,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -68,17 +69,19 @@ import {
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
+  DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
   reindexCollection,
   generateEmbeddings,
+  maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -98,12 +101,22 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  saveConfig,
+  setConfigSource,
+  findLocalConfigPath,
+  getLocalDbPath,
+  getConfigPath,
+  configExists,
+  type CollectionConfig,
+  type ModelsConfig,
 } from "../collections.js";
-import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
-// Enable production mode - allows using default database path
-// Tests must set INDEX_PATH or use createStore() with explicit path
-enableProductionMode();
+// NOTE: enableProductionMode() is intentionally NOT called at module scope here.
+// Importing this module for its exports (e.g. buildEditorUri, termLink from
+// test/cli.test.ts) must not flip the global production flag, as that leaks
+// into unrelated tests that rely on the default (development) database path
+// resolution. The flag is flipped inside the CLI's main-module guard below so
+// it only fires when qmd is actually invoked as a script.
 
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
@@ -118,15 +131,14 @@ function getStore(): ReturnType<typeof createStore> {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
+      const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
-      }
+      setDefaultLlamaCpp(new LlamaCpp({
+        embedModel: activeModels.embed,
+        generateModel: activeModels.generate,
+        rerankModel: activeModels.rerank,
+      }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -170,9 +182,7 @@ function setIndexName(name: string | null): void {
   let normalizedName = name;
   // Normalize relative paths to prevent malformed database paths
   if (name && name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
+    const absolutePath = pathResolve(process.cwd(), name);
     // Replace path separators with underscores to create a valid filename
     normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
   }
@@ -206,6 +216,76 @@ const cursor = {
   show() { process.stderr.write('\x1b[?25h'); },
 };
 
+type CliLifecycleWritable = {
+  write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
+};
+
+type FinishSuccessfulCliCommandOptions = {
+  command: string;
+  format?: OutputFormat;
+  cleanup?: () => Promise<void>;
+  exit?: (code: number) => void;
+  immediateExit?: (code: number) => void;
+  stdout?: CliLifecycleWritable;
+  stderr?: CliLifecycleWritable;
+  platform?: NodeJS.Platform;
+};
+
+async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
+  await new Promise<void>((resolve) => {
+    stream.write("", () => resolve());
+  });
+}
+
+function shouldBypassNativeCleanup(options: FinishSuccessfulCliCommandOptions): boolean {
+  return (
+    (options.platform ?? process.platform) === "darwin" &&
+    options.command === "query" &&
+    options.format === "json" &&
+    process.env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1"
+  );
+}
+
+function immediateProcessExit(code: number): void {
+  const processWithReallyExit = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
+  if (typeof processWithReallyExit.reallyExit === "function") {
+    processWithReallyExit.reallyExit(code);
+    return;
+  }
+  process.exit(code);
+}
+
+/**
+ * Finish a successful CLI command after output has been flushed. On macOS JSON
+ * query runs, skip normal native teardown and use Node/Bun's immediate exit path:
+ * ggml Metal can abort from C++ finalizers after valid JSON has already been
+ * produced (#368). This wrapper is only reached after the command completed, so
+ * real query failures still exit through the normal error path before this runs.
+ */
+export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
+  const stderr = options.stderr ?? process.stderr;
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  const immediateExit = options.immediateExit ?? immediateProcessExit;
+
+  await flushWritable(options.stdout ?? process.stdout);
+
+  if (shouldBypassNativeCleanup(options)) {
+    await flushWritable(stderr);
+    immediateExit(0);
+    return;
+  }
+
+  try {
+    await (options.cleanup ?? disposeDefaultLlamaCpp)();
+  } catch (error) {
+    stderr.write(
+      `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
+    );
+  }
+  await flushWritable(stderr);
+  exit(0);
+}
+
 // Ensure cursor is restored on exit
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
@@ -236,8 +316,8 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database): void {
-  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db);
+function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
+  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -315,6 +395,80 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function sameDirectory(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return pathResolve(a) === pathResolve(b);
+  }
+}
+
+function initLocalIndex(): void {
+  const cwd = getPwd();
+  if (sameDirectory(cwd, homedir())) {
+    throw new Error("Refusing to initialize a local index in $HOME. The global index is automatically created; run `qmd collection add <path>` for the global index, or run `qmd init` inside a project folder.");
+  }
+
+  const qmdDir = pathJoin(cwd, ".qmd");
+  const ymlPath = pathJoin(qmdDir, "index.yml");
+  const yamlPath = pathJoin(qmdDir, "index.yaml");
+  const configPath = existsSync(yamlPath) ? yamlPath : ymlPath;
+  const dbPath = pathJoin(qmdDir, "index.sqlite");
+
+  mkdirSync(qmdDir, { recursive: true });
+  setConfigSource({ configPath });
+  storeDbPathOverride = dbPath;
+  closeDb();
+
+  if (!existsSync(configPath)) {
+    saveConfig({
+      collections: {},
+      models: resolveModels(),
+    });
+  } else {
+    ensureModelsConfiguredForCli();
+  }
+
+  const localStore = createStore(dbPath);
+  syncConfigToDb(localStore.db, loadConfig());
+  localStore.close();
+
+  console.log("ready to go with new local index");
+}
+
+function isForceCpuEnabled(): boolean {
+  const value = process.env.QMD_FORCE_CPU;
+  return !!value && !["false", "off", "none", "disable", "disabled", "0"].includes(value.trim().toLowerCase());
+}
+
+function configuredGpuModeLabel(): string {
+  return isForceCpuEnabled()
+    ? "CPU forced (QMD_FORCE_CPU)"
+    : (process.env.QMD_LLAMA_GPU?.trim() || "auto");
+}
+
+function summarizeDeviceNames(names: string[]): string {
+  const counts = new Map<string, number>();
+  for (const name of names) {
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+    .join(", ");
+}
+
+function sanitizeDiagnosticMessage(message: string): string {
+  const home = homedir();
+  return message
+    .replaceAll(home, "~")
+    .replaceAll(process.cwd(), ".")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .join("; ");
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -335,7 +489,8 @@ async function showStatus(): Promise<void> {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const statusEmbedModel = resolveEmbedModelForCli();
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, statusEmbedModel);
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -461,49 +616,13 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
+    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
+    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
-  // Device / GPU info
-  // Important: probing node-llama-cpp can abort the whole process on machines with
-  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
-  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
-  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
-    console.log(`\n${c.bold}Device${c.reset}`);
-    try {
-      const llm = getDefaultLlamaCpp();
-      const device = await llm.getDeviceInfo({ allowBuild: false });
-      if (device.gpu) {
-        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-        if (device.gpuDevices.length > 0) {
-          // Deduplicate and count GPUs
-          const counts = new Map<string, number>();
-          for (const name of device.gpuDevices) {
-            counts.set(name, (counts.get(name) || 0) + 1);
-          }
-          const deviceStr = Array.from(counts.entries())
-            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-            .join(', ');
-          console.log(`  Devices:  ${deviceStr}`);
-        }
-        if (device.vram) {
-          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-        }
-      } else {
-        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
-      }
-      console.log(`  CPU:      ${device.cpuCores} math cores`);
-    } catch (error) {
-      console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
-      if (error instanceof Error && error.message) {
-        console.log(`  ${c.dim}${error.message}${c.reset}`);
-      }
-    }
-  }
 
   // Tips section
   const tips: string[] = [];
@@ -843,6 +962,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       inputPath = inputPath.slice(0, -colonMatch[0].length);
     }
   }
+  if (fromLine !== undefined) fromLine = Math.max(1, fromLine);
 
   const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
   if (parsedIndexPath?.indexName) {
@@ -1291,8 +1411,33 @@ function listFiles(pathArg?: string): void {
   let collectionName: string;
   let pathPrefix: string | null = null;
 
-  if (pathArg.startsWith('qmd://')) {
-    // Virtual path format: qmd://collection/path
+  const afterScheme = pathArg.startsWith('qmd://') ? pathArg.slice('qmd://'.length) : null;
+  if (afterScheme !== null && afterScheme.startsWith('/')) {
+    // Absolute-path collection: qmd:///Users/foo/bar — normalizeVirtualPath would corrupt
+    // this by stripping all leading slashes, so bypass parseVirtualPath entirely.
+    const normalized = afterScheme.replace(/\/$/, '');
+    const allColls = yamlListCollections();
+    const match = allColls
+      .filter(c => normalized === c.name || normalized.startsWith(c.name + '/'))
+      .sort((a, b) => b.name.length - a.name.length)[0];
+    if (match) {
+      collectionName = match.name;
+      const rest = normalized.slice(match.name.length).replace(/^\//, '');
+      pathPrefix = rest || null;
+    } else {
+      // Preserve the historical qmd:////collection/path alias behavior for normal
+      // collections when no absolute-path collection matches.
+      const parsed = parseVirtualPath(pathArg);
+      if (!parsed) {
+        console.error(`Invalid virtual path: ${pathArg}`);
+        closeDb();
+        process.exit(1);
+      }
+      collectionName = parsed.collectionName;
+      pathPrefix = parsed.path;
+    }
+  } else if (afterScheme !== null) {
+    // Normal virtual path: qmd://collection-name/path
     const parsed = parseVirtualPath(pathArg);
     if (!parsed) {
       console.error(`Invalid virtual path: ${pathArg}`);
@@ -1301,8 +1446,22 @@ function listFiles(pathArg?: string): void {
     }
     collectionName = parsed.collectionName;
     pathPrefix = parsed.path;
+  } else if (pathArg.startsWith('/')) {
+    // Raw absolute filesystem path — longest-prefix match against collection names
+    const normalized = pathArg.replace(/\/$/, '');
+    const allColls = yamlListCollections();
+    const match = allColls
+      .filter(c => normalized === c.name || normalized.startsWith(c.name + '/'))
+      .sort((a, b) => b.name.length - a.name.length)[0];
+    if (match) {
+      collectionName = match.name;
+      const rest = normalized.slice(match.name.length).replace(/^\//, '');
+      pathPrefix = rest || null;
+    } else {
+      collectionName = normalized;
+    }
   } else {
-    // Just collection name or collection/path
+    // Short collection name or name/path
     const parts = pathArg.split('/');
     collectionName = parts[0] || '';
     if (parts.length > 1) {
@@ -1321,7 +1480,7 @@ function listFiles(pathArg?: string): void {
 
   // List files in the collection with size and modification time
   let query: string;
-  let params: any[];
+  let params: SQLiteValue[];
 
   if (pathPrefix) {
     // List files under a specific path
@@ -1571,7 +1730,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch (err: any) {
+    } catch {
       // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
       processed++;
       progress.set((processed / total) * 100);
@@ -1678,10 +1837,48 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
 }
 
+function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  try {
+    const config = loadConfig();
+    const models = resolveModels(config.models);
+    const current = config.models ?? {};
+    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+      saveConfig({
+        ...config,
+        models: {
+          ...current,
+          embed: models.embed,
+          generate: models.generate,
+          rerank: models.rerank,
+        },
+      });
+    }
+    return models;
+  } catch {
+    return resolveModels();
+  }
+}
+
+export function resolveEmbedModelForCli(): string {
+  return ensureModelsConfiguredForCli().embed;
+}
+
+export function resolveGenerateModelForCli(): string {
+  return ensureModelsConfiguredForCli().generate;
+}
+
+export function resolveRerankModelForCli(): string {
+  return ensureModelsConfiguredForCli().rerank;
+}
+
+function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
+  return ensureModelsConfiguredForCli();
+}
+
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL_URI,
+  model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1691,14 +1888,14 @@ async function vectorIndex(
   }
 
   // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db);
+  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
   if (hashesToEmbed === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1712,26 +1909,34 @@ async function vectorIndex(
   const result = await generateEmbeddings(storeInstance, {
     force,
     model,
+    collection: batchOptions?.collection,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
-      const percent = (info.bytesProcessed / info.totalBytes) * 100;
+      // Progress is measured by input bytes, not by chunks. The final chunk
+      // count is discovered lazily batch-by-batch, so displaying
+      // chunksEmbedded/totalChunks makes the percent look wrong when a few
+      // large documents remain. Show chunks as a count and label the byte
+      // percentage explicitly as input progress.
+      const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
       progress.set(percent);
 
       const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = info.bytesProcessed / elapsed;
-      const remainingBytes = info.totalBytes - info.bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
+      const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
+      const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
+      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
 
       const bar = renderProgressBar(percent);
       const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = `${formatBytes(bytesPerSec)}/s`;
-      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = info.errors > 0 ? ` ${c.yellow}${info.errors} err${c.reset}` : "";
+      const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
+      const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
+      const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
+      const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
+      const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${info.chunksEmbedded}/${info.totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
     },
   });
 
@@ -1746,7 +1951,13 @@ async function vectorIndex(
     console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
     if (result.errors > 0) {
-      console.log(`${c.yellow}⚠ ${result.errors} chunks failed${c.reset}`);
+      console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+      for (const failure of (result.failures ?? []).slice(0, 8)) {
+        console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
+      }
+      if ((result.failures?.length ?? 0) > 8) {
+        console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+      }
     }
   }
 
@@ -1880,6 +2091,7 @@ type OutputRow = {
   score: number;
   context?: string | null;
   chunkPos?: number;
+  chunkLen?: number;
   hash?: string;
   docid?: string;
   explain?: HybridQueryExplain;
@@ -1962,9 +2174,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     // JSON output for LLM consumption
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+      const snippetInfo = extractSnippet(row.body, query, 300, row.chunkPos, row.chunkLen, opts.intent);
       let body = opts.full ? row.body : undefined;
-      const snippetInfo = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent) : undefined;
-      let snippet = snippetInfo?.snippet;
+      let snippet = !opts.full ? snippetInfo.snippet : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1973,7 +2185,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
         file: toQmdPath(row.displayPath),
-        ...(snippetInfo && { line: snippetInfo.line }),
+        line: snippetInfo.line,
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),
@@ -1996,7 +2208,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -2060,8 +2272,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log();
 
       // Snippet with highlighting (diff-style header included)
-      let displaySnippet = opts.lineNumbers ? addLineNumbers(snippet, line) : snippet;
-      const highlighted = highlightTerms(displaySnippet, query);
+      const content = opts.full ? row.body : snippet;
+      const displayContent = opts.lineNumbers ? addLineNumbers(content, opts.full ? 1 : line) : content;
+      const highlighted = highlightTerms(displayContent, query);
       console.log(highlighted);
 
       // Double empty line between results
@@ -2073,7 +2286,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -2086,7 +2299,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -2096,10 +2309,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
-        content = addLineNumbers(content, line);
+        content = addLineNumbers(content, opts.full ? 1 : line);
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const snippetText = content || "";
@@ -2455,13 +2668,13 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
 
-    // Map to CLI output format — use bestChunk for snippet display
     outputResults(results.map(r => ({
       file: r.file,
       displayPath: r.displayPath,
       title: r.title,
-      body: r.bestChunk,
+      body: r.body,
       chunkPos: r.bestChunkPos,
+      chunkLen: r.bestChunk.length,
       score: r.score,
       context: r.context,
       docid: r.docid,
@@ -2517,6 +2730,7 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -2529,11 +2743,26 @@ function parseCLI() {
     strict: false, // Allow unknown options to pass through
   });
 
-  // Select index name (default: "index")
+  if (values["no-gpu"]) {
+    process.env.QMD_FORCE_CPU = "1";
+  }
+
+  // Select index name (default: "index"). If no explicit --index is supplied,
+  // a project-local .qmd/index.yaml overrides the global config/cache paths.
   const indexName = values.index as string | undefined;
   if (indexName) {
     setIndexName(indexName);
     setConfigIndexName(indexName);
+    setConfigSource();
+  } else {
+    const localConfigPath = findLocalConfigPath();
+    if (localConfigPath) {
+      setConfigSource({ configPath: localConfigPath });
+      storeDbPathOverride = getLocalDbPath(localConfigPath);
+      closeDb();
+    } else {
+      setConfigSource();
+    }
   }
 
   // Determine output format
@@ -2603,14 +2832,187 @@ function removePath(path: string): void {
   }
 }
 
+type SkillInfo = {
+  name: string;
+  description: string;
+  dir: string;
+  hidden: boolean;
+};
+
+const SKILL_DIR = "skills";
+
+function findPackageRoot(): string | null {
+  if (process.env.QMD_SKILLS_DIR) {
+    return null;
+  }
+
+  const start = dirname(fileURLToPath(import.meta.url));
+  let current = start;
+  while (true) {
+    if (existsSync(resolve(current, SKILL_DIR))) {
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+
+function getSkillSearchDirs(_runtimeOnly = false): string[] {
+  if (process.env.QMD_SKILLS_DIR) {
+    return [process.env.QMD_SKILLS_DIR];
+  }
+
+  const root = findPackageRoot();
+  if (!root) return [];
+
+  const dir = resolve(root, SKILL_DIR);
+  return existsSync(dir) ? [dir] : [];
+}
+
+function parseSkillFrontmatter(content: string): { name: string; description: string; hidden: boolean } | null {
+  const trimmed = content.trimStart();
+  if (!trimmed.startsWith("---")) return null;
+  const end = trimmed.slice(3).indexOf("\n---");
+  if (end < 0) return null;
+
+  const frontmatter = trimmed.slice(3, 3 + end);
+  let name = "";
+  let description = "";
+  let hidden = false;
+  const lines = frontmatter.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.startsWith("name:")) {
+      name = line.slice("name:".length).trim();
+    } else if (line.startsWith("description:")) {
+      const parts = [line.slice("description:".length).trim()];
+      while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]!)) {
+        i++;
+        parts.push(lines[i]!.trim());
+      }
+      description = parts.join(" ");
+    } else if (line.startsWith("hidden:")) {
+      const value = line.slice("hidden:".length).trim().toLowerCase();
+      hidden = value === "true" || value === "yes";
+    }
+  }
+
+  if (!name) return null;
+  return { name, description, hidden };
+}
+
+function discoverSkills(runtimeOnly = false): SkillInfo[] {
+  const skills: SkillInfo[] = [];
+  for (const dir of getSkillSearchDirs(runtimeOnly)) {
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const skillDir = resolve(dir, entry);
+      const skillPath = resolve(skillDir, "SKILL.md");
+      if (!existsSync(skillPath)) continue;
+      let content = "";
+      try {
+        content = readFileSync(skillPath, "utf-8");
+      } catch {
+        continue;
+      }
+      const parsed = parseSkillFrontmatter(content);
+      if (!parsed) continue;
+      skills.push({ ...parsed, dir: skillDir });
+    }
+  }
+  return skills.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function findSkill(name: string, runtimeOnly = false): SkillInfo | null {
+  return discoverSkills(runtimeOnly).find((skill) => skill.name === name) ?? null;
+}
+
+function readSkillContent(skill: SkillInfo): string {
+  return readFileSync(resolve(skill.dir, "SKILL.md"), "utf-8");
+}
+
+function collectSkillFiles(skill: SkillInfo): { relativePath: string; content: string }[] {
+  const files: { relativePath: string; content: string }[] = [];
+  for (const subdirName of ["references", "templates", "scripts"]) {
+    const subdir = resolve(skill.dir, subdirName);
+    if (!existsSync(subdir)) continue;
+    for (const entry of readdirSync(subdir).sort()) {
+      const filePath = resolve(subdir, entry);
+      try {
+        if (!statSync(filePath).isFile()) continue;
+        files.push({ relativePath: `${subdirName}/${basename(filePath)}`, content: readFileSync(filePath, "utf-8") });
+      } catch {
+        // Ignore unreadable supplementary files.
+      }
+    }
+  }
+  return files;
+}
+
 function showSkill(): void {
-  console.log("QMD Skill (embedded)");
+  const skill = findSkill("qmd");
+  if (!skill) {
+    throw new Error("QMD skill not found. Reinstall qmd or set QMD_SKILLS_DIR.");
+  }
+  console.log("QMD Skill");
   console.log("");
-  const content = getEmbeddedQmdSkillContent();
+  const content = readSkillContent(skill);
   process.stdout.write(content.endsWith("\n") ? content : content + "\n");
 }
 
-function writeEmbeddedSkill(targetDir: string, force: boolean): void {
+function copyDirectoryContents(sourceDir: string, targetDir: string): void {
+  mkdirSync(targetDir, { recursive: true });
+  for (const entry of readdirSync(sourceDir)) {
+    const sourcePath = resolve(sourceDir, entry);
+    const targetPath = resolve(targetDir, entry);
+    const stat = statSync(sourcePath);
+    if (stat.isDirectory()) {
+      copyDirectoryContents(sourcePath, targetPath);
+    } else if (stat.isFile()) {
+      copyFileSync(sourcePath, targetPath);
+    }
+  }
+}
+
+function installedSkillStubContent(): string {
+  return `---
+name: qmd
+description: Bootstrap QMD search instructions from the installed qmd CLI. Use when users ask to find notes, retrieve documents, inspect a wiki, or answer from indexed local markdown.
+license: MIT
+compatibility: Requires qmd CLI. Run \`qmd skill show\` for version-matched instructions.
+allowed-tools: Bash(qmd:*), mcp__qmd__*
+---
+
+# QMD - Query Markdown Documents
+
+This installed skill is intentionally a small bootstrap so it does not go stale
+when the qmd package updates.
+
+Load the full, version-matched QMD instructions from the CLI:
+
+!\`qmd skill show\`
+
+If your agent does not support bang-command expansion, run:
+
+\`\`\`bash
+qmd skill show
+\`\`\`
+
+Then follow those instructions. In short: search first, fetch full sources with
+\`qmd get\` or \`qmd multi-get\`, and answer from retrieved text rather than snippets.
+`;
+}
+
+function writeSkillInstall(targetDir: string, force: boolean): void {
   if (pathExists(targetDir)) {
     if (!force) {
       throw new Error(`Skill already exists: ${targetDir} (use --force to replace it)`);
@@ -2618,12 +3020,122 @@ function writeEmbeddedSkill(targetDir: string, force: boolean): void {
     removePath(targetDir);
   }
 
-  mkdirSync(targetDir, { recursive: true });
-  for (const file of getEmbeddedQmdSkillFiles()) {
-    const destination = resolve(targetDir, file.relativePath);
-    mkdirSync(dirname(destination), { recursive: true });
-    writeFileSync(destination, file.content, "utf-8");
+  const skill = findSkill("qmd");
+  if (!skill) {
+    throw new Error("QMD skill not found. Reinstall qmd or set QMD_SKILLS_DIR.");
   }
+
+  copyDirectoryContents(skill.dir, targetDir);
+  writeFileSync(resolve(targetDir, "SKILL.md"), installedSkillStubContent(), "utf-8");
+}
+
+function outputSkillsJson(payload: unknown): void {
+  console.log(JSON.stringify(payload));
+}
+
+function runSkillsCommand(args: string[], jsonMode: boolean, fullOption = false, allOption = false): void {
+  const subcommand = args[0] ?? "list";
+  const runtimeSkills = () => discoverSkills(true).filter((skill) => !skill.hidden);
+
+  switch (subcommand) {
+    case "list": {
+      const skills = runtimeSkills();
+      if (jsonMode) {
+        outputSkillsJson({ success: true, data: skills.map(({ name, description }) => ({ name, description })) });
+        return;
+      }
+      if (skills.length === 0) {
+        console.log("No skills found");
+        return;
+      }
+      const maxName = Math.max(...skills.map((skill) => skill.name.length));
+      for (const skill of skills) {
+        console.log(`  ${skill.name.padEnd(maxName)}  ${skill.description}`);
+      }
+      return;
+    }
+
+    case "get": {
+      const full = fullOption || args.includes("--full");
+      const getAll = allOption || args.includes("--all");
+      const names = args.slice(1).filter((arg) => arg !== "--full" && arg !== "--all");
+      const targets = getAll ? runtimeSkills() : names.map((name) => {
+        const skill = findSkill(name, true);
+        if (!skill) {
+          throw new Error(`Skill not found: ${name}`);
+        }
+        return skill;
+      });
+
+      if (targets.length === 0) {
+        throw new Error("No skill name provided. Usage: qmd skills get <name>");
+      }
+
+      if (jsonMode) {
+        outputSkillsJson({
+          success: true,
+          data: targets.map((skill) => ({
+            name: skill.name,
+            content: readSkillContent(skill),
+            ...(full ? { files: collectSkillFiles(skill).map((file) => ({ path: file.relativePath, content: file.content })) } : {}),
+          })),
+        });
+        return;
+      }
+
+      targets.forEach((skill, index) => {
+        if (index > 0) console.log("\n---\n");
+        const content = readSkillContent(skill);
+        process.stdout.write(content.endsWith("\n") ? content : content + "\n");
+        if (full) {
+          for (const file of collectSkillFiles(skill)) {
+            console.log(`\n--- ${file.relativePath} ---\n`);
+            process.stdout.write(file.content.endsWith("\n") ? file.content : file.content + "\n");
+          }
+        }
+      });
+      return;
+    }
+
+    case "path": {
+      const name = args[1];
+      if (!name) {
+        const paths = getSkillSearchDirs(true);
+        if (jsonMode) outputSkillsJson({ success: true, data: { paths } });
+        else paths.forEach((path) => console.log(path));
+        return;
+      }
+      const skill = findSkill(name, true);
+      if (!skill) {
+        throw new Error(`Skill not found: ${name}`);
+      }
+      if (jsonMode) outputSkillsJson({ success: true, data: { name: skill.name, path: skill.dir } });
+      else console.log(skill.dir);
+      return;
+    }
+
+    case "help": {
+      showSkillsHelp();
+      return;
+    }
+
+    default:
+      throw new Error(`Unknown skills subcommand: ${subcommand}`);
+  }
+}
+
+function showSkillsHelp(): void {
+  console.log("Usage: qmd skills <list|get|path> [options]");
+  console.log("");
+  console.log("Commands:");
+  console.log("  list                 List bundled runtime skills");
+  console.log("  get <name>           Print a bundled runtime skill");
+  console.log("  get <name> --full    Include references/templates/scripts");
+  console.log("  get --all            Print all bundled runtime skills");
+  console.log("  path [name]          Print runtime skill directory path(s)");
+  console.log("");
+  console.log("Options:");
+  console.log("  --json               Print structured JSON");
 }
 
 function ensureClaudeSymlink(linkPath: string, targetDir: string, force: boolean): boolean {
@@ -2683,7 +3195,7 @@ async function shouldCreateClaudeSymlink(linkPath: string, autoYes: boolean): Pr
 
 async function installSkill(globalInstall: boolean, force: boolean, autoYes: boolean): Promise<void> {
   const installDir = getSkillInstallDir(globalInstall);
-  writeEmbeddedSkill(installDir, force);
+  writeSkillInstall(installDir, force);
   console.log(`✓ Installed QMD skill to ${installDir}`);
 
   const claudeLinkPath = getClaudeSkillLinkPath(globalInstall);
@@ -2712,7 +3224,8 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
-  console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
+  console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
+  console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -2722,9 +3235,10 @@ function showHelp(): void {
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
   console.log("");
   console.log("Maintenance:");
+  console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
@@ -2765,6 +3279,7 @@ function showHelp(): void {
   console.log("");
   console.log("AI agents & integrations:");
   console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
+  console.log("  - Run `qmd skills get qmd --full` for version-matched agent instructions.");
   console.log("  - `qmd skill install` installs the QMD skill into ./.agents/skills/qmd.");
   console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
@@ -2781,6 +3296,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
@@ -2797,10 +3313,580 @@ function showHelp(): void {
   console.log(`Index: ${getDbPath()}`);
 }
 
-async function showVersion(): Promise<void> {
+function doctorCheck(label: string, ok: boolean, details: string): void {
+  const mark = ok ? `${c.green}✓${c.reset}` : `${c.yellow}⚠${c.reset}`;
+  console.log(`${mark} ${label}: ${details}`);
+}
+
+function formatCount(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function shortModelName(model: string): string {
+  if (model.startsWith("hf:")) {
+    return model.split("/").pop() || model;
+  }
+  return model.length > 56 ? `${model.slice(0, 53)}...` : model;
+}
+
+function normalizedDoctorNextSteps(steps: string[]): string[] {
+  const unique = Array.from(new Set(steps));
+  const hasForceEmbed = unique.some(step => step.includes("qmd embed --force"));
+  if (!hasForceEmbed) return unique;
+  return unique.filter(step => !step.includes("qmd embed") || step.startsWith("Run `qmd embed --force`"));
+}
+
+function shortHashSeq(hashSeq: string): string {
+  const idx = hashSeq.lastIndexOf("_");
+  if (idx < 0) return hashSeq.length > 18 ? `${hashSeq.slice(0, 18)}...` : hashSeq;
+  return `${hashSeq.slice(0, 12)}_${hashSeq.slice(idx + 1)}`;
+}
+
+type DoctorVectorSampleResult = {
+  ok: boolean;
+  details: string;
+};
+
+function decodeStoredEmbedding(bytes: Uint8Array): Float32Array {
+  return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+function cosineDistance(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  if (a.length !== b.length || a.length === 0) return Number.POSITIVE_INFINITY;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    dot += av * bv;
+    normA += av * av;
+    normB += bv * bv;
+  }
+  if (normA === 0 || normB === 0) return Number.POSITIVE_INFINITY;
+  return 1 - (dot / (Math.sqrt(normA) * Math.sqrt(normB)));
+}
+
+type CachedModelInspection = {
+  path: string | null;
+  invalid: string[];
+};
+
+function formatModelDiagnosticPath(path: string): string {
+  return sanitizeDiagnosticMessage(path);
+}
+
+function findCachedModelInspection(model: string): CachedModelInspection {
+  const invalid: string[] = [];
+  if (model.startsWith("hf:")) {
+    const filename = model.split("/").pop();
+    if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
+    const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.includes(filename)) continue;
+      const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
+      const inspection = inspectGgufFile(candidate);
+      if (inspection.valid) return { path: candidate, invalid };
+      invalid.push(`${formatModelDiagnosticPath(candidate)}: ${inspection.details}`);
+    }
+    return { path: null, invalid };
+  }
+
+  const inspection = inspectGgufFile(model);
+  if (inspection.valid) return { path: model, invalid };
+  if (inspection.exists) invalid.push(`${formatModelDiagnosticPath(model)}: ${inspection.details}`);
+  return { path: null, invalid };
+}
+
+type EnvOverride = {
+  name: string;
+  value: string;
+  consequence: string;
+};
+
+function envValueForDisplay(value: string): string {
+  const sanitized = sanitizeDiagnosticMessage(value);
+  return sanitized.length > 96 ? `${sanitized.slice(0, 93)}...` : sanitized;
+}
+
+function collectEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): EnvOverride[] {
+  const overrides: EnvOverride[] = [];
+  const add = (name: string, consequence: string) => {
+    const raw = process.env[name]?.trim();
+    if (!raw) return;
+    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+  };
+  const addModel = (name: string, key: "embed" | "generate" | "rerank", active: string) => {
+    const raw = process.env[name]?.trim();
+    if (!raw) return;
+    const configured = configModels[key];
+    const consequence = configured && configured !== raw
+      ? `set but ignored because index models.${key} is configured as ${configured}`
+      : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
+    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+  };
+
+  add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
+  add("QMD_CONFIG_DIR", "overrides the QMD config directory and takes precedence over XDG_CONFIG_HOME");
+  add("XDG_CONFIG_HOME", "moves QMD config to $XDG_CONFIG_HOME/qmd when QMD_CONFIG_DIR is not set");
+  add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
+  addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
+  addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
+  addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
+  add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
+  add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
+  add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
+  add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
+  add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
+  add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
+  add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
+  add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
+  add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
+  add("QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT", "disables macOS JSON-query safe exit workaround; may re-expose Metal finalizer crashes");
+  add("NO_COLOR", "disables colored terminal output");
+  add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
+  add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
+  add("QMD_WRAPPER_CAPTURE", "test/debug hook for the qmd shell wrapper; should not be set in normal use");
+  add("WSL_DISTRO_NAME", "enables WSL path handling heuristics");
+  add("WSL_INTEROP", "enables WSL path handling heuristics");
+  return overrides;
+}
+
+type DoctorConfigCheck = {
+  config: CollectionConfig | null;
+  valid: boolean;
+};
+
+function checkDoctorIndexConfig(nextSteps: string[]): DoctorConfigCheck {
+  try {
+    const config = loadConfig();
+    const collectionCount = Object.keys(config.collections ?? {}).length;
+    if (collectionCount === 0) {
+      doctorCheck("index config", false, "no collections configured. Next: `qmd collection add .`");
+      nextSteps.push("Run `qmd collection add . --name <name>` from the folder you want to index, or edit .qmd/index.yml manually.");
+    } else {
+      doctorCheck("index config", true, `${formatCount(collectionCount)} ${collectionCount === 1 ? "collection" : "collections"} configured`);
+    }
+    return { config, valid: true };
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    const configPath = getConfigPath();
+    doctorCheck("index config", false, `invalid index.yml at ${configPath}: ${message}. Next: fix the YAML and rerun \`qmd doctor\``);
+    nextSteps.push(`Fix invalid YAML in ${configPath}, then rerun \`qmd doctor\`.`);
+    return { config: null, valid: false };
+  }
+}
+
+function checkEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
+  const overrides = collectEnvironmentOverrides(activeModels, configModels);
+  if (overrides.length === 0) {
+    doctorCheck("environment overrides", true, "none");
+    return;
+  }
+
+  doctorCheck("environment overrides", false, `${overrides.length} set`);
+  for (const override of overrides) {
+    console.log(`  - ${override.name}=${override.value}: ${override.consequence}`);
+  }
+}
+
+function checkModelDefaults(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
+  const checks = [
+    { role: "embedding", key: "embed", active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
+    { role: "generation", key: "generate", active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
+    { role: "reranking", key: "rerank", active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
+  ] as const;
+
+  const notes: string[] = [];
+  for (const check of checks) {
+    const envValue = check.envValue?.trim();
+    if (envValue && check.active === envValue) {
+      notes.push(`${check.role}: env ${check.envName}=${check.active} (default ${check.defaultModel}; might be ok)`);
+    } else if (check.configured && check.configured !== check.defaultModel) {
+      notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
+    } else if (envValue && check.active !== envValue) {
+      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
+    }
+  }
+
+  if (notes.length === 0) {
+    doctorCheck("model defaults", true, "using QMD codebase defaults");
+    return;
+  }
+
+  doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
+}
+
+function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
+  const models = [
+    ["embedding", activeModels.embed],
+    ["generation", activeModels.generate],
+    ["reranking", activeModels.rerank],
+  ] as const;
+  const unique = new Map<string, string[]>();
+  for (const [role, model] of models) {
+    unique.set(model, [...(unique.get(model) ?? []), role]);
+  }
+
+  const missing: string[] = [];
+  const cached: string[] = [];
+  const invalid: string[] = [];
+  for (const [model, roles] of unique) {
+    const label = `${roles.join("+")}: ${model}`;
+    const inspection = findCachedModelInspection(model);
+    invalid.push(...inspection.invalid.map(detail => `${label} (${detail})`));
+    if (inspection.path) {
+      cached.push(label);
+    } else {
+      missing.push(label);
+    }
+  }
+
+  if (missing.length === 0 && invalid.length === 0) {
+    doctorCheck("model cache", true, `${cached.length} active ${cached.length === 1 ? "model is" : "models are"} downloaded and valid GGUF`);
+    return;
+  }
+
+  const parts: string[] = [];
+  if (invalid.length > 0) parts.push(`invalid ${invalid.length}: ${invalid.join("; ")}`);
+  if (missing.length > 0) parts.push(`missing ${missing.length}/${unique.size}: ${missing.join("; ")}`);
+  const next = invalid.length > 0
+    ? "Next: run `qmd pull --refresh` (or remove the bad cached file)"
+    : "Next: run `qmd pull`";
+  doctorCheck("model cache", false, `${parts.join("; ")}. ${next}`);
+  if (invalid.length > 0) {
+    nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
+  } else {
+    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+  }
+}
+
+async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+  const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
+  if (activeDocs === 0) {
+    return { ok: true, details: "no active documents indexed" };
+  }
+
+  const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!vecTableExists) {
+    return { ok: false, details: "no vector table to test; please run qmd embed again" };
+  }
+
+  const samples = db.prepare(`
+    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN content c ON c.hash = cv.hash
+    WHERE cv.model = ? AND cv.embed_fingerprint = ?
+    GROUP BY cv.hash, cv.seq, c.doc
+    ORDER BY random()
+    LIMIT ?
+  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+
+  if (samples.length === 0) {
+    return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
+  }
+
+  const threshold = 0.0001;
+  const mismatches: string[] = [];
+
+  await withLLMSession(async (session) => {
+    for (const sample of samples) {
+      const hashSeq = `${sample.hash}_${sample.seq}`;
+      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunk = chunks[sample.seq];
+      if (!chunk) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
+        continue;
+      }
+
+      const title = extractTitle(sample.body, sample.path);
+      const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+      if (!result) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: embedding failed`);
+        continue;
+      }
+
+      const stored = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`).get(hashSeq) as { embedding: Uint8Array } | undefined;
+      if (!stored) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector missing`);
+        continue;
+      }
+
+      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
+      if (distance > threshold) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
+      }
+    }
+  }, { maxDuration: 10 * 60 * 1000, name: "doctorEmbeddingVectorSample" });
+
+  if (mismatches.length > 0) {
+    return {
+      ok: false,
+      details: `${mismatches.length}/${samples.length} sampled chunks differ from stored vectors (${mismatches[0]}). Rebuild with \`qmd embed --force\``,
+    };
+  }
+
+  return {
+    ok: true,
+    details: `${samples.length} sampled ${samples.length === 1 ? "chunk" : "chunks"} reproduce stored vectors`,
+  };
+}
+
+function hasLibraryInDirs(libraryBaseName: string, dirs: string[]): boolean {
+  for (const dir of dirs) {
+    if (!dir || !existsSync(dir)) continue;
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry === libraryBaseName || entry.startsWith(`${libraryBaseName}.`)) return true;
+      }
+    } catch { /* ignore unreadable system library dirs */ }
+  }
+  return false;
+}
+
+function linuxCudaRuntimeDiagnostic(): string | null {
+  if (process.platform !== "linux") return null;
+
+  const dirs = new Set<string>();
+  for (const value of [process.env.LD_LIBRARY_PATH, process.env.CUDA_PATH]) {
+    for (const part of (value ?? "").split(":")) {
+      if (part) dirs.add(part);
+    }
+  }
+  if (process.env.CUDA_PATH) {
+    dirs.add(pathJoin(process.env.CUDA_PATH, "lib64"));
+    dirs.add(pathJoin(process.env.CUDA_PATH, "targets", "x86_64-linux", "lib"));
+  }
+  for (const dir of ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64", "/usr/local/cuda/targets/x86_64-linux/lib"]) {
+    dirs.add(dir);
+  }
+  try {
+    for (const entry of readdirSync("/usr/local")) {
+      if (!entry.toLowerCase().startsWith("cuda-")) continue;
+      const cudaRoot = pathJoin("/usr/local", entry);
+      dirs.add(pathJoin(cudaRoot, "lib64"));
+      dirs.add(pathJoin(cudaRoot, "targets", "x86_64-linux", "lib"));
+    }
+  } catch { /* /usr/local may not be readable in restricted environments */ }
+
+  const searchDirs = [...dirs];
+  const hasDriver = hasLibraryInDirs("libcuda.so", searchDirs) || hasLibraryInDirs("libnvidia-ml.so", searchDirs);
+  if (!hasDriver) return null;
+
+  const cudaLibraries: [library: string, label: string][] = [
+    ["libcudart.so", "CUDA runtime"],
+    ["libcublas.so", "cuBLAS"],
+    ["libcublasLt.so", "cuBLASLt"],
+  ];
+  const missing = cudaLibraries
+    .filter(([library]) => !hasLibraryInDirs(library, searchDirs))
+    .map(([, label]) => label);
+
+  if (missing.length === 0) return null;
+  return `NVIDIA driver libraries are visible, but CUDA user-space libraries are missing from loader paths (${missing.join(", ")})`;
+}
+
+async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
+  const mode = configuredGpuModeLabel();
+  doctorCheck("device mode", true, mode);
+
+  const skipProbe = ["0", "false", "off", "no", "skip"].includes((process.env.QMD_DOCTOR_DEVICE_PROBE ?? "").trim().toLowerCase());
+  if (skipProbe) {
+    doctorCheck("device probe", false, "skipped by QMD_DOCTOR_DEVICE_PROBE=0. Next: unset it and rerun `qmd doctor` to verify GPU/CPU acceleration");
+    nextSteps.push("Unset `QMD_DOCTOR_DEVICE_PROBE` and rerun `qmd doctor` when you want to verify llama.cpp device acceleration.");
+    return;
+  }
+
+  const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
+  if (process.stdout.isTTY) {
+    process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
+  }
+
+  try {
+    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+    }
+    if (device.gpu) {
+      const gpuLabel = device.gpu === "metal" && process.platform === "darwin"
+        ? "metal (macOS Metal backend)"
+        : String(device.gpu);
+      const parts = [`GPU ${gpuLabel}`, `offloading ${device.gpuOffloading ? "enabled" : "disabled"}`];
+      if (device.gpuDevices.length > 0) parts.push(`devices: ${summarizeDeviceNames(device.gpuDevices)}`);
+      if (device.vram) parts.push(`VRAM ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      parts.push(`${device.cpuCores} CPU math cores`);
+      doctorCheck("device probe", device.gpuOffloading, device.gpuOffloading
+        ? parts.join("; ")
+        : `${parts.join("; ")}. Next: check QMD_LLAMA_GPU and llama.cpp backend support`);
+      if (!device.gpuOffloading) {
+        nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
+      }
+    } else {
+      const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
+      const diagnosticSuffix = cudaDiagnostic ? ` ${cudaDiagnostic}.` : "";
+      doctorCheck("device probe", false, `running on CPU (${device.cpuCores} math cores).${diagnosticSuffix} Next: install/configure Metal, CUDA, or Vulkan for faster embeddings, or set QMD_FORCE_CPU=1 to make CPU mode explicit`);
+      if (cudaDiagnostic) {
+        nextSteps.push(`${cudaDiagnostic}; install CUDA runtime/cuBLAS libraries or add their directory to LD_LIBRARY_PATH, then rerun \`qmd doctor\`.`);
+      } else {
+        nextSteps.push("Vector operations are running on CPU; install/configure Metal, CUDA, or Vulkan if embedding/query performance is too slow.");
+      }
+    }
+  } catch (error) {
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+    }
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("device probe", false, `probe failed: ${message}. Next: run with QMD_FORCE_CPU=1 to bypass GPU probing, or set QMD_LLAMA_GPU=metal|cuda|vulkan and retry`);
+    nextSteps.push("GPU probe failed; try `QMD_FORCE_CPU=1 qmd doctor` to confirm CPU fallback, then fix GPU drivers/backend if acceleration is expected.");
+  }
+}
+
+async function showDoctor(): Promise<void> {
+  const storeInstance = getStore();
+  const db = storeInstance.db;
+  const pkg = readPackageJson();
+  const activeModels = resolveModelsForCli();
+  const embedModel = activeModels.embed;
+  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const nextSteps: string[] = [];
+
+  console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+  console.log(`Index: ${getDbPath()}`);
+  console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
+
+  try {
+    const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
+    doctorCheck("SQLite runtime", true, row.version);
+  } catch (error) {
+    doctorCheck("SQLite runtime", false, error instanceof Error ? error.message : String(error));
+  }
+
+  const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
+  doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
+
+  try {
+    const row = db.prepare(`SELECT vec_version() AS version`).get() as { version: string };
+    doctorCheck("sqlite-vec", true, row.version);
+  } catch (error) {
+    doctorCheck("sqlite-vec", false, error instanceof Error ? error.message : String(error));
+  }
+
+  const configCheck = checkDoctorIndexConfig(nextSteps);
+  const configModels = configCheck.config?.models ?? {};
+  checkEnvironmentOverrides(activeModels, configModels);
+  checkModelDefaults(activeModels, configModels);
+  checkModelCache(activeModels, nextSteps);
+
+  await runDoctorDeviceChecks(nextSteps);
+
+  try {
+    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    if (adoption.checked || adoption.adopted > 0) {
+      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
+    }
+  } catch (error) {
+    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
+    doctorCheck("embedding freshness", pending === 0, pending === 0 ? "all active documents match current fingerprint" : `${formatCount(pending)} active documents need embeddings. Next: \`qmd embed\``);
+    if (pending > 0) {
+      nextSteps.push(`Run \`qmd embed\` to generate ${formatCount(pending)} missing/stale document embeddings.`);
+    }
+  } catch (error) {
+    doctorCheck("embedding freshness", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const rows = db.prepare(`
+      SELECT model, embed_fingerprint AS fingerprint, COUNT(DISTINCT hash) AS docs, COUNT(*) AS chunks
+      FROM content_vectors
+      GROUP BY model, embed_fingerprint
+      ORDER BY chunks DESC, model, embed_fingerprint
+    `).all() as { model: string; fingerprint: string; docs: number; chunks: number }[];
+    const uniqueFingerprints = new Set(rows.map(row => row.fingerprint));
+    const offCurrent = rows.filter(row => row.model === embedModel && row.fingerprint !== fingerprint);
+    const ok = rows.length === 0 || (uniqueFingerprints.size === 1 && rows[0]?.fingerprint === fingerprint && offCurrent.length === 0);
+    const currentDocs = rows
+      .filter(row => row.model === embedModel && row.fingerprint === fingerprint)
+      .reduce((sum, row) => sum + row.docs, 0);
+    const otherDocs = rows.reduce((sum, row) => sum + row.docs, 0) - currentDocs;
+    const groups = rows.map(row => {
+      const label = row.fingerprint === fingerprint ? "current" : (row.fingerprint || "legacy");
+      return `${shortModelName(row.model)}:${label} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`;
+    }).join("; ");
+    const namedFingerprintRows = rows.filter(row => row.fingerprint);
+    const namedFingerprints = [...new Set(namedFingerprintRows.map(row => row.fingerprint))];
+    if (namedFingerprints.length > 1) {
+      const namedGroups = namedFingerprintRows
+        .map(row => `${row.fingerprint}${row.fingerprint === fingerprint ? " (current)" : ""}: ${shortModelName(row.model)} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`)
+        .join("; ");
+      doctorCheck("mixed named embedding fingerprints", false, `content_vectors contains ${namedFingerprints.length} named fingerprints: ${namedGroups}. Next: \`qmd embed\` or \`qmd embed --force\``);
+      nextSteps.push("Run `qmd embed` to converge mixed named embedding fingerprints; use `qmd embed --force` if old named fingerprints or vector sample mismatches remain.");
+    }
+    const details = rows.length === 0
+      ? `no vectors yet; current fingerprint ${fingerprint}`
+      : ok
+        ? `${formatCount(currentDocs)} docs on current fingerprint (${fingerprint})`
+        : `${formatCount(currentDocs)} docs current, ${formatCount(otherDocs)} docs legacy/stale. ${groups}. Next: \`qmd embed\``;
+    doctorCheck("embedding fingerprints", ok, details);
+    if (!ok) {
+      nextSteps.push("Run `qmd embed` to migrate active documents to the current embedding fingerprint; use `qmd embed --force` if vector samples still fail afterward.");
+    }
+  } catch (error) {
+    doctorCheck("embedding fingerprints", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
+    if (!vectorSample.ok) {
+      nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("embedding vector sample", false, `${message}; rebuild with \`qmd embed --force\``);
+    nextSteps.push("Run `qmd embed --force` to rebuild existing vectors, then rerun `qmd doctor`.");
+  }
+
+  const steps = normalizedDoctorNextSteps(nextSteps);
+  if (steps.length > 0) {
+    console.log(`\n${c.bold}Recommended next step${steps.length === 1 ? "" : "s"}${c.reset}`);
+    for (const step of steps) {
+      console.log(`  - ${step}`);
+    }
+  }
+
+  closeDb();
+}
+
+function printDoctorHint(): void {
+  console.error("If qmd still behaves unexpectedly, run 'qmd doctor' for diagnostics.");
+}
+
+function exitWithError(error: unknown, code = 1): never {
+  console.error(error instanceof Error ? error.message : String(error));
+  printDoctorHint();
+  process.exit(code);
+}
+
+type PackageJson = {
+  version: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+
+function readPackageJson(): PackageJson {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const pkgPath = resolve(scriptDir, "..", "..", "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+  return JSON.parse(readFileSync(pkgPath, "utf-8"));
+}
+
+async function showVersion(): Promise<void> {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const pkg = readPackageJson();
 
   let commit = "";
   try {
@@ -2821,6 +3907,11 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
+  // Flip to production mode only when this module is executed as the CLI
+  // entrypoint, not when imported for its exports. Tests must set INDEX_PATH
+  // or use createStore() with an explicit path.
+  enableProductionMode();
+
   const cli = parseCLI();
 
   if (cli.values.version) {
@@ -2837,8 +3928,8 @@ if (isMain) {
     console.log("Usage: qmd skill <show|install> [options]");
     console.log("");
     console.log("Commands:");
-    console.log("  show                 Print the packaged QMD skill");
-    console.log("  install              Install into ./.agents/skills/qmd");
+    console.log("  show                 Print the QMD skill");
+    console.log("  install              Install QMD skill into ./.agents/skills/qmd");
     console.log("");
     console.log("Options:");
     console.log("  --global             Install into ~/.agents/skills/qmd");
@@ -3094,13 +4185,26 @@ if (isMain) {
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Run 'qmd collection help' for usage");
+          printDoctorHint();
           process.exit(1);
       }
       break;
     }
 
+    case "init":
+      try {
+        initLocalIndex();
+      } catch (error) {
+        exitWithError(error);
+      }
+      break;
+
     case "status":
       await showStatus();
+      break;
+
+    case "doctor":
+      await showDoctor();
       break;
 
     case "update":
@@ -3112,23 +4216,30 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        // Validate -c against configured collections before dispatching, so a
+        // typo errors with "Collection not found: X" instead of silently
+        // reporting success because no pending docs match a nonexistent name.
+        // embed operates on a single collection; only the first value is used.
+        const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
+        const embedCollection = embedValidatedCollections[0];
+        await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
+          collection: embedCollection,
         });
       } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
+        exitWithError(error);
       }
       break;
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const activeModels = resolveModelsForCli();
       const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
+        activeModels.embed,
+        activeModels.generate,
+        activeModels.rerank,
       ];
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
@@ -3185,8 +4296,10 @@ if (isMain) {
       const { runBenchmark } = await import("../bench/bench.js");
       const benchCollection = cli.opts.collection;
       await runBenchmark(fixturePath, {
-        json: !!(cli.opts as { json?: boolean }).json,
+        json: !!cli.values.json,
         collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+        dbPath: getDbPath(),
+        configPath: configExists() ? getConfigPath() : undefined,
       });
       break;
     }
@@ -3239,9 +4352,10 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3261,9 +4375,9 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
-        } catch (e: any) {
-          if (e?.code === "EADDRINUSE") {
+          await startMcpHttpServer(port, { dbPath: getDbPath() });
+        } catch (e: unknown) {
+          if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
             process.exit(1);
           }
@@ -3272,7 +4386,25 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer();
+        await startMcpServer({ dbPath: getDbPath() });
+      }
+      break;
+    }
+
+    case "skills": {
+      try {
+        if (cli.values.help || cli.args[0] === "help") {
+          showSkillsHelp();
+        } else {
+          runSkillsCommand(cli.args, Boolean(cli.values.json), Boolean(cli.values.full), Boolean(cli.values.all));
+        }
+      } catch (error) {
+        if (cli.values.json) {
+          outputSkillsJson({ success: false, error: error instanceof Error ? error.message : String(error) });
+        } else {
+          console.error(error instanceof Error ? error.message : String(error));
+        }
+        process.exit(1);
       }
       break;
     }
@@ -3289,8 +4421,7 @@ if (isMain) {
           try {
             await installSkill(Boolean(cli.values.global), Boolean(cli.values.force), Boolean(cli.values.yes));
           } catch (error) {
-            console.error(error instanceof Error ? error.message : String(error));
-            process.exit(1);
+            exitWithError(error);
           }
           break;
         }
@@ -3300,8 +4431,8 @@ if (isMain) {
           console.log("Usage: qmd skill <show|install> [options]");
           console.log("");
           console.log("Commands:");
-          console.log("  show                 Print the packaged QMD skill");
-          console.log("  install              Install into ./.agents/skills/qmd");
+          console.log("  show                 Print the QMD skill");
+          console.log("  install              Install QMD skill into ./.agents/skills/qmd");
           console.log("");
           console.log("Options:");
           console.log("  --global             Install into ~/.agents/skills/qmd");
@@ -3313,6 +4444,7 @@ if (isMain) {
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Run 'qmd skill help' for usage");
+          printDoctorHint();
           process.exit(1);
       }
       break;
@@ -3350,12 +4482,15 @@ if (isMain) {
     default:
       console.error(`Unknown command: ${cli.command}`);
       console.error("Run 'qmd --help' for usage.");
+      printDoctorHint();
       process.exit(1);
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
-    process.exit(0);
+    await finishSuccessfulCliCommand({
+      command: cli.command,
+      format: cli.opts.format,
+    });
   }
 
 } // end if (main module)

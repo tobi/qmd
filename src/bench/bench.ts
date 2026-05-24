@@ -22,6 +22,7 @@ import {
   type QMDStore,
   type SearchResult,
   type HybridQueryResult,
+  type ExpandedQuery,
 } from "../index.js";
 import { scoreResults } from "./score.js";
 import type {
@@ -34,35 +35,130 @@ import type {
 
 type Backend = {
   name: string;
-  run: (store: QMDStore, query: string, limit: number, collection?: string) => Promise<string[]>;
+  run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string) => Promise<string[]>;
 };
+
+type ParsedStructuredQuery = {
+  searches: ExpandedQuery[];
+  intent?: string;
+};
+
+function parseStructuredQuery(query: string): ParsedStructuredQuery | undefined {
+  const lines = query.split("\n").map((line, idx) => ({
+    trimmed: line.trim(),
+    number: idx + 1,
+  })).filter(line => line.trimmed.length > 0);
+
+  if (lines.length === 0) return undefined;
+
+  const prefixRe = /^(lex|vec|hyde):\s*/i;
+  const intentRe = /^intent:\s*/i;
+  const searches: ExpandedQuery[] = [];
+  let intent: string | undefined;
+
+  for (const line of lines) {
+    if (intentRe.test(line.trimmed)) {
+      if (intent !== undefined) {
+        throw new Error(`Line ${line.number}: only one intent: line is allowed per benchmark query.`);
+      }
+      intent = line.trimmed.replace(intentRe, "").trim();
+      if (!intent) {
+        throw new Error(`Line ${line.number}: intent: must include text.`);
+      }
+      continue;
+    }
+
+    const match = line.trimmed.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as "lex" | "vec" | "hyde";
+      const text = line.trimmed.slice(match[0].length).trim();
+      if (!text) {
+        throw new Error(`Line ${line.number} (${type}:) must include text.`);
+      }
+      searches.push({ type, query: text, line: line.number });
+      continue;
+    }
+
+    if (lines.length === 1) {
+      return undefined;
+    }
+
+    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde:/intent: prefix.`);
+  }
+
+  if (intent && searches.length === 0) {
+    throw new Error("intent: cannot appear alone. Add at least one lex:, vec:, or hyde: line.");
+  }
+
+  return searches.length > 0 ? { searches, intent } : undefined;
+}
+
+function uniqueFiles(files: string[], limit: number): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const file of files) {
+    if (seen.has(file)) continue;
+    seen.add(file);
+    out.push(file);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
 
 const BACKENDS: Backend[] = [
   {
     name: "bm25",
     run: async (store, query, limit, collection) => {
-      const results = await store.searchLex(query, { limit, collection });
+      const structured = parseStructuredQuery(query.query);
+      const lexQueries = structured?.searches.filter(q => q.type === "lex");
+      if (structured) {
+        const files: string[] = [];
+        for (const lex of lexQueries ?? []) {
+          const results = await store.searchLex(lex.query, { limit, collection });
+          files.push(...results.map((r: SearchResult) => r.filepath));
+        }
+        return uniqueFiles(files, limit);
+      }
+
+      const results = await store.searchLex(query.query, { limit, collection });
       return results.map((r: SearchResult) => r.filepath);
     },
   },
   {
     name: "vector",
     run: async (store, query, limit, collection) => {
-      const results = await store.searchVector(query, { limit, collection });
+      const structured = parseStructuredQuery(query.query);
+      const vectorQueries = structured?.searches.filter(q => q.type === "vec" || q.type === "hyde");
+      if (structured) {
+        const files: string[] = [];
+        for (const vectorQuery of vectorQueries ?? []) {
+          const results = await store.searchVector(vectorQuery.query, { limit, collection });
+          files.push(...results.map((r: SearchResult) => r.filepath));
+        }
+        return uniqueFiles(files, limit);
+      }
+
+      const results = await store.searchVector(query.query, { limit, collection });
       return results.map((r: SearchResult) => r.filepath);
     },
   },
   {
     name: "hybrid",
     run: async (store, query, limit, collection) => {
-      const results = await store.search({ query, limit, collection, rerank: false });
+      const structured = parseStructuredQuery(query.query);
+      const results = structured
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: false })
+        : await store.search({ query: query.query, limit, collection, rerank: false });
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
   {
     name: "full",
     run: async (store, query, limit, collection) => {
-      const results = await store.search({ query, limit, collection, rerank: true });
+      const structured = parseStructuredQuery(query.query);
+      const results = structured
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: true })
+        : await store.search({ query: query.query, limit, collection, rerank: true });
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
@@ -79,18 +175,23 @@ async function runQuery(
 
   let resultFiles: string[];
   try {
-    resultFiles = await backend.run(store, query.query, limit, collection);
-  } catch (err: any) {
+    resultFiles = await backend.run(store, query, limit, collection);
+  } catch {
     // Backend may not be available (e.g., no embeddings for vector search)
     return {
       precision_at_k: 0,
       recall: 0,
+      recall_at_1: 0,
+      recall_at_3: 0,
+      recall_at_5: 0,
       mrr: 0,
       f1: 0,
       hits_at_k: 0,
       total_expected: query.expected_files.length,
       latency_ms: Date.now() - start,
       top_files: [],
+      matched_files: [],
+      unmatched_expected_files: query.expected_files,
     };
   }
 
@@ -111,14 +212,14 @@ function formatTable(results: QueryResult[]): string {
   const num = (n: number) => n.toFixed(2).padStart(5);
 
   lines.push(
-    `${pad("Query", 25)} ${pad("Backend", 8)} ${pad("P@k", 6)} ${pad("Recall", 7)} ${pad("MRR", 6)} ${pad("F1", 6)} ${pad("ms", 8)}`
+    `${pad("Query", 25)} ${pad("Backend", 8)} ${pad("P@k", 6)} ${pad("R@1", 6)} ${pad("R@3", 6)} ${pad("R@5", 6)} ${pad("MRR", 6)} ${pad("F1", 6)} ${pad("ms", 8)}`
   );
-  lines.push("-".repeat(70));
+  lines.push("-".repeat(88));
 
   for (const r of results) {
     for (const [backend, br] of Object.entries(r.backends)) {
       lines.push(
-        `${pad(r.id, 25)} ${pad(backend, 8)} ${num(br.precision_at_k)} ${num(br.recall)}  ${num(br.mrr)} ${num(br.f1)} ${String(Math.round(br.latency_ms)).padStart(7)}ms`
+        `${pad(r.id, 25)} ${pad(backend, 8)} ${num(br.precision_at_k)} ${num(br.recall_at_1)} ${num(br.recall_at_3)} ${num(br.recall_at_5)} ${num(br.mrr)} ${num(br.f1)} ${String(Math.round(br.latency_ms)).padStart(7)}ms`
       );
     }
     lines.push("");
@@ -138,13 +239,16 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
     }
   }
 
-  for (const name of backendNames) {
-    let totalP = 0, totalR = 0, totalMrr = 0, totalF1 = 0, totalLat = 0, count = 0;
+  for (const name of Array.from(backendNames)) {
+    let totalP = 0, totalR = 0, totalR1 = 0, totalR3 = 0, totalR5 = 0, totalMrr = 0, totalF1 = 0, totalLat = 0, count = 0;
     for (const r of results) {
       const br = r.backends[name];
       if (!br) continue;
       totalP += br.precision_at_k;
       totalR += br.recall;
+      totalR1 += br.recall_at_1;
+      totalR3 += br.recall_at_3;
+      totalR5 += br.recall_at_5;
       totalMrr += br.mrr;
       totalF1 += br.f1;
       totalLat += br.latency_ms;
@@ -154,6 +258,9 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
       summary[name] = {
         avg_precision: totalP / count,
         avg_recall: totalR / count,
+        avg_recall_at_1: totalR1 / count,
+        avg_recall_at_3: totalR3 / count,
+        avg_recall_at_5: totalR5 / count,
         avg_mrr: totalMrr / count,
         avg_f1: totalF1 / count,
         avg_latency_ms: totalLat / count,
@@ -166,7 +273,7 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
 
 export async function runBenchmark(
   fixturePath: string,
-  options: { json?: boolean; collection?: string; backends?: string[] } = {},
+  options: { json?: boolean; collection?: string; backends?: string[]; dbPath?: string; configPath?: string } = {},
 ): Promise<BenchmarkResult> {
   // Load fixture
   const raw = readFileSync(resolve(fixturePath), "utf-8");
@@ -177,7 +284,10 @@ export async function runBenchmark(
   }
 
   // Open store
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+  const store = await createStore({
+    dbPath: options.dbPath ?? getDefaultDbPath(),
+    ...(options.configPath ? { configPath: options.configPath } : {}),
+  });
 
   // Filter backends if requested
   const activeBackends = options.backends
@@ -232,7 +342,7 @@ export async function runBenchmark(
     const num = (n: number) => n.toFixed(3).padStart(6);
     for (const [name, s] of Object.entries(summary)) {
       console.log(
-        `  ${pad(name, 8)} P@k=${num(s.avg_precision)} Recall=${num(s.avg_recall)} MRR=${num(s.avg_mrr)} F1=${num(s.avg_f1)} Avg=${Math.round(s.avg_latency_ms)}ms`
+        `  ${pad(name, 8)} P@k=${num(s.avg_precision)} R@1=${num(s.avg_recall_at_1)} R@3=${num(s.avg_recall_at_3)} R@5=${num(s.avg_recall_at_5)} MRR=${num(s.avg_mrr)} F1=${num(s.avg_f1)} Avg=${Math.round(s.avg_latency_ms)}ms`
       );
     }
   }

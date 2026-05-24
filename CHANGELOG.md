@@ -2,8 +2,73 @@
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-05-22
+
 ### Fixes
 
+- Launcher: Rewrite `bin/qmd` as a Node-based shebang polyglot to fix global npm installation execution failures on Windows (#668 / #452), while supporting seamless fallback to Bun in Node-less environments.
+
+
+## [2.5.1] - 2026-05-20
+
+### Changes
+
+- Release: publish from GitHub Actions via npm Trusted Publishing/OIDC instead of a long-lived `NPM_TOKEN` secret.
+
+## [2.5.0] - 2026-05-19
+
+### Changes
+
+- Dependencies: update core SQLite/config/chunking packages (`better-sqlite3`, `yaml`, `web-tree-sitter`, `tree-sitter-go`, and `tree-sitter-python`) while keeping incompatible `zod`, `tsx`, and `vitest` majors pinned.
+- Agent skills: add `qmd skills list|get|path` to serve version-matched runtime skill instructions from the installed CLI, and make `qmd skill install` write a stable discovery stub so installed agent skills do not go stale after QMD upgrades.
+- CLI: add `qmd doctor` for index/runtime diagnostics, including SQLite/sqlite-vec versions, embedding fingerprint freshness, mixed-fingerprint detection, safe legacy fingerprint adoption, and content-hash sampling.
+
+### Fixes
+
+- Launcher: prefer runnable TypeScript source in git checkouts even when ignored `dist/` artifacts exist, while packaged installs continue to run `dist/`.
+- GPU: keep node-llama-cpp's documented `gpu: "auto"` initialization as the primary path, then perform no-build packaged CUDA/Vulkan/Metal probes only if auto falls back to CPU.
+- CLI: move GPU/CPU runtime diagnostics out of `qmd status`; use `qmd doctor` for device probing and related environment guidance.
+- CLI: point unexpected command/setup failures toward `qmd doctor` so diagnostics are the default next step when QMD behaves incorrectly.
+- Doctor: explicitly warn when `content_vectors` contains multiple non-empty embedding fingerprint names, with the per-fingerprint document/chunk breakdown.
+- Embed: make the TTY progress line label byte-based input progress explicitly, show embedded chunks as a count, and shorten the displayed model name.
+- Embed: retain per-chunk failure details, retry failed chunks after later successful embeds and again when no other chunks remain, clear recovered errors, and cap retries to avoid endless loops.
+- Tests: expand the container smoke harness to cover npm-global, npx-style, and Bun-global install scenarios, always checking auto and `QMD_FORCE_CPU=1` doctor modes, with opt-in tiny `qmd embed` and GPU probe runs for supported container runtimes.
+- Embedding: fingerprint vector metadata using the active embedding model and formatting/chunking parameters so stale vectors are treated as pending after search semantics change. Legacy `content_vectors` columns are migrated lazily on first vector-health/write use to preserve fast QMD startup.
+
+- Skill: expand the packaged QMD skill with retrieval-first workflows, structured query examples, wiki/source collection guidance, and safe fallbacks when model-backed search is unavailable.
+- Tests: make `bun run test` execute the local unit suite under both Node/Vitest and Bun (`test:node` + `test:bun`) so runtime-specific regressions are caught before CI.
+- Model config: centralize embedding/rerank/generation model resolution so `qmd embed`, `status`, `query`, `vsearch`, `pull`, SDK vector search, and `bench` use the same active `.qmd/index.yaml` model hints and environment fallbacks.
+- GPU/status: `qmd status` now uses the same embedding model identity as `qmd embed` when computing pending embeddings, so URI-backed embeddings are not incorrectly reported as pending under the legacy `embeddinggemma` alias.
+- GPU status: `qmd status` now always shows GPU mode/configuration without unsafe native probing, and CPU-fallback warnings point to `QMD_STATUS_DEVICE_PROBE=1 qmd status` for an actual backend probe. The no-GPU warning is emitted once per process instead of once per LLM instance during benchmarks.
+- GPU: add `QMD_FORCE_CPU=1` / `--no-gpu` to bypass CUDA/Vulkan/Metal probing entirely, and route native llama.cpp stdout noise to stderr so JSON output stays parseable during search/query commands.
+- Snippet line numbers: `qmd_query` (MCP), HTTP `/query`, and `qmd query`
+  (CLI JSON output and snippet headers) now return absolute source-file
+  line numbers instead of chunk-local ones, so the `line` field can be
+  passed back to `qmd_get` as `fromLine` without a separate lookup.
+  Snippet selection remains scoped to the best matching chunk
+  (preserves #149).
+- CLI: `qmd query --full` now emits the full document body in all output
+  formats (json, csv, md, xml), restoring the documented behavior of the
+  flag. Previously it returned only the best matching chunk (~3.6KB max
+  per result). Output payload for `--full` queries is now proportional
+  to total document size.
+- macOS Metal: `qmd query --json` now flushes successful JSON output and uses a safe immediate-exit path on Darwin to avoid ggml Metal finalizer aborts; other commands still dispose LLM contexts/models before the llama runtime. #368
+- Embedding: require complete chunk coverage before treating a document as
+  embedded, remove partial vectors when chunk/session failures leave a
+  document incomplete, and keep `qmd status` pending counts honest after
+  interrupted long embed runs. #637 #378
+- Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
+  to the requested collection instead of embedding global pending work.
+  Scoped `--force` clears only collection-owned vectors, preserves shared
+  hashes referenced by sibling collections, and drops `vectors_vec` only
+  when the scoped clear empties all vectors.
+- Hybrid search: weight RRF lists by query type so original FTS and original vector evidence get the intended 2x boost, instead of accidentally boosting the first lexical expansion. #591
+- MCP: seed llama.cpp/GGML quiet env vars before launching `qmd mcp` so native logs cannot pollute stdio JSON-RPC framing. #593
+- CLI: remove CommonJS `require()` calls from ESM index path normalization so `qmd --index <path>` no longer crashes with `ERR_AMBIGUOUS_MODULE_SYNTAX` on Node 22+. #634
+- Windows CUDA: serialize llama.cpp embedding/reranking contexts by default to avoid intermittent `ggml-cuda.cu:98` crashes in `qmd query`; set `QMD_EMBED_PARALLELISM` to opt back into parallel contexts if your driver is stable. #519
+- MCP: make `qmd mcp --index <name>` use the selected index for both foreground and daemon HTTP servers instead of falling back to the default store. #343
+- Embedding: respect `QMD_EMBED_MODEL` consistently for vector indexing and vector-backed search, with default-model fallback when unset.
+- Config: use one home-directory resolver for YAML config and the default SQLite cache path, avoiding Windows CLI/MCP split-brain when `HOME` is unset.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive
@@ -12,6 +77,18 @@
 - CLI: make `qmd status` skip native `node-llama-cpp` device probing by
   default so status stays safe on machines with broken or unsupported GPU
   drivers. Set `QMD_STATUS_DEVICE_PROBE=1` to opt in.
+- CLI: lazy-load `node-llama-cpp` so lightweight commands such as
+  `qmd status` do not import native ML dependencies or trigger llama.cpp
+  builds on ARM/no-GPU machines. #491
+- Store: keep content rows referenced by inactive documents during orphan
+  cleanup so `qmd update` preserves soft-deleted tombstones for removed
+  files. #585
+- Packaging: install AST grammar WASM packages as required dependencies so
+  Bun global installs include TypeScript/TSX/JavaScript grammars, and add a
+  `smoke:package-grammars` verification command. #595
+- Launcher: add wrapper smoke coverage for scoped package, npm/npx,
+  Homebrew/Linuxbrew, Bun global symlink layouts, and `$BUN_INSTALL`
+  false-positive runtime selection regressions. #351 #353 #354 #356 #358 #359
 
 ## [2.1.0] - 2026-04-05
 

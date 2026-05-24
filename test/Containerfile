@@ -13,10 +13,12 @@ ENV PATH="/root/.local/bin:$PATH"
 # Pre-install node and bun
 RUN mise use -g node@latest bun@latest
 
-# Copy the packed tarball and install via both package managers
-COPY tobilu-qmd-*.tgz /tmp/
-RUN mise exec node@latest -- npm install -g /tmp/tobilu-qmd-*.tgz
-RUN mise exec bun@latest -- bun install -g /tmp/tobilu-qmd-*.tgz
+# Copy the packed tarball and install via both package managers. Keep a stable
+# tarball path for npm-exec/npx-style smoke scenarios.
+COPY tobilu-qmd-*.tgz /tmp/qmd-package.tgz
+RUN cp /tmp/qmd-package.tgz /tmp/tobilu-qmd.tgz
+RUN mise exec node@latest -- npm install -g /tmp/qmd-package.tgz
+RUN mise exec bun@latest -- bun install -g /tmp/qmd-package.tgz
 
 # Copy test project (src + test + configs) and install deps
 COPY test-src/ /opt/qmd/
