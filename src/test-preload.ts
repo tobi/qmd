@@ -18,6 +18,11 @@
 import { afterAll } from "bun:test";
 import { disposeDefaultLlamaCpp } from "./llm";
 
+// Hermetic tests: a developer's shell-set QMD_REMOTE_URL would otherwise make
+// getDefaultLLM() auto-construct a RemoteLLM, routing test traffic at a real
+// `qmd serve` daemon (or a refused connect when it's not running).
+delete process.env.QMD_REMOTE_URL;
+
 // Global afterAll runs after all test files complete
 afterAll(async () => {
   await disposeDefaultLlamaCpp();

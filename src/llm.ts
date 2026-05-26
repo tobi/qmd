@@ -10,6 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import { RemoteLLM } from "./llm-remote.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -574,6 +575,19 @@ export interface LLM {
    * Returns an array of token IDs (or dummy array of correct length for remote).
    */
   tokenize(text: string): Promise<readonly unknown[]>;
+
+  /**
+   * Name of the embed model in use. Optional — local backends know it
+   * synchronously; remote backends may not have it resolved until first
+   * `/health` call. Consumers fall back to `DEFAULT_EMBED_MODEL` when undefined.
+   */
+  readonly embedModelName?: string;
+
+  /** Name of the generation model in use. Same caveats as `embedModelName`. */
+  readonly generateModelName?: string;
+
+  /** Name of the rerank model in use. Same caveats as `embedModelName`. */
+  readonly rerankModelName?: string;
 
   /**
    * Dispose of resources
@@ -2361,8 +2375,6 @@ export function getDefaultLLM(): LLM {
   // without the CLI having run setDefaultLLM first.
   const remoteUrl = process.env.QMD_REMOTE_URL;
   if (remoteUrl) {
-    // Lazy import to avoid circular dependency at module load time
-    const { RemoteLLM } = require("./llm-remote.js");
     const remote: LLM = new RemoteLLM({ serverUrl: remoteUrl });
     defaultLLM = remote;
     return remote;
