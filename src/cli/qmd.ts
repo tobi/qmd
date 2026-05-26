@@ -154,11 +154,16 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      // Constructing a local LlamaCpp would defeat QMD_REMOTE_URL by reloading
+      // models the daemon already holds, allocating VRAM the user explicitly
+      // delegated to `qmd serve`.
+      if (!process.env.QMD_REMOTE_URL) {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -4178,6 +4183,10 @@ if (isMain) {
   // Configure remote model server if --remote-url is set or QMD_REMOTE_URL env var
   const remoteUrl = (cli.values["remote-url"] as string) || process.env.QMD_REMOTE_URL;
   if (remoteUrl && cli.command !== "serve") {
+    // Reflect --remote-url into the environment so downstream lookups (e.g.
+    // getStore's local-LlamaCpp guard, getDefaultLLM's auto-detect fallback)
+    // share one source of truth regardless of which entry point they came in.
+    process.env.QMD_REMOTE_URL = remoteUrl;
     setDefaultLLM(new RemoteLLM({ serverUrl: remoteUrl }));
   }
 

@@ -56,6 +56,11 @@
   without the scheme prefix (#576).
 - The embed session `maxDuration` is now env-configurable via `QMD_EMBED_MAX_DURATION_MS` (default: 30 min). This
   prevents large-corpus embeddings from being aborted by the hardcoded 30-minute ceiling (#673).
+- `QMD_REMOTE_URL` now actually reaches `RemoteLLM` from every entry point. The store layer's `embed`, `expandQuery`,
+  and `rerank` paths previously instantiated `LlamaCpp` directly and ignored the remote default; they now go through
+  `getDefaultLLM()`, and `getStore()` skips constructing a local `LlamaCpp` entirely when a remote daemon is configured
+  (no more double-loading models the daemon already holds). `LLM` gains optional `embedModelName` / `generateModelName`
+  / `rerankModelName` so callers fall back cleanly when a remote backend hasn't surfaced them yet.
 
 ## [2.5.3] - 2026-05-28
 
