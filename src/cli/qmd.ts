@@ -4,8 +4,9 @@ import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
+import { constants as osConstants } from "os";
 import { parseArgs } from "util";
-import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
+import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync, writeSync } from "fs";
 import { createInterface } from "readline/promises";
 import {
   getPwd,
@@ -81,7 +82,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isLlamaGpuDisabledByEnv } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -220,58 +221,196 @@ type CliLifecycleWritable = {
   write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
 };
 
+const DARWIN_QUERY_JSON_CHILD_ENV = "QMD_DARWIN_QUERY_JSON_CHILD";
+const DARWIN_QUERY_JSON_SUCCESS_FD_ENV = "QMD_DARWIN_QUERY_JSON_SUCCESS_FD";
+const DARWIN_QUERY_JSON_SUCCESS_SENTINEL = "qmd:query-json-success\n";
+
 type FinishSuccessfulCliCommandOptions = {
   command: string;
   format?: OutputFormat;
   cleanup?: () => Promise<void>;
   exit?: (code: number) => void;
-  immediateExit?: (code: number) => void;
+  terminateImmediately?: () => void;
+  successFd?: number;
+  writeSync?: (fd: number, data: string | Uint8Array) => number;
   stdout?: CliLifecycleWritable;
   stderr?: CliLifecycleWritable;
   platform?: NodeJS.Platform;
 };
 
-async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
+type DarwinJsonQuerySupervisorDecision = {
+  command: string;
+  query?: string;
+  format?: OutputFormat;
+  values?: Record<string, unknown>;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+};
+
+type DarwinJsonQuerySupervisorResult = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  successOutput: string;
+};
+
+async function writeWritable(stream: CliLifecycleWritable, chunk: string | Uint8Array): Promise<void> {
   await new Promise<void>((resolve) => {
-    stream.write("", () => resolve());
+    stream.write(chunk, () => resolve());
   });
+}
+
+async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
+  await writeWritable(stream, "");
+}
+
+function isJsonQueryCommand(command: string): boolean {
+  return command === "query" || command === "deep-search";
+}
+
+export function shouldSuperviseDarwinJsonQuery(options: DarwinJsonQuerySupervisorDecision): boolean {
+  const env = options.env ?? process.env;
+  const values = options.values ?? {};
+  return (
+    (options.platform ?? process.platform) === "darwin" &&
+    isJsonQueryCommand(options.command) &&
+    options.format === "json" &&
+    Boolean(options.query?.trim()) &&
+    env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1" &&
+    env[DARWIN_QUERY_JSON_CHILD_ENV] !== "1" &&
+    values["no-gpu"] !== true &&
+    !isLlamaGpuDisabledByEnv(env.QMD_LLAMA_GPU ?? "", env.QMD_FORCE_CPU ?? "")
+  );
+}
+
+function getSupervisedSuccessFd(options: FinishSuccessfulCliCommandOptions): number | undefined {
+  if (options.successFd !== undefined) return options.successFd;
+  if (process.env[DARWIN_QUERY_JSON_CHILD_ENV] !== "1") return undefined;
+  const raw = process.env[DARWIN_QUERY_JSON_SUCCESS_FD_ENV];
+  if (!raw) return undefined;
+  const fd = Number.parseInt(raw, 10);
+  return Number.isFinite(fd) && fd >= 0 ? fd : undefined;
+}
+
+function terminateWithoutNativeCleanup(options: FinishSuccessfulCliCommandOptions): void {
+  if (options.terminateImmediately) {
+    options.terminateImmediately();
+    return;
+  }
+  process.kill(process.pid, "SIGKILL");
+}
+
+export function isSuccessfulJsonSupervisorOutput(stdout: string, successOutput: string): boolean {
+  if (!successOutput.includes(DARWIN_QUERY_JSON_SUCCESS_SENTINEL)) return false;
+  try {
+    JSON.parse(stdout.trim());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getSelfSpawnArgs(selfPath: string, argvArgs: string[], runtimeIsBun: boolean = isBun): string[] {
+  if (!selfPath.endsWith(".ts")) {
+    return [selfPath, ...argvArgs];
+  }
+  if (runtimeIsBun) {
+    return [selfPath, ...argvArgs];
+  }
+  return ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...argvArgs];
+}
+
+function signalExitCode(signal: NodeJS.Signals | null): number {
+  if (!signal) return 1;
+  const signalNumber = (osConstants.signals as Record<string, number>)[signal];
+  return typeof signalNumber === "number" ? 128 + signalNumber : 1;
+}
+
+export async function writeSupervisorOutput(
+  stdoutText: string,
+  stderrText: string,
+  stdout: CliLifecycleWritable = process.stdout,
+  stderr: CliLifecycleWritable = process.stderr,
+): Promise<void> {
+  if (stderrText) await writeWritable(stderr, stderrText);
+  if (stdoutText) await writeWritable(stdout, stdoutText);
+}
+
+async function collectDarwinJsonQueryChild(selfPath: string, argvArgs: string[]): Promise<DarwinJsonQuerySupervisorResult> {
+  const child = nodeSpawn(process.execPath, getSelfSpawnArgs(selfPath, argvArgs), {
+    env: {
+      ...process.env,
+      [DARWIN_QUERY_JSON_CHILD_ENV]: "1",
+      [DARWIN_QUERY_JSON_SUCCESS_FD_ENV]: "3",
+    },
+    stdio: ["ignore", "pipe", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  let stderr = "";
+  let successOutput = "";
+
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+
+  const successStream = child.stdio[3];
+  if (successStream && "setEncoding" in successStream) {
+    successStream.setEncoding("utf8");
+    successStream.on("data", (chunk: string) => { successOutput += chunk; });
+  }
+
+  return await new Promise((resolve) => {
+    child.on("close", (code, signal) => {
+      resolve({ code, signal, stdout, stderr, successOutput });
+    });
+    child.on("error", (error) => {
+      resolve({ code: 1, signal: null, stdout, stderr: `${stderr}${error.message}\n`, successOutput });
+    });
+  });
+}
+
+async function superviseDarwinJsonQuery(selfPath: string, argvArgs: string[]): Promise<number> {
+  const result = await collectDarwinJsonQueryChild(selfPath, argvArgs);
+  const success = isSuccessfulJsonSupervisorOutput(result.stdout, result.successOutput);
+
+  if (success) {
+    await writeSupervisorOutput(result.stdout, result.stderr);
+    return 0;
+  }
+
+  await writeSupervisorOutput(result.stdout, result.stderr);
+  return result.code ?? signalExitCode(result.signal);
 }
 
 function shouldBypassNativeCleanup(options: FinishSuccessfulCliCommandOptions): boolean {
   return (
     (options.platform ?? process.platform) === "darwin" &&
-    options.command === "query" &&
+    isJsonQueryCommand(options.command) &&
     options.format === "json" &&
     process.env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1"
   );
 }
 
-function immediateProcessExit(code: number): void {
-  const processWithReallyExit = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
-  if (typeof processWithReallyExit.reallyExit === "function") {
-    processWithReallyExit.reallyExit(code);
-    return;
-  }
-  process.exit(code);
-}
-
 /**
- * Finish a successful CLI command after output has been flushed. On macOS JSON
- * query runs, skip normal native teardown and use Node/Bun's immediate exit path:
- * ggml Metal can abort from C++ finalizers after valid JSON has already been
- * produced (#368). This wrapper is only reached after the command completed, so
- * real query failures still exit through the normal error path before this runs.
+ * Finish a successful CLI command after output has been flushed. In a supervised
+ * macOS JSON query child, write the success sentinel and terminate before native
+ * Metal finalizers can abort after valid JSON has already been produced (#368).
+ * Real query failures still exit through the normal error path before this runs.
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
   const exit = options.exit ?? ((code: number) => process.exit(code));
-  const immediateExit = options.immediateExit ?? immediateProcessExit;
 
   await flushWritable(options.stdout ?? process.stdout);
 
-  if (shouldBypassNativeCleanup(options)) {
+  const successFd = getSupervisedSuccessFd(options);
+  if (successFd !== undefined && shouldBypassNativeCleanup(options)) {
     await flushWritable(stderr);
-    immediateExit(0);
+    (options.writeSync ?? writeSync)(successFd, DARWIN_QUERY_JSON_SUCCESS_SENTINEL);
+    terminateWithoutNativeCleanup(options);
     return;
   }
 
@@ -3941,6 +4080,16 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  if (shouldSuperviseDarwinJsonQuery({
+    command: cli.command,
+    query: cli.query,
+    format: cli.opts.format,
+    values: cli.values,
+  })) {
+    const code = await superviseDarwinJsonQuery(__filename, process.argv.slice(2));
+    process.exit(code);
   }
 
   switch (cli.command) {
