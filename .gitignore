@@ -12,9 +12,11 @@ texts/
 !README.md
 !CLAUDE.md
 !CHANGELOG.md
+!CLINICAL.md
 !skills/**/*.md
 !finetune/*.md
 !docs/*.md
+!clinical/**/*.md
 finetune/outputs/
 finetune/data/train/
 .claude/

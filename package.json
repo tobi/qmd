@@ -1,7 +1,7 @@
 {
-  "name": "@tobilu/qmd",
-  "version": "2.5.2",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "name": "@os1123/clinical-qmd",
+  "version": "0.1.0-clinical.0",
+  "description": "Clinical fork of qmd — on-device hybrid search and retrieval tuned for clinical notes (SOAP, H&P, consult, op-note, discharge). All processing local; no PHI leaves the device.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -49,11 +49,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
+    "url": "git+https://github.com/os1123/clinical-qmd.git"
   },
-  "homepage": "https://github.com/tobi/qmd#readme",
+  "homepage": "https://github.com/os1123/clinical-qmd#readme",
   "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "url": "https://github.com/os1123/clinical-qmd/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
@@ -101,10 +101,16 @@
     "node": ">=22.0.0"
   },
   "keywords": [
+    "clinical",
+    "clinical-notes",
+    "ehr",
+    "physician",
+    "medical",
+    "hipaa",
+    "on-device",
     "markdown",
     "search",
     "fts",
-    "full-text-search",
     "vector",
     "semantic-search",
     "sqlite",
@@ -113,10 +119,12 @@
     "rag",
     "mcp",
     "reranking",
-    "knowledge-base",
     "local-ai",
     "llm"
   ],
-  "author": "Tobi Lutke <tobi@lutke.com>",
+  "author": "Omar Said <omars1123@gmail.com>",
+  "contributors": [
+    "Tobi Lutke <tobi@lutke.com> (original qmd author)"
+  ],
   "license": "MIT"
 }
