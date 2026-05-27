@@ -626,18 +626,27 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   return Math.max(1, options.computed);
 }
 
+const LLAMA_GPU_DISABLED_VALUES = new Set(["false", "off", "none", "disable", "disabled", "0"]);
+
+export function isLlamaGpuDisabledByEnv(
+  envValue = process.env.QMD_LLAMA_GPU,
+  forceCpuValue = process.env.QMD_FORCE_CPU
+): boolean {
+  const forceCpu = forceCpuValue?.trim().toLowerCase() ?? "";
+  if (forceCpu && !LLAMA_GPU_DISABLED_VALUES.has(forceCpu)) return true;
+
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  return LLAMA_GPU_DISABLED_VALUES.has(normalized);
+}
+
 export function resolveLlamaGpuMode(
   envValue = process.env.QMD_LLAMA_GPU,
   forceCpuValue = process.env.QMD_FORCE_CPU
 ): LlamaGpuMode {
-  const forceCpu = forceCpuValue?.trim().toLowerCase() ?? "";
-  if (forceCpu && !["false", "off", "none", "disable", "disabled", "0"].includes(forceCpu)) {
-    return false;
-  }
+  if (isLlamaGpuDisabledByEnv(envValue, forceCpuValue)) return false;
 
   const normalized = envValue?.trim().toLowerCase() ?? "";
   if (!normalized) return "auto";
-  if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
   if (normalized === "metal" || normalized === "vulkan" || normalized === "cuda") return normalized;
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
