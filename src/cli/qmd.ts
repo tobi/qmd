@@ -81,7 +81,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -107,6 +107,7 @@ import {
   getLocalDbPath,
   getConfigPath,
   configExists,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
@@ -609,8 +610,14 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
-  {
+  // Models / Provider info
+  if (isUsingOpenAI()) {
+    const embCfg = getEmbeddingConfig();
+    console.log(`\n${c.bold}Provider${c.reset}`);
+    console.log(`  Mode:        ${c.green}OpenAI-compatible${c.reset}`);
+    console.log(`  Base URL:    ${embCfg.openai?.baseURL || process.env.QMD_OPENAI_BASE_URL || '(default)'}`);
+    console.log(`  Embed model: ${embCfg.openai?.embedModel || 'text-embedding-3-small'}`);
+  } else {
     // hf:org/repo/file.gguf → https://huggingface.co/org/repo
     const hfLink = (uri: string) => {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
@@ -623,6 +630,43 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
+  // Device / GPU info (local mode only — skip in OpenAI mode to avoid triggering compilation
+  // Important: probing node-llama-cpp can abort the whole process on machines with
+  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
+  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
+  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
+    console.log(`\n${c.bold}Device${c.reset}`);
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo({ allowBuild: false });
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
+        }
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      }
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch (error) {
+      console.log(`  Status:   ${c.dim}skipped${c.reset} (status probe does not build llama.cpp backends)`);
+      if (error instanceof Error && error.message) {
+        console.log(`  ${c.dim}${error.message}${c.reset}`);
+      }
+    }
+  }
 
   // Tips section
   const tips: string[] = [];
@@ -1906,42 +1950,40 @@ async function vectorIndex(
 
   const startTime = Date.now();
 
-  const result = await generateEmbeddings(storeInstance, {
-    force,
-    model,
-    collection: batchOptions?.collection,
-    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
-    maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
-    onProgress: (info) => {
-      if (info.totalBytes === 0) return;
-      // Progress is measured by input bytes, not by chunks. The final chunk
-      // count is discovered lazily batch-by-batch, so displaying
-      // chunksEmbedded/totalChunks makes the percent look wrong when a few
-      // large documents remain. Show chunks as a count and label the byte
-      // percentage explicitly as input progress.
-      const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
-      progress.set(percent);
+  let result: Awaited<ReturnType<typeof generateEmbeddings>>;
+  try {
+    result = await generateEmbeddings(storeInstance, {
+      force,
+      model,
+      collection: batchOptions?.collection,
+      maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+      maxBatchBytes: batchOptions?.maxBatchBytes,
+      chunkStrategy: batchOptions?.chunkStrategy,
+      onProgress: (info) => {
+        if (info.totalBytes === 0) return;
+        const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
+        progress.set(percent);
 
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
-      const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
-      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
+        const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
+        const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
 
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
-      const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
-      const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
-      const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
-      const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
+        const bar = renderProgressBar(percent);
+        const percentStr = percent.toFixed(0).padStart(3);
+        const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
+        const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
+        const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
+        const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
+        const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
-    },
-  });
-
-  progress.clear();
-  cursor.show();
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
+      },
+    });
+  } finally {
+    progress.clear();
+    cursor.show();
+  }
 
   const totalTimeSec = result.durationMs / 1000;
 
@@ -2453,10 +2495,8 @@ function search(query: string, opts: OutputOptions): void {
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  // Pass collections directly to searchFTS (it now supports arrays)
+  const results = searchFTS(db, query, fetchLimit, collectionNames.length > 0 ? collectionNames : undefined);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2504,7 +2544,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  const llmSession = async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2542,7 +2582,15 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  };
+
+  if (isUsingOpenAI()) {
+    await llmSession();
+  } else {
+    await withLLMSession(async () => llmSession(),
+      { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' }
+    );
+  }
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2560,7 +2608,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
-  await withLLMSession(async () => {
+  const querySession = async () => {
     let results;
 
     if (parsed) {
@@ -2680,7 +2728,15 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       docid: r.docid,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  };
+
+  if (isUsingOpenAI()) {
+    await querySession();
+  } else {
+    await withLLMSession(async () => querySession(),
+      { maxDuration: 10 * 60 * 1000, name: 'querySearch' }
+    );
+  }
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -3941,6 +3997,31 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration.
+  // Priority: YAML config > env vars > default (local).
+  // Setting QMD_OPENAI_BASE_URL alone is enough to activate OpenAI mode.
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  const useOpenAI = embeddingYamlConfig.provider === 'openai'
+    || !!process.env.QMD_OPENAI_BASE_URL
+    || process.env.QMD_OPENAI === '1';
+
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
+        embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
+        expansionModel: embeddingYamlConfig.openai?.expansion_model,
+        rerankModel: embeddingYamlConfig.openai?.rerank_model,
+        baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
+        chatBaseURL: embeddingYamlConfig.openai?.chat_base_url,
+        chatApiKey: embeddingYamlConfig.openai?.chat_api_key,
+        rerankBaseURL: embeddingYamlConfig.openai?.rerank_base_url,
+        rerankApiKey: embeddingYamlConfig.openai?.rerank_api_key,
+      },
+    });
   }
 
   switch (cli.command) {

@@ -18,13 +18,17 @@ import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import { encoding_for_model } from "tiktoken";
 import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultEmbeddingLLM,
+  isUsingOpenAI,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  withEmbeddingSession,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
@@ -1214,8 +1218,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collections?: string | string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1599,11 +1603,17 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const embedModelUri = model;
+  const runEmbeddingSession = async <T>(
+    fn: (session: ILLMSession, modelName: string) => Promise<T>,
+    sessionOptions: Parameters<typeof withEmbeddingSession>[1]
+  ): Promise<T> => {
+    if (isUsingOpenAI()) {
+      return withEmbeddingSession(fn, sessionOptions);
+    }
+    return withLLMSessionForLlm(llm, (session) => fn(session, model), sessionOptions);
+  };
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  const result = await runEmbeddingSession(async (session, embedModelUri) => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
@@ -1683,7 +1693,6 @@ export async function generateEmbeddings(
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
-      // Abort early if session has been invalidated
       if (!session.isValid) {
         console.warn(`⚠ Session expired — skipping remaining document batches`);
         break;
@@ -1745,7 +1754,6 @@ export async function generateEmbeddings(
       let batchChunkBytesProcessed = 0;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
         if (!session.isValid) {
           const remainingChunks = batchChunks.slice(batchStart);
           for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
@@ -1824,7 +1832,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings', storeLlm: store.llm ?? undefined });
 
   return {
     docsProcessed: totalDocs,
@@ -1886,8 +1894,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collections?: string | string[]) => searchFTS(db, query, limit, collections),
+    searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collections, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
@@ -2624,6 +2632,17 @@ export async function chunkDocumentAsync(
  * When filepath and chunkStrategy are provided, uses AST-aware break points
  * for supported code files.
  */
+// Cached tiktoken encoder for OpenAI tokenization
+let tiktokenEncoder: ReturnType<typeof encoding_for_model> | null = null;
+
+function getTiktokenEncoder() {
+  if (!tiktokenEncoder) {
+    // Use cl100k_base which is used by text-embedding-3-small
+    tiktokenEncoder = encoding_for_model("gpt-4");
+  }
+  return tiktokenEncoder;
+}
+
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
@@ -2633,6 +2652,12 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  // Use tiktoken for OpenAI (fast, no model loading)
+  // Use llama-cpp for local models (accurate to the model)
+  if (isUsingOpenAI()) {
+    return chunkWithTiktoken(content, maxTokens, overlapTokens);
+  }
+
   const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
@@ -2712,6 +2737,86 @@ export async function chunkDocumentByTokens(
   }
 
   return results;
+}
+
+/**
+ * Chunk using tiktoken (fast, for OpenAI embeddings)
+ */
+function chunkWithTiktoken(
+  content: string,
+  maxTokens: number,
+  overlapTokens: number
+): { text: string; pos: number; tokens: number }[] {
+  const encoder = getTiktokenEncoder();
+  // Allow all special tokens in documents (they might contain code examples, etc.)
+  const allTokens = encoder.encode(content, "all");
+  const totalTokens = allTokens.length;
+
+  if (totalTokens <= maxTokens) {
+    return [{ text: content, pos: 0, tokens: totalTokens }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  const step = maxTokens - overlapTokens;
+  const decoder = new TextDecoder();
+  let tokenPos = 0;
+
+  while (tokenPos < totalTokens) {
+    const chunkEnd = Math.min(tokenPos + maxTokens, totalTokens);
+    const chunkTokens = allTokens.slice(tokenPos, chunkEnd);
+    let chunkText = decoder.decode(encoder.decode(chunkTokens));
+
+    // Find a good break point if not at end of document
+    if (chunkEnd < totalTokens) {
+      chunkText = findGoodBreakPoint(chunkText);
+    }
+
+    // Approximate character position
+    const avgCharsPerToken = content.length / totalTokens;
+    const charPos = Math.floor(tokenPos * avgCharsPerToken);
+    chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
+
+    if (chunkEnd >= totalTokens) break;
+    tokenPos += step;
+  }
+
+  return chunks;
+}
+
+/**
+ * Find a good break point in text (paragraph, sentence, or line)
+ */
+function findGoodBreakPoint(text: string): string {
+  const searchStart = Math.floor(text.length * 0.7);
+  const searchSlice = text.slice(searchStart);
+
+  let breakOffset = -1;
+  const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+  if (paragraphBreak >= 0) {
+    breakOffset = paragraphBreak + 2;
+  } else {
+    const sentenceEnd = Math.max(
+      searchSlice.lastIndexOf('. '),
+      searchSlice.lastIndexOf('.\n'),
+      searchSlice.lastIndexOf('? '),
+      searchSlice.lastIndexOf('?\n'),
+      searchSlice.lastIndexOf('! '),
+      searchSlice.lastIndexOf('!\n')
+    );
+    if (sentenceEnd >= 0) {
+      breakOffset = sentenceEnd + 2;
+    } else {
+      const lineBreak = searchSlice.lastIndexOf('\n');
+      if (lineBreak >= 0) {
+        breakOffset = lineBreak + 1;
+      }
+    }
+  }
+
+  if (breakOffset >= 0) {
+    return text.slice(0, searchStart + breakOffset);
+  }
+  return text;
 }
 
 // =============================================================================
@@ -3389,7 +3494,7 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collections?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3403,7 +3508,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // When filtering by collection, fetch extra candidates from the FTS index
   // since some will be filtered out. Without a collection filter we can
   // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  const ftsLimit = collections ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -3426,9 +3531,16 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     WHERE d.active = 1
   `;
 
-  if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
+  if (collections) {
+    const collArray = Array.isArray(collections) ? collections : [collections];
+    if (collArray.length === 1 && collArray[0]) {
+      sql += ` AND d.collection = ?`;
+      params.push(collArray[0]);
+    } else if (collArray.length > 1) {
+      const valid = collArray.filter(Boolean);
+      sql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
+      params.push(...valid);
+    }
   }
 
   // bm25 lower is better; sort ascending.
@@ -3464,7 +3576,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -3507,9 +3619,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+  if (collections) {
+    const collArray = Array.isArray(collections) ? collections : [collections];
+    if (collArray.length === 1 && collArray[0]) {
+      docSql += ` AND d.collection = ?`;
+      params.push(collArray[0]);
+    } else if (collArray.length > 1) {
+      const valid = collArray.filter(Boolean);
+      docSql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
+      params.push(...valid);
+    }
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
@@ -3557,6 +3676,15 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
+
+  // Always use OpenAI when configured, regardless of session
+  if (isUsingOpenAI()) {
+    const llm = llmOverride ?? getDefaultEmbeddingLLM();
+    const result = await llm.embed(formattedText, { model, isQuery });
+    return result?.embedding || null;
+  }
+
+  // Use session if available, otherwise local default model
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
@@ -3715,6 +3843,17 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  // Use OpenAI query expansion when configured (fast, ~200ms via gpt-4o-mini)
+  if (isUsingOpenAI()) {
+    const openaiLLM = getDefaultEmbeddingLLM();
+    const results = await openaiLLM.expandQuery(query, { context: intent, includeLexical: true });
+    const expanded = results
+      .filter(r => r.text !== query)
+      .map(r => ({ type: r.type, query: r.text }));
+    if (expanded.length > 0) return expanded;
+    return [{ type: 'lex' as const, query }];
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3734,8 +3873,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : (llmOverride ?? getDefaultLlamaCpp());
   const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -3756,8 +3894,21 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // =============================================================================
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+  // Use OpenAI-based reranking when in OpenAI mode
+  if (isUsingOpenAI()) {
+    const embeddingLLM = getDefaultEmbeddingLLM();
+    const rerankDocs: RerankDocument[] = documents.map((doc) => ({
+      file: doc.file,
+      text: doc.text.slice(0, 4000),
+    }));
+    const result = await embeddingLLM.rerank(query, rerankDocs);
+    return result.results.map((r) => ({ file: r.file, score: r.score }));
+  }
+
   // Prepend intent to rerank query so the reranker scores with domain context
-  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const rerankQuery = intent ? `${intent}
+
+${query}` : query;
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -4580,8 +4731,8 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
+    const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
+    const embedModel = isUsingOpenAI() ? llm.getModelName() : (llm as LlamaCpp).embedModelName;
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -4966,9 +5117,9 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
+      const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
+      const modelName = isUsingOpenAI() ? llm.getModelName() : (llm as LlamaCpp).embedModelName;
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, modelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
@@ -4980,7 +5131,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, embedModel, 20, coll,
+            vecSearches[i]!.query, modelName, 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {

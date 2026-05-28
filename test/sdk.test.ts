@@ -22,7 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
-import { setDefaultLlamaCpp } from "../src/llm.js";
+import { getEmbeddingConfig, setDefaultLlamaCpp, setEmbeddingConfig } from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -66,6 +66,14 @@ function freshDbPath(): string {
 // =============================================================================
 
 describe("createStore", () => {
+  afterEach(() => {
+    delete process.env.QMD_OPENAI;
+    delete process.env.QMD_OPENAI_API_KEY;
+    delete process.env.QMD_OPENAI_BASE_URL;
+    delete process.env.QMD_OPENAI_EMBED_MODEL;
+    setEmbeddingConfig({ provider: "local" });
+  });
+
   test("creates store with inline config", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
@@ -144,6 +152,60 @@ describe("createStore", () => {
     });
 
     expect(store.dbPath).toBe(dbPath);
+    await store.close();
+  });
+
+  test("applies OpenAI embedding config in inline SDK mode", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {},
+        embedding: {
+          provider: "openai",
+          openai: {
+            api_key: "inline-key",
+            model: "text-embedding-3-small",
+            expansion_model: "gpt-4o-mini",
+            rerank_model: "rerank-v3",
+            base_url: "http://localhost:11434/v1",
+          },
+        },
+      },
+    });
+
+    expect(getEmbeddingConfig()).toMatchObject({
+      provider: "openai",
+      openai: {
+        apiKey: "inline-key",
+        embedModel: "text-embedding-3-small",
+        expansionModel: "gpt-4o-mini",
+        rerankModel: "rerank-v3",
+        baseURL: "http://localhost:11434/v1",
+      },
+    });
+
+    await store.close();
+  });
+
+  test("activates OpenAI embedding config from SDK env vars", async () => {
+    process.env.QMD_OPENAI_BASE_URL = "http://localhost:8080/v1";
+    process.env.QMD_OPENAI_API_KEY = "env-key";
+    process.env.QMD_OPENAI_EMBED_MODEL = "nomic-embed-text";
+
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+    });
+
+    expect(getEmbeddingConfig()).toMatchObject({
+      provider: "openai",
+      openai: {
+        apiKey: "env-key",
+        embedModel: "nomic-embed-text",
+        baseURL: "http://localhost:8080/v1",
+      },
+    });
+
     await store.close();
   });
 });

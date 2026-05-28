@@ -70,6 +70,7 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
   }
 }
 
+
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -525,6 +526,16 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts in a batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -742,6 +753,13 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string {
+    return this.embedModelUri;
+  }
+
+  /**
    * Reset the inactivity timer. Called after each model operation.
    * When timer fires, models are unloaded to free memory (if no active sessions).
    */
@@ -856,6 +874,7 @@ export class LlamaCpp implements LLM {
           // diagnostic/probe paths that must not compile llama.cpp.
           build: buildOverride ?? (sourceBuildAllowed ? "auto" : "never"),
           logLevel: LlamaLogLevel.error,
+
           gpu,
           progressLogs: false,
           skipDownload: !sourceBuildAllowed,
@@ -955,6 +974,7 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
+
     const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
@@ -1373,9 +1393,9 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
+    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -1451,11 +1471,11 @@ export class LlamaCpp implements LLM {
       : `/no_think Expand this search query: ${query}`;
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
+    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const genContext = await this.generateModel!.createContext({
       contextSize: this.expandContextSize,
     });
     const sequence = genContext.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
@@ -1976,4 +1996,131 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// OpenAI Embedding Support
+// =============================================================================
+
+import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
+
+/**
+ * Embedding provider configuration
+ */
+export type EmbeddingProvider = 'local' | 'openai';
+
+export type EmbeddingConfig = {
+  provider: EmbeddingProvider;
+  openai?: OpenAIConfig;
+};
+
+// Default embedding config: use local llama-cpp
+let embeddingConfig: EmbeddingConfig = { provider: 'local' };
+let openAIEmbedding: OpenAIEmbedding | null = null;
+
+/**
+ * Set the embedding configuration. Call before using embeddings.
+ */
+export function setEmbeddingConfig(config: EmbeddingConfig): void {
+  embeddingConfig = config;
+  // Reset OpenAI instance if config changes
+  openAIEmbedding = null;
+}
+
+/**
+ * Get the current embedding configuration
+ */
+export function getEmbeddingConfig(): EmbeddingConfig {
+  return embeddingConfig;
+}
+
+/**
+ * Check if using OpenAI for embeddings
+ */
+export function isUsingOpenAI(): boolean {
+  return embeddingConfig.provider === 'openai';
+}
+
+/**
+ * Get the appropriate LLM for embeddings based on config.
+ * Returns OpenAI embedding client if configured, otherwise local LlamaCpp.
+ */
+export function getDefaultEmbeddingLLM(): LLM {
+  if (embeddingConfig.provider === 'openai') {
+    if (!openAIEmbedding) {
+      openAIEmbedding = new OpenAIEmbedding(embeddingConfig.openai);
+    }
+    return openAIEmbedding;
+  }
+  return getDefaultLlamaCpp();
+}
+
+/**
+ * Lightweight ILLMSession wrapper for OpenAI — no LlamaCpp session manager needed.
+ */
+class OpenAILLMSession implements ILLMSession {
+  private llm: OpenAIEmbedding;
+  private abortController = new AbortController();
+  private released = false;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(llm: OpenAIEmbedding, options: LLMSessionOptions = {}) {
+    this.llm = llm;
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000;
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(new Error("OpenAI session exceeded max duration"));
+      }, maxDuration);
+      this.maxDurationTimer.unref();
+    }
+  }
+
+  get isValid(): boolean { return !this.released && !this.abortController.signal.aborted; }
+  get signal(): AbortSignal { return this.abortController.signal; }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.maxDurationTimer) { clearTimeout(this.maxDurationTimer); this.maxDurationTimer = null; }
+    this.abortController.abort(new Error("Session released"));
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    return this.llm.embed(text, options);
+  }
+
+  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.llm.embedBatch(texts);
+  }
+
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    return this.llm.expandQuery(query, options);
+  }
+
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    return this.llm.rerank(query, documents, options);
+  }
+}
+
+/**
+ * Execute a function with the correct session type based on embedding provider.
+ * OpenAI mode: lightweight wrapper, no node-llama-cpp loaded.
+ * Local mode: full LlamaCpp session with resource management.
+ */
+export async function withEmbeddingSession<T>(
+  fn: (session: ILLMSession, modelName: string) => Promise<T>,
+  options?: LLMSessionOptions & { storeLlm?: LlamaCpp }
+): Promise<T> {
+  if (isUsingOpenAI()) {
+    const llm = getDefaultEmbeddingLLM() as OpenAIEmbedding;
+    const session = new OpenAILLMSession(llm, options);
+    try {
+      return await fn(session, llm.getModelName());
+    } finally {
+      session.release();
+    }
+  }
+
+  const llm = options?.storeLlm ?? getDefaultLlamaCpp();
+  return withLLMSessionForLlm(llm, (session) => fn(session, llm.embedModelName), options);
 }
