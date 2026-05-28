@@ -260,16 +260,18 @@ async function main() {
       const r = await benchmarkConfig(model, llama, docs, p, true);
       results.push(r);
       process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
-    } catch (e: any) {
-      process.stdout.write(` failed: ${e.message}\n`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      process.stdout.write(` failed: ${message}\n`);
       // Try without flash
       process.stdout.write(`  [${p} ctx, no flash] running...`);
       try {
         const r = await benchmarkConfig(model, llama, docs, p, false);
         results.push(r);
         process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
-      } catch (e2: any) {
-        process.stdout.write(` failed: ${e2.message}\n`);
+      } catch (e2: unknown) {
+        const message = e2 instanceof Error ? e2.message : String(e2);
+        process.stdout.write(` failed: ${message}\n`);
       }
     }
   }

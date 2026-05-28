@@ -37,6 +37,12 @@ export interface BackendResult {
   precision_at_k: number;
   /** Fraction of expected files found anywhere in results */
   recall: number;
+  /** Fraction of expected files found in the first result */
+  recall_at_1: number;
+  /** Fraction of expected files found in the top 3 results */
+  recall_at_3: number;
+  /** Fraction of expected files found in the top 5 results */
+  recall_at_5: number;
   /** Reciprocal rank of first relevant result (1/rank, 0 if not found) */
   mrr: number;
   /** Harmonic mean of precision_at_k and recall */
@@ -49,6 +55,10 @@ export interface BackendResult {
   latency_ms: number;
   /** Top result file paths (for inspection) */
   top_files: string[];
+  /** Expected files that were found anywhere in the returned result set */
+  matched_files: string[];
+  /** Expected files missing from the returned result set */
+  unmatched_expected_files: string[];
 }
 
 export interface QueryResult {
@@ -65,6 +75,9 @@ export interface BenchmarkResult {
   summary: Record<string, {
     avg_precision: number;
     avg_recall: number;
+    avg_recall_at_1: number;
+    avg_recall_at_3: number;
+    avg_recall_at_5: number;
     avg_mrr: number;
     avg_f1: number;
     avg_latency_ms: number;

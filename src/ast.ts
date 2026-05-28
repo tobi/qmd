@@ -63,14 +63,21 @@ export function detectLanguage(filepath: string): SupportedLanguage | null {
 /**
  * Maps language to the npm package and wasm filename for the grammar.
  */
-const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
-  typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
-  tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm" },
-  javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
-  python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
-  go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
-  rust:       { pkg: "tree-sitter-rust",        wasm: "tree-sitter-rust.wasm" },
+const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; version: string }> = {
+  typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
+  tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm",        version: "0.23.2" },
+  javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
+  python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.23.4" },
+  go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.23.4" },
+  rust:       { pkg: "tree-sitter-rust",       wasm: "tree-sitter-rust.wasm",       version: "0.24.0" },
 };
+
+export function formatGrammarLoadError(language: SupportedLanguage, err: unknown): string {
+  const grammar = GRAMMAR_MAP[language];
+  const detail = err instanceof Error ? err.message : String(err);
+  return `${grammar.pkg}/${grammar.wasm} failed to load (${detail}); falling back to regex chunking. ` +
+    `Repair a broken global install with: bun add ${grammar.pkg}@${grammar.version}`;
+}
 
 // =============================================================================
 // Per-Language Query Definitions
@@ -176,6 +183,9 @@ let initPromise: Promise<void> | null = null;
 /** Languages that have already failed to load — warn only once per process. */
 const failedLanguages = new Set<string>();
 
+/** Last grammar load error by language, for status output. */
+const grammarLoadErrors = new Map<SupportedLanguage, string>();
+
 /** Cached grammar load promises. */
 const grammarCache = new Map<string, Promise<LanguageType>>();
 
@@ -228,7 +238,9 @@ async function loadGrammar(language: SupportedLanguage): Promise<LanguageType | 
   } catch (err) {
     failedLanguages.add(language);
     grammarCache.delete(wasmKey);
-    console.warn(`[qmd] Failed to load tree-sitter grammar for ${language}: ${err}`);
+    const message = formatGrammarLoadError(language, err);
+    grammarLoadErrors.set(language, message);
+    console.warn(`[qmd] AST grammar unavailable for ${language}: ${message}`);
     return null;
   }
 }
@@ -345,7 +357,7 @@ export async function getASTStatus(): Promise<{
         getQuery(lang, grammar);
         languages.push({ language: lang, available: true });
       } else {
-        languages.push({ language: lang, available: false, error: "grammar failed to load" });
+        languages.push({ language: lang, available: false, error: grammarLoadErrors.get(lang) ?? "grammar failed to load" });
       }
     } catch (err) {
       languages.push({

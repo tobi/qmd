@@ -4,7 +4,7 @@
     "noEmit": false,
     "outDir": "dist",
     "declaration": true,
-    "noImplicitAny": false
+    "noImplicitAny": true
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/test-preload.ts", "src/bench-*.ts"]

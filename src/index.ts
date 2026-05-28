@@ -23,7 +23,6 @@ import {
   structuredSearch,
   extractSnippet,
   addLineNumbers,
-  DEFAULT_EMBED_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   generateEmbeddings,
@@ -160,6 +159,8 @@ export interface SearchOptions {
   collections?: string[];
   /** Max results (default: 10) */
   limit?: number;
+  /** Max candidates to rerank (default: 40) */
+  candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
   /** Include explain traces */
@@ -291,6 +292,8 @@ export interface QMDStore {
   embed(options?: {
     force?: boolean;
     model?: string;
+    /** Restrict embedding to documents in one collection. */
+    collection?: string;
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
@@ -430,6 +433,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           minScore: opts.minScore,
           explain: opts.explain,
           intent: opts.intent,
+          candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
@@ -442,12 +446,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         minScore: opts.minScore,
         explain: opts.explain,
         intent: opts.intent,
+        candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -546,6 +551,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
+        collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
