@@ -3384,6 +3384,59 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("searchVec embeds the query with the store's pinned llm, not the global default (qmd-prm regression)", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+
+    // Store is pinned to a 3-dim embed model. Docs AND the query must use it,
+    // so vectors_vec is created as float[3].
+    const storeModel = "hf:store/embeddinggemma-300M.gguf";
+    const storeLlm = {
+      embedModelName: storeModel,
+      async embed(_text: string, _options?: { model?: string }) {
+        return { embedding: [0.1, 0.2, 0.3], model: storeModel };
+      },
+      async embedBatch(texts: string[], _options?: { model?: string }) {
+        return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: storeModel }));
+      },
+    };
+
+    // The global default (env QMD_EMBED_MODEL) is a DIFFERENT, 4-dim model.
+    // If the query is wrongly embedded with this, sqlite-vec rejects the 4-dim
+    // vector against the float[3] table (the reported dim-mismatch symptom).
+    let defaultEmbedCalls = 0;
+    const defaultLlm = {
+      // Chunking tokenizes via the global default (chunkDocumentByTokens passes
+      // no tokenizer), so the default must provide tokenize.
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+      async embed(_text: string, _options?: { model?: string }) {
+        defaultEmbedCalls++;
+        return { embedding: [9, 9, 9, 9], model: "env-8b" };
+      },
+    };
+
+    setDefaultLlamaCpp(defaultLlm as any);
+    store.llm = storeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "alpha", body: "# Alpha\n\nvector regression doc" });
+      const embed = await generateEmbeddings(store);
+      expect(embed.chunksEmbedded).toBeGreaterThan(0);
+
+      // Inline-embed path (no session, no precomputed embedding): the query must
+      // be embedded with the store's llm. Pre-fix this threw a dim mismatch.
+      const results = await store.searchVec("find alpha", storeModel);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(defaultEmbedCalls).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";

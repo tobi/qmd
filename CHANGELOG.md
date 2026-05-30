@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- `store.searchVector()` (and the internal multi-query vector path) now embed the
+  query with the store's pinned embed model instead of the global
+  `QMD_EMBED_MODEL`. A store created with a non-default `models.embed` previously
+  failed with `Dimension mismatch ... Expected N ... received M` and loaded the
+  wrong (often much larger) model at query time, because the query was embedded
+  with the env model rather than the store's. Hybrid/precomputed/session search
+  paths were unaffected and stay unchanged.
+
 ## [2.5.3] - 2026-05-28
 
 ### Features
