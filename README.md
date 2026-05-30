@@ -543,6 +543,9 @@ qmd collection add . --name myproject
 # Create a collection with explicit path and custom glob mask
 qmd collection add ~/Documents/notes --name notes --mask "**/*.md"
 
+# Follow symbolic links when indexing (e.g. for vaults with symlinked folders)
+qmd collection add ~/vault --name vault --follow-symlinks
+
 # List all collections
 qmd collection list
 
