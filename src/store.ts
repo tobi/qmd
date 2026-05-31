@@ -1824,7 +1824,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: Number(process.env.QMD_EMBED_MAX_DURATION_MS ?? 30 * 60 * 1000), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
