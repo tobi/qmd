@@ -1117,4 +1117,110 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(hit.line).toBe(301);
     expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #682: reranker "Object is disposed" on first cold-start query.
+  // The concurrent-init race (two simultaneous first-callers) is covered in
+  // test/llm.test.ts ("handles concurrent rerank calls on fresh instance").
+  // This test covers the MCP HTTP transport end-to-end: a fresh server must
+  // handle two concurrent query calls with rerank: true without crashing.
+  // ---------------------------------------------------------------------------
+
+  test("concurrent first query calls with rerank: true succeed on cold MCP server", async () => {
+    // Spin up a completely fresh server (new db, new LlamaCpp instance) to
+    // simulate a cold start — rerank contexts have never been initialised.
+    const coldDbPath = `/tmp/qmd-mcp-cold-rerank-${Date.now()}.sqlite`;
+    const coldDb = openDatabase(coldDbPath);
+    initTestDatabase(coldDb);
+    seedTestData(coldDb);
+
+    const coldConfig: CollectionConfig = {
+      collections: {
+        docs: { path: "/test/docs", pattern: "**/*.md" },
+      },
+    };
+    syncConfigToDb(coldDb, coldConfig);
+    coldDb.close();
+
+    // Point the process env at the fresh DB for the duration of this test.
+    const prevIndexPath = process.env.INDEX_PATH;
+    process.env.INDEX_PATH = coldDbPath;
+
+    let coldHandle: HttpServerHandle | null = null;
+    try {
+      coldHandle = await startMcpHttpServer(0, { quiet: true, dbPath: coldDbPath });
+      const coldBase = `http://localhost:${coldHandle.port}`;
+
+      let coldSessionId: string | null = null;
+
+      // Each session needs its own session ID, so use independent request functions
+      const makeRequest = (sessionId: { value: string | null }, body: object) => async () => {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        };
+        if (sessionId.value) headers["mcp-session-id"] = sessionId.value;
+        const res = await fetch(`${coldBase}/mcp`, { method: "POST", headers, body: JSON.stringify(body) });
+        const sid = res.headers.get("mcp-session-id");
+        if (sid) sessionId.value = sid;
+        return { status: res.status, json: await res.json() };
+      };
+
+      const sidA = { value: null as string | null };
+      const sidB = { value: null as string | null };
+
+      // Initialize both sessions (sequential — required before any tool calls)
+      await makeRequest(sidA, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "cold-test-a", version: "1.0" } },
+      })();
+      await makeRequest(sidB, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "cold-test-b", version: "1.0" } },
+      })();
+
+      // Fire TWO concurrent query calls with rerank: true on the cold server.
+      // This is the actual race: both callers see rerankContexts.length === 0 and
+      // both enter ensureRerankContexts() simultaneously. Without the promise guard,
+      // one disposes the other's half-built context → "Object is disposed".
+      const [resultA, resultB] = await Promise.all([
+        makeRequest(sidA, {
+          jsonrpc: "2.0", id: 2, method: "tools/call",
+          params: {
+            name: "query",
+            arguments: {
+              searches: [{ type: "lex", query: "readme" }],
+              rerank: true,
+            },
+          },
+        })(),
+        makeRequest(sidB, {
+          jsonrpc: "2.0", id: 2, method: "tools/call",
+          params: {
+            name: "query",
+            arguments: {
+              searches: [{ type: "lex", query: "api" }],
+              rerank: true,
+            },
+          },
+        })(),
+      ]);
+
+      // Both should succeed — no "Object is disposed"
+      expect(resultA.status).toBe(200);
+      expect(resultA.json.error).toBeUndefined();
+      expect(resultA.json.result).toBeDefined();
+      expect(resultA.json.result.content.length).toBeGreaterThan(0);
+
+      expect(resultB.status).toBe(200);
+      expect(resultB.json.error).toBeUndefined();
+      expect(resultB.json.result).toBeDefined();
+      expect(resultB.json.result.content.length).toBeGreaterThan(0);
+    } finally {
+      if (coldHandle) await coldHandle.stop();
+      if (prevIndexPath !== undefined) process.env.INDEX_PATH = prevIndexPath;
+      else delete process.env.INDEX_PATH;
+      try { unlinkSync(coldDbPath); } catch {}
+    }
+  }, 120000); // Allow up to 2 min for first reranker model load
 });

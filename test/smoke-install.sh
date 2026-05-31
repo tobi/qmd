@@ -104,7 +104,7 @@ run() {
   # Intentionally word-split GPU args: container CLIs expect separate flags.
   # shellcheck disable=SC2206
   args=( $(gpu_args) )
-  $CTR run --rm "${args[@]}" "$IMAGE" bash -lc "$*"
+  $CTR run --rm "${args[@]}" "$IMAGE" bash -c "$*"
 }
 
 PASS=0
@@ -156,6 +156,94 @@ run_collection_smoke() {
     "$fixture_setup; cd /tmp/qmd-fixture; $extra_env $bin collection add . --name smoke; $extra_env $bin collection list; $extra_env $bin status"
 }
 
+# ---------------------------------------------------------------------------
+# MCP stdio smoke: start qmd mcp, send initialize + query, verify clean JSON-RPC
+# response. CPU-safe (QMD_FORCE_CPU=1), no embedding/reranking needed.
+# ---------------------------------------------------------------------------
+run_mcp_smoke() {
+  local label="$1" bin="$2" path_env="${3:-}"
+  local script
+  script=$(cat <<'PYEOF'
+import subprocess, json, sys, os, time
+
+# Resolve the binary from PATH set by path_env
+qmd_bin = os.environ.get("_QMD_BIN", "qmd")
+
+env = os.environ.copy()
+env["QMD_FORCE_CPU"] = "1"
+env["QMD_CONFIG_DIR"] = "/tmp/qmd-config"
+
+proc = subprocess.Popen(
+    [qmd_bin, "mcp"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=env,
+)
+
+def send(msg):
+    payload = json.dumps(msg)
+    line = (payload + "\n").encode()
+    proc.stdin.write(line)
+    proc.stdin.flush()
+
+def recv():
+    line = proc.stdout.readline()
+    if not line:
+        stderr = proc.stderr.read(4096).decode(errors="replace")
+        print(f"MCP process exited early. stderr: {stderr}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(line.decode())
+
+try:
+    # 1. Send initialize
+    send({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "smoke-test", "version": "1.0"},
+        },
+    })
+    resp = recv()
+    assert resp.get("jsonrpc") == "2.0", f"Bad jsonrpc: {resp}"
+    assert resp.get("id") == 1, f"Bad id: {resp}"
+    assert "result" in resp, f"No result in initialize: {resp}"
+    assert resp["result"]["serverInfo"]["name"] == "qmd", f"Bad serverInfo: {resp}"
+
+    # 2. Send initialized notification (required by MCP spec)
+    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    # 3. Send query tool call (rerank: false — FTS only, no LLM needed)
+    send({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {
+            "name": "query",
+            "arguments": {
+                "searches": [{"type": "lex", "query": "smoke test"}],
+                "rerank": False,
+            },
+        },
+    })
+    resp = recv()
+    assert resp.get("jsonrpc") == "2.0", f"Bad jsonrpc: {resp}"
+    assert resp.get("id") == 2, f"Bad id: {resp}"
+    assert "error" not in resp, f"Unexpected error in query: {resp}"
+    assert "result" in resp, f"No result in query: {resp}"
+
+    print("MCP stdio smoke: OK")
+finally:
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+PYEOF
+  )
+  smoke_test "$label mcp stdio (initialize + query)" \
+    "$path_env; $fixture_setup; cd /tmp/qmd-fixture; QMD_FORCE_CPU=1 $bin collection add . --name smoke 2>/dev/null; _QMD_BIN=\"\$(which $bin 2>/dev/null || echo $bin)\" python3 -c \"$script\""
+}
+
 run_embed_smoke() {
   local label="$1" bin="$2" extra_env="${3:-}"
   [[ $WITH_EMBED -eq 1 ]] || return 0
@@ -171,6 +259,7 @@ run_runtime_matrix() {
   run_collection_smoke "$label" "$path_env; $bin" "QMD_FORCE_CPU=1"
   run_embed_smoke "$label force-cpu" "$path_env; $bin" "QMD_FORCE_CPU=1"
   run_embed_smoke "$label auto" "$path_env; $bin"
+  run_mcp_smoke "$label" "$bin" "$path_env"
   if [[ $WITH_GPU -eq 1 ]]; then
     local ge
     ge=$(gpu_env)
@@ -186,7 +275,7 @@ run_node_scenario() {
   run_runtime_matrix "node" "$bin" "export PATH=$NODE_BIN:\$PATH"
   smoke_test "node sqlite-vec loads" \
     "export PATH=$NODE_BIN:\$PATH; NPM_GLOBAL=\$(npm root -g); node -e \"
-      const {openDatabase, loadSqliteVec} = await import('\\$NPM_GLOBAL/@tobilu/qmd/dist/db.js');
+      const {openDatabase, loadSqliteVec} = await import('\${NPM_GLOBAL}/@tobilu/qmd/dist/db.js');
       const db = openDatabase(':memory:');
       loadSqliteVec(db);
       const r = db.prepare('SELECT vec_version() as v').get();

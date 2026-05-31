@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- MCP: fix `Object is disposed` error on the first `query` call with `rerank: true` against a freshly-started MCP server. The reranker lazy-init path lacked the concurrent-init promise guard that the embed path already had; two overlapping cold-start callers would both enter the init block, and the one to finish first would dispose the other's half-built context. Fixed by adding `rerankContextsCreatePromise` (mirrors `embedContextsCreatePromise`) so concurrent callers await the in-flight promise instead of racing. #682
+- Tests: add cold-start `rerank: true` MCP query test, and add MCP stdio smoke (initialize + query via JSON-RPC subprocess) to `smoke-install.sh`.
+
 ## [2.5.2] - 2026-05-22
 
 ### Fixes

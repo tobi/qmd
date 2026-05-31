@@ -938,6 +938,70 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
         console.log(`  ${doc.file}: ${doc.score.toFixed(4)}`);
       }
     }, 30000);
+
+    test("handles concurrent rerank calls on fresh instance without race condition (issue #682)", async () => {
+      // This test verifies the fix for the reranker \"Object is disposed\" bug on cold start.
+      //
+      // Without the rerankContextsCreatePromise guard, two concurrent callers both see
+      // rerankContexts.length === 0, both enter the init block, both start building contexts.
+      // The first to finish calls touchActivity(), resetting the inactivity timer — but
+      // the second caller's half-built context can be disposed while the first one returns.
+      // Result: \"Error: Object is disposed\" on the first query call to a fresh MCP server.
+      //
+      // Fix: rerankContextsCreatePromise guards concurrent init — same pattern as
+      // embedContextsCreatePromise in ensureEmbedContexts().
+      //
+      // We verify: only one set of contexts is created regardless of concurrent callers.
+
+      const freshLlm = new LlamaCpp({});
+      let contextCreateCount = 0;
+
+      // Instrument createRankingContext to count calls
+      const originalEnsureRerankModel = (freshLlm as any).ensureRerankModel.bind(freshLlm);
+      let modelInstrumented = false;
+      (freshLlm as any).ensureRerankModel = async function() {
+        const model = await originalEnsureRerankModel();
+        if (!modelInstrumented) {
+          modelInstrumented = true;
+          const originalCreate = model.createRankingContext.bind(model);
+          model.createRankingContext = async function(...args: any[]) {
+            contextCreateCount++;
+            return originalCreate(...args);
+          };
+        }
+        return model;
+      };
+
+      const documents: RerankDocument[] = [
+        { file: "a.md", text: "The capital of France is Paris." },
+        { file: "b.md", text: "The capital of Canada is Ottawa." },
+      ];
+
+      // Fire 5 concurrent rerank calls on a fresh instance.
+      // Without the promise guard, each would create its own context set.
+      // With the fix, all share the single in-flight promise.
+      const results = await Promise.all([
+        freshLlm.rerank("What is the capital of France?", documents),
+        freshLlm.rerank("What is the capital of France?", documents),
+        freshLlm.rerank("What is the capital of France?", documents),
+        freshLlm.rerank("What is the capital of France?", documents),
+        freshLlm.rerank("What is the capital of France?", documents),
+      ]);
+
+      // All calls should succeed
+      for (const result of results) {
+        expect(result.results).toHaveLength(2);
+        expect(result.results[0]!.file).toBe("a.md"); // France doc ranks first
+      }
+
+      // THE KEY ASSERTION: contexts should be created once, not 5× duplicated.
+      // computeParallelism caps at 4 for rerank; exact count depends on VRAM.
+      console.log(`Rerank context creation count: ${contextCreateCount} (expected: ≤ 4, not 5× duplicated)`);
+      expect(contextCreateCount).toBeGreaterThanOrEqual(1);
+      expect(contextCreateCount).toBeLessThanOrEqual(4);
+
+      await freshLlm.dispose();
+    }, 120000); // Allow up to 2 min for first reranker model load
   });
 
   describe("expandQuery", () => {
