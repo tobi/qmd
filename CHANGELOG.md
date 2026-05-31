@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **build**: Remove `shell: true` from `spawnSync` in `scripts/build.mjs`. On
+  Windows, passing `shell: true` caused `cmd.exe` to misparse `process.execPath`
+  when the Node.js installation path contains spaces (e.g.
+  `C:\Program Files\nodejs\node.exe`). Since `run()` always receives a real
+  binary path + args array, no shell is needed — `spawnSync` can spawn
+  executables directly. (#681)
+
 ## [2.5.3] - 2026-05-28
 
 ### Features

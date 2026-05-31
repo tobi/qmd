@@ -10,7 +10,7 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
-    shell: process.platform === "win32",
+    shell: false,
     ...options,
   });
   if (result.status !== 0) {
