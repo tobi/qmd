@@ -10,6 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import { execSync } from "child_process";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -644,6 +645,77 @@ export function resolveLlamaGpuMode(
   return "auto";
 }
 
+type AppleMetalWorkaroundEnv = Partial<Record<"GGML_METAL_NO_RESIDENCY" | "GGML_METAL_TENSOR_DISABLE", string>>;
+const DISABLE_ENV_VALUES = ["false", "off", "none", "disable", "disabled", "0"];
+
+export function resolveAppleMetalWorkarounds(envValue = process.env.QMD_APPLE_METAL_WORKAROUNDS): boolean {
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  if (!normalized) return true;
+  if (DISABLE_ENV_VALUES.includes(normalized)) return false;
+  return true;
+}
+
+function readAppleCpuBrand(): string | null {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return null;
+
+  try {
+    const output = execSync("sysctl -n machdep.cpu.brand_string", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+export function getAppleMetalWorkaroundEnv(opts: {
+  platform?: NodeJS.Platform;
+  arch?: string;
+  env?: NodeJS.ProcessEnv;
+  cpuBrand?: string | null;
+  enabled?: boolean;
+} = {}): AppleMetalWorkaroundEnv {
+  const {
+    platform = process.platform,
+    arch = process.arch,
+    env = process.env,
+    cpuBrand = readAppleCpuBrand(),
+    enabled = resolveAppleMetalWorkarounds(),
+  } = opts;
+
+  if (!enabled || platform !== "darwin" || arch !== "arm64") {
+    return {};
+  }
+
+  const patch: AppleMetalWorkaroundEnv = {};
+
+  // Apple Silicon can hit ggml Metal cleanup assertions on process exit when
+  // residency sets remain active; disable them before node-llama-cpp loads.
+  if (env.GGML_METAL_NO_RESIDENCY == null) {
+    patch.GGML_METAL_NO_RESIDENCY = "1";
+  }
+
+  // M5/A19-class Metal 4 devices can fail tensor API shader probes before
+  // fallback. Pre-disable that probe while keeping the rest of Metal enabled.
+  const normalizedBrand = (cpuBrand ?? "").toUpperCase();
+  if (
+    /(M5|M6|A19|A20)/.test(normalizedBrand) &&
+    env.GGML_METAL_TENSOR_DISABLE == null
+  ) {
+    patch.GGML_METAL_TENSOR_DISABLE = "1";
+  }
+
+  return patch;
+}
+
+function applyAppleMetalWorkaroundEnv(): void {
+  const patch = getAppleMetalWorkaroundEnv();
+  for (const [key, value] of Object.entries(patch)) {
+    process.env[key] = value;
+  }
+}
+
 async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
   const timeoutPromise = new Promise<"timeout">((resolve) => {
     setTimeout(() => resolve("timeout"), timeoutMs).unref();
@@ -850,6 +922,7 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
+      applyAppleMetalWorkaroundEnv();
       const gpuMode = resolveLlamaGpuMode();
 
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
