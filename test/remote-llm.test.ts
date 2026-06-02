@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
+import { createConfiguredLLM } from "../src/configured-llm.js";
 import { RemoteLLM, remoteConfigFromEnv, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
 import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp } from "../src/llm.js";
@@ -68,6 +69,23 @@ function createRemoteLLM(overrides?: Partial<RemoteLLMConfig>): RemoteLLM {
     embedApiModel: "test-model",
     ...overrides,
   });
+}
+
+function withRemoteEnvCleared<T>(fn: () => T): T {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("QMD_") && key.includes("API")) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value !== undefined) process.env[key] = value;
+    }
+  }
 }
 
 // =============================================================================
@@ -409,14 +427,22 @@ describe("RemoteLLM", () => {
 describe("HybridLLM", () => {
   // Simple mock local LLM
   function createMockLocalLLM(): LLM {
+    const localTokens = [1, 2, 3] as any;
     return {
       embedModelName: "local-model",
+      generateModelName: "local-generate-model",
+      rerankModelName: "local-rerank-model",
       embed: async () => ({ embedding: [0.5], model: "local-model" }),
       embedBatch: async (texts) => texts.map(() => ({ embedding: [0.5], model: "local-model" })),
       generate: async () => ({ text: "expanded", model: "local-model", done: true }),
       modelExists: async (model) => ({ name: model, exists: true }),
       expandQuery: async () => [{ type: "lex" as const, text: "expanded query" }],
-      rerank: async () => ({ results: [], model: "local-model" }),
+      rerank: async (_query, documents) => ({
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0.42, index })),
+        model: "local-rerank-model",
+      }),
+      tokenize: async () => localTokens,
+      detokenize: async () => "detokenized",
       dispose: async () => {},
     };
   }
@@ -478,12 +504,72 @@ describe("HybridLLM", () => {
     expect(result[0]!.text).toBe("expanded query");
   });
 
+  it("falls back to local rerank when configured remote rerank fails", async () => {
+    setMockHandler(() => ({
+      status: 500,
+      body: { error: "rerank down" },
+    }));
+
+    const remote = createRemoteLLM({ rerankApiModel: "remote-rerank" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.rerank("query", [{ file: "doc.md", text: "doc text" }]);
+    expect(result.model).toBe("local-rerank-model");
+    expect(result.results).toEqual([{ file: "doc.md", score: 0.42, index: 0 }]);
+  });
+
+  it("falls back to local expansion when configured remote expansion fails", async () => {
+    setMockHandler(() => ({
+      status: 500,
+      body: { error: "chat down" },
+    }));
+
+    const remote = createRemoteLLM({ expandApiModel: "remote-chat" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+  });
+
   it("should use remote embedModelName", async () => {
     const remote = createRemoteLLM({ embedApiModel: "BAAI/bge-m3" });
     const local = createMockLocalLLM();
     const hybrid = new HybridLLM(remote, local);
 
     expect(hybrid.embedModelName).toBe("BAAI/bge-m3");
+  });
+});
+
+describe("createConfiguredLLM", () => {
+  it("returns local LlamaCpp when remote config is absent", () => {
+    const llm = withRemoteEnvCleared(() => createConfiguredLLM(undefined, {
+      embedModel: "hf:local/embed.gguf",
+      generateModel: "hf:local/generate.gguf",
+      rerankModel: "hf:local/rerank.gguf",
+    }));
+
+    expect(llm).toBeInstanceOf(LlamaCpp);
+    expect(llm.embedModelName).toBe("hf:local/embed.gguf");
+  });
+
+  it("returns HybridLLM when remote embedding is configured", () => {
+    const llm = withRemoteEnvCleared(() => createConfiguredLLM({
+      embed_api_url: baseUrl(),
+      embed_api_model: "remote-embed",
+      rerank_api_model: "remote-rerank",
+      expand_api_model: "remote-chat",
+    }));
+
+    expect(llm).toBeInstanceOf(HybridLLM);
+    expect(llm.embedModelName).toBe("remote-embed");
+    expect(llm.usesRemoteEmbedding).toBe(true);
+  });
+
+  it("throws instead of falling back locally when remote config is incomplete", () => {
+    expect(() => withRemoteEnvCleared(() => createConfiguredLLM({ embed_api_url: baseUrl() })))
+      .toThrow(/incomplete remote embedding/i);
   });
 });
 

@@ -32,6 +32,7 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocumentByTokens,
+  chunkDocumentByApproxTokens,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -81,8 +82,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
-import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
-import { HybridLLM } from "../hybrid-llm.js";
+import { createConfiguredLLM } from "../configured-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -131,25 +131,19 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const activeModels = ensureModelsConfiguredForCli();
+    let config: CollectionConfig | undefined;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
+      config = loadConfig();
       syncConfigToDb(store.db, config);
-      const localLlm = new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      });
-      // Remote embedding/rerank: env vars (QMD_EMBED_API_URL etc) take precedence over YAML models.*_api_*
-      const remoteConfig = remoteConfigFromEnv(config.models);
-      if (remoteConfig) {
-        setDefaultLLM(new HybridLLM(new RemoteLLM(remoteConfig), localLlm));
-      } else {
-        setDefaultLLM(localLlm);
-      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
+    setDefaultLLM(createConfiguredLLM(config?.models, {
+      embedModel: activeModels.embed,
+      generateModel: activeModels.generate,
+      rerankModel: activeModels.rerank,
+    }));
   }
   return store;
 }
@@ -319,7 +313,11 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
+function getActiveEmbedModelForCli(): string {
+  return getDefaultLLM().embedModelName;
+}
+
+function checkIndexHealth(db: Database, model: string = getActiveEmbedModelForCli()): void {
   const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
 
   // Warn if many docs need embedding
@@ -492,7 +490,7 @@ async function showStatus(): Promise<void> {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const statusEmbedModel = resolveEmbedModelForCli();
+  const statusEmbedModel = getActiveEmbedModelForCli();
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, statusEmbedModel);
 
   // Most recent update across all collections
@@ -749,7 +747,7 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, getActiveEmbedModelForCli());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -1782,7 +1780,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, getActiveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -3688,11 +3686,15 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
 
   const threshold = 0.0001;
   const mismatches: string[] = [];
+  const llm = getDefaultLLM();
+  const usesRemoteEmbedding = llm.usesRemoteEmbedding === true;
 
   await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunks = usesRemoteEmbedding
+        ? await chunkDocumentByApproxTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal)
+        : await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
       const chunk = chunks[sample.seq];
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
@@ -3877,7 +3879,7 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = getActiveEmbedModelForCli();
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 

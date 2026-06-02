@@ -55,13 +55,18 @@ export class HybridLLM implements LLM {
     return this.remote.embedBatch(texts, options);
   }
 
-  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
     // When remote is a RemoteLLM without a rerank model configured, fall back to local rerank
     // (same fallback shape as expandQuery → local).
     if (this.remote instanceof RemoteLLM && !this.remote.supportsRerank) {
       return this.local.rerank(query, documents, options);
     }
-    return this.remote.rerank(query, documents, options);
+    try {
+      return await this.remote.rerank(query, documents, options);
+    } catch (error) {
+      console.error("Remote rerank failed; falling back to local rerank:", error);
+      return this.local.rerank(query, documents, options);
+    }
   }
 
   // Route to local
@@ -77,11 +82,15 @@ export class HybridLLM implements LLM {
     return this.local.detokenize(tokens);
   }
 
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
     // Route to remote when configured for it; otherwise local (same fallback
     // shape as rerank → local when remote doesn't support rerank).
     if (this.remote instanceof RemoteLLM && this.remote.supportsExpand) {
-      return this.remote.expandQuery(query, options);
+      try {
+        return await this.remote.expandQuery(query, options);
+      } catch (error) {
+        console.error("Remote query expansion failed; falling back to local expansion:", error);
+      }
     }
     return this.local.expandQuery(query, options);
   }

@@ -497,11 +497,9 @@ export class RemoteLLM implements LLM {
       };
       content = json.choices?.[0]?.message?.content ?? "";
     } catch (err) {
-      // Network error, timeout, or non-2xx — fall back to the default triple.
-      // Don't escalate to caller; LocalLLM also masks failures behind the
-      // fallback to keep search resilient.
-      console.error("Remote query expansion failed:", err);
-      return defaultFallback();
+      // Network error, timeout, or non-2xx. Let HybridLLM fall back to local
+      // query expansion when available; bare RemoteLLM callers see the failure.
+      throw err;
     }
 
     // Parse — mirror LocalLLM's parsing exactly so downstream sees consistent
