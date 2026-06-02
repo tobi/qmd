@@ -81,7 +81,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -134,11 +136,18 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      const localLlm = new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
-      }));
+      });
+      // Remote embedding/rerank: env vars (QMD_EMBED_API_URL etc) take precedence over YAML models.*_api_*
+      const remoteConfig = remoteConfigFromEnv(config.models);
+      if (remoteConfig) {
+        setDefaultLLM(new HybridLLM(new RemoteLLM(remoteConfig), localLlm));
+      } else {
+        setDefaultLLM(localLlm);
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -1983,6 +1992,39 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // PR #629 follow-up: when HybridLLM/RemoteLLM is configured, the actual embedding
+  // model name comes from the LLM (e.g. "nomic-embed-text") rather than the local
+  // GGUF URI we got from CLI defaults. Override here so generateEmbeddings, fingerprint
+  // computation, and the pending-doc lookup all use the remote model identifier.
+  const llm = getDefaultLLM();
+  model = llm.embedModelName;
+
+  // Pre-flight probe: when remote embedding is configured, verify the remote
+  // endpoint actually works BEFORE writing any vectors. This prevents the
+  // silent-fallback failure mode where a misconfigured/unreachable remote
+  // backend would otherwise let qmd appear to "succeed" while writing
+  // local-model-tagged vectors (or no vectors at all). Belt-and-suspenders
+  // on top of RemoteLLM's call-time errors — fail fast at startup with a
+  // clear message rather than mid-batch.
+  if (llm.usesRemoteEmbedding) {
+    try {
+      const probe = await llm.embed("preflight probe", { model });
+      if (!probe || !Array.isArray(probe.embedding) || probe.embedding.length === 0) {
+        throw new Error(
+          `Pre-flight probe to remote embedder returned no embedding ` +
+          `(model=${model}). Aborting embed run to avoid silent fallback. ` +
+          `Check llama-server / remote endpoint health.`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Pre-flight probe to remote embedder FAILED (model=${model}): ${msg}. ` +
+        `Aborting embed run to avoid silent fallback.`
+      );
+    }
+  }
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -3868,7 +3910,15 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const llm = getDefaultLLM();
+    if (!(llm instanceof LlamaCpp)) {
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+      }
+      console.log(`  ${c.dim}device probe unavailable for non-local LLM backend${c.reset}`);
+      return;
+    }
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
