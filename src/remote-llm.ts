@@ -2,7 +2,8 @@
  * remote-llm.ts - OpenAI-compatible remote embedding & reranking backend
  *
  * Implements the LLM interface by calling HTTP endpoints (vLLM, Ollama, OpenAI, etc.).
- * Only supports embed/rerank operations — generate/expandQuery throw.
+ * Supports embedding, optional reranking, and optional chat-based query expansion.
+ * Text generation remains local-only through HybridLLM.
  */
 
 import type {
@@ -12,6 +13,7 @@ import type {
   GenerateOptions,
   GenerateResult,
   ModelInfo,
+  LLMExpandQueryOptions,
   Queryable,
   QueryType,
   RerankDocument,
@@ -65,6 +67,7 @@ class CircuitBreaker {
   private state: CircuitState = "closed";
   private failures = 0;
   private lastFailureTime = 0;
+  private halfOpenProbeInFlight = false;
   private readonly maxFailures: number;
   private readonly cooldownMs: number;
 
@@ -78,22 +81,29 @@ class CircuitBreaker {
     if (this.state === "open") {
       if (Date.now() - this.lastFailureTime >= this.cooldownMs) {
         this.state = "half-open";
+        this.halfOpenProbeInFlight = true;
         return true;
       }
       return false;
     }
-    // half-open: allow one attempt
-    return true;
+    // half-open: allow one probe at a time
+    if (!this.halfOpenProbeInFlight) {
+      this.halfOpenProbeInFlight = true;
+      return true;
+    }
+    return false;
   }
 
   onSuccess(): void {
     this.state = "closed";
     this.failures = 0;
+    this.halfOpenProbeInFlight = false;
   }
 
   onFailure(): void {
     this.failures++;
     this.lastFailureTime = Date.now();
+    this.halfOpenProbeInFlight = false;
     if (this.state === "half-open" || this.failures >= this.maxFailures) {
       this.state = "open";
     }
@@ -135,6 +145,7 @@ export class RemoteLLM implements LLM {
 
   private readonly embedBreaker = new CircuitBreaker();
   private readonly rerankBreaker = new CircuitBreaker();
+  private readonly expandBreaker = new CircuitBreaker();
   private expectedDimensions: number | null = null;
 
   constructor(config: RemoteLLMConfig) {
@@ -159,6 +170,10 @@ export class RemoteLLM implements LLM {
   /** Remote backend exposes no local generation model; use the embed model as a placeholder identifier. */
   get generateModelName(): string {
     return this.config.embedApiModel;
+  }
+
+  get expandModelName(): string {
+    return this.config.expandApiModel || this.config.embedApiModel;
   }
 
   get usesRemoteEmbedding(): boolean {
@@ -418,7 +433,7 @@ export class RemoteLLM implements LLM {
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean; intent?: string },
+    options?: LLMExpandQueryOptions,
   ): Promise<Queryable[]> {
     const expandUrl = this.config.expandApiUrl || this.config.embedApiUrl;
     const expandModel = this.config.expandApiModel;
@@ -426,9 +441,9 @@ export class RemoteLLM implements LLM {
     const includeLexical = options?.includeLexical ?? true;
     const intent = options?.intent;
 
-    // Shared fallback shape — used whenever the remote call fails OR returns
-    // nothing parseable. Mirrors LocalLLM.expandQuery's fallback exactly so
-    // downstream code doesn't see a behavior difference.
+    // Shared fallback shape for RemoteLLM without a configured expand model.
+    // When remote expansion is configured but unavailable or unusable, throw
+    // so HybridLLM can fall back to local expansion instead.
     const defaultFallback = (): Queryable[] => {
       const triple: Queryable[] = [
         { type: "hyde", text: `Information about ${query}` },
@@ -440,13 +455,22 @@ export class RemoteLLM implements LLM {
 
     if (!expandModel) {
       // Configured to use remote but no expand model set → safe default.
+      options?.onModelUsed?.(this.expandModelName);
       return defaultFallback();
+    }
+
+    if (!this.expandBreaker.canAttempt()) {
+      throw new Error(
+        `Remote expand circuit breaker is open — endpoint ${expandUrl} is unavailable. ` +
+        `Will retry after cooldown.`
+      );
     }
 
     // Prompt the chat model to emit the lex/vec/hyde format that
     // LocalLLM.expandQuery produces via grammar-constrained sampling.
     // Without llama.cpp grammar we have to ask politely; parsing below is
-    // tolerant of variations and falls back if the model goes off-script.
+    // tolerant of small variations but rejects unusable output so HybridLLM
+    // can fall back to local expansion.
     const systemPrompt =
       "You expand search queries for a hybrid retrieval system. " +
       "Output 3 to 6 query variants, one per line, each prefixed with its type. " +
@@ -497,6 +521,7 @@ export class RemoteLLM implements LLM {
       };
       content = json.choices?.[0]?.message?.content ?? "";
     } catch (err) {
+      this.expandBreaker.onFailure();
       // Network error, timeout, or non-2xx. Let HybridLLM fall back to local
       // query expansion when available; bare RemoteLLM callers see the failure.
       throw err;
@@ -534,8 +559,14 @@ export class RemoteLLM implements LLM {
       ? queryables
       : queryables.filter(q => q.type !== "lex");
 
-    if (filtered.length > 0) return filtered;
-    return defaultFallback();
+    if (filtered.length > 0) {
+      this.expandBreaker.onSuccess();
+      options?.onModelUsed?.(this.expandModelName);
+      return filtered;
+    }
+
+    this.expandBreaker.onFailure();
+    throw new Error("Expand API returned no parseable query expansions");
   }
 
   async dispose(): Promise<void> {

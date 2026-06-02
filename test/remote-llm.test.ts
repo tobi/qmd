@@ -405,6 +405,91 @@ describe("RemoteLLM", () => {
       await expect(llm.generate("prompt")).rejects.toThrow("does not support text generation");
     });
 
+    it("should expand queries through chat completions when configured", async () => {
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("remote-chat");
+        expect(parsed.messages.at(-1).content).toContain("search docs");
+        return {
+          status: 200,
+          body: {
+            choices: [{
+              message: {
+                content: [
+                  "lex: search docs keywords",
+                  "vec: semantic search docs",
+                  "hyde: Information about search docs",
+                ].join("\n"),
+              },
+            }],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      const result = await llm.expandQuery("search docs");
+      expect(result).toEqual([
+        { type: "lex", text: "search docs keywords" },
+        { type: "vec", text: "semantic search docs" },
+        { type: "hyde", text: "Information about search docs" },
+      ]);
+    });
+
+    it("opens an independent circuit breaker after repeated expansion failures", async () => {
+      let requestCount = 0;
+      setMockHandler(() => {
+        requestCount++;
+        return {
+          status: 500,
+          body: { error: "chat down" },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.expandQuery("test query")).rejects.toThrow("500");
+      }
+
+      await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
+      expect(requestCount).toBe(3);
+
+      setMockHandler((req) => {
+        expect(req.url).toContain("/embeddings");
+        return {
+          status: 200,
+          body: { data: [{ embedding: [0.4], index: 0 }] },
+        };
+      });
+
+      const embedResult = await llm.embed("embed still works");
+      expect(embedResult?.embedding).toEqual([0.4]);
+    });
+
+    it("treats unparseable expansion responses as failures", async () => {
+      let requestCount = 0;
+      setMockHandler(() => {
+        requestCount++;
+        return {
+          status: 200,
+          body: {
+            choices: [{
+              message: {
+                content: "I cannot help with that.",
+              },
+            }],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.expandQuery("test query")).rejects.toThrow("no parseable");
+      }
+
+      await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
+      expect(requestCount).toBe(3);
+    });
+
     it("should fall back to the default expansion triple when no expand model is configured", async () => {
       // RemoteLLM.expandQuery now implements query expansion via chat
       // completions. When no expand model is configured it returns the same
@@ -533,12 +618,45 @@ describe("HybridLLM", () => {
     expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
   });
 
+  it("falls back to local expansion when configured remote expansion is unparseable", async () => {
+    setMockHandler(() => ({
+      status: 200,
+      body: {
+        choices: [{
+          message: {
+            content: "Here are some ideas without the required prefixes.",
+          },
+        }],
+      },
+    }));
+
+    const remote = createRemoteLLM({ expandApiModel: "remote-chat" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+  });
+
   it("should use remote embedModelName", async () => {
     const remote = createRemoteLLM({ embedApiModel: "BAAI/bge-m3" });
     const local = createMockLocalLLM();
     const hybrid = new HybridLLM(remote, local);
 
     expect(hybrid.embedModelName).toBe("BAAI/bge-m3");
+  });
+
+  it("should use remote expandModelName only when remote expansion is configured", async () => {
+    const local = createMockLocalLLM();
+
+    const embedOnlyHybrid = new HybridLLM(createRemoteLLM(), local);
+    expect(embedOnlyHybrid.expandModelName).toBe("local-generate-model");
+
+    const remoteExpandHybrid = new HybridLLM(
+      createRemoteLLM({ expandApiModel: "remote-chat" }),
+      local,
+    );
+    expect(remoteExpandHybrid.expandModelName).toBe("remote-chat");
   });
 });
 

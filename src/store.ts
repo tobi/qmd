@@ -2003,7 +2003,7 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.expandModelName ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
 
     // Document retrieval
@@ -3954,8 +3954,14 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = llmOverride ?? getDefaultLLM();
+  let modelUsed = model;
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query, { intent });
+  const results = await llm.expandQuery(query, {
+    intent,
+    onModelUsed: (usedModel) => {
+      modelUsed = usedModel;
+    },
+  });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -3964,7 +3970,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     .map(r => ({ type: r.type, query: r.text }));
 
   if (expanded.length > 0) {
-    setCachedResult(db, cacheKey, JSON.stringify(expanded));
+    const writeCacheKey = modelUsed === model
+      ? cacheKey
+      : getCacheKey("expandQuery", { query, model: modelUsed, ...(intent && { intent }) });
+    setCachedResult(db, writeCacheKey, JSON.stringify(expanded));
   }
 
   return expanded;
