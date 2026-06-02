@@ -10,7 +10,13 @@ import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
+import {
+  getConfigPath,
+  getEmbeddingConfig,
+  loadConfig,
+  setConfigIndexName,
+  setConfigSource,
+} from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -21,14 +27,18 @@ beforeEach(() => {
     USERPROFILE: process.env.USERPROFILE,
     QMD_CONFIG_DIR: process.env.QMD_CONFIG_DIR,
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    QMD_OPENAI: process.env.QMD_OPENAI,
+    QMD_OPENAI_API_KEY: process.env.QMD_OPENAI_API_KEY,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
   };
   // Reset index name to default
   setConfigIndexName("index");
 });
 
 afterEach(() => {
-  // Reset index name to default (prevents leaking into other test files under bun test)
+  // Reset index name/source to default (prevents leaking into other test files under bun test)
   setConfigIndexName("index");
+  setConfigSource(undefined);
   for (const [key, val] of Object.entries(savedEnv)) {
     if (val === undefined) {
       delete process.env[key];
@@ -94,5 +104,41 @@ describe("getConfigDir via getConfigPath", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe("getEmbeddingConfig defaults", () => {
+  test("uses local embeddings when no config or OpenAI signal is present", () => {
+    delete process.env.QMD_OPENAI;
+    delete process.env.QMD_OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    setConfigSource({ config: { collections: {} } });
+
+    expect(getEmbeddingConfig()).toEqual({ provider: "local" });
+  });
+
+  test("defaults to OpenAI when the EdwinPAI/QMD installer enables QMD_OPENAI", () => {
+    process.env.QMD_OPENAI = "1";
+    delete process.env.QMD_OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    setConfigSource({ config: { collections: {} } });
+
+    expect(getEmbeddingConfig()).toEqual({ provider: "openai" });
+  });
+
+  test("defaults to OpenAI when an OpenAI embedding key is available", () => {
+    delete process.env.QMD_OPENAI;
+    process.env.OPENAI_API_KEY = "sk-test";
+    setConfigSource({ config: { collections: {} } });
+
+    expect(getEmbeddingConfig()).toEqual({ provider: "openai" });
+  });
+
+  test("explicit config still wins over environment defaults", () => {
+    process.env.QMD_OPENAI = "1";
+    setConfigSource({ config: { collections: {}, embedding: { provider: "local" } } });
+
+    expect(getEmbeddingConfig()).toEqual({ provider: "local" });
   });
 });

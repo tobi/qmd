@@ -46,7 +46,7 @@ export interface ModelsConfig {
  * Embedding provider configuration (optional in config file)
  */
 export interface EmbeddingProviderConfig {
-  provider?: 'local' | 'openai';  // Default: 'local'
+  provider?: 'local' | 'openai';  // Default: 'openai' when QMD_OPENAI or an OpenAI key is present, otherwise 'local'
   openai?: {
     api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
     model?: string;               // Default: 'text-embedding-3-small'
@@ -558,10 +558,23 @@ export function isValidCollectionName(name: string): boolean {
 }
 
 /**
- * Get embedding configuration from config file
- * Returns default (local) config if not specified
+ * Get embedding configuration from config file.
+ *
+ * QMD historically defaulted to the local node-llama-cpp embedding model when the
+ * config omitted `embedding`. That is a bad default for EdwinPAI installs: the
+ * first embed pass can download/load a local GGUF model and make setup feel
+ * frozen. Prefer OpenAI whenever the installer/runtime has explicitly enabled it
+ * (`QMD_OPENAI=1`) or an OpenAI-compatible key is available, while preserving the
+ * local fallback for standalone/offline installs.
  */
 export function getEmbeddingConfig(): EmbeddingProviderConfig {
   const config = loadConfig();
-  return config.embedding || { provider: 'local' };
+  if (config.embedding) return config.embedding;
+
+  const wantsOpenAI =
+    process.env.QMD_OPENAI === "1" ||
+    Boolean(process.env.QMD_OPENAI_API_KEY?.trim()) ||
+    Boolean(process.env.OPENAI_API_KEY?.trim());
+
+  return wantsOpenAI ? { provider: 'openai' } : { provider: 'local' };
 }
