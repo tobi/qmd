@@ -292,6 +292,63 @@ describe("RemoteLLM", () => {
       expect(bScore).toBeGreaterThan(aScore);
     });
 
+    it("recovers from an oversized rerank batch by splitting", async () => {
+      // log-odds keyed by document text; the server rejects any multi-document
+      // batch as "too large", forcing recursive bisection down to single docs.
+      const scores: Record<string, number> = {
+        "doc a": 0.5, "doc b": 1.5, "doc c": -0.5, "doc d": 2.5,
+      };
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        if (parsed.documents.length > 1) {
+          return { status: 413, body: { error: "input is too large to process" } };
+        }
+        return {
+          status: 200,
+          body: { results: [{ index: 0, relevance_score: scores[parsed.documents[0]] }] },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [
+        { file: "a.md", text: "doc a" },
+        { file: "b.md", text: "doc b" },
+        { file: "c.md", text: "doc c" },
+        { file: "d.md", text: "doc d" },
+      ]);
+
+      // Every document is scored, response indices remap back to the original
+      // positions, and results come back sorted by normalized score descending.
+      expect(result.results).toHaveLength(4);
+      expect(result.results.map(r => r.file)).toEqual(["d.md", "b.md", "a.md", "c.md"]);
+      const byFile = Object.fromEntries(result.results.map(r => [r.file, r.index]));
+      expect(byFile["a.md"]).toBe(0);
+      expect(byFile["d.md"]).toBe(3);
+      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-2.5)), 10);
+    });
+
+    it("recovers from a single oversized document by truncating", async () => {
+      // The server rejects any request whose document exceeds 64 chars, forcing
+      // halve-truncation of the single oversized doc until it fits.
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        const longest = Math.max(...parsed.documents.map((d: string) => d.length));
+        if (longest > 64) {
+          return { status: 400, body: { error: "input too long" } };
+        }
+        return {
+          status: 200,
+          body: { results: parsed.documents.map((_: string, i: number) => ({ index: i, relevance_score: 1.0 })) },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [{ file: "big.md", text: "x".repeat(500) }]);
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].file).toBe("big.md");
+      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-1.0)), 10);
+    });
+
     it("should throw when rerankApiModel not configured", async () => {
       const llm = createRemoteLLM();
       await expect(

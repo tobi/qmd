@@ -15,6 +15,7 @@ import type {
   Queryable,
   QueryType,
   RerankDocument,
+  RerankDocumentResult,
   RerankOptions,
   RerankResult,
 } from "./llm.js";
@@ -101,6 +102,26 @@ class CircuitBreaker {
   getState(): CircuitState {
     return this.state;
   }
+}
+
+/** Floor for halve-truncating a single oversized document during rerank recovery. */
+const RERANK_MIN_DOC_CHARS = 32;
+
+/**
+ * True when a rerank request failed because the payload exceeded what the
+ * server/model can process (the whole batch, or a single very long document).
+ * Drives batch-splitting recovery; non-oversized errors propagate instead so
+ * the circuit breaker / HybridLLM local fallback can react.
+ */
+function isOversizedRerankError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return m.includes("too large to process")
+    || m.includes("payload too large")
+    || m.includes(" 413")
+    || m.includes("context length")
+    || m.includes("maximum context")
+    || m.includes("too long");
 }
 
 // =============================================================================
@@ -279,17 +300,22 @@ export class RemoteLLM implements LLM {
       headers["Authorization"] = `Bearer ${rerankKey}`;
     }
 
-    const body = JSON.stringify({
-      model: rerankModel,
-      query,
-      documents: documents.map(d => d.text),
-    });
-
-    try {
+    // One rerank request for a slice of `documents` starting at `start`.
+    // Response indices are local to the submitted slice, so they are remapped
+    // to original document positions via `start`. relevance_score is
+    // sigmoid-normalized (see note below).
+    const rerankBatch = async (
+      batch: RerankDocument[],
+      start: number,
+    ): Promise<RerankDocumentResult[]> => {
       const response = await fetchWithTimeout(url, {
         method: "POST",
         headers,
-        body,
+        body: JSON.stringify({
+          model: rerankModel,
+          query,
+          documents: batch.map(d => d.text),
+        }),
       }, this.config.rerankReadTimeoutMs);
 
       if (!response.ok) {
@@ -307,20 +333,60 @@ export class RemoteLLM implements LLM {
       // endpoint (notably bge-reranker-v2-m3, BAAI/bge-reranker-large, jina-
       // reranker-v2) emit log-odds (range roughly -10..+10, negative = poor
       // match, positive = good match). The qmd consumer (store.ts blend
-      // formula at line ~4767 and the --min-score default of 0.3) assumes a
-      // 0..1 probability range. Without normalization, every blended score
-      // ends up negative and the default min-score filter drops all results.
+      // formula and the --min-score default of 0.3) assumes a 0..1 probability
+      // range. Without normalization, every blended score ends up negative and
+      // the default min-score filter drops all results.
       //
       // Sigmoid is monotonic so ordering is preserved. For rerankers that
       // already emit 0..1 scores (some Voyage / Cohere endpoints), sigmoid
-      // is a no-op-ish squash that keeps them in [0,1]. The conversion is
-      // safe in both directions.
-      const results = json.results.map(r => ({
-        file: documents[r.index]!.file,
-        score: 1 / (1 + Math.exp(-r.relevance_score)),
-        index: r.index,
-      }));
+      // is a no-op-ish squash that keeps them in [0,1]. Safe in both directions.
+      return json.results.map(r => {
+        const documentIndex = start + r.index;
+        return {
+          file: documents[documentIndex]!.file,
+          score: 1 / (1 + Math.exp(-r.relevance_score)),
+          index: documentIndex,
+        };
+      });
+    };
 
+    // Recovery for servers that reject an over-large rerank payload (the batch
+    // or a single very long document exceeds the model's context). On an
+    // oversized error we bisect the batch; a single oversized document is
+    // halve-truncated down to a floor and re-scored on the truncated text.
+    // Adapted from the recovery in tobi/qmd#619 (loopyd). Non-oversized errors
+    // propagate so the circuit breaker / HybridLLM local fallback can react.
+    const scoreBatch = async (
+      batch: RerankDocument[],
+      start: number,
+    ): Promise<RerankDocumentResult[]> => {
+      try {
+        return await rerankBatch(batch, start);
+      } catch (err) {
+        if (!isOversizedRerankError(err) || batch.length === 0) {
+          throw err;
+        }
+        if (batch.length === 1) {
+          const doc = batch[0]!;
+          const nextLength = Math.max(RERANK_MIN_DOC_CHARS, Math.floor(doc.text.length / 2));
+          if (doc.text.length <= RERANK_MIN_DOC_CHARS || nextLength >= doc.text.length) {
+            throw err;
+          }
+          return scoreBatch([{ ...doc, text: doc.text.slice(0, nextLength) }], start);
+        }
+        const mid = Math.ceil(batch.length / 2);
+        const left = await scoreBatch(batch.slice(0, mid), start);
+        const right = await scoreBatch(batch.slice(mid), start + mid);
+        return [...left, ...right];
+      }
+    };
+
+    try {
+      const results = await scoreBatch(documents, 0);
+      // Sub-batch recovery merges results out of global rank order; sort by the
+      // (monotonic) normalized score for a coherent final ranking. No-op on the
+      // common single-request path, where the server already returns ranked.
+      results.sort((a, b) => b.score - a.score);
       this.rerankBreaker.onSuccess();
       return { results, model: rerankModel };
     } catch (err) {
