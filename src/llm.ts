@@ -225,7 +225,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -244,6 +244,14 @@ export type QueryType = 'lex' | 'vec' | 'hyde';
 export type Queryable = {
   type: QueryType;
   text: string;
+};
+
+export type LLMExpandQueryOptions = {
+  context?: string;
+  includeLexical?: boolean;
+  intent?: string;
+  /** Reports the model that actually produced the returned expansion. */
+  onModelUsed?: (model: string) => void;
 };
 
 /**
@@ -553,6 +561,12 @@ export interface LLM {
   readonly generateModelName: string;
 
   /**
+   * The query-expansion model name/URI. Defaults to generateModelName for
+   * local backends, but remote chat expansion can use an independent model.
+   */
+  readonly expandModelName?: string;
+
+  /**
    * The reranking model name/URI.
    */
   readonly rerankModelName: string;
@@ -588,7 +602,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -790,6 +804,10 @@ export class LlamaCpp implements LLM {
   }
 
   get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get expandModelName(): string {
     return this.generateModelUri;
   }
 
@@ -1481,8 +1499,9 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: LLMExpandQueryOptions = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    options.onModelUsed?.(this.expandModelName);
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1916,7 +1935,7 @@ class LLMSession implements ILLMSession {
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean }
+    options?: LLMExpandQueryOptions
   ): Promise<Queryable[]> {
     return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }

@@ -2,7 +2,8 @@
  * hybrid-llm.ts - Compositor that routes LLM operations between remote and local backends
  *
  * Embed/rerank → remote (GPU-heavy, benefits from offloading)
- * Generate/expandQuery → local LlamaCpp (QMD's fine-tuned query expansion model)
+ * Generate → local LlamaCpp
+ * expandQuery → remote when configured, otherwise local
  * tokenize/countTokens → local LlamaCpp (CPU-cheap, needed for chunking)
  */
 
@@ -12,6 +13,7 @@ import type {
   EmbeddingResult,
   GenerateOptions,
   GenerateResult,
+  LLMExpandQueryOptions,
   ModelInfo,
   Queryable,
   RerankDocument,
@@ -33,6 +35,13 @@ export class HybridLLM implements LLM {
 
   get generateModelName(): string {
     return this.local.generateModelName;
+  }
+
+  get expandModelName(): string {
+    if (this.remote instanceof RemoteLLM && this.remote.supportsExpand) {
+      return this.remote.expandModelName ?? this.remote.generateModelName;
+    }
+    return this.local.expandModelName ?? this.local.generateModelName;
   }
 
   get rerankModelName(): string {
@@ -82,7 +91,7 @@ export class HybridLLM implements LLM {
     return this.local.detokenize(tokens);
   }
 
-  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]> {
     // Route to remote when configured for it; otherwise local (same fallback
     // shape as rerank → local when remote doesn't support rerank).
     if (this.remote instanceof RemoteLLM && this.remote.supportsExpand) {

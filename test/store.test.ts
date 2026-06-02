@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
+import { disposeDefaultLlamaCpp, setDefaultLlamaCpp, type LLMExpandQueryOptions } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -1148,6 +1148,78 @@ describe("Caching", () => {
     // Clear cache
     store.clearCache();
     expect(store.getCachedResult(key)).toBeNull();
+
+    await cleanupTestDb(store);
+  });
+
+  test("expandQuery cache separates local and remote expansion models", async () => {
+    const store = await createTestStore();
+    const query = "same expansion query";
+    const calls: string[] = [];
+
+    const makeLlm = (label: string, expandModelName?: string, modelUsed = expandModelName ?? "local-generate") => ({
+      embedModelName: "remote-embed",
+      generateModelName: "local-generate",
+      ...(expandModelName ? { expandModelName } : {}),
+      rerankModelName: "remote-rerank",
+      embed: async () => ({ embedding: [0.1], model: "remote-embed" }),
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [0.1], model: "remote-embed" })),
+      generate: async () => ({ text: label, model: "local-generate", done: true }),
+      modelExists: async (model: string) => ({ name: model, exists: true }),
+      expandQuery: async (_query: string, options?: LLMExpandQueryOptions) => {
+        calls.push(label);
+        options?.onModelUsed?.(modelUsed);
+        return [{ type: "lex" as const, text: `${query} ${label}` }];
+      },
+      rerank: async () => ({ results: [], model: "remote-rerank" }),
+      tokenize: async () => [] as any,
+      detokenize: async () => "",
+      dispose: async () => {},
+    });
+
+    // Simulate an existing local-generation cache entry keyed by generateModelName.
+    store.llm = makeLlm("local") as any;
+    const local = await store.expandQuery(query);
+    expect(calls).toEqual(["local"]);
+
+    // LLMs without expandModelName remain compatible by falling back to
+    // generateModelName for the cache identity.
+    store.llm = makeLlm("local-again") as any;
+    const localAgain = await store.expandQuery(query);
+    expect(calls).toEqual(["local"]);
+    expect(localAgain).toEqual(local);
+
+    // Remote expansion keeps local generation for generate(), but must use a
+    // distinct expansion model identity so it does not reuse the local cache.
+    store.llm = makeLlm("remote-v1", "remote-chat-v1") as any;
+    const remoteV1 = await store.expandQuery(query);
+    expect(calls).toEqual(["local", "remote-v1"]);
+    expect(remoteV1).not.toEqual(local);
+
+    // Same remote expansion model should hit cache.
+    const remoteV1Again = await store.expandQuery(query);
+    expect(calls).toEqual(["local", "remote-v1"]);
+    expect(remoteV1Again).toEqual(remoteV1);
+
+    // Changing only the remote chat model must miss the old remote cache.
+    store.llm = makeLlm("remote-v2", "remote-chat-v2") as any;
+    const remoteV2 = await store.expandQuery(query);
+    expect(calls).toEqual(["local", "remote-v1", "remote-v2"]);
+    expect(remoteV2).not.toEqual(remoteV1);
+
+    store.clearCache();
+    calls.length = 0;
+
+    // If HybridLLM falls back locally after a remote expansion failure, Store
+    // must not cache that local output under the remote chat model key.
+    store.llm = makeLlm("fallback-local", "remote-chat", "local-generate") as any;
+    const fallbackLocal = await store.expandQuery(query);
+    expect(calls).toEqual(["fallback-local"]);
+
+    store.llm = makeLlm("remote-after-recovery", "remote-chat") as any;
+    const recoveredRemote = await store.expandQuery(query);
+    expect(calls).toEqual(["fallback-local", "remote-after-recovery"]);
+    expect(recoveredRemote).not.toEqual(fallbackLocal);
 
     await cleanupTestDb(store);
   });
