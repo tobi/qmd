@@ -942,9 +942,9 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 
 Used for generating query variations via `LlamaChatSession`.
 
-### Remote Embedding & Reranking
+### Remote Embedding, Reranking & Query Expansion
 
-QMD can offload embedding and reranking to a remote OpenAI-compatible server (vLLM, Ollama, LM Studio, OpenAI, etc.) while keeping query expansion local.
+QMD can offload embedding, reranking, and query expansion to remote OpenAI-compatible servers (vLLM, Ollama, LM Studio, OpenAI, etc.) while keeping local generation and tokenization available for hybrid fallback.
 
 **Environment variables** (presence of `QMD_EMBED_API_URL` activates remote mode):
 
@@ -956,6 +956,9 @@ QMD can offload embedding and reranking to a remote OpenAI-compatible server (vL
 | `QMD_RERANK_API_URL` | No | Rerank endpoint (defaults to embed URL) |
 | `QMD_RERANK_API_MODEL` | No | Rerank model name |
 | `QMD_RERANK_API_KEY` | No | Rerank auth (defaults to embed key) |
+| `QMD_EXPAND_API_URL` | No | Query expansion chat endpoint (defaults to embed URL) |
+| `QMD_EXPAND_API_MODEL` | No | Chat model for query expansion |
+| `QMD_EXPAND_API_KEY` | No | Query expansion auth (defaults to embed key) |
 
 **YAML config** (`~/.config/qmd/index.yml`):
 ```yaml
@@ -963,6 +966,8 @@ models:
   embed_api_url: "http://gpu-host:8000/v1"
   embed_api_model: "BAAI/bge-m3"
   rerank_api_model: "BAAI/bge-reranker-v2-m3"
+  expand_api_url: "https://chat-host/v1"
+  expand_api_model: "qwen3-4b"
 ```
 
 **Example with vLLM:**

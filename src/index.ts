@@ -63,9 +63,7 @@ import {
   type EmbedResult,
   type ChunkStrategy,
 } from "./store.js";
-import {
-  LlamaCpp,
-} from "./llm.js";
+import { createConfiguredLLM } from "./configured-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -211,8 +209,8 @@ export interface StoreOptions {
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
  *
- * All methods are async. The store manages its own LlamaCpp instance
- * (lazy-loaded, auto-unloaded after inactivity) — no global singletons.
+ * All methods are async. The store manages its own LLM instance
+ * (lazy-loaded, auto-unloaded after inactivity for local models) — no global singletons.
  */
 export interface QMDStore {
   /** The underlying internal store (for advanced use) */
@@ -368,9 +366,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Create a per-store LLM instance — local-only by default, HybridLLM when
+  // remote embedding is configured.
+  const llm = createConfiguredLLM(config?.models, {
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,

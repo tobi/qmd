@@ -2195,9 +2195,12 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   const expectedHashSeq = `${sample.hash}_${sample.seq}`;
   const title = extractTitle(sample.body, sample.path);
   const llm = getLlm(store);
+  const usesRemoteEmbedding = llm.usesRemoteEmbedding === true;
 
   return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunks = usesRemoteEmbedding
+      ? await chunkDocumentByApproxTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal)
+      : await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
     const chunk = chunks[sample.seq];
     if (!chunk) {
       return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
