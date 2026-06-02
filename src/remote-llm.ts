@@ -302,8 +302,9 @@ export class RemoteLLM implements LLM {
 
     // One rerank request for a slice of `documents` starting at `start`.
     // Response indices are local to the submitted slice, so they are remapped
-    // to original document positions via `start`. relevance_score is
-    // sigmoid-normalized (see note below).
+    // to original document positions via `start`. The RAW relevance_score is
+    // returned; score normalization happens once in the caller (see below) so
+    // the logit-vs-probability decision is consistent across recovered batches.
     const rerankBatch = async (
       batch: RerankDocument[],
       start: number,
@@ -327,24 +328,11 @@ export class RemoteLLM implements LLM {
         results: { index: number; relevance_score: number }[];
       };
 
-      // Normalize relevance_score via sigmoid σ(x) = 1/(1+e^-x).
-      //
-      // Many cross-encoder rerankers exposed through llama.cpp's /v1/rerank
-      // endpoint (notably bge-reranker-v2-m3, BAAI/bge-reranker-large, jina-
-      // reranker-v2) emit log-odds (range roughly -10..+10, negative = poor
-      // match, positive = good match). The qmd consumer (store.ts blend
-      // formula and the --min-score default of 0.3) assumes a 0..1 probability
-      // range. Without normalization, every blended score ends up negative and
-      // the default min-score filter drops all results.
-      //
-      // Sigmoid is monotonic so ordering is preserved. For rerankers that
-      // already emit 0..1 scores (some Voyage / Cohere endpoints), sigmoid
-      // is a no-op-ish squash that keeps them in [0,1]. Safe in both directions.
       return json.results.map(r => {
         const documentIndex = start + r.index;
         return {
           file: documents[documentIndex]!.file,
-          score: 1 / (1 + Math.exp(-r.relevance_score)),
+          score: r.relevance_score, // raw; normalized once in the caller
           index: documentIndex,
         };
       });
@@ -382,10 +370,31 @@ export class RemoteLLM implements LLM {
     };
 
     try {
-      const results = await scoreBatch(documents, 0);
-      // Sub-batch recovery merges results out of global rank order; sort by the
-      // (monotonic) normalized score for a coherent final ranking. No-op on the
-      // common single-request path, where the server already returns ranked.
+      const merged = await scoreBatch(documents, 0);
+
+      // Normalize once, over the full merged set, so the decision is consistent
+      // even when oversized-recovery split the request into sub-batches.
+      //
+      // Cross-encoder rerankers exposed via llama.cpp's /v1/rerank (notably
+      // bge-reranker-v2-m3, BAAI/bge-reranker-large, jina-reranker-v2) emit
+      // log-odds (~−10..+10), which the qmd consumer (store.ts blend formula +
+      // the --min-score 0.3 default) would otherwise read as sub-zero
+      // probabilities and drop. We map those into [0,1] with sigmoid
+      // σ(x)=1/(1+e^-x) (monotonic, so ordering is preserved).
+      //
+      // But Cohere/Voyage-style endpoints already return probabilities in [0,1];
+      // sigmoid would distort those (0.9→0.71, 0.01→0.50) and skew min-score
+      // filtering. So normalize ONLY when logit-range values are actually present
+      // (any score < 0 or > 1). (A logit reranker whose scores for a query all
+      // land within [0,1] is left as-is; an explicit per-endpoint normalization
+      // config could remove that ambiguity as a follow-up.)
+      const needsSigmoid = merged.some(r => r.score < 0 || r.score > 1);
+      const results = needsSigmoid
+        ? merged.map(r => ({ ...r, score: 1 / (1 + Math.exp(-r.score)) }))
+        : merged;
+
+      // Recovery merges sub-batches out of global rank order; sort for a coherent
+      // final ranking (no-op on the common single-request path).
       results.sort((a, b) => b.score - a.score);
       this.rerankBreaker.onSuccess();
       return { results, model: rerankModel };
@@ -584,7 +593,20 @@ export function remoteConfigFromEnv(yamlModels?: {
   const embedApiUrl = process.env.QMD_EMBED_API_URL || yamlModels?.embed_api_url;
   const embedApiModel = process.env.QMD_EMBED_API_MODEL || yamlModels?.embed_api_model;
 
-  if (!embedApiUrl || !embedApiModel) return null;
+  // Neither set → remote mode not requested; caller uses the local backend.
+  if (!embedApiUrl && !embedApiModel) return null;
+
+  // Exactly one set → a misconfiguration that would otherwise silently install
+  // the local backend (and skip the remote pre-flight probe), so indexing would
+  // quietly run on the wrong embeddings. Fail fast so the operator notices.
+  if (!embedApiUrl || !embedApiModel) {
+    const present = embedApiUrl ? "embed_api_url (QMD_EMBED_API_URL)" : "embed_api_model (QMD_EMBED_API_MODEL)";
+    const missing = embedApiUrl ? "embed_api_model (QMD_EMBED_API_MODEL)" : "embed_api_url (QMD_EMBED_API_URL)";
+    throw new Error(
+      `Incomplete remote embedding configuration: ${present} is set but ${missing} is missing. ` +
+      `Set both to use a remote backend, or neither to use the local model.`
+    );
+  }
 
   return {
     embedApiUrl,

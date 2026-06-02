@@ -252,7 +252,7 @@ describe("RemoteLLM", () => {
   });
 
   describe("rerank", () => {
-    it("should rerank documents", async () => {
+    it("sigmoid-normalizes logit-style rerank scores", async () => {
       setMockHandler((_req, body) => {
         const parsed = JSON.parse(body);
         expect(parsed.model).toBe("rerank-model");
@@ -262,16 +262,14 @@ describe("RemoteLLM", () => {
           status: 200,
           body: {
             results: [
-              { index: 1, relevance_score: 0.9 },
-              { index: 0, relevance_score: 0.3 },
+              { index: 1, relevance_score: 2.0 },   // log-odds (outside [0,1])
+              { index: 0, relevance_score: -1.0 },
             ],
           },
         };
       });
 
-      const llm = createRemoteLLM({
-        rerankApiModel: "rerank-model",
-      });
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
       const result = await llm.rerank(
         "test query",
         [
@@ -280,16 +278,42 @@ describe("RemoteLLM", () => {
         ]
       );
 
+      // Scores fall outside [0,1] (log-odds), so they're mapped to a 0..1
+      // probability via σ(x)=1/(1+e^-x). σ(2.0)≈0.881, σ(-1.0)≈0.269. Ordering
+      // (monotonic) is preserved.
       expect(result.model).toBe("rerank-model");
       expect(result.results).toHaveLength(2);
-      // RemoteLLM.rerank sigmoid-normalizes the raw relevance_score (log-odds)
-      // into a 0..1 probability: σ(x) = 1/(1+e^-x). σ(0.9) ≈ 0.7109,
-      // σ(0.3) ≈ 0.5744. Ordering (monotonic) is preserved.
       const bScore = result.results.find(r => r.file === "b.md")!.score;
       const aScore = result.results.find(r => r.file === "a.md")!.score;
-      expect(bScore).toBeCloseTo(1 / (1 + Math.exp(-0.9)), 10);
-      expect(aScore).toBeCloseTo(1 / (1 + Math.exp(-0.3)), 10);
+      expect(bScore).toBeCloseTo(1 / (1 + Math.exp(-2.0)), 10);
+      expect(aScore).toBeCloseTo(1 / (1 + Math.exp(1.0)), 10); // σ(-1.0)
       expect(bScore).toBeGreaterThan(aScore);
+    });
+
+    it("preserves rerank scores already in [0,1] (no sigmoid distortion)", async () => {
+      // Cohere/Voyage-style rerankers return probabilities in [0,1] already;
+      // applying sigmoid would compress them (0.9→0.71) and skew min-score
+      // filtering, so in-range scores must pass through unchanged.
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        return {
+          status: 200,
+          body: {
+            results: [
+              { index: 0, relevance_score: 0.9 },
+              { index: 1, relevance_score: 0.2 },
+            ],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [
+        { file: "a.md", text: "doc a" },
+        { file: "b.md", text: "doc b" },
+      ]);
+      expect(result.results.find(r => r.file === "a.md")!.score).toBe(0.9);
+      expect(result.results.find(r => r.file === "b.md")!.score).toBe(0.2);
     });
 
     it("recovers from an oversized rerank batch by splitting", async () => {
@@ -338,7 +362,7 @@ describe("RemoteLLM", () => {
         }
         return {
           status: 200,
-          body: { results: parsed.documents.map((_: string, i: number) => ({ index: i, relevance_score: 1.0 })) },
+          body: { results: parsed.documents.map((_: string, i: number) => ({ index: i, relevance_score: 2.0 })) },
         };
       });
 
@@ -346,7 +370,7 @@ describe("RemoteLLM", () => {
       const result = await llm.rerank("q", [{ file: "big.md", text: "x".repeat(500) }]);
       expect(result.results).toHaveLength(1);
       expect(result.results[0].file).toBe("big.md");
-      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-1.0)), 10);
+      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-2.0)), 10); // σ(2.0)
     });
 
     it("should throw when rerankApiModel not configured", async () => {
@@ -524,6 +548,18 @@ describe("remoteConfigFromEnv", () => {
     });
     expect(config!.embedApiUrl).toBe("http://env:8000/v1");
     expect(config!.embedApiModel).toBe("env-model");
+  });
+
+  it("throws on incomplete remote config (url without model)", () => {
+    // Half-configured remote would otherwise silently install the local backend
+    // and skip the remote pre-flight probe — fail fast instead.
+    expect(() => remoteConfigFromEnv({ embed_api_url: "http://gpu:8000/v1" }))
+      .toThrow(/incomplete remote embedding/i);
+  });
+
+  it("throws on incomplete remote config (model without url)", () => {
+    expect(() => remoteConfigFromEnv({ embed_api_model: "bge-m3" }))
+      .toThrow(/incomplete remote embedding/i);
   });
 });
 
