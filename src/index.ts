@@ -292,6 +292,7 @@ export interface QMDStore {
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
     force?: boolean;
+    /** Local embedding model override; remote embedding rejects mismatches with the configured remote model. */
     model?: string;
     /** Restrict embedding to documents in one collection. */
     collection?: string;
@@ -520,9 +521,21 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
 
     embed: async (embedOpts) => {
+      const activeEmbedModel = internal.llm?.embedModelName;
+      if (
+        internal.llm?.usesRemoteEmbedding === true
+        && embedOpts?.model
+        && activeEmbedModel
+        && embedOpts.model !== activeEmbedModel
+      ) {
+        throw new Error(
+          `Remote embedding is configured for model '${activeEmbedModel}'; ` +
+          `store.embed({ model }) cannot override it.`
+        );
+      }
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
-        model: embedOpts?.model,
+        model: internal.llm?.usesRemoteEmbedding === true ? activeEmbedModel : embedOpts?.model,
         collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,

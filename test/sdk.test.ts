@@ -665,6 +665,61 @@ describe("searchLex (BM25)", () => {
   });
 });
 
+describe("searchVector", () => {
+  test("uses the per-store LLM for query embeddings with remote SDK config", async () => {
+    await withRemoteEnvCleared(async () => {
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: {},
+          models: {
+            embed_api_url: "http://remote.example/v1",
+            embed_api_model: "remote-embed",
+          },
+        },
+      });
+      const embedCalls: Array<{ text: string; options?: { model?: string; isQuery?: boolean } }> = [];
+
+      setDefaultLlamaCpp({
+        embed: async () => {
+          throw new Error("searchVector used the global default LLM");
+        },
+      } as any);
+
+      store.internal.llm = {
+        embedModelName: "remote-embed",
+        generateModelName: "local-generate",
+        rerankModelName: "local-rerank",
+        usesRemoteEmbedding: true,
+        embed: async (text: string, options?: { model?: string; isQuery?: boolean }) => {
+          embedCalls.push({ text, options });
+          return { embedding: [0.1, 0.2, 0.3], model: "remote-embed" };
+        },
+        embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: "remote-embed" })),
+        generate: async () => ({ text: "", model: "local-generate", done: true }),
+        modelExists: async (model: string) => ({ name: model, exists: true }),
+        expandQuery: async () => [],
+        rerank: async () => ({ results: [], model: "local-rerank" }),
+        tokenize: async () => [] as any,
+        detokenize: async () => "",
+        dispose: async () => {},
+      } as any;
+
+      try {
+        store.internal.ensureVecTable(3);
+        await expect(store.searchVector("remote query", { limit: 1 })).resolves.toEqual([]);
+        expect(embedCalls).toEqual([{
+          text: "remote query",
+          options: { model: "remote-embed", isQuery: true },
+        }]);
+      } finally {
+        setDefaultLlamaCpp(null);
+        await store.close();
+      }
+    });
+  });
+});
+
 // =============================================================================
 // Unified search() API Tests
 // =============================================================================
@@ -1084,6 +1139,30 @@ describe("embed", () => {
       setDefaultLlamaCpp(null);
       await store.close();
     }
+  });
+
+  test("store.embed rejects model overrides when remote embedding is configured", async () => {
+    await withRemoteEnvCleared(async () => {
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: {},
+          models: {
+            embed_api_url: "http://remote.example/v1",
+            embed_api_model: "remote-embed",
+          },
+        },
+      });
+
+      try {
+        await expect(store.embed({ model: "hf:local/embed-model.gguf" }))
+          .rejects.toThrow(/Remote embedding.*cannot override/i);
+        await expect(store.embed({ model: "remote-embed" }))
+          .resolves.toMatchObject({ docsProcessed: 0, chunksEmbedded: 0 });
+      } finally {
+        await store.close();
+      }
+    });
   });
 
   test("store.embed scopes pending documents to the requested collection", async () => {
