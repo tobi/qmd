@@ -33,6 +33,7 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocumentByTokens,
+  chunkDocumentByApproxTokens,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -81,7 +82,8 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { createConfiguredLLM } from "../configured-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -130,18 +132,19 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const activeModels = ensureModelsConfiguredForCli();
+    let config: CollectionConfig | undefined;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
+      config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
+    setDefaultLLM(createConfiguredLLM(config?.models, {
+      embedModel: activeModels.embed,
+      generateModel: activeModels.generate,
+      rerankModel: activeModels.rerank,
+    }));
   }
   return store;
 }
@@ -311,7 +314,11 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
+function getActiveEmbedModelForCli(): string {
+  return getDefaultLLM().embedModelName;
+}
+
+function checkIndexHealth(db: Database, model: string = getActiveEmbedModelForCli()): void {
   const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
 
   // Warn if many docs need embedding
@@ -484,7 +491,7 @@ async function showStatus(): Promise<void> {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const statusEmbedModel = resolveEmbedModelForCli();
+  const statusEmbedModel = getActiveEmbedModelForCli();
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, statusEmbedModel);
 
   // Most recent update across all collections
@@ -741,7 +748,7 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, getActiveEmbedModelForCli());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -1900,7 +1907,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, getActiveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -1983,6 +1990,39 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // PR #629 follow-up: when HybridLLM/RemoteLLM is configured, the actual embedding
+  // model name comes from the LLM (e.g. "nomic-embed-text") rather than the local
+  // GGUF URI we got from CLI defaults. Override here so generateEmbeddings, fingerprint
+  // computation, and the pending-doc lookup all use the remote model identifier.
+  const llm = getDefaultLLM();
+  model = llm.embedModelName;
+
+  // Pre-flight probe: when remote embedding is configured, verify the remote
+  // endpoint actually works BEFORE writing any vectors. This prevents the
+  // silent-fallback failure mode where a misconfigured/unreachable remote
+  // backend would otherwise let qmd appear to "succeed" while writing
+  // local-model-tagged vectors (or no vectors at all). Belt-and-suspenders
+  // on top of RemoteLLM's call-time errors — fail fast at startup with a
+  // clear message rather than mid-batch.
+  if (llm.usesRemoteEmbedding) {
+    try {
+      const probe = await llm.embed("preflight probe", { model });
+      if (!probe || !Array.isArray(probe.embedding) || probe.embedding.length === 0) {
+        throw new Error(
+          `Pre-flight probe to remote embedder returned no embedding ` +
+          `(model=${model}). Aborting embed run to avoid silent fallback. ` +
+          `Check llama-server / remote endpoint health.`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Pre-flight probe to remote embedder FAILED (model=${model}): ${msg}. ` +
+        `Aborting embed run to avoid silent fallback.`
+      );
+    }
+  }
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -3753,11 +3793,15 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
 
   const threshold = 0.0001;
   const mismatches: string[] = [];
+  const llm = getDefaultLLM();
+  const usesRemoteEmbedding = llm.usesRemoteEmbedding === true;
 
   await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunks = usesRemoteEmbedding
+        ? await chunkDocumentByApproxTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal)
+        : await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
       const chunk = chunks[sample.seq];
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
@@ -3868,7 +3912,15 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const llm = getDefaultLLM();
+    if (!(llm instanceof LlamaCpp)) {
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+      }
+      console.log(`  ${c.dim}device probe unavailable for non-local LLM backend${c.reset}`);
+      return;
+    }
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
@@ -3934,7 +3986,7 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = getActiveEmbedModelForCli();
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 

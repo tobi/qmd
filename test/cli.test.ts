@@ -553,6 +553,32 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("fix the YAML");
   }, 20000);
 
+  test("qmd status surfaces incomplete remote config instead of falling back locally", async () => {
+    const env = await createIsolatedTestEnv("status-incomplete-remote-config");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections: {}",
+      "models:",
+      "  embed_api_url: http://remote.example/v1",
+      "",
+    ].join("\n"));
+
+    const { stderr, exitCode } = await runQmd(["status"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_EMBED_API_URL: "",
+        QMD_EMBED_API_MODEL: "",
+        QMD_RERANK_API_URL: "",
+        QMD_RERANK_API_MODEL: "",
+        QMD_EXPAND_API_URL: "",
+        QMD_EXPAND_API_MODEL: "",
+      },
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(/incomplete remote embedding/i);
+  }, 20000);
+
   test("qmd doctor warns when configured models differ from code defaults", async () => {
     const env = await createIsolatedTestEnv("doctor-custom-models");
     await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: hf:example/custom-embed/custom.gguf\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`);

@@ -61,6 +61,24 @@ function freshDbPath(): string {
   return join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
 }
 
+async function withRemoteEnvCleared<T>(fn: () => Promise<T>): Promise<T> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("QMD_") && key.includes("API")) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 // =============================================================================
 // Constructor Tests
 // =============================================================================
@@ -80,6 +98,78 @@ describe("createStore", () => {
     expect(store.dbPath).toBeTruthy();
     expect(store.internal).toBeDefined();
     await store.close();
+  });
+
+  test("creates hybrid remote LLM from inline config", async () => {
+    await withRemoteEnvCleared(async () => {
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: {},
+          models: {
+            embed_api_url: "http://remote.example/v1",
+            embed_api_model: "remote-embed",
+            rerank_api_model: "remote-rerank",
+            expand_api_model: "remote-chat",
+          },
+        },
+      });
+
+      try {
+        expect(store.internal.llm?.embedModelName).toBe("remote-embed");
+        expect(store.internal.llm?.usesRemoteEmbedding).toBe(true);
+        expect(store.internal.llm?.rerankModelName).toBe("remote-rerank");
+      } finally {
+        await store.close();
+      }
+    });
+  });
+
+  test("creates hybrid remote LLM from YAML config path used by MCP startup", async () => {
+    await withRemoteEnvCleared(async () => {
+      const configPath = join(testDir, "test-remote-mcp-config.yml");
+      const config: CollectionConfig = {
+        collections: {},
+        models: {
+          embed_api_url: "http://remote.example/v1",
+          embed_api_model: "remote-embed",
+          rerank_api_model: "remote-rerank",
+          expand_api_model: "remote-chat",
+        },
+      };
+      writeFileSync(configPath, YAML.stringify(config));
+
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        configPath,
+      });
+
+      try {
+        expect(store.internal.llm?.embedModelName).toBe("remote-embed");
+        expect(store.internal.llm?.usesRemoteEmbedding).toBe(true);
+        expect(store.internal.llm?.rerankModelName).toBe("remote-rerank");
+      } finally {
+        await store.close();
+      }
+    });
+  });
+
+  test("rejects incomplete remote YAML config instead of falling back locally", async () => {
+    await withRemoteEnvCleared(async () => {
+      const configPath = join(testDir, "test-incomplete-remote-config.yml");
+      const config: CollectionConfig = {
+        collections: {},
+        models: {
+          embed_api_url: "http://remote.example/v1",
+        },
+      };
+      writeFileSync(configPath, YAML.stringify(config));
+
+      await expect(createStore({
+        dbPath: freshDbPath(),
+        configPath,
+      })).rejects.toThrow(/incomplete remote embedding/i);
+    });
   });
 
   test("creates store with YAML config file", async () => {
@@ -575,6 +665,61 @@ describe("searchLex (BM25)", () => {
   });
 });
 
+describe("searchVector", () => {
+  test("uses the per-store LLM for query embeddings with remote SDK config", async () => {
+    await withRemoteEnvCleared(async () => {
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: {},
+          models: {
+            embed_api_url: "http://remote.example/v1",
+            embed_api_model: "remote-embed",
+          },
+        },
+      });
+      const embedCalls: Array<{ text: string; options?: { model?: string; isQuery?: boolean } }> = [];
+
+      setDefaultLlamaCpp({
+        embed: async () => {
+          throw new Error("searchVector used the global default LLM");
+        },
+      } as any);
+
+      store.internal.llm = {
+        embedModelName: "remote-embed",
+        generateModelName: "local-generate",
+        rerankModelName: "local-rerank",
+        usesRemoteEmbedding: true,
+        embed: async (text: string, options?: { model?: string; isQuery?: boolean }) => {
+          embedCalls.push({ text, options });
+          return { embedding: [0.1, 0.2, 0.3], model: "remote-embed" };
+        },
+        embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: "remote-embed" })),
+        generate: async () => ({ text: "", model: "local-generate", done: true }),
+        modelExists: async (model: string) => ({ name: model, exists: true }),
+        expandQuery: async () => [],
+        rerank: async () => ({ results: [], model: "local-rerank" }),
+        tokenize: async () => [] as any,
+        detokenize: async () => "",
+        dispose: async () => {},
+      } as any;
+
+      try {
+        store.internal.ensureVecTable(3);
+        await expect(store.searchVector("remote query", { limit: 1 })).resolves.toEqual([]);
+        expect(embedCalls).toEqual([{
+          text: "remote query",
+          options: { model: "remote-embed", isQuery: true },
+        }]);
+      } finally {
+        setDefaultLlamaCpp(null);
+        await store.close();
+      }
+    });
+  });
+});
+
 // =============================================================================
 // Unified search() API Tests
 // =============================================================================
@@ -994,6 +1139,30 @@ describe("embed", () => {
       setDefaultLlamaCpp(null);
       await store.close();
     }
+  });
+
+  test("store.embed rejects model overrides when remote embedding is configured", async () => {
+    await withRemoteEnvCleared(async () => {
+      const store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: {},
+          models: {
+            embed_api_url: "http://remote.example/v1",
+            embed_api_model: "remote-embed",
+          },
+        },
+      });
+
+      try {
+        await expect(store.embed({ model: "hf:local/embed-model.gguf" }))
+          .rejects.toThrow(/Remote embedding.*cannot override/i);
+        await expect(store.embed({ model: "remote-embed" }))
+          .resolves.toMatchObject({ docsProcessed: 0, chunksEmbedded: 0 });
+      } finally {
+        await store.close();
+      }
+    });
   });
 
   test("store.embed scopes pending documents to the requested collection", async () => {

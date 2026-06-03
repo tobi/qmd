@@ -1,0 +1,877 @@
+/**
+ * Tests for RemoteLLM and HybridLLM
+ *
+ * Uses a local HTTP server to mock OpenAI-compatible endpoints.
+ */
+
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
+import { createConfiguredLLM } from "../src/configured-llm.js";
+import { RemoteLLM, remoteConfigFromEnv, type RemoteLLMConfig } from "../src/remote-llm.js";
+import { HybridLLM } from "../src/hybrid-llm.js";
+import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp } from "../src/llm.js";
+import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, ModelInfo } from "../src/llm.js";
+
+// =============================================================================
+// Mock HTTP server
+// =============================================================================
+
+type MockHandler = (req: IncomingMessage, body: string) => { status: number; body: any };
+
+let server: Server;
+let serverPort: number;
+let mockHandler: MockHandler;
+
+function setMockHandler(handler: MockHandler) {
+  mockHandler = handler;
+}
+
+beforeAll(async () => {
+  server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    const body = Buffer.concat(chunks).toString();
+
+    try {
+      const result = mockHandler(req, body);
+      res.writeHead(result.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result.body));
+    } catch (err: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (typeof addr === "object" && addr) {
+        serverPort = addr.port;
+      }
+      resolve();
+    });
+  });
+});
+
+afterAll(() => {
+  server.close();
+});
+
+function baseUrl(): string {
+  return `http://127.0.0.1:${serverPort}/v1`;
+}
+
+function createRemoteLLM(overrides?: Partial<RemoteLLMConfig>): RemoteLLM {
+  return new RemoteLLM({
+    embedApiUrl: baseUrl(),
+    embedApiModel: "test-model",
+    ...overrides,
+  });
+}
+
+function withRemoteEnvCleared<T>(fn: () => T): T {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("QMD_") && key.includes("API")) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value !== undefined) process.env[key] = value;
+    }
+  }
+}
+
+// =============================================================================
+// RemoteLLM Tests
+// =============================================================================
+
+describe("RemoteLLM", () => {
+  describe("embed", () => {
+    it("should embed a single text", async () => {
+      setMockHandler((req, body) => {
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("test-model");
+        expect(parsed.input).toEqual(["hello world"]);
+        return {
+          status: 200,
+          body: {
+            data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM();
+      const result = await llm.embed("hello world");
+      expect(result).not.toBeNull();
+      expect(result!.embedding).toEqual([0.1, 0.2, 0.3]);
+      expect(result!.model).toBe("test-model");
+    });
+
+    it("should embed a batch of texts", async () => {
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        return {
+          status: 200,
+          body: {
+            data: parsed.input.map((text: string, i: number) => ({
+              embedding: [i * 0.1, i * 0.2],
+              index: i,
+            })),
+          },
+        };
+      });
+
+      const llm = createRemoteLLM();
+      const results = await llm.embedBatch(["text1", "text2", "text3"]);
+      expect(results).toHaveLength(3);
+      expect(results[0]!.embedding).toEqual([0, 0]);
+      expect(results[2]!.embedding).toEqual([0.2, 0.4]);
+    });
+
+    it("should return empty array for empty input", async () => {
+      const llm = createRemoteLLM();
+      const results = await llm.embedBatch([]);
+      expect(results).toEqual([]);
+    });
+
+    it("should split large batches", async () => {
+      const requestBodies: string[][] = [];
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        requestBodies.push(parsed.input);
+        return {
+          status: 200,
+          body: {
+            data: parsed.input.map((_: string, i: number) => ({
+              embedding: [1.0],
+              index: i,
+            })),
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ maxBatchSize: 2 });
+      const texts = ["a", "b", "c", "d", "e"];
+      const results = await llm.embedBatch(texts);
+
+      expect(results).toHaveLength(5);
+      // Should have made 3 requests: [a,b], [c,d], [e]
+      expect(requestBodies).toHaveLength(3);
+      expect(requestBodies[0]).toEqual(["a", "b"]);
+      expect(requestBodies[1]).toEqual(["c", "d"]);
+      expect(requestBodies[2]).toEqual(["e"]);
+    });
+
+    it("should sort response by index", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          // Return in reverse order
+          data: [
+            { embedding: [0.3], index: 2 },
+            { embedding: [0.1], index: 0 },
+            { embedding: [0.2], index: 1 },
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      const results = await llm.embedBatch(["a", "b", "c"]);
+      expect(results[0]!.embedding).toEqual([0.1]);
+      expect(results[1]!.embedding).toEqual([0.2]);
+      expect(results[2]!.embedding).toEqual([0.3]);
+    });
+  });
+
+  describe("auth", () => {
+    it("should send Authorization header when key is set", async () => {
+      let authHeader: string | undefined;
+      setMockHandler((req) => {
+        authHeader = req.headers["authorization"] as string;
+        return {
+          status: 200,
+          body: { data: [{ embedding: [1.0], index: 0 }] },
+        };
+      });
+
+      const llm = createRemoteLLM({ embedApiKey: "test-key-123" });
+      await llm.embed("test");
+      expect(authHeader).toBe("Bearer test-key-123");
+    });
+
+    it("should not send Authorization header when no key", async () => {
+      let authHeader: string | undefined;
+      setMockHandler((req) => {
+        authHeader = req.headers["authorization"] as string;
+        return {
+          status: 200,
+          body: { data: [{ embedding: [1.0], index: 0 }] },
+        };
+      });
+
+      const llm = createRemoteLLM();
+      await llm.embed("test");
+      expect(authHeader).toBeUndefined();
+    });
+  });
+
+  describe("dimension validation", () => {
+    it("should reject dimension mismatch after first response", async () => {
+      let callCount = 0;
+      setMockHandler(() => {
+        callCount++;
+        const dim = callCount === 1 ? [1.0, 2.0, 3.0] : [1.0, 2.0];
+        return {
+          status: 200,
+          body: { data: [{ embedding: dim, index: 0 }] },
+        };
+      });
+
+      const llm = createRemoteLLM();
+      // First call succeeds and locks dimensions to 3
+      await llm.embed("first");
+      // Second call should fail because dimensions changed
+      await expect(llm.embed("second")).rejects.toThrow("dimension mismatch");
+    });
+  });
+
+  describe("error handling", () => {
+    it("should throw on HTTP error", async () => {
+      setMockHandler(() => ({
+        status: 500,
+        body: { error: "Internal server error" },
+      }));
+
+      const llm = createRemoteLLM();
+      await expect(llm.embed("test")).rejects.toThrow("500");
+    });
+
+    it("should open circuit breaker after failures", async () => {
+      setMockHandler(() => ({
+        status: 500,
+        body: { error: "down" },
+      }));
+
+      const llm = createRemoteLLM();
+      // Fail 3 times to trip the breaker
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.embed("test")).rejects.toThrow();
+      }
+      // Next call should fail immediately with circuit breaker message
+      await expect(llm.embed("test")).rejects.toThrow("circuit breaker");
+    });
+  });
+
+  describe("rerank", () => {
+    it("sigmoid-normalizes logit-style rerank scores", async () => {
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("rerank-model");
+        expect(parsed.query).toBe("test query");
+        expect(parsed.documents).toEqual(["doc A text", "doc B text"]);
+        return {
+          status: 200,
+          body: {
+            results: [
+              { index: 1, relevance_score: 2.0 },   // log-odds (outside [0,1])
+              { index: 0, relevance_score: -1.0 },
+            ],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank(
+        "test query",
+        [
+          { file: "a.md", text: "doc A text" },
+          { file: "b.md", text: "doc B text" },
+        ]
+      );
+
+      // Scores fall outside [0,1] (log-odds), so they're mapped to a 0..1
+      // probability via σ(x)=1/(1+e^-x). σ(2.0)≈0.881, σ(-1.0)≈0.269. Ordering
+      // (monotonic) is preserved.
+      expect(result.model).toBe("rerank-model");
+      expect(result.results).toHaveLength(2);
+      const bScore = result.results.find(r => r.file === "b.md")!.score;
+      const aScore = result.results.find(r => r.file === "a.md")!.score;
+      expect(bScore).toBeCloseTo(1 / (1 + Math.exp(-2.0)), 10);
+      expect(aScore).toBeCloseTo(1 / (1 + Math.exp(1.0)), 10); // σ(-1.0)
+      expect(bScore).toBeGreaterThan(aScore);
+    });
+
+    it("preserves rerank scores already in [0,1] (no sigmoid distortion)", async () => {
+      // Cohere/Voyage-style rerankers return probabilities in [0,1] already;
+      // applying sigmoid would compress them (0.9→0.71) and skew min-score
+      // filtering, so in-range scores must pass through unchanged.
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        return {
+          status: 200,
+          body: {
+            results: [
+              { index: 0, relevance_score: 0.9 },
+              { index: 1, relevance_score: 0.2 },
+            ],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [
+        { file: "a.md", text: "doc a" },
+        { file: "b.md", text: "doc b" },
+      ]);
+      expect(result.results.find(r => r.file === "a.md")!.score).toBe(0.9);
+      expect(result.results.find(r => r.file === "b.md")!.score).toBe(0.2);
+    });
+
+    it("recovers from an oversized rerank batch by splitting", async () => {
+      // log-odds keyed by document text; the server rejects any multi-document
+      // batch as "too large", forcing recursive bisection down to single docs.
+      const scores: Record<string, number> = {
+        "doc a": 0.5, "doc b": 1.5, "doc c": -0.5, "doc d": 2.5,
+      };
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        if (parsed.documents.length > 1) {
+          return { status: 413, body: { error: "input is too large to process" } };
+        }
+        return {
+          status: 200,
+          body: { results: [{ index: 0, relevance_score: scores[parsed.documents[0]] }] },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [
+        { file: "a.md", text: "doc a" },
+        { file: "b.md", text: "doc b" },
+        { file: "c.md", text: "doc c" },
+        { file: "d.md", text: "doc d" },
+      ]);
+
+      // Every document is scored, response indices remap back to the original
+      // positions, and results come back sorted by normalized score descending.
+      expect(result.results).toHaveLength(4);
+      expect(result.results.map(r => r.file)).toEqual(["d.md", "b.md", "a.md", "c.md"]);
+      const byFile = Object.fromEntries(result.results.map(r => [r.file, r.index]));
+      expect(byFile["a.md"]).toBe(0);
+      expect(byFile["d.md"]).toBe(3);
+      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-2.5)), 10);
+    });
+
+    it("recovers from a single oversized document by truncating", async () => {
+      // The server rejects any request whose document exceeds 64 chars, forcing
+      // halve-truncation of the single oversized doc until it fits.
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        const longest = Math.max(...parsed.documents.map((d: string) => d.length));
+        if (longest > 64) {
+          return { status: 400, body: { error: "input too long" } };
+        }
+        return {
+          status: 200,
+          body: { results: parsed.documents.map((_: string, i: number) => ({ index: i, relevance_score: 2.0 })) },
+        };
+      });
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      const result = await llm.rerank("q", [{ file: "big.md", text: "x".repeat(500) }]);
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].file).toBe("big.md");
+      expect(result.results[0].score).toBeCloseTo(1 / (1 + Math.exp(-2.0)), 10); // σ(2.0)
+    });
+
+    it("should throw when rerankApiModel not configured", async () => {
+      const llm = createRemoteLLM();
+      await expect(
+        llm.rerank("query", [{ file: "a.md", text: "text" }])
+      ).rejects.toThrow("rerankApiModel");
+    });
+  });
+
+  describe("unsupported operations", () => {
+    it("should throw on generate", async () => {
+      const llm = createRemoteLLM();
+      await expect(llm.generate("prompt")).rejects.toThrow("does not support text generation");
+    });
+
+    it("should expand queries through chat completions when configured", async () => {
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("remote-chat");
+        expect(parsed.messages.at(-1).content).toContain("search docs");
+        return {
+          status: 200,
+          body: {
+            choices: [{
+              message: {
+                content: [
+                  "lex: search docs keywords",
+                  "vec: semantic search docs",
+                  "hyde: Information about search docs",
+                ].join("\n"),
+              },
+            }],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      const result = await llm.expandQuery("search docs");
+      expect(result).toEqual([
+        { type: "lex", text: "search docs keywords" },
+        { type: "vec", text: "semantic search docs" },
+        { type: "hyde", text: "Information about search docs" },
+      ]);
+    });
+
+    it("opens an independent circuit breaker after repeated expansion failures", async () => {
+      let requestCount = 0;
+      setMockHandler(() => {
+        requestCount++;
+        return {
+          status: 500,
+          body: { error: "chat down" },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.expandQuery("test query")).rejects.toThrow("500");
+      }
+
+      await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
+      expect(requestCount).toBe(3);
+
+      setMockHandler((req) => {
+        expect(req.url).toContain("/embeddings");
+        return {
+          status: 200,
+          body: { data: [{ embedding: [0.4], index: 0 }] },
+        };
+      });
+
+      const embedResult = await llm.embed("embed still works");
+      expect(embedResult?.embedding).toEqual([0.4]);
+    });
+
+    it("treats unparseable expansion responses as failures", async () => {
+      let requestCount = 0;
+      setMockHandler(() => {
+        requestCount++;
+        return {
+          status: 200,
+          body: {
+            choices: [{
+              message: {
+                content: "I cannot help with that.",
+              },
+            }],
+          },
+        };
+      });
+
+      const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.expandQuery("test query")).rejects.toThrow("no parseable");
+      }
+
+      await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
+      expect(requestCount).toBe(3);
+    });
+
+    it("should fall back to the default expansion triple when no expand model is configured", async () => {
+      // RemoteLLM.expandQuery now implements query expansion via chat
+      // completions. When no expand model is configured it returns the same
+      // lex/vec/hyde fallback that LocalLLM produces, rather than throwing.
+      const llm = createRemoteLLM();
+      const result = await llm.expandQuery("query");
+      expect(result).toEqual([
+        { type: "hyde", text: "Information about query" },
+        { type: "lex", text: "query" },
+        { type: "vec", text: "query" },
+      ]);
+    });
+  });
+});
+
+// =============================================================================
+// HybridLLM Tests
+// =============================================================================
+
+describe("HybridLLM", () => {
+  // Simple mock local LLM
+  function createMockLocalLLM(): LLM {
+    const localTokens = [1, 2, 3] as any;
+    return {
+      embedModelName: "local-model",
+      generateModelName: "local-generate-model",
+      rerankModelName: "local-rerank-model",
+      embed: async () => ({ embedding: [0.5], model: "local-model" }),
+      embedBatch: async (texts) => texts.map(() => ({ embedding: [0.5], model: "local-model" })),
+      generate: async () => ({ text: "expanded", model: "local-model", done: true }),
+      modelExists: async (model) => ({ name: model, exists: true }),
+      expandQuery: async () => [{ type: "lex" as const, text: "expanded query" }],
+      rerank: async (_query, documents) => ({
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0.42, index })),
+        model: "local-rerank-model",
+      }),
+      tokenize: async () => localTokens,
+      detokenize: async () => "detokenized",
+      dispose: async () => {},
+    };
+  }
+
+  it("should route embed to remote", async () => {
+    setMockHandler(() => ({
+      status: 200,
+      body: { data: [{ embedding: [0.9], index: 0 }] },
+    }));
+
+    const remote = createRemoteLLM();
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.embed("test");
+    // Should come from remote (0.9), not local (0.5)
+    expect(result!.embedding).toEqual([0.9]);
+  });
+
+  it("should route embedBatch to remote", async () => {
+    setMockHandler((_req, body) => {
+      const parsed = JSON.parse(body);
+      return {
+        status: 200,
+        body: {
+          data: parsed.input.map((_: string, i: number) => ({
+            embedding: [0.9 + i * 0.01],
+            index: i,
+          })),
+        },
+      };
+    });
+
+    const remote = createRemoteLLM();
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const results = await hybrid.embedBatch(["a", "b"]);
+    expect(results[0]!.embedding).toEqual([0.9]);
+    expect(results[1]!.embedding).toEqual([0.91]);
+  });
+
+  it("should route generate to local", async () => {
+    const local = createMockLocalLLM();
+    const remote = createRemoteLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.generate("prompt");
+    expect(result!.text).toBe("expanded");
+    expect(result!.model).toBe("local-model");
+  });
+
+  it("should route expandQuery to local", async () => {
+    const local = createMockLocalLLM();
+    const remote = createRemoteLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    expect(result[0]!.text).toBe("expanded query");
+  });
+
+  it("falls back to local rerank when configured remote rerank fails", async () => {
+    setMockHandler(() => ({
+      status: 500,
+      body: { error: "rerank down" },
+    }));
+
+    const remote = createRemoteLLM({ rerankApiModel: "remote-rerank" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.rerank("query", [{ file: "doc.md", text: "doc text" }]);
+    expect(result.model).toBe("local-rerank-model");
+    expect(result.results).toEqual([{ file: "doc.md", score: 0.42, index: 0 }]);
+  });
+
+  it("falls back to local expansion when configured remote expansion fails", async () => {
+    setMockHandler(() => ({
+      status: 500,
+      body: { error: "chat down" },
+    }));
+
+    const remote = createRemoteLLM({ expandApiModel: "remote-chat" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+  });
+
+  it("falls back to local expansion when configured remote expansion is unparseable", async () => {
+    setMockHandler(() => ({
+      status: 200,
+      body: {
+        choices: [{
+          message: {
+            content: "Here are some ideas without the required prefixes.",
+          },
+        }],
+      },
+    }));
+
+    const remote = createRemoteLLM({ expandApiModel: "remote-chat" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    const result = await hybrid.expandQuery("test query");
+    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+  });
+
+  it("should use remote embedModelName", async () => {
+    const remote = createRemoteLLM({ embedApiModel: "BAAI/bge-m3" });
+    const local = createMockLocalLLM();
+    const hybrid = new HybridLLM(remote, local);
+
+    expect(hybrid.embedModelName).toBe("BAAI/bge-m3");
+  });
+
+  it("should use remote expandModelName only when remote expansion is configured", async () => {
+    const local = createMockLocalLLM();
+
+    const embedOnlyHybrid = new HybridLLM(createRemoteLLM(), local);
+    expect(embedOnlyHybrid.expandModelName).toBe("local-generate-model");
+
+    const remoteExpandHybrid = new HybridLLM(
+      createRemoteLLM({ expandApiModel: "remote-chat" }),
+      local,
+    );
+    expect(remoteExpandHybrid.expandModelName).toBe("remote-chat");
+  });
+});
+
+describe("createConfiguredLLM", () => {
+  it("returns local LlamaCpp when remote config is absent", () => {
+    const llm = withRemoteEnvCleared(() => createConfiguredLLM(undefined, {
+      embedModel: "hf:local/embed.gguf",
+      generateModel: "hf:local/generate.gguf",
+      rerankModel: "hf:local/rerank.gguf",
+    }));
+
+    expect(llm).toBeInstanceOf(LlamaCpp);
+    expect(llm.embedModelName).toBe("hf:local/embed.gguf");
+  });
+
+  it("returns HybridLLM when remote embedding is configured", () => {
+    const llm = withRemoteEnvCleared(() => createConfiguredLLM({
+      embed_api_url: baseUrl(),
+      embed_api_model: "remote-embed",
+      rerank_api_model: "remote-rerank",
+      expand_api_model: "remote-chat",
+    }));
+
+    expect(llm).toBeInstanceOf(HybridLLM);
+    expect(llm.embedModelName).toBe("remote-embed");
+    expect(llm.usesRemoteEmbedding).toBe(true);
+  });
+
+  it("throws instead of falling back locally when remote config is incomplete", () => {
+    expect(() => withRemoteEnvCleared(() => createConfiguredLLM({ embed_api_url: baseUrl() })))
+      .toThrow(/incomplete remote embedding/i);
+  });
+});
+
+// =============================================================================
+// Config Tests
+// =============================================================================
+
+describe("remoteConfigFromEnv", () => {
+  const origEnv = { ...process.env };
+
+  beforeEach(() => {
+    // Clear any QMD_ env vars
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("QMD_") && key.includes("API")) {
+        delete process.env[key];
+      }
+    }
+  });
+
+  afterAll(() => {
+    // Restore original env
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("QMD_") && key.includes("API")) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, origEnv);
+  });
+
+  it("should return null when no config", () => {
+    expect(remoteConfigFromEnv()).toBeNull();
+  });
+
+  it("should parse env vars", () => {
+    process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "bge-m3";
+    process.env.QMD_EMBED_API_KEY = "secret";
+
+    const config = remoteConfigFromEnv();
+    expect(config).not.toBeNull();
+    expect(config!.embedApiUrl).toBe("http://gpu:8000/v1");
+    expect(config!.embedApiModel).toBe("bge-m3");
+    expect(config!.embedApiKey).toBe("secret");
+  });
+
+  it("should use YAML config as fallback", () => {
+    const config = remoteConfigFromEnv({
+      embed_api_url: "http://yaml:8000/v1",
+      embed_api_model: "yaml-model",
+    });
+    expect(config).not.toBeNull();
+    expect(config!.embedApiUrl).toBe("http://yaml:8000/v1");
+  });
+
+  it("should prefer env vars over YAML", () => {
+    process.env.QMD_EMBED_API_URL = "http://env:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "env-model";
+
+    const config = remoteConfigFromEnv({
+      embed_api_url: "http://yaml:8000/v1",
+      embed_api_model: "yaml-model",
+    });
+    expect(config!.embedApiUrl).toBe("http://env:8000/v1");
+    expect(config!.embedApiModel).toBe("env-model");
+  });
+
+  it("throws on incomplete remote config (url without model)", () => {
+    // Half-configured remote would otherwise silently install the local backend
+    // and skip the remote pre-flight probe — fail fast instead.
+    expect(() => remoteConfigFromEnv({ embed_api_url: "http://gpu:8000/v1" }))
+      .toThrow(/incomplete remote embedding/i);
+  });
+
+  it("throws on incomplete remote config (model without url)", () => {
+    expect(() => remoteConfigFromEnv({ embed_api_model: "bge-m3" }))
+      .toThrow(/incomplete remote embedding/i);
+  });
+});
+
+// =============================================================================
+// Embedding format tests
+// =============================================================================
+
+describe("isRemoteModel", () => {
+  it("should detect remote models", () => {
+    expect(isRemoteModel("BAAI/bge-m3")).toBe(true);
+    expect(isRemoteModel("intfloat/multilingual-e5-large")).toBe(true);
+    expect(isRemoteModel("text-embedding-ada-002")).toBe(true);
+  });
+
+  it("should detect local models", () => {
+    expect(isRemoteModel("hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf")).toBe(false);
+    expect(isRemoteModel("/path/to/model.gguf")).toBe(false);
+  });
+});
+
+describe("formatQueryForEmbedding with remote models", () => {
+  it("should return raw query for remote models", () => {
+    expect(formatQueryForEmbedding("test query", "BAAI/bge-m3")).toBe("test query");
+  });
+
+  it("should add prefix for local nomic models", () => {
+    expect(formatQueryForEmbedding("test query", "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf")).toContain("task:");
+  });
+});
+
+describe("formatDocForEmbedding with remote models", () => {
+  it("should return raw text for remote models", () => {
+    expect(formatDocForEmbedding("doc text", undefined, "BAAI/bge-m3")).toBe("doc text");
+  });
+
+  it("should include title when provided for remote models", () => {
+    expect(formatDocForEmbedding("doc text", "My Title", "BAAI/bge-m3")).toBe("My Title\ndoc text");
+  });
+});
+
+// =============================================================================
+// Local-only path (no remote config)
+// =============================================================================
+
+describe("Local-only LlamaCpp path", () => {
+  afterEach(() => {
+    // Reset to default so other tests aren't affected
+    setDefaultLLM(null);
+  });
+
+  it("getDefaultLLM() returns a LlamaCpp instance when nothing is configured", () => {
+    setDefaultLLM(null);
+    const llm = getDefaultLLM();
+    expect(llm).toBeInstanceOf(LlamaCpp);
+  });
+
+  it("LlamaCpp instance satisfies the LLM interface", () => {
+    const llm = new LlamaCpp();
+    // All LLM interface methods exist
+    expect(typeof llm.embed).toBe("function");
+    expect(typeof llm.embedBatch).toBe("function");
+    expect(typeof llm.generate).toBe("function");
+    expect(typeof llm.modelExists).toBe("function");
+    expect(typeof llm.expandQuery).toBe("function");
+    expect(typeof llm.rerank).toBe("function");
+    expect(typeof llm.dispose).toBe("function");
+    expect(typeof llm.embedModelName).toBe("string");
+  });
+
+  it("LlamaCpp has tokenize method (used by chunkDocumentByTokens duck-typing)", () => {
+    const llm = new LlamaCpp();
+    expect(typeof llm.tokenize).toBe("function");
+  });
+
+  it("setDefaultLLM with LlamaCpp is retrievable via getDefaultLLM", () => {
+    const llm = new LlamaCpp();
+    setDefaultLLM(llm);
+    expect(getDefaultLLM()).toBe(llm);
+  });
+
+  it("remoteConfigFromEnv returns null when no env vars or YAML set", () => {
+    // Clear any remote env vars
+    const saved: Record<string, string | undefined> = {};
+    for (const key of ["QMD_EMBED_API_URL", "QMD_EMBED_API_MODEL"]) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    try {
+      expect(remoteConfigFromEnv()).toBeNull();
+      expect(remoteConfigFromEnv({})).toBeNull();
+      expect(remoteConfigFromEnv({ embed_api_url: undefined })).toBeNull();
+    } finally {
+      for (const [key, val] of Object.entries(saved)) {
+        if (val !== undefined) process.env[key] = val;
+      }
+    }
+  });
+
+  it("formatQueryForEmbedding adds nomic prefix for default local model", () => {
+    // Default model is embeddinggemma (hf: URI), should get task prefix
+    const formatted = formatQueryForEmbedding("hello");
+    expect(formatted).toContain("task:");
+    expect(formatted).toContain("hello");
+  });
+
+  it("formatDocForEmbedding adds nomic prefix for default local model", () => {
+    const formatted = formatDocForEmbedding("doc content", "My Doc");
+    expect(formatted).toContain("title: My Doc");
+    expect(formatted).toContain("text: doc content");
+  });
+});
