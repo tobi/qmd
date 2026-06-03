@@ -1223,6 +1223,51 @@ describe("Caching", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("rerank cache uses the model that actually produced fallback scores", async () => {
+    const store = await createTestStore();
+    const query = "same rerank query";
+    const docs = [{ file: "doc.md", text: "same chunk text" }];
+    const calls: string[] = [];
+
+    const makeLlm = (label: string, resultModel: string, score: number) => ({
+      embedModelName: "remote-embed",
+      generateModelName: "local-generate",
+      rerankModelName: "remote-rerank",
+      embed: async () => ({ embedding: [0.1], model: "remote-embed" }),
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [0.1], model: "remote-embed" })),
+      generate: async () => ({ text: label, model: "local-generate", done: true }),
+      modelExists: async (model: string) => ({ name: model, exists: true }),
+      expandQuery: async () => [{ type: "lex" as const, text: "expanded query" }],
+      rerank: async (_query: string, documents: { file: string; text: string }[]) => {
+        calls.push(label);
+        return {
+          model: resultModel,
+          results: documents.map((doc, index) => ({ file: doc.file, score, index })),
+        };
+      },
+      tokenize: async () => [] as any,
+      detokenize: async () => "",
+      dispose: async () => {},
+    });
+
+    store.llm = makeLlm("fallback-local", "local-rerank", 0.42) as any;
+    const fallback = await store.rerank(query, docs);
+    expect(calls).toEqual(["fallback-local"]);
+    expect(fallback).toEqual([{ file: "doc.md", score: 0.42 }]);
+
+    const remoteCacheKey = getCacheKey("rerank", { query, model: "remote-rerank", chunk: docs[0]!.text });
+    const localCacheKey = getCacheKey("rerank", { query, model: "local-rerank", chunk: docs[0]!.text });
+    expect(store.getCachedResult(remoteCacheKey)).toBeNull();
+    expect(store.getCachedResult(localCacheKey)).toBe("0.42");
+
+    store.llm = makeLlm("remote-after-recovery", "remote-rerank", 0.91) as any;
+    const recoveredRemote = await store.rerank(query, docs);
+    expect(calls).toEqual(["fallback-local", "remote-after-recovery"]);
+    expect(recoveredRemote).toEqual([{ file: "doc.md", score: 0.91 }]);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
