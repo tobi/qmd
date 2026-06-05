@@ -3209,6 +3209,44 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings stops early when maxDurationMs is exceeded", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    // A slow embedder so the short session cap trips between document batches.
+    const embedBatchCalls: string[][] = [];
+    const slowLlm = {
+      async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return texts.map((_text, index) => ({ embedding: [index + 1, index + 2, index + 3], model: "fake-embed" }));
+      },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = slowLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,           // one doc per batch, so the cap can stop between docs
+        maxBatchBytes: 1024 * 1024,
+        maxDurationMs: 10,            // trips ~10ms in, well before the 80ms batches finish
+      });
+
+      // The first batch runs, then the session expires and the rest are skipped.
+      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
+      expect(embedBatchCalls.length).toBeLessThan(3);
+      expect(result.chunksEmbedded).toBeLessThan(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings flushes batches when maxBatchBytes is reached", async () => {
     const store = await createTestStore();
     const db = store.db;
