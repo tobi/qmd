@@ -49,6 +49,7 @@ export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -1412,6 +1413,13 @@ export type EmbedOptions = {
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
+  /**
+   * Max wall-clock duration for the whole embed session, in milliseconds. When the
+   * cap is reached, remaining document batches are skipped (re-run `qmd embed` to
+   * continue). A value <= 0 disables the cap. Defaults to
+   * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
+   */
+  maxDurationMs?: number;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -1827,7 +1835,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
