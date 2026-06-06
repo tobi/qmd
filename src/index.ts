@@ -80,6 +80,15 @@ import {
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
+import {
+  createLexicalSearchBackendFromConfig,
+  type LexicalBackendConfig,
+  type LexicalDocumentRef,
+  type LexicalSearchBackend,
+  type LexicalSearchBackendContext,
+  type LexicalSearchHit,
+  type LexicalSearchRequest,
+} from "./lexical-backends.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -103,6 +112,12 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  LexicalBackendConfig,
+  LexicalDocumentRef,
+  LexicalSearchBackend,
+  LexicalSearchBackendContext,
+  LexicalSearchHit,
+  LexicalSearchRequest,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -110,6 +125,11 @@ export type { InternalStore };
 
 // Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+export {
+  createExternalCommandLexicalBackend,
+  createLexicalSearchBackendFromConfig,
+  isSqliteFts5LexicalBackendConfig,
+} from "./lexical-backends.js";
 export type { ChunkStrategy } from "./store.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
@@ -205,6 +225,11 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /**
+   * Custom lexical backend for searchLex() and lex parts of search().
+   * Omit to use the built-in SQLite FTS5 backend.
+   */
+  lexicalBackend?: LexicalSearchBackend;
 }
 
 /**
@@ -346,27 +371,32 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
-  // Create the internal store (opens DB, creates tables)
-  const internal = createStoreInternal(options.dbPath);
-  const db = internal.db;
-
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
-  // Sync config into SQLite store_collections
+  // Load config before creating the internal store so lexical backend selection
+  // can come from either SDK options or YAML config.
   let config: CollectionConfig | undefined;
   if (options.configPath) {
-    // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
     config = loadConfig();
-    syncConfigToDb(db, config);
   } else if (options.config) {
-    // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
     config = options.config;
+  }
+
+  const lexicalBackend = options.lexicalBackend
+    ?? createLexicalSearchBackendFromConfig(config?.search?.lexicalBackend);
+
+  // Create the internal store (opens DB, creates tables)
+  const internal = createStoreInternal(options.dbPath, { lexicalBackend });
+  const db = internal.db;
+
+  // Sync config into SQLite store_collections
+  if (config) {
     syncConfigToDb(db, config);
   }
-  // else: DB-only mode — no external config, use existing store_collections
+  // else: DB-only mode - no external config, use existing store_collections
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
@@ -421,7 +451,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchLexical(q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),

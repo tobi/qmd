@@ -37,6 +37,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import type { LexicalSearchBackend, LexicalSearchHit } from "./lexical-backends.js";
 
 // =============================================================================
 // Configuration
@@ -1178,6 +1179,8 @@ export type Store = {
   dbPath: string;
   /** Optional LlamaCpp instance for this store (overrides the global singleton) */
   llm?: LlamaCpp;
+  /** Optional lexical backend. Omitted means built-in SQLite FTS5. */
+  lexicalBackend?: LexicalSearchBackend;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1215,6 +1218,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
+  searchLexical: (query: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -1246,6 +1250,10 @@ export type Store = {
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
+
+export interface StoreCreateOptions {
+  lexicalBackend?: LexicalSearchBackend;
+}
 
 // =============================================================================
 // Reindex & Embed — pure-logic functions for SDK and CLI
@@ -1845,7 +1853,7 @@ export async function generateEmbeddings(
  * @param dbPath - Path to the SQLite database file
  * @returns Store instance with all methods bound to the database
  */
-export function createStore(dbPath?: string): Store {
+export function createStore(dbPath?: string, options: StoreCreateOptions = {}): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
@@ -1853,6 +1861,7 @@ export function createStore(dbPath?: string): Store {
   const store: Store = {
     db,
     dbPath: resolvedPath,
+    lexicalBackend: options.lexicalBackend,
     close: () => db.close(),
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
@@ -1890,6 +1899,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
+    searchLexical: (query: string, limit?: number, collectionName?: string) => searchLexical(db, resolvedPath, query, limit, collectionName, store.lexicalBackend),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
@@ -2030,6 +2040,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  lexicalBackend?: string;    // Concrete lexical backend name when source is "fts"
 };
 
 /**
@@ -3520,8 +3531,156 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
+      lexicalBackend: "sqlite-fts5",
     };
   });
+}
+
+export async function searchLexical(
+  db: Database,
+  dbPath: string,
+  query: string,
+  limit: number = 20,
+  collectionName?: string,
+  backend?: LexicalSearchBackend
+): Promise<SearchResult[]> {
+  if (!backend) {
+    return searchFTS(db, query, limit, collectionName);
+  }
+
+  const hits = await backend.search(
+    { query, limit, collectionName, dbPath },
+    { dbPath }
+  );
+  return hydrateLexicalSearchHits(db, hits, backend.name, collectionName).slice(0, limit);
+}
+
+type LexicalHitRow = {
+  id: number;
+  virtual_path: string;
+  display_path: string;
+  title: string;
+  hash: string;
+  collection: string;
+  modified_at: string;
+  body_length: number;
+  body: string;
+};
+
+function hydrateLexicalSearchHits(
+  db: Database,
+  hits: LexicalSearchHit[],
+  backendName: string,
+  collectionName?: string
+): SearchResult[] {
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+
+  for (const hit of hits) {
+    const row = findLexicalHitRow(db, hit);
+    if (!row) continue;
+    if (collectionName && row.collection !== collectionName) continue;
+    if (seen.has(row.virtual_path)) continue;
+    seen.add(row.virtual_path);
+
+    results.push({
+      filepath: row.virtual_path,
+      displayPath: row.display_path,
+      title: row.title,
+      context: getContextForFile(db, row.virtual_path),
+      hash: row.hash,
+      docid: getDocid(row.hash),
+      collectionName: row.collection,
+      modifiedAt: row.modified_at,
+      bodyLength: row.body_length,
+      body: row.body,
+      score: clampSearchScore(hit.score),
+      source: "fts",
+      lexicalBackend: backendName,
+    });
+  }
+
+  return results;
+}
+
+function findLexicalHitRow(db: Database, hit: LexicalSearchHit): LexicalHitRow | null {
+  const selectCols = `
+    d.id,
+    'qmd://' || d.collection || '/' || d.path as virtual_path,
+    d.collection || '/' || d.path as display_path,
+    d.title,
+    d.hash,
+    d.collection,
+    d.modified_at,
+    LENGTH(content.doc) as body_length,
+    content.doc as body
+  `;
+
+  if (hit.documentId !== undefined) {
+    const row = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.id = ? AND d.active = 1
+    `).get(hit.documentId) as LexicalHitRow | null;
+    if (row) return row;
+  }
+
+  if (hit.hash) {
+    const row = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.hash = ? AND d.active = 1
+      LIMIT 1
+    `).get(hit.hash) as LexicalHitRow | null;
+    if (row) return row;
+  }
+
+  if (hit.docid) {
+    const docid = hit.docid.startsWith("#") ? hit.docid.slice(1) : hit.docid;
+    const row = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.hash LIKE ? AND d.active = 1
+      LIMIT 1
+    `).get(`${docid}%`) as LexicalHitRow | null;
+    if (row) return row;
+  }
+
+  if (hit.collectionName && hit.path) {
+    const row = db.prepare(`
+      SELECT ${selectCols}
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+      LIMIT 1
+    `).get(hit.collectionName, hit.path) as LexicalHitRow | null;
+    if (row) return row;
+  }
+
+  const filepath = hit.filepath ?? (hit.path && hit.collectionName ? `qmd://${hit.collectionName}/${hit.path}` : undefined);
+  if (!filepath) return null;
+  const doc = findDocument(db, filepath, { includeBody: true });
+  if ("error" in doc) return null;
+
+  return {
+    id: 0,
+    virtual_path: doc.filepath,
+    display_path: doc.displayPath,
+    title: doc.title,
+    hash: doc.hash,
+    collection: doc.collectionName,
+    modified_at: doc.modifiedAt,
+    body_length: doc.bodyLength,
+    body: doc.body ?? "",
+  };
+}
+
+function clampSearchScore(score: number): number {
+  if (!Number.isFinite(score)) return 0;
+  return Math.max(0, Math.min(1, score));
 }
 
 // =============================================================================
@@ -4578,12 +4737,12 @@ export async function hybridQuery(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
-  // Step 1: BM25 probe — strong signal skips expensive LLM expansion
+  // Step 1: Lexical probe — strong signal skips expensive LLM expansion
   // When intent is provided, disable strong-signal bypass — the obvious BM25
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const initialFts = await store.searchLexical(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -4613,14 +4772,14 @@ export async function hybridQuery(
 
   // Step 3: Route searches by query type
   //
-  // Strategy: run all FTS queries immediately (they're sync/instant), then
+  // Strategy: run all lexical queries before vector search, then
   // batch-embed all vector queries in one embedBatch() call, then run
   // sqlite-vec lookups with pre-computed embeddings.
 
-  // 3a: Run FTS for all lex expansions right away (no LLM needed)
+  // 3a: Run lexical backend for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = await store.searchLexical(q.query, 20, collection);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -5002,11 +5161,11 @@ export async function structuredSearch(
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections
 
-  // Step 1: Run FTS for all lex searches (sync, instant)
+  // Step 1: Run lexical backend for all lex searches
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = await store.searchLexical(search.query, 20, coll);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
