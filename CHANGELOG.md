@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- Added a prominent **Apple Silicon arm64 Node requirement** section to README. Explains
+  that running qmd under a Rosetta x64 Node causes `node-llama-cpp`'s postinstall to abort
+  with "llama.cpp is not supported under Rosetta on Apple Silicon", and gives copy-pasteable
+  remediation steps for nvm, Homebrew, and mise, plus a `file $(which node)` arch sanity
+  check. Also cross-references the Intel Mac x64 crash (#448).
+
 ### Fixed
 
 - Filesystem paths with special characters (`#`, `&`, spaces, `[]`, `()`, etc.)

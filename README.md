@@ -481,6 +481,46 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   brew install sqlite
   ```
 
+> **Apple Silicon (M1/M2/M3/M4): native arm64 Node required**
+>
+> QMD's LLM features use [node-llama-cpp](https://github.com/withcatai/node-llama-cpp), which compiles native binaries.
+> On Apple Silicon, you **must** run a native arm64 Node — not an x64 (Rosetta-translated) one.
+> Running under Rosetta causes `node-llama-cpp`'s postinstall to abort with:
+>
+> ```
+> llama.cpp is not supported under Rosetta on Apple Silicon
+> ```
+>
+> **Verify your Node architecture:**
+> ```sh
+> node -p process.arch   # must print: arm64
+> ```
+>
+> **Fix: install/select a native arm64 Node** (pick one):
+> ```sh
+> # nvm
+> nvm install 22
+> nvm use 22
+> node -p process.arch   # arm64 ✓
+>
+> # Homebrew
+> brew install node
+> node -p process.arch   # arm64 ✓
+>
+> # mise
+> mise install node@22
+> mise use node@22
+> node -p process.arch   # arm64 ✓
+> ```
+>
+> If you still see `x64` after switching, ensure your terminal is not itself running under Rosetta
+> (`file $(which node)` should show `Mach-O 64-bit executable arm64`).
+
+> **Intel Mac (x64):** LLM-powered features (`qmd query`, `qmd embed`, `qmd vsearch`) require the
+> x64 llama.cpp native binary. If you see `zsh: illegal hardware instruction` on an Intel Mac,
+> see [#448](https://github.com/tobi/qmd/issues/448). BM25 search (`qmd search`) works without
+> any native model and is unaffected.
+
 ### GGUF Models (via node-llama-cpp)
 
 QMD uses three local GGUF models (auto-downloaded on first use):
