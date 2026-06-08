@@ -13,7 +13,6 @@ import {
   homedir,
   resolve,
   enableProductionMode,
-  searchFTS,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -110,6 +109,7 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
+import { createLexicalSearchBackendFromConfig } from "../lexical-backends.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -128,19 +128,25 @@ let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
-    store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    let activeModels: ReturnType<typeof ensureModelsConfiguredForCli> | undefined;
+    let config: CollectionConfig | undefined;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
+      activeModels = ensureModelsConfiguredForCli();
+      config = loadConfig();
+    } catch {
+      // Config may not exist yet — that's fine, DB works without it
+    }
+    store = createStore(storeDbPathOverride, {
+      lexicalBackend: createLexicalSearchBackendFromConfig(config?.search?.lexicalBackend),
+    });
+    if (config && activeModels) {
+      // Sync YAML config into SQLite store_collections so store.ts reads from DB
       syncConfigToDb(store.db, config);
       setDefaultLlamaCpp(new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
       }));
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
     }
   }
   return store;
@@ -2585,8 +2591,9 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
-function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
+async function search(query: string, opts: OutputOptions): Promise<void> {
+  const storeInstance = getStore();
+  const db = storeInstance.db;
 
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
@@ -2596,7 +2603,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    await storeInstance.searchLexical(query, fetchLimit, singleCollection),
     collectionNames
   );
 
@@ -4450,7 +4457,7 @@ if (isMain) {
         console.error("Usage: qmd search [options] <query>");
         process.exit(1);
       }
-      search(cli.query, cli.opts);
+      await search(cli.query, cli.opts);
       break;
 
     case "vsearch":

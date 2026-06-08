@@ -21,6 +21,7 @@ import {
   type LexSearchOptions,
   type VectorSearchOptions,
   type ExpandQueryOptions,
+  type LexicalSearchBackend,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
 
@@ -572,6 +573,88 @@ describe("searchLex (BM25)", () => {
     const collections = new Set(results.map(r => r.collectionName));
     // Auth appears in both docs/auth.md and notes/meeting-2025-02.md
     expect(collections.size).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("custom lexical backend", () => {
+  test("searchLex hydrates backend document refs from QMD SQLite", async () => {
+    const dbPath = freshDbPath();
+    const requests: unknown[] = [];
+    let documentId = 0;
+    const lexicalBackend: LexicalSearchBackend = {
+      name: "test-lexical",
+      search: (request) => {
+        requests.push(request);
+        return [{ documentId, score: 0.92, rawScore: 42 }];
+      },
+    };
+    const store = await createStore({
+      dbPath,
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+      lexicalBackend,
+    });
+
+    const body = "# Custom Backend\n\nExternal lexical backends return QMD document refs.";
+    const hash = require("crypto").createHash("sha256").update(body).digest("hex");
+    const now = new Date().toISOString();
+    store.internal.insertContent(hash, body, now);
+    store.internal.insertDocument("docs", "custom-backend.md", "Custom Backend", hash, now, now);
+    const row = store.internal.db.prepare(
+      `SELECT id FROM documents WHERE collection = ? AND path = ?`
+    ).get("docs", "custom-backend.md") as { id: number };
+    documentId = row.id;
+
+    const results = await store.searchLex("anything", { limit: 5, collection: "docs" });
+
+    expect(requests).toHaveLength(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.displayPath).toBe("docs/custom-backend.md");
+    expect(results[0]!.body).toContain("External lexical backends");
+    expect(results[0]!.source).toBe("fts");
+    expect(results[0]!.lexicalBackend).toBe("test-lexical");
+    await store.close();
+  });
+
+  test("search() uses custom lexical backend for hybrid retrieval", async () => {
+    const dbPath = freshDbPath();
+    let documentId = 0;
+    const lexicalBackend: LexicalSearchBackend = {
+      name: "test-lexical",
+      search: () => [{ documentId, score: 0.96 }],
+    };
+    const store = await createStore({
+      dbPath,
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+      lexicalBackend,
+    });
+
+    const body = "# Hybrid Backend\n\nA strong lexical backend hit can seed hybrid search.";
+    const hash = require("crypto").createHash("sha256").update(body).digest("hex");
+    const now = new Date().toISOString();
+    store.internal.insertContent(hash, body, now);
+    store.internal.insertDocument("docs", "hybrid-backend.md", "Hybrid Backend", hash, now, now);
+    const row = store.internal.db.prepare(
+      `SELECT id FROM documents WHERE collection = ? AND path = ?`
+    ).get("docs", "hybrid-backend.md") as { id: number };
+    documentId = row.id;
+
+    const results = await store.search({
+      query: "hybrid backend",
+      rerank: false,
+      limit: 1,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.displayPath).toBe("docs/hybrid-backend.md");
+    await store.close();
   });
 });
 
