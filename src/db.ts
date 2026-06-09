@@ -77,6 +77,7 @@ export interface Database {
   loadExtension(path: string): void;
   transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
   close(): void;
+  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
 }
 
 export interface Statement {
