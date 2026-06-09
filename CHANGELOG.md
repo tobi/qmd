@@ -4,6 +4,30 @@
 
 ### Documentation
 
+- README: added a "Configuring `index.yml`" section documenting the full config
+  schema — `global_context`, `editor_uri`, the `models.embed`/`rerank`/`generate`
+  overrides, and per-collection `path`/`pattern`/`ignore`/`update`/
+  `includeByDefault`/`context` — with file-location rules (`XDG_CONFIG_HOME`,
+  `QMD_CONFIG_DIR`, named `{name}.yml`, project-local `.qmd/index.yml`). Every key
+  is verified against `src/collections.ts` and its consumers. Documents behavior
+  that previously existed only in code, where the absence of docs led contributors
+  to repeatedly re-submit already-shipped model-resolution fixes (#502, #559, #564)
+  and to request config that already works (#645, #678). Added
+  `XDG_CONFIG_HOME`/`QMD_CONFIG_DIR` to the environment-variable table and noted
+  the `index.yml` `models:` / `QMD_EMBED_MODEL` override path in the Model
+  Configuration section.
+- README: expanded the per-collection `update` field into an "Automatic update
+  commands" subsection — the feature the maintainer publicly called under-documented
+  — covering execution via `bash -c` in the collection's directory, the run-then-
+  reindex order, the non-zero-exit abort behavior, and the `qmd collection
+  update-cmd` set/clear shortcut. The `ignore` key now states it is YAML-only (no
+  CLI command) and additive with the un-overridable built-in exclusions.
+- `example-index.yml`: overhauled from three near-identical collections into a
+  fully-commented starter template where each collection demonstrates a distinct
+  feature (hierarchical context, auto-`update`, `ignore` patterns, non-markdown
+  globs, `includeByDefault: false`, and an all-fields example), plus commented
+  `editor_uri`/`models` stubs. README now links to it. Model URIs are intentionally
+  left as placeholders so the template can't drift from the defaults.
 - README: documented collection filtering (`-c` semantics), the `collection
   show`/`include`/`exclude`/`update-cmd` subcommands, the `--intent`/`--no-rerank`/
   `-C`/`--full-path` search flags, the `--format <kind>` output selector (with the

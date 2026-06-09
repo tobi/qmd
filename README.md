@@ -648,6 +648,101 @@ qmd context list
 qmd context rm qmd://notes/old
 ```
 
+### Configuring `index.yml`
+
+The `collection` and `context` commands above all read and write a single YAML
+config file — you can also edit it directly. Everything QMD knows about your
+collections (paths, masks, exclusions, per-collection update hooks, contexts, and
+optional model overrides) lives here. A fully-commented starter template ships as
+[`example-index.yml`](example-index.yml) in this repo.
+
+**Location:** `~/.config/qmd/index.yml` by default. The directory honors
+`XDG_CONFIG_HOME` (→ `$XDG_CONFIG_HOME/qmd/index.yml`) and `QMD_CONFIG_DIR`. A
+named index uses `{name}.yml` — `qmd --index work …` reads/writes `work.yml`.
+A **project-local** index created with `qmd init` lives at `.qmd/index.yml`
+(`.qmd/index.yaml` is also accepted) alongside a project-local `index.sqlite`,
+so config and index stay inside the project instead of `~/.config` / `~/.cache`.
+
+```yaml
+# ~/.config/qmd/index.yml
+
+# Context applied to every collection (system-message style). Optional.
+global_context: "Knowledge base for my projects"
+
+# Terminal hyperlink template for search results. Optional.
+# Overridden by the QMD_EDITOR_URI env var. See "Editor Links" below.
+editor_uri: "vscode://file{path}:{line}:{col}"
+
+# Override the default GGUF models per role. Optional — omit to use the
+# built-in defaults. `qmd init` writes this block pre-filled with the
+# resolved defaults. See "Model Configuration" for the default URIs.
+models:
+  embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
+  rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
+  generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+
+# One entry per collection. The key is the collection name.
+collections:
+  notes:
+    path: /Users/me/notes        # absolute path to index (required)
+    pattern: "**/*.md"           # glob mask (default: **/*.md)
+    ignore:                      # glob patterns to exclude from indexing
+      - "Archive/**"
+      - "**/drafts/**"
+    update: "git pull --rebase"  # bash command run before each `qmd update`
+    includeByDefault: true       # include in unscoped queries (default: true)
+    context:                     # path prefix → description; longest match wins
+      "/": "Personal notes and ideas"
+      "/work": "Work-related notes"
+```
+
+| Key | Scope | Purpose |
+|-----|-------|---------|
+| `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
+| `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
+| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `collections.<name>.path` | per-collection | Absolute directory to index. |
+| `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. |
+| `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
+| `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
+| `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
+| `collections.<name>.context` | per-collection | Path-prefix → description map; the most specific (longest) matching prefix wins. Set via `qmd context add`. |
+
+> **Note:** Editing `index.yml` changes which directories and models QMD *uses*,
+> but does not re-index on its own. Run `qmd update` after changing `path`,
+> `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
+
+#### Automatic update commands
+
+A collection's `update` field is QMD's built-in refresh hook: when you run
+`qmd update`, each collection's `update` command runs **first**, then the
+collection is re-indexed. This keeps a collection in sync with an upstream source
+(a git remote, a sync script) without wrapping `qmd` yourself.
+
+```yaml
+collections:
+  wiki:
+    path: ~/reference/wiki
+    update: "git pull --ff-only"
+```
+
+    $ qmd update
+    [1/3] wiki (**/*.md)
+        Running update command: git pull --ff-only
+        Already up to date.
+    Collection: ~/reference/wiki (**/*.md)
+    Indexed: 0 new, 2 updated, 340 unchanged, 0 removed
+
+The command runs via `bash -c` in the collection's own directory (its `path`), not
+your current working directory. If it exits non-zero, `qmd update` prints the
+failure and **aborts the entire run** — collections after the failing one are not
+re-indexed. Set or clear it from the CLI instead of editing YAML by hand:
+
+```sh
+qmd collection update-cmd wiki 'git pull --ff-only'   # set
+qmd collection update-cmd wiki                         # clear
+```
+
 ### Search Commands
 
 ```
@@ -967,6 +1062,8 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `XDG_CONFIG_HOME` | `~/.config` | Config directory location (where `index.yml` lives) |
+| `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
@@ -1086,13 +1183,17 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured in `src/llm.ts` as HuggingFace URIs:
+The default models are defined in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
+
+Override them per-role without touching source via the `models:` block in
+`index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
+`QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
 
 ### EmbeddingGemma Prompt Format
 

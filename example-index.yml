@@ -1,33 +1,98 @@
 # QMD Collections Configuration
 # Location: ~/.config/qmd/index.yml
 #
-# This file defines all collections and their contexts.
-# You can manually edit this file - changes take effect immediately.
+# This file is the single source of truth for your collections. Every
+# `qmd collection ...` and `qmd context ...` command reads and writes it, and
+# you can also edit it directly — changes take effect on the next command.
+# (Editing does NOT re-index; run `qmd update` after changing a path, pattern,
+# or ignore list.)
+#
+# Copy this file to ~/.config/qmd/index.yml and customize it.
 
-# Global context applied to all collections
-# Use this for universal search instructions or patterns
+# ─── Global context ──────────────────────────────────────────────────────────
+# Prepended to results across ALL collections. Use it for conventions that span
+# your whole knowledge base. Set via: qmd context add / "..."
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
-# Collection definitions
+# ─── Terminal hyperlinks (optional) ──────────────────────────────────────────
+# Template that turns result paths into clickable editor links.
+# Overridden by the QMD_EDITOR_URI env var.
+# editor_uri: "vscode://file{path}:{line}:{col}"
+
+# ─── Model overrides (optional) ──────────────────────────────────────────────
+# Omit to use the built-in GGUF defaults. `qmd init` writes this block
+# pre-filled with the resolved defaults. See "Model Configuration" in the README
+# for the current default URIs (kept there so this template can't go stale).
+# models:
+#   embed: "hf:<user>/<repo>/<file>.gguf"
+#   rerank: "hf:<user>/<repo>/<file>.gguf"
+#   generate: "hf:<user>/<repo>/<file>.gguf"
+
+# ─── Collections ─────────────────────────────────────────────────────────────
 collections:
-  # Meeting notes
-  Meetings:
+
+  # ── Basic: just a path and a pattern ───────────────────────────────────────
+  meetings:
     path: ~/Documents/Meetings
     pattern: "**/*.md"
     context:
       "/": "Meeting notes and summaries"
 
-  # Daily journal entries
+  # ── Hierarchical context: path-prefix → description ────────────────────────
+  # Context is matched by path prefix; the most specific (longest) match wins.
   journals:
     path: ~/Documents/Notes
     pattern: "**/*.md"
     context:
+      "/": "Personal notes vault"
       "/journal/2024": "Daily notes from 2024"
       "/journal/2025": "Daily notes from 2025"
-      "/": "Notes vault"
+      "/recipes": "Cooking recipes and meal planning"
 
+  # ── Auto-update: run a command before re-indexing ──────────────────────────
+  # On `qmd update`, this runs via `bash -c` in the collection's directory
+  # BEFORE re-indexing. A non-zero exit aborts the whole `qmd update` run.
+  # Set via CLI: qmd collection update-cmd wiki 'git pull --ff-only'
+  wiki:
+    path: ~/reference/wiki
+    pattern: "**/*.md"
+    update: "git pull --ff-only"
+    context:
+      "/": "External wiki — automatically pulled on every qmd update"
+
+  # ── Ignore patterns: exclude files from indexing ───────────────────────────
+  # YAML-only — there is no CLI command for this. Additive with the built-in
+  # exclusions (node_modules, .git, .cache, vendor, dist, build), which you
+  # cannot un-ignore. Non-markdown patterns work too.
+  project-docs:
+    path: ~/work/project
+    pattern: "**/*.{md,mdx,txt}"
+    ignore:
+      - "drafts/**"           # skip draft documents
+      - "*.tmp"               # skip temp files
+      - "archive/2023/**"     # skip old archive
+    context:
+      "/": "Team project documentation"
+      "/api": "API reference and endpoint docs"
+      "/guides": "How-to guides and tutorials"
+
+  # ── Exclude from default searches ──────────────────────────────────────────
+  # includeByDefault: false → skipped unless you name it: qmd query -c vendor "..."
+  # Set via CLI: qmd collection exclude vendor
+  vendor:
+    path: ~/work/vendor
+    pattern: "**/*.md"
+    includeByDefault: false
+    context:
+      "/": "Third-party vendor docs (excluded from default searches; use -c vendor)"
+
+  # ── Everything together ────────────────────────────────────────────────────
   codex:
     path: ~/Documents/Codex
     pattern: "**/*.md"
+    ignore:
+      - "Sessions/**"
+    update: "git stash && git pull --rebase --ff-only && git stash pop"
+    includeByDefault: true    # true is the default; shown here for clarity
     context:
       "/": "Thematic collections of important concepts and discussions"
