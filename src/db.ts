@@ -77,6 +77,8 @@ export interface Database {
   loadExtension(path: string): void;
   transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
   close(): void;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+  transaction<T extends Function>(fn: T): T;
 }
 
 export interface Statement {
