@@ -513,12 +513,38 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
           json(res, 500, { error: "Failed to embed query" });
           return;
         }
-        // Step 2: vector search with precomputed embedding
-        const results = await searchVec(
-          store.db, vsQuery, embedResult.model,
-          vsLimit ?? 20, vsCollection ?? undefined,
-          undefined, embedResult.embedding,
-        );
+        // Step 2: vector search with precomputed embedding.
+        // Guard the common operational failure: the index was built with a
+        // different embedding model than the one this server now embeds with,
+        // so the query vector's dimension doesn't match the stored vectors.
+        // sqlite-vec surfaces this as a raw "Dimension mismatch" error; turn it
+        // into an actionable 409 (which model/dim we sent + a rebuild hint)
+        // instead of a cryptic 500.
+        let results;
+        try {
+          results = await searchVec(
+            store.db, vsQuery, embedResult.model,
+            vsLimit ?? 20, vsCollection ?? undefined,
+            undefined, embedResult.embedding,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/dimension mismatch/i.test(msg)) {
+            json(res, 409, {
+              error:
+                "embedding dimension mismatch: this index was built with a " +
+                "different embedding model than the server is using",
+              detail: msg,
+              query_model: embedResult.model,
+              query_dim: embedResult.embedding.length,
+              hint:
+                "rebuild the index with the current embed model (e.g. `qmd update`), " +
+                "or point the server at an index built with this model",
+            });
+            return;
+          }
+          throw err;
+        }
         json(res, 200, { results, total: results.length });
         return;
       }
