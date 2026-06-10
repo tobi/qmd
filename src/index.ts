@@ -385,19 +385,6 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   });
   internal.llm = llm;
 
-  // Startup probe for remote LLMs — catch misconfiguration early
-  if (typeof (llm as any).probe === 'function') {
-    (llm as any).probe().then((result: { ok: boolean; dimensions: number; error?: string }) => {
-      if (result.ok) {
-        console.log(`Remote LLM probe OK (dimensions=${result.dimensions})`);
-      } else {
-        console.warn(`Remote LLM probe failed: ${result.error ?? 'unknown error'}`);
-      }
-    }).catch((err: unknown) => {
-      console.warn(`Remote LLM probe error: ${err}`);
-    });
-  }
-
   const store: QMDStore = {
     internal,
     dbPath: internal.dbPath,
@@ -442,7 +429,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, llm),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent, llm),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });

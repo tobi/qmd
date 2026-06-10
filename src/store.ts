@@ -22,6 +22,7 @@ import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  hasDefaultLlamaCpp,
   type LLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -108,6 +109,16 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
  */
 function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
+}
+
+function hasRemoteEndpointConfig(candidate: unknown): candidate is {
+  embedCfg: { baseUrl?: string; model?: string; apiKey?: string };
+} {
+  return !!candidate
+    && typeof candidate === "object"
+    && "embedCfg" in candidate
+    && !!(candidate as { embedCfg?: unknown }).embedCfg
+    && typeof (candidate as { embedCfg?: unknown }).embedCfg === "object";
 }
 
 // =============================================================================
@@ -1288,7 +1299,7 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, options?: SearchResultOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
+  expandQuery: (query: string, model?: string, intent?: string, llmOverride?: LLM) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -2008,7 +2019,7 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, options?: SearchResultOptions) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, llm, options),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
+    expandQuery: (query: string, model?: string, intent?: string, llmOverride?: LLM) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, llmOverride ?? store.llm),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
 
     // Document retrieval
@@ -2858,10 +2869,8 @@ export async function chunkDocumentByTokens(
 
     // YAML-only remote setup may not populate env vars. In that case, attempt
     // to read endpoint config from the currently injected RemoteLLM instance.
-    const defaultLlmUnknown = getDefaultLlamaCpp() as unknown as {
-      embedCfg?: { baseUrl?: string; model?: string; apiKey?: string };
-    };
-    const embedCfg = defaultLlmUnknown?.embedCfg;
+    const defaultLlmUnknown = defaultLlamaCandidate as unknown;
+    const embedCfg = hasRemoteEndpointConfig(defaultLlmUnknown) ? defaultLlmUnknown.embedCfg : undefined;
     if ((!baseUrl || !model) && embedCfg) {
       baseUrl = baseUrl || clean(embedCfg.baseUrl);
       model = model || (embedCfg.model || '').trim();
@@ -2903,8 +2912,13 @@ export async function chunkDocumentByTokens(
   );
 
   const tokenizerMode = resolveRemoteTokenizerMode();
-  const defaultLlm = getDefaultLlamaCpp();
-  const remoteMode = isRemoteConfigured() || !hasLocalTokenizerApi(defaultLlm as unknown);
+  const existingDefaultLlm = hasDefaultLlamaCpp() ? getDefaultLlamaCpp() : null;
+  const remoteMode = isRemoteConfigured()
+    || (existingDefaultLlm !== null && !hasLocalTokenizerApi(existingDefaultLlm as unknown));
+
+  const defaultLlamaCandidate = remoteMode
+    ? existingDefaultLlm
+    : getDefaultLlamaCpp();
 
   if (remoteMode) {
     if (tokenizerMode === 'off') {
@@ -3013,7 +3027,10 @@ export async function chunkDocumentByTokens(
     return results;
   }
 
-  const llm = defaultLlm;
+  if (!defaultLlamaCandidate) {
+    throw new Error("Local tokenizer path selected without an active default LLM");
+  }
+  const llm = defaultLlamaCandidate;
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
