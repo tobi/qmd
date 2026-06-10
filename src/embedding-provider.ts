@@ -49,10 +49,16 @@ export type RemoteLLMConfig = {
   embedModel?: string;
   apiKey?: string;
 
-  /** Max texts per batch request (default: 100) */
+  /** Max texts per batch request (default: 32) */
   maxBatchSize?: number;
-  /** HTTP request timeout in ms (default: 30000) */
-  timeoutMs?: number;
+  /** Connect timeout in ms (default: 5000) */
+  connectTimeoutMs?: number;
+  /** Read timeout for embedding requests in ms (default: 30000) */
+  embedReadTimeoutMs?: number;
+  /** Read timeout for rerank requests in ms (default: 60000) */
+  rerankReadTimeoutMs?: number;
+  /** Read timeout for expand/generate requests in ms (default: 30000) */
+  expandReadTimeoutMs?: number;
 };
 
 // =============================================================================
@@ -181,6 +187,64 @@ function resolveEndpoint(
 }
 
 // =============================================================================
+// Circuit Breaker
+// =============================================================================
+
+type CircuitState = 'closed' | 'open' | 'half-open';
+
+/**
+ * Simple circuit breaker that tracks consecutive failures.
+ *
+ * - Closed: normal operation, requests proceed.
+ * - Open: too many consecutive failures; requests are rejected immediately.
+ * - Half-open: cooldown has elapsed; one request is allowed to probe.
+ *
+ * Auto-recovers after `cooldownMs` in the open state.
+ */
+class CircuitBreaker {
+  private state: CircuitState = 'closed';
+  private failures = 0;
+  private lastFailureTime = 0;
+  private readonly maxFailures: number;
+  private readonly cooldownMs: number;
+
+  constructor(maxFailures = 3, cooldownMs = 10 * 60 * 1000) {
+    this.maxFailures = maxFailures;
+    this.cooldownMs = cooldownMs;
+  }
+
+  canAttempt(): boolean {
+    if (this.state === 'closed') return true;
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailureTime >= this.cooldownMs) {
+        this.state = 'half-open';
+        return true;
+      }
+      return false;
+    }
+    // half-open: allow one attempt
+    return true;
+  }
+
+  onSuccess(): void {
+    this.state = 'closed';
+    this.failures = 0;
+  }
+
+  onFailure(): void {
+    this.failures++;
+    this.lastFailureTime = Date.now();
+    if (this.state === 'half-open' || this.failures >= this.maxFailures) {
+      this.state = 'open';
+    }
+  }
+
+  getState(): CircuitState {
+    return this.state;
+  }
+}
+
+// =============================================================================
 // RemoteLLM — implements the LLM interface via HTTP
 // =============================================================================
 
@@ -195,7 +259,22 @@ export class RemoteLLM implements LLM {
   readonly generateCfg: EndpointConfig;
 
   readonly maxBatchSize: number;
-  readonly timeoutMs: number;
+  readonly connectTimeoutMs: number;
+  readonly embedReadTimeoutMs: number;
+  readonly rerankReadTimeoutMs: number;
+  readonly expandReadTimeoutMs: number;
+
+  /** Circuit breakers for each endpoint */
+  private readonly embedBreaker = new CircuitBreaker();
+  private readonly rerankBreaker = new CircuitBreaker();
+  private readonly expandBreaker = new CircuitBreaker();
+
+  /**
+   * Expected embedding dimensions, set on first successful embed response.
+   * If a subsequent response returns different dimensions, an error is thrown
+   * to prevent silent vector corruption.
+   */
+  private expectedDimensions: number | null = null;
 
   constructor(config: RemoteLLMConfig = {}) {
     // --- Backward compat: treat old flat config as embed endpoint ---
@@ -253,8 +332,11 @@ export class RemoteLLM implements LLM {
       this.generateCfg = resolveEndpoint('generate', 'GENERATE', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL);
     }
 
-    this.maxBatchSize = config.maxBatchSize || parseInt(process.env.QMD_EMBED_BATCH_SIZE || '100', 10);
-    this.timeoutMs = config.timeoutMs || parseInt(process.env.QMD_EMBED_TIMEOUT || '30000', 10);
+    this.maxBatchSize = config.maxBatchSize ?? parseInt(process.env.QMD_EMBED_BATCH_SIZE || '32', 10);
+    this.connectTimeoutMs = config.connectTimeoutMs ?? parseInt(process.env.QMD_REMOTE_CONNECT_TIMEOUT || '5000', 10);
+    this.embedReadTimeoutMs = config.embedReadTimeoutMs ?? parseInt(process.env.QMD_REMOTE_READ_TIMEOUT || '30000', 10);
+    this.rerankReadTimeoutMs = config.rerankReadTimeoutMs ?? parseInt(process.env.QMD_REMOTE_RERANK_TIMEOUT || '60000', 10);
+    this.expandReadTimeoutMs = config.expandReadTimeoutMs ?? parseInt(process.env.QMD_REMOTE_EXPAND_TIMEOUT || '30000', 10);
   }
 
   // =========================================================================
@@ -283,50 +365,66 @@ export class RemoteLLM implements LLM {
   }
 
   async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    if (!this.embedBreaker.canAttempt()) {
+      throw new Error(
+        `Remote embedding circuit breaker is open — endpoint ${this.embedCfg.baseUrl} is unavailable. ` +
+        `Will retry after cooldown.`
+      );
+    }
+
     const results: (EmbeddingResult | null)[] = [];
 
     for (let i = 0; i < texts.length; i += this.maxBatchSize) {
       const batch = texts.slice(i, i + this.maxBatchSize);
-      const batchResults = await this.embedWithRetry(batch);
+      const batchResults = await this.embedBatchRequest(batch);
       results.push(...batchResults);
     }
 
     return results;
   }
 
-  private async embedWithRetry(texts: string[], retries = 3): Promise<(EmbeddingResult | null)[]> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < retries; attempt++) {
-      try {
-        const headers: Record<string, string> = {};
-        if (this.embedCfg.apiKey) {
-          headers['Authorization'] = `Bearer ${this.embedCfg.apiKey.trim()}`;
-        }
-
-        const data = await nodePost(
-          `${this.embedCfg.baseUrl}/embeddings`,
-          headers,
-          { model: this.embedCfg.model, input: texts },
-          this.timeoutMs,
-        ) as { data: Array<{ embedding: number[]; index?: number }> };
-
-        return data.data.map((item) => ({
-          embedding: item.embedding,
-          model: this.embedCfg.model,
-        }));
-
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt < retries - 1) {
-          const delay = 1000 * Math.pow(2, attempt);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
-      }
+  private async embedBatchRequest(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    const headers: Record<string, string> = {};
+    if (this.embedCfg.apiKey) {
+      headers['Authorization'] = `Bearer ${this.embedCfg.apiKey.trim()}`;
     }
 
-    console.error(`RemoteLLM: embedding failed after ${retries} retries:`, lastError?.message);
-    return texts.map(() => null);
+    try {
+      const data = await nodePost(
+        `${this.embedCfg.baseUrl}/embeddings`,
+        headers,
+        { model: this.embedCfg.model, input: texts },
+        this.embedReadTimeoutMs,
+      ) as { data: Array<{ embedding: number[]; index?: number }> };
+
+      // Dimension validation: track expected dimensions on first response
+      if (data.data.length > 0) {
+        const dim = data.data[0]!.embedding.length;
+        if (this.expectedDimensions === null) {
+          this.expectedDimensions = dim;
+        } else if (dim !== this.expectedDimensions) {
+          throw new Error(
+            `Embedding dimension mismatch: expected ${this.expectedDimensions}, got ${dim}. ` +
+            `This usually means the remote model changed.`
+          );
+        }
+      }
+
+      // Sort by index to preserve input order
+      const sorted = [...data.data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+      const results: (EmbeddingResult | null)[] = sorted.map(item => ({
+        embedding: item.embedding,
+        model: this.embedCfg.model,
+      }));
+
+      this.embedBreaker.onSuccess();
+      return results;
+    } catch (err) {
+      this.embedBreaker.onFailure();
+      throw err;
+    }
   }
 
   // =========================================================================
@@ -334,13 +432,13 @@ export class RemoteLLM implements LLM {
   // =========================================================================
 
   async generate(prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
-    try {
-      const ep = this.generateCfg;
-      const headers: Record<string, string> = {};
-      if (ep.apiKey) {
-        headers['Authorization'] = `Bearer ${ep.apiKey.trim()}`;
-      }
+    const ep = this.generateCfg;
+    const headers: Record<string, string> = {};
+    if (ep.apiKey) {
+      headers['Authorization'] = `Bearer ${ep.apiKey.trim()}`;
+    }
 
+    try {
       const data = await nodePost(
         `${ep.baseUrl}/chat/completions`,
         headers,
@@ -350,7 +448,7 @@ export class RemoteLLM implements LLM {
           max_tokens: _options?.maxTokens ?? 1024,
           temperature: _options?.temperature ?? 0.7,
         },
-        this.timeoutMs,
+        this.expandReadTimeoutMs,
       ) as { choices: Array<{ message: { content: string } }>; model: string };
 
       return {
@@ -400,57 +498,106 @@ export class RemoteLLM implements LLM {
       return [{ type: 'lex', text: query }];
     }
 
+    if (!this.expandBreaker.canAttempt()) {
+      console.warn('RemoteLLM: expand circuit breaker is open, returning passthrough query');
+      return this.expandFallback(query, options?.includeLexical ?? true);
+    }
+
+    const includeLexical = options?.includeLexical ?? true;
     const intent = options?.intent ? ` with intent: ${options.intent}` : '';
-    const prompt = `Expand this search query for a document retrieval system${intent}.
-Output ONLY three lines, nothing else, no markdown, no explanation:
-
-lex: <keyword-focused variant>
-vec: <semantically rephrased version>
-hyde: <short hypothetical document passage>
-
-Original query: "${query}"`;
+    const systemPrompt =
+      'You are a search query expansion assistant. ' +
+      'Given a search query, produce expanded variants in EXACTLY this format:\n' +
+      'lex: <keyword/BM25 variant>\n' +
+      'vec: <semantic paraphrase>\n' +
+      'hyde: <one-sentence hypothetical document excerpt>\n\n' +
+      'Output only those three lines. No explanation, no extra text.';
+    const userPrompt = intent
+      ? `Expand this search query: ${query}\nQuery intent: ${options?.intent}`
+      : `Expand this search query: ${query}`;
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (ep.apiKey) {
+        headers['Authorization'] = `Bearer ${ep.apiKey.trim()}`;
+      }
+
       const data = await nodePost(
         `${ep.baseUrl}/chat/completions`,
-        { 'Authorization': `Bearer ${ep.apiKey}` },
+        headers,
         {
           model: ep.model,
-          messages: [{ role: 'user', content: prompt }],
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
           max_tokens: 600,
           temperature: 0.7,
         },
-        this.timeoutMs,
+        this.expandReadTimeoutMs,
       ) as { choices: Array<{ message: { content: string } }> };
 
       const content = data.choices[0]?.message?.content ?? '';
 
-      // Parse: find any line containing "lex:", "vec:", or "hyde:" anywhere in the text
-      // (handles markdown wrapping, bold labels, etc.)
-      const queryables: Queryable[] = [];
-      const typeRegex = /(lex|vec|hyde)\s*[:.]\s*(.+?)(?:\n|$)/gi;
-      let match;
-      while ((match = typeRegex.exec(content)) !== null) {
-        const type = match[1]?.toLowerCase() as 'lex' | 'vec' | 'hyde' | undefined;
-        const raw = match[2];
-        if (!type || !raw) continue;
-        const text = raw.trim().replace(/\*\*/g, '').replace(/^"|"$/g, '');
-        if (text && text.length > 3) {
-          queryables.push({ type, text });
-        }
-      }
+      const queryables = this.parseExpandResponse(content, query, includeLexical);
 
-      if (queryables.length > 0) {
-        return queryables;
-      }
-
-      // Parse failed — fall through
-      console.warn('RemoteLLM: expand query response could not be parsed, using passthrough');
+      this.expandBreaker.onSuccess();
+      return queryables;
     } catch (err) {
+      this.expandBreaker.onFailure();
       console.error('RemoteLLM: expandQuery failed:', err instanceof Error ? err.message : String(err));
+      return this.expandFallback(query, includeLexical);
+    }
+  }
+
+  /**
+   * Parse the chat completion response from the expand endpoint into Queryable[].
+   * Expects lines in "type: content" format where type ∈ {lex, vec, hyde}.
+   * Validates that expanded text contains terms from the original query.
+   */
+  private parseExpandResponse(content: string, originalQuery: string, includeLexical: boolean): Queryable[] {
+    const lines = content.trim().split('\n');
+    const queryTerms = originalQuery.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const hasQueryTerm = (text: string): boolean => {
+      if (queryTerms.length === 0) return true;
+      const lower = text.toLowerCase();
+      return queryTerms.some(term => lower.includes(term));
+    };
+
+    const queryables: Queryable[] = [];
+    for (const line of lines) {
+      const colonIdx = line.indexOf(':');
+      if (colonIdx === -1) continue;
+      const type = line.slice(0, colonIdx).trim().toLowerCase();
+      if (type !== 'lex' && type !== 'vec' && type !== 'hyde') continue;
+      const raw = line.slice(colonIdx + 1).trim();
+      const text = raw.replace(/\*\*/g, '').replace(/^"|"$/g, '');
+      if (!text || text.length <= 3) continue;
+      if (!hasQueryTerm(text)) continue;
+      queryables.push({ type: type as 'lex' | 'vec' | 'hyde', text });
     }
 
-    return [{ type: 'lex', text: query }];
+    const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+    if (filtered.length > 0) return filtered;
+
+    // Parsing failed completely — return a sensible fallback
+    return this.expandFallback(originalQuery, includeLexical);
+  }
+
+  /**
+   * Generate a sensible fallback when query expansion fails or cannot be parsed.
+   */
+  private expandFallback(query: string, includeLexical: boolean): Queryable[] {
+    const fallback: Queryable[] = [
+      { type: 'hyde', text: `Information about ${query}` },
+      { type: 'lex', text: query },
+      { type: 'vec', text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
   }
 
   // =========================================================================
@@ -467,19 +614,33 @@ Original query: "${query}"`;
       };
     }
 
+    if (!this.rerankBreaker.canAttempt()) {
+      console.warn('RemoteLLM: rerank circuit breaker is open, returning uniform scores');
+      return {
+        results: documents.map((doc, i) => ({ file: doc.file, score: 1.0, index: i })),
+        model: ep.model,
+      };
+    }
+
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (ep.apiKey) {
+        headers['Authorization'] = `Bearer ${ep.apiKey.trim()}`;
+      }
+
       const data = await nodePost(
         `${ep.baseUrl}/rerank`,
-        { 'Authorization': `Bearer ${ep.apiKey}` },
+        headers,
         {
           model: ep.model,
           query,
           documents: documents.map(d => d.text),
           top_n: documents.length,
         },
-        this.timeoutMs,
+        this.rerankReadTimeoutMs,
       ) as { results: Array<{ index: number; relevance_score: number }>; model?: string };
 
+      this.rerankBreaker.onSuccess();
       return {
         results: data.results.map(r => ({
           index: r.index,
@@ -489,6 +650,7 @@ Original query: "${query}"`;
         model: data.model || ep.model,
       };
     } catch (err) {
+      this.rerankBreaker.onFailure();
       console.error('RemoteLLM: rerank failed:', err instanceof Error ? err.message : String(err));
       // Fall back to uniform scores
       return {

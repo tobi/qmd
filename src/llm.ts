@@ -87,12 +87,24 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * Detect if a model URI refers to a remote API model (not a local GGUF model).
+ * Remote models handle their own prompt formatting, so no prefixes should be added.
+ * Returns true for model names that don't start with "hf:" and don't end in ".gguf".
+ */
+export function isRemoteModel(modelUri: string): boolean {
+  // Local models use hf: URIs (HuggingFace) or local file paths ending in .gguf
+  return !modelUri.startsWith("hf:") && !modelUri.endsWith(".gguf");
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * Remote models receive raw text — they handle their own formatting.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -103,9 +115,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields (default).
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
+ * Remote models receive raw text — they handle their own formatting.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
