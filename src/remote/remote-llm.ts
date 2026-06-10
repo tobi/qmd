@@ -43,11 +43,14 @@ import type { EndpointConfig, RemoteLLMConfig } from './types.js';
 import type { Logger } from './log.js';
 import { consoleLogger } from './log.js';
 import { CircuitBreaker } from './circuit-breaker.js';
-import { resolveEndpoint, remoteConfigFromEnv, OPENROUTER_DEFAULT_URL } from './config.js';
-import { embedBatch } from './embed.js';
-import { expandQuery } from './expand.js';
-import { rerank } from './rerank.js';
-import { generate } from './generate.js';
+import {
+  resolveEndpoint,
+  resolveEndpointFormat,
+  remoteConfigFromEnv,
+  OPENROUTER_DEFAULT_URL,
+} from './config.js';
+import type { RemoteAdapterBundle } from './adapters/types.js';
+import { resolveAdapterBundle } from './adapters/registry.js';
 import { modelExists, probe as runProbe } from './probe.js';
 
 // Re-export types and config for backward compat
@@ -81,6 +84,7 @@ export class RemoteLLM implements LLM {
   private readonly rerankBreaker = new CircuitBreaker();
   private readonly expandBreaker = new CircuitBreaker();
   private readonly generateBreaker = new CircuitBreaker();
+  private readonly adapters: RemoteAdapterBundle;
 
   /**
    * Mutable dimension tracker shared with embed.ts.
@@ -102,50 +106,67 @@ export class RemoteLLM implements LLM {
     if (config.embed) {
       this.embedCfg = {
         baseUrl: config.embed.baseUrl.replace(/\/+$/, ''),
+        format: config.embed.format ?? 'auto',
         model: config.embed.model,
         apiKey: (config.embed.apiKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else if (oldBaseUrl) {
       this.embedCfg = {
         baseUrl: oldBaseUrl.replace(/\/+$/, ''),
+        format: 'auto',
         model: oldModel || process.env.QMD_EMBED_MODEL || 'Qwen/Qwen3-Embedding-0.6B',
         apiKey: (oldKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else {
-      this.embedCfg = resolveEndpoint('embed', 'EMBED', 'Qwen/Qwen3-Embedding-0.6B', 'http://localhost:11434/v1');
+      this.embedCfg = {
+        ...resolveEndpoint('embed', 'EMBED', 'Qwen/Qwen3-Embedding-0.6B', 'http://localhost:11434/v1'),
+        format: resolveEndpointFormat('embed', 'EMBED'),
+      };
     }
 
     // Expand endpoint
     if (config.expand) {
       this.expandCfg = {
         baseUrl: config.expand.baseUrl.replace(/\/+$/, ''),
+        format: config.expand.format ?? 'auto',
         model: config.expand.model,
         apiKey: (config.expand.apiKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else {
-      this.expandCfg = resolveEndpoint('expand', 'EXPAND', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL);
+      this.expandCfg = {
+        ...resolveEndpoint('expand', 'EXPAND', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL),
+        format: resolveEndpointFormat('expand', 'EXPAND'),
+      };
     }
 
     // Rerank endpoint
     if (config.rerank) {
       this.rerankCfg = {
         baseUrl: config.rerank.baseUrl.replace(/\/+$/, ''),
+        format: config.rerank.format ?? 'auto',
         model: config.rerank.model,
         apiKey: (config.rerank.apiKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else {
-      this.rerankCfg = resolveEndpoint('rerank', 'RERANK', 'cohere/rerank-v3.5', OPENROUTER_DEFAULT_URL);
+      this.rerankCfg = {
+        ...resolveEndpoint('rerank', 'RERANK', 'cohere/rerank-v3.5', OPENROUTER_DEFAULT_URL),
+        format: resolveEndpointFormat('rerank', 'RERANK'),
+      };
     }
 
     // Generate endpoint
     if (config.generate) {
       this.generateCfg = {
         baseUrl: config.generate.baseUrl.replace(/\/+$/, ''),
+        format: config.generate.format ?? 'auto',
         model: config.generate.model,
         apiKey: (config.generate.apiKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else {
-      this.generateCfg = resolveEndpoint('generate', 'GENERATE', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL);
+      this.generateCfg = {
+        ...resolveEndpoint('generate', 'GENERATE', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL),
+        format: resolveEndpointFormat('generate', 'GENERATE'),
+      };
     }
 
     // Operational settings
@@ -159,6 +180,13 @@ export class RemoteLLM implements LLM {
       parseInt(process.env.QMD_REMOTE_RERANK_TIMEOUT || '60000', 10);
     this.expandReadTimeoutMs = config.expandReadTimeoutMs ??
       parseInt(process.env.QMD_REMOTE_EXPAND_TIMEOUT || '30000', 10);
+
+    this.adapters = resolveAdapterBundle({
+      embed: this.embedCfg,
+      expand: this.expandCfg,
+      rerank: this.rerankCfg,
+      generate: this.generateCfg,
+    });
   }
 
   // ── Model name getters ──────────────────────────────────────────────
@@ -175,30 +203,26 @@ export class RemoteLLM implements LLM {
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return embedBatch(
-      this.embedCfg,
-      this.embedBreaker,
-      texts,
-      this.maxBatchSize,
-      this.embedReadTimeoutMs,
-      this.dimState,
-      this.embedMaxRetries,
-      this.log,
-      options,
-    );
+    return this.adapters.embed.embedBatch({
+      cfg: this.embedCfg,
+      breaker: this.embedBreaker,
+      log: this.log,
+      maxBatchSize: this.maxBatchSize,
+      readTimeoutMs: this.embedReadTimeoutMs,
+      maxRetries: this.embedMaxRetries,
+      dimState: this.dimState,
+    }, texts, options);
   }
 
   // ── LLM interface: generate ─────────────────────────────────────────
 
   async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
-    return generate(
-      this.generateCfg,
-      this.generateBreaker,
-      prompt,
-      this.expandReadTimeoutMs,
-      this.log,
-      options,
-    );
+    return this.adapters.generate.generate({
+      cfg: this.generateCfg,
+      breaker: this.generateBreaker,
+      log: this.log,
+      readTimeoutMs: this.expandReadTimeoutMs,
+    }, prompt, options);
   }
 
   // ── LLM interface: modelExists ──────────────────────────────────────
@@ -213,14 +237,12 @@ export class RemoteLLM implements LLM {
     query: string,
     options?: { context?: string; includeLexical?: boolean; intent?: string },
   ): Promise<Queryable[]> {
-    return expandQuery(
-      this.expandCfg,
-      this.expandBreaker,
-      query,
-      this.expandReadTimeoutMs,
-      options,
-      this.log,
-    );
+    return this.adapters.expand.expandQuery({
+      cfg: this.expandCfg,
+      breaker: this.expandBreaker,
+      log: this.log,
+      readTimeoutMs: this.expandReadTimeoutMs,
+    }, query, options);
   }
 
   // ── LLM interface: rerank ───────────────────────────────────────────
@@ -228,16 +250,14 @@ export class RemoteLLM implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    _options?: RerankOptions,
+    options?: RerankOptions,
   ): Promise<RerankResult> {
-    return rerank(
-      this.rerankCfg,
-      this.rerankBreaker,
-      query,
-      documents,
-      this.rerankReadTimeoutMs,
-      this.log,
-    );
+    return this.adapters.rerank.rerank({
+      cfg: this.rerankCfg,
+      breaker: this.rerankBreaker,
+      log: this.log,
+      readTimeoutMs: this.rerankReadTimeoutMs,
+    }, query, documents, options);
   }
 
   // ── LLM interface: dispose ──────────────────────────────────────────
