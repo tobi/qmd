@@ -21,8 +21,7 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
-  findDocumentByDocid,
-  isDocid,
+  findDocument,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -993,163 +992,37 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   if (fromLine !== undefined) fromLine = Math.max(1, fromLine);
 
   const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
-  if (parsedIndexPath?.indexName) {
-    setIndexName(parsedIndexPath.indexName);
-    setConfigIndexName(parsedIndexPath.indexName);
+  if (parsedIndexPath) {
+    if (parsedIndexPath.indexName) {
+      setIndexName(parsedIndexPath.indexName);
+      setConfigIndexName(parsedIndexPath.indexName);
+    }
+    inputPath = buildVirtualPath(parsedIndexPath.collectionName, parsedIndexPath.path);
   }
 
   const db = getDb();
-
-  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
-  if (isDocid(inputPath)) {
-    const docidMatch = findDocumentByDocid(db, inputPath);
-    if (docidMatch) {
-      inputPath = docidMatch.filepath;
+  const doc = findDocument(db, inputPath, { includeBody: true });
+  if ("error" in doc) {
+    if (doc.error === "excluded_by_ignore") {
+      console.error(`Document is excluded by ignore rule: ${filename}`);
+      console.error(`Collection: ${doc.collection}`);
+      console.error(`Matched path: ${doc.path}`);
+      console.error(`Ignore rule: ${doc.rule}`);
     } else {
       console.error(`Document not found: ${filename}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
-  let doc: { collectionName: string; path: string; body: string } | null = null;
-  let virtualPath: string;
-
-  // Handle virtual paths (qmd://collection/path)
-  if (isVirtualPath(inputPath)) {
-    const parsed = parseVirtualPath(inputPath);
-    if (!parsed) {
-      console.error(`Invalid virtual path: ${inputPath}`);
-      closeDb();
-      process.exit(1);
-    }
-
-    // Try exact match on collection + path
-    doc = db.prepare(`
-      SELECT d.collection as collectionName, d.path, content.doc as body
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(parsed.collectionName, parsed.path) as typeof doc;
-
-    if (!doc) {
-      // Try fuzzy match by path ending
-      doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-        LIMIT 1
-      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
-    }
-
-    virtualPath = inputPath;
-  } else {
-    // Try to interpret as collection/path format first (before filesystem path)
-    // If path is relative (no / or ~ prefix), check if first component is a collection name
-    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
-      const parts = inputPath.split('/');
-      if (parts.length >= 2) {
-        const possibleCollection = parts[0];
-        const possiblePath = parts.slice(1).join('/');
-
-        // Check if this collection exists
-        const collExists = possibleCollection ? db.prepare(`
-          SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
-        `).get(possibleCollection) : null;
-
-        if (collExists) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT d.collection as collectionName, d.path, content.doc as body
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
-
-          if (!doc) {
-            // Try fuzzy match by path ending
-            doc = db.prepare(`
-              SELECT d.collection as collectionName, d.path, content.doc as body
-              FROM documents d
-              JOIN content ON content.hash = d.hash
-              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-              LIMIT 1
-            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
-          }
-
-          if (doc) {
-            virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-            // Skip the filesystem path handling below
-          }
-        }
+      if (doc.similarFiles.length > 0) {
+        console.error("Similar files:");
+        for (const file of doc.similarFiles) console.error(`  ${file}`);
       }
     }
-
-    // If not found as collection/path, handle as filesystem paths
-    if (!doc) {
-      let fsPath = inputPath;
-
-      // Expand ~ to home directory
-      if (fsPath.startsWith('~/')) {
-        fsPath = homedir() + fsPath.slice(1);
-      } else if (!fsPath.startsWith('/')) {
-        // Relative path - resolve from current directory
-        fsPath = resolve(getPwd(), fsPath);
-      }
-      fsPath = getRealPath(fsPath);
-
-      // Try to detect which collection contains this path
-      const detected = detectCollectionFromPath(db, fsPath);
-
-      if (detected) {
-        // Found collection - query by collection name + relative path
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      // Fuzzy match by filename (last component of path)
-      if (!doc) {
-        const filename = inputPath.split('/').pop() || inputPath;
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      if (doc) {
-        virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-      } else {
-        virtualPath = inputPath;
-      }
-    }
-  }
-
-  // Ensure doc is not null before proceeding
-  if (!doc) {
-    console.error(`Document not found: ${filename}`);
     closeDb();
     process.exit(1);
   }
 
-  // Get context for this file
-  const context = getContextForPath(db, doc.collectionName, doc.path);
-
-  // Resolve the docid (first 6 chars of the content hash) so callers always
-  // know what they retrieved and can cite it back to `get`/`multi-get`.
-  const hashRow = db.prepare(`
-    SELECT d.hash as hash
-    FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
-  `).get(doc.collectionName, doc.path) as { hash: string } | null;
-  const docid = hashRow?.hash ? hashRow.hash.slice(0, 6) : undefined;
-  const canonicalPath = buildVirtualPath(doc.collectionName, doc.path);
+  // `findDocument` already computes the docid (first 6 hash chars) and the
+  // canonical display path, so we reuse them here instead of a second lookup.
+  const docid = doc.docid;
+  const canonicalPath = `qmd://${doc.displayPath}`;
 
   // --full-path: show the on-disk path instead of the qmd:// URL + docid, when
   // the file actually exists. Fall back to the canonical header otherwise.
@@ -1165,7 +1038,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
   }
 
-  let output = doc.body;
+  let output = doc.body || "";
   const startLine = fromLine || 1;
 
   // Apply line filtering if specified
@@ -1185,8 +1058,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   // Header: identify the document (path + docid, or the on-disk path with
   // --full-path), then optional context.
   console.log(header);
-  if (context) {
-    console.log(`Folder Context: ${context}`);
+  if (doc.context) {
+    console.log(`Folder Context: ${doc.context}`);
   }
   console.log("---\n");
   console.log(output);

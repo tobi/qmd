@@ -1222,7 +1222,7 @@ export type Store = {
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
-  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
+  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
   findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
 
@@ -2086,6 +2086,16 @@ export type DocumentNotFound = {
   query: string;
   similarFiles: string[];
 };
+
+export type DocumentExcludedByIgnore = {
+  error: "excluded_by_ignore";
+  query: string;
+  collection: string;
+  path: string;
+  rule: string;
+};
+
+export type DocumentLookupError = DocumentNotFound | DocumentExcludedByIgnore;
 
 /**
  * Result from multi-get operations
@@ -3995,6 +4005,63 @@ type DbDocRow = {
   body?: string;
 };
 
+function normalizeLookupPathForIgnore(path: string): string {
+  let normalized = path.replace(/\\/g, '/').trim();
+  if (normalized.startsWith('~/')) {
+    normalized = homedir() + normalized.slice(1);
+  }
+  return normalized;
+}
+
+function matchesIgnoreRule(relativePath: string, rule: string): boolean {
+  const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const normalizedRule = rule.replace(/\\/g, '/').replace(/^\/+/, '');
+  const isMatch = picomatch(normalizedRule, { dot: true });
+  return isMatch(normalizedPath);
+}
+
+function getIgnoredLookupMatch(db: Database, query: string): DocumentExcludedByIgnore | null {
+  const normalizedQuery = normalizeLookupPathForIgnore(query);
+  const parsedVirtual = isVirtualPath(normalizedQuery) ? parseVirtualPath(normalizedQuery) : null;
+  const collections = getStoreCollections(db);
+
+  for (const coll of collections) {
+    if (!coll.ignore || coll.ignore.length === 0) continue;
+
+    const candidates: string[] = [];
+
+    if (parsedVirtual) {
+      if (parsedVirtual.collectionName !== coll.name) continue;
+      candidates.push(parsedVirtual.path);
+    } else if (normalizedQuery.startsWith(coll.path + '/')) {
+      candidates.push(normalizedQuery.slice(coll.path.length + 1));
+    } else if (!normalizedQuery.startsWith('/')) {
+      const collectionPrefix = `${coll.name}/`;
+      if (normalizedQuery.startsWith(collectionPrefix)) {
+        candidates.push(normalizedQuery.slice(collectionPrefix.length));
+      } else {
+        candidates.push(normalizedQuery);
+      }
+    }
+
+    for (const candidate of candidates) {
+      for (const rule of coll.ignore) {
+        if (matchesIgnoreRule(candidate, rule)) {
+          return {
+            error: "excluded_by_ignore",
+            query,
+            collection: coll.name,
+            path: candidate,
+            rule,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Find a document by filename/path, docid (#hash), or with fuzzy matching.
  * Returns document metadata without body by default.
@@ -4005,7 +4072,7 @@ type DbDocRow = {
  * - Relative paths: path/to/file.md
  * - Short docid: #abc123 (first 6 chars of hash)
  */
-export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
+export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentLookupError {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
@@ -4088,6 +4155,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
   }
 
   if (!doc) {
+    const ignored = getIgnoredLookupMatch(db, filepath);
+    if (ignored) return ignored;
+
     const similar = findSimilarFiles(db, filepath, 5, 5);
     return { error: "not_found", query: filename, similarFiles: similar };
   }

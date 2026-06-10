@@ -1980,6 +1980,69 @@ describe("get command path normalization", () => {
   });
 });
 
+describe("get command missing and ignored paths", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let getTestDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("get-missing-ignored");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    getTestDir = join(testDir, "get-missing-ignored-fixtures");
+
+    await mkdir(join(getTestDir, "public"), { recursive: true });
+    await mkdir(join(getTestDir, "private"), { recursive: true });
+    await writeFile(join(getTestDir, "public", "prompt-log.md"), "# Public Log\nThis indexed file must not be returned for missing paths.");
+    await writeFile(join(getTestDir, "private", "log.md"), "# Private Log\nThis ignored file must not be indexed.");
+
+    await writeFile(
+      join(localConfigDir, "index.yml"),
+      `collections:
+  gettst:
+    path: ${getTestDir}
+    pattern: "**/*.md"
+    ignore:
+      - "private/**"
+`
+    );
+
+    const { exitCode, stderr } = await runQmd(["update"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    if (exitCode !== 0) console.error("update failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("get reports ignored paths instead of falling back to same-basename fuzzy match", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["get", "private/log.md"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("Public Log");
+    expect(stderr).toContain("excluded by ignore rule");
+    expect(stderr).toContain("private/log.md");
+    expect(stderr).toContain("private/**");
+  });
+
+  test("get does not fall back to same-basename fuzzy match for missing paths", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["get", "missing/log.md"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("Public Log");
+    expect(stderr).toContain("Document not found");
+  });
+});
+
 // =============================================================================
 // Status and Collection List - No Full Paths
 // =============================================================================

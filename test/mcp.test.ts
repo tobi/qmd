@@ -475,7 +475,10 @@ describe("MCP Server", () => {
       const result = findDocument(testDb, "readm.md", { includeBody: false }); // typo
       expect("error" in result).toBe(true);
       if ("error" in result) {
-        expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        expect(result.error).toBe("not_found");
+        if (result.error === "not_found") {
+          expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        }
       }
     });
 
