@@ -613,18 +613,106 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
+  // Models — read config + env vars directly (no auto-save via ensureModelsConfiguredForCli)
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
+    type ModelEndpoint = 'embed' | 'expand' | 'rerank' | 'generate';
+
+    const config = loadConfig();
+    const models = config.models ?? {};
+
+    // Env var mapping for each endpoint
+    const envMap: Record<ModelEndpoint, { model: string; baseUrl: string; apiKey: string }> = {
+      embed:   { model: 'QMD_EMBED_MODEL',   baseUrl: 'QMD_EMBED_BASE_URL',   apiKey: 'QMD_EMBED_API_KEY' },
+      expand:  { model: 'QMD_EXPAND_MODEL',  baseUrl: 'QMD_EXPAND_BASE_URL',  apiKey: 'QMD_EXPAND_API_KEY' },
+      rerank:  { model: 'QMD_RERANK_MODEL',  baseUrl: 'QMD_RERANK_BASE_URL',  apiKey: 'QMD_RERANK_API_KEY' },
+      generate: { model: 'QMD_GENERATE_MODEL', baseUrl: 'QMD_GENERATE_BASE_URL', apiKey: 'QMD_GENERATE_API_KEY' },
     };
-    const activeModels = resolveModelsForCli();
+
+    // Config field mapping
+    const cfgMap: Record<ModelEndpoint, { model: string; url: string; key: string; flat?: string }> = {
+      embed:    { model: 'embed_api_model',  url: 'embed_api_url',  key: 'embed_api_key',  flat: 'embed' },
+      expand:   { model: 'expand_api_model', url: 'expand_api_url', key: 'expand_api_key', flat: undefined },
+      rerank:   { model: 'rerank_api_model', url: 'rerank_api_url', key: 'rerank_api_key', flat: 'rerank' },
+      generate: { model: 'generate_api_model', url: 'generate_api_url', key: 'generate_api_key', flat: 'generate' },
+    };
+
+    // Default GGUF models
+    const defaults: Record<ModelEndpoint, string> = {
+      embed: DEFAULT_EMBED_MODEL,
+      expand: DEFAULT_QUERY_MODEL,
+      rerank: DEFAULT_RERANK_MODEL,
+      generate: DEFAULT_QUERY_MODEL,
+    };
+
+    // Determine provider label from URL
+    const providerLabel = (url: string): string => {
+      if (!url) return 'local (GGUF)';
+      try {
+        const u = new URL(url);
+        const host = u.hostname + (u.port && u.port !== '80' && u.port !== '443' ? `:${u.port}` : '');
+        if (u.hostname.includes('openrouter.ai')) return 'OpenRouter';
+        if (u.hostname.includes('api.openai.com')) return 'OpenAI';
+        if (u.hostname.includes('ollama')) return 'Ollama';
+        if (u.hostname.includes('api.x.ai')) return 'xAI';
+        return host;
+      } catch {
+        return url;
+      }
+    };
+
+    // Resolve each endpoint's model name, provider, and source tag
+    const resolveEndpoint = (ep: ModelEndpoint): { model: string; provider: string; source: string } => {
+      const env = envMap[ep];
+      const cfg = cfgMap[ep];
+      const envModel = process.env[env.model];
+      const envUrl = process.env[env.baseUrl];
+      const cfgModel = (models as Record<string, string | undefined>)[cfg.model];
+      const cfgUrl = (models as Record<string, string | undefined>)[cfg.url];
+      const flatModel = cfg.flat ? (models as Record<string, string | undefined>)[cfg.flat] : undefined;
+
+      // Source priority: env var > config (remote or flat) > default
+      if (envModel || envUrl) {
+        return {
+          model: envModel || cfgModel || defaults[ep],
+          provider: providerLabel((envUrl || cfgUrl) ?? ''),
+          source: `(env ${env.model})`,
+        };
+      }
+      if (cfgModel || cfgUrl) {
+        return {
+          model: cfgModel || flatModel || defaults[ep],
+          provider: providerLabel(cfgUrl ?? ''),
+          source: '(index.yml)',
+        };
+      }
+      if (flatModel) {
+        return {
+          model: flatModel,
+          provider: providerLabel(''),
+          source: '(index.yml)',
+        };
+      }
+      return {
+        model: defaults[ep],
+        provider: providerLabel(''),
+        source: '(default)',
+      };
+    };
+
+    const labelWidth = 11; // "Embed:     " = 11 chars
+    const eps: { ep: ModelEndpoint; label: string }[] = [
+      { ep: 'embed',   label: 'Embed:' },
+      { ep: 'expand',  label: 'Expand:' },
+      { ep: 'rerank',  label: 'Rerank:' },
+      { ep: 'generate', label: 'Generate:' },
+    ];
+
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    for (const { ep, label } of eps) {
+      const { model, provider, source } = resolveEndpoint(ep);
+      const pad = ' '.repeat(Math.max(0, labelWidth - label.length));
+      console.log(`  ${label}${pad} ${c.cyan}${model}${c.reset} → ${c.dim}${provider}${c.reset} ${c.yellow}${source}${c.reset}`);
+    }
   }
 
 
@@ -1948,22 +2036,10 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  // Read-only resolution: config + env + defaults, no auto-save
   try {
     const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    return resolveModels(config.models);
   } catch {
     return resolveModels();
   }
