@@ -283,6 +283,17 @@ describe('CircuitBreaker', () => {
     cb.onFailure();  // fail in half-open
     expect(cb.getState()).toBe('open');
   });
+
+  test('half-open allows only one in-flight probe attempt', async () => {
+    const cb = new CircuitBreaker(1, 50);
+    cb.onFailure();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(cb.canAttempt()).toBe(true);  // first probe
+    expect(cb.canAttempt()).toBe(false); // second concurrent probe blocked
+    cb.onSuccess();
+    expect(cb.getState()).toBe('closed');
+    expect(cb.canAttempt()).toBe(true);
+  });
 });
 
 // =============================================================================

@@ -4674,22 +4674,7 @@ function loadSearchDocumentsByFilepaths(
   const uniqueFilepaths = [...new Set(filepaths)];
   if (uniqueFilepaths.length === 0) return new Map();
 
-  const placeholders = uniqueFilepaths.map(() => "?").join(",");
-  const rows = db.prepare(`
-    SELECT
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      d.hash,
-      d.collection,
-      d.modified_at,
-      LENGTH(content.doc) as body_length,
-      content.doc as body
-    FROM documents d
-    JOIN content ON content.hash = d.hash
-    WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders})
-      AND d.active = 1
-  `).all(...uniqueFilepaths) as Array<{
+  type HydrationRow = {
     filepath: string;
     display_path: string;
     title: string;
@@ -4698,7 +4683,70 @@ function loadSearchDocumentsByFilepaths(
     modified_at: string;
     body_length: number;
     body: string;
-  }>;
+  };
+
+  const rows: HydrationRow[] = [];
+
+  // Fast path: virtual paths are keyed by (collection, path), which aligns with
+  // the documents UNIQUE(collection, path) index. This avoids filtering via a
+  // computed "qmd://..." expression that forces a scan on large indexes.
+  const virtualPairs = new Map<string, { collection: string; path: string }>();
+  const fallbackFilepaths: string[] = [];
+
+  for (const filepath of uniqueFilepaths) {
+    const parsed = filepath.startsWith('qmd://') ? parseVirtualPath(filepath) : null;
+    if (parsed) {
+      const key = `${parsed.collectionName}\u0000${parsed.path}`;
+      if (!virtualPairs.has(key)) {
+        virtualPairs.set(key, { collection: parsed.collectionName, path: parsed.path });
+      }
+    } else {
+      fallbackFilepaths.push(filepath);
+    }
+  }
+
+  if (virtualPairs.size > 0) {
+    const pairs = [...virtualPairs.values()];
+    const wherePairs = pairs.map(() => `(d.collection = ? AND d.path = ?)`).join(' OR ');
+    const params = pairs.flatMap((p) => [p.collection, p.path]);
+    const indexedRows = db.prepare(`
+      SELECT
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        d.hash,
+        d.collection,
+        d.modified_at,
+        LENGTH(content.doc) as body_length,
+        content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.active = 1
+        AND (${wherePairs})
+    `).all(...params) as HydrationRow[];
+    rows.push(...indexedRows);
+  }
+
+  // Compatibility fallback for any non-virtual file identifiers.
+  if (fallbackFilepaths.length > 0) {
+    const placeholders = fallbackFilepaths.map(() => '?').join(',');
+    const fallbackRows = db.prepare(`
+      SELECT
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        d.hash,
+        d.collection,
+        d.modified_at,
+        LENGTH(content.doc) as body_length,
+        content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders})
+        AND d.active = 1
+    `).all(...fallbackFilepaths) as HydrationRow[];
+    rows.push(...fallbackRows);
+  }
 
   return new Map(rows.map(row => [row.filepath, {
     filepath: row.filepath,

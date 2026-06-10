@@ -28,6 +28,7 @@ export class CircuitBreaker {
   private state: CircuitState = 'closed';
   private failures = 0;
   private lastFailureTime = 0;
+  private halfOpenProbeInFlight = false;
   private readonly maxFailures: number;
   private readonly cooldownMs: number;
 
@@ -50,11 +51,14 @@ export class CircuitBreaker {
     if (this.state === 'open') {
       if (Date.now() - this.lastFailureTime >= this.cooldownMs) {
         this.state = 'half-open';
+        this.halfOpenProbeInFlight = true;
         return true;
       }
       return false;
     }
-    // half-open: allow one probe attempt
+    // half-open: allow only one in-flight probe request.
+    if (this.halfOpenProbeInFlight) return false;
+    this.halfOpenProbeInFlight = true;
     return true;
   }
 
@@ -62,12 +66,14 @@ export class CircuitBreaker {
   onSuccess(): void {
     this.state = 'closed';
     this.failures = 0;
+    this.halfOpenProbeInFlight = false;
   }
 
   /** Report a failed request. May transition to open state. */
   onFailure(): void {
     this.failures++;
     this.lastFailureTime = Date.now();
+    this.halfOpenProbeInFlight = false;
     if (this.state === 'half-open' || this.failures >= this.maxFailures) {
       this.state = 'open';
     }
