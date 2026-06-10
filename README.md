@@ -1010,7 +1010,7 @@ QMD can run fully local or delegate each LLM role to remote APIs. Roles are inde
 
 | Role | Used for | Typical route(s) |
 |------|----------|------------------|
-| `embed` | `qmd embed`, vector search (`vsearch`, hybrid pipeline) | `/v1/embeddings`, `/v2/embed`, `/embed` |
+| `embed` | `qmd embed`, vector search (`vsearch`, hybrid pipeline) | `/v1/embeddings`, `/v2/embed`, `/embed`, `/pooling`, `/v1/pooling` |
 | `expand` | Query expansion in hybrid search | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` |
 | `rerank` | Final relevance sorting of candidate chunks | `/rerank`, `/v1/rerank`, `/v2/rerank`, `/score`, `/v1/score` |
 | `generate` | General text generation path (SDK/adapter surface) | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` |
@@ -1044,6 +1044,7 @@ Adapter notes:
 
 - `auto` keeps legacy behavior.
 - `cohere_v2_embed` uses the Cohere-compatible embed adapter with path/payload/input-type fallback.
+- `vllm_pooling` uses the vLLM Pooling adapter (`/pooling` with `/v1/pooling` fallback).
 - `cohere_v1_rerank` / `cohere_v2_rerank` use the Cohere-compatible rerank adapter.
 - `vllm_score` uses the vLLM Score adapter (`/score` with `/v1/score` fallback).
 - `anthropic_messages` uses `x-api-key` + `anthropic-version` headers and `/messages` payloads.

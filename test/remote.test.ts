@@ -63,6 +63,12 @@ import {
 } from '../src/remote/adapters/anthropic-messages.js';
 import { cohereV2EmbedAdapter } from '../src/remote/adapters/cohere-embed.js';
 import { ollamaEmbedAdapter } from '../src/remote/adapters/ollama-embed.js';
+import { vllmPoolingAdapter } from '../src/remote/adapters/vllm-pooling.js';
+import {
+  remoteTokenize,
+  remoteDetokenize,
+  remoteTokenizerAvailable,
+} from '../src/remote/tokenizer.js';
 import {
   ollamaChatExpandAdapter,
   ollamaChatGenerateAdapter,
@@ -1431,6 +1437,16 @@ describe('resolveAdapterBundle', () => {
     });
     expect(bundle.rerank.id).toBe('vllm/score');
   });
+
+  test('vllm_pooling resolves to vLLM pooling adapter', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'vllm_pooling' }),
+      expand: ecfg({ format: 'auto' }),
+      rerank: ecfg({ format: 'auto' }),
+      generate: ecfg({ format: 'auto' }),
+    });
+    expect(bundle.embed.id).toBe('vllm/pooling');
+  });
 });
 
 // =============================================================================
@@ -1486,7 +1502,7 @@ describe('cohereV2EmbedAdapter', () => {
     await server.close();
   });
 
-  test('sets input_type=search_query when embedding query text', async () => {
+  test('for non-Cohere hosts, uses query input_type when embedding query text', async () => {
     let receivedBody: any = null;
     const server = startMockServer(async (req, res) => {
       receivedBody = await readBody(req);
@@ -1501,24 +1517,42 @@ describe('cohereV2EmbedAdapter', () => {
       { isQuery: true },
     );
 
-    expect(receivedBody.input_type).toBe('search_query');
+    expect(receivedBody.input_type).toBe('query');
     await server.close();
   });
 
-  test('falls back input_type from search_document to document on vLLM-style error', async () => {
+  test('for Cohere hosts, falls back input_type from search_document to document on unsupported-input_type errors', async () => {
+    const seenInputTypes: string[] = [];
+    const postSpy = vi
+      .spyOn(await import('../src/remote/transport.js'), 'nodePost')
+      .mockImplementation(async (_url, _headers, body) => {
+        const inputType = String((body as Record<string, unknown>).input_type ?? '');
+        seenInputTypes.push(inputType);
+        if (inputType === 'search_document') {
+          throw new Error("HTTP 400: Unsupported input_type 'search_document'. Supported values: document, query");
+        }
+        return { embeddings: { float: [mockEmbedding] } };
+      });
+
+    try {
+      const result = await cohereV2EmbedAdapter.embedBatch(
+        makeCtx('https://api2.cohere.ai/v2'),
+        ['hello'],
+        {},
+      );
+
+      expect(result).toHaveLength(1);
+      expect(seenInputTypes).toEqual(['search_document', 'document']);
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  test('for non-Cohere hosts, prefers document input_type first', async () => {
     const seenInputTypes: string[] = [];
     const server = startMockServer(async (req, res) => {
       const body = await readBody(req) as Record<string, unknown>;
-      const inputType = String(body.input_type ?? '');
-      seenInputTypes.push(inputType);
-      if (inputType === 'search_document') {
-        jsonRes(res, 400, {
-          error: {
-            message: "Unsupported input_type 'search_document'. Supported values: document, query",
-          },
-        });
-        return;
-      }
+      seenInputTypes.push(String(body.input_type ?? ''));
       jsonRes(res, 200, {
         embeddings: { float: [mockEmbedding] },
       });
@@ -1531,8 +1565,33 @@ describe('cohereV2EmbedAdapter', () => {
     );
 
     expect(result).toHaveLength(1);
-    expect(seenInputTypes).toEqual(['search_document', 'document']);
+    expect(seenInputTypes[0]).toBe('document');
     await server.close();
+  });
+
+  test('for Cohere hosts, prefers search_document input_type first', async () => {
+    const seenInputTypes: string[] = [];
+    const realPost = nodePost;
+    const postSpy = vi
+      .spyOn(await import('../src/remote/transport.js'), 'nodePost')
+      .mockImplementation(async (_url, _headers, body) => {
+        seenInputTypes.push(String((body as Record<string, unknown>).input_type ?? ''));
+        return { embeddings: { float: [mockEmbedding] } };
+      });
+
+    try {
+      const result = await cohereV2EmbedAdapter.embedBatch(
+        makeCtx('https://api.cohere.ai/v2'),
+        ['hello'],
+        {},
+      );
+      expect(result).toHaveLength(1);
+      expect(seenInputTypes[0]).toBe('search_document');
+    } finally {
+      postSpy.mockRestore();
+      // Keep reference live to avoid accidental tree-shake lint in test context.
+      void realPost;
+    }
   });
 
   test('normalizes OpenAI-style data embeddings using index order', async () => {
@@ -1557,17 +1616,11 @@ describe('cohereV2EmbedAdapter', () => {
     await server.close();
   });
 
-  test('falls back endpoint path from /v2/embed to /embed', async () => {
+  test('does not fall back to /embed when /v2/embed returns 404', async () => {
     const requestedPaths: string[] = [];
     const server = startMockServer(async (req, res) => {
       requestedPaths.push(req.url ?? '');
-      if (req.url === '/v2/embed') {
-        jsonRes(res, 404, { error: 'not found' });
-        return;
-      }
-      jsonRes(res, 200, {
-        embeddings: { float: [mockEmbedding] },
-      });
+      jsonRes(res, 404, { error: 'not found' });
     });
 
     const result = await cohereV2EmbedAdapter.embedBatch(
@@ -1576,19 +1629,37 @@ describe('cohereV2EmbedAdapter', () => {
       {},
     );
 
-    expect(result).toHaveLength(1);
-    expect(requestedPaths).toEqual(['/v2/embed', '/v2/embed', '/embed']);
+    expect(result).toEqual([null]);
+    expect(requestedPaths).toEqual(['/v2/embed', '/v2/embed']);
+    expect(requestedPaths).not.toContain('/embed');
     await server.close();
   });
 
-  test('when baseUrl ends with /embed, fallback target is sibling /v2/embed', async () => {
+  test('when baseUrl ends with /v1, targets root /v2/embed first (not /v1/v2/embed)', async () => {
     const requestedPaths: string[] = [];
     const server = startMockServer(async (req, res) => {
       requestedPaths.push(req.url ?? '');
-      if (req.url === '/embed') {
-        jsonRes(res, 404, { error: 'not found' });
-        return;
-      }
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(`${server.url}/v1`),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths[0]).toBe('/v2/embed');
+    expect(requestedPaths).not.toContain('/v1/v2/embed');
+    await server.close();
+  });
+
+  test('when baseUrl ends with /embed, normalizes to sibling /v2/embed', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
       jsonRes(res, 200, {
         embeddings: { float: [mockEmbedding] },
       });
@@ -1601,7 +1672,29 @@ describe('cohereV2EmbedAdapter', () => {
     );
 
     expect(result).toHaveLength(1);
-    expect(requestedPaths).toEqual(['/embed', '/embed', '/v2/embed']);
+    expect(requestedPaths).toEqual(['/v2/embed']);
+    expect(requestedPaths).not.toContain('/embed');
+    await server.close();
+  });
+
+  test('when baseUrl ends with /v1/embed, prefers root /v2/embed before /v1/embed', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(`${server.url}/v1/embed`),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths[0]).toBe('/v2/embed');
+    expect(requestedPaths).not.toContain('/v1/v2/embed');
     await server.close();
   });
 
@@ -1729,6 +1822,177 @@ describe('ollamaEmbedAdapter', () => {
       ollamaEmbedAdapter.embedBatch(ctx, ['b'], {}),
     ).rejects.toThrow('dimension mismatch');
 
+    await server.close();
+  });
+});
+
+describe('vllmPoolingAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof vllmPoolingAdapter.embedBatch>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'Qwen/Qwen3-Embedding-0.6B', apiKey: 'sk-test', format: 'vllm_pooling' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      maxBatchSize: 32,
+      readTimeoutMs: 5000,
+      maxRetries: 1,
+      dimState: { dimensions: null },
+    };
+  }
+
+  test('posts to /pooling and normalizes data[].embedding vectors', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        data: [
+          { index: 0, embedding: mockEmbedding },
+          { index: 1, embedding: [0.4, 0.5, 0.6] },
+        ],
+      });
+    });
+
+    const result = await vllmPoolingAdapter.embedBatch(
+      makeCtx(server.url),
+      ['hello', 'world'],
+      {},
+    );
+
+    expect(requestedPath).toBe('/pooling');
+    expect(receivedBody.input).toEqual(['hello', 'world']);
+    expect(result).toHaveLength(2);
+    expect(result[0]!.embedding).toEqual(mockEmbedding);
+    expect(result[1]!.embedding).toEqual([0.4, 0.5, 0.6]);
+    await server.close();
+  });
+
+  test('when baseUrl ends with /v1, targets sibling /pooling first', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer((req, res) => {
+      requestedPaths.push(req.url ?? '');
+      jsonRes(res, 200, {
+        data: [{ embedding: mockEmbedding }],
+      });
+    });
+
+    const result = await vllmPoolingAdapter.embedBatch(
+      makeCtx(`${server.url}/v1`),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths[0]).toBe('/pooling');
+    expect(requestedPaths).not.toContain('/v1/v1/pooling');
+    await server.close();
+  });
+
+  test('falls back endpoint path from /pooling to /v1/pooling', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer((req, res) => {
+      requestedPaths.push(req.url ?? '');
+      if (req.url === '/pooling') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        data: [{ embedding: mockEmbedding }],
+      });
+    });
+
+    const result = await vllmPoolingAdapter.embedBatch(
+      makeCtx(server.url),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths).toEqual(['/pooling', '/v1/pooling']);
+    await server.close();
+  });
+});
+
+describe('remote tokenizer endpoints', () => {
+  test('for /v1 baseUrl, tokenization hits root /tokenize (not /v1/tokenize)', async () => {
+    const paths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      paths.push(req.url || '');
+      if (req.url === '/tokenize') {
+        jsonRes(res, 200, { count: 3, max_model_len: 8192, tokens: [11, 22, 33] });
+        return;
+      }
+      jsonRes(res, 404, { error: 'not found' });
+    });
+
+    const tokens = await remoteTokenize(
+      { baseUrl: `${server.url}/v1`, model: 'test-embed-model' },
+      'hello world',
+    );
+
+    expect(tokens).toEqual([11, 22, 33]);
+    expect(paths[0]).toBe('/tokenize');
+    await server.close();
+  });
+
+  test('tokenization falls back from /tokenize to /v1/tokenize when needed', async () => {
+    const paths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      paths.push(req.url || '');
+      if (req.url === '/tokenize') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      if (req.url === '/v1/tokenize') {
+        jsonRes(res, 200, { count: 2, max_model_len: 8192, tokens: [1, 2] });
+        return;
+      }
+      jsonRes(res, 404, { error: 'not found' });
+    });
+
+    const tokens = await remoteTokenize(
+      { baseUrl: server.url, model: 'test-embed-model' },
+      'fallback please',
+    );
+
+    expect(tokens).toEqual([1, 2]);
+    expect(paths.slice(0, 2)).toEqual(['/tokenize', '/v1/tokenize']);
+    await server.close();
+  });
+
+  test('detokenization posts to /detokenize and returns prompt text', async () => {
+    const paths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      paths.push(req.url || '');
+      if (req.url === '/detokenize') {
+        const body = await readBody(req) as { tokens?: number[] };
+        expect(body.tokens).toEqual([5, 6, 7]);
+        jsonRes(res, 200, { prompt: 'decoded text' });
+        return;
+      }
+      jsonRes(res, 404, { error: 'not found' });
+    });
+
+    const text = await remoteDetokenize(
+      { baseUrl: `${server.url}/v1`, model: 'test-embed-model' },
+      [5, 6, 7],
+    );
+
+    expect(text).toBe('decoded text');
+    expect(paths[0]).toBe('/detokenize');
+    await server.close();
+  });
+
+  test('remoteTokenizerAvailable returns false when endpoint is missing', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 404, { error: 'not found' });
+    });
+
+    const ok = await remoteTokenizerAvailable({
+      baseUrl: server.url,
+      model: 'test-embed-model',
+    });
+    expect(ok).toBe(false);
     await server.close();
   });
 });
@@ -2667,7 +2931,9 @@ describe('RemoteLLM with Phase 4 cohere formats', () => {
     const result = await llm.embedBatch(['hello']);
     expect(result[0]!.embedding).toEqual(mockEmbedding);
     expect(requestedPath).toBe('/v2/embed');
-    expect(receivedBody.input_type).toBe('search_document');
+    // Local/mock hosts use the generic plain contract; Cohere-hosted endpoints
+    // prefer the search_* variants and fall back when unsupported.
+    expect(receivedBody.input_type).toBe('document');
 
     await llm.dispose();
     await server.close();

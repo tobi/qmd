@@ -7,6 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  retrieval-gate:
+    name: Retrieval Gate (Node 22, Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install SQLite (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - run: npm install
+
+      - name: Retrieval Metrics Gate
+        run: npx vitest run --reporter=verbose --testTimeout 60000 test/retrieval-gate.test.ts
+        env:
+          CI: true
+
   test-node:
     name: Node ${{ matrix.node-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

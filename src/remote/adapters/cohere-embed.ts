@@ -27,6 +27,7 @@ type CohereInputType =
 const endpointPathCache = new Map<string, string>();
 const requestModeCache = new Map<string, CohereEmbedMode>();
 const inputTypeCache = new Map<string, CohereInputType>();
+const inputTypeFamilyCache = new Map<string, 'cohere_search' | 'generic_plain'>();
 
 function cacheKey(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '');
@@ -36,16 +37,23 @@ function buildEmbedUrlCandidates(baseUrl: string): string[] {
   const trimmed = baseUrl.replace(/\/+$/, '');
 
   if (trimmed.endsWith('/v2/embed')) return [trimmed];
+  if (trimmed.endsWith('/v1/embed')) {
+    const root = trimmed.replace(/\/v1\/embed$/, '');
+    return [`${root}/v2/embed`];
+  }
+  if (trimmed.endsWith('/v1')) {
+    const root = trimmed.replace(/\/v1$/, '');
+    return [`${root}/v2/embed`];
+  }
   if (trimmed.endsWith('/v2')) {
-    const sibling = trimmed.replace(/\/v2$/, '/embed');
-    return Array.from(new Set([`${trimmed}/embed`, sibling]));
+    return [`${trimmed}/embed`];
   }
   if (trimmed.endsWith('/embed')) {
     const sibling = trimmed.replace(/\/embed$/, '/v2/embed');
-    return Array.from(new Set([trimmed, sibling]));
+    return [sibling];
   }
 
-  return [`${trimmed}/v2/embed`, `${trimmed}/embed`];
+  return [`${trimmed}/v2/embed`];
 }
 
 function orderByCachedFirst(values: string[], cached?: string): string[] {
@@ -86,9 +94,25 @@ function shouldTryNextInputType(err: unknown): boolean {
   return /unsupported input_type/i.test(err.message);
 }
 
-function buildInputTypeCandidates(options?: EmbedOptions): CohereInputType[] {
-  if (options?.isQuery) return ['search_query', 'query'];
-  return ['search_document', 'document'];
+function isCohereHost(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host.includes('cohere.ai') || host.includes('cohere.com');
+  } catch {
+    return false;
+  }
+}
+
+function buildInputTypeCandidates(baseUrl: string, options?: EmbedOptions): CohereInputType[] {
+  const key = cacheKey(baseUrl);
+  const cachedFamily = inputTypeFamilyCache.get(key);
+  const preferCohereSearchTypes = cachedFamily
+    ? cachedFamily === 'cohere_search'
+    : isCohereHost(baseUrl);
+  if (options?.isQuery) {
+    return preferCohereSearchTypes ? ['search_query', 'query'] : ['query', 'search_query'];
+  }
+  return preferCohereSearchTypes ? ['search_document', 'document'] : ['document', 'search_document'];
 }
 
 function buildEmbedBody(
@@ -187,7 +211,7 @@ async function postEmbedWithFallback(
   );
   const modes = orderModesByCachedFirst(cachedMode);
   const inputTypes = orderInputTypesByCachedFirst(
-    buildInputTypeCandidates(options),
+    buildInputTypeCandidates(cfg.baseUrl, options),
     cachedInputType,
   );
   const headers = buildBearerHeaders(cfg.apiKey);
@@ -208,6 +232,11 @@ async function postEmbedWithFallback(
           if (vectors.length === 0) {
             throw new Error('Cohere embed response contained no numeric embeddings');
           }
+          if (inputType.startsWith('search_')) {
+            inputTypeFamilyCache.set(key, 'cohere_search');
+          } else {
+            inputTypeFamilyCache.set(key, 'generic_plain');
+          }
           endpointPathCache.set(key, endpoint);
           requestModeCache.set(key, mode);
           inputTypeCache.set(inputTypeKey, inputType);
@@ -216,6 +245,9 @@ async function postEmbedWithFallback(
           if (shouldTryNextShapeOrEndpoint(err)) {
             lastRecoverableError = err instanceof Error ? err : new Error(String(err));
             if (shouldTryNextInputType(err)) {
+              if (inputType.startsWith('search_')) {
+                inputTypeFamilyCache.set(key, 'generic_plain');
+              }
               continue;
             }
             if (shouldSkipToNextEndpoint(err)) {

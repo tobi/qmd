@@ -39,6 +39,14 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { remoteConfigFromEnv } from "./remote/config.js";
+import {
+  remoteDetokenize,
+  remoteTokenize,
+  remoteTokenizerAvailable,
+  resolveRemoteTokenizerMode,
+  type RemoteTokenizerConfig,
+} from "./remote/tokenizer.js";
 
 // =============================================================================
 // Configuration
@@ -50,12 +58,23 @@ export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 
 /** One-time flag to avoid spamming the chunkDocumentByTokens remote-fallback warning. */
 let _remoteChunkWarningShown = false;
+let _remoteTokenizerWarningShown = false;
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 const UNKNOWN_SOURCE_MTIME_MS = -1;
 const UNKNOWN_SOURCE_SIZE = -1;
+const RERANK_TOP_CHUNKS_PER_DOC = 3;
+const CANDIDATE_LIMIT_LOW_AMBIGUITY_MAX = 24;
+const CANDIDATE_LIMIT_HIGH_AMBIGUITY_MAX = 80;
+const EXPANSION_MAX_PER_TYPE: Record<"lex" | "vec" | "hyde", number> = {
+  lex: 2,
+  vec: 3,
+  hyde: 2,
+};
+const EXPANSION_MIN_NOVELTY_JACCARD = 0.12;
+const EXPANSION_NEAR_DUPLICATE_JACCARD = 0.88;
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -2821,13 +2840,42 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  if (isRemoteConfigured()) {
-    // Remote LLM has no tokenizer — use character-based chunking with ~3 chars/token estimate.
-    // Result token counts are estimated for compatibility with the return type.
-    // Log once per process to avoid noise during batch embedding.
+  const resolveRemoteTokenizerConfig = (): RemoteTokenizerConfig | null => {
+    const clean = (value: string | undefined): string => (value || '').trim().replace(/\/+$/, '');
+    const envCfg = remoteConfigFromEnv().embed;
+
+    const overrideBaseUrl = clean(process.env.QMD_TOKENIZER_BASE_URL);
+    const overrideModel = (process.env.QMD_TOKENIZER_MODEL || '').trim();
+    const overrideApiKey = (process.env.QMD_TOKENIZER_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+
+    const envBaseUrl = clean(envCfg?.baseUrl);
+    const envModel = (envCfg?.model || '').trim();
+    const envApiKey = (envCfg?.apiKey || '').trim();
+
+    let baseUrl = overrideBaseUrl || envBaseUrl;
+    let model = overrideModel || envModel;
+    let apiKey = overrideApiKey || envApiKey;
+
+    // YAML-only remote setup may not populate env vars. In that case, attempt
+    // to read endpoint config from the currently injected RemoteLLM instance.
+    const defaultLlmUnknown = getDefaultLlamaCpp() as unknown as {
+      embedCfg?: { baseUrl?: string; model?: string; apiKey?: string };
+    };
+    const embedCfg = defaultLlmUnknown?.embedCfg;
+    if ((!baseUrl || !model) && embedCfg) {
+      baseUrl = baseUrl || clean(embedCfg.baseUrl);
+      model = model || (embedCfg.model || '').trim();
+      apiKey = apiKey || (embedCfg.apiKey || '').trim();
+    }
+
+    if (!baseUrl || !model) return null;
+    return { baseUrl, model, apiKey };
+  };
+
+  const fallbackCharChunking = async (reason: string): Promise<{ text: string; pos: number; tokens: number }[]> => {
     if (!_remoteChunkWarningShown) {
       console.warn(
-        'Remote LLM configured — chunkDocumentByTokens using character-based chunking ' +
+        `Remote tokenizer unavailable (${reason}) — chunkDocumentByTokens using character-based chunking ` +
         'with estimated token counts (~3 chars/token). Token counts are approximate.'
       );
       _remoteChunkWarningShown = true;
@@ -2842,9 +2890,130 @@ export async function chunkDocumentByTokens(
       pos: chunk.pos,
       tokens: Math.ceil(chunk.text.length / avgCharsPerToken),
     }));
+  };
+
+  const hasLocalTokenizerApi = (candidate: unknown): candidate is {
+    tokenize: (text: string) => Promise<readonly unknown[]>;
+    detokenize: (tokens: readonly unknown[]) => Promise<string>;
+  } => (
+    !!candidate
+    && typeof candidate === 'object'
+    && typeof (candidate as { tokenize?: unknown }).tokenize === 'function'
+    && typeof (candidate as { detokenize?: unknown }).detokenize === 'function'
+  );
+
+  const tokenizerMode = resolveRemoteTokenizerMode();
+  const defaultLlm = getDefaultLlamaCpp();
+  const remoteMode = isRemoteConfigured() || !hasLocalTokenizerApi(defaultLlm as unknown);
+
+  if (remoteMode) {
+    if (tokenizerMode === 'off') {
+      return fallbackCharChunking('QMD_REMOTE_TOKENIZER=off');
+    }
+
+    const remoteTokenizerCfg = resolveRemoteTokenizerConfig();
+    if (!remoteTokenizerCfg) {
+      if (tokenizerMode === 'force') {
+        throw new Error(
+          'QMD_REMOTE_TOKENIZER=force is set, but remote tokenizer config is missing. ' +
+          'Set QMD_TOKENIZER_BASE_URL/QMD_TOKENIZER_MODEL or QMD_EMBED_BASE_URL/QMD_EMBED_MODEL.'
+        );
+      }
+      return fallbackCharChunking('remote tokenizer config missing');
+    }
+
+    const available = await remoteTokenizerAvailable(remoteTokenizerCfg);
+    if (!available) {
+      if (tokenizerMode === 'force') {
+        throw new Error(
+          `QMD_REMOTE_TOKENIZER=force is set, but tokenizer endpoint is unavailable at ${remoteTokenizerCfg.baseUrl}.`
+        );
+      }
+      return fallbackCharChunking('tokenizer endpoint unavailable');
+    }
+
+    if (!_remoteTokenizerWarningShown) {
+      console.warn(
+        `Remote tokenizer enabled — chunkDocumentByTokens using ${remoteTokenizerCfg.baseUrl}/tokenize ` +
+        'and /detokenize for exact token limits.'
+      );
+      _remoteTokenizerWarningShown = true;
+    }
+
+    const avgCharsPerToken = 3;
+    const maxChars = maxTokens * avgCharsPerToken;
+    const overlapChars = overlapTokens * avgCharsPerToken;
+    const windowChars = windowTokens * avgCharsPerToken;
+
+    const charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+    const results: { text: string; pos: number; tokens: number }[] = [];
+    const clampOverlapChars = (value: number, maxCharsValue: number): number => {
+      if (maxCharsValue <= 1) return 0;
+      return Math.max(0, Math.min(maxCharsValue - 1, Math.floor(value)));
+    };
+
+    const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+      if (signal?.aborted) return;
+
+      const tokens = await remoteTokenize(remoteTokenizerCfg, text);
+      if (tokens.length <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: tokens.length });
+        return;
+      }
+
+      const actualCharsPerToken = text.length / tokens.length;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+      if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+        safeMaxChars = Math.floor(text.length / 2);
+      }
+      safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+      let nextOverlapChars = clampOverlapChars(
+        overlapChars * actualCharsPerToken / 2,
+        safeMaxChars,
+      );
+      let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+      let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+        nextOverlapChars = 0;
+        nextWindowChars = 0;
+        subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+      }
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+        const truncatedText = await remoteDetokenize(remoteTokenizerCfg, fallbackTokens);
+        results.push({
+          text: truncatedText,
+          pos,
+          tokens: fallbackTokens.length,
+        });
+        return;
+      }
+
+      for (const subChunk of subChunks) {
+        await pushChunkWithinTokenLimit(
+          text.slice(subChunk.pos, subChunk.pos + subChunk.text.length),
+          pos + subChunk.pos,
+        );
+      }
+    };
+
+    for (const chunk of charChunks) {
+      await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
+    }
+    return results;
   }
 
-  const llm = getDefaultLlamaCpp();
+  const llm = defaultLlm;
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -4000,9 +4169,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
-  const expanded: ExpandedQuery[] = results
+  const rawExpanded: ExpandedQuery[] = results
     .filter(r => r.text !== query)
     .map(r => ({ type: r.type, query: r.text }));
+  const expanded = filterExpandedQueries(rawExpanded, query);
 
   if (expanded.length > 0) {
     setCachedResult(db, cacheKey, JSON.stringify(expanded));
@@ -4838,6 +5008,139 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+function tokenizeForSimilarity(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .map((t) => t.trim())
+      .filter((t) => t.length > 1),
+  );
+}
+
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const item of a) {
+    if (b.has(item)) intersection++;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function filterExpandedQueries(raw: ExpandedQuery[], originalQuery: string): ExpandedQuery[] {
+  const sourceTokens = tokenizeForSimilarity(originalQuery);
+  const perTypeCount = new Map<ExpandedQuery["type"], number>();
+  const keptTokenSets: Array<{ type: ExpandedQuery["type"]; tokens: Set<string> }> = [];
+  const seenNormalized = new Set<string>();
+  const filtered: ExpandedQuery[] = [];
+
+  for (const entry of raw) {
+    const normalized = entry.query.toLowerCase().replace(/\s+/g, " ").trim();
+    if (!normalized || seenNormalized.has(normalized)) continue;
+    seenNormalized.add(normalized);
+
+    const tokens = tokenizeForSimilarity(entry.query);
+    const novelty = 1 - jaccardSimilarity(sourceTokens, tokens);
+    if (novelty < EXPANSION_MIN_NOVELTY_JACCARD) continue;
+
+    let duplicate = false;
+    for (const existing of keptTokenSets) {
+      if (existing.type !== entry.type) continue;
+      if (jaccardSimilarity(existing.tokens, tokens) >= EXPANSION_NEAR_DUPLICATE_JACCARD) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) continue;
+
+    const used = perTypeCount.get(entry.type) ?? 0;
+    const limit = EXPANSION_MAX_PER_TYPE[entry.type];
+    if (used >= limit) continue;
+
+    perTypeCount.set(entry.type, used + 1);
+    keptTokenSets.push({ type: entry.type, tokens });
+    filtered.push(entry);
+  }
+
+  return filtered;
+}
+
+function resolveAdaptiveCandidateLimit(
+  fused: RankedResult[],
+  requestedCandidateLimit: number | undefined,
+  resultLimit: number,
+): number {
+  if (requestedCandidateLimit && requestedCandidateLimit > 0) return requestedCandidateLimit;
+  if (fused.length <= resultLimit) return Math.max(resultLimit, 1);
+
+  const defaultLimit = RERANK_CANDIDATE_LIMIT;
+  const topScore = fused[0]?.score ?? 0;
+  const secondScore = fused[1]?.score ?? 0;
+  const scoreGap = topScore - secondScore;
+  const k = Math.min(8, fused.length);
+  const topK = fused.slice(0, k).map((r) => r.score);
+  const mean = topK.reduce((sum, s) => sum + s, 0) / topK.length;
+  const variance = topK.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / topK.length;
+  const spread = Math.sqrt(Math.max(variance, 0));
+
+  if (scoreGap >= 0.035 && spread <= 0.012) {
+    return Math.min(
+      Math.max(resultLimit * 2, 12),
+      CANDIDATE_LIMIT_LOW_AMBIGUITY_MAX,
+      fused.length,
+    );
+  }
+
+  if (scoreGap <= 0.01 || spread >= 0.03) {
+    return Math.min(
+      Math.max(defaultLimit, resultLimit * 6),
+      CANDIDATE_LIMIT_HIGH_AMBIGUITY_MAX,
+      fused.length,
+    );
+  }
+
+  return Math.min(defaultLimit, fused.length);
+}
+
+type ChunkSelection = {
+  chunks: { text: string; pos: number }[];
+  rankedIndices: number[];
+};
+
+type ChunkRerankCandidate = {
+  rerankId: string;
+  docFile: string;
+  chunkIndex: number;
+  text: string;
+  pos: number;
+};
+
+function selectChunkIndicesForRerank(
+  chunks: { text: string; pos: number }[],
+  queryTerms: string[],
+  intentTerms: string[],
+  maxChunks: number = RERANK_TOP_CHUNKS_PER_DOC,
+): number[] {
+  const scored = chunks.map((chunk, idx) => {
+    const chunkLower = chunk.text.toLowerCase();
+    let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+    for (const term of intentTerms) {
+      if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+    }
+    return { idx, score };
+  });
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.idx - b.idx;
+  });
+
+  const top = scored.slice(0, Math.max(1, Math.min(maxChunks, chunks.length))).map((row) => row.idx);
+  return top.length > 0 ? top : [0];
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -4858,7 +5161,7 @@ export async function hybridQuery(
 ): Promise<HybridQueryResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
-  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const requestedCandidateLimit = options?.candidateLimit;
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
@@ -4976,17 +5279,18 @@ export async function hybridQuery(
   const weights = getHybridRrfWeights(rankedListMeta);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  const candidateLimit = resolveAdaptiveCandidateLimit(fused, requestedCandidateLimit, limit);
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
   const resolveContext = createContextResolver(store.db);
   const hydratedCandidates = loadSearchDocumentsByFilepaths(store.db, candidates.map(candidate => candidate.file), resolveContext);
 
-  // Step 5: Chunk documents, pick best chunk per doc for reranking.
-  // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
+  // Step 5: Chunk documents and select top-k chunks per doc for reranking.
+  // Reranking full bodies is O(tokens) — keep rerank payloads focused.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const docChunkMap = new Map<string, ChunkSelection>();
   const candidateDocMap = new Map<string, HydratedSearchDocument>();
 
   const chunkStrategy = options?.chunkStrategy;
@@ -4997,20 +5301,10 @@ export async function hybridQuery(
     const chunks = await chunkDocumentAsync(hydrated.body, undefined, undefined, undefined, cand.file, chunkStrategy);
     if (chunks.length === 0) continue;
 
-    // Pick chunk with most keyword overlap (fallback: first chunk)
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
+    docChunkMap.set(cand.file, {
+      chunks,
+      rankedIndices: selectChunkIndicesForRerank(chunks, queryTerms, intentTerms),
+    });
   }
 
   if (skipRerank) {
@@ -5020,7 +5314,7 @@ export async function hybridQuery(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const candidate = candidateDocMap.get(cand.file);
-        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestIdx = chunkInfo?.rankedIndices[0] ?? 0;
         const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
@@ -5064,39 +5358,66 @@ export async function hybridQuery(
       .slice(0, limit);
   }
 
-  // Step 6: Rerank chunks (NOT full bodies)
-  const chunksToRerank: { file: string; text: string }[] = [];
+  // Step 6: Rerank top-k chunks per document.
+  const chunkCandidates: ChunkRerankCandidate[] = [];
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
-    if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    if (!chunkInfo) continue;
+    for (const idx of chunkInfo.rankedIndices) {
+      const chunk = chunkInfo.chunks[idx];
+      if (!chunk) continue;
+      chunkCandidates.push({
+        rerankId: `${cand.file}#${idx}`,
+        docFile: cand.file,
+        chunkIndex: idx,
+        text: chunk.text,
+        pos: chunk.pos,
+      });
     }
   }
 
-  hooks?.onRerankStart?.(chunksToRerank.length);
+  hooks?.onRerankStart?.(chunkCandidates.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(
+    query,
+    chunkCandidates.map((c) => ({ file: c.rerankId, text: c.text })),
+    undefined,
+    intent,
+  );
   hooks?.onRerankDone?.(Date.now() - rerankStart);
+
+  const rerankCandidateById = new Map(chunkCandidates.map((c) => [c.rerankId, c]));
+  const bestChunkByDoc = new Map<string, { score: number; chunk: ChunkRerankCandidate }>();
+  for (const row of reranked) {
+    const candidate = rerankCandidateById.get(row.file);
+    if (!candidate) continue;
+    const existing = bestChunkByDoc.get(candidate.docFile);
+    if (!existing || row.score > existing.score) {
+      bestChunkByDoc.set(candidate.docFile, { score: row.score, chunk: candidate });
+    }
+  }
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-  const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+  const blended = candidates.map(cand => {
+    const rrfRank = rrfRankMap.get(cand.file) || candidateLimit;
+    const bestChunk = bestChunkByDoc.get(cand.file);
+    const rerankScore = bestChunk?.score ?? 0;
     let rrfWeight: number;
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
 
-    const candidate = candidateDocMap.get(r.file);
-    const chunkInfo = docChunkMap.get(r.file);
-    const bestIdx = chunkInfo?.bestIdx ?? 0;
-    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
-    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
+    const candidate = candidateDocMap.get(cand.file);
+    const chunkInfo = docChunkMap.get(cand.file);
+    const bestIdx = bestChunk?.chunk.chunkIndex ?? chunkInfo?.rankedIndices[0] ?? 0;
+    const bestChunkText = (bestChunk?.chunk.text ?? chunkInfo?.chunks[bestIdx]?.text) || candidate?.body || "";
+    const bestChunkPos = (bestChunk?.chunk.pos ?? chunkInfo?.chunks[bestIdx]?.pos) || 0;
+    const trace = rrfTraceByFile?.get(cand.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
       ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
       vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
@@ -5109,20 +5430,20 @@ export async function hybridQuery(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore,
       blendedScore,
     } : undefined;
 
     return {
-      file: r.file,
+      file: cand.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
       body: candidate?.body || "",
-      bestChunk,
+      bestChunk: bestChunkText,
       bestChunkPos,
       score: blendedScore,
       context: candidate?.context ?? null,
-      docid: docidMap.get(r.file) || "",
+      docid: docidMap.get(cand.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -5293,7 +5614,7 @@ export async function structuredSearch(
 ): Promise<HybridQueryResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
-  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const requestedCandidateLimit = options?.candidateLimit;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -5401,6 +5722,7 @@ export async function structuredSearch(
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  const candidateLimit = resolveAdaptiveCandidateLimit(fused, requestedCandidateLimit, limit);
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -5409,14 +5731,14 @@ export async function structuredSearch(
 
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
 
-  // Step 4: Chunk documents, pick best chunk per doc for reranking
+  // Step 4: Chunk documents, select top-k chunk candidates per doc
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
   const primaryQuery = searches.find(s => s.type === 'lex')?.query
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const docChunkMap = new Map<string, ChunkSelection>();
   const candidateDocMap = new Map<string, HydratedSearchDocument>();
   const ssChunkStrategy = options?.chunkStrategy;
 
@@ -5427,20 +5749,10 @@ export async function structuredSearch(
     const chunks = await chunkDocumentAsync(hydrated.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
     if (chunks.length === 0) continue;
 
-    // Pick chunk with most keyword overlap
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
+    docChunkMap.set(cand.file, {
+      chunks,
+      rankedIndices: selectChunkIndicesForRerank(chunks, queryTerms, intentTerms),
+    });
   }
 
   if (skipRerank) {
@@ -5450,7 +5762,7 @@ export async function structuredSearch(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const candidate = candidateDocMap.get(cand.file);
-        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestIdx = chunkInfo?.rankedIndices[0] ?? 0;
         const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
@@ -5494,38 +5806,65 @@ export async function structuredSearch(
       .slice(0, limit);
   }
 
-  // Step 5: Rerank chunks
-  const chunksToRerank: { file: string; text: string }[] = [];
+  // Step 5: Rerank top-k chunks per document
+  const chunkCandidates: ChunkRerankCandidate[] = [];
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
-    if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    if (!chunkInfo) continue;
+    for (const idx of chunkInfo.rankedIndices) {
+      const chunk = chunkInfo.chunks[idx];
+      if (!chunk) continue;
+      chunkCandidates.push({
+        rerankId: `${cand.file}#${idx}`,
+        docFile: cand.file,
+        chunkIndex: idx,
+        text: chunk.text,
+        pos: chunk.pos,
+      });
     }
   }
 
-  hooks?.onRerankStart?.(chunksToRerank.length);
+  hooks?.onRerankStart?.(chunkCandidates.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(
+    primaryQuery,
+    chunkCandidates.map((c) => ({ file: c.rerankId, text: c.text })),
+    undefined,
+    intent,
+  );
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
+
+  const rerankCandidateById = new Map(chunkCandidates.map((c) => [c.rerankId, c]));
+  const bestChunkByDoc = new Map<string, { score: number; chunk: ChunkRerankCandidate }>();
+  for (const row of reranked) {
+    const candidate = rerankCandidateById.get(row.file);
+    if (!candidate) continue;
+    const existing = bestChunkByDoc.get(candidate.docFile);
+    if (!existing || row.score > existing.score) {
+      bestChunkByDoc.set(candidate.docFile, { score: row.score, chunk: candidate });
+    }
+  }
 
   // Step 6: Blend RRF position score with reranker score
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-  const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+  const blended = candidates.map(cand => {
+    const rrfRank = rrfRankMap.get(cand.file) || candidateLimit;
+    const bestChunk = bestChunkByDoc.get(cand.file);
+    const rerankScore = bestChunk?.score ?? 0;
     let rrfWeight: number;
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
 
-    const candidate = candidateDocMap.get(r.file);
-    const chunkInfo = docChunkMap.get(r.file);
-    const bestIdx = chunkInfo?.bestIdx ?? 0;
-    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
-    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
+    const candidate = candidateDocMap.get(cand.file);
+    const chunkInfo = docChunkMap.get(cand.file);
+    const bestIdx = bestChunk?.chunk.chunkIndex ?? chunkInfo?.rankedIndices[0] ?? 0;
+    const bestChunkText = (bestChunk?.chunk.text ?? chunkInfo?.chunks[bestIdx]?.text) || candidate?.body || "";
+    const bestChunkPos = (bestChunk?.chunk.pos ?? chunkInfo?.chunks[bestIdx]?.pos) || 0;
+    const trace = rrfTraceByFile?.get(cand.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
       ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
       vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
@@ -5538,20 +5877,20 @@ export async function structuredSearch(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore,
       blendedScore,
     } : undefined;
 
     return {
-      file: r.file,
+      file: cand.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
       body: candidate?.body || "",
-      bestChunk,
+      bestChunk: bestChunkText,
       bestChunkPos,
       score: blendedScore,
       context: candidate?.context ?? null,
-      docid: docidMap.get(r.file) || "",
+      docid: docidMap.get(cand.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);

@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
+import * as remoteTokenizerModule from "../src/remote/tokenizer.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
@@ -3590,6 +3591,15 @@ describe("Embedding batching", () => {
 
 describe("Token chunking guardrails", () => {
   test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
+    const saved = {
+      remoteTokenizer: process.env.QMD_REMOTE_TOKENIZER,
+      embedBaseUrl: process.env.QMD_EMBED_BASE_URL,
+      embedModel: process.env.QMD_EMBED_MODEL,
+    };
+    process.env.QMD_REMOTE_TOKENIZER = "off";
+    delete process.env.QMD_EMBED_BASE_URL;
+    delete process.env.QMD_EMBED_MODEL;
+
     setDefaultLlamaCpp({
       async tokenize(text: string) {
         return Array.from({ length: text.length }, () => 1);
@@ -3608,6 +3618,62 @@ describe("Token chunking guardrails", () => {
         expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     } finally {
+      if (saved.remoteTokenizer === undefined) delete process.env.QMD_REMOTE_TOKENIZER;
+      else process.env.QMD_REMOTE_TOKENIZER = saved.remoteTokenizer;
+      if (saved.embedBaseUrl === undefined) delete process.env.QMD_EMBED_BASE_URL;
+      else process.env.QMD_EMBED_BASE_URL = saved.embedBaseUrl;
+      if (saved.embedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = saved.embedModel;
+
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens uses remote tokenizer endpoints when available", async () => {
+    const saved = {
+      remoteTokenizer: process.env.QMD_REMOTE_TOKENIZER,
+      embedBaseUrl: process.env.QMD_EMBED_BASE_URL,
+      embedModel: process.env.QMD_EMBED_MODEL,
+    };
+
+    process.env.QMD_REMOTE_TOKENIZER = "auto";
+    process.env.QMD_EMBED_BASE_URL = "http://unit-test-remote/v1";
+    process.env.QMD_EMBED_MODEL = "unit-test-model";
+
+    const availableSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteTokenizerAvailable")
+      .mockResolvedValue(true);
+    const tokenizeSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteTokenize")
+      .mockImplementation(async (_cfg, text) => Array.from({ length: text.length }, () => 1));
+    const detokenizeSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteDetokenize")
+      .mockImplementation(async (_cfg, tokens) => "x".repeat(tokens.length));
+
+    try {
+      setDefaultLlamaCpp({
+        embedCfg: {
+          baseUrl: "http://unit-test-remote/v1",
+          model: "unit-test-model",
+        },
+      } as any);
+
+      const chunks = await chunkDocumentByTokens("x".repeat(900), 80, 10, 20);
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.tokens <= 80)).toBe(true);
+      expect(availableSpy).toHaveBeenCalled();
+      expect(tokenizeSpy).toHaveBeenCalled();
+    } finally {
+      if (saved.remoteTokenizer === undefined) delete process.env.QMD_REMOTE_TOKENIZER;
+      else process.env.QMD_REMOTE_TOKENIZER = saved.remoteTokenizer;
+      if (saved.embedBaseUrl === undefined) delete process.env.QMD_EMBED_BASE_URL;
+      else process.env.QMD_EMBED_BASE_URL = saved.embedBaseUrl;
+      if (saved.embedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = saved.embedModel;
+
+      availableSpy.mockRestore();
+      tokenizeSpy.mockRestore();
+      detokenizeSpy.mockRestore();
       setDefaultLlamaCpp(null);
     }
   });
