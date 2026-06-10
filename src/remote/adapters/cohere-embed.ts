@@ -12,7 +12,7 @@
 
 import type { EmbedAdapter, EmbedAdapterContext } from './types.js';
 import type { EmbedOptions, EmbeddingResult } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 
 type CohereEmbedMode = 'inputs' | 'texts';
 type CohereInputType =
@@ -149,15 +149,19 @@ function normalizeCohereVectors(raw: unknown): number[][] {
   const legacyData = data['data'];
   if (Array.isArray(legacyData)) {
     const collected: Array<{ index: number; embedding: number[] }> = [];
+    let needsSort = false;
     for (const item of legacyData) {
       if (!item || typeof item !== 'object') return [];
       const row = item as Record<string, unknown>;
       const embedding = row['embedding'];
       if (!isNumericVector(embedding)) return [];
       const index = typeof row['index'] === 'number' ? row['index'] : collected.length;
+      if (index !== collected.length) needsSort = true;
       collected.push({ index, embedding });
     }
-    collected.sort((a, b) => a.index - b.index);
+    if (needsSort) {
+      collected.sort((a, b) => a.index - b.index);
+    }
     return collected.map((row) => row.embedding);
   }
 
@@ -186,8 +190,7 @@ async function postEmbedWithFallback(
     buildInputTypeCandidates(options),
     cachedInputType,
   );
-  const headers: Record<string, string> = {};
-  if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
+  const headers = buildBearerHeaders(cfg.apiKey);
 
   let lastRecoverableError: Error | null = null;
 

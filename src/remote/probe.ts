@@ -10,7 +10,7 @@
 
 import type { EmbeddingResult, ModelInfo } from '../llm.js';
 import type { EndpointConfig } from './types.js';
-import { nodeGet } from './transport.js';
+import { buildBearerHeaders, nodeGet } from './transport.js';
 
 // =============================================================================
 // modelExists
@@ -35,15 +35,10 @@ export async function modelExists(
   model: string,
 ): Promise<ModelInfo> {
   try {
-    const headers: Record<string, string> = {};
-    if (cfg.apiKey) {
-      headers['Authorization'] = `Bearer ${cfg.apiKey}`;
-    }
-
     // Strip /v1 suffix for the /models endpoint (vLLM, OpenAI convention)
     const baseForModels = cfg.baseUrl.replace(/\/v1$/, '');
     const data = await nodeGet(
-      `${baseForModels}/models`, headers, 5000,
+      `${baseForModels}/models`, buildBearerHeaders(cfg.apiKey), 5000,
     ) as { data?: Array<{ id: string }> };
 
     if (data.data) {

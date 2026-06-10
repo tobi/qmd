@@ -21,7 +21,7 @@ import type { EndpointConfig } from './types.js';
 import type { CircuitBreaker } from './circuit-breaker.js';
 import type { Logger } from './log.js';
 import { consoleLogger } from './log.js';
-import { nodePost } from './transport.js';
+import { buildBearerHeaders, nodePost } from './transport.js';
 
 // =============================================================================
 // expandQuery
@@ -72,16 +72,9 @@ export async function expandQuery(
     : `Expand this search query: ${query}`;
 
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (cfg.apiKey) {
-      headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-    }
-
     const data = await nodePost(
       `${cfg.baseUrl}/chat/completions`,
-      headers,
+      buildBearerHeaders(cfg.apiKey),
       {
         model: cfg.model,
         messages: [

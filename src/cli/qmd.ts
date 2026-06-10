@@ -1,6 +1,5 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
-import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -28,7 +27,6 @@ import {
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
-  hashContent,
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
@@ -43,15 +41,6 @@ import {
   isVirtualPath,
   resolveVirtualPath,
   toVirtualPath,
-  insertContent,
-  insertDocument,
-  findActiveDocument,
-  findOrMigrateLegacyDocument,
-  updateDocumentTitle,
-  updateDocument,
-  deactivateDocument,
-  getActiveDocumentPaths,
-  cleanupOrphanedContent,
   deleteLLMCache,
   deleteInactiveDocuments,
   cleanupOrphanedVectors,
@@ -1874,10 +1863,9 @@ function collectionRename(oldName: string, newName: string): void {
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
-  const db = getDb();
   const resolvedPwd = pwd || getPwd();
-  const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  const store = getStore();
+  const db = store.db;
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1890,119 +1878,28 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
-    ...(ignorePatterns || []),
-  ];
-  const allFiles: string[] = await fastGlob(globPattern, {
-    cwd: resolvedPwd,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: allIgnore,
-  });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
-
-  const total = files.length;
-  const hasNoFiles = total === 0;
-  if (hasNoFiles) {
-    progress.clear();
-    console.log("No files found matching pattern.");
-    // Continue so the deactivation pass can mark previously indexed docs as inactive.
-  }
-
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
-  const seenPaths = new Set<string>();
   const startTime = Date.now();
-
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    // Store the literal relative path — handelize() is NOT applied at index time.
-    const path = relativeFile.replace(/\\/g, '/');
-    seenPaths.add(path);
-
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
-      processed++;
-      progress.set((processed / total) * 100);
-      continue;
-    }
-
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
-
-    if (existing) {
-      if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-      } else {
-        // Content changed - insert new content hash and update document
-        insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
+  const result = await reindexCollection(store, resolvedPwd, globPattern, collectionName, {
+    ignorePatterns,
+    onProgress: (info) => {
+      if (info.total > 0) {
+        progress.set((info.current / info.total) * 100);
       }
-    } else {
-      // New document - insert content and document
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-    }
-
-    processed++;
-    progress.set((processed / total) * 100);
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
-  }
-
-  // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
-    }
-  }
-
-  // Clean up orphaned content hashes (content not referenced by any document)
-  const orphanedContent = cleanupOrphanedContent(db);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = info.current > 0 && elapsed > 0 ? info.current / elapsed : 0;
+      const remaining = rate > 0 ? (info.total - info.current) / rate : 0;
+      const eta = info.current > 2 && rate > 0 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+    },
+  });
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
-  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
-  if (orphanedContent > 0) {
-    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+  if (result.orphanedCleaned > 0) {
+    console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {

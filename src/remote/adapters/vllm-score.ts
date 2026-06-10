@@ -7,7 +7,7 @@
 
 import type { RerankAdapter } from './types.js';
 import type { RerankDocument, RerankResult } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 
 function cacheKey(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '');
@@ -127,13 +127,6 @@ export const vllmScoreAdapter: RerankAdapter = {
       return fallback;
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (cfg.apiKey) {
-      headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-    }
-
     const body: Record<string, unknown> = {
       model: activeModel,
       queries: query,
@@ -144,7 +137,7 @@ export const vllmScoreAdapter: RerankAdapter = {
     try {
       const response = await postScoreWithFallback(
         cfg.baseUrl,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         body,
         readTimeoutMs,
       );

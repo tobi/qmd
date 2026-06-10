@@ -25,7 +25,7 @@
 
 import type { ExpandAdapter, ExpandAdapterContext, GenerateAdapter, GenerateAdapterContext } from './types.js';
 import type { GenerateOptions } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 import { parseExpandResponse, expandFallback } from '../expand.js';
 import {
   normalizeCompletionsText,
@@ -58,8 +58,6 @@ export const openaiCompletionsExpandAdapter: ExpandAdapter = {
     }
 
     const includeLexical = options?.includeLexical ?? true;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
 
     // Completions endpoint: combine system prompt + user prompt into one string
     const combinedPrompt = `${EXPAND_SYSTEM_PROMPT}\n\n${buildExpandUserPrompt(query, options?.intent)}`;
@@ -67,7 +65,7 @@ export const openaiCompletionsExpandAdapter: ExpandAdapter = {
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/completions`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           prompt: combinedPrompt,
@@ -120,13 +118,10 @@ export const openaiCompletionsGenerateAdapter: GenerateAdapter = {
       return null;
     }
 
-    const headers: Record<string, string> = {};
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/completions`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           prompt,

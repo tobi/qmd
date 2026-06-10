@@ -16,7 +16,7 @@ import type { EndpointConfig } from './types.js';
 import type { CircuitBreaker } from './circuit-breaker.js';
 import type { Logger } from './log.js';
 import { consoleLogger } from './log.js';
-import { nodePost } from './transport.js';
+import { buildBearerHeaders, nodePost } from './transport.js';
 
 // =============================================================================
 // generate
@@ -48,15 +48,10 @@ export async function generate(
     return null;
   }
 
-  const headers: Record<string, string> = {};
-  if (cfg.apiKey) {
-    headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-  }
-
   try {
     const data = await nodePost(
       `${cfg.baseUrl}/chat/completions`,
-      headers,
+      buildBearerHeaders(cfg.apiKey),
       {
         model: cfg.model,
         messages: [{ role: 'user', content: prompt }],

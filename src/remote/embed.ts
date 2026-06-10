@@ -26,7 +26,7 @@ import type { EndpointConfig } from './types.js';
 import type { CircuitBreaker } from './circuit-breaker.js';
 import type { Logger } from './log.js';
 import { consoleLogger } from './log.js';
-import { nodePost } from './transport.js';
+import { buildBearerHeaders, nodePost } from './transport.js';
 
 // =============================================================================
 // embedBatch
@@ -180,17 +180,12 @@ async function sendBatch(
   dimState: { dimensions: number | null },
   modelOverride?: string,
 ): Promise<(EmbeddingResult | null)[]> {
-  const headers: Record<string, string> = {};
-  if (cfg.apiKey) {
-    headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-  }
-
   const activeModel = modelOverride || cfg.model;
 
   try {
     const data = await nodePost(
       `${cfg.baseUrl}/embeddings`,
-      headers,
+      buildBearerHeaders(cfg.apiKey),
       { model: activeModel, input: texts },
       readTimeoutMs,
     ) as { data: Array<{ embedding: number[]; index?: number }> };
@@ -208,11 +203,17 @@ async function sendBatch(
       }
     }
 
-    // Sort by index to preserve input order (API may reorder)
-    const sorted = [...data.data].sort(
-      (a, b) => (a.index ?? 0) - (b.index ?? 0),
-    );
-    const results: (EmbeddingResult | null)[] = sorted.map((item) => ({
+    let orderedItems = data.data;
+    for (let i = 0; i < data.data.length; i++) {
+      if ((data.data[i]?.index ?? i) !== i) {
+        orderedItems = [...data.data].sort(
+          (a, b) => (a.index ?? 0) - (b.index ?? 0),
+        );
+        break;
+      }
+    }
+
+    const results: (EmbeddingResult | null)[] = orderedItems.map((item) => ({
       embedding: item.embedding,
       model: activeModel,
     }));

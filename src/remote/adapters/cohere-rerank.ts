@@ -7,7 +7,7 @@
 
 import type { RerankAdapter } from './types.js';
 import type { RerankDocument, RerankResult } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 
 const rerankPathCache = new Map<string, string>();
 
@@ -147,10 +147,7 @@ export const cohereRerankAdapter: RerankAdapter = {
       return fallback;
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey.trim()}`,
-    };
+    const headers = buildBearerHeaders(cfg.apiKey);
 
     const body: Record<string, unknown> = {
       model: activeModel,

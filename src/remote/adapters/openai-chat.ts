@@ -23,7 +23,7 @@
 
 import type { ExpandAdapter, ExpandAdapterContext, GenerateAdapter, GenerateAdapterContext } from './types.js';
 import type { GenerateOptions } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 import { parseExpandResponse, expandFallback } from '../expand.js';
 import {
   normalizeChatCompletionText,
@@ -58,13 +58,11 @@ export const openaiChatCompletionsExpandAdapter: ExpandAdapter = {
     }
 
     const includeLexical = options?.includeLexical ?? true;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
 
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/chat/completions`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           messages: [
@@ -121,13 +119,10 @@ export const openaiChatCompletionsGenerateAdapter: GenerateAdapter = {
       return null;
     }
 
-    const headers: Record<string, string> = {};
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/chat/completions`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           messages: [{ role: 'user', content: prompt }],

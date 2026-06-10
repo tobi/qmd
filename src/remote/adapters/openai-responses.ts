@@ -25,7 +25,7 @@
 
 import type { ExpandAdapter, ExpandAdapterContext, GenerateAdapter, GenerateAdapterContext } from './types.js';
 import type { GenerateOptions } from '../../llm.js';
-import { nodePost } from '../transport.js';
+import { buildBearerHeaders, nodePost } from '../transport.js';
 import { parseExpandResponse, expandFallback } from '../expand.js';
 import {
   normalizeResponseAPIText,
@@ -58,13 +58,11 @@ export const openaiResponsesExpandAdapter: ExpandAdapter = {
     }
 
     const includeLexical = options?.includeLexical ?? true;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
 
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/responses`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           instructions: EXPAND_SYSTEM_PROMPT,
@@ -118,13 +116,10 @@ export const openaiResponsesGenerateAdapter: GenerateAdapter = {
       return null;
     }
 
-    const headers: Record<string, string> = {};
-    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey.trim()}`;
-
     try {
       const data = await nodePost(
         `${cfg.baseUrl}/responses`,
-        headers,
+        buildBearerHeaders(cfg.apiKey),
         {
           model: cfg.model,
           input: prompt,
