@@ -74,6 +74,7 @@ export function openDatabase(path: string): Database {
 export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
+  transaction<T>(fn: () => T): () => T;
   loadExtension(path: string): void;
   transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
   close(): void;
