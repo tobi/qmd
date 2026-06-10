@@ -32,6 +32,8 @@ export type RemoteApiFormat =
   | 'openai_v1_embeddings'
   | 'cohere_v2_embed'
   | 'ollama_embed'
+  | 'ollama_chat'
+  | 'ollama_generate'
   | 'vllm_pooling'
   | 'openai_chat_completions'
   | 'openai_completions'

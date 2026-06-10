@@ -25,6 +25,8 @@ const REMOTE_API_FORMATS: readonly RemoteApiFormat[] = [
   'openai_v1_embeddings',
   'cohere_v2_embed',
   'ollama_embed',
+  'ollama_chat',
+  'ollama_generate',
   'vllm_pooling',
   'openai_chat_completions',
   'openai_completions',
@@ -71,6 +73,8 @@ const ALLOWED_FORMATS_BY_ENDPOINT: Record<EndpointRole, readonly RemoteApiFormat
     'openai_completions',
     'openai_responses',
     'anthropic_messages',
+    'ollama_chat',
+    'ollama_generate',
   ],
   rerank: [
     'auto',
@@ -84,6 +88,8 @@ const ALLOWED_FORMATS_BY_ENDPOINT: Record<EndpointRole, readonly RemoteApiFormat
     'openai_completions',
     'openai_responses',
     'anthropic_messages',
+    'ollama_chat',
+    'ollama_generate',
   ],
 };
 

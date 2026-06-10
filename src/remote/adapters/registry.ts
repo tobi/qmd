@@ -38,6 +38,13 @@ import {
   anthropicMessagesGenerateAdapter,
 } from './anthropic-messages.js';
 import { cohereV2EmbedAdapter } from './cohere-embed.js';
+import { ollamaEmbedAdapter } from './ollama-embed.js';
+import {
+  ollamaChatExpandAdapter,
+  ollamaChatGenerateAdapter,
+  ollamaGenerateExpandAdapter,
+  ollamaGenerateGenerateAdapter,
+} from './ollama-text.js';
 import { cohereRerankAdapter } from './cohere-rerank.js';
 import { vllmScoreAdapter } from './vllm-score.js';
 
@@ -45,7 +52,7 @@ const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
   auto: legacyEmbedAdapter,
   openai_v1_embeddings: legacyEmbedAdapter,
   cohere_v2_embed: cohereV2EmbedAdapter,
-  ollama_embed: legacyEmbedAdapter,
+  ollama_embed: ollamaEmbedAdapter,
   vllm_pooling: legacyEmbedAdapter,
 };
 
@@ -55,6 +62,8 @@ const EXPAND_ADAPTERS: Partial<Record<RemoteApiFormat, ExpandAdapter>> = {
   openai_completions: openaiCompletionsExpandAdapter,
   openai_responses: openaiResponsesExpandAdapter,
   anthropic_messages: anthropicMessagesExpandAdapter,
+  ollama_chat: ollamaChatExpandAdapter,
+  ollama_generate: ollamaGenerateExpandAdapter,
 };
 
 const RERANK_ADAPTERS: Partial<Record<RemoteApiFormat, RerankAdapter>> = {
@@ -70,6 +79,8 @@ const GENERATE_ADAPTERS: Partial<Record<RemoteApiFormat, GenerateAdapter>> = {
   openai_completions: openaiCompletionsGenerateAdapter,
   openai_responses: openaiResponsesGenerateAdapter,
   anthropic_messages: anthropicMessagesGenerateAdapter,
+  ollama_chat: ollamaChatGenerateAdapter,
+  ollama_generate: ollamaGenerateGenerateAdapter,
 };
 
 function pickAdapter<T>(
