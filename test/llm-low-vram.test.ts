@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { LlamaCpp, type RerankDocument, type Queryable, type RerankResult } from "../src/llm.js";
+import { LlamaCpp, type RerankDocument, type Queryable, type RerankResult, type EmbeddingResult, type EmbedOptions } from "../src/llm.js";
 
 /**
  * Build a LlamaCpp with lowVram=true and replace its low-level methods with
@@ -205,5 +205,175 @@ describe("LlamaCpp lowVram mode", () => {
       if (original === undefined) delete process.env.QMD_LOW_VRAM;
       else process.env.QMD_LOW_VRAM = original;
     }
+  });
+
+  test("embed: catch-and-retry on insufficient VRAM disposes heavies and retries once", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      attempts++;
+      events.push(`embed:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("A context size of 2048 is too large for the available VRAM");
+      }
+      return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    const result = await llm.embed("hello");
+    expect(result).toEqual({ embedding: [0.1, 0.2, 0.3], model: "fake-embed" });
+    expect(attempts).toBe(2);
+    expect(events).toEqual([
+      "embed:attempt-1",
+      "dispose:generate",
+      "dispose:rerank",
+      "embed:attempt-2",
+    ]);
+  });
+
+  test("embedBatch: catch-and-retry on insufficient VRAM disposes heavies and retries once", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { embedBatchImpl: (texts: string[], options: EmbedOptions) => Promise<(EmbeddingResult | null)[]> }).embedBatchImpl = async (texts: string[]) => {
+      attempts++;
+      events.push(`batch:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("Failed to create any embedding context");
+      }
+      return texts.map(() => ({ embedding: [1, 2, 3], model: "fake-embed" }));
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    const results = await llm.embedBatch(["a", "b"]);
+    expect(results).toHaveLength(2);
+    expect(results.every((r) => r?.embedding[0] === 1)).toBe(true);
+    expect(attempts).toBe(2);
+    expect(events).toEqual([
+      "batch:attempt-1",
+      "dispose:generate",
+      "dispose:rerank",
+      "batch:attempt-2",
+    ]);
+  });
+
+  test("embed: non-VRAM errors do not trigger reclaim (no dispose, returns null per existing contract)", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      events.push("embed:attempt");
+      throw new Error("model file not found");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    const result = await llm.embed("hello");
+    expect(result).toBeNull();
+    // Single attempt — no retry, no dispose
+    expect(events).toEqual(["embed:attempt"]);
+  });
+
+  test("embed: lowVram=false skips reclaim entirely", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({}); // lowVram defaults to false
+
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      events.push("embed:attempt");
+      throw new Error("A context size of 2048 is too large for the available VRAM");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+
+    const result = await llm.embed("hello");
+    expect(result).toBeNull();
+    // No retry: outside lowVram, VRAM errors fall through to the existing null-returning catch
+    expect(events).toEqual(["embed:attempt"]);
+  });
+
+  test("embed: reclaim awaits in-flight generate/rerank chains before disposing", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let embedAttempts = 0;
+    const release: { generate?: () => void; rerank?: () => void } = {};
+
+    // expandQuery and rerank each park inside their lowVram chain wrappers
+    // until we release them, simulating in-flight callers.
+    (llm as unknown as { expandQueryImpl: () => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      events.push("expand:start");
+      await new Promise<void>((r) => { release.generate = r; });
+      events.push("expand:end");
+      return [];
+    };
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+      events.push("rerank:start");
+      await new Promise<void>((r) => { release.rerank = r; });
+      events.push("rerank:end");
+      return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
+    };
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      embedAttempts++;
+      events.push(`embed:attempt-${embedAttempts}`);
+      if (embedAttempts === 1) throw new Error("too large for the available VRAM");
+      return { embedding: [9], model: "fake-embed" };
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    // Kick off in-flight expand and rerank — they park.
+    const expand = llm.expandQuery("e");
+    const rerank = llm.rerank("r", [{ file: "a.md", text: "x" }]);
+    await new Promise((r) => setImmediate(r));
+
+    // Start embed: it should fail on attempt 1, then await both chains.
+    const embed = llm.embed("hello");
+    // Give embed time to throw and enter reclaim await.
+    await new Promise((r) => setImmediate(r));
+
+    // At this point, embed:attempt-1 has fired and embed is parked on the chains.
+    // Dispose should NOT have been called yet — chains haven't drained.
+    expect(events).toContain("embed:attempt-1");
+    expect(events).not.toContain("dispose:generate");
+    expect(events).not.toContain("dispose:rerank");
+
+    // Release the in-flight callers. Their lowVram wrappers will run their own
+    // finally-dispose first, then embed's reclaim will run its (idempotent) dispose,
+    // then embed retries and succeeds.
+    release.generate!();
+    release.rerank!();
+    await Promise.all([expand, rerank]);
+    const result = await embed;
+
+    expect(result).toEqual({ embedding: [9], model: "fake-embed" });
+    // expand:end and rerank:end must precede embed's dispose calls.
+    const expandEnd = events.indexOf("expand:end");
+    const rerankEnd = events.indexOf("rerank:end");
+    const firstDispose = Math.min(events.indexOf("dispose:generate"), events.indexOf("dispose:rerank"));
+    expect(expandEnd).toBeGreaterThanOrEqual(0);
+    expect(rerankEnd).toBeGreaterThanOrEqual(0);
+    expect(firstDispose).toBeGreaterThan(expandEnd);
+    expect(firstDispose).toBeGreaterThan(rerankEnd);
   });
 });
