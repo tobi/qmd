@@ -2320,6 +2320,82 @@ describe("Reciprocal Rank Fusion", () => {
     // Lower k = higher scores for top ranks
     expect(fused30[0]!.score).toBeGreaterThan(fused60[0]!.score);
   });
+
+  test("structuredSearch title boost can affect skip-rerank ordering", async () => {
+    const store = {
+      db: { prepare: () => ({ get: () => undefined }) },
+      searchFTS: () => [
+        { filepath: "qmd://docs/body.md", displayPath: "docs/body.md", title: "Body Match", body: "api routing details", score: 10, docid: "body" },
+        { filepath: "qmd://docs/title.md", displayPath: "docs/title.md", title: "API Routing", body: "details", score: 1, docid: "title" },
+      ],
+      searchVec: async () => [],
+      getContextForFile: () => null,
+    } as unknown as Store;
+
+    const results = await structuredSearch(store, [{ type: "lex", query: "api routing" }], {
+      skipRerank: true,
+      minScore: 0,
+      limit: 2,
+    });
+
+    expect(results.map(r => r.file)).toEqual([
+      "qmd://docs/title.md",
+      "qmd://docs/body.md",
+    ]);
+    expect(results[0]!.score).toBeLessThanOrEqual(1);
+  });
+
+  test("structuredSearch title boost affects rerank blending through boosted rank", async () => {
+    const store = {
+      db: { prepare: () => ({ get: () => undefined }) },
+      searchFTS: () => [
+        { filepath: "qmd://docs/body.md", displayPath: "docs/body.md", title: "Body Match", body: "api details", score: 10, docid: "body" },
+        { filepath: "qmd://docs/title.md", displayPath: "docs/title.md", title: "API Reference", body: "details", score: 1, docid: "title" },
+      ],
+      searchVec: async () => [],
+      rerank: async () => [
+        { file: "qmd://docs/body.md", score: 0 },
+        { file: "qmd://docs/title.md", score: 1 },
+      ],
+      getContextForFile: () => null,
+    } as unknown as Store;
+
+    const results = await structuredSearch(store, [{ type: "lex", query: "api" }], {
+      skipRerank: false,
+      minScore: 0,
+      limit: 2,
+    });
+
+    expect(results.map(r => r.file)).toEqual([
+      "qmd://docs/title.md",
+      "qmd://docs/body.md",
+    ]);
+    expect(results[0]!.score).toBeLessThanOrEqual(1);
+  });
+
+  test("structuredSearch explain shows title boost without changing score equation", async () => {
+    const store = {
+      db: { prepare: () => ({ get: () => undefined }) },
+      searchFTS: () => [
+        { filepath: "qmd://docs/body.md", displayPath: "docs/body.md", title: "Body Match", body: "api routing details", score: 10, docid: "body" },
+        { filepath: "qmd://docs/title.md", displayPath: "docs/title.md", title: "API Routing", body: "details", score: 1, docid: "title" },
+      ],
+      searchVec: async () => [],
+      getContextForFile: () => null,
+    } as unknown as Store;
+
+    const results = await structuredSearch(store, [{ type: "lex", query: "api routing" }], {
+      skipRerank: true,
+      explain: true,
+      minScore: 0,
+      limit: 2,
+    });
+
+    expect(results[0]!.file).toBe("qmd://docs/title.md");
+    expect(results[0]!.score).toBe(results[0]!.explain!.blendedScore);
+    expect(results[0]!.explain!.titleBoost).toBeGreaterThan(1);
+    expect(results[0]!.explain!.rrf.positionScore).toBe(1);
+  });
 });
 
 // =============================================================================
