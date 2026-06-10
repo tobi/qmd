@@ -7,6 +7,7 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 ![QMD Architecture](assets/qmd-architecture.png)
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
+For remote provider roles, protocol formats, and configuration examples, see [docs/remote-endpoints.md](docs/remote-endpoints.md).
 
 ## Quick Start
 

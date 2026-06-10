@@ -469,6 +469,13 @@ describe("CLI Init Command", () => {
 });
 
 describe("CLI Add Command", () => {
+  test("refuses collection add with no path argument", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "add"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Usage: qmd collection add <path>");
+    expect(stderr).toContain("Refusing to index the current working directory implicitly.");
+  });
+
   test("adds files from current directory", async () => {
     const { stdout, exitCode } = await runQmd(["collection", "add", "."]);
     expect(exitCode).toBe(0);
@@ -526,10 +533,8 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("please run qmd embed again");
 
     const configText = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
-    expect(configText).toContain("models:");
-    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
-    expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
-    expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+    // doctor no longer auto-writes models into index.yml
+    expect(configText).toContain("collections:");
   }, 20000);
 
   test("qmd doctor warns when no collections are configured", async () => {
