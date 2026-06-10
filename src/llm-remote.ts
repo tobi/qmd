@@ -39,11 +39,50 @@ export interface RemoteLLMConfig {
 export class RemoteLLM implements LLM {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private _embedModelName?: string;
+  private _generateModelName?: string;
+  private _rerankModelName?: string;
+  private healthPromise?: Promise<void>;
 
   constructor(config: RemoteLLMConfig) {
     // Normalise: strip trailing slash
     this.baseUrl = config.serverUrl.replace(/\/+$/, "");
     this.timeoutMs = config.timeoutMs ?? 300_000;
+    // Fire-and-forget warmup so model names are populated before they're needed.
+    // Sync getters return undefined until this resolves; callers already handle
+    // undefined by falling back to DEFAULT_EMBED_MODEL.
+    this.healthPromise = this.warmup().catch(() => undefined);
+  }
+
+  private async warmup(): Promise<void> {
+    try {
+      const health = await this.get<{ models: Record<string, string> }>("/health");
+      this._embedModelName = health.models?.embed;
+      this._generateModelName = health.models?.generate;
+      this._rerankModelName = health.models?.rerank;
+    } catch {
+      // Server unreachable at construction time — first real request will surface the error.
+    }
+  }
+
+  get embedModelName(): string | undefined {
+    return this._embedModelName;
+  }
+
+  get generateModelName(): string | undefined {
+    return this._generateModelName;
+  }
+
+  get rerankModelName(): string | undefined {
+    return this._rerankModelName;
+  }
+
+  /**
+   * Await the in-flight /health priming so model names are available
+   * synchronously. Idempotent — safe to call multiple times.
+   */
+  async ready(): Promise<void> {
+    if (this.healthPromise) await this.healthPromise;
   }
 
   // ---- helpers ----------------------------------------------------------
@@ -94,8 +133,8 @@ export class RemoteLLM implements LLM {
     return this.post<EmbeddingResult | null>("/embed", { text, options });
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.post<(EmbeddingResult | null)[]>("/embed-batch", { texts });
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.post<(EmbeddingResult | null)[]>("/embed-batch", { texts, options });
   }
 
   async generate(_prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {

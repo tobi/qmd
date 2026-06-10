@@ -91,7 +91,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 
 interface ModelBackend {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
   rerank(query: string, documents: RerankDocument[]): Promise<RerankResult>;
   expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   tokenize(text: string): Promise<number>;
@@ -116,8 +116,8 @@ class LocalBackend implements ModelBackend {
     return this.llm.embed(text, options);
   }
 
-  async embedBatch(texts: string[]) {
-    return this.llm.embedBatch(texts);
+  async embedBatch(texts: string[], options?: EmbedOptions) {
+    return this.llm.embedBatch(texts, options);
   }
 
   async rerank(query: string, documents: RerankDocument[]) {
@@ -202,7 +202,7 @@ class OllamaCompatBackend implements ModelBackend {
     };
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
     // Send all texts in one /api/embed call — Ollama API accepts arrays
@@ -540,12 +540,15 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
 
       // ----- Embed Batch ------------------------------------------------------
       if (path === "/embed-batch") {
-        const { texts } = body as { texts: string[] };
+        const { texts, options: embedOpts } = body as {
+          texts: string[];
+          options?: EmbedOptions;
+        };
         if (!Array.isArray(texts) || texts.length === 0 || !texts.every(t => typeof t === "string")) {
           json(res, 400, { error: "texts must be a non-empty array of strings" });
           return;
         }
-        const results = await backend.embedBatch(texts);
+        const results = await backend.embedBatch(texts, embedOpts);
         json(res, 200, results);
         return;
       }
