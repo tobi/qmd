@@ -113,6 +113,24 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
   return `title: ${title || "none"} | text: ${text}`;
 }
 
+/**
+ * Detect node-llama-cpp's pre-allocation VRAM ceiling errors and its native
+ * out-of-memory variants. Used by lowVram embed reclaim to decide whether
+ * disposing the heavy generate/rerank models could free enough VRAM to
+ * recover. Conservative on purpose — too broad and we'd evict on unrelated
+ * failures; too narrow and we'd miss the case the feature targets.
+ */
+function isInsufficientVramError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /too large for the available VRAM/i.test(message)
+    || /Failed to create any (embedding|rerank) context/i.test(message)
+    || /insufficient VRAM/i.test(message)
+    || /out of memory/i.test(message)
+  );
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -1308,24 +1326,28 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
-      const context = await this.ensureEmbedContext();
-
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
-      }
-
-      const embedding = await context.getEmbeddingFor(safeText);
-
-      return {
-        embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
-      };
+      return await this.embedWithReclaim(() => this.embedImpl(text, options));
     } catch (error) {
       console.error("Embedding error:", error);
       return null;
     }
+  }
+
+  private async embedImpl(text: string, options: EmbedOptions): Promise<EmbeddingResult> {
+    const context = await this.ensureEmbedContext();
+
+    // Guard: truncate text that exceeds model context window to prevent GGML crash
+    const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+    if (truncated) {
+      console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+    }
+
+    const embedding = await context.getEmbeddingFor(safeText);
+
+    return {
+      embedding: Array.from(embedding.vector),
+      model: options.model ?? this.embedModelUri,
+    };
   }
 
   /**
@@ -1340,63 +1362,67 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
-      const contexts = await this.ensureEmbedContexts();
-      const n = contexts.length;
+      return await this.embedWithReclaim(() => this.embedBatchImpl(texts, options));
+    } catch (error) {
+      console.error("Batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
 
-      if (n === 1) {
-        // Single context: sequential (no point splitting)
-        const context = contexts[0]!;
-        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
-        for (const text of texts) {
+  private async embedBatchImpl(texts: string[], options: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    const contexts = await this.ensureEmbedContexts();
+    const n = contexts.length;
+
+    if (n === 1) {
+      // Single context: sequential (no point splitting)
+      const context = contexts[0]!;
+      const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
+      for (const text of texts) {
+        try {
+          const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+          if (truncated) {
+            console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
+          }
+          const embedding = await context.getEmbeddingFor(safeText);
+          this.touchActivity();
+          embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+        } catch (err) {
+          console.error("Embedding error for text:", err);
+          embeddings.push(null);
+        }
+      }
+      return embeddings;
+    }
+
+    // Multiple contexts: split texts across contexts for parallel evaluation
+    const chunkSize = Math.ceil(texts.length / n);
+    const chunks = Array.from({ length: n }, (_, i) =>
+      texts.slice(i * chunkSize, (i + 1) * chunkSize)
+    );
+
+    const chunkResults = await Promise.all(
+      chunks.map(async (chunk, i) => {
+        const ctx = contexts[i]!;
+        const results: (EmbeddingResult | null)[] = [];
+        for (const text of chunk) {
           try {
             const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
             if (truncated) {
               console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
-            const embedding = await context.getEmbeddingFor(safeText);
+            const embedding = await ctx.getEmbeddingFor(safeText);
             this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+            results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
-            embeddings.push(null);
+            results.push(null);
           }
         }
-        return embeddings;
-      }
+        return results;
+      })
+    );
 
-      // Multiple contexts: split texts across contexts for parallel evaluation
-      const chunkSize = Math.ceil(texts.length / n);
-      const chunks = Array.from({ length: n }, (_, i) =>
-        texts.slice(i * chunkSize, (i + 1) * chunkSize)
-      );
-
-      const chunkResults = await Promise.all(
-        chunks.map(async (chunk, i) => {
-          const ctx = contexts[i]!;
-          const results: (EmbeddingResult | null)[] = [];
-          for (const text of chunk) {
-            try {
-              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-              if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
-              }
-              const embedding = await ctx.getEmbeddingFor(safeText);
-              this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-            } catch (err) {
-              console.error("Embedding error for text:", err);
-              results.push(null);
-            }
-          }
-          return results;
-        })
-      );
-
-      return chunkResults.flat();
-    } catch (error) {
-      console.error("Batch embedding error:", error);
-      return texts.map(() => null);
-    }
+    return chunkResults.flat();
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
@@ -1716,6 +1742,29 @@ export class LlamaCpp implements LLM {
       vram,
       cpuCores: llama.cpuMathCores,
     };
+  }
+
+  /**
+   * Wrap an embed operation so that, in lowVram mode, an insufficient-VRAM
+   * failure triggers a one-shot recovery: drain the generate and rerank chains
+   * (so any in-flight expand/rerank completes its own finally-dispose), then
+   * dispose both heavy models defensively, then retry the operation once.
+   *
+   * The chain-drain is what makes the dispose safe — it can never race with
+   * an in-flight expand or rerank because those callers' finallys already ran.
+   * Outside lowVram mode, this is a pass-through.
+   */
+  private async embedWithReclaim<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.lowVram) return fn();
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isInsufficientVramError(error)) throw error;
+      await Promise.allSettled([this.generateChain, this.rerankChain]);
+      await this.disposeGenerateModel();
+      await this.disposeRerankModel();
+      return await fn();
+    }
   }
 
   /**
