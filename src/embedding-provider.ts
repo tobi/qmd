@@ -27,6 +27,7 @@ import type {
   RerankDocument,
   RerankOptions,
 } from './llm.js';
+import type { ModelsConfig } from './collections.js';
 
 // =============================================================================
 // Types
@@ -184,6 +185,55 @@ function resolveEndpoint(
   const model = process.env[`QMD_${envSuffix}_MODEL`] || modelDefault;
   const apiKey = (process.env[`QMD_${envSuffix}_API_KEY`] || process.env.OPENAI_API_KEY || '').trim();
   return { baseUrl, model, apiKey };
+}
+
+/**
+ * Resolve a RemoteLLMConfig from environment variables and optional YAML models config.
+ *
+ * Priority: environment variables > YAML models config > local-first defaults.
+ *
+ * This allows users to configure remote expand/generate/rerank endpoints
+ * in their index.yml under the `models:` key, falling back to env vars.
+ * Local-first defaults: all endpoints default to empty (local LlamaCpp)
+ * unless explicitly configured via env vars or YAML.
+ * 
+ * 
+ */
+export function remoteConfigFromEnv(models?: ModelsConfig): RemoteLLMConfig {
+  // --- Embed ---
+  // Priority: QMD_EMBED_* env vars > models.embed_api_* YAML > OPENAI_* fallback > empty (local-first)
+  // Empty baseUrl means: fall back to local LlamaCpp embeddings.
+  const embed: EndpointConfig = {
+    baseUrl: (process.env.QMD_EMBED_BASE_URL || models?.embed_api_url || process.env.OPENAI_BASE_URL || '').replace(/\/+$/, ''),
+    model: process.env.QMD_EMBED_MODEL || models?.embed_api_model || '',
+    apiKey: (process.env.QMD_EMBED_API_KEY || models?.embed_api_key || process.env.OPENAI_API_KEY || '').trim(),
+  };
+
+  // --- Expand ---
+  // Priority: QMD_EXPAND_* env vars > models.expand_api_* YAML > empty (local-first)
+  const expand: EndpointConfig = {
+    baseUrl: (process.env.QMD_EXPAND_BASE_URL || models?.expand_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_EXPAND_MODEL || models?.expand_api_model || '',
+    apiKey: (process.env.QMD_EXPAND_API_KEY || models?.expand_api_key || process.env.OPENAI_API_KEY || '').trim(),
+  };
+
+  // --- Rerank ---
+  // Priority: QMD_RERANK_* env vars > models.rerank_api_* YAML > empty (local-first)
+  const rerank: EndpointConfig = {
+    baseUrl: (process.env.QMD_RERANK_BASE_URL || models?.rerank_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_RERANK_MODEL || models?.rerank_api_model || '',
+    apiKey: (process.env.QMD_RERANK_API_KEY || models?.rerank_api_key || process.env.OPENAI_API_KEY || '').trim(),
+  };
+
+  // --- Generate ---
+  // Priority: QMD_GENERATE_* env vars > models.generate_api_* YAML > empty (local-first)
+  const generate: EndpointConfig = {
+    baseUrl: (process.env.QMD_GENERATE_BASE_URL || models?.generate_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_GENERATE_MODEL || models?.generate_api_model || '',
+    apiKey: (process.env.QMD_GENERATE_API_KEY || models?.generate_api_key || process.env.OPENAI_API_KEY || '').trim(),
+  };
+
+  return { embed, expand, rerank, generate };
 }
 
 // =============================================================================

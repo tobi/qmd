@@ -82,7 +82,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, isRemoteConfigured } from "../llm.js";
-import { RemoteLLM } from "../embedding-provider.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../embedding-provider.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -135,9 +135,10 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (isRemoteConfigured()) {
+      if (isRemoteConfigured(config.models)) {
         // Remote LLM configured via env vars — use RemoteLLM instead of LlamaCpp
-        const remoteLlm = new RemoteLLM();
+        const remoteConfig = remoteConfigFromEnv(config.models);
+        const remoteLlm = new RemoteLLM(remoteConfig);
         store.llm = remoteLlm;
         setDefaultLlamaCpp(remoteLlm as unknown as LlamaCpp);
       } else {

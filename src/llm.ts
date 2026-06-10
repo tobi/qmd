@@ -4,6 +4,7 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
+import type { ModelsConfig } from './collections.js';
 import type {
   Llama,
   LlamaModel,
@@ -2097,14 +2098,18 @@ export class NoopLlamaCpp implements LLM {
 /**
  * Check whether a remote embedding provider is configured.
  */
-export function isRemoteConfigured(): boolean {
+export function isRemoteConfigured(models?: ModelsConfig): boolean {
   return !!(
     process.env.OPENAI_BASE_URL ||
     process.env.QMD_EMBED_PROVIDER === 'remote' ||
     process.env.QMD_EMBED_BASE_URL ||
     process.env.QMD_EXPAND_BASE_URL ||
     process.env.QMD_RERANK_BASE_URL ||
-    process.env.QMD_GENERATE_BASE_URL
+    process.env.QMD_GENERATE_BASE_URL ||
+    models?.embed_api_url ||
+    models?.expand_api_url ||
+    models?.rerank_api_url ||
+    models?.generate_api_url
   );
 }
 

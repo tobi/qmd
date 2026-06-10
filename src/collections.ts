@@ -40,6 +40,20 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+
+  // Remote API endpoint configuration (env vars take precedence)
+  embed_api_url?: string;    // Remote embed API base URL
+  embed_api_model?: string;  // Remote embed model name
+  embed_api_key?: string;    // Bearer token for remote embed API
+  expand_api_url?: string;    // Remote query expansion API base URL
+  expand_api_model?: string;  // Remote query expansion model name
+  expand_api_key?: string;    // Bearer token for remote expand API
+  rerank_api_url?: string;    // Remote rerank API base URL
+  rerank_api_model?: string;  // Remote rerank model name
+  rerank_api_key?: string;    // Bearer token for remote rerank API
+  generate_api_url?: string;  // Remote generation API base URL
+  generate_api_model?: string; // Remote generation model name
+  generate_api_key?: string;  // Bearer token for remote generate API
 }
 
 /**
