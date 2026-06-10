@@ -37,11 +37,14 @@ import {
   anthropicMessagesExpandAdapter,
   anthropicMessagesGenerateAdapter,
 } from './anthropic-messages.js';
+import { cohereV2EmbedAdapter } from './cohere-embed.js';
+import { cohereRerankAdapter } from './cohere-rerank.js';
+import { vllmScoreAdapter } from './vllm-score.js';
 
 const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
   auto: legacyEmbedAdapter,
   openai_v1_embeddings: legacyEmbedAdapter,
-  cohere_v2_embed: legacyEmbedAdapter,
+  cohere_v2_embed: cohereV2EmbedAdapter,
   ollama_embed: legacyEmbedAdapter,
   vllm_pooling: legacyEmbedAdapter,
 };
@@ -56,9 +59,9 @@ const EXPAND_ADAPTERS: Partial<Record<RemoteApiFormat, ExpandAdapter>> = {
 
 const RERANK_ADAPTERS: Partial<Record<RemoteApiFormat, RerankAdapter>> = {
   auto: legacyRerankAdapter,
-  cohere_v1_rerank: legacyRerankAdapter,
-  cohere_v2_rerank: legacyRerankAdapter,
-  vllm_score: legacyRerankAdapter,
+  cohere_v1_rerank: cohereRerankAdapter,
+  cohere_v2_rerank: cohereRerankAdapter,
+  vllm_score: vllmScoreAdapter,
 };
 
 const GENERATE_ADAPTERS: Partial<Record<RemoteApiFormat, GenerateAdapter>> = {
@@ -91,4 +94,3 @@ export function resolveAdapterBundle(cfgs: {
     generate: pickAdapter(GENERATE_ADAPTERS, cfgs.generate, legacyGenerateAdapter),
   };
 }
-

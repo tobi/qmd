@@ -8,6 +8,30 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking�
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
+## Fork Overview
+
+This fork focuses on remote-provider interoperability while preserving local-first defaults.
+
+### What This Fork Adds
+
+- Protocol-aware remote adapter layer for per-endpoint formats (`embed`, `expand`, `rerank`, `generate`).
+- Explicit API format selection via env vars / YAML (`*_api_format`).
+- OpenAI generation support across:
+  - `/v1/chat/completions`
+  - `/v1/completions`
+  - `/v1/responses`
+- Anthropic Messages support (`/v1/messages`) for expand/generate.
+- Cohere-compatible embed/rerank adapters with vLLM compatibility:
+  - Embed: `/v2/embed` and `/embed` fallback
+  - Rerank: `/rerank`, `/v1/rerank`, `/v2/rerank` fallback
+- Query-aware remote embedding in batch vector paths (`isQuery: true`) so query/document embedding intent is preserved in hybrid and structured search flows.
+
+### Backward Compatibility Goals
+
+- `auto` format keeps legacy behavior unless a specific format is configured.
+- OpenAI-style `/v1/embeddings` remains supported.
+- Local GGUF workflows remain default when no remote URLs are configured.
+
 ## Quick Start
 
 ```sh
@@ -973,67 +997,205 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ### Remote LLM Endpoints
 
-When `QMD_EMBED_PROVIDER=remote` or any `QMD_*_BASE_URL` environment variable is set, QMD uses a remote LLM provider (vLLM, Ollama, OpenRouter, etc.) instead of local GGUF models. Configure each endpoint via environment variables **or** YAML config — env vars take precedence. All endpoints default to local LlamaCpp unless explicitly configured via env vars or YAML. Set `QMD_EMBED_BASE_URL` (or `embed_api_url` in YAML) to use a remote embedding server like vLLM or Ollama.
+QMD can run fully local or delegate each LLM role to remote APIs. Roles are independent, so you can mix providers and protocols.
 
-**Environment variables:**
+#### Remote Setup Checklist
+
+1. Decide which roles you want remote (`embed`, `expand`, `rerank`, `generate`).
+2. Set each role's `*_api_url`, `*_api_format`, and `*_api_model` in YAML or env vars.
+3. Add API keys only for endpoints that require auth.
+4. Run `qmd embed` (or `qmd embed -f` after model changes) and validate with `qmd vsearch` / `qmd query`.
+
+#### RemoteLLM Roles
+
+| Role | Used for | Typical route(s) |
+|------|----------|------------------|
+| `embed` | `qmd embed`, vector search (`vsearch`, hybrid pipeline) | `/v1/embeddings`, `/v2/embed`, `/embed` |
+| `expand` | Query expansion in hybrid search | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` |
+| `rerank` | Final relevance sorting of candidate chunks | `/rerank`, `/v1/rerank`, `/v2/rerank`, `/score`, `/v1/score` |
+| `generate` | General text generation path (SDK/adapter surface) | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` |
+
+#### Activation and Precedence
+
+QMD stays local by default. Remote mode is activated when any remote endpoint URL is configured:
+
+- env vars: `QMD_*_BASE_URL`
+- YAML: `models.*_api_url`
+- backward-compat embed trigger: `OPENAI_BASE_URL`
+
+Precedence is:
+
+1. Environment variables (`QMD_*`)
+2. YAML config (`~/.config/qmd/index.yml`, `models:`)
+3. Backward-compat embed fallbacks (`OPENAI_BASE_URL`/`OPENAI_API_KEY`)
+
+#### Endpoint Formats and Adapter Mapping
+
+Allowed `*_api_format` values:
+
+| Role | Allowed formats |
+|------|-----------------|
+| `embed` | `auto`, `openai_v1_embeddings`, `cohere_v2_embed`, `ollama_embed`, `vllm_pooling` |
+| `expand` | `auto`, `openai_chat_completions`, `openai_completions`, `openai_responses`, `anthropic_messages` |
+| `rerank` | `auto`, `cohere_v1_rerank`, `cohere_v2_rerank`, `vllm_score` |
+| `generate` | `auto`, `openai_chat_completions`, `openai_completions`, `openai_responses`, `anthropic_messages` |
+
+Adapter notes:
+
+- `auto` keeps legacy behavior.
+- `cohere_v2_embed` uses the Cohere-compatible embed adapter with path/payload/input-type fallback.
+- `cohere_v1_rerank` / `cohere_v2_rerank` use the Cohere-compatible rerank adapter.
+- `vllm_score` uses the vLLM Score adapter (`/score` with `/v1/score` fallback).
+- `anthropic_messages` uses `x-api-key` + `anthropic-version` headers and `/messages` payloads.
+
+#### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `QMD_EMBED_BASE_URL` | — | Embed API base URL (e.g. `http://localhost:11434/v1`)
+| `QMD_EMBED_BASE_URL` | — | Embed API base URL |
+| `QMD_EMBED_API_FORMAT` | `auto` | Embed protocol |
 | `QMD_EMBED_MODEL` | *(empty, local)* | Embed model name |
-| `QMD_EMBED_API_KEY` | — | Bearer token for embed API |
+| `QMD_EMBED_API_KEY` | — | Embed bearer token |
 | `QMD_EXPAND_BASE_URL` | *(empty, local)* | Expand API base URL |
+| `QMD_EXPAND_API_FORMAT` | `auto` | Expand protocol |
 | `QMD_EXPAND_MODEL` | *(empty, local)* | Expand model name |
-| `QMD_EXPAND_API_KEY` | — | Bearer token for expand API |
+| `QMD_EXPAND_API_KEY` | — | Expand API key/token |
 | `QMD_RERANK_BASE_URL` | *(empty, local)* | Rerank API base URL |
+| `QMD_RERANK_API_FORMAT` | `auto` | Rerank protocol |
 | `QMD_RERANK_MODEL` | *(empty, local)* | Rerank model name |
-| `QMD_RERANK_API_KEY` | — | Bearer token for rerank API |
+| `QMD_RERANK_API_KEY` | — | Rerank bearer token |
 | `QMD_GENERATE_BASE_URL` | *(empty, local)* | Generate API base URL |
+| `QMD_GENERATE_API_FORMAT` | `auto` | Generate protocol |
 | `QMD_GENERATE_MODEL` | *(empty, local)* | Generate model name |
-| `QMD_GENERATE_API_KEY` | — | Bearer token for generate API |
-| `OPENAI_BASE_URL` | — | Fallback base URL for embed endpoint (backward compat)
-| `OPENAI_API_KEY` | — | Fallback API key for all endpoints
+| `QMD_GENERATE_API_KEY` | — | Generate API key/token |
+| `OPENAI_BASE_URL` | — | Backward-compat embed URL fallback |
+| `OPENAI_API_KEY` | — | API key fallback for endpoints |
 
-**YAML config (`~/.config/qmd/index.yml`):**
+#### YAML Configuration (Full Multi-Endpoint Example)
 
 ```yaml
 models:
+  # Local defaults are still useful as fallback documentation in your config.
   embed: hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
   rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
-  embed_api_url: http://localhost:11434/v1  # or leave empty for local LlamaCpp
+
+  embed_api_url: http://localhost:11434/v1
+  embed_api_format: openai_v1_embeddings
   embed_api_model: Qwen/Qwen3-Embedding-0.6B
-  embed_api_key: ''  # or set to your API key
-  expand_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
+  embed_api_key: ""
+
+  expand_api_url: https://openrouter.ai/api/v1
+  expand_api_format: openai_chat_completions
   expand_api_model: google/gemini-2.0-flash-lite-001
   expand_api_key: sk-or-...
-  rerank_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
+
+  rerank_api_url: https://openrouter.ai/api/v1
+  rerank_api_format: cohere_v1_rerank
   rerank_api_model: cohere/rerank-v3.5
   rerank_api_key: sk-or-...
-  generate_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
+
+  generate_api_url: https://openrouter.ai/api/v1
+  generate_api_format: openai_chat_completions
   generate_api_model: google/gemini-2.0-flash-lite-001
   generate_api_key: sk-or-...
 ```
 
-| YAML field | Env var | Default | Description |
-|-----------|---------|---------|-------------|
-| `embed` | `QMD_EMBED_MODEL` | embeddinggemma | Local GGUF model URI for embeddings |
-| `embed_api_url` | `QMD_EMBED_BASE_URL` | *(empty, local)* | Remote embed API base URL |
-| `embed_api_model` | `QMD_EMBED_MODEL` | *(empty, local)* | Remote embed model name |
-| `embed_api_key` | `QMD_EMBED_API_KEY` | — | Bearer token for remote embed API |
-| `rerank` | `QMD_RERANK_MODEL` | qwen3-reranker | Local GGUF model URI for reranking |
-| `generate` | `QMD_GENERATE_MODEL` | qmd-query-expansion | Local GGUF model URI for generation |
-| `expand_api_url` | `QMD_EXPAND_BASE_URL` | *(empty, local)* | Remote expand API base URL |
-| `expand_api_model` | `QMD_EXPAND_MODEL` | *(empty, local)* | Remote expand model name |
-| `expand_api_key` | `QMD_EXPAND_API_KEY` | — | Bearer token for remote expand API |
-| `rerank_api_url` | `QMD_RERANK_BASE_URL` | *(empty, local)* | Remote rerank API base URL |
-| `rerank_api_model` | `QMD_RERANK_MODEL` | *(empty, local)* | Remote rerank model name |
-| `rerank_api_key` | `QMD_RERANK_API_KEY` | — | Bearer token for remote rerank API |
-| `generate_api_url` | `QMD_GENERATE_BASE_URL` | *(empty, local)* | Remote generate API base URL |
-| `generate_api_model` | `QMD_GENERATE_MODEL` | *(empty, local)* | Remote generate model name |
-| `generate_api_key` | `QMD_GENERATE_API_KEY` | — | Bearer token for remote generate API |
+Environment variables override YAML values.
 
-Env vars always take precedence over YAML config values.
+#### Common Remote Profiles
+
+OpenAI-compatible `/v1/embeddings` only:
+
+```yaml
+models:
+  embed_api_url: http://your-host:port/v1
+  embed_api_format: openai_v1_embeddings
+  embed_api_model: Qwen/Qwen3-Embedding-0.6B
+```
+
+vLLM Cohere-compatible embed endpoint (your fork use case):
+
+```yaml
+models:
+  embed_api_url: http://10.0.0.165:8000
+  embed_api_format: cohere_v2_embed
+  embed_api_model: qwen3-embedding-0.6b
+```
+
+Use the exact model id returned by `GET /v1/models`.
+
+vLLM Score API reranking:
+
+```yaml
+models:
+  rerank_api_url: http://10.0.0.165:8000
+  rerank_api_format: vllm_score
+  rerank_api_model: BAAI/bge-reranker-v2-m3
+```
+
+Anthropic Messages for expand/generate:
+
+```yaml
+models:
+  expand_api_url: https://api.anthropic.com/v1
+  expand_api_format: anthropic_messages
+  expand_api_model: your-claude-model-id
+  expand_api_key: sk-ant-...
+
+  generate_api_url: https://api.anthropic.com/v1
+  generate_api_format: anthropic_messages
+  generate_api_model: your-claude-model-id
+  generate_api_key: sk-ant-...
+```
+
+#### Remote Embed Behavior in This Fork (`cohere_v2_embed`)
+
+1. Endpoint fallback:
+   `.../v2/embed` first, then `.../embed`.
+2. Request-shape fallback:
+   `inputs` object form first, then `texts` array form.
+3. `input_type` fallback:
+   query mode: `search_query` then `query`; document mode: `search_document` then `document`.
+4. Response normalization:
+   accepts Cohere-style and compatible embedding payload shapes.
+5. Safety checks:
+   embedding count and dimension consistency are validated.
+
+The adapter caches the last successful endpoint path, request shape, and input type per base URL.
+
+#### Query vs Document Embeddings
+
+This fork forwards query intent through batch embedding paths (`isQuery: true`) in hybrid and structured search, so remote providers that support query/document embedding modes can improve retrieval quality.
+
+#### Graceful Degradation Behavior
+
+- Missing expand key: expansion falls back to passthrough/fallback query variants.
+- Missing rerank key: reranking returns uniform scores instead of failing search.
+- Generate failures: return `null` for generation calls without breaking indexing/search.
+
+#### Verification Workflow
+
+1. Confirm the model id on the remote endpoint:
+   `curl -s http://HOST:PORT/v1/models | jq .`
+2. Generate vectors:
+   `qmd embed -f`
+3. Run semantic search:
+   `qmd vsearch "test query"`
+4. Run hybrid search (expand + rerank path):
+   `qmd query "test query"`
+5. Inspect index health:
+   `qmd status`
+
+#### Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `Embedding dimension mismatch` | Remote embedding model changed after vectors were created | Rebuild vectors with `qmd embed -f` |
+| HTTP 404/405 on embed | Wrong path contract (`/v1/embeddings` vs `/v2/embed`) | Set `embed_api_format` correctly and verify `embed_api_url` base |
+| Poor hybrid quality | Query/document mode not supported by provider or wrong embed model | Use provider-native embedding model and verify `input_type` support |
+| Rerank always uniform | Missing/invalid rerank key or rerank endpoint errors | Set `rerank_api_key`, validate rerank URL/model |
+| Expand returns mostly original query | Missing expand key or format mismatch | Set `expand_api_key`, verify `expand_api_format` and endpoint protocol |
 
 ## How It Works
 

@@ -61,6 +61,9 @@ import {
   anthropicMessagesExpandAdapter,
   anthropicMessagesGenerateAdapter,
 } from '../src/remote/adapters/anthropic-messages.js';
+import { cohereV2EmbedAdapter } from '../src/remote/adapters/cohere-embed.js';
+import { cohereRerankAdapter } from '../src/remote/adapters/cohere-rerank.js';
+import { vllmScoreAdapter } from '../src/remote/adapters/vllm-score.js';
 import { resolveAdapterBundle } from '../src/remote/adapters/registry.js';
 
 // =============================================================================
@@ -1272,10 +1275,10 @@ describe('normalizeAnthropicMessagesText', () => {
 });
 
 // =============================================================================
-// Phase 2 — Adapter registry: format → adapter mapping
+// Adapter registry: format → adapter mapping
 // =============================================================================
 
-describe('resolveAdapterBundle (Phase 2)', () => {
+describe('resolveAdapterBundle', () => {
   function ecfg(overrides?: Partial<EndpointConfig>): EndpointConfig {
     return {
       baseUrl: 'http://localhost:1',
@@ -1353,15 +1356,422 @@ describe('resolveAdapterBundle (Phase 2)', () => {
     expect(bundle.generate.id).toBe('legacy/openai-chat-generate');
   });
 
-  test('embed and rerank adapters unchanged (Phase 2 only touches expand/generate)', () => {
+  test('cohere formats resolve to cohere embed/rerank adapters', () => {
     const bundle = resolveAdapterBundle({
-      embed: ecfg({ format: 'auto' }),
+      embed: ecfg({ format: 'cohere_v2_embed' }),
       expand: ecfg({ format: 'openai_chat_completions' }),
-      rerank: ecfg({ format: 'auto' }),
+      rerank: ecfg({ format: 'cohere_v2_rerank' }),
       generate: ecfg({ format: 'openai_chat_completions' }),
     });
-    expect(bundle.embed.id).toBe('legacy/openai-embeddings');
-    expect(bundle.rerank.id).toBe('legacy/cohere-rerank');
+    expect(bundle.embed.id).toBe('cohere/v2-embed');
+    expect(bundle.rerank.id).toBe('cohere/rerank');
+  });
+
+  test('vllm_score resolves to vLLM score adapter', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'auto' }),
+      expand: ecfg({ format: 'auto' }),
+      rerank: ecfg({ format: 'vllm_score' }),
+      generate: ecfg({ format: 'auto' }),
+    });
+    expect(bundle.rerank.id).toBe('vllm/score');
+  });
+});
+
+// =============================================================================
+// Phase 4 — Cohere-compatible embed/rerank adapters
+// =============================================================================
+
+describe('cohereV2EmbedAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof cohereV2EmbedAdapter.embedBatch>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'embed-v4.0', apiKey: 'sk-test', format: 'cohere_v2_embed' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      maxBatchSize: 32,
+      readTimeoutMs: 5000,
+      maxRetries: 1,
+      dimState: { dimensions: null },
+    };
+  }
+
+  test('falls back from inputs payload to texts payload on contract mismatch', async () => {
+    const seenShapes: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      expect(req.url).toBe('/v2/embed');
+      const body = await readBody(req) as Record<string, unknown>;
+      if (Array.isArray(body.inputs)) {
+        seenShapes.push('inputs');
+        jsonRes(res, 400, { error: 'inputs unsupported here' });
+        return;
+      }
+      if (Array.isArray(body.texts)) {
+        seenShapes.push('texts');
+        jsonRes(res, 200, {
+          embeddings: {
+            float: [mockEmbedding, mockEmbedding],
+          },
+          model: 'embed-v4.0',
+        });
+        return;
+      }
+      jsonRes(res, 400, { error: 'invalid body' });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(server.url),
+      ['hello', 'world'],
+      {},
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[0]!.embedding).toEqual(mockEmbedding);
+    expect(result[1]!.embedding).toEqual(mockEmbedding);
+    expect(seenShapes).toEqual(['inputs', 'inputs', 'texts']);
+    await server.close();
+  });
+
+  test('sets input_type=search_query when embedding query text', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(server.url),
+      ['query text'],
+      { isQuery: true },
+    );
+
+    expect(receivedBody.input_type).toBe('search_query');
+    await server.close();
+  });
+
+  test('falls back input_type from search_document to document on vLLM-style error', async () => {
+    const seenInputTypes: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      const body = await readBody(req) as Record<string, unknown>;
+      const inputType = String(body.input_type ?? '');
+      seenInputTypes.push(inputType);
+      if (inputType === 'search_document') {
+        jsonRes(res, 400, {
+          error: {
+            message: "Unsupported input_type 'search_document'. Supported values: document, query",
+          },
+        });
+        return;
+      }
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(server.url),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(seenInputTypes).toEqual(['search_document', 'document']);
+    await server.close();
+  });
+
+  test('normalizes OpenAI-style data embeddings using index order', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        data: [
+          { index: 1, embedding: [2, 2, 2] },
+          { index: 0, embedding: [1, 1, 1] },
+        ],
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(server.url),
+      ['first', 'second'],
+      {},
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[0]!.embedding).toEqual([1, 1, 1]);
+    expect(result[1]!.embedding).toEqual([2, 2, 2]);
+    await server.close();
+  });
+
+  test('falls back endpoint path from /v2/embed to /embed', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
+      if (req.url === '/v2/embed') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(server.url),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths).toEqual(['/v2/embed', '/v2/embed', '/embed']);
+    await server.close();
+  });
+
+  test('when baseUrl ends with /embed, fallback target is sibling /v2/embed', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
+      if (req.url === '/embed') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        embeddings: { float: [mockEmbedding] },
+      });
+    });
+
+    const result = await cohereV2EmbedAdapter.embedBatch(
+      makeCtx(`${server.url}/embed`),
+      ['hello'],
+      {},
+    );
+
+    expect(result).toHaveLength(1);
+    expect(requestedPaths).toEqual(['/embed', '/embed', '/v2/embed']);
+    await server.close();
+  });
+
+  test('throws on embedding dimension mismatch across calls', async () => {
+    let callCount = 0;
+    const ctx = makeCtx('http://localhost:1');
+    const server = startMockServer((_req, res) => {
+      callCount++;
+      if (callCount === 1) {
+        jsonRes(res, 200, { embeddings: { float: [[0.1, 0.2, 0.3]] } });
+      } else {
+        jsonRes(res, 200, { embeddings: { float: [[0.1, 0.2]] } });
+      }
+    });
+    ctx.cfg.baseUrl = server.url;
+
+    await cohereV2EmbedAdapter.embedBatch(ctx, ['a'], {});
+    await expect(
+      cohereV2EmbedAdapter.embedBatch(ctx, ['b'], {}),
+    ).rejects.toThrow('dimension mismatch');
+    await server.close();
+  });
+});
+
+describe('cohereRerankAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof cohereRerankAdapter.rerank>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'rerank-v3.5', apiKey: 'sk-test', format: 'cohere_v2_rerank' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  const docs = [
+    { file: 'a.md', text: 'first document' },
+    { file: 'b.md', text: 'second document' },
+  ];
+
+  test('tries /rerank then /v1/rerank when provider only supports v1 path', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
+      if (req.url === '/rerank') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        results: [{ index: 1, relevance_score: 0.88 }],
+      });
+    });
+
+    const result = await cohereRerankAdapter.rerank(
+      makeCtx(server.url),
+      'query',
+      docs,
+      {},
+    );
+
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]!.file).toBe('b.md');
+    expect(requestedPaths).toEqual(['/rerank', '/v1/rerank']);
+    await server.close();
+  });
+
+  test('when baseUrl ends with /rerank, fallback targets sibling /v1/rerank', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer(async (req, res) => {
+      requestedPaths.push(req.url ?? '');
+      if (req.url === '/rerank') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        results: [{ index: 0, relevance_score: 0.88 }],
+      });
+    });
+
+    const result = await cohereRerankAdapter.rerank(
+      makeCtx(`${server.url}/rerank`),
+      'query',
+      docs,
+      {},
+    );
+
+    expect(result.results).toHaveLength(1);
+    expect(requestedPaths).toEqual(['/rerank', '/v1/rerank']);
+    await server.close();
+  });
+
+  test('uses options.model override in request body', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (_req, res) => {
+      receivedBody = await readBody(_req);
+      jsonRes(res, 200, {
+        results: [{ index: 0, relevance_score: 0.99 }],
+      });
+    });
+
+    await cohereRerankAdapter.rerank(
+      makeCtx(server.url),
+      'query',
+      docs,
+      { model: 'rerank-override' },
+    );
+
+    expect(receivedBody.model).toBe('rerank-override');
+    await server.close();
+  });
+
+  test('returns uniform fallback when API key is missing', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.cfg.apiKey = '';
+    ctx.log = log;
+
+    const result = await cohereRerankAdapter.rerank(ctx, 'query', docs, {});
+    expect(result.results.every((r) => r.score === 1.0)).toBe(true);
+    expect(log.calls.some((c) => c.msg.includes('no API key'))).toBe(true);
+  });
+
+  test('treats malformed 200 response as failure and returns uniform fallback', async () => {
+    const log = spyLogger();
+    const breaker = new CircuitBreaker(1);
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, { results: [{ foo: 'bad-shape' }] });
+    });
+
+    const ctx = makeCtx(server.url);
+    ctx.log = log;
+    ctx.breaker = breaker;
+
+    const result = await cohereRerankAdapter.rerank(ctx, 'query', docs, {});
+    expect(result.results.every((r) => r.score === 1.0)).toBe(true);
+    expect(breaker.getState()).toBe('open');
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+    await server.close();
+  });
+});
+
+describe('vllmScoreAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof vllmScoreAdapter.rerank>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'BAAI/bge-reranker-v2-m3', apiKey: '', format: 'vllm_score' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  const docs = [
+    { file: 'a.md', text: 'first document' },
+    { file: 'b.md', text: 'second document' },
+  ];
+
+  test('posts to /score and normalizes data[] scores', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'BAAI/bge-reranker-v2-m3',
+        data: [
+          { index: 0, score: 0.22 },
+          { index: 1, score: 0.91 },
+        ],
+      });
+    });
+
+    const result = await vllmScoreAdapter.rerank(
+      makeCtx(server.url),
+      'query',
+      docs,
+      {},
+    );
+
+    expect(requestedPath).toBe('/score');
+    expect(receivedBody.queries).toBe('query');
+    expect(receivedBody.documents).toEqual(['first document', 'second document']);
+    expect(result.results[0]!.file).toBe('b.md');
+    expect(result.results[0]!.score).toBe(0.91);
+    await server.close();
+  });
+
+  test('falls back endpoint path from /score to /v1/score', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer((_req, res) => {
+      requestedPaths.push(_req.url ?? '');
+      if (_req.url === '/score') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        data: [{ index: 0, score: 0.77 }],
+      });
+    });
+
+    const result = await vllmScoreAdapter.rerank(
+      makeCtx(server.url),
+      'query',
+      docs,
+      {},
+    );
+
+    expect(result.results[0]!.score).toBe(0.77);
+    expect(requestedPaths).toEqual(['/score', '/v1/score']);
+    await server.close();
+  });
+
+  test('returns uniform fallback when score response is malformed', async () => {
+    const breaker = new CircuitBreaker(1);
+    const log = spyLogger();
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, { data: [{ foo: 'bad-shape' }] });
+    });
+    const ctx = makeCtx(server.url);
+    ctx.breaker = breaker;
+    ctx.log = log;
+
+    const result = await vllmScoreAdapter.rerank(ctx, 'query', docs, {});
+    expect(result.results.every((r) => r.score === 1.0)).toBe(true);
+    expect(breaker.getState()).toBe('open');
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+    await server.close();
   });
 });
 
@@ -1943,6 +2353,94 @@ describe('RemoteLLM with Phase 2 formats', () => {
     const result = await llm.generate('test');
     expect(result!.text).toBe('answer');
     expect(requestedPath).toBe('/chat/completions'); // legacy also uses chat completions
+    await llm.dispose();
+    await server.close();
+  });
+});
+
+// =============================================================================
+// Phase 4 — RemoteLLM integration with Cohere-compatible formats
+// =============================================================================
+
+describe('RemoteLLM with Phase 4 cohere formats', () => {
+  test('RemoteLLM embedBatch uses cohere_v2_embed adapter and /v2/embed path', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        embeddings: {
+          float: [mockEmbedding],
+        },
+      });
+    });
+
+    const llm = new RemoteLLM({
+      embed: { baseUrl: server.url, model: 'embed-v4.0', apiKey: 'sk', format: 'cohere_v2_embed' },
+    }, silentLogger);
+
+    const result = await llm.embedBatch(['hello']);
+    expect(result[0]!.embedding).toEqual(mockEmbedding);
+    expect(requestedPath).toBe('/v2/embed');
+    expect(receivedBody.input_type).toBe('search_document');
+
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM rerank uses cohere_v2_rerank adapter with endpoint fallback', async () => {
+    const requestedPaths: string[] = [];
+    const server = startMockServer((_req, res) => {
+      requestedPaths.push(_req.url ?? '');
+      if (_req.url === '/rerank') {
+        jsonRes(res, 404, { error: 'not found' });
+        return;
+      }
+      jsonRes(res, 200, {
+        results: [{ index: 0, relevance_score: 0.91 }],
+      });
+    });
+
+    const llm = new RemoteLLM({
+      rerank: { baseUrl: server.url, model: 'rerank-v3.5', apiKey: 'sk', format: 'cohere_v2_rerank' },
+    }, silentLogger);
+
+    const result = await llm.rerank('q', [{ file: 'a.md', text: 'doc' }]);
+    expect(result.results[0]!.score).toBe(0.91);
+    expect(requestedPaths).toEqual(['/rerank', '/v1/rerank']);
+
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM rerank uses vllm_score adapter and /score endpoint', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'BAAI/bge-reranker-v2-m3',
+        data: [{ index: 0, score: 0.93 }],
+      });
+    });
+
+    const llm = new RemoteLLM({
+      rerank: {
+        baseUrl: server.url,
+        model: 'BAAI/bge-reranker-v2-m3',
+        apiKey: '',
+        format: 'vllm_score',
+      },
+    }, silentLogger);
+
+    const result = await llm.rerank('q', [{ file: 'a.md', text: 'doc' }]);
+    expect(result.results[0]!.score).toBe(0.93);
+    expect(requestedPath).toBe('/score');
+    expect(receivedBody.queries).toBe('q');
+    expect(receivedBody.documents).toEqual(['doc']);
+
     await llm.dispose();
     await server.close();
   });
