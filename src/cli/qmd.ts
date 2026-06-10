@@ -72,6 +72,7 @@ import {
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, isRemoteConfigured } from "../llm.js";
 import { RemoteLLM, remoteConfigFromEnv } from "../embedding-provider.js";
+import { buildBearerHeaders, nodeGet, nodePost } from "../remote/transport.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -462,6 +463,213 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
+type ModelEndpoint = 'embed' | 'expand' | 'rerank' | 'generate';
+
+type ResolvedModelEndpoint = {
+  model: string;
+  provider: string;
+  source: string;
+  baseUrl: string;
+  apiKey: string;
+  format: string;
+};
+
+type RemoteConnectionStatus = {
+  state: 'ok' | 'error';
+  detail: string;
+  latencyMs?: number;
+};
+
+function isStatusVerbose(): boolean {
+  const raw = process.env.QMD_STATUS_VERBOSE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function trimTrailingSlashes(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
+function appendPath(baseUrl: string, suffix: string): string {
+  return `${trimTrailingSlashes(baseUrl)}${suffix}`;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function buildMetadataProbeCandidates(baseUrl: string, format: string): string[] {
+  const trimmed = trimTrailingSlashes(baseUrl);
+  const lowerFormat = format.toLowerCase();
+  const ollamaLike = lowerFormat.startsWith('ollama_') || trimmed.includes(':11434') || trimmed.includes('/api');
+
+  const modelsCandidates = [appendPath(trimmed, '/models')];
+  if (trimmed.endsWith('/v1')) {
+    modelsCandidates.push(`${trimmed.slice(0, -3)}/models`);
+  }
+
+  const tagsCandidates = [
+    appendPath(trimmed, '/api/tags'),
+    appendPath(trimmed, '/tags'),
+  ];
+  if (trimmed.endsWith('/v1')) {
+    tagsCandidates.push(`${trimmed.slice(0, -3)}/api/tags`);
+  }
+
+  return ollamaLike
+    ? uniqueStrings([...tagsCandidates, ...modelsCandidates])
+    : uniqueStrings([...modelsCandidates, ...tagsCandidates]);
+}
+
+function buildRerankProbeCandidates(baseUrl: string): string[] {
+  const trimmed = trimTrailingSlashes(baseUrl);
+  const candidates = [appendPath(trimmed, '/rerank')];
+  if (trimmed.endsWith('/v1')) {
+    candidates.push(`${trimmed.slice(0, -3)}/rerank`);
+  } else {
+    candidates.push(appendPath(trimmed, '/v1/rerank'));
+  }
+  return uniqueStrings(candidates);
+}
+
+function extractModelIdsFromProbeResponse(data: unknown): string[] {
+  if (!data || typeof data !== 'object') return [];
+  const record = data as Record<string, unknown>;
+
+  const dataRows = Array.isArray(record.data) ? record.data : null;
+  if (dataRows) {
+    const ids = dataRows
+      .map((item) => (item && typeof item === 'object' ? (item as Record<string, unknown>).id : undefined))
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (ids.length > 0) return ids;
+  }
+
+  const models = Array.isArray(record.models) ? record.models : null;
+  if (models) {
+    const ids = models.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const row = item as Record<string, unknown>;
+      const out: string[] = [];
+      if (typeof row.name === 'string' && row.name.length > 0) out.push(row.name);
+      if (typeof row.model === 'string' && row.model.length > 0) out.push(row.model);
+      return out;
+    });
+    if (ids.length > 0) return ids;
+  }
+
+  return [];
+}
+
+function hasRerankResults(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+  const record = data as Record<string, unknown>;
+  return Array.isArray(record.results) || Array.isArray(record.data);
+}
+
+async function probeRerankRequest(
+  resolved: ResolvedModelEndpoint,
+  timeoutMs: number,
+): Promise<RemoteConnectionStatus> {
+  const verbose = isStatusVerbose();
+  const candidates = buildRerankProbeCandidates(resolved.baseUrl);
+  const headers = buildBearerHeaders(resolved.apiKey);
+  const body = {
+    model: resolved.model,
+    query: 'qmd status probe',
+    documents: ['qmd status probe document'],
+    top_n: 1,
+  };
+  let lastError = 'rerank endpoint unreachable';
+
+  for (const endpoint of candidates) {
+    const start = Date.now();
+    try {
+      const response = await nodePost(endpoint, headers, body, timeoutMs);
+      const latencyMs = Date.now() - start;
+      if (!hasRerankResults(response)) {
+        return {
+          state: 'error',
+          detail: verbose ? `${endpoint} responded without rerank results` : 'rerank probe malformed response',
+          latencyMs,
+        };
+      }
+      return {
+        state: 'ok',
+        detail: verbose ? `${endpoint} accepted rerank request` : 'rerank probe ok',
+        latencyMs,
+      };
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      lastError = sanitizeDiagnosticMessage(raw);
+    }
+  }
+
+  return { state: 'error', detail: lastError };
+}
+
+function modelNameMatches(availableId: string, configuredModel: string): boolean {
+  const a = availableId.trim();
+  const b = configuredModel.trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // Ollama tags: "model" in config can match "model:latest" from /api/tags.
+  if (a.startsWith(`${b}:`) || b.startsWith(`${a}:`)) return true;
+  return false;
+}
+
+async function probeRemoteModelEndpoint(
+  endpointRole: ModelEndpoint,
+  resolved: ResolvedModelEndpoint,
+): Promise<RemoteConnectionStatus> {
+  const timeoutMs = parseInt(process.env.QMD_STATUS_REMOTE_TIMEOUT_MS || '2500', 10);
+  const verbose = isStatusVerbose();
+  const candidates = buildMetadataProbeCandidates(resolved.baseUrl, resolved.format);
+  let lastError = 'unreachable';
+
+  for (const endpoint of candidates) {
+    const start = Date.now();
+    try {
+      const response = await nodeGet(endpoint, buildBearerHeaders(resolved.apiKey), timeoutMs);
+      const latencyMs = Date.now() - start;
+      const availableIds = extractModelIdsFromProbeResponse(response);
+      if (availableIds.length === 0) {
+        return { state: 'ok', detail: verbose ? `${endpoint} reachable` : 'metadata reachable', latencyMs };
+      }
+      const exists = availableIds.some((id) => modelNameMatches(id, resolved.model));
+      if (!exists && endpointRole === 'rerank') {
+        const rerankProbe = await probeRerankRequest(resolved, timeoutMs);
+        if (rerankProbe.state === 'ok') {
+          return {
+            state: 'ok',
+            detail: verbose
+              ? `${endpoint} reachable; model not listed in metadata, but ${rerankProbe.detail}`
+              : `metadata miss; ${rerankProbe.detail}`,
+            latencyMs: rerankProbe.latencyMs ?? latencyMs,
+          };
+        }
+        return {
+          state: 'error',
+          detail: verbose
+            ? `${endpoint} reachable; model not listed; ${rerankProbe.detail}`
+            : `metadata miss; ${rerankProbe.detail}`,
+          latencyMs: rerankProbe.latencyMs ?? latencyMs,
+        };
+      }
+      return {
+        state: exists ? 'ok' : 'error',
+        detail: exists
+          ? (verbose ? `${endpoint} reachable; model found` : 'metadata lists model')
+          : (verbose ? `${endpoint} reachable; model not listed` : 'metadata miss (model not listed)'),
+        latencyMs,
+      };
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      lastError = sanitizeDiagnosticMessage(raw);
+    }
+  }
+
+  return { state: 'error', detail: lastError };
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -604,25 +812,30 @@ async function showStatus(): Promise<void> {
 
   // Models — read config + env vars directly (no auto-save via ensureModelsConfiguredForCli)
   {
-    type ModelEndpoint = 'embed' | 'expand' | 'rerank' | 'generate';
-
     const config = loadConfig();
     const models = config.models ?? {};
+    const remoteCfg = remoteConfigFromEnv(models);
+    const endpointCfgByRole: Record<ModelEndpoint, { baseUrl: string; model: string; apiKey?: string; format?: string }> = {
+      embed: remoteCfg.embed!,
+      expand: remoteCfg.expand!,
+      rerank: remoteCfg.rerank!,
+      generate: remoteCfg.generate!,
+    };
 
     // Env var mapping for each endpoint
-    const envMap: Record<ModelEndpoint, { model: string; baseUrl: string; apiKey: string }> = {
-      embed:   { model: 'QMD_EMBED_MODEL',   baseUrl: 'QMD_EMBED_BASE_URL',   apiKey: 'QMD_EMBED_API_KEY' },
-      expand:  { model: 'QMD_EXPAND_MODEL',  baseUrl: 'QMD_EXPAND_BASE_URL',  apiKey: 'QMD_EXPAND_API_KEY' },
-      rerank:  { model: 'QMD_RERANK_MODEL',  baseUrl: 'QMD_RERANK_BASE_URL',  apiKey: 'QMD_RERANK_API_KEY' },
-      generate: { model: 'QMD_GENERATE_MODEL', baseUrl: 'QMD_GENERATE_BASE_URL', apiKey: 'QMD_GENERATE_API_KEY' },
+    const envMap: Record<ModelEndpoint, { model: string; baseUrl: string; apiKey: string; format: string }> = {
+      embed:    { model: 'QMD_EMBED_MODEL',    baseUrl: 'QMD_EMBED_BASE_URL',    apiKey: 'QMD_EMBED_API_KEY',    format: 'QMD_EMBED_API_FORMAT' },
+      expand:   { model: 'QMD_EXPAND_MODEL',   baseUrl: 'QMD_EXPAND_BASE_URL',   apiKey: 'QMD_EXPAND_API_KEY',   format: 'QMD_EXPAND_API_FORMAT' },
+      rerank:   { model: 'QMD_RERANK_MODEL',   baseUrl: 'QMD_RERANK_BASE_URL',   apiKey: 'QMD_RERANK_API_KEY',   format: 'QMD_RERANK_API_FORMAT' },
+      generate: { model: 'QMD_GENERATE_MODEL', baseUrl: 'QMD_GENERATE_BASE_URL', apiKey: 'QMD_GENERATE_API_KEY', format: 'QMD_GENERATE_API_FORMAT' },
     };
 
     // Config field mapping
-    const cfgMap: Record<ModelEndpoint, { model: string; url: string; key: string; flat?: string }> = {
-      embed:    { model: 'embed_api_model',  url: 'embed_api_url',  key: 'embed_api_key',  flat: 'embed' },
-      expand:   { model: 'expand_api_model', url: 'expand_api_url', key: 'expand_api_key', flat: undefined },
-      rerank:   { model: 'rerank_api_model', url: 'rerank_api_url', key: 'rerank_api_key', flat: 'rerank' },
-      generate: { model: 'generate_api_model', url: 'generate_api_url', key: 'generate_api_key', flat: 'generate' },
+    const cfgMap: Record<ModelEndpoint, { model: string; url: string; key: string; format: string; flat?: string }> = {
+      embed:    { model: 'embed_api_model',    url: 'embed_api_url',    key: 'embed_api_key',    format: 'embed_api_format',    flat: 'embed' },
+      expand:   { model: 'expand_api_model',   url: 'expand_api_url',   key: 'expand_api_key',   format: 'expand_api_format' },
+      rerank:   { model: 'rerank_api_model',   url: 'rerank_api_url',   key: 'rerank_api_key',   format: 'rerank_api_format',   flat: 'rerank' },
+      generate: { model: 'generate_api_model', url: 'generate_api_url', key: 'generate_api_key', format: 'generate_api_format', flat: 'generate' },
     };
 
     // Default GGUF models
@@ -650,41 +863,62 @@ async function showStatus(): Promise<void> {
     };
 
     // Resolve each endpoint's model name, provider, and source tag
-    const resolveEndpoint = (ep: ModelEndpoint): { model: string; provider: string; source: string } => {
+    const resolveEndpoint = (ep: ModelEndpoint): ResolvedModelEndpoint => {
       const env = envMap[ep];
       const cfg = cfgMap[ep];
       const envModel = process.env[env.model];
       const envUrl = process.env[env.baseUrl];
+      const envKey = process.env[env.apiKey];
+      const envFormat = process.env[env.format];
       const cfgModel = (models as Record<string, string | undefined>)[cfg.model];
       const cfgUrl = (models as Record<string, string | undefined>)[cfg.url];
+      const cfgKey = (models as Record<string, string | undefined>)[cfg.key];
+      const cfgFormat = (models as Record<string, string | undefined>)[cfg.format];
       const flatModel = cfg.flat ? (models as Record<string, string | undefined>)[cfg.flat] : undefined;
+      const fallback = endpointCfgByRole[ep];
+      const baseUrl = (envUrl || cfgUrl || fallback.baseUrl || '').trim();
+      const apiKey = (envKey || cfgKey || fallback.apiKey || '').trim();
+      const format = (envFormat || cfgFormat || fallback.format || 'auto').trim();
+      const provider = providerLabel(baseUrl);
 
       // Source priority: env var > config (remote or flat) > default
       if (envModel || envUrl) {
         return {
           model: envModel || cfgModel || defaults[ep],
-          provider: providerLabel((envUrl || cfgUrl) ?? ''),
+          provider,
           source: `(env ${env.model})`,
+          baseUrl,
+          apiKey,
+          format,
         };
       }
       if (cfgModel || cfgUrl) {
         return {
           model: cfgModel || flatModel || defaults[ep],
-          provider: providerLabel(cfgUrl ?? ''),
+          provider,
           source: '(index.yml)',
+          baseUrl,
+          apiKey,
+          format,
         };
       }
       if (flatModel) {
         return {
           model: flatModel,
-          provider: providerLabel(''),
+          provider,
           source: '(index.yml)',
+          baseUrl,
+          apiKey,
+          format,
         };
       }
       return {
         model: defaults[ep],
-        provider: providerLabel(''),
+        provider,
         source: '(default)',
+        baseUrl,
+        apiKey,
+        format,
       };
     };
 
@@ -695,12 +929,27 @@ async function showStatus(): Promise<void> {
       { ep: 'rerank',  label: 'Rerank:' },
       { ep: 'generate', label: 'Generate:' },
     ];
+    const resolvedEndpoints = eps.map(({ ep, label }) => ({ ep, label, resolved: resolveEndpoint(ep) }));
+    const probePromises = new Map<ModelEndpoint, Promise<RemoteConnectionStatus>>();
+    for (const { ep, resolved } of resolvedEndpoints) {
+      if (resolved.baseUrl) probePromises.set(ep, probeRemoteModelEndpoint(ep, resolved));
+    }
 
     console.log(`\n${c.bold}Models${c.reset}`);
-    for (const { ep, label } of eps) {
-      const { model, provider, source } = resolveEndpoint(ep);
+    for (const { ep, label, resolved } of resolvedEndpoints) {
+      const { model, provider, source } = resolved;
       const pad = ' '.repeat(Math.max(0, labelWidth - label.length));
       console.log(`  ${label}${pad} ${c.cyan}${model}${c.reset} → ${c.dim}${provider}${c.reset} ${c.yellow}${source}${c.reset}`);
+
+      if (!resolved.baseUrl) {
+        console.log(`  ${' '.repeat(labelWidth)} ${c.dim}Connection: local (no remote endpoint configured)${c.reset}`);
+        continue;
+      }
+
+      const status = await probePromises.get(ep)!;
+      const statusColor = status.state === 'ok' ? c.green : c.yellow;
+      const latency = status.latencyMs !== undefined ? ` (${formatMs(status.latencyMs)})` : '';
+      console.log(`  ${' '.repeat(labelWidth)} ${c.dim}Connection:${c.reset} ${statusColor}${status.state}${c.reset}${latency} ${c.dim}— ${status.detail}${c.reset}`);
     }
   }
 
@@ -3585,6 +3834,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
   add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
+  add("QMD_STATUS_VERBOSE", "shows full per-endpoint diagnostics in `qmd status` model connection output");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
   add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
