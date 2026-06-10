@@ -4481,7 +4481,12 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          if (!cli.args[1]) {
+            console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
+            console.error("  Refusing to index the current working directory implicitly.");
+            process.exit(1);
+          }
+          const pwd = cli.args[1];
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
