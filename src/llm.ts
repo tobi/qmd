@@ -546,7 +546,7 @@ export interface LLM {
   /**
    * Batch embed multiple texts efficiently
    */
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -588,6 +588,14 @@ export interface LLM {
 
   /** Name of the rerank model in use. Same caveats as `embedModelName`. */
   readonly rerankModelName?: string;
+
+  /**
+   * Optional warm-up hook. Backends that resolve metadata asynchronously
+   * (e.g. RemoteLLM fetching model names from `/health`) implement this so
+   * callers can await first-use readiness before reading `embedModelName`
+   * and friends. Local backends omit it.
+   */
+  ready?(): Promise<void>;
 
   /**
    * Dispose of resources
@@ -2059,11 +2067,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -2099,7 +2107,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlm(): LLM {
     return this.llm;
   }
 }
@@ -2202,18 +2210,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLlm().embed(text, options));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLlm().embedBatch(texts, options));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean; intent?: string }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLlm().expandQuery(query, options));
   }
 
   async rerank(
@@ -2221,7 +2229,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLlm().rerank(query, documents, options));
   }
 }
 
@@ -2232,8 +2240,8 @@ let defaultSessionManager: LLMSessionManager | null = null;
  * Get the session manager for the default LlamaCpp instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLlm() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -2272,7 +2280,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
