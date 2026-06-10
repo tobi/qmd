@@ -22,7 +22,10 @@ import {
   type RerankResult,
   type ModelInfo,
 } from "../src/llm.js";
-import { expandQuery, rerank, createStore } from "../src/store.js";
+import { RemoteLLM } from "../src/llm-remote.js";
+import { expandQuery, rerank, createStore, generateEmbeddings, chunkDocumentByTokens } from "../src/store.js";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 class CountingLLM implements LLM {
   calls = {
@@ -149,5 +152,72 @@ describe("store layer routes through the polymorphic LLM default", () => {
     store.llm = fake;
     await store.rerank("hybrid query path", [{ file: "d.md", text: "delta" }]);
     expect(fake.calls.rerank).toBe(1);
+  });
+
+  test("generateEmbeddings accepts a real RemoteLLM (no requireLlamaCpp gate)", async () => {
+    // Spin a minimal /health responder so RemoteLLM can warm up.
+    const server = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          ok: true,
+          version: "2",
+          backend: "local",
+          models: { embed: "test-embed", rerank: "test-rerank", generate: "test-generate" },
+        }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      const remote = new RemoteLLM({ serverUrl: `http://127.0.0.1:${port}` });
+      store.llm = remote;
+      // No documents inserted → early return path. Pre-fix this still threw
+      // "requires a local LlamaCpp backend" because the gate ran before the
+      // empty-pending check. Post-fix it returns cleanly.
+      const result = await generateEmbeddings(store);
+      expect(result.docsProcessed).toBe(0);
+      expect(result.chunksEmbedded).toBe(0);
+      await remote.dispose();
+    } finally {
+      await new Promise<void>(r => server.close(() => r()));
+    }
+  });
+
+  test("chunkDocumentByTokens falls back to char truncation when llm has no detokenize", async () => {
+    // Fake LLM with tokenize but no detokenize — exercises the new fallback path.
+    class TokenOnlyLLM implements LLM {
+      readonly embedModelName = "fake-embed";
+      async embed(): Promise<EmbeddingResult | null> { return null; }
+      async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+        return texts.map(() => null);
+      }
+      async generate(): Promise<GenerateResult | null> { return null; }
+      async modelExists(model: string): Promise<ModelInfo> { return { name: model, exists: true }; }
+      async expandQuery(): Promise<Queryable[]> { return []; }
+      async rerank(_q: string, docs: RerankDocument[]): Promise<RerankResult> {
+        return { results: docs.map(d => ({ file: d.file, score: 0 })) };
+      }
+      async tokenize(text: string): Promise<readonly unknown[]> {
+        // 2 chars per "token" — exaggerates so the maxTokens limit triggers fallback.
+        return new Array(Math.ceil(text.length / 2)).fill(0);
+      }
+      async dispose(): Promise<void> {}
+    }
+    setDefaultLLM(new TokenOnlyLLM());
+    // Pathological single-line blob: no whitespace, length forces re-split, but
+    // every sub-split returns the same text → fallback char-truncate kicks in.
+    const blob = "x".repeat(4000);
+    const chunks = await chunkDocumentByTokens(blob, 50, 5, 10);
+    expect(chunks.length).toBeGreaterThan(0);
+    // Every chunk must be a non-empty string (no thrown detokenize errors).
+    for (const c of chunks) {
+      expect(typeof c.text).toBe("string");
+      expect(c.text.length).toBeGreaterThan(0);
+    }
   });
 });
