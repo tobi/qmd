@@ -2050,13 +2050,20 @@ export function isDarwinExitGuardInstalled(): boolean {
 }
 
 // =============================================================================
-// NoopLlamaCpp — stub that throws helpful errors
+// NoopLlamaCpp — stub that throws helpful errors when remote is configured
 // =============================================================================
 
 /**
- * Stub implementing LLM that throws descriptive errors instead of building
- * a local llama.cpp instance. Returned by getDefaultLlamaCpp() when a remote
- * LLM provider is configured.
+ * No-op LLM stub returned by getDefaultLlamaCpp() when a remote LLM provider
+ * is configured. This prevents accidental native llama.cpp compilation.
+ *
+ * Embed methods throw descriptive errors directing the user to use RemoteLLM.
+ * Query expansion and reranking return empty results (no-op).
+ * generate() returns null — text generation is not available without a local model.
+ *
+ * This class is never used directly by application code. It exists solely as a
+ * safety net: if any code path bypasses the isRemoteConfigured() guards and calls
+ * getDefaultLlamaCpp(), it gets a clear error instead of a native build.
  */
 export class NoopLlamaCpp implements LLM {
   static readonly instance = new NoopLlamaCpp();
@@ -2096,7 +2103,20 @@ export class NoopLlamaCpp implements LLM {
 }
 
 /**
- * Check whether a remote embedding provider is configured.
+ * Check whether any remote LLM endpoint is configured.
+ *
+ * Examines environment variables and YAML models config to determine if
+ * the user intends to use remote endpoints instead of local GGUF models.
+ * Used by getDefaultLlamaCpp() to decide whether to return a NoopLlamaCpp
+ * stub, and by chunkDocumentByTokens() to select the tokenization strategy.
+ *
+ * Detection triggers (any one suffices):
+ *   - Env vars: OPENAI_BASE_URL, QMD_EMBED_PROVIDER=remote, QMD_EMBED_BASE_URL,
+ *     QMD_EXPAND_BASE_URL, QMD_RERANK_BASE_URL, QMD_GENERATE_BASE_URL
+ *   - YAML config: embed_api_url, expand_api_url, rerank_api_url, generate_api_url
+ *
+ * @param models - Optional YAML models config from loadConfig()
+ * @returns true if any remote endpoint is configured
  */
 export function isRemoteConfigured(models?: ModelsConfig): boolean {
   return !!(
@@ -2114,17 +2134,32 @@ export function isRemoteConfigured(models?: ModelsConfig): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+/**
+ * Global singleton LLM instance.
+ *
+ * Lifecycle: Set once during store creation (by createStore or CLI getStore).
+ * May be a LlamaCpp (local), RemoteLLM (remote), or NoopLlamaCpp (stub).
+ * Callers should use getDefaultLlamaCpp() which handles lazy initialization
+ * and remote-fallback logic.
+ */
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed).
+ * Get the default LLM instance (creates a LlamaCpp if none is set).
  *
- * When a remote LLM is configured via OPENAI_BASE_URL or QMD_EMBED_PROVIDER,
- * returns a NoopLlamaCpp stub that throws helpful errors instead of building
- * a local llama.cpp instance.
+ * When a remote LLM is configured (detected via isRemoteConfigured()),
+ * returns a NoopLlamaCpp stub that throws descriptive errors instead of
+ * building a local llama.cpp instance. This prevents accidental native
+ * compilation when a remote provider is in use.
+ *
+ * Return type is `LlamaCpp` for backward compatibility — callers that
+ * use LlamaCpp-specific methods (like tokenize()) are guarded by
+ * isRemoteConfigured() checks at each call site.
+ *
+ * @returns The active LLM instance (never null — throws if uninitialized)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   // When a remote LLM is configured, skip local model entirely
@@ -2134,22 +2169,25 @@ export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
   }
-  return defaultLlamaCpp;
+  return defaultLlamaCpp as LlamaCpp;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
- * non-null instance also ensures the darwin exit guard is installed — keeps
- * the invariant intact for test doubles that didn't go through the real
- * constructor.
+ * Set the global default LLM instance.
+ *
+ * Accepts any LLM implementation — LlamaCpp (local), RemoteLLM (remote),
+ * or null to clear. Used by CLI getStore() to inject a RemoteLLM, and
+ * by LocalEmbeddingProvider to register itself as the default.
+ *
+ * @param llm - The LLM instance to set as default, or null to clear
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 
 /**
- * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * Peek at the default LLM instance without instantiating one. Used by
  * doctor and lifecycle diagnostics.
  */
 export function hasDefaultLlamaCpp(): boolean {
@@ -2157,8 +2195,12 @@ export function hasDefaultLlamaCpp(): boolean {
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
- * Call this before process exit to prevent NAPI crashes.
+ * Dispose the default LLM instance if it exists.
+ *
+ * Call this before process exit to prevent NAPI crashes from native
+ * llama.cpp backends. For RemoteLLM, dispose() is a no-op.
+ *
+ * @returns Promise that resolves when disposal is complete
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
   if (defaultLlamaCpp) {

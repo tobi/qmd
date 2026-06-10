@@ -47,6 +47,9 @@ import type {
 export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
+
+/** One-time flag to avoid spamming the chunkDocumentByTokens remote-fallback warning. */
+let _remoteChunkWarningShown = false;
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
@@ -2645,14 +2648,35 @@ export async function chunkDocumentAsync(
 }
 
 /**
- * Chunk a document by actual token count using the LLM tokenizer.
- * More accurate than character-based chunking but requires async.
+ * Chunk a document using the LLM tokenizer for accurate token-count boundaries.
  *
- * When a remote LLM is configured, falls back to character-based chunking
- * (~3 chars/token estimate) since the remote provider lacks a tokenizer.
+ * ## Local mode (default)
  *
- * When filepath and chunkStrategy are provided, uses AST-aware break points
- * for supported code files.
+ * Uses llama.cpp's tokenizer for exact token counts. More accurate than
+ * character-based chunking. Requires a loaded local GGUF model.
+ *
+ * ## Remote mode (when isRemoteConfigured() returns true)
+ *
+ * Falls back to character-based chunking with a ~3 chars/token estimate.
+ * **The returned token counts are estimates, not exact.** This is because
+ * remote providers don't expose tokenizers. Chunks may be slightly larger
+ * or smaller than maxTokens. If exact token limits matter, use a local
+ * model or pre-chunk documents externally.
+ *
+ * ## AST-aware chunking
+ *
+ * When filepath and chunkStrategy are provided, uses tree-sitter AST
+ * break points for supported code files (TypeScript, Python, Go). This
+ * produces chunks aligned to function/class boundaries.
+ *
+ * @param content       - Raw document text
+ * @param maxTokens     - Target max tokens per chunk (default CHUNK_SIZE_TOKENS)
+ * @param overlapTokens - Overlap between consecutive chunks in tokens
+ * @param windowTokens  - Window size for AST context analysis
+ * @param filepath      - Optional file path for AST detection and language selection
+ * @param chunkStrategy - "auto" (AST for code, regex otherwise) or "regex"
+ * @param signal        - Optional AbortSignal for cancellation
+ * @returns Array of chunks with text, byte position, and **estimated** token count
  */
 export async function chunkDocumentByTokens(
   content: string,
@@ -2666,6 +2690,14 @@ export async function chunkDocumentByTokens(
   if (isRemoteConfigured()) {
     // Remote LLM has no tokenizer — use character-based chunking with ~3 chars/token estimate.
     // Result token counts are estimated for compatibility with the return type.
+    // Log once per process to avoid noise during batch embedding.
+    if (!_remoteChunkWarningShown) {
+      console.warn(
+        'Remote LLM configured — chunkDocumentByTokens using character-based chunking ' +
+        'with estimated token counts (~3 chars/token). Token counts are approximate.'
+      );
+      _remoteChunkWarningShown = true;
+    }
     const avgCharsPerToken = 3;
     const maxChars = maxTokens * avgCharsPerToken;
     const overlapChars = overlapTokens * avgCharsPerToken;

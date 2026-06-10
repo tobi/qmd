@@ -140,7 +140,7 @@ function getStore(): ReturnType<typeof createStore> {
         const remoteConfig = remoteConfigFromEnv(config.models);
         const remoteLlm = new RemoteLLM(remoteConfig);
         store.llm = remoteLlm;
-        setDefaultLlamaCpp(remoteLlm as unknown as LlamaCpp);
+        setDefaultLlamaCpp(remoteLlm);
       } else {
         setDefaultLlamaCpp(new LlamaCpp({
           embedModel: activeModels.embed,
