@@ -1025,21 +1025,25 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
 
     // Try exact match on collection + path
     doc = db.prepare(`
-      SELECT d.collection as collectionName, d.path, content.doc as body
+      SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(parsed.collectionName, parsed.path) as typeof doc;
+      WHERE d.collection = ?
+        AND (d.path = ? OR d.original_path = ?)
+        AND d.active = 1
+    `).get(parsed.collectionName, parsed.path, parsed.path) as typeof doc;
 
     if (!doc) {
       // Try fuzzy match by path ending
       doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
+        SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
         FROM documents d
         JOIN content ON content.hash = d.hash
-        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+        WHERE d.collection = ?
+          AND (d.path LIKE ? OR d.original_path LIKE ?)
+          AND d.active = 1
         LIMIT 1
-      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
+      `).get(parsed.collectionName, `%${parsed.path}`, `%${parsed.path}`) as typeof doc;
     }
 
     virtualPath = inputPath;
@@ -1060,21 +1064,25 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
         if (collExists) {
           // Try exact match on collection + path
           doc = db.prepare(`
-            SELECT d.collection as collectionName, d.path, content.doc as body
+            SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
             FROM documents d
             JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
+            WHERE d.collection = ?
+              AND (d.path = ? OR d.original_path = ?)
+              AND d.active = 1
+          `).get(possibleCollection || "", possiblePath || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
 
           if (!doc) {
             // Try fuzzy match by path ending
             doc = db.prepare(`
-              SELECT d.collection as collectionName, d.path, content.doc as body
+              SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
               FROM documents d
               JOIN content ON content.hash = d.hash
-              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+              WHERE d.collection = ?
+                AND (d.path LIKE ? OR d.original_path LIKE ?)
+                AND d.active = 1
               LIMIT 1
-            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
+            `).get(possibleCollection || "", `%${possiblePath}`, `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
           }
 
           if (doc) {
@@ -1104,23 +1112,25 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       if (detected) {
         // Found collection - query by collection name + relative path
         doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
+          SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
+          WHERE d.collection = ?
+            AND (d.path = ? OR d.original_path = ?)
+            AND d.active = 1
+        `).get(detected.collectionName, detected.relativePath, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
       }
 
       // Fuzzy match by filename (last component of path)
       if (!doc) {
         const filename = inputPath.split('/').pop() || inputPath;
         doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
+          SELECT d.collection as collectionName, COALESCE(d.original_path, d.path) as path, content.doc as body
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
+          WHERE (d.path LIKE ? OR d.original_path LIKE ?) AND d.active = 1
           LIMIT 1
-        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
+        `).get(`%${filename}`, `%${filename}`) as { collectionName: string; path: string; body: string } | null;
       }
 
       if (doc) {
@@ -1216,42 +1226,49 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
           // Try exact match on collection + path
           doc = db.prepare(`
             SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
+              'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
               LENGTH(content.doc) as body_length,
               d.collection,
-              d.path
+              COALESCE(d.original_path, d.path) as path
             FROM documents d
             JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(parsed.collectionName, parsed.path) as typeof doc;
+            WHERE d.collection = ?
+              AND (d.path = ? OR d.original_path = ?)
+              AND d.active = 1
+          `).get(parsed.collectionName, parsed.path, parsed.path) as typeof doc;
         }
       } else {
         // Try exact match on path
         doc = db.prepare(`
           SELECT
-            'qmd://' || d.collection || '/' || d.path as virtual_path,
+            'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
             LENGTH(content.doc) as body_length,
             d.collection,
-            d.path
+            COALESCE(d.original_path, d.path) as path
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.path = ? AND d.active = 1
+          WHERE (
+            d.path = ?
+            OR d.original_path = ?
+            OR d.collection || '/' || d.path = ?
+            OR d.collection || '/' || d.original_path = ?
+          ) AND d.active = 1
           LIMIT 1
-        `).get(name) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+        `).get(name, name, name, name) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
 
         // Try suffix match
         if (!doc) {
           doc = db.prepare(`
             SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
+              'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
               LENGTH(content.doc) as body_length,
               d.collection,
-              d.path
+              COALESCE(d.original_path, d.path) as path
             FROM documents d
             JOIN content ON content.hash = d.hash
-            WHERE d.path LIKE ? AND d.active = 1
+            WHERE (d.path LIKE ? OR d.original_path LIKE ?) AND d.active = 1
             LIMIT 1
-          `).get(`%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+          `).get(`%${name}`, `%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
         }
       }
 
@@ -1340,8 +1357,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       SELECT content.doc as body, d.title
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(collection, path) as { body: string; title: string } | null;
+      WHERE d.collection = ?
+        AND (d.path = ? OR d.original_path = ?)
+        AND d.active = 1
+    `).get(collection, path, path) as { body: string; title: string } | null;
 
     if (!doc) continue;
 
@@ -2114,6 +2133,7 @@ type OutputOptions = {
   minScore: number;
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
+  path?: string;  // Filter by folder-prefix within collection(s)
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
@@ -2596,7 +2616,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchFTS(db, query, fetchLimit, singleCollection, opts.path),
     collectionNames
   );
 
@@ -2649,6 +2669,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
+      pathPrefix: opts.path,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2724,6 +2745,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
       results = await structuredSearch(store, structuredQueries, {
         collections: singleCollection ? [singleCollection] : undefined,
+        pathPrefix: opts.path,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2752,6 +2774,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
         collection: singleCollection,
+        pathPrefix: opts.path,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2857,6 +2880,7 @@ function parseCLI() {
       json: { type: "boolean" },
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      path: { type: "string", short: "p" },  // Filter by folder-prefix within collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2944,6 +2968,7 @@ function parseCLI() {
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string[] | undefined,
+    path: values.path as string | undefined,
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
@@ -3464,6 +3489,7 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
   console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  -p, --path <folder-prefix>  - Filter to folder-prefix within collection(s) (folder-only)");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");

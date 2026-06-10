@@ -795,7 +795,7 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     `);
   }
   const rows = db.prepare(`
-    SELECT d.id, d.collection, d.path, d.title, content.doc as body
+    SELECT d.id, d.collection, COALESCE(d.original_path, d.path) AS path, d.title, content.doc as body
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
@@ -853,6 +853,7 @@ function initializeDatabase(db: Database): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collection TEXT NOT NULL,
       path TEXT NOT NULL,
+      original_path TEXT,
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -862,6 +863,11 @@ function initializeDatabase(db: Database): void {
       UNIQUE(collection, path)
     )
   `);
+
+  const documentsInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!documentsInfo.some(col => col.name === 'original_path')) {
+    db.exec(`ALTER TABLE documents ADD COLUMN original_path TEXT`);
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
@@ -931,7 +937,7 @@ function initializeDatabase(db: Database): void {
       INSERT INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
-        new.collection || '/' || new.path,
+        new.collection || '/' || COALESCE(new.original_path, new.path),
         new.title,
         (SELECT doc FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
@@ -956,7 +962,7 @@ function initializeDatabase(db: Database): void {
       INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
-        new.collection || '/' || new.path,
+        new.collection || '/' || COALESCE(new.original_path, new.path),
         new.title,
         (SELECT doc FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
@@ -1214,8 +1220,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefix?: string) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefix?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1233,7 +1239,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, originalPath?: string | null) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
@@ -1335,8 +1341,12 @@ export async function reindexCollection(
       if (existing.hash === hash) {
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
+          db.prepare(`UPDATE documents SET original_path = ? WHERE id = ? AND (original_path IS NULL OR original_path != ?)`)
+            .run(relativeFile, existing.id, relativeFile);
           updated++;
         } else {
+          db.prepare(`UPDATE documents SET original_path = ? WHERE id = ? AND (original_path IS NULL OR original_path != ?)`)
+            .run(relativeFile, existing.id, relativeFile);
           unchanged++;
         }
       } else {
@@ -1344,6 +1354,7 @@ export async function reindexCollection(
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
+        db.prepare(`UPDATE documents SET original_path = ? WHERE id = ?`).run(relativeFile, existing.id);
         updated++;
       }
     } else {
@@ -1352,7 +1363,8 @@ export async function reindexCollection(
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        stat ? new Date(stat.mtime).toISOString() : now,
+        relativeFile);
     }
 
     processed++;
@@ -1889,8 +1901,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefix?: string) => searchFTS(db, query, limit, collectionName, pathPrefix),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefix?: string) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, pathPrefix),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
@@ -1908,7 +1920,7 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, originalPath?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, originalPath),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findOrMigrateLegacyDocument: (collectionName: string, path: string) => findOrMigrateLegacyDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
@@ -2063,6 +2075,8 @@ export type RRFScoreTrace = {
 };
 
 export type HybridQueryExplain = {
+  scoreType?: 'rerank-blend' | 'rrf-position';
+  backendSources?: ('bm25' | 'cosine')[];
   ftsScores: number[];
   vectorScores: number[];
   rrf: {
@@ -2418,7 +2432,7 @@ export function insertContent(db: Database, hash: string, content: string, creat
 
 function rebuildDocumentFTS(db: Database, documentId: number): void {
   const row = db.prepare(`
-    SELECT d.id, d.collection, d.path, d.title, content.doc as body
+    SELECT d.id, d.collection, COALESCE(d.original_path, d.path) AS path, d.title, content.doc as body
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.id = ? AND d.active = 1
@@ -2448,17 +2462,19 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  originalPath?: string | null
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, original_path, title, hash, created_at, modified_at, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(collection, path) DO UPDATE SET
+      original_path = COALESCE(excluded.original_path, documents.original_path),
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, originalPath ?? null, title, hash, createdAt, modifiedAt);
 
   const row = db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`).get(collectionName, path) as { id: number } | undefined;
   if (row) rebuildDocumentFTS(db, row.id);
@@ -2821,7 +2837,7 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
-    SELECT d.path
+    SELECT COALESCE(d.original_path, d.path) AS path
     FROM documents d
     WHERE d.active = 1
   `).all() as { path: string }[];
@@ -2837,21 +2853,29 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
   const allFiles = db.prepare(`
     SELECT
-      'qmd://' || d.collection || '/' || d.path as virtual_path,
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
       LENGTH(content.doc) as body_length,
       d.path,
+      d.original_path,
       d.collection
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
+  `).all() as { virtual_path: string; body_length: number; path: string; original_path: string | null; collection: string }[];
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
+    .filter(f => {
+      const displayPath = f.original_path || f.path;
+      return isMatch(f.virtual_path)
+        || isMatch(f.path)
+        || isMatch(displayPath)
+        || isMatch(f.collection + '/' + f.path)
+        || isMatch(f.collection + '/' + displayPath);
+    })
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
+      displayPath: f.original_path || f.path, // Relative path for display
       bodyLength: f.body_length
     }));
 }
@@ -2956,9 +2980,11 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const doc = db.prepare(`
     SELECT d.path
     FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    WHERE d.collection = ?
+      AND (d.path = ? OR d.original_path = ?)
+      AND d.active = 1
     LIMIT 1
-  `).get(collectionName, relativePath) as { path: string } | null;
+  `).get(collectionName, relativePath, relativePath) as { path: string } | null;
 
   if (!doc) return null;
 
@@ -3442,6 +3468,36 @@ export function validateSemanticQuery(query: string): string | null {
   return null;
 }
 
+/**
+ * Normalize a folder-prefix path for search pathPrefix filters.
+ *
+ * Folder-prefix ONLY. File-prefix matching is not supported — e.g.,
+ * normalizePathPrefix("README.md") returns "README.md/" which matches no docs
+ * (no document has path starting with "README.md/"). If you need to find a
+ * specific file, query without pathPrefix or use a folder containing the file.
+ *
+ * Returns null for empty/root input; callers must skip the SQL predicate then.
+ */
+function normalizePathPrefix(p: string): string | null {
+  const cleaned = p
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+  if (!cleaned) return null;
+  return cleaned + '/';
+}
+
+/** Compute the exclusive upper bound for a folder-prefix range query. */
+function lexicographicSuccessor(p: string): string {
+  if (!p.endsWith('/')) {
+    throw new Error(`lexicographicSuccessor: input must end with '/', got: ${JSON.stringify(p)}`);
+  }
+  return p.slice(0, -1) + '0';
+}
+
+export const __testPathPrefixHelpers = { normalizePathPrefix, lexicographicSuccessor };
+
 export function validateLexQuery(query: string): string | null {
   if (/[\r\n]/.test(query)) {
     return 'Lex queries must be a single line. Remove newline characters or split into separate lex: lines.';
@@ -3453,7 +3509,7 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, pathPrefix?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3463,11 +3519,13 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // abandon the FTS5 index and fall back to a full scan — turning an 8ms
   // query into a 17-second query on large collections.
   const params: (string | number)[] = [ftsQuery];
+  const normalizedPath = pathPrefix ? normalizePathPrefix(pathPrefix) : null;
 
-  // When filtering by collection, fetch extra candidates from the FTS index
-  // since some will be filtered out. Without a collection filter we can
-  // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  // When filtering by collection/path, fetch extra candidates from the FTS index
+  // since some will be filtered out. Without a filter we can fetch exactly the requested limit.
+  // Recall behavior is documented but not guaranteed for highly selective filters; this
+  // matches qmd's existing collection-filter overfetch heuristic.
+  const ftsLimit = (collectionName || normalizedPath) ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -3478,8 +3536,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       LIMIT ${ftsLimit}
     )
     SELECT
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as filepath,
+      d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
       d.title,
       content.doc as body,
       d.hash,
@@ -3493,6 +3551,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   if (collectionName) {
     sql += ` AND d.collection = ?`;
     params.push(String(collectionName));
+  }
+  if (normalizedPath) {
+    sql += ` AND COALESCE(d.original_path, d.path) COLLATE BINARY >= ? AND COALESCE(d.original_path, d.path) COLLATE BINARY < ?`;
+    params.push(normalizedPath, lexicographicSuccessor(normalizedPath));
   }
 
   // bm25 lower is better; sort ascending.
@@ -3528,7 +3590,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefix?: string): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -3540,12 +3602,15 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
 
+  const normalizedPath = pathPrefix ? normalizePathPrefix(pathPrefix) : null;
+  const vecLimit = (collectionName || normalizedPath) ? limit * 10 : limit * 3;
+
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), vecLimit) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -3560,8 +3625,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
       cv.pos,
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as filepath,
+      d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
       d.title,
       content.doc as body
     FROM content_vectors cv
@@ -3574,6 +3639,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
     params.push(collectionName);
+  }
+  if (normalizedPath) {
+    docSql += ` AND COALESCE(d.original_path, d.path) COLLATE BINARY >= ? AND COALESCE(d.original_path, d.path) COLLATE BINARY < ?`;
+    params.push(normalizedPath, lexicographicSuccessor(normalizedPath));
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
@@ -4031,8 +4100,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
   // Build computed columns
   // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
+    d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -4046,8 +4115,11 @@ export function findDocument(db: Database, filename: string, options: { includeB
     SELECT ${selectCols}
     FROM documents d
     JOIN content ON content.hash = d.hash
-    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-  `).get(filepath) as DbDocRow | null;
+    WHERE (
+      'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+      OR 'qmd://' || d.collection || '/' || d.path = ?
+    ) AND d.active = 1
+  `).get(filepath, filepath) as DbDocRow | null;
 
   // Try fuzzy match by virtual path
   if (!doc) {
@@ -4055,9 +4127,12 @@ export function findDocument(db: Database, filename: string, options: { includeB
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) LIKE ?
+        OR 'qmd://' || d.collection || '/' || d.path LIKE ?
+      ) AND d.active = 1
       LIMIT 1
-    `).get(`%${filepath}`) as DbDocRow | null;
+    `).get(`%${filepath}`, `%${filepath}`) as DbDocRow | null;
   }
 
   // Try to match by absolute path (requires looking up collection paths from DB)
@@ -4072,7 +4147,10 @@ export function findDocument(db: Database, filename: string, options: { includeB
       }
       // Otherwise treat filepath as relative to collection
       else if (!filepath.startsWith('/')) {
-        relativePath = filepath;
+        const collectionPrefix = `${coll.name}/`;
+        relativePath = filepath.startsWith(collectionPrefix)
+          ? filepath.slice(collectionPrefix.length)
+          : filepath;
       }
 
       if (relativePath) {
@@ -4080,8 +4158,10 @@ export function findDocument(db: Database, filename: string, options: { includeB
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as DbDocRow | null;
+          WHERE d.collection = ?
+            AND (d.path = ? OR d.original_path = ?)
+            AND d.active = 1
+        `).get(coll.name, relativePath, relativePath) as DbDocRow | null;
         if (doc) break;
       }
     }
@@ -4126,8 +4206,11 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
       SELECT content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-    `).get(filepath) as { body: string } | null;
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+        OR 'qmd://' || d.collection || '/' || d.path = ?
+      ) AND d.active = 1
+    `).get(filepath, filepath) as { body: string } | null;
   }
 
   // Try absolute path by looking up in DB store_collections
@@ -4140,8 +4223,10 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
           SELECT content.doc as body
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as { body: string } | null;
+          WHERE d.collection = ?
+            AND (d.path = ? OR d.original_path = ?)
+            AND d.active = 1
+        `).get(coll.name, relativePath, relativePath) as { body: string } | null;
         if (row) break;
       }
     }
@@ -4175,8 +4260,8 @@ export function findDocuments(
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
+    'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) as virtual_path,
+    d.collection || '/' || COALESCE(d.original_path, d.path) as display_path,
     d.title,
     d.hash,
     d.collection,
@@ -4195,16 +4280,22 @@ export function findDocuments(
         SELECT ${selectCols}
         FROM documents d
         JOIN content ON content.hash = d.hash
-        WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-      `).get(name) as DbDocRow | null;
+        WHERE (
+          'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) = ?
+          OR 'qmd://' || d.collection || '/' || d.path = ?
+        ) AND d.active = 1
+      `).get(name, name) as DbDocRow | null;
       if (!doc) {
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+          WHERE (
+            'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) LIKE ?
+            OR 'qmd://' || d.collection || '/' || d.path LIKE ?
+          ) AND d.active = 1
           LIMIT 1
-        `).get(`%${name}`) as DbDocRow | null;
+        `).get(`%${name}`, `%${name}`) as DbDocRow | null;
       }
       if (doc) {
         fileRows.push(doc);
@@ -4230,8 +4321,11 @@ export function findDocuments(
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
-    `).all(...virtualPaths) as DbDocRow[];
+      WHERE (
+        'qmd://' || d.collection || '/' || COALESCE(d.original_path, d.path) IN (${placeholders})
+        OR 'qmd://' || d.collection || '/' || d.path IN (${placeholders})
+      ) AND d.active = 1
+    `).all(...virtualPaths, ...virtualPaths) as DbDocRow[];
   }
 
   const results: MultiGetResult[] = [];
@@ -4500,6 +4594,8 @@ export interface SearchHooks {
 
 export interface HybridQueryOptions {
   collection?: string;
+  /** Filter to folder-prefix within collection (folder-only, not file-prefix). */
+  pathPrefix?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4566,6 +4662,7 @@ export async function hybridQuery(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
+  const pathPrefix = options?.pathPrefix;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -4583,7 +4680,7 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const initialFts = store.searchFTS(query, 20, collection, pathPrefix);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -4620,7 +4717,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection, pathPrefix);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -4659,7 +4756,7 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding
+        undefined, embedding, pathPrefix
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -4724,9 +4821,16 @@ export async function hybridQuery(
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
+        const ftsScores = trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [];
+        const vectorScores = trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [];
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          scoreType: 'rrf-position' as const,
+          backendSources: [
+            ...(ftsScores.length > 0 ? ['bm25' as const] : []),
+            ...(vectorScores.length > 0 ? ['cosine' as const] : []),
+          ],
+          ftsScores,
+          vectorScores,
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -4798,9 +4902,16 @@ export async function hybridQuery(
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
+    const ftsScores = trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [];
+    const vectorScores = trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [];
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      scoreType: 'rerank-blend' as const,
+      backendSources: [
+        ...(ftsScores.length > 0 ? ['bm25' as const] : []),
+        ...(vectorScores.length > 0 ? ['cosine' as const] : []),
+      ],
+      ftsScores,
+      vectorScores,
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
@@ -4842,6 +4953,8 @@ export async function hybridQuery(
 
 export interface VectorSearchOptions {
   collection?: string;
+  /** Filter to folder-prefix within collection (folder-only, not file-prefix). */
+  pathPrefix?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -4875,6 +4988,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const pathPrefix = options?.pathPrefix;
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -4893,7 +5007,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, pathPrefix);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4926,6 +5040,8 @@ export async function vectorSearchQuery(
  */
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
+  /** Filter to folder-prefix within collection(s); folder-only, not file-prefix. */
+  pathPrefix?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4970,6 +5086,7 @@ export async function structuredSearch(
   const hooks = options?.hooks;
 
   const collections = options?.collections;
+  const pathPrefix = options?.pathPrefix;
 
   if (searches.length === 0) return [];
 
@@ -5006,7 +5123,7 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, pathPrefix);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
@@ -5045,7 +5162,7 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, embedModel, 20, coll,
-            undefined, embedding
+            undefined, embedding, pathPrefix
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -5118,9 +5235,16 @@ export async function structuredSearch(
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
+        const ftsScores = trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [];
+        const vectorScores = trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [];
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          scoreType: 'rrf-position' as const,
+          backendSources: [
+            ...(ftsScores.length > 0 ? ['bm25' as const] : []),
+            ...(vectorScores.length > 0 ? ['cosine' as const] : []),
+          ],
+          ftsScores,
+          vectorScores,
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -5191,9 +5315,16 @@ export async function structuredSearch(
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
+    const ftsScores = trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [];
+    const vectorScores = trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [];
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      scoreType: 'rerank-blend' as const,
+      backendSources: [
+        ...(ftsScores.length > 0 ? ['bm25' as const] : []),
+        ...(vectorScores.length > 0 ? ['cosine' as const] : []),
+      ],
+      ftsScores,
+      vectorScores,
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
