@@ -1904,6 +1904,10 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
 }
 
 export function resolveEmbedModelForCli(): string {
+  const embeddingConfig = getEmbeddingConfig();
+  if (embeddingConfig.provider === "openai") {
+    return embeddingConfig.openai?.embedModel || process.env.QMD_OPENAI_EMBED_MODEL || "text-embedding-3-small";
+  }
   return ensureModelsConfiguredForCli().embed;
 }
 
