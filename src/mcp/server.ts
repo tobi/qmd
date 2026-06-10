@@ -449,7 +449,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: {
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
-        maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
+        maxBytes: z.number().optional().default(DEFAULT_MULTI_GET_MAX_BYTES).describe("Skip files larger than this (default: 65536 = 64KB)"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },

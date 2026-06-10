@@ -3470,7 +3470,7 @@ function showHelp(): void {
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 65536)");
   console.log("  --format <kind>            - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
