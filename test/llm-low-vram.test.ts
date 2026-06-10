@@ -376,4 +376,122 @@ describe("LlamaCpp lowVram mode", () => {
     expect(firstDispose).toBeGreaterThan(expandEnd);
     expect(firstDispose).toBeGreaterThan(rerankEnd);
   });
+
+  test("expandQuery: catch-and-retry on insufficient VRAM disposes rerank (not generate) and retries once", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      attempts++;
+      events.push(`expand:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("A context size of 2048 is too large for the available VRAM");
+      }
+      return [{ type: "lex", text: "ok" }];
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    const result = await llm.expandQuery("test");
+    expect(result).toEqual([{ type: "lex", text: "ok" }]);
+    expect(attempts).toBe(2);
+    // Reclaim disposes rerank (not generate — we need generate).
+    // Then the chain's own finally fires after the call returns, disposing generate.
+    expect(events).toEqual([
+      "expand:attempt-1",
+      "dispose:rerank",
+      "expand:attempt-2",
+      "dispose:generate",
+    ]);
+  });
+
+  test("rerank: catch-and-retry on insufficient VRAM disposes generate (not rerank) and retries once", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("Failed to create any rerank context");
+      }
+      return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    const result = await llm.rerank("q", [{ file: "a.md", text: "x" }]);
+    expect(result.results.map(r => r.file)).toEqual(["a.md"]);
+    expect(attempts).toBe(2);
+    // Reclaim disposes generate (not rerank — we need rerank).
+    // Then the chain's own finally fires after the call returns, disposing rerank.
+    expect(events).toEqual([
+      "rerank:attempt-1",
+      "dispose:generate",
+      "rerank:attempt-2",
+      "dispose:rerank",
+    ]);
+  });
+
+  test("expandQuery reclaim waits for in-flight rerank chain before disposing rerank", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let expandAttempts = 0;
+    const release: { rerank?: () => void } = {};
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+      events.push("rerank:start");
+      await new Promise<void>((r) => { release.rerank = r; });
+      events.push("rerank:end");
+      return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
+    };
+    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      expandAttempts++;
+      events.push(`expand:attempt-${expandAttempts}`);
+      if (expandAttempts === 1) throw new Error("too large for the available VRAM");
+      return [{ type: "lex", text: "ok" }];
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+
+    // Start rerank — it parks until released.
+    const rerank = llm.rerank("r", [{ file: "a.md", text: "x" }]);
+    await new Promise((r) => setImmediate(r));
+
+    // Start expand — it should fail on attempt 1 and park awaiting rerankChain.
+    const expand = llm.expandQuery("e");
+    await new Promise((r) => setImmediate(r));
+
+    // expand:attempt-1 has fired; rerank is still mid-flight; expand is parked.
+    expect(events).toContain("expand:attempt-1");
+    expect(events).toContain("rerank:start");
+    expect(events).not.toContain("dispose:rerank");
+
+    // Release rerank. Its chain finally fires (disposing rerank), then expand's
+    // reclaim runs its own (idempotent) dispose:rerank, then expand retries.
+    release.rerank!();
+    await rerank;
+    const result = await expand;
+
+    expect(result).toEqual([{ type: "lex", text: "ok" }]);
+    // rerank:end must precede expand's reclaim dispose.
+    const rerankEnd = events.indexOf("rerank:end");
+    const expandRetry = events.indexOf("expand:attempt-2");
+    expect(rerankEnd).toBeGreaterThanOrEqual(0);
+    expect(expandRetry).toBeGreaterThan(rerankEnd);
+  });
 });

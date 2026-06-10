@@ -1326,7 +1326,7 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
-      return await this.embedWithReclaim(() => this.embedImpl(text, options));
+      return await this.withReclaim("embed", () => this.embedImpl(text, options));
     } catch (error) {
       console.error("Embedding error:", error);
       return null;
@@ -1362,7 +1362,7 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
-      return await this.embedWithReclaim(() => this.embedBatchImpl(texts, options));
+      return await this.withReclaim("embed", () => this.embedBatchImpl(texts, options));
     } catch (error) {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
@@ -1492,9 +1492,11 @@ export class LlamaCpp implements LLM {
     }
     // Low-VRAM: serialize and dispose the generate model after each call so
     // peak VRAM stays bounded. Concurrent callers queue through generateChain.
+    // withReclaim retries once if loading generate fails for lack of VRAM:
+    // it drains the rerank chain and disposes rerank, then retries.
     const next = this.generateChain.then(async () => {
       try {
-        return await this.expandQueryImpl(query, options);
+        return await this.withReclaim("generate", () => this.expandQueryImpl(query, options));
       } finally {
         await this.disposeGenerateModel();
       }
@@ -1608,9 +1610,11 @@ export class LlamaCpp implements LLM {
       return this.rerankImpl(query, documents, options);
     }
     // Low-VRAM: serialize and dispose the rerank model after each call.
+    // withReclaim retries once if loading rerank fails for lack of VRAM:
+    // it drains the generate chain and disposes generate, then retries.
     const next = this.rerankChain.then(async () => {
       try {
-        return await this.rerankImpl(query, documents, options);
+        return await this.withReclaim("rerank", () => this.rerankImpl(query, documents, options));
       } finally {
         await this.disposeRerankModel();
       }
@@ -1745,24 +1749,41 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Wrap an embed operation so that, in lowVram mode, an insufficient-VRAM
-   * failure triggers a one-shot recovery: drain the generate and rerank chains
-   * (so any in-flight expand/rerank completes its own finally-dispose), then
-   * dispose both heavy models defensively, then retry the operation once.
+   * Wrap a heavy-model operation so that, in lowVram mode, an insufficient-VRAM
+   * failure triggers a one-shot recovery: drain the OTHER models' chains (so
+   * their in-flight callers complete their own finally-dispose), dispose those
+   * models defensively, then retry the operation once.
    *
-   * The chain-drain is what makes the dispose safe — it can never race with
-   * an in-flight expand or rerank because those callers' finallys already ran.
+   * The `needs` argument names which model the operation requires — we never
+   * dispose or await our own chain. `"generate"` (used by expandQuery) frees
+   * rerank; `"rerank"` (used by rerank) frees generate; `"embed"` frees both,
+   * since embed doesn't sit on either chain.
+   *
+   * Awaiting our own chain would deadlock — we're already inside its current
+   * link. The `needs` discrimination prevents that.
+   *
    * Outside lowVram mode, this is a pass-through.
    */
-  private async embedWithReclaim<T>(fn: () => Promise<T>): Promise<T> {
+  private async withReclaim<T>(needs: "embed" | "generate" | "rerank", fn: () => Promise<T>): Promise<T> {
     if (!this.lowVram) return fn();
     try {
       return await fn();
     } catch (error) {
       if (!isInsufficientVramError(error)) throw error;
-      await Promise.allSettled([this.generateChain, this.rerankChain]);
-      await this.disposeGenerateModel();
-      await this.disposeRerankModel();
+      const drains: Promise<unknown>[] = [];
+      const disposes: (() => Promise<void>)[] = [];
+      if (needs !== "generate") {
+        drains.push(this.generateChain);
+        disposes.push(() => this.disposeGenerateModel());
+      }
+      if (needs !== "rerank") {
+        drains.push(this.rerankChain);
+        disposes.push(() => this.disposeRerankModel());
+      }
+      await Promise.allSettled(drains);
+      for (const dispose of disposes) {
+        await dispose();
+      }
       return await fn();
     }
   }
