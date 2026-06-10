@@ -2,8 +2,8 @@
  * Adapter registry and resolver.
  *
  * Phase 1 kept behavior stable by routing all formats to legacy adapters.
- * Phase 2 wires OpenAI-specific protocol adapters while keeping `auto` and
- * `anthropic_messages` on legacy paths for backward compatibility.
+ * Phase 2 wired OpenAI-specific protocol adapters.
+ * Phase 3 wires Anthropic Messages protocol adapters.
  */
 
 import type { RemoteApiFormat } from '../../collections.js';
@@ -33,6 +33,10 @@ import {
   openaiResponsesExpandAdapter,
   openaiResponsesGenerateAdapter,
 } from './openai-responses.js';
+import {
+  anthropicMessagesExpandAdapter,
+  anthropicMessagesGenerateAdapter,
+} from './anthropic-messages.js';
 
 const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
   auto: legacyEmbedAdapter,
@@ -47,7 +51,7 @@ const EXPAND_ADAPTERS: Partial<Record<RemoteApiFormat, ExpandAdapter>> = {
   openai_chat_completions: openaiChatCompletionsExpandAdapter,
   openai_completions: openaiCompletionsExpandAdapter,
   openai_responses: openaiResponsesExpandAdapter,
-  anthropic_messages: legacyExpandAdapter,
+  anthropic_messages: anthropicMessagesExpandAdapter,
 };
 
 const RERANK_ADAPTERS: Partial<Record<RemoteApiFormat, RerankAdapter>> = {
@@ -62,7 +66,7 @@ const GENERATE_ADAPTERS: Partial<Record<RemoteApiFormat, GenerateAdapter>> = {
   openai_chat_completions: openaiChatCompletionsGenerateAdapter,
   openai_completions: openaiCompletionsGenerateAdapter,
   openai_responses: openaiResponsesGenerateAdapter,
-  anthropic_messages: legacyGenerateAdapter,
+  anthropic_messages: anthropicMessagesGenerateAdapter,
 };
 
 function pickAdapter<T>(

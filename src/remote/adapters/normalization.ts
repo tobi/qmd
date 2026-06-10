@@ -1,12 +1,12 @@
 /**
- * normalization.ts — Normalization helpers and common patterns for OpenAI protocol adapters.
+ * normalization.ts — Normalization helpers for remote API protocol adapters.
  *
- * Each OpenAI-style protocol (chat completions, text completions, responses)
- * differs in request/response shapes but shares error-handling semantics,
+ * Supports both OpenAI-style protocols (chat completions, text completions,
+ * responses) and Anthropic's Messages API. Each protocol differs in
+ * request/response shapes but shares error-handling semantics,
  * circuit-breaker gating, and fallback behavior.
  *
- * Phase 2 extracts these patterns so adapters stay focused on protocol
- * specifics without duplicating cross-cutting concerns.
+ * Phase 2 extracted shared patterns. Phase 3 added Anthropic support.
  *
  * @module remote/adapters/normalization
  */
@@ -113,6 +113,42 @@ export function normalizeModelName(data: unknown, fallback: string): string {
   if (!data || typeof data !== 'object') return fallback;
   const d = data as Record<string, unknown>;
   return typeof d['model'] === 'string' ? d['model'] : fallback;
+}
+
+// =============================================================================
+// Anthropic Messages API — text extraction from content blocks
+// =============================================================================
+
+/**
+ * Extract the assistant message text from an Anthropic `/v1/messages` response.
+ *
+ * Anthropic's response always wraps the assistant reply in a `content` array
+ * of content blocks. The standard text block is `{type: "text", text: "..."}`.
+ *
+ * Handles:
+ * - Standard: `content: [{type:"text", text:"hello"}]`
+ * - Multi-block: concatenates all text blocks in order
+ * - Gracefully handles empty/missing data
+ *
+ * Returns empty string for malformed/missing data.
+ */
+export function normalizeAnthropicMessagesText(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const d = data as Record<string, unknown>;
+  const content = Array.isArray(d['content']) ? d['content'] : [];
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as Record<string, unknown>;
+    if (b['type'] === 'text' && typeof b['text'] === 'string') {
+      parts.push(b['text']);
+    }
+  }
+  // Join text blocks deterministically with newline separation to avoid
+  // word-merging that raw concatenation (join('')) would cause.
+  // Empty/whitespace-only blocks are omitted.
+  const trimmed = parts.map(p => p.trim()).filter(p => p.length > 0);
+  return trimmed.join('\n');
 }
 
 // =============================================================================
