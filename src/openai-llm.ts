@@ -60,6 +60,42 @@ function truncateToTokenLimit(text: string, maxTokens: number): string {
 const DEFAULT_EMBED_MODEL = 'text-embedding-3-small';
 const DEFAULT_EXPANSION_MODEL = 'gpt-4o-mini';
 
+/**
+ * OpenAI API calls must be stateless. Bun's fetch/runtime can retain or attach
+ * cookie-related headers after Cloudflare responses in long-running CLI flows,
+ * which can make subsequent OpenAI requests fail with HTTP 431
+ * "Request headers are too large". The OpenAI API does not need cookies, so
+ * strip them defensively on every SDK request.
+ */
+const OPENAI_STRIPPED_REQUEST_HEADERS = new Set([
+  'cookie',
+  'cookie2',
+  'set-cookie',
+  'set-cookie2',
+]);
+
+function sanitizedOpenAIFetch(input: unknown, init?: unknown): Promise<Response> {
+  const requestInit = (init ?? {}) as RequestInit;
+  const nextInit: RequestInit = { ...requestInit };
+  const headers = new Headers(requestInit.headers);
+  for (const name of OPENAI_STRIPPED_REQUEST_HEADERS) {
+    headers.delete(name);
+  }
+  nextInit.headers = headers;
+  return fetch(input as Parameters<typeof fetch>[0], nextInit);
+}
+
+function createOpenAIClient(opts: { apiKey?: string; baseURL?: string }): OpenAI {
+  const clientOptions: Record<string, unknown> = {
+    apiKey: opts.apiKey,
+    fetch: sanitizedOpenAIFetch,
+  };
+  if (opts.baseURL) {
+    clientOptions.baseURL = opts.baseURL;
+  }
+  return new OpenAI(clientOptions as ConstructorParameters<typeof OpenAI>[0]);
+}
+
 // Retry configuration
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1000;
@@ -143,19 +179,19 @@ export class OpenAIEmbedding implements LLM {
     const apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
     const baseURL = config.baseURL || process.env.QMD_OPENAI_BASE_URL;
 
-    this.client = new OpenAI({ apiKey, baseURL });
+    this.client = createOpenAIClient({ apiKey, baseURL });
 
     const chatApiKey = config.chatApiKey || process.env.QMD_OPENAI_CHAT_API_KEY || apiKey;
     const chatBaseURL = config.chatBaseURL || process.env.QMD_OPENAI_CHAT_BASE_URL || baseURL;
     this.chatClient = (chatBaseURL !== baseURL || chatApiKey !== apiKey)
-      ? new OpenAI({ apiKey: chatApiKey, baseURL: chatBaseURL })
+      ? createOpenAIClient({ apiKey: chatApiKey, baseURL: chatBaseURL })
       : this.client;
 
     // Rerank client: falls back to chat client, then base client
     const rerankApiKey = config.rerankApiKey || process.env.QMD_OPENAI_RERANK_API_KEY || chatApiKey;
     const rerankBaseURL = config.rerankBaseURL || process.env.QMD_OPENAI_RERANK_BASE_URL || chatBaseURL;
     this.rerankClient = (rerankBaseURL !== chatBaseURL || rerankApiKey !== chatApiKey)
-      ? new OpenAI({ apiKey: rerankApiKey, baseURL: rerankBaseURL })
+      ? createOpenAIClient({ apiKey: rerankApiKey, baseURL: rerankBaseURL })
       : this.chatClient;
 
     this.embedModel = config.embedModel || DEFAULT_EMBED_MODEL;
