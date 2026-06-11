@@ -2878,6 +2878,7 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      "low-vram": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -2892,6 +2893,14 @@ function parseCLI() {
 
   if (values["no-gpu"]) {
     process.env.QMD_FORCE_CPU = "1";
+  }
+
+  if (values["low-vram"]) {
+    // Sequential model loading — disposes generate (~2 GB) and rerank (~2.3 GB)
+    // after each use, keeping only the tiny embed model (~320 MB) resident.
+    // Peak VRAM drops from ~5.4 GB to ~2.6 GB at the cost of per-stage load
+    // latency. The LlamaCpp constructor reads QMD_LOW_VRAM directly.
+    process.env.QMD_LOW_VRAM = "1";
   }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
@@ -3457,6 +3466,7 @@ function showHelp(): void {
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
+  console.log("  --low-vram                 - Load one heavy model at a time (~2.6 GB peak; same as QMD_LOW_VRAM=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
@@ -3597,6 +3607,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
+  add("QMD_LOW_VRAM", "loads one heavy model at a time (expand → embed → rerank) so peak VRAM stays under ~2.6 GB; trades load latency for memory headroom");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
   add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
