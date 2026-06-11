@@ -120,7 +120,7 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
  * recover. Conservative on purpose — too broad and we'd evict on unrelated
  * failures; too narrow and we'd miss the case the feature targets.
  */
-function isInsufficientVramError(error: unknown): boolean {
+export function isInsufficientVramError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
   return (
