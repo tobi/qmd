@@ -180,3 +180,150 @@ describe("hasSufficientFreeVramForIntegration", () => {
     }
   });
 });
+
+describe("hasSufficientFreeVramForIntegration — QMD_TEST_EVACUATE_VRAM opt-in", () => {
+  let originalEvacuate: string | undefined;
+  let originalSkip: string | undefined;
+
+  beforeEach(() => {
+    _resetVramPreconditionCacheForTests();
+    originalEvacuate = process.env.QMD_TEST_EVACUATE_VRAM;
+    originalSkip = process.env.QMD_SKIP_GPU_INTEGRATION;
+    delete process.env.QMD_TEST_EVACUATE_VRAM;
+    delete process.env.QMD_SKIP_GPU_INTEGRATION;
+  });
+
+  afterEach(() => {
+    if (originalEvacuate === undefined) delete process.env.QMD_TEST_EVACUATE_VRAM;
+    else process.env.QMD_TEST_EVACUATE_VRAM = originalEvacuate;
+    if (originalSkip === undefined) delete process.env.QMD_SKIP_GPU_INTEGRATION;
+    else process.env.QMD_SKIP_GPU_INTEGRATION = originalSkip;
+  });
+
+  test("does NOT run evacuate when env unset (default behavior preserved)", async () => {
+    let evacuateCalled = false;
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => fakeLlama({ gpu: "cuda", free: gb(1) }),
+      evacuate: async () => { evacuateCalled = true; },
+      log: () => {},
+    });
+    expect(result).toBe(false);
+    expect(evacuateCalled).toBe(false);
+  });
+
+  test("runs evacuate when env=1 and first probe insufficient, then re-probes", async () => {
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    let probeCalls = 0;
+    let evacuateCalled = false;
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => {
+        probeCalls++;
+        // First probe: tight.  Second probe (after evacuate): roomy.
+        return fakeLlama({ gpu: "cuda", free: probeCalls === 1 ? gb(1) : gb(20) });
+      },
+      evacuate: async () => { evacuateCalled = true; },
+      log: () => {},
+    });
+    expect(result).toBe(true);
+    expect(evacuateCalled).toBe(true);
+    expect(probeCalls).toBe(2);
+  });
+
+  test("evacuate runs but does not free enough → still returns false", async () => {
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    let evacuateCalled = false;
+    const messages: string[] = [];
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => fakeLlama({ gpu: "cuda", free: gb(1) }),  // stays tight
+      evacuate: async () => { evacuateCalled = true; },
+      log: (m) => messages.push(m),
+    });
+    expect(result).toBe(false);
+    expect(evacuateCalled).toBe(true);
+    expect(messages.some((m) => m.includes("post-eviction"))).toBe(true);
+  });
+
+  test("evacuate throws → still re-probes (best-effort), logs the failure", async () => {
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    let probeCalls = 0;
+    const messages: string[] = [];
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => {
+        probeCalls++;
+        return fakeLlama({ gpu: "cuda", free: probeCalls === 1 ? gb(1) : gb(20) });
+      },
+      evacuate: async () => { throw new Error("simulated eviction failure"); },
+      log: (m) => messages.push(m),
+    });
+    expect(result).toBe(true);
+    expect(probeCalls).toBe(2);
+    expect(messages.some((m) => m.includes("Eviction step threw"))).toBe(true);
+  });
+
+  test("first probe already sufficient → evacuate is NOT called even with env=1", async () => {
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    let evacuateCalled = false;
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => fakeLlama({ gpu: "cuda", free: gb(20) }),
+      evacuate: async () => { evacuateCalled = true; },
+      log: () => {},
+    });
+    expect(result).toBe(true);
+    expect(evacuateCalled).toBe(false);
+  });
+
+  test("QMD_SKIP_GPU_INTEGRATION=1 wins over QMD_TEST_EVACUATE_VRAM=1 (no probe, no evacuate)", async () => {
+    process.env.QMD_SKIP_GPU_INTEGRATION = "1";
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    let probeCalls = 0;
+    let evacuateCalled = false;
+    const result = await hasSufficientFreeVramForIntegration({
+      getLlama: async () => { probeCalls++; return fakeLlama({ gpu: "cuda", free: gb(1) }); },
+      evacuate: async () => { evacuateCalled = true; },
+      log: () => {},
+    });
+    expect(result).toBe(false);
+    expect(probeCalls).toBe(0);
+    expect(evacuateCalled).toBe(false);
+  });
+
+  test("QMD_TEST_EVACUATE_VRAM values other than '1' do not trigger eviction (precise env match)", async () => {
+    for (const raw of ["0", "false", "no", "true", "yes", ""]) {
+      _resetVramPreconditionCacheForTests();
+      process.env.QMD_TEST_EVACUATE_VRAM = raw;
+      let evacuateCalled = false;
+      const result = await hasSufficientFreeVramForIntegration({
+        getLlama: async () => fakeLlama({ gpu: "cuda", free: gb(1) }),
+        evacuate: async () => { evacuateCalled = true; },
+        log: () => {},
+      });
+      expect(result, `value ${JSON.stringify(raw)} should not trigger eviction`).toBe(false);
+      expect(evacuateCalled, `value ${JSON.stringify(raw)} should not call evacuate`).toBe(false);
+    }
+  });
+
+  test("default evacuate path: Ollama unreachable does not throw (best-effort)", async () => {
+    // Red-team: when the default evacuate runs against a host with no Ollama,
+    // it must swallow the connection error and let the re-probe proceed.
+    // We exercise the default evacuate (no injection) by aiming at a port
+    // that nothing is listening on.
+    process.env.QMD_TEST_EVACUATE_VRAM = "1";
+    const originalHost = process.env.OLLAMA_HOST;
+    process.env.OLLAMA_HOST = "http://127.0.0.1:1";  // reserved/unused port
+    try {
+      let probeCalls = 0;
+      const messages: string[] = [];
+      const result = await hasSufficientFreeVramForIntegration({
+        getLlama: async () => { probeCalls++; return fakeLlama({ gpu: "cuda", free: gb(1) }); },
+        log: (m) => messages.push(m),
+        // No `evacuate` injected — exercises the real defaultEvacuate path.
+      });
+      expect(result).toBe(false);
+      expect(probeCalls).toBe(2);  // initial + post-eviction re-probe
+      expect(messages.some((m) => m.includes("Ollama unreachable"))).toBe(true);
+    } finally {
+      if (originalHost === undefined) delete process.env.OLLAMA_HOST;
+      else process.env.OLLAMA_HOST = originalHost;
+    }
+  });
+});
