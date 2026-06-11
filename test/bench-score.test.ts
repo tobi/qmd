@@ -99,6 +99,20 @@ describe("scoreResults", () => {
     expect(result.mrr).toBeCloseTo(0.5); // 1/2
   });
 
+  test("reports recall@1/3/5 and matched documents", () => {
+    const result = scoreResults(
+      ["x.md", "qmd://concepts/a.md", "docs/b.md", "docs/c.md", "docs/d.md"],
+      ["concepts/a.md", "b.md", "missing.md"],
+      3,
+    );
+
+    expect(result.recall_at_1).toBe(0);
+    expect(result.recall_at_3).toBeCloseTo(2 / 3);
+    expect(result.recall_at_5).toBeCloseTo(2 / 3);
+    expect(result.matched_files).toEqual(["concepts/a.md", "b.md"]);
+    expect(result.unmatched_expected_files).toEqual(["missing.md"]);
+  });
+
   test("empty results", () => {
     const result = scoreResults([], ["a.md"], 1);
     expect(result.precision_at_k).toBe(0);

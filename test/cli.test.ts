@@ -6,14 +6,17 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
+import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
+import { openDatabase } from "../src/db.ts";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
+import { setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -26,14 +29,15 @@ let testCounter = 0; // Unique counter for each test run
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
-// Resolve tsx binary from project's node_modules (not cwd-dependent)
-const tsxBin = (() => {
-  const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
-  if (existsSync(candidate)) {
-    return candidate;
-  }
-  return join(process.cwd(), "node_modules", ".bin", "tsx");
-})();
+const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const qmdCommand = isBunRuntime
+  ? { command: process.execPath, args: [qmdScript] }
+  : { command: process.execPath, args: [tsxCli, qmdScript] };
+
+function qmdRunnerArgs(args: string[]): { command: string; args: string[] } {
+  return { command: qmdCommand.command, args: [...qmdCommand.args, ...args] };
+}
 
 // Helper to run qmd command with test database
 async function runQmd(
@@ -43,13 +47,15 @@ async function runQmd(
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
   const configDir = options.configDir || testConfigDir;
-  const proc = spawn(tsxBin, [qmdScript, ...args], {
+  const runner = qmdRunnerArgs(args);
+  const proc = spawn(runner.command, runner.args, {
     cwd: workingDir,
     env: {
       ...process.env,
       INDEX_PATH: dbPath,
       QMD_CONFIG_DIR: configDir, // Use test config directory
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
+      QMD_DOCTOR_DEVICE_PROBE: "0", // Keep integration tests deterministic on CI hosts without usable GPU backends.
       ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -232,6 +238,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
   });
 
@@ -242,7 +249,99 @@ describe("CLI Help", () => {
   });
 });
 
+
+
+describe("CLI Skills", () => {
+  test("lists bundled runtime skills", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["skills", "list"]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd");
+    expect(stdout).toContain("Search local markdown knowledge bases");
+  });
+
+  test("gets version-matched runtime skill content", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["skills", "get", "qmd"]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("# QMD - Query Markdown Documents");
+    expect(stdout).toContain("## MCP Tool: `query`");
+    expect(stdout).not.toContain("This file is a discovery stub");
+  });
+
+  test("gets runtime skill with supplementary references", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["skills", "get", "qmd", "--full"]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("# QMD - Query Markdown Documents");
+    expect(stdout).toContain("--- references/mcp-setup.md ---");
+    expect(stdout).toContain("# QMD MCP Server Setup");
+  });
+
+  test("prints canonical repository skill path", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["skills", "path", "qmd"]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toMatch(/skills\/qmd$/);
+  });
+
+  test("legacy skill show prints the canonical skill", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["skill", "show"]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("# QMD - Query Markdown Documents");
+    expect(stdout).toContain("## MCP Tool: `query`");
+    expect(stdout).not.toContain("This file is a discovery stub");
+  });
+
+  test("legacy skill install writes a qmd skill show bootstrap", async () => {
+    const installDir = join(testDir, "skill-install-target");
+    await mkdir(installDir, { recursive: true });
+
+    const { stdout, stderr, exitCode } = await runQmd(["skill", "install", "--yes"], { cwd: installDir });
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Installed QMD skill");
+
+    const installedSkillDir = join(installDir, ".agents", "skills", "qmd");
+    const installed = readFileSync(join(installedSkillDir, "SKILL.md"), "utf8");
+    expect(installed).toContain("# QMD - Query Markdown Documents");
+    expect(installed).toContain("!`qmd skill show`");
+    expect(installed).toContain("qmd get");
+    expect(installed).not.toContain("## MCP Tool: `query`");
+    expect(readFileSync(join(installedSkillDir, "references", "mcp-setup.md"), "utf8")).toContain("# QMD MCP Server Setup");
+  });
+});
+
 describe("CLI Embed", () => {
+  test("prefers QMD_EMBED_MODEL for qmd embed when the index has no model pin", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:env/embed-model.gguf";
+    setConfigSource({ config: { collections: {} } });
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe("hf:env/embed-model.gguf");
+    } finally {
+      setConfigSource();
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("falls back to the default embed model when QMD_EMBED_MODEL is unset", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+    setConfigSource({ config: { collections: {} } });
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe(DEFAULT_EMBED_MODEL_URI);
+    } finally {
+      setConfigSource();
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
   test("rejects invalid --max-docs-per-batch", async () => {
     const { stderr, exitCode } = await runQmd(["embed", "--max-docs-per-batch", "0"]);
     expect(exitCode).toBe(1);
@@ -260,7 +359,7 @@ describe("CLI Skill Commands", () => {
   test("shows embedded skill with --skill alias", async () => {
     const { stdout, exitCode } = await runQmd(["--skill"]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("QMD Skill (embedded)");
+    expect(stdout).toContain("QMD Skill");
     expect(stdout).toContain("name: qmd");
     expect(stdout).toContain("allowed-tools: Bash(qmd:*), mcp__qmd__*");
   });
@@ -281,8 +380,9 @@ describe("CLI Skill Commands", () => {
     expect(exitCode).toBe(0);
 
     const skillDir = join(projectDir, ".agents", "skills", "qmd");
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
-    expect(readFileSync(join(skillDir, "references", "mcp-setup.md"), "utf-8")).toContain("Claude Code");
+    const installed = readFileSync(join(skillDir, "SKILL.md"), "utf-8");
+    expect(installed).toContain("# QMD - Query Markdown Documents");
+    expect(installed).toContain("!`qmd skill show`");
     expect(existsSync(join(projectDir, ".claude", "skills", "qmd"))).toBe(false);
     expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
     expect(stdout).toContain("Tip: create a Claude symlink manually");
@@ -300,9 +400,9 @@ describe("CLI Skill Commands", () => {
     const skillDir = join(fakeHome, ".agents", "skills", "qmd");
     const claudeLink = join(fakeHome, ".claude", "skills", "qmd");
 
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
     expect(lstatSync(claudeLink).isSymbolicLink()).toBe(true);
-    expect(readFileSync(join(claudeLink, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(readFileSync(join(claudeLink, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
     expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
     expect(stdout).toContain(`✓ Linked Claude skill at ${claudeLink}`);
   });
@@ -320,7 +420,7 @@ describe("CLI Skill Commands", () => {
 
     const skillDir = join(fakeHome, ".agents", "skills", "qmd");
     expect(lstatSync(skillDir).isSymbolicLink()).toBe(false);
-    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("name: qmd");
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
     expect(stdout).toContain(`✓ Claude already sees the skill via ${join(fakeHome, ".claude", "skills")}`);
   });
 
@@ -335,6 +435,36 @@ describe("CLI Skill Commands", () => {
     expect(second.exitCode).toBe(1);
     expect(second.stderr).toContain("Skill already exists");
     expect(second.stderr).toContain("--force");
+  });
+});
+
+describe("CLI Init Command", () => {
+  test("creates a project-local .qmd index", async () => {
+    const projectDir = join(testDir, "init-project");
+    await mkdir(projectDir, { recursive: true });
+
+    const { stdout, exitCode } = await runQmd(["init"], { cwd: projectDir });
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe("ready to go with new local index");
+    expect(existsSync(join(projectDir, ".qmd", "index.yml"))).toBe(true);
+    expect(existsSync(join(projectDir, ".qmd", "index.sqlite"))).toBe(true);
+    const configText = readFileSync(join(projectDir, ".qmd", "index.yml"), "utf-8");
+    expect(configText).toContain("collections: {}");
+    expect(configText).toContain("models:");
+  });
+
+  test("refuses to initialize in HOME", async () => {
+    const fakeHome = join(testDir, "init-home");
+    await mkdir(fakeHome, { recursive: true });
+
+    const { stderr, exitCode } = await runQmd(["init"], {
+      cwd: fakeHome,
+      env: { HOME: fakeHome },
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Refusing to initialize a local index in $HOME");
+    expect(stderr).toContain("global index is automatically created");
+    expect(existsSync(join(fakeHome, ".qmd", "index.yml"))).toBe(false);
   });
 });
 
@@ -375,6 +505,184 @@ describe("CLI Status Command", () => {
     await runQmd(["collection", "add", "."]);
   });
 
+  test("qmd doctor reports core index health checks", async () => {
+    const { stdout, exitCode } = await runQmd(["doctor"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("QMD Doctor");
+    expect(stdout).toContain("SQLite runtime");
+    expect(stdout).toContain("sqlite-vec");
+    expect(stdout).toContain("environment overrides");
+    expect(stdout).toContain("INDEX_PATH");
+    expect(stdout).toContain("overrides the SQLite index path");
+    expect(stdout).toContain("QMD_CONFIG_DIR");
+    expect(stdout).toContain("overrides the QMD config directory");
+    expect(stdout).toContain("model defaults");
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("device mode");
+    expect(stdout).toContain("device probe");
+    expect(stdout).toContain("embedding freshness");
+    expect(stdout).toContain("embedding fingerprints");
+    expect(stdout).toContain("embedding vector sample");
+    expect(stdout).toContain("please run qmd embed again");
+
+    const configText = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
+    expect(configText).toContain("models:");
+    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
+    expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
+    expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+  }, 20000);
+
+  test("qmd doctor warns when no collections are configured", async () => {
+    const env = await createIsolatedTestEnv("doctor-no-collections");
+    const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("index config");
+    expect(stdout).toContain("no collections configured");
+    expect(stdout).toContain("qmd collection add .");
+  }, 20000);
+
+  test("qmd doctor reports invalid index.yml without crashing", async () => {
+    const env = await createIsolatedTestEnv("doctor-invalid-config");
+    await writeFile(join(env.configDir, "index.yml"), "collections:\n  bad: [unterminated\n");
+
+    const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("index config");
+    expect(stdout).toContain("invalid index.yml at");
+    expect(stdout).toContain(join(env.configDir, "index.yml"));
+    expect(stdout).toContain("fix the YAML");
+  }, 20000);
+
+  test("qmd doctor warns when configured models differ from code defaults", async () => {
+    const env = await createIsolatedTestEnv("doctor-custom-models");
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: hf:example/custom-embed/custom.gguf\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`);
+
+    const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model defaults");
+    expect(stdout).toContain("non-default model configuration");
+    expect(stdout).toContain("index hf:example/custom-embed/custom.gguf");
+    expect(stdout).toContain("might be ok");
+    expect(stdout).toContain("qmd pull");
+  }, 20000);
+
+  test("qmd doctor identifies cached non-GGUF model files", async () => {
+    const env = await createIsolatedTestEnv("doctor-invalid-model-cache");
+    const model = "hf:example/custom-model/custom.gguf";
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+    const cacheRoot = join(env.configDir, "cache");
+    const modelCacheDir = join(cacheRoot, "qmd", "models");
+    await mkdir(modelCacheDir, { recursive: true });
+    const badModelPath = join(modelCacheDir, "custom.gguf");
+    await writeFile(badModelPath, "<!doctype html><html>blocked</html>");
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        XDG_CACHE_HOME: cacheRoot,
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("invalid 1");
+    expect(stdout).toContain("HTML page, not a GGUF model");
+    expect(stdout).toContain("qmd pull --refresh");
+  }, 20000);
+
+  test("qmd doctor says when models are overridden by env", async () => {
+    const env = await createIsolatedTestEnv("doctor-env-models");
+    await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
+
+    const customEmbed = "hf:example/env-embed/custom.gguf";
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_EMBED_MODEL: customEmbed },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model defaults");
+    expect(stdout).toContain(`env QMD_EMBED_MODEL=${customEmbed}`);
+    expect(stdout).toContain("might be ok");
+    expect(stdout).toContain("environment overrides");
+    expect(stdout).toContain(`QMD_EMBED_MODEL=${customEmbed}`);
+    expect(stdout).toContain("sets the active embed model");
+  }, 20000);
+
+  test("qmd doctor shows CPU-forced device mode with QMD_FORCE_CPU=1", async () => {
+    const env = await createIsolatedTestEnv("doctor-force-cpu");
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_FORCE_CPU: "1",
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("QMD_FORCE_CPU=1");
+    expect(stdout).toContain("forces llama.cpp to bypass GPU backends");
+    expect(stdout).toContain("device mode: CPU forced (QMD_FORCE_CPU)");
+  }, 20000);
+
+  test("qmd doctor lists known environment overrides and consequences", async () => {
+    const env = await createIsolatedTestEnv("doctor-env-overrides");
+    const overrides = {
+      XDG_CACHE_HOME: join(env.configDir, "cache"),
+      QMD_DOCTOR_DEVICE_PROBE: "0",
+      QMD_FORCE_CPU: "1",
+      QMD_LLAMA_GPU: "metal",
+      QMD_EMBED_PARALLELISM: "2",
+      QMD_EXPAND_CONTEXT_SIZE: "4096",
+      QMD_RERANK_CONTEXT_SIZE: "8192",
+      QMD_EMBED_CONTEXT_SIZE: "1024",
+      QMD_EDITOR_URI: "vscode://file/{file}:{line}:{col}",
+      QMD_SKILLS_DIR: "/tmp/qmd-skills",
+      QMD_METAL_KEEP_RESIDENCY: "1",
+      NO_COLOR: "1",
+      CI: "1",
+      HF_ENDPOINT: "https://hf-mirror.com",
+      WSL_DISTRO_NAME: "Ubuntu",
+      WSL_INTEROP: "1",
+    };
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: overrides,
+    });
+    expect(exitCode).toBe(0);
+    for (const name of Object.keys(overrides)) {
+      expect(stdout).toContain(name);
+    }
+    expect(stdout).toContain("forces llama.cpp to bypass GPU backends");
+    expect(stdout).toContain("moves the default index cache");
+    expect(stdout).toContain("disables real LLM operations");
+    expect(stdout).toContain("changes Hugging Face download endpoint");
+  }, 20000);
+
+  test("qmd doctor flags mixed embedding fingerprints", async () => {
+    const db = openDatabase(testDbPath);
+    const doc = db.prepare(`SELECT hash FROM documents WHERE active = 1 LIMIT 1`).get() as { hash: string };
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, 'stale1', 2, ?)
+    `).run(doc.hash, resolveEmbedModelForCli(), now);
+    db.prepare(`
+      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 1, 1, ?, 'stale2', 2, ?)
+    `).run(doc.hash, resolveEmbedModelForCli(), now);
+    db.close();
+
+    const { stdout, exitCode } = await runQmd(["doctor"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("embedding fingerprints");
+    expect(stdout).toContain("mixed named embedding fingerprints");
+    expect(stdout).toContain("stale1");
+  }, 20000);
+
   test("shows index status", async () => {
     const { stdout, exitCode } = await runQmd(["status"]);
     expect(exitCode).toBe(0);
@@ -382,10 +690,12 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("Collection");
   });
 
-  test("skips device probing by default", async () => {
+  test("status omits device probing details; doctor owns GPU diagnostics", async () => {
     const { stdout, exitCode } = await runQmd(["status"]);
     expect(exitCode).toBe(0);
     expect(stdout).not.toContain("Device");
+    expect(stdout).not.toContain("QMD_STATUS_DEVICE_PROBE");
+    expect(stdout).not.toContain("not probed");
   });
 });
 
@@ -482,6 +792,16 @@ describe("CLI Search Command", () => {
     // Error message goes to stderr
     expect(stderr).toContain("Usage:");
   });
+
+  test("--json --full includes line field for round-tripping to qmd get", async () => {
+    const { stdout, exitCode } = await runQmd(["search", "meeting", "--json", "--full", "-n", "1"]);
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].line).toBeTypeOf("number");
+    expect(results[0].line).toBeGreaterThan(0);
+    expect(results[0].body).toBeTypeOf("string");
+  });
 });
 
 describe("CLI Get Command", () => {
@@ -506,6 +826,13 @@ describe("CLI Get Command", () => {
     const { stdout, exitCode } = await runQmd(["get", "nonexistent.md"]);
     // Should indicate file not found
     expect(exitCode).toBe(1);
+  });
+
+  test("clamps negative --from to top of file (no silent tail content)", async () => {
+    const baseline = await runQmd(["get", "README.md"]);
+    const negative = await runQmd(["get", "README.md", "--from", "-19"]);
+    expect(negative.exitCode).toBe(0);
+    expect(negative.stdout).toBe(baseline.stdout);
   });
 });
 
@@ -539,6 +866,69 @@ describe("CLI Multi-Get Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Project");
     expect(stdout).toContain("Team Meeting");
+  });
+
+  test("--md output includes a #docid for each file", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--md"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    // Every result carries a docid line, consistent with `search --md`.
+    expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
+  });
+
+  test("--json output includes a #docid for each file", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--json"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.docid).toMatch(/^#[a-f0-9]{6}$/);
+    }
+  });
+
+  test("shows line numbers by default and --no-line-numbers disables them", async () => {
+    const withNums = await runQmd(["multi-get", "README.md"], { dbPath: localDbPath });
+    expect(withNums.exitCode).toBe(0);
+    expect(withNums.stdout).toMatch(/^1: /m);
+
+    const raw = await runQmd(["multi-get", "README.md", "--no-line-numbers"], { dbPath: localDbPath });
+    expect(raw.exitCode).toBe(0);
+    expect(raw.stdout).not.toMatch(/^1: /m);
+  });
+
+  test("--full-path --md shows ./-prefixed on-disk paths and drops the docid", async () => {
+    // Default runQmd cwd is fixturesDir, so notes/*.md files are subpaths.
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--md", "--full-path"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    // Headings are ./-prefixed relative paths under fixturesDir.
+    expect(stdout).toMatch(/^## \.\/notes\/[^\s]+\.md$/m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/\*\*docid:\*\*/);
+  });
+
+  test("--full-path --json puts the ./-prefixed path in `file` and omits docid", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--json", "--full-path"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.file.startsWith("./notes/")).toBe(true);
+      expect(entry.docid).toBeUndefined();
+    }
+  });
+
+  test("--full-path --json uses absolute path when files are outside $PWD", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["multi-get", "notes/*.md", "--json", "--full-path"],
+      { dbPath: localDbPath, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.file.startsWith("/")).toBe(true);
+      expect(entry.file).not.toMatch(/^\.\//);
+      expect(entry.docid).toBeUndefined();
+    }
   });
 });
 
@@ -651,8 +1041,9 @@ describe("CLI Error Handling", () => {
   test("handles unknown command", async () => {
     const { stderr, exitCode } = await runQmd(["unknowncommand"]);
     expect(exitCode).toBe(1);
-    // Should indicate unknown command
+    // Should indicate unknown command and point users to diagnostics
     expect(stderr).toContain("Unknown command");
+    expect(stderr).toContain("qmd doctor");
   });
 
   test("uses INDEX_PATH environment variable", async () => {
@@ -861,6 +1252,71 @@ describe("CLI ls Command", () => {
     const { stdout, exitCode } = await runQmd(["ls", "qmd://fixtures/docs"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("continues to normalize extra slashes for normal collection virtual paths", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["ls", "qmd:///fixtures/docs"], { dbPath: localDbPath });
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/docs/api.md");
+  });
+
+  test("lists an absolute-path collection from a qmd:/// virtual path", async () => {
+    const env = await createIsolatedTestEnv("absolute-qmd-path");
+    const absoluteDir = await mkdtemp(join(tmpdir(), "qmd-absolute-collection-"));
+    await writeFile(join(absoluteDir, "root.md"), "# Absolute collection\n");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      `collections:\n  "${absoluteDir}":\n    path: "${absoluteDir}"\n    pattern: "**/*.md"\n`
+    );
+
+    const update = await runQmd(["update"], {
+      cwd: absoluteDir,
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(update.exitCode).toBe(0);
+
+    const { stdout, stderr, exitCode } = await runQmd(["ls", `qmd://${absoluteDir}/`], {
+      cwd: absoluteDir,
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`qmd://${absoluteDir}/root.md`);
+  });
+
+  test("lists an absolute-path collection from a raw path using the longest prefix match", async () => {
+    const env = await createIsolatedTestEnv("absolute-raw-path");
+    const parentCollectionName = await mkdtemp(join(tmpdir(), "qmd-absolute-parent-name-"));
+    const childCollectionName = join(parentCollectionName, "nested");
+    const parentDataDir = await mkdtemp(join(tmpdir(), "qmd-absolute-parent-data-"));
+    const childDataDir = await mkdtemp(join(tmpdir(), "qmd-absolute-child-data-"));
+    await writeFile(join(parentDataDir, "parent.md"), "# Parent collection\n");
+    await writeFile(join(childDataDir, "child.md"), "# Child collection\n");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      `collections:\n  "${parentCollectionName}":\n    path: "${parentDataDir}"\n    pattern: "**/*.md"\n  "${childCollectionName}":\n    path: "${childDataDir}"\n    pattern: "**/*.md"\n`
+    );
+
+    const update = await runQmd(["update"], {
+      cwd: parentDataDir,
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(update.exitCode).toBe(0);
+
+    const { stdout, stderr, exitCode } = await runQmd(["ls", `${childCollectionName}/`], {
+      cwd: childDataDir,
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`qmd://${childCollectionName}/child.md`);
+    expect(stdout).not.toContain("No files found");
+    expect(stdout).not.toContain(`qmd://${parentCollectionName}/parent.md`);
   });
 
   test("handles non-existent collection", async () => {
@@ -1198,12 +1654,15 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
-  test("search --md includes docid and context", async () => {
+  test("search --md includes docid, context, and qmd:// file line", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "--md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
 
     expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
     expect(stdout).toContain("**context:** Test fixtures for QMD");
+    // The file path must be a qmd:// URI so the model can pipe it back into
+    // `qmd get` without having to reassemble a collection-relative string.
+    expect(stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
   });
 
   test("search --xml includes qmd:// path, docid, and context", async () => {
@@ -1217,6 +1676,93 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
+  test("search --full-path --json swaps qmd:// for absolute realpath when cwd is unrelated", async () => {
+    // Use "/" as cwd so the fixtures path (under tmpdir) is NOT a subpath of $PWD.
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--json", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    const result = results[0];
+    expect(result.file).not.toMatch(/^qmd:\/\//);
+    // Must be an absolute path ending in .md.
+    expect(result.file).toMatch(/^\/.+\.md$/);
+    // --full-path: the on-disk path replaces the docid as the identifier.
+    expect(result.docid).toBeUndefined();
+  });
+
+  test("search --full-path --json uses ./-prefixed $PWD-relative path when in a parent of the file", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--json", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: fixturesDir }
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    const result = results[0];
+    expect(result.file).not.toMatch(/^qmd:\/\//);
+    // Must start with "./" so it's unambiguously a filesystem path and not
+    // mistaken for a bare collection-relative string.
+    expect(result.file.startsWith("./")).toBe(true);
+    expect(result.file).not.toMatch(/^\.\.\//);
+    expect(result.file).toMatch(/\.md$/);
+  });
+
+  test("search --full-path default CLI format shows on-disk path and drops the docid", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    // eslint-disable-next-line no-control-regex
+    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
+    const plain = stripAnsi(stdout);
+    expect(plain).not.toMatch(/qmd:\/\//);
+    expect(plain).toMatch(/^\/.+\.md/m);
+    // No `#docid` suffix when --full-path is set.
+    expect(plain).not.toMatch(/#[a-f0-9]{6}\s*$/m);
+  });
+
+  test("search --full-path --md uses on-disk path in heading and drops the docid", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--md", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toMatch(/qmd:\/\//);
+    expect(stdout).not.toMatch(/\*\*docid:\*\*/);
+    expect(stdout).toMatch(/\*\*file:\*\* `\/.+\.md`/);
+  });
+
+  test("search --format json matches the legacy --json behavior", async () => {
+    const a = await runQmd(["search", "test", "--format", "json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    const b = await runQmd(["search", "test", "--json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(a.exitCode).toBe(0);
+    expect(b.exitCode).toBe(0);
+    // Both must yield valid JSON with at least one result.
+    const ar = JSON.parse(a.stdout);
+    const br = JSON.parse(b.stdout);
+    expect(ar.length).toBeGreaterThan(0);
+    expect(br.length).toBeGreaterThan(0);
+    // Identical first-result file path (the rest may differ in score formatting only).
+    expect(ar[0].file).toBe(br[0].file);
+  });
+
+  test("search --format md works equivalent to legacy --md", async () => {
+    const a = await runQmd(["search", "test", "--format", "md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(a.exitCode).toBe(0);
+    expect(a.stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
+    expect(a.stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
+  });
+
+  test("search --format with an unknown kind fails cleanly", async () => {
+    const { exitCode, stderr } = await runQmd(["search", "test", "--format", "yaml", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Unknown --format value");
+  });
+
   test("search default CLI format includes plain qmd:// path, docid, and context in non-TTY mode", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1228,6 +1774,14 @@ describe("search output formats", () => {
     // Ensure no full filesystem paths
     expect(stdout).not.toMatch(/\/Users\//);
     expect(stdout).not.toMatch(/\/home\//);
+    // The visible path must NOT be the bare collection-relative form
+    // (a leading `${collName}/foo.md` would be "relative to nowhere").
+    // Strip ANSI and OSC 8 sequences then assert no result line starts with
+    // a bare collection-relative path missing the qmd:// scheme.
+    // eslint-disable-next-line no-control-regex
+    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
+    const plain = stripAnsi(stdout);
+    expect(plain).not.toMatch(new RegExp(`^${collName}/`, "m"));
   });
 });
 
@@ -1326,6 +1880,104 @@ describe("get command path normalization", () => {
     // Should start from line 3, not line 1
     expect(stdout).not.toMatch(/^# Test Document 1$/m);
   });
+
+  test("get with path:from:count format reads a bounded range", async () => {
+    // Lines: 1 "# Test Document 1", 5 "It has multiple lines...",
+    //        6 "Line 6 is here.", 7 "Line 7 is here."
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).toContain("Line 6 is here.");
+    // Bounded to 2 lines: must not include the start of the file or line 7
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+    expect(stdout).not.toContain("Line 7 is here.");
+  });
+
+  test("get with qmd://path:from:count format reads a bounded range", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).toContain("Line 6 is here.");
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+    expect(stdout).not.toContain("Line 7 is here.");
+  });
+
+  test("explicit -l overrides the :count in path:from:count", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`, "-l", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).not.toContain("Line 6 is here.");
+  });
+
+  test("get header includes canonical qmd:// path and a #docid", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // First line of output identifies the document by path + docid.
+    expect(stdout).toMatch(new RegExp(`^qmd://${collName}/test1\\.md\\s+#[a-f0-9]{6}`, "m"));
+  });
+
+  test("get shows line numbers by default", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^1: # Test Document 1$/m);
+    expect(stdout).toMatch(/^6: Line 6 is here\.$/m);
+  });
+
+  test("get --no-line-numbers returns raw content", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "--no-line-numbers"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toMatch(/^1: /m);
+    expect(stdout).toMatch(/^# Test Document 1$/m);
+  });
+
+  test("get line numbers reflect the start line of a range", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // Numbering starts at the requested line, not at 1.
+    expect(stdout).toMatch(/^5: It has multiple lines/m);
+    expect(stdout).not.toMatch(/^1: /m);
+  });
+
+  test("get --full-path shows ./-prefixed path when file is under $PWD", async () => {
+    // Default runQmd cwd is fixturesDir, and test1.md lives in fixturesDir,
+    // so the rendered path must be relative-with-./ prefix.
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "--full-path"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^\.\/test1\.md$/m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/#[a-f0-9]{6}/);
+    // Body still present and line-numbered.
+    expect(stdout).toMatch(/^1: # Test Document 1$/m);
+  });
+
+  test("get --full-path shows absolute path when file is outside $PWD", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["get", `${collName}/test1.md`, "--full-path"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    // Absolute realpath (allow macOS /var → /private/var).
+    expect(stdout).toMatch(/^\/.+\/test1\.md$/m);
+    expect(stdout).not.toMatch(/^\.\//m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/#[a-f0-9]{6}/);
+  });
+
+  test("get --full-path falls back to qmd:// + docid when the file is gone", async () => {
+    // Index a doc, then delete the underlying file so the fs path no longer exists.
+    const env = await createIsolatedTestEnv("full-path-fallback");
+    const collectionDir = join(testDir, `gone-fixtures-${Date.now()}`);
+    await mkdir(collectionDir, { recursive: true });
+    const gonePath = join(collectionDir, "gone.md");
+    await writeFile(gonePath, "# Gone\n\nbody line\n");
+    const add = await runQmd(["collection", "add", collectionDir, "--name", "gonecoll"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+    await rm(gonePath);
+
+    const { stdout, exitCode } = await runQmd(["get", "gonecoll/gone.md", "--full-path"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(new RegExp(`^qmd://gonecoll/gone\\.md\\s+#[a-f0-9]{6}`, "m"));
+  });
 });
 
 // =============================================================================
@@ -1361,6 +2013,20 @@ describe("status and collection list hide filesystem paths", () => {
     const pathLines = lines.filter(l => l.includes('/Users/') || l.includes('/home/') || l.includes('/tmp/'));
     expect(pathLines.length).toBe(0);
   });
+
+  test("doctor does not show full filesystem paths", async () => {
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      env: { QMD_DOCTOR_DEVICE_PROBE: "0" },
+    });
+    expect(exitCode).toBe(0);
+
+    expect(stdout).toContain("QMD Doctor");
+    const lines = stdout.split('\n').filter(l => !l.includes('Index:') && !l.includes('INDEX_PATH=') && !l.includes('QMD_CONFIG_DIR='));
+    const pathLines = lines.filter(l => l.includes('/Users/') || l.includes('/home/') || l.includes('/tmp/'));
+    expect(pathLines.length).toBe(0);
+  }, 20000);
 
   test("collection list does not show full filesystem paths", async () => {
     const { stdout, exitCode } = await runQmd(["collection", "list"], { dbPath: localDbPath, configDir: localConfigDir });
@@ -1403,13 +2069,19 @@ describe("mcp http daemon", () => {
   }
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
-  function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+  function spawnHttpServer(
+    port: number,
+    options: { args?: string[]; env?: Record<string, string> } = {},
+  ): import("child_process").ChildProcess {
+    const runner = qmdRunnerArgs([...(options.args ?? []), "mcp", "--http", "--port", String(port)]);
+    const proc = spawn(runner.command, runner.args, {
       cwd: fixturesDir,
       env: {
         ...process.env,
         INDEX_PATH: daemonDbPath,
         QMD_CONFIG_DIR: daemonConfigDir,
+        PWD: fixturesDir,
+        ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1481,10 +2153,74 @@ describe("mcp http daemon", () => {
       const body = await res.json();
       expect(body.status).toBe("ok");
     } finally {
+      const closed = new Promise(r => proc.once("close", r));
       proc.kill("SIGTERM");
-      await new Promise(r => proc.on("close", r));
+      await closed;
     }
   });
+
+  test("foreground HTTP server honors --index when selecting the store", async () => {
+    const customIndex = "mcp-alt-index";
+    const customCacheDir = join(daemonTestDir, `cache-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const customConfigDir = join(daemonTestDir, `config-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await mkdir(customCacheDir, { recursive: true });
+    await mkdir(customConfigDir, { recursive: true });
+
+    const addResult = await runQmd(
+      ["--index", customIndex, "collection", "add", fixturesDir, "--name", "mcp-fixtures"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const updateResult = await runQmd(
+      ["--index", customIndex, "update"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(updateResult.exitCode).toBe(0);
+
+    const port = randomPort();
+    const proc = spawnHttpServer(port, {
+      args: ["--index", customIndex],
+      env: {
+        INDEX_PATH: "",
+        XDG_CACHE_HOME: customCacheDir,
+        QMD_CONFIG_DIR: customConfigDir,
+      },
+    });
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://localhost:${port}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const files = body.results.map((r: { file: string }) => r.file);
+      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+    } finally {
+      const closed = new Promise(r => proc.once("close", r));
+      proc.kill("SIGTERM");
+      await closed;
+    }
+  }, 10000);
 
   // -------------------------------------------------------------------------
   // Daemon lifecycle
@@ -1599,5 +2335,74 @@ describe("mcp http daemon", () => {
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
+  });
+});
+
+// =============================================================================
+// MCP stdio stdout hygiene
+// =============================================================================
+
+describe("mcp stdio launcher", () => {
+  test("sets native llama/ggml quiet env before Node starts so stdout stays JSON-RPC only", async () => {
+    const tempPackage = await mkdtemp(join(tmpdir(), "qmd-bin-mcp-"));
+    try {
+      await mkdir(join(tempPackage, "bin"), { recursive: true });
+      await mkdir(join(tempPackage, "dist", "cli"), { recursive: true });
+      await writeFile(join(tempPackage, "dist", "cli", "qmd.js"), "// fixture\n");
+      await mkdir(join(tempPackage, "fake-bin"), { recursive: true });
+
+      const qmdBin = join(tempPackage, "bin", "qmd");
+      await copyFile(join(projectRoot, "bin", "qmd"), qmdBin);
+      await chmod(qmdBin, 0o755);
+
+      // Force the wrapper down the Node branch, then put our fake `node` first
+      // in PATH. The fake node behaves like the native llama/ggml layer: it
+      // writes a non-JSON stdout line unless qmd pre-seeded the documented
+      // quiet env vars before launching JS.
+      await writeFile(join(tempPackage, "package-lock.json"), "{}\n");
+      const fakeNode = join(tempPackage, "fake-bin", "node");
+      await writeFile(fakeNode, `#!/bin/sh
+if [ "$(basename "$1")" = "qmd" ]; then
+  exec "${process.execPath}" "$@"
+else
+  if [ "\${GGML_BACKEND_SILENT:-}" != "1" ]; then
+    printf 'llama.cpp native log on stdout\\n'
+  fi
+  printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n'
+fi
+`);
+      await chmod(fakeNode, 0o755);
+
+      const proc = spawn(qmdBin, ["mcp"], {
+        cwd: tempPackage,
+        env: {
+          ...process.env,
+          PATH: `${join(tempPackage, "fake-bin")}:${process.env.PATH}`,
+          LLAMA_LOG_LEVEL: "",
+          GGML_LOG_LEVEL: "",
+          GGML_BACKEND_SILENT: "",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+      const exitCode = await new Promise<number>((resolve, reject) => {
+        proc.once("error", reject);
+        proc.on("close", (code) => resolve(code ?? 1));
+      });
+
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe("");
+      const lines = stdout.trim().split("\n").filter(Boolean);
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) {
+        expect(() => JSON.parse(line)).not.toThrow();
+      }
+    } finally {
+      await rm(tempPackage, { recursive: true, force: true });
+    }
   });
 });

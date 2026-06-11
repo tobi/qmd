@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { detectLanguage, getASTBreakPoints, extractSymbols } from "../src/ast.js";
+import { detectLanguage, getASTBreakPoints, extractSymbols, formatGrammarLoadError } from "../src/ast.js";
 import type { SupportedLanguage } from "../src/ast.js";
 
 // =============================================================================
@@ -314,6 +314,16 @@ describe("getASTBreakPoints - error handling", () => {
     const points = await getASTBreakPoints("function { broken syntax %%%", "broken.ts");
     // Should either return some partial break points or empty array — not throw
     expect(Array.isArray(points)).toBe(true);
+  });
+
+  test("explains missing grammar packages with a repair command", () => {
+    const msg = formatGrammarLoadError(
+      "typescript",
+      new Error("Cannot find module 'tree-sitter-typescript/tree-sitter-typescript.wasm'"),
+    );
+    expect(msg).toContain("tree-sitter-typescript");
+    expect(msg).toContain("bun add tree-sitter-typescript@0.23.2");
+    expect(msg).toContain("falling back to regex");
   });
 });
 

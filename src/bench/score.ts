@@ -11,7 +11,7 @@
  */
 export function normalizePath(p: string): string {
   if (p.startsWith("qmd://")) {
-    // qmd://collection/path/to/file → path/to/file
+    // qmd://collection/docs/readme.md → docs/readme.md
     const withoutScheme = p.slice("qmd://".length);
     const slashIdx = withoutScheme.indexOf("/");
     p = slashIdx >= 0 ? withoutScheme.slice(slashIdx + 1) : withoutScheme;
@@ -31,6 +31,30 @@ export function pathsMatch(result: string, expected: string): boolean {
   return false;
 }
 
+type ScoreMetrics = {
+  precision_at_k: number;
+  recall: number;
+  recall_at_1: number;
+  recall_at_3: number;
+  recall_at_5: number;
+  mrr: number;
+  f1: number;
+  hits_at_k: number;
+  matched_files: string[];
+  unmatched_expected_files: string[];
+};
+
+function hitsWithin(resultFiles: string[], expectedFiles: string[], k: number): number {
+  const topKResults = resultFiles.slice(0, k);
+  let hits = 0;
+  for (const expected of expectedFiles) {
+    if (topKResults.some(r => pathsMatch(r, expected))) {
+      hits++;
+    }
+  }
+  return hits;
+}
+
 /**
  * Score a set of search results against expected files.
  */
@@ -38,21 +62,18 @@ export function scoreResults(
   resultFiles: string[],
   expectedFiles: string[],
   topK: number,
-): { precision_at_k: number; recall: number; mrr: number; f1: number; hits_at_k: number } {
+): ScoreMetrics {
   // Count hits in top-k
-  const topKResults = resultFiles.slice(0, topK);
-  let hitsAtK = 0;
-  for (const expected of expectedFiles) {
-    if (topKResults.some(r => pathsMatch(r, expected))) {
-      hitsAtK++;
-    }
-  }
+  const hitsAtK = hitsWithin(resultFiles, expectedFiles, topK);
 
-  // Count total hits anywhere
-  let totalHits = 0;
+  const matchedFiles: string[] = [];
+  const unmatchedExpectedFiles: string[] = [];
+
   for (const expected of expectedFiles) {
     if (resultFiles.some(r => pathsMatch(r, expected))) {
-      totalHits++;
+      matchedFiles.push(expected);
+    } else {
+      unmatchedExpectedFiles.push(expected);
     }
   }
 
@@ -67,10 +88,24 @@ export function scoreResults(
 
   const denominator = Math.min(topK, expectedFiles.length);
   const precision_at_k = denominator > 0 ? hitsAtK / denominator : 0;
-  const recall = expectedFiles.length > 0 ? totalHits / expectedFiles.length : 0;
+  const recall = expectedFiles.length > 0 ? matchedFiles.length / expectedFiles.length : 0;
+  const recall_at_1 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 1) / expectedFiles.length : 0;
+  const recall_at_3 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 3) / expectedFiles.length : 0;
+  const recall_at_5 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 5) / expectedFiles.length : 0;
   const f1 = precision_at_k + recall > 0
     ? 2 * (precision_at_k * recall) / (precision_at_k + recall)
     : 0;
 
-  return { precision_at_k, recall, mrr, f1, hits_at_k: hitsAtK };
+  return {
+    precision_at_k,
+    recall,
+    recall_at_1,
+    recall_at_3,
+    recall_at_5,
+    mrr,
+    f1,
+    hits_at_k: hitsAtK,
+    matched_files: matchedFiles,
+    unmatched_expected_files: unmatchedExpectedFiles,
+  };
 }

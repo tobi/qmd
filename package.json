@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "2.1.0",
+  "version": "2.5.3",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "main": "dist/index.js",
@@ -17,13 +17,23 @@
   "files": [
     "bin/",
     "dist/",
+    "skills/",
+    "scripts/build.mjs",
+    "scripts/check-package-grammars.mjs",
+    "scripts/package-smoke.mjs",
+    "scripts/test-all.mjs",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
-    "test": "vitest run --reporter=verbose test/",
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test-all.mjs",
+    "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
+    "test:node": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000",
+    "test:bun": "bun test --timeout 60000 --preload ./src/test-preload.ts",
+    "test:unit": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/ && CI=true bun test --timeout 60000 --preload ./src/test-preload.ts test/",
+    "test:package": "node scripts/package-smoke.mjs",
     "qmd": "tsx src/cli/qmd.ts",
     "index": "tsx src/cli/qmd.ts index",
     "vector": "tsx src/cli/qmd.ts vector",
@@ -31,7 +41,8 @@
     "vsearch": "tsx src/cli/qmd.ts vsearch",
     "rerank": "tsx src/cli/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "smoke:package-grammars": "node scripts/check-package-grammars.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -46,13 +57,17 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
-    "better-sqlite3": "12.8.0",
+    "better-sqlite3": "12.10.0",
     "fast-glob": "3.3.3",
     "node-llama-cpp": "3.18.1",
     "picomatch": "4.0.4",
     "sqlite-vec": "0.1.9",
-    "web-tree-sitter": "0.26.7",
-    "yaml": "2.8.3",
+    "tree-sitter-go": "0.25.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-rust": "0.24.0",
+    "tree-sitter-typescript": "0.23.2",
+    "web-tree-sitter": "0.26.8",
+    "yaml": "2.9.0",
     "zod": "4.2.1"
   },
   "optionalDependencies": {
@@ -60,11 +75,7 @@
     "sqlite-vec-darwin-x64": "0.1.9",
     "sqlite-vec-linux-arm64": "0.1.9",
     "sqlite-vec-linux-x64": "0.1.9",
-    "sqlite-vec-windows-x64": "0.1.9",
-    "tree-sitter-go": "0.23.4",
-    "tree-sitter-python": "0.23.4",
-    "tree-sitter-rust": "0.24.0",
-    "tree-sitter-typescript": "0.23.2"
+    "sqlite-vec-windows-x64": "0.1.9"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",

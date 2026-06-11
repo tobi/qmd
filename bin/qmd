@@ -31,3 +31,165 @@ elif [ -x "$HOME/.bun/bin/bun" ]; then
 else
   exec node "$DIR/dist/cli/qmd.js" "$@"
 fi
+#!/usr/bin/env node
+// 2>/dev/null; if command -v node >/dev/null 2>&1; then exec node "$0" "$@"; else exec bun "$0" "$@"; fi
+// Cross-platform launcher for qmd.
+//
+// Previously this was a POSIX shell script with `#!/bin/sh`, which meant npm
+// on Windows generated shims that tried to route through `/bin/sh` — a path
+// that doesn't exist on Windows, so `qmd` failed immediately after a global
+// install. Rewriting the launcher in Node.js lets npm generate native
+// cmd/ps1/sh shims that invoke `node` directly on every platform.
+
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Resolve symlinks so global installs (npm link / npm install -g) can find
+// the actual package directory instead of the global bin directory.
+const self = realpathSync(fileURLToPath(import.meta.url));
+const pkgDir = resolve(dirname(self), "..");
+const jsEntry = resolve(pkgDir, "dist/cli/qmd.js");
+const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
+
+// MCP stdio reserves stdout exclusively for JSON-RPC frames. node-llama-cpp
+// / llama.cpp / ggml can write native logs directly to stdout before JS-level
+// log handlers are attached, so seed the native quiet env before Node/Bun imports
+// the CLI and its LLM modules. Preserve explicit user values when provided.
+if (process.argv[2] === "mcp") {
+  process.env.LLAMA_LOG_LEVEL = process.env.LLAMA_LOG_LEVEL || "error";
+  process.env.GGML_LOG_LEVEL = process.env.GGML_LOG_LEVEL || "error";
+  process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
+}
+
+// libggml-metal on macOS uses "residency sets" to keep allocated model memory
+// resident across inference requests (180-second keep_alive timer). The
+// process-static device destructor that runs during libc exit() asserts the
+// residency set is empty (ggml-org/llama.cpp#22593); the keep_alive hasn't
+// expired by exit, so the assertion fails and ggml_abort dumps a multi-kB
+// stack trace to stderr even when the user-visible results were already
+// emitted correctly. No JS-side dispose can prevent it because the static
+// destructor runs in __cxa_finalize_ranges, after every JS-reachable cleanup.
+//
+// For QMD's short-lived CLI workflow, residency sets provide no observable
+// performance benefit (subsequent requests don't reuse the warm mapping —
+// measured: identical wall time with and without on M3 Pro), so disable them
+// by default on darwin. The env var must be set BEFORE the native llama.cpp
+// binding loads, which is why it lives here in the launcher rather than in
+// the JS entry point. Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you
+// run long-lived qmd processes (the MCP daemon may benefit on hot reload)
+// or are triaging an upstream Metal teardown fix.
+if (process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1") {
+  process.env.GGML_METAL_NO_RESIDENCY = process.env.GGML_METAL_NO_RESIDENCY || "1";
+}
+
+function hasBun() {
+  try {
+    const res = spawnSync("bun", ["--version"], { stdio: "ignore", shell: process.platform === "win32" });
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// In published packages, bin/qmd must run dist/. In a git checkout, however,
+// dist/ is often ignored and can be stale after git reset or branch switches.
+// Prefer source mode only for checkouts so ./bin/qmd reflects the checked-out
+// source without changing packaged/runtime behavior.
+//
+// Critical: source-mode detection must NOT trigger when a package manager
+// installed us. `pnpm install -g .` (and `npm install -g .`) copy the entire
+// working tree — including .git/, bun.lock, package-lock.json, src/, and even
+// node_modules/ — into <prefix>/node_modules/@tobilu/qmd/, so .git and a
+// lockfile being present is not a reliable "this is a working tree" signal.
+// What IS reliable: a package-manager install always lands the package
+// directory inside a `node_modules/` segment; a bare working-tree checkout
+// (with `bun link` or a direct path invocation) does not. Gate source mode
+// on that. Allow QMD_SOURCE_MODE=1 / =0 as an explicit override for the
+// rare case where the heuristic disagrees with the user.
+const sourceOverride = process.env.QMD_SOURCE_MODE;
+const looksInstalled = pkgDir.split("/").includes("node_modules");
+const sourceAllowed = sourceOverride === "1"
+  || (sourceOverride !== "0" && !looksInstalled);
+
+let useSourceMode = false;
+let sourceRunner = null;
+let sourceArgs = [];
+
+if (sourceAllowed && existsSync(resolve(pkgDir, ".git")) && existsSync(tsEntry)) {
+  // Lockfile-driven runner selection — mirror the dist-mode logic below so
+  // source mode picks the same runtime the user's deps were installed for.
+  // package-lock.json wins over bun.lock when both are present: pnpm/npm
+  // installs ship the Node-ABI native modules (better-sqlite3, sqlite-vec),
+  // and running Bun against them produces ABI mismatches. This also fixes
+  // pnpm-global installs, which copy the whole working tree — including .git
+  // and bun.lock — into the install dir and used to route through Bun even
+  // when the user installed via npm/pnpm.
+  const hasNpmLock = existsSync(resolve(pkgDir, "package-lock.json"));
+  const hasBunLock = existsSync(resolve(pkgDir, "bun.lock")) || existsSync(resolve(pkgDir, "bun.lockb"));
+  const tsxEntry = resolve(pkgDir, "node_modules/tsx/dist/cli.mjs");
+  const tsxAvailable = existsSync(tsxEntry);
+
+  if (hasNpmLock && tsxAvailable) {
+    useSourceMode = true;
+    sourceRunner = "node";
+    sourceArgs = [tsxEntry, tsEntry, ...process.argv.slice(2)];
+  } else if (hasBunLock && hasBun()) {
+    useSourceMode = true;
+    sourceRunner = "bun";
+    sourceArgs = [tsEntry, ...process.argv.slice(2)];
+  } else if (tsxAvailable) {
+    useSourceMode = true;
+    sourceRunner = "node";
+    sourceArgs = [tsxEntry, tsEntry, ...process.argv.slice(2)];
+  }
+}
+
+if (!useSourceMode && !existsSync(jsEntry)) {
+  console.error(`qmd is not built: missing ${jsEntry}`);
+  console.error("Run: bun install && bun run build");
+  console.error("Or:  npm install && npm run build");
+  console.error("After building, run: qmd doctor");
+  process.exit(1);
+}
+
+// Detect the package manager that installed dependencies by checking lockfiles.
+// $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
+// on the system, not that it was used to install this package (see #361).
+//
+// package-lock.json takes priority: if it exists, npm installed the native
+// modules for Node. The repo ships bun.lock, so without this check, source
+// builds that use npm would be incorrectly routed to bun, causing ABI
+// mismatches with better-sqlite3 / sqlite-vec (see #381).
+let runnerName = "node";
+if (existsSync(resolve(pkgDir, "package-lock.json"))) {
+  runnerName = "node";
+} else if (existsSync(resolve(pkgDir, "bun.lock")) || existsSync(resolve(pkgDir, "bun.lockb"))) {
+  runnerName = "bun";
+} else {
+  runnerName = "node";
+}
+
+const runner = useSourceMode ? sourceRunner : (runnerName === "node" ? "node" : "bun");
+const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
+const needsShell = (runner === "bun") && process.platform === "win32";
+
+const child = spawn(runner, args, {
+  stdio: "inherit",
+  shell: needsShell,
+});
+
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+  } else {
+    process.exit(code ?? 0);
+  }
+});
+
+child.on("error", (err) => {
+  const name = useSourceMode ? sourceRunner : runnerName;
+  console.error(`qmd: failed to launch ${name}: ${err.message}`);
+  process.exit(1);
+});

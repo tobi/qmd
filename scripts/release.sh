@@ -93,7 +93,7 @@ echo ""
 
 # --- Rename [Unreleased] -> [X.Y.Z] - date, add fresh [Unreleased] ---
 
-sed -i '' "s/^## \[Unreleased\].*/## [$NEW] - $DATE/" CHANGELOG.md
+perl -0pi -e 's/^## \[Unreleased\].*/## ['"$NEW"'] - '"$DATE"'/m' CHANGELOG.md
 
 # Insert a new empty [Unreleased] section after the header
 awk '

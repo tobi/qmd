@@ -32,8 +32,6 @@ import {
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 
-enableProductionMode();
-
 // =============================================================================
 // Types for structured content
 // =============================================================================
@@ -44,6 +42,7 @@ type SearchResultItem = {
   title: string;
   score: number;
   context: string | null;
+  line: number;   // Absolute line in source markdown
   snippet: string;
 };
 
@@ -108,7 +107,6 @@ function getPackageVersion(): string {
  */
 async function buildInstructions(store: QMDStore): Promise<string> {
   const status = await store.getStatus();
-  const contexts = await store.listContexts();
   const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
 
@@ -117,15 +115,13 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   if (globalCtx) lines.push(`Context: ${globalCtx}`);
 
   // --- What's searchable? ---
+  // Emit names only — the per-collection doc counts and descriptions can run to ~1.5 KB
+  // across a dozen collections, and the same info is available on demand via the `status` tool.
   if (status.collections.length > 0) {
     lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
-    for (const col of status.collections) {
-      // Find root context for this collection
-      const rootCtx = contexts.find(c => c.collection === col.name && (c.path === "" || c.path === "/"));
-      const desc = rootCtx ? ` — ${rootCtx.context}` : "";
-      lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
-    }
+    const names = status.collections.map(c => c.name).join(", ");
+    lines.push(`Collections (scope with \`collections\` parameter): ${names}`);
+    lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
   }
 
   // --- Capability gaps ---
@@ -155,7 +151,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   // --- Retrieval workflow ---
   lines.push("");
   lines.push("Retrieval:");
-  lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
+  lines.push("  - `get` — single document by path or docid (#abc123). Supports a line-range suffix: `file.md:100` (from line 100) or `file.md:100:40` (40 lines from line 100).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
 
   // --- Non-obvious things that prevent mistakes ---
@@ -243,6 +239,8 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
     {
       title: "Query",
       description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
+
+Each result includes a \`line\` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call \`get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)\`.
 
 ## Query Types
 
@@ -333,6 +331,7 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
         rerank,
         intent,
       });
@@ -343,13 +342,14 @@ Intent-aware lex (C++ performance, not sports):
         || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
+        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
           title: r.title,
           score: Math.round(r.score * 100) / 100,
           context: r.context,
+          line,
           snippet: addLineNumbers(snippet, line),
         };
       });
@@ -372,21 +372,31 @@ Intent-aware lex (C++ performance, not sports):
       description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        file: z.string().describe("File path or docid from search results (e.g., 'pages/meeting.md', '#abc123', or 'pages/meeting.md:100' to start at line 100)"),
+        file: z.string().describe("File path or docid from search results. Supports a line-range suffix: 'pages/meeting.md:100' starts at line 100; 'pages/meeting.md:100:40' (or '#abc123:100:40') reads 40 lines from line 100."),
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
         maxLines: z.number().optional().describe("Maximum number of lines to return"),
-        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
+        lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },
     async ({ file, fromLine, maxLines, lineNumbers }) => {
-      // Support :line suffix in `file` (e.g. "foo.md:120") when fromLine isn't provided
+      // Support :line and :from:count suffixes in `file` (e.g. "foo.md:120" or
+      // "foo.md:120:40"). Explicit fromLine/maxLines args take precedence.
       let parsedFromLine = fromLine;
+      let parsedMaxLines = maxLines;
       let lookup = file;
-      const colonMatch = lookup.match(/:(\d+)$/);
-      if (colonMatch && colonMatch[1] && parsedFromLine === undefined) {
-        parsedFromLine = parseInt(colonMatch[1], 10);
-        lookup = lookup.slice(0, -colonMatch[0].length);
+      const rangeMatch = lookup.match(/:(\d+):(\d+)$/);
+      if (rangeMatch) {
+        if (parsedFromLine === undefined) parsedFromLine = parseInt(rangeMatch[1]!, 10);
+        if (parsedMaxLines === undefined) parsedMaxLines = parseInt(rangeMatch[2]!, 10);
+        lookup = lookup.slice(0, -rangeMatch[0].length);
+      } else {
+        const colonMatch = lookup.match(/:(\d+)$/);
+        if (colonMatch && colonMatch[1] && parsedFromLine === undefined) {
+          parsedFromLine = parseInt(colonMatch[1], 10);
+          lookup = lookup.slice(0, -colonMatch[0].length);
+        }
       }
+      if (parsedFromLine !== undefined) parsedFromLine = Math.max(1, parsedFromLine);
 
       const result = await store.get(lookup, { includeBody: false });
 
@@ -401,7 +411,7 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      const body = await store.getDocumentBody(result.filepath, { fromLine: parsedFromLine, maxLines }) ?? "";
+      const body = await store.getDocumentBody(result.filepath, { fromLine: parsedFromLine, maxLines: parsedMaxLines }) ?? "";
       let text = body;
       if (lineNumbers) {
         const startLine = parsedFromLine || 1;
@@ -440,7 +450,7 @@ Intent-aware lex (C++ performance, not sports):
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
         maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
-        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
+        lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },
     async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
@@ -540,10 +550,20 @@ Intent-aware lex (C++ performance, not sports):
 // Transport: stdio (default)
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
+export type McpStartupOptions = {
+  dbPath?: string;
+};
+
+export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
+  // Opt into production mode when the MCP server is actually started, not
+  // when this module is merely imported for its exports. Importing the module
+  // at the top level flipped the global production flag and broke test
+  // isolation for downstream suites that expect the default (development)
+  // database path behaviour.
+  enableProductionMode();
   const configPath = getConfigPath();
   const store = await createStore({
-    dbPath: getDefaultDbPath(),
+    dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
   const server = await createMcpServer(store);
@@ -565,10 +585,17 @@ export type HttpServerHandle = {
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(
+  port: number,
+  options: ({ quiet?: boolean } & McpStartupOptions) = {},
+): Promise<HttpServerHandle> {
+  // See startMcpServer() for the rationale — flip production mode here so the
+  // HTTP transport resolves the real database path, without leaking state into
+  // callers that only import this module for its exports (e.g. tests).
+  enableProductionMode();
   const configPath = getConfigPath();
   const store = await createStore({
-    dbPath: getDefaultDbPath(),
+    dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
 
@@ -608,9 +635,21 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
   }
 
+  type JsonRpcLikeBody = {
+    method?: unknown;
+    params?: {
+      name?: unknown;
+      arguments?: Record<string, unknown>;
+    };
+  };
+  type RestSearchInput = {
+    type?: unknown;
+    query?: unknown;
+  };
+
   /** Extract a human-readable label from a JSON-RPC body */
-  function describeRequest(body: any): string {
-    const method = body?.method ?? "unknown";
+  function describeRequest(body: JsonRpcLikeBody): string {
+    const method = typeof body.method === "string" ? body.method : "unknown";
     if (method === "tools/call") {
       const tool = body.params?.name ?? "?";
       const args = body.params?.arguments;
@@ -654,7 +693,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody);
+        const params = JSON.parse(rawBody) as Record<string, unknown>;
 
         // Validate required fields
         if (!params.searches || !Array.isArray(params.searches)) {
@@ -664,35 +703,39 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         }
 
         // Map to internal format
-        const queries: ExpandedQuery[] = params.searches.map((s: any) => ({
+        const searches = params.searches as RestSearchInput[];
+        const queries: ExpandedQuery[] = searches.map((s) => ({
           type: s.type as 'lex' | 'vec' | 'hyde',
           query: String(s.query || ""),
         }));
 
         // Use default collections if none specified
-        const effectiveCollections = params.collections ?? defaultCollectionNames;
+        const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
         const results = await store.search({
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit: params.limit ?? 10,
-          minScore: params.minScore ?? 0,
-          intent: params.intent,
+          limit: typeof params.limit === "number" ? params.limit : 10,
+          minScore: typeof params.minScore === "number" ? params.minScore : 0,
+          candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
+          intent: typeof params.intent === "string" ? params.intent : undefined,
+          rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
         });
 
         // Use first lex or vec query for snippet extraction
-        const primaryQuery = params.searches.find((s: any) => s.type === 'lex')?.query
-          || params.searches.find((s: any) => s.type === 'vec')?.query
-          || params.searches[0]?.query || "";
+        const primaryQuery = searches.find((s) => s.type === 'lex')?.query
+          || searches.find((s) => s.type === 'vec')?.query
+          || searches[0]?.query || "";
 
         const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+          const { line, snippet } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
           return {
             docid: `#${r.docid}`,
-            file: r.displayPath,
+            file: `qmd://${encodeQmdPath(r.displayPath)}`,
             title: r.title,
             score: Math.round(r.score * 100) / 100,
             context: r.context,
+            line,
             snippet: addLineNumbers(snippet, line),
           };
         });
