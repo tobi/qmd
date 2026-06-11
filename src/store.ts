@@ -27,6 +27,8 @@ import {
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
   localModelsEnabled,
   type RerankDocument,
   type ILLMSession,
@@ -44,8 +46,8 @@ import type {
 
 const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
-export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
+export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
+export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;

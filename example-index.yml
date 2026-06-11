@@ -13,7 +13,7 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 # Set NVIDIA_API_KEY, QMD_EMBED_API_KEY, or OPENAI_API_KEY in the environment for API auth.
 # Local GGUF models are disabled unless QMD_ENABLE_LOCAL_MODELS=1 is set.
 models:
-  embed: nvidia/llama-3.2-nv-embedqa-1b-v2
+  embed: nvidia/llama-nemotron-embed-1b-v2
   # Optional local embedding model instead of the external API:
   # embed: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
   # Optional local rerank/generation models:

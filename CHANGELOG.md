@@ -2,10 +2,19 @@
 
 ## [Unreleased]
 
+### Changes
+
+- CLI: add `qmd sync` for SSH/rsync-based QMD source-file and YAML-config
+  synchronization between a local machine and remote QMD host. The sync path
+  uses resumable rsync transfers, conflict-copy preservation, and keeps SQLite
+  indexes out of the transport so each side can re-index independently.
+- CLI: add `qmd sync --update` to refresh local and remote indexes after a
+  successful sync, with optional `--embed` for explicit embedding refreshes.
+
 ### Fixes
 
 - Embedding: default to an external OpenAI-compatible embeddings API
-  (`nvidia/llama-3.2-nv-embedqa-1b-v2`) and require
+  (`nvidia/llama-nemotron-embed-1b-v2`) and require
   `QMD_ENABLE_LOCAL_MODELS=1` for local node-llama-cpp embedding, reranking,
   and query expansion models.
 - Embedding: use approximate token counts in external embedding mode so

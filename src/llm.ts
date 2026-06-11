@@ -193,7 +193,7 @@ export type RerankDocument = {
 
 // Embeddings use NVIDIA's OpenAI-compatible API by default.
 // Set QMD_ENABLE_LOCAL_MODELS=1 before using any local node-llama-cpp GGUF models.
-const DEFAULT_EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v2";
+const DEFAULT_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";

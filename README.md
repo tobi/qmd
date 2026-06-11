@@ -489,7 +489,7 @@ by default. Configure it with:
 ```sh
 export NVIDIA_API_KEY="..."
 export QMD_EMBED_API_BASE_URL="https://integrate.api.nvidia.com/v1"
-export QMD_EMBED_MODEL="nvidia/llama-3.2-nv-embedqa-1b-v2"
+export QMD_EMBED_MODEL="nvidia/llama-nemotron-embed-1b-v2"
 ```
 
 QMD reads `NVIDIA_API_KEY` when `QMD_EMBED_API_KEY` is not set and sends
@@ -936,7 +936,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 Models are configured in `src/llm.ts`:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v2";
+const DEFAULT_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
@@ -945,7 +945,7 @@ YAML configuration can override those defaults; see `example-index.yml` for a co
 
 ```yaml
 models:
-  embed: nvidia/llama-3.2-nv-embedqa-1b-v2
+  embed: nvidia/llama-nemotron-embed-1b-v2
   # Optional local models, used only when QMD_ENABLE_LOCAL_MODELS=1:
   # rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   # generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
