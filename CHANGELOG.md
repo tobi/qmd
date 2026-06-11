@@ -2,11 +2,23 @@
 
 ## [Unreleased]
 
+### Changes
+
+- CLI: add `qmd sync` for SSH/rsync-based QMD source-file and YAML-config
+  synchronization between a local machine and remote QMD host. The sync path
+  uses resumable rsync transfers, conflict-copy preservation, and keeps SQLite
+  indexes out of the transport so each side can re-index independently.
+- CLI: add `qmd sync --update` to refresh local and remote indexes after a
+  successful sync, with optional `--embed` for explicit embedding refreshes.
+
 ### Fixes
 
 - Embedding: default to an external OpenAI-compatible embeddings API
-  (`text-embedding-3-small`) and require explicit `hf:`/`.gguf`
-  configuration to use local node-llama-cpp embedding models.
+  (`nvidia/llama-nemotron-embed-1b-v2`) and require
+  `QMD_ENABLE_LOCAL_MODELS=1` for local node-llama-cpp embedding, reranking,
+  and query expansion models.
+- Embedding: use approximate token counts in external embedding mode so
+  chunking does not load a local GGUF tokenizer.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive

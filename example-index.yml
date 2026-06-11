@@ -9,14 +9,16 @@
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
 # Model overrides.
-# Embeddings use an external OpenAI-compatible /embeddings API by default.
-# Set QMD_EMBED_API_KEY or OPENAI_API_KEY in the environment for API auth.
+# Embeddings use NVIDIA's OpenAI-compatible /embeddings API by default.
+# Set NVIDIA_API_KEY, QMD_EMBED_API_KEY, or OPENAI_API_KEY in the environment for API auth.
+# Local GGUF models are disabled unless QMD_ENABLE_LOCAL_MODELS=1 is set.
 models:
-  embed: text-embedding-3-small
+  embed: nvidia/llama-nemotron-embed-1b-v2
   # Optional local embedding model instead of the external API:
   # embed: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
-  rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
-  generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  # Optional local rerank/generation models:
+  # rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  # generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
 
 # Collection definitions
 collections:

@@ -2820,6 +2820,33 @@ describe("Embedding batching", () => {
 });
 
 describe("Token chunking guardrails", () => {
+  test("chunkDocumentByTokens uses approximate counts for external embeddings without tokenizer load", async () => {
+    const tokenize = vi.fn(async () => {
+      throw new Error("should not tokenize through local GGUF");
+    });
+    const detokenize = vi.fn(async () => {
+      throw new Error("should not detokenize through local GGUF");
+    });
+
+    setDefaultLlamaCpp({
+      usesLocalEmbedding: false,
+      tokenize,
+      detokenize,
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("x".repeat(1200), 100, 15, 20);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.tokens <= 100)).toBe(true);
+      expect(chunks[0]!.text.length).toBeLessThanOrEqual(300);
+      expect(tokenize).not.toHaveBeenCalled();
+      expect(detokenize).not.toHaveBeenCalled();
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
   test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
     setDefaultLlamaCpp({
       async tokenize(text: string) {
