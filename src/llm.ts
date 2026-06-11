@@ -1232,15 +1232,7 @@ export class LlamaCpp implements LLM {
           }));
         } catch {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
+            throw new Error("Failed to create any rerank context");
           }
           break;
         }
@@ -1770,21 +1762,58 @@ export class LlamaCpp implements LLM {
       return await fn();
     } catch (error) {
       if (!isInsufficientVramError(error)) throw error;
-      const drains: Promise<unknown>[] = [];
-      const disposes: (() => Promise<void>)[] = [];
-      if (needs !== "generate") {
-        drains.push(this.generateChain);
-        disposes.push(() => this.disposeGenerateModel());
+      await this.reclaimNonNeededHeavies(needs);
+      try {
+        return await fn();
+      } catch (retryError) {
+        if (!isInsufficientVramError(retryError)) throw retryError;
+        // Second pass: the embed model is the only heavy weight we held back
+        // on pass one. Drop it now (~568 MB) and try once more. Skip when the
+        // caller is embed itself — it cannot make progress without the model.
+        if (needs === "embed") throw retryError;
+        await this.bestEffort(() => this.disposeEmbedModel(), "disposeEmbedModel");
+        return await fn();
       }
-      if (needs !== "rerank") {
-        drains.push(this.rerankChain);
-        disposes.push(() => this.disposeRerankModel());
-      }
-      await Promise.allSettled(drains);
-      for (const dispose of disposes) {
-        await dispose();
-      }
-      return await fn();
+    }
+  }
+
+  /**
+   * First-pass reclaim: drop everything that isn't what the caller needs.
+   * Generate + rerank models go entirely; embed contexts are released but
+   * the embed model is kept (small, and reload cost dominates the win on
+   * cards with plenty of headroom). The embed-model evict is the second-
+   * pass escalation in `withReclaim`.
+   *
+   * Each dispose runs best-effort: a failure is logged but does not skip
+   * the remaining disposes or abort the retry. A retry against a partially
+   * reclaimed state is still more likely to succeed than no retry at all,
+   * and the original VRAM error is more informative than a dispose error.
+   */
+  private async reclaimNonNeededHeavies(needs: "embed" | "generate" | "rerank"): Promise<void> {
+    const drains: Promise<unknown>[] = [];
+    const disposes: { label: string; fn: () => Promise<void> }[] = [];
+    if (needs !== "generate") {
+      drains.push(this.generateChain);
+      disposes.push({ label: "disposeGenerateModel", fn: () => this.disposeGenerateModel() });
+    }
+    if (needs !== "rerank") {
+      drains.push(this.rerankChain);
+      disposes.push({ label: "disposeRerankModel", fn: () => this.disposeRerankModel() });
+    }
+    if (needs !== "embed") {
+      disposes.push({ label: "disposeEmbedContexts", fn: () => this.disposeEmbedContexts() });
+    }
+    await Promise.allSettled(drains);
+    for (const { label, fn } of disposes) {
+      await this.bestEffort(fn, label);
+    }
+  }
+
+  private async bestEffort(fn: () => Promise<void>, label: string): Promise<void> {
+    try {
+      await fn();
+    } catch (error) {
+      console.warn(`LlamaCpp reclaim: ${label} failed, continuing:`, error);
     }
   }
 
@@ -1798,6 +1827,44 @@ export class LlamaCpp implements LLM {
     const model = this.generateModel;
     this.generateModel = null;
     this.generateModelLoadPromise = null;
+    if (model) {
+      await model.dispose();
+    }
+  }
+
+  /**
+   * Dispose embedding contexts (~143 MB each) but keep the embed model
+   * resident. Used by withReclaim on non-embed paths to free a few hundred MB
+   * of context VRAM without paying the embed model's reload cost. The next
+   * embed call lazily recreates the contexts.
+   *
+   * Embed has no serialization chain, so a concurrent in-flight embed could
+   * be mid-call against a context we dispose here. That collision implies
+   * VRAM is already exhausted (which is why withReclaim fired); the embed
+   * caller's null-return contract absorbs the failure on retry.
+   */
+  private async disposeEmbedContexts(): Promise<void> {
+    if (this.disposed) return;
+    const contexts = this.embedContexts;
+    this.embedContexts = [];
+    this.embedContextsCreatePromise = null;
+    for (const ctx of contexts) {
+      await ctx.dispose();
+    }
+  }
+
+  /**
+   * Drop the embed model and any live contexts that depend on it. Used as
+   * `withReclaim`'s second-pass escalation when first-pass eviction (which
+   * keeps the embed model resident) didn't free enough VRAM. Next embed call
+   * pays a one-time reload cost (~200 ms from a hot disk cache).
+   */
+  private async disposeEmbedModel(): Promise<void> {
+    if (this.disposed) return;
+    await this.disposeEmbedContexts();
+    const model = this.embedModel;
+    this.embedModel = null;
+    this.embedModelLoadPromise = null;
     if (model) {
       await model.dispose();
     }

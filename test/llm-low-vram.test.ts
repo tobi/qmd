@@ -377,7 +377,7 @@ describe("LlamaCpp lowVram mode", () => {
     expect(firstDispose).toBeGreaterThan(rerankEnd);
   });
 
-  test("expandQuery: catch-and-retry on insufficient VRAM disposes rerank (not generate) and retries once", async () => {
+  test("expandQuery: catch-and-retry on insufficient VRAM disposes rerank + embed contexts and retries once", async () => {
     const events: string[] = [];
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
@@ -396,21 +396,25 @@ describe("LlamaCpp lowVram mode", () => {
     (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
 
     const result = await llm.expandQuery("test");
     expect(result).toEqual([{ type: "lex", text: "ok" }]);
     expect(attempts).toBe(2);
-    // Reclaim disposes rerank (not generate — we need generate).
+    // Reclaim disposes rerank + embed contexts (not generate — we need generate).
     // Then the chain's own finally fires after the call returns, disposing generate.
     expect(events).toEqual([
       "expand:attempt-1",
       "dispose:rerank",
+      "dispose:embed-contexts",
       "expand:attempt-2",
       "dispose:generate",
     ]);
   });
 
-  test("rerank: catch-and-retry on insufficient VRAM disposes generate (not rerank) and retries once", async () => {
+  test("rerank: catch-and-retry on insufficient VRAM disposes generate + embed contexts and retries once", async () => {
     const events: string[] = [];
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
@@ -429,18 +433,121 @@ describe("LlamaCpp lowVram mode", () => {
     (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
 
     const result = await llm.rerank("q", [{ file: "a.md", text: "x" }]);
     expect(result.results.map(r => r.file)).toEqual(["a.md"]);
     expect(attempts).toBe(2);
-    // Reclaim disposes generate (not rerank — we need rerank).
+    // Reclaim disposes generate + embed contexts (not rerank — we need rerank).
     // Then the chain's own finally fires after the call returns, disposing rerank.
     expect(events).toEqual([
       "rerank:attempt-1",
       "dispose:generate",
+      "dispose:embed-contexts",
       "rerank:attempt-2",
       "dispose:rerank",
     ]);
+  });
+
+  test("embed reclaim never disposes embed contexts or model (it needs them)", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      attempts++;
+      events.push(`embed:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("Failed to create any embedding context");
+      }
+      return { embedding: [1], model: "fake-embed" };
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+      events.push("dispose:embed-model");
+    };
+
+    const result = await llm.embed("hello");
+    expect(result).toEqual({ embedding: [1], model: "fake-embed" });
+    expect(attempts).toBe(2);
+    expect(events).not.toContain("dispose:embed-contexts");
+    expect(events).not.toContain("dispose:embed-model");
+    expect(events).toEqual([
+      "embed:attempt-1",
+      "dispose:generate",
+      "dispose:rerank",
+      "embed:attempt-2",
+    ]);
+  });
+
+  test("rerank reclaim escalates to disposing the embed model when first-pass retry still hits VRAM", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      if (attempts < 3) {
+        throw new Error("Failed to create any rerank context");
+      }
+      return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+      events.push("dispose:embed-model");
+    };
+
+    const result = await llm.rerank("q", [{ file: "a.md", text: "x" }]);
+    expect(result.results.map((r) => r.file)).toEqual(["a.md"]);
+    expect(attempts).toBe(3);
+    expect(events).toEqual([
+      "rerank:attempt-1",
+      "dispose:generate",
+      "dispose:embed-contexts",
+      "rerank:attempt-2",
+      "dispose:embed-model",
+      "rerank:attempt-3",
+      "dispose:rerank",
+    ]);
+  });
+
+  test("rerank reclaim gives up after second-pass retry still fails for VRAM", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      throw new Error("Failed to create any rerank context");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
+
+    await expect(llm.rerank("q", [{ file: "a.md", text: "x" }])).rejects.toThrow(/Failed to create any rerank context/);
+    // 1 initial + 2 reclaim retries = 3 attempts, no more.
+    expect(attempts).toBe(3);
   });
 
   test("expandQuery reclaim waits for in-flight rerank chain before disposing rerank", async () => {
@@ -493,5 +600,200 @@ describe("LlamaCpp lowVram mode", () => {
     const expandRetry = events.indexOf("expand:attempt-2");
     expect(rerankEnd).toBeGreaterThanOrEqual(0);
     expect(expandRetry).toBeGreaterThan(rerankEnd);
+  });
+
+  // ===========================================================================
+  // Red-team: second-pass escalation symmetry, caps, and failure modes
+  // ===========================================================================
+
+  test("expandQuery reclaim escalates to disposing the embed model when first-pass retry still hits VRAM", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      attempts++;
+      events.push(`expand:attempt-${attempts}`);
+      if (attempts < 3) {
+        throw new Error("A context size of 2048 is too large for the available VRAM");
+      }
+      return [{ type: "lex", text: "ok" }];
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+      events.push("dispose:embed-model");
+    };
+
+    const result = await llm.expandQuery("test");
+    expect(result).toEqual([{ type: "lex", text: "ok" }]);
+    expect(attempts).toBe(3);
+    expect(events).toEqual([
+      "expand:attempt-1",
+      "dispose:rerank",
+      "dispose:embed-contexts",
+      "expand:attempt-2",
+      "dispose:embed-model",
+      "expand:attempt-3",
+      "dispose:generate",
+    ]);
+  });
+
+  test("expandQuery reclaim gives up after second-pass retry still fails for VRAM", async () => {
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      attempts++;
+      throw new Error("A context size of 2048 is too large for the available VRAM");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
+
+    await expect(llm.expandQuery("test")).rejects.toThrow(/too large for the available VRAM/);
+    // Initial + first-pass retry + second-pass retry = 3 attempts, then surface.
+    expect(attempts).toBe(3);
+  });
+
+  test("embed reclaim surfaces a second VRAM error without ever escalating to embed-model dispose", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+      attempts++;
+      events.push(`embed:attempt-${attempts}`);
+      throw new Error("Failed to create any embedding context");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+      events.push("dispose:embed-model");
+    };
+
+    // embed swallows the error and returns null per its existing contract;
+    // it must not have escalated to disposing the embed model.
+    const result = await llm.embed("hello");
+    expect(result).toBeNull();
+    expect(attempts).toBe(2); // initial + one first-pass retry, no second-pass
+    expect(events).not.toContain("dispose:embed-contexts");
+    expect(events).not.toContain("dispose:embed-model");
+  });
+
+  test("rerank reclaim continues retry even when a dispose helper throws (best-effort)", async () => {
+    const events: string[] = [];
+    const warnings: unknown[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("Failed to create any rerank context");
+      }
+      return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
+    };
+    // First-pass dispose throws — reclaim must swallow and continue.
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate-throws");
+      throw new Error("simulated dispose failure");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args); };
+    try {
+      const result = await llm.rerank("q", [{ file: "a.md", text: "x" }]);
+      expect(result.results.map((r) => r.file)).toEqual(["a.md"]);
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    // The retry MUST still have run; the embed-contexts dispose MUST still have
+    // run despite the generate-dispose throwing.
+    expect(attempts).toBe(2);
+    expect(events).toContain("dispose:embed-contexts");
+    expect(events).toContain("rerank:attempt-2");
+    // The warning should mention the failing label so the operator can grep.
+    expect(warnings.some((w) => JSON.stringify(w).includes("disposeGenerateModel"))).toBe(true);
+  });
+
+  test("reclaim ignores non-VRAM errors thrown by the operation (no dispose, no retry)", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      // A *different* error — looks like a bug, not VRAM pressure. Reclaim
+      // must not chew through retries on errors that won't be fixed by
+      // dropping models.
+      throw new Error("Computing rankings is not supported for this model.");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+      events.push("dispose:generate");
+    };
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+      events.push("dispose:rerank");
+    };
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+      events.push("dispose:embed-contexts");
+    };
+
+    await expect(llm.rerank("q", [{ file: "a.md", text: "x" }])).rejects.toThrow(/not supported for this model/);
+    expect(attempts).toBe(1);
+    // The reclaim path must NOT have fired — those touch generate and embed.
+    // The rerank-chain's own finally fires regardless (intentional lowVram
+    // post-call cleanup), so dispose:rerank is expected exactly once.
+    expect(events).not.toContain("dispose:generate");
+    expect(events).not.toContain("dispose:embed-contexts");
+    expect(events.filter((e) => e === "dispose:rerank")).toHaveLength(1);
+  });
+
+  test("reclaim treats post-first-pass non-VRAM errors as terminal (no second pass)", async () => {
+    const events: string[] = [];
+    const llm = new LlamaCpp({ lowVram: true });
+    let attempts = 0;
+
+    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+      attempts++;
+      events.push(`rerank:attempt-${attempts}`);
+      if (attempts === 1) throw new Error("Failed to create any rerank context");
+      // Second attempt fails for an unrelated reason — must not escalate.
+      throw new Error("model file corrupted");
+    };
+    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+      events.push("dispose:embed-model");
+    };
+
+    await expect(llm.rerank("q", [{ file: "a.md", text: "x" }])).rejects.toThrow(/model file corrupted/);
+    expect(attempts).toBe(2);
+    expect(events).not.toContain("dispose:embed-model");
   });
 });
