@@ -22,12 +22,15 @@ import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  approximateTokenCount,
+  truncateByApproxTokens,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  localModelsEnabled,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -42,6 +45,7 @@ import type {
 // Configuration
 // =============================================================================
 
+const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
@@ -2659,6 +2663,15 @@ export async function chunkDocumentByTokens(
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
+  const useLocalTokenizer = typeof (llm as any).usesLocalEmbedding === "boolean"
+    ? Boolean((llm as any).usesLocalEmbedding)
+    : true;
+
+  const countTokens = async (text: string): Promise<number> => {
+    if (!useLocalTokenizer) return approximateTokenCount(text);
+    const tokens = await llm.tokenize(text);
+    return tokens.length;
+  };
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -2681,13 +2694,13 @@ export async function chunkDocumentByTokens(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
-    if (tokens.length <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokens.length });
+    const tokenCount = await countTokens(text);
+    if (tokenCount <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokenCount });
       return;
     }
 
-    const actualCharsPerToken = text.length / tokens.length;
+    const actualCharsPerToken = text.length / tokenCount;
     let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
     if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
       safeMaxChars = Math.floor(text.length / 2);
@@ -2717,12 +2730,14 @@ export async function chunkDocumentByTokens(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      const truncatedText = await llm.detokenize(fallbackTokens);
+      const tokenLimit = Math.max(1, maxTokens);
+      const truncatedText = useLocalTokenizer
+        ? await llm.detokenize((await llm.tokenize(text)).slice(0, tokenLimit))
+        : truncateByApproxTokens(text, tokenLimit);
       results.push({
         text: truncatedText,
         pos,
-        tokens: fallbackTokens.length,
+        tokens: tokenLimit,
       });
       return;
     }
@@ -4568,7 +4583,7 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = options?.skipRerank ?? !localModelsEnabled();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -4649,7 +4664,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -4966,7 +4981,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = options?.skipRerank ?? !localModelsEnabled();
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -5035,7 +5050,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
