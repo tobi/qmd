@@ -859,6 +859,7 @@ export class LlamaCpp implements LLM {
       await ctx.dispose();
     }
     this.rerankContexts = [];
+    this.rerankContextSize = null;
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
@@ -1209,10 +1210,55 @@ export class LlamaCpp implements LLM {
   // was insufficient.  4096 comfortably fits the largest real-world chunks
   // while staying well below the 40 960-token auto size.
   // Override with QMD_RERANK_CONTEXT_SIZE env var if you need more headroom.
-  private static readonly RERANK_CONTEXT_SIZE: number = (() => {
-    const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : 4096;
-  })();
+  private static readonly RERANK_CONTEXT_SIZE_DEFAULT = 4096;
+  // Shrink-under-pressure fallback when free VRAM cannot fit the default.
+  private static readonly RERANK_CONTEXT_SIZE_TIGHT = 2048;
+  // Threshold below which we shrink to the tight size.  The default 4096
+  // context costs ~1.15 GB with flash attention; the threshold also holds
+  // back ~350 MB for the rerank model itself and a margin for concurrent
+  // allocations.  Picked empirically — see the cost model below.
+  private static readonly RERANK_VRAM_SHRINK_THRESHOLD_MB = 1500;
+  // Cost model: a rerank context with flash attention is roughly 0.28 MB
+  // per token (measured: 4096-ctx ≈ 1146 MB, 2048-ctx ≈ 568 MB).  Used by
+  // `computeParallelism` to budget each context's VRAM footprint against
+  // the actual chosen size, not a constant that assumed 2048.
+  private static readonly RERANK_CTX_MB_PER_TOKEN = 0.28;
+
+  // Tracks the size actually used to allocate the live rerank contexts.
+  // `rerankImpl` needs this to compute the truncation budget against the
+  // real allocation, not a static guess.  Cleared whenever the contexts
+  // are torn down so the next `ensureRerankContexts` call re-probes VRAM.
+  private rerankContextSize: number | null = null;
+
+  /**
+   * Pick a rerank context size that fits available VRAM.
+   *
+   * Order:
+   * 1. `QMD_RERANK_CONTEXT_SIZE` env override — always wins, no probe.
+   * 2. CPU mode (CPU offload forced or no GPU) — keeps the 4096 default
+   *    since CPU RAM is plentiful and the cost model doesn't apply.
+   * 3. GPU probe — query `getVramState`, shrink to 2048 when free VRAM
+   *    is below the threshold.  A probe failure conservatively falls
+   *    back to the 4096 default (caller's existing reclaim/retry path
+   *    will catch a VRAM-too-tight allocation).
+   */
+  private async resolveRerankContextSize(): Promise<number> {
+    const envValue = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
+    if (Number.isFinite(envValue) && envValue > 0) return envValue;
+    const llama = await this.ensureLlama();
+    if (this.isCpuOffloadForced() || !llama.gpu) {
+      return LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    }
+    try {
+      const vram = await llama.getVramState();
+      const freeMB = vram.free / (1024 * 1024);
+      return freeMB < LlamaCpp.RERANK_VRAM_SHRINK_THRESHOLD_MB
+        ? LlamaCpp.RERANK_CONTEXT_SIZE_TIGHT
+        : LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    } catch {
+      return LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    }
+  }
 
   private static readonly EMBED_CONTEXT_SIZE: number = (() => {
     const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
@@ -1221,13 +1267,19 @@ export class LlamaCpp implements LLM {
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
-      const n = Math.min(await this.computeParallelism(1000), 4);
+      const contextSize = await this.resolveRerankContextSize();
+      this.rerankContextSize = contextSize;
+      // perContextMB derives from the *actual* chosen size, not a constant
+      // that assumed 2048.  Pre-fix this was hardcoded to 1000 MB, which
+      // both under-budgeted the 4096 default (~1146 MB) and over-budgeted
+      // the 2048 fallback (~568 MB), skewing parallelism in both directions.
+      const perContextMB = Math.ceil(contextSize * LlamaCpp.RERANK_CTX_MB_PER_TOKEN);
+      const n = Math.min(await this.computeParallelism(perContextMB), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
-            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            contextSize,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -1628,9 +1680,13 @@ export class LlamaCpp implements LLM {
     const model = await this.ensureRerankModel();
 
     // Truncate documents that would exceed the rerank context size.
-    // Budget = contextSize - template overhead - query tokens
+    // Budget = contextSize - template overhead - query tokens.
+    // The size matches whatever `ensureRerankContexts` actually allocated
+    // (`resolveRerankContextSize` may have shrunk it under VRAM pressure),
+    // so the budget never under-truncates relative to the live context.
     const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const contextSize = this.rerankContextSize ?? LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    const maxDocTokens = contextSize - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
     const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
@@ -1879,6 +1935,7 @@ export class LlamaCpp implements LLM {
     const contexts = this.rerankContexts;
     const model = this.rerankModel;
     this.rerankContexts = [];
+    this.rerankContextSize = null;
     this.rerankModel = null;
     this.rerankModelLoadPromise = null;
     for (const ctx of contexts) {
@@ -1915,6 +1972,7 @@ export class LlamaCpp implements LLM {
       await disposeWithTimeout("rerank context", () => ctx.dispose());
     }
     this.rerankContexts = [];
+    this.rerankContextSize = null;
 
     if (this.embedModel) {
       await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
