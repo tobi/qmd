@@ -219,7 +219,11 @@ import {
   createStore,
 } from "../src/store";
 import type { RankedResult } from "../src/store";
+import { hasSufficientFreeVramForIntegration } from "./_helpers/vram-precondition.js";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
+
+// One-shot probe at module load.  Gates real-LLM integration suites below.
+const _vramSufficient = await hasSufficientFreeVramForIntegration();
 
 // =============================================================================
 // Tests
@@ -325,7 +329,7 @@ describe("MCP Server", () => {
   // searchVec (Vector similarity search)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("searchVec (vector similarity)", () => {
+  describe.skipIf(!!process.env.CI || !_vramSufficient)("searchVec (vector similarity)", () => {
     test("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
@@ -351,7 +355,7 @@ describe("MCP Server", () => {
   // hybridQuery (query expansion + reranking)
   // ===========================================================================
 
-  describe.skipIf(!!process.env.CI)("hybridQuery (expansion + reranking)", () => {
+  describe.skipIf(!!process.env.CI || !_vramSufficient)("hybridQuery (expansion + reranking)", () => {
     test("expands query with typed variations", async () => {
       const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Returns ExpandedQuery[] — typed expansions, original excluded
@@ -936,7 +940,7 @@ describe("MCP Server", () => {
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
 import { enableProductionMode } from "../src/store";
 
-describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
   let baseUrl: string;
   let httpTestDbPath: string;

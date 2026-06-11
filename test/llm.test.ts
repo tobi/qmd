@@ -27,6 +27,14 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+import { hasSufficientFreeVramForIntegration } from "./_helpers/vram-precondition.js";
+
+// One-shot probe at module load.  Gates real-LLM integration suites below.
+// CI and remote-server runs already short-circuit before the probe matters,
+// but on a dev box this is what prevents the "qmd is broken" cascade of
+// rerank-context allocation failures when Ollama (or another workload) is
+// holding most of the GPU.
+const _vramSufficient = await hasSufficientFreeVramForIntegration();
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
@@ -565,7 +573,7 @@ describe("LlamaCpp.getDeviceInfo", () => {
 // Integration Tests (require actual models)
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
 
@@ -968,7 +976,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 // Session Management Tests
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("LLM Session Management", () => {
   describe("withLLMSession", () => {
     test("session provides access to LLM operations", async () => {
       const result = await withLLMSession(async (session) => {
