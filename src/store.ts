@@ -927,9 +927,8 @@ function initializeDatabase(db: Database): void {
   // Triggers keep FTS in sync for callers that write directly to documents.
   // Production indexing paths rebuild entries in TypeScript so CJK text can be
   // normalized before it reaches the unicode61 tokenizer.
-  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
   db.exec(`
-    CREATE TRIGGER documents_ai AFTER INSERT ON documents
+    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
       INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -942,16 +941,14 @@ function initializeDatabase(db: Database): void {
     END
   `);
 
-  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
   db.exec(`
-    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
       DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
 
-  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
   db.exec(`
-    CREATE TRIGGER documents_au AFTER UPDATE ON documents
+    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
     BEGIN
       -- Delete from FTS if no longer active
       DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;

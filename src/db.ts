@@ -65,7 +65,19 @@ if (isBun) {
  * Open a SQLite database. Works with both bun:sqlite and better-sqlite3.
  */
 export function openDatabase(path: string): Database {
-  return new _Database(path) as Database;
+  const db = new _Database(path) as Database;
+  // QMD is frequently invoked as many short-lived CLI processes. Even search
+  // commands run startup/schema checks, so concurrent readers can briefly
+  // contend with WAL/schema locks. Wait instead of failing immediately.
+  const raw = process.env.QMD_SQLITE_BUSY_TIMEOUT_MS;
+  const parsed = raw ? Number.parseInt(raw, 10) : 10000;
+  const timeoutMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : 10000;
+  try {
+    db.exec(`PRAGMA busy_timeout = ${timeoutMs}`);
+  } catch {
+    // Some runtimes may not support the pragma; keep opening best-effort.
+  }
+  return db;
 }
 
 /**
