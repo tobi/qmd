@@ -13,10 +13,10 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
-import { openDatabase } from "../src/db.ts";
-import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
-import { setConfigSource } from "../src/collections.ts";
+import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.js";
+import { openDatabase } from "../src/db.js";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.js";
+import { setConfigSource } from "../src/collections.js";
 
 // Test fixtures directory and database path
 let testDir: string;

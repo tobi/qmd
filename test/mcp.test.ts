@@ -10,15 +10,15 @@ import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm.js";
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "../src/collections";
-import { setConfigIndexName } from "../src/collections";
-import { syncConfigToDb } from "../src/store";
+import type { CollectionConfig } from "../src/collections.js";
+import { setConfigIndexName } from "../src/collections.js";
+import { syncConfigToDb } from "../src/store.js";
 
 // =============================================================================
 // Test Database Setup
@@ -217,8 +217,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "../src/store";
-import type { RankedResult } from "../src/store";
+} from "../src/store.js";
+import type { RankedResult } from "../src/store.js";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -923,8 +923,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { enableProductionMode } from "../src/store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.js";
+import { enableProductionMode } from "../src/store.js";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
