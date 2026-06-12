@@ -27,16 +27,32 @@ function fakeLlama(opts: { gpu: false | string; free?: number; throwOnVram?: boo
 
 describe("hasSufficientFreeVramForIntegration", () => {
   let originalSkip: string | undefined;
+  let originalEvacuate: string | undefined;
+  let originalOllamaHost: string | undefined;
 
   beforeEach(() => {
     _resetVramPreconditionCacheForTests();
+    // Snapshot AND clear every env var this helper reads.  A leaked
+    // `QMD_TEST_EVACUATE_VRAM=1` from the surrounding process would otherwise
+    // activate the eviction path inside tests that expect a clean skip,
+    // turning false-returning probes into true-returning re-probes against
+    // a real Ollama.  Same for `OLLAMA_HOST`: a leaked override could send
+    // the default eviction step to the wrong endpoint.
     originalSkip = process.env.QMD_SKIP_GPU_INTEGRATION;
+    originalEvacuate = process.env.QMD_TEST_EVACUATE_VRAM;
+    originalOllamaHost = process.env.OLLAMA_HOST;
     delete process.env.QMD_SKIP_GPU_INTEGRATION;
+    delete process.env.QMD_TEST_EVACUATE_VRAM;
+    delete process.env.OLLAMA_HOST;
   });
 
   afterEach(() => {
     if (originalSkip === undefined) delete process.env.QMD_SKIP_GPU_INTEGRATION;
     else process.env.QMD_SKIP_GPU_INTEGRATION = originalSkip;
+    if (originalEvacuate === undefined) delete process.env.QMD_TEST_EVACUATE_VRAM;
+    else process.env.QMD_TEST_EVACUATE_VRAM = originalEvacuate;
+    if (originalOllamaHost === undefined) delete process.env.OLLAMA_HOST;
+    else process.env.OLLAMA_HOST = originalOllamaHost;
   });
 
   test("returns true on CPU mode (no GPU) without checking VRAM", async () => {
@@ -184,13 +200,16 @@ describe("hasSufficientFreeVramForIntegration", () => {
 describe("hasSufficientFreeVramForIntegration — QMD_TEST_EVACUATE_VRAM opt-in", () => {
   let originalEvacuate: string | undefined;
   let originalSkip: string | undefined;
+  let originalOllamaHost: string | undefined;
 
   beforeEach(() => {
     _resetVramPreconditionCacheForTests();
     originalEvacuate = process.env.QMD_TEST_EVACUATE_VRAM;
     originalSkip = process.env.QMD_SKIP_GPU_INTEGRATION;
+    originalOllamaHost = process.env.OLLAMA_HOST;
     delete process.env.QMD_TEST_EVACUATE_VRAM;
     delete process.env.QMD_SKIP_GPU_INTEGRATION;
+    delete process.env.OLLAMA_HOST;
   });
 
   afterEach(() => {
@@ -198,6 +217,8 @@ describe("hasSufficientFreeVramForIntegration — QMD_TEST_EVACUATE_VRAM opt-in"
     else process.env.QMD_TEST_EVACUATE_VRAM = originalEvacuate;
     if (originalSkip === undefined) delete process.env.QMD_SKIP_GPU_INTEGRATION;
     else process.env.QMD_SKIP_GPU_INTEGRATION = originalSkip;
+    if (originalOllamaHost === undefined) delete process.env.OLLAMA_HOST;
+    else process.env.OLLAMA_HOST = originalOllamaHost;
   });
 
   test("does NOT run evacuate when env unset (default behavior preserved)", async () => {
