@@ -583,11 +583,13 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Binds to `options.host` (default "localhost", overridable via the QMD_HOST
+ * env var) — set "0.0.0.0" to accept connections from other hosts, e.g. a
+ * container liveness probe. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -839,9 +841,10 @@ export async function startMcpHttpServer(
     }
   });
 
+  const host = options.host ?? process.env.QMD_HOST ?? "localhost";
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -869,7 +872,7 @@ export async function startMcpHttpServer(
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 

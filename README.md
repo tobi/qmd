@@ -120,12 +120,17 @@ By default, QMD's MCP server uses stdio (launched as a subprocess by each client
 # Foreground (Ctrl-C to stop)
 qmd mcp --http                    # localhost:8181
 qmd mcp --http --port 8080        # custom port
+qmd mcp --http --host 0.0.0.0     # bind all interfaces (e.g. container probes)
 
 # Background daemon
 qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
 qmd mcp stop                      # stop via PID file
 qmd status                        # shows "MCP: running (PID ...)" when active
 ```
+
+The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
+environment variable) to override — `--host 0.0.0.0` is useful when the server
+runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
