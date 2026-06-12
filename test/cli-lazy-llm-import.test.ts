@@ -11,7 +11,7 @@ describe("LLM module loading", () => {
   });
 
   test("importing the CLI for lightweight commands succeeds", async () => {
-    const mod = await import("../src/cli/qmd.ts");
+    const mod = await import("../src/cli/qmd.js");
     expect(mod).toMatchObject({
       buildEditorUri: expect.any(Function),
       termLink: expect.any(Function),

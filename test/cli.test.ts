@@ -13,10 +13,10 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
-import { openDatabase } from "../src/db.ts";
-import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
-import { setConfigSource } from "../src/collections.ts";
+import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.js";
+import { openDatabase } from "../src/db.js";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.js";
+import { setConfigSource } from "../src/collections.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -2150,7 +2150,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/health`);
       expect(res.status).toBe(200);
-      const body = await res.json();
+      const body = await res.json() as { status: string };
       expect(body.status).toBe("ok");
     } finally {
       const closed = new Promise(r => proc.once("close", r));
@@ -2212,7 +2212,7 @@ describe("mcp http daemon", () => {
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);
-      const body = await res.json();
+      const body = await res.json() as { results: { file: string }[] };
       const files = body.results.map((r: { file: string }) => r.file);
       expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
     } finally {
