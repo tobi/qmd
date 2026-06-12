@@ -42,11 +42,11 @@ class CountingLLM implements LLM {
 
   async embed(_text: string, _options?: EmbedOptions): Promise<EmbeddingResult | null> {
     this.calls.embed++;
-    return { embedding: [0.1, 0.2, 0.3] };
+    return { embedding: [0.1, 0.2, 0.3], model: this.embedModelName };
   }
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     this.calls.embedBatch++;
-    return texts.map(() => ({ embedding: [0.1, 0.2, 0.3] }));
+    return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: this.embedModelName }));
   }
   async generate(_prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
     return null;
@@ -68,7 +68,8 @@ class CountingLLM implements LLM {
   ): Promise<RerankResult> {
     this.calls.rerank++;
     return {
-      results: documents.map((d, i) => ({ file: d.file, score: documents.length - i })),
+      results: documents.map((d, i) => ({ file: d.file, score: documents.length - i, index: i })),
+      model: this.rerankModelName,
     };
   }
   async tokenize(text: string): Promise<readonly unknown[]> {
@@ -200,7 +201,10 @@ describe("store layer routes through the polymorphic LLM default", () => {
       async modelExists(model: string): Promise<ModelInfo> { return { name: model, exists: true }; }
       async expandQuery(): Promise<Queryable[]> { return []; }
       async rerank(_q: string, docs: RerankDocument[]): Promise<RerankResult> {
-        return { results: docs.map(d => ({ file: d.file, score: 0 })) };
+        return {
+          results: docs.map((d, i) => ({ file: d.file, score: 0, index: i })),
+          model: "fake-rerank",
+        };
       }
       async tokenize(text: string): Promise<readonly unknown[]> {
         // 2 chars per "token" — exaggerates so the maxTokens limit triggers fallback.

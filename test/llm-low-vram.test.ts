@@ -31,7 +31,7 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
   // Replace the heavy work with fast fakes that exercise the chain only.
   // The public expandQuery/rerank still run their lowVram wrappers, which is
   // what we want to test.
-  (llm as unknown as { expandQueryImpl: (...args: unknown[]) => Promise<Queryable[]> }).expandQueryImpl = async (
+  (llm as unknown as { expandQueryImpl: (query: string, options?: unknown) => Promise<Queryable[]> }).expandQueryImpl = async (
     _query: string,
     _options?: unknown,
   ): Promise<Queryable[]> => {
@@ -42,7 +42,7 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
     return [{ type: "lex", text: "x" }];
   };
 
-  (llm as unknown as { rerankImpl: (...args: unknown[]) => Promise<RerankResult> }).rerankImpl = async (
+  (llm as unknown as { rerankImpl: (query: string, documents: RerankDocument[], options?: unknown) => Promise<RerankResult> }).rerankImpl = async (
     _query: string,
     documents: RerankDocument[],
     _options?: unknown,
