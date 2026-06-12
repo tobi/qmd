@@ -172,6 +172,31 @@ describe("bin/qmd package wrapper", () => {
     expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
   });
 
+  test("bun global install with bun.lock at the install root uses bun", () => {
+    const { root, runtimeBin, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "home/user/.bun/install/global/node_modules/@tobilu/qmd");
+    writeFileSync(join(root, "home", "user", ".bun", "install", "global", "bun.lock"), "");
+    const bunBin = join(root, "home", "user", ".bun", "bin", "qmd");
+    symlinkRelative(join(packageRoot, "bin", "qmd"), bunBin);
+
+    const result = runWrapper(bunBin, runtimeBin, capturePath);
+
+    expect(result.runtime).toBe("bun");
+    expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
+  });
+
+  test("package-lock.json at the install root keeps npm priority", () => {
+    const { root, runtimeBin, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "project/node_modules/@tobilu/qmd");
+    writeFileSync(join(root, "project", "package-lock.json"), "");
+    writeFileSync(join(root, "project", "bun.lock"), "");
+
+    const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
+
+    expect(result.runtime).toBe("node");
+    expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
+  });
+
   test("ambient BUN_INSTALL alone does not select bun for an npm-installed package", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
     const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@tobilu/qmd");

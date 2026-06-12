@@ -24,6 +24,12 @@ detect_runtime() {
     echo "node"
   elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
     echo "bun"
+  elif [[ "$DIR" == */node_modules/* ]] && [ -f "${DIR%/node_modules/*}/package-lock.json" ]; then
+    # Mirror the install-root fallback: package-manager installs keep their
+    # lockfile above node_modules/, never inside the package directory.
+    echo "node"
+  elif [[ "$DIR" == */node_modules/* ]] && { [ -f "${DIR%/node_modules/*}/bun.lock" ] || [ -f "${DIR%/node_modules/*}/bun.lockb" ]; }; then
+    echo "bun"
   else
     echo "node"
   fi
@@ -91,6 +97,24 @@ touch "$d/package-lock.json"
 touch "$d/bun.lock"
 touch "$d/bun.lockb"
 assert_runtime "all three lockfiles → node (npm priority)" "$d" "node"
+
+# 8. bun global install: bun.lock at the install root, none in the package dir → bun
+d="$TMPDIR_BASE/bun-global/install/global/node_modules/@tobilu/qmd"
+mkdir -p "$d"
+touch "$TMPDIR_BASE/bun-global/install/global/bun.lock"
+assert_runtime "bun.lock at install root → bun" "$d" "bun"
+
+# 9. package-lock.json at the install root wins over bun.lock there → node
+d="$TMPDIR_BASE/npm-project/node_modules/@tobilu/qmd"
+mkdir -p "$d"
+touch "$TMPDIR_BASE/npm-project/package-lock.json"
+touch "$TMPDIR_BASE/npm-project/bun.lock"
+assert_runtime "install-root package-lock.json + bun.lock → node" "$d" "node"
+
+# 10. no lockfiles anywhere (npm/Homebrew global layout) → node
+d="$TMPDIR_BASE/homebrew/lib/node_modules/@tobilu/qmd"
+mkdir -p "$d"
+assert_runtime "no lockfiles anywhere → node" "$d" "node"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
