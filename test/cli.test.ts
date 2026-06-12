@@ -2150,7 +2150,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/health`);
       expect(res.status).toBe(200);
-      const body = await res.json();
+      const body = await res.json() as { status: string };
       expect(body.status).toBe("ok");
     } finally {
       const closed = new Promise(r => proc.once("close", r));
@@ -2212,7 +2212,7 @@ describe("mcp http daemon", () => {
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);
-      const body = await res.json();
+      const body = await res.json() as { results: { file: string }[] };
       const files = body.results.map((r: { file: string }) => r.file);
       expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
     } finally {

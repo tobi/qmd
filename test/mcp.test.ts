@@ -1009,7 +1009,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const res = await fetch(`${baseUrl}/health`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await res.json() as { status: string; uptime: number };
     expect(body.status).toBe("ok");
     expect(typeof body.uptime).toBe("number");
   });
