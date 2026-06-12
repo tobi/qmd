@@ -15,7 +15,7 @@ import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { encoding_for_model } from "tiktoken";
@@ -57,6 +57,11 @@ export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
 const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
+const readonlyDatabases = new WeakSet<Database>();
+
+function isReadOnlyDatabase(db: Database): boolean {
+  return readonlyDatabases.has(db);
+}
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -1847,10 +1852,46 @@ export async function generateEmbeddings(
  * @param dbPath - Path to the SQLite database file
  * @returns Store instance with all methods bound to the database
  */
-export function createStore(dbPath?: string): Store {
+export type CreateStoreOptions = {
+  /**
+   * Open the SQLite store for query-only access. This skips schema migrations,
+   * FTS trigger maintenance, WAL setup, and other write-on-open initialization
+   * so parallel search processes do not contend for writer locks.
+   */
+  readonly?: boolean;
+};
+
+function initializeReadOnlyDatabase(db: Database): void {
+  try {
+    loadSqliteVec(db);
+    verifySqliteVecLoaded(db);
+    _sqliteVecAvailable = true;
+    _sqliteVecUnavailableReason = null;
+  } catch (err) {
+    _sqliteVecAvailable = false;
+    _sqliteVecUnavailableReason = getErrorMessage(err);
+    console.warn(_sqliteVecUnavailableReason);
+  }
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+  } catch {
+    // Read-only query mode should never fail just because a connection-local
+    // pragma is unavailable in a runtime.
+  }
+}
+
+export function createStore(dbPath?: string, options: CreateStoreOptions = {}): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
-  const db = openDatabase(resolvedPath);
-  initializeDatabase(db);
+  if (options.readonly && !existsSync(resolvedPath)) {
+    throw new Error(`QMD index database does not exist at ${resolvedPath}. Run 'qmd update' first.`);
+  }
+  const db = openDatabase(resolvedPath, { readonly: options.readonly });
+  if (options.readonly) {
+    readonlyDatabases.add(db);
+    initializeReadOnlyDatabase(db);
+  } else {
+    initializeDatabase(db);
+  }
 
   const store: Store = {
     db,
@@ -2252,6 +2293,7 @@ export function getCachedResult(db: Database, cacheKey: string): string | null {
 }
 
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
+  if (isReadOnlyDatabase(db)) return;
   const now = new Date().toISOString();
   db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
   if (Math.random() < 0.01) {
@@ -2260,6 +2302,7 @@ export function setCachedResult(db: Database, cacheKey: string, result: string):
 }
 
 export function clearCache(db: Database): void {
+  if (isReadOnlyDatabase(db)) return;
   db.exec(`DELETE FROM llm_cache`);
 }
 

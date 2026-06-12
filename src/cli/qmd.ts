@@ -124,6 +124,7 @@ import {
 // =============================================================================
 
 let store: ReturnType<typeof createStore> | null = null;
+let readOnlyStore: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
 
@@ -147,8 +148,30 @@ function getStore(): ReturnType<typeof createStore> {
   return store;
 }
 
+
+function getReadOnlyStore(): ReturnType<typeof createStore> {
+  if (!readOnlyStore) {
+    readOnlyStore = createStore(storeDbPathOverride, { readonly: true });
+    try {
+      const activeModels = ensureModelsConfiguredForCli();
+      setDefaultLlamaCpp(new LlamaCpp({
+        embedModel: activeModels.embed,
+        generateModel: activeModels.generate,
+        rerankModel: activeModels.rerank,
+      }));
+    } catch {
+      // Query-only mode can run without model config for plain FTS searches.
+    }
+  }
+  return readOnlyStore;
+}
+
 function getDb(): Database {
   return getStore().db;
+}
+
+function getReadOnlyDb(): Database {
+  return getReadOnlyStore().db;
 }
 
 /** Re-sync YAML config into SQLite after CLI mutations (add/remove/rename collection, context changes) */
@@ -168,6 +191,10 @@ function closeDb(): void {
   if (store) {
     store.close();
     store = null;
+  }
+  if (readOnlyStore) {
+    readOnlyStore.close();
+    readOnlyStore = null;
   }
 }
 
@@ -2490,7 +2517,7 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
 }
 
 function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
+  const db = getReadOnlyDb();
 
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
@@ -2539,7 +2566,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 }
 
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
-  const store = getStore();
+  const store = getReadOnlyStore();
 
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
@@ -2598,7 +2625,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
-  const store = getStore();
+  const store = getReadOnlyStore();
 
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
