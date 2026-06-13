@@ -28,6 +28,7 @@ import {
   type QMDStore,
   type ExpandedQuery,
   type IndexStatus,
+  type HybridQueryExplain,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
@@ -44,6 +45,7 @@ type SearchResultItem = {
   context: string | null;
   line: number;   // Absolute line in source markdown
   snippet: string;
+  explain?: HybridQueryExplain;  // Retrieval score traces, present only when explain=true
 };
 
 type StatusResult = {
@@ -314,9 +316,13 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        explain: z.boolean().optional().default(false).describe(
+          "Include retrieval score traces (FTS/vector scores, RRF fusion breakdown, rerank " +
+          "blend weights) in each result. Useful for debugging query quality and tuning search."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank, explain }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -334,6 +340,7 @@ Intent-aware lex (C++ performance, not sports):
         candidateLimit,
         rerank,
         intent,
+        explain,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -351,6 +358,7 @@ Intent-aware lex (C++ performance, not sports):
           context: r.context,
           line,
           snippet: addLineNumbers(snippet, line),
+          ...(r.explain ? { explain: r.explain } : {}),
         };
       });
 
@@ -720,6 +728,7 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          explain: typeof params.explain === "boolean" ? params.explain : undefined,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -737,6 +746,7 @@ export async function startMcpHttpServer(
             context: r.context,
             line,
             snippet: addLineNumbers(snippet, line),
+            ...(r.explain ? { explain: r.explain } : {}),
           };
         });
 
