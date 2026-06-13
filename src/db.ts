@@ -63,9 +63,17 @@ if (isBun) {
 
 /**
  * Open a SQLite database. Works with both bun:sqlite and better-sqlite3.
+ *
+ * Sets PRAGMA busy_timeout = 10000 (10s) on every connection so that two
+ * processes sharing the same store — e.g. the long-running MCP daemon and a
+ * `qmd` CLI invocation (often driven from cron) — wait-and-retry instead of
+ * failing immediately with SQLITE_BUSY when one holds a write lock the other
+ * needs. 10s comfortably covers the typical write window of either side.
  */
 export function openDatabase(path: string): Database {
-  return new _Database(path) as Database;
+  const db = new _Database(path) as Database;
+  db.exec("PRAGMA busy_timeout = 10000");
+  return db;
 }
 
 /**
