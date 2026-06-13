@@ -14,6 +14,10 @@ import {
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
   setNodeLlamaCppModuleForTest,
+  resetNodeLlamaCppModuleForTest,
+  isNodeLlamaCppAvailable,
+  assertNodeLlamaCppAvailable,
+  NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE,
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
@@ -177,6 +181,16 @@ describe("QMD_LLAMA_GPU resolution", () => {
 });
 
 describe("native llama stdout containment", () => {
+  test("treats a null node-llama-cpp test module as unavailable", async () => {
+    setNodeLlamaCppModuleForTest(null);
+    try {
+      await expect(isNodeLlamaCppAvailable()).resolves.toBe(false);
+      await expect(assertNodeLlamaCppAvailable()).rejects.toThrow(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+    } finally {
+      resetNodeLlamaCppModuleForTest();
+    }
+  });
+
   test("redirects native stdout noise to stderr while JSON callers are initializing llama", async () => {
     const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
@@ -232,7 +246,7 @@ describe("native llama stdout containment", () => {
     } finally {
       stdoutSpy.mockRestore();
       stderrSpy.mockRestore();
-      setNodeLlamaCppModuleForTest(null);
+      resetNodeLlamaCppModuleForTest();
       if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
       else process.env.QMD_LLAMA_GPU = prevGpu;
       if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
@@ -267,7 +281,7 @@ describe("native llama stdout containment", () => {
       expect(stderr).not.toContain("QMD_STATUS_DEVICE_PROBE");
     } finally {
       stderrSpy.mockRestore();
-      setNodeLlamaCppModuleForTest(null);
+      resetNodeLlamaCppModuleForTest();
       if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
       else process.env.QMD_LLAMA_GPU = prevGpu;
       if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
@@ -324,7 +338,7 @@ describe("native llama stdout containment", () => {
     } finally {
       await llm.dispose();
       stderrSpy.mockRestore();
-      setNodeLlamaCppModuleForTest(null);
+      resetNodeLlamaCppModuleForTest();
       if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
       else process.env.QMD_LLAMA_GPU = prevGpu;
       if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
