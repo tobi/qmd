@@ -268,11 +268,12 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
 | Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
+| Unknown vocabulary | Pass \`query\` with natural language so the server auto-expands it |
 
 ## Examples
 
@@ -299,8 +300,13 @@ Intent-aware lex (C++ performance, not sports):
 \`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
+        query: z.string().optional().describe(
+          "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
+          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+        ),
+        searches: z.array(subSearchSchema).max(10).optional().describe(
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
+          "control over retrieval strategy. Mutually exclusive with 'query'."
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
@@ -316,18 +322,32 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Map to internal format
-      const queries: ExpandedQuery[] = searches.map(s => ({
-        type: s.type,
-        query: s.query,
-      }));
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+      // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
+      if (!query && (!searches || searches.length === 0)) {
+        return {
+          content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
+          isError: true,
+        };
+      }
+      if (query && searches && searches.length > 0) {
+        return {
+          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
+          isError: true,
+        };
+      }
 
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
 
+      // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
+      // `searches` runs the caller's typed sub-queries directly.
+      const searchOptions = query
+        ? { query }
+        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
+
       const results = await store.search({
-        queries,
+        ...searchOptions,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
@@ -336,10 +356,12 @@ Intent-aware lex (C++ performance, not sports):
         intent,
       });
 
-      // Use first lex or vec query for snippet extraction
-      const primaryQuery = searches.find(s => s.type === 'lex')?.query
-        || searches.find(s => s.type === 'vec')?.query
-        || searches[0]?.query || "";
+      // Use the plain query, or the first lex/vec sub-query, for snippet extraction
+      const primaryQuery = query
+        || searches?.find(s => s.type === 'lex')?.query
+        || searches?.find(s => s.type === 'vec')?.query
+        || searches?.[0]?.query
+        || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
