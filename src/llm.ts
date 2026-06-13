@@ -24,16 +24,35 @@ type NodeLlamaCppModule = {
   LlamaLogLevel: { error: unknown };
 };
 
-let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
-async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
+export const NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE =
+  "node-llama-cpp is not available (postinstall failed -- likely Rosetta/x64 Node on Apple Silicon). Install a native arm64 Node from nodejs.org and reinstall: npm install -g @tobilu/qmd";
+
+let nodeLlamaCppImport: Promise<NodeLlamaCppModule | null> | null = null;
+async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule | null> {
   nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
     () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
-  );
+  ).catch(() => null);
   return nodeLlamaCppImport;
 }
 
+export async function isNodeLlamaCppAvailable(): Promise<boolean> {
+  return (await loadNodeLlamaCpp()) !== null;
+}
+
+export async function assertNodeLlamaCppAvailable(): Promise<void> {
+  if (await isNodeLlamaCppAvailable()) return;
+  throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+}
+
 export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
-  nodeLlamaCppImport = module ? Promise.resolve(module) : null;
+  nodeLlamaCppImport = Promise.resolve(module);
+  failedGpuInitModes.clear();
+  noGpuAccelerationWarningShown = false;
+  cpuForcedPrebuiltFallbackWarningShown = false;
+}
+
+export function resetNodeLlamaCppModuleForTest(): void {
+  nodeLlamaCppImport = null;
   failedGpuInitModes.clear();
   noGpuAccelerationWarningShown = false;
   cpuForcedPrebuiltFallbackWarningShown = false;
@@ -495,7 +514,9 @@ export async function pullModels(
       }
     }
 
-    const { resolveModelFile } = await loadNodeLlamaCpp();
+    const llamaModule = await loadNodeLlamaCpp();
+    if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+    const { resolveModelFile } = llamaModule;
     const path = await resolveModelFile(model, cacheDir);
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
@@ -852,7 +873,9 @@ export class LlamaCpp implements LLM {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
-      const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
+      const llamaModule = await loadNodeLlamaCpp();
+      if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+      const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = llamaModule;
       const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
@@ -961,7 +984,9 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    const { resolveModelFile } = await loadNodeLlamaCpp();
+    const llamaModule = await loadNodeLlamaCpp();
+    if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+    const { resolveModelFile } = llamaModule;
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
     return modelPath;
@@ -1381,7 +1406,9 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
+    const llamaModule = await loadNodeLlamaCpp();
+    if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+    const { LlamaChatSession } = llamaModule;
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -1461,7 +1488,9 @@ export class LlamaCpp implements LLM {
       contextSize: this.expandContextSize,
     });
     const sequence = genContext.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
+    const llamaModule = await loadNodeLlamaCpp();
+    if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
+    const { LlamaChatSession } = llamaModule;
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
