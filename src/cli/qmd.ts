@@ -81,7 +81,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, assertNodeLlamaCppAvailable, isNodeLlamaCppAvailable, NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1976,11 +1976,17 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
   return ensureModelsConfiguredForCli();
 }
 
+export async function assertNodeLlamaCppAvailableForCli(): Promise<void> {
+  await assertNodeLlamaCppAvailable();
+}
+
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
 ): Promise<void> {
+  await assertNodeLlamaCppAvailableForCli();
+
   const storeInstance = getStore();
   const db = storeInstance.db;
 
@@ -2637,6 +2643,8 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 }
 
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+  await assertNodeLlamaCppAvailableForCli();
+
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2688,6 +2696,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+  await assertNodeLlamaCppAvailableForCli();
+
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -3481,6 +3491,27 @@ function doctorCheck(label: string, ok: boolean, details: string): void {
   console.log(`${mark} ${label}: ${details}`);
 }
 
+export function rosettaNodeDoctorWarning(
+  platform: NodeJS.Platform = process.platform,
+  arch: NodeJS.Architecture = process.arch
+): string | null {
+  if (platform === "darwin" && arch === "x64") {
+    return "x64 Node on macOS detected; on Apple Silicon this is likely Rosetta and node-llama-cpp may fail to install. Install a native arm64 Node from nodejs.org and reinstall: npm install -g @tobilu/qmd";
+  }
+  return null;
+}
+
+function checkNodeArchitecture(nextSteps: string[]): void {
+  const warning = rosettaNodeDoctorWarning();
+  if (!warning) {
+    doctorCheck("node architecture", true, `${process.platform}/${process.arch}`);
+    return;
+  }
+
+  doctorCheck("node architecture", false, warning);
+  nextSteps.push("Install a native arm64 Node from nodejs.org and reinstall: `npm install -g @tobilu/qmd`.");
+}
+
 function formatCount(n: number): string {
   return n.toLocaleString("en-US");
 }
@@ -3751,6 +3782,10 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
   }
 
+  if (!(await isNodeLlamaCppAvailable())) {
+    return { ok: false, details: `${NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE}; skip vector reproduction until node-llama-cpp is available` };
+  }
+
   const threshold = 0.0001;
   const mismatches: string[] = [];
 
@@ -3862,6 +3897,12 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
     return;
   }
 
+  if (!(await isNodeLlamaCppAvailable())) {
+    doctorCheck("device probe", false, `${NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE}. Next: install native Node and reinstall qmd, or use BM25 commands such as \`qmd search\`.`);
+    nextSteps.push("Install a native arm64 Node from nodejs.org and reinstall: `npm install -g @tobilu/qmd`.");
+    return;
+  }
+
   const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
   if (process.stdout.isTTY) {
     process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
@@ -3941,6 +3982,8 @@ async function showDoctor(): Promise<void> {
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
   console.log(`Index: ${getDbPath()}`);
   console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
+
+  checkNodeArchitecture(nextSteps);
 
   try {
     const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
@@ -4425,22 +4468,27 @@ if (isMain) {
       break;
 
     case "pull": {
-      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const activeModels = resolveModelsForCli();
-      const models = [
-        activeModels.embed,
-        activeModels.generate,
-        activeModels.rerank,
-      ];
-      console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      try {
+        await assertNodeLlamaCppAvailableForCli();
+        const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+        const activeModels = resolveModelsForCli();
+        const models = [
+          activeModels.embed,
+          activeModels.generate,
+          activeModels.rerank,
+        ];
+        console.log(`${c.bold}Pulling models${c.reset}`);
+        const results = await pullModels(models, {
+          refresh,
+          cacheDir: DEFAULT_MODEL_CACHE_DIR,
+        });
+        for (const result of results) {
+          const size = formatBytes(result.sizeBytes);
+          const note = result.refreshed ? "refreshed" : "cached/checked";
+          console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+        }
+      } catch (error) {
+        exitWithError(error);
       }
       break;
     }
@@ -4463,7 +4511,11 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
-      await vectorSearch(cli.query, cli.opts);
+      try {
+        await vectorSearch(cli.query, cli.opts);
+      } catch (error) {
+        exitWithError(error);
+      }
       break;
 
     case "query":
@@ -4472,7 +4524,11 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
-      await querySearch(cli.query, cli.opts);
+      try {
+        await querySearch(cli.query, cli.opts);
+      } catch (error) {
+        exitWithError(error);
+      }
       break;
 
     case "bench": {
