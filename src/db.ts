@@ -83,6 +83,7 @@ export interface Statement {
   run(...params: SQLiteValue[]): { changes: number; lastInsertRowid: number | bigint };
   get<T = unknown>(...params: SQLiteValue[]): T | undefined;
   all<T = unknown>(...params: SQLiteValue[]): T[];
+  iterate<T = unknown>(...params: SQLiteValue[]): IterableIterator<T>;
 }
 
 /**
