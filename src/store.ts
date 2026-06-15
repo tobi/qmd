@@ -3548,7 +3548,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // When filtering by collection, fetch extra candidates from the FTS index
   // since some will be filtered out. Without a collection filter we can
   // fetch exactly the requested limit.
-  const ftsLimit = collections ? limit * 10 : limit;
+  // Collection-scoped searches are filtered after the FTS candidate pass.
+  // In a large global index, limit*10 can miss all matches from a tiny target
+  // collection even when that collection has strong matches. Use a wider
+  // candidate window for filtered searches while keeping unfiltered search exact.
+  const ftsLimit = collections ? Math.max(limit * 1000, 5000) : limit;
 
   let sql = `
     WITH fts_matches AS (
