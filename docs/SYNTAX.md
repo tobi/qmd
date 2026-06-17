@@ -127,26 +127,41 @@ Without intent, "performance" is ambiguous (web-perf? team health? fitness?). Wi
 - Empty lines are ignored
 - Leading/trailing whitespace is trimmed
 
-## MCP/HTTP API
+## Scoping
 
-The `query` tool accepts a query document:
+Restrict queries to specific collections with `-c` (CLI) or `collections` (MCP/SDK):
 
-```json
-{
-  "q": "lex: CAP theorem\nvec: consistency vs availability",
-  "collections": ["docs"],
-  "limit": 10
-}
+```bash
+# CLI — by collection name (see `qmd collection list`)
+qmd query -c docs "how does auth work"
+qmd query -c docs -c notes $'lex: auth\nvec: authentication flow'
 ```
 
-Or structured format:
+For MCP / HTTP, pass a plural `collections` array (OR match):
+
+```json
+{ "searches": [ { "type": "lex", "query": "auth" } ], "collections": ["docs", "notes"] }
+```
+
+`-c`/`collections` matches by collection name and works from any directory.
+Multiple values are OR-combined. Without scoping, all default-included collections
+are searched; collections marked excluded (`qmd collection exclude <name>`) are
+skipped unless explicitly named. In MCP the parameter is the plural `collections`
+array — a singular `collection` is silently ignored.
+
+## MCP/HTTP API
+
+The `query` tool (and the REST `/query` endpoint) accept a structured query with a
+`searches` array. There is no `q` string parameter — `searches` is required:
 
 ```json
 {
   "searches": [
     { "type": "lex", "query": "CAP theorem" },
     { "type": "vec", "query": "consistency vs availability" }
-  ]
+  ],
+  "collections": ["docs"],
+  "limit": 10
 }
 ```
 

@@ -185,8 +185,9 @@ export function searchResultsToMarkdown(
     if (opts.lineNumbers) {
       content = addLineNumbers(content);
     }
+    const fileLine = `**file:** \`${row.displayPath}\`\n`;
     const contextLine = row.context ? `**context:** ${row.context}\n` : "";
-    return `---\n# ${heading}\n\n**docid:** \`#${row.docid}\`\n${contextLine}\n${content}\n`;
+    return `---\n# ${heading}\n\n${fileLine}**docid:** \`#${row.docid}\`\n${contextLine}\n${content}\n`;
   }).join("\n");
 }
 

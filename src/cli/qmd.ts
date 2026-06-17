@@ -81,7 +81,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -253,10 +253,8 @@ type FinishSuccessfulCliCommandOptions = {
   format?: OutputFormat;
   cleanup?: () => Promise<void>;
   exit?: (code: number) => void;
-  immediateExit?: (code: number) => void;
   stdout?: CliLifecycleWritable;
   stderr?: CliLifecycleWritable;
-  platform?: NodeJS.Platform;
 };
 
 async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
@@ -265,43 +263,34 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   });
 }
 
-function shouldBypassNativeCleanup(options: FinishSuccessfulCliCommandOptions): boolean {
-  return (
-    (options.platform ?? process.platform) === "darwin" &&
-    options.command === "query" &&
-    options.format === "json" &&
-    process.env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1"
-  );
-}
-
-function immediateProcessExit(code: number): void {
-  const processWithReallyExit = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
-  if (typeof processWithReallyExit.reallyExit === "function") {
-    processWithReallyExit.reallyExit(code);
-    return;
-  }
-  process.exit(code);
-}
-
 /**
- * Finish a successful CLI command after output has been flushed. On macOS JSON
- * query runs, skip normal native teardown and use Node/Bun's immediate exit path:
- * ggml Metal can abort from C++ finalizers after valid JSON has already been
- * produced (#368). This wrapper is only reached after the command completed, so
- * real query failures still exit through the normal error path before this runs.
+ * Finish a successful CLI command after output has been flushed.
+ *
+ * We deliberately do NOT call `process.exit(0)`. `process.exit()` skips
+ * Node's `beforeExit` event, and node-llama-cpp registers a `beforeExit` hook
+ * that auto-disposes its native handles. On darwin, without that hook firing,
+ * libggml-metal's static `ggml_metal_device` destructor asserts on a
+ * non-empty residency-set collection during `__cxa_finalize_ranges` and
+ * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
+ * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
+ * direct `process.exit(0)` path still trips the assertion — letting the
+ * event loop drain naturally is what actually clears the rsets.
+ *
+ * So: set `process.exitCode = 0` and return. The main module finishes, the
+ * event loop drains, `beforeExit` fires, native resources tear down in
+ * order, and the process exits cleanly. The `GGML_METAL_NO_RESIDENCY=1` env
+ * var that `bin/qmd` exports is a defense-in-depth safety net for paths
+ * that still call `process.exit()` after loading the native binding
+ * (signal handlers, error paths, `bun test`).
+ *
+ * If the caller passes an explicit `exit` for testability, we honor it —
+ * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
+ * Production callers must not pass `exit`.
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
-  const exit = options.exit ?? ((code: number) => process.exit(code));
-  const immediateExit = options.immediateExit ?? immediateProcessExit;
 
   await flushWritable(options.stdout ?? process.stdout);
-
-  if (shouldBypassNativeCleanup(options)) {
-    await flushWritable(stderr);
-    immediateExit(0);
-    return;
-  }
 
   try {
     await (options.cleanup ?? disposeDefaultLlamaCpp)();
@@ -311,7 +300,13 @@ export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCom
     );
   }
   await flushWritable(stderr);
-  exit(0);
+
+  if (options.exit) {
+    options.exit(0);
+    return;
+  }
+
+  process.exitCode = 0;
 }
 
 // Ensure cursor is restored on exit
@@ -1022,15 +1017,48 @@ function contextRemove(pathArg: string): void {
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
 }
 
-function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
-  // Parse :linenum suffix from filename (e.g., "file.md:100")
+/**
+ * Render an absolute filesystem path for human display under --full-path.
+ *
+ * If the path is the current working directory or a subpath of it, return a
+ * "./"-prefixed relative path so it is unambiguously a filesystem path (not a
+ * bare collection-relative string that could be confused for a `qmd://`
+ * fragment). Otherwise return the absolute realpath so symlinks resolve
+ * consistently. Returns `null` if the path could not be normalized — callers
+ * fall back to whatever they had before.
+ */
+function renderFullPath(absolutePath: string, cwd: string = process.cwd()): string {
+  let real: string;
+  try { real = realpathSync(absolutePath); } catch { real = absolutePath; }
+  const cwdReal = (() => { try { return realpathSync(cwd); } catch { return cwd; } })();
+  if (real === cwdReal) return "./";
+  if (real.startsWith(cwdReal + "/")) {
+    const rel = relativePath(cwdReal, real);
+    if (rel && !rel.startsWith("..")) return `./${rel}`;
+  }
+  return real;
+}
+
+function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean, fullPath: boolean = false): void {
+  // Parse :line suffix from filename. Two forms:
+  //   "file.md:100"     -> start at line 100
+  //   "file.md:100:40"  -> start at line 100, read 40 lines
+  // The :// in virtual paths is never matched because we anchor digits to $.
+  // Explicit --from/-l flags always win over values parsed from the path.
   let inputPath = filename;
-  const colonMatch = inputPath.match(/:(\d+)$/);
-  if (colonMatch && !fromLine) {
-    const matched = colonMatch[1];
-    if (matched) {
-      fromLine = parseInt(matched, 10);
-      inputPath = inputPath.slice(0, -colonMatch[0].length);
+  const rangeMatch = inputPath.match(/:(\d+):(\d+)$/);
+  if (rangeMatch) {
+    if (fromLine === undefined) fromLine = parseInt(rangeMatch[1]!, 10);
+    if (maxLines === undefined) maxLines = parseInt(rangeMatch[2]!, 10);
+    inputPath = inputPath.slice(0, -rangeMatch[0].length);
+  } else {
+    const colonMatch = inputPath.match(/:(\d+)$/);
+    if (colonMatch) {
+      const matched = colonMatch[1];
+      if (matched) {
+        if (fromLine === undefined) fromLine = parseInt(matched, 10);
+        inputPath = inputPath.slice(0, -colonMatch[0].length);
+      }
     }
   }
   if (fromLine !== undefined) fromLine = Math.max(1, fromLine);
@@ -1184,6 +1212,30 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   // Get context for this file
   const context = getContextForPath(db, doc.collectionName, doc.path);
 
+  // Resolve the docid (first 6 chars of the content hash) so callers always
+  // know what they retrieved and can cite it back to `get`/`multi-get`.
+  const hashRow = db.prepare(`
+    SELECT d.hash as hash
+    FROM documents d
+    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+  `).get(doc.collectionName, doc.path) as { hash: string } | null;
+  const docid = hashRow?.hash ? hashRow.hash.slice(0, 6) : undefined;
+  const canonicalPath = buildVirtualPath(doc.collectionName, doc.path);
+
+  // --full-path: show the on-disk path instead of the qmd:// URL + docid, when
+  // the file actually exists. Fall back to the canonical header otherwise.
+  let header: string;
+  if (fullPath) {
+    const fsPath = resolveVirtualPath(db, canonicalPath);
+    if (fsPath && existsSync(fsPath)) {
+      header = renderFullPath(fsPath);
+    } else {
+      header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
+    }
+  } else {
+    header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
+  }
+
   let output = doc.body;
   const startLine = fromLine || 1;
 
@@ -1195,21 +1247,25 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     output = lines.slice(start, end).join('\n');
   }
 
-  // Add line numbers if requested
+  // Line numbers are on by default (disable with --no-line-numbers) so the
+  // model can cite exact lines and request follow-up ranges via path:from:count.
   if (lineNumbers) {
     output = addLineNumbers(output, startLine);
   }
 
-  // Output context header if exists
+  // Header: identify the document (path + docid, or the on-disk path with
+  // --full-path), then optional context.
+  console.log(header);
   if (context) {
-    console.log(`Folder Context: ${context}\n---\n`);
+    console.log(`Folder Context: ${context}`);
   }
+  console.log("---\n");
   console.log(output);
   closeDb();
 }
 
 // Multi-get: fetch multiple documents by glob pattern or comma-separated list
-function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli"): void {
+function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli", lineNumbers: boolean = true, fullPath: boolean = false): void {
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
@@ -1297,7 +1353,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   }
 
   // Collect results for structured output
-  const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
+  const results: { file: string; displayPath: string; fsPath?: string; docid?: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
 
   for (const file of files) {
     // Parse virtual path to get collection info if not already available
@@ -1315,11 +1371,30 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     // Get context using collection-scoped function
     const context = collection && path ? getContextForPath(db, collection, path) : null;
 
+    // Resolve docid (first 6 chars of content hash) so every entry can be cited.
+    const docidRow = collection && path ? db.prepare(`
+      SELECT d.hash as hash
+      FROM documents d
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(collection, path) as { hash: string } | null : null;
+    const docid = docidRow?.hash ? docidRow.hash.slice(0, 6) : undefined;
+
+    // --full-path: resolve the on-disk path when it exists (else fall back).
+    // Display as ./-prefixed relative path when under $PWD; absolute realpath
+    // otherwise. See renderFullPath() for the policy.
+    let fsPath: string | undefined;
+    if (fullPath) {
+      const resolved = resolveVirtualPath(db, file.filepath);
+      if (resolved && existsSync(resolved)) fsPath = renderFullPath(resolved);
+    }
+
     // Check size limit
     if (file.bodyLength > maxBytes) {
       results.push({
         file: file.filepath,
         displayPath: file.displayPath,
+        fsPath,
+        docid,
         title: file.displayPath.split('/').pop() || file.displayPath,
         body: "",
         context,
@@ -1352,9 +1427,16 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       }
     }
 
+    // Line numbers on by default (disable with --no-line-numbers).
+    if (lineNumbers) {
+      body = addLineNumbers(body);
+    }
+
     results.push({
       file: file.filepath,
       displayPath: file.displayPath,
+      fsPath,
+      docid,
       title: doc.title || file.displayPath.split('/').pop() || file.displayPath,
       body,
       context,
@@ -1364,14 +1446,23 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 
   closeDb();
 
+  // --full-path replaces the qmd:// path + docid with the on-disk path (when it
+  // resolved). Per result: pick the identifier and whether to show the docid.
+  const identOf = (r: typeof results[number]): string => (fullPath && r.fsPath) ? r.fsPath : r.displayPath;
+  const docidOf = (r: typeof results[number]): string | undefined => (fullPath && r.fsPath) ? undefined : r.docid;
+
   // Output based on format
   if (format === "json") {
-    const output = results.map(r => ({
-      file: r.displayPath,
-      title: r.title,
-      ...(r.context && { context: r.context }),
-      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
-    }));
+    const output = results.map(r => {
+      const docidVal = docidOf(r);
+      return {
+        file: identOf(r),
+        ...(docidVal && { docid: `#${docidVal}` }),
+        title: r.title,
+        ...(r.context && { context: r.context }),
+        ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
+      };
+    });
     console.log(JSON.stringify(output, null, 2));
   } else if (format === "csv") {
     const escapeField = (val: string | null | undefined): string => {
@@ -1382,19 +1473,24 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       }
       return str;
     };
-    console.log("file,title,context,skipped,body");
+    console.log("docid,file,title,context,skipped,body");
     for (const r of results) {
-      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+      const docidVal = docidOf(r);
+      console.log([docidVal ? `#${docidVal}` : "", identOf(r), r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
     for (const r of results) {
+      const docidVal = docidOf(r);
+      const id = docidVal ? `#${docidVal} ` : "";
       const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
       const status = r.skipped ? "[SKIPPED]" : "";
-      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
+      console.log(`${id}${identOf(r)}${ctx}${status ? `,${status}` : ""}`);
     }
   } else if (format === "md") {
     for (const r of results) {
-      console.log(`## ${r.displayPath}\n`);
+      const docidVal = docidOf(r);
+      console.log(`## ${identOf(r)}\n`);
+      if (docidVal) console.log(`**docid:** \`#${docidVal}\`\n`);
       if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
       if (r.context) console.log(`**Context:** ${r.context}\n`);
       if (r.skipped) {
@@ -1409,8 +1505,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     console.log('<?xml version="1.0" encoding="UTF-8"?>');
     console.log("<documents>");
     for (const r of results) {
-      console.log("  <document>");
-      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
+      const docidVal = docidOf(r);
+      const docidAttr = docidVal ? ` docid="#${docidVal}"` : "";
+      console.log(`  <document${docidAttr}>`);
+      console.log(`    <file>${escapeXml(identOf(r))}</file>`);
       console.log(`    <title>${escapeXml(r.title)}</title>`);
       if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
       if (r.skipped) {
@@ -1425,8 +1523,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   } else {
     // CLI format (default)
     for (const r of results) {
+      const docidVal = docidOf(r);
+      const id = docidVal ? `  #${docidVal}` : "";
       console.log(`\n${'='.repeat(60)}`);
-      console.log(`File: ${r.displayPath}`);
+      console.log(`File: ${identOf(r)}${id}`);
       console.log(`${'='.repeat(60)}\n`);
 
       if (r.skipped) {
@@ -1795,7 +1895,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = handelize(relativeFile); // Normalize path for token-friendliness
+    // Store the literal relative path — handelize() is NOT applied at index time.
+    const path = relativeFile.replace(/\\/g, '/');
     seenPaths.add(path);
 
     let content: string;
@@ -2093,6 +2194,7 @@ type OutputOptions = {
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2243,6 +2345,21 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     );
   };
 
+  // Helper to pick the visible path for a result. With --full-path we swap
+  // the qmd:// URI for the file's on-disk path via renderFullPath() (./-
+  // prefixed relative when under $PWD, absolute realpath otherwise). Falls
+  // back to qmd:// if the file is no longer resolvable on disk.
+  const linkDbForPaths = opts.fullPath ? getDb() : null;
+  const displayPathFor = (row: OutputRow): string => {
+    // Always rebuild from displayPath so the active index name is included
+    // as ?index=… for non-default indexes. row.file may not carry it.
+    const qmdUri = toQmdPath(row.displayPath);
+    if (!opts.fullPath || !linkDbForPaths) return qmdUri;
+    const absolute = resolveVirtualPath(linkDbForPaths, qmdUri);
+    if (!absolute || !existsSync(absolute)) return qmdUri;
+    return renderFullPath(absolute);
+  };
+
   if (opts.format === "json") {
     // JSON output for LLM consumption
     const output = filtered.map(row => {
@@ -2254,10 +2371,11 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
       }
+      // With --full-path, omit docid (the on-disk path is the identifier).
       return {
-        ...(docid && { docid: `#${docid}` }),
+        ...(docid && !opts.fullPath && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
-        file: toQmdPath(row.displayPath),
+        file: displayPathFor(row),
         line: snippetInfo.line,
         title: row.title,
         ...(row.context && { context: row.context }),
@@ -2272,7 +2390,12 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (const row of filtered) {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-      console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
+      if (opts.fullPath) {
+        // --full-path: drop the docid, the on-disk path is the identifier.
+        console.log(`${row.score.toFixed(2)},${displayPathFor(row)}${ctx}`);
+      } else {
+        console.log(`#${docid},${row.score.toFixed(2)},${displayPathFor(row)}${ctx}`);
+      }
     }
   } else if (opts.format === "cli") {
     const editorUriTemplate = getEditorUriTemplate();
@@ -2285,26 +2408,32 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      // Default: show the full qmd:// URI so the user can see which collection
+      // a hit lives in and can pipe the same string straight back into
+      // `qmd get`. A bare collection-relative path like `sources/foo.md` is
+      // ambiguous: it's not a real filesystem path, not a URI, and not a
+      // shell-friendly identifier on its own.
+      // With --full-path the visible label is the file's on-disk path
+      // ($PWD-relative when in a subfolder; absolute realpath otherwise),
+      // and the docid is omitted because the path is the identifier.
+      const virtualPath = toQmdPath(row.displayPath);
       const parsed = parseVirtualPath(virtualPath);
       const absolutePath = resolveVirtualPath(linkDb, virtualPath);
-
-      const legacyPath = toQmdPath(row.displayPath);
-      const displayPath = parsed?.path || row.displayPath;
+      const visiblePath = displayPathFor(row);
 
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
-      const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
+      const docidStr = (docid && !opts.fullPath) ? ` ${c.dim}#${docid}${c.reset}` : "";
 
       if (process.stdout.isTTY && absolutePath && parsed?.path) {
         const linkLine = hasMatch ? line : 1;
         const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
-        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        const clickable = termLink(`${visiblePath}${lineInfo}`, linkTarget);
         console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
       } else {
-        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+        console.log(`${c.cyan}${visiblePath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
       }
 
       // Line 2: Title (if available)
@@ -2357,15 +2486,18 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const heading = row.title || row.displayPath;
+      const visiblePath = displayPathFor(row);
+      const heading = row.title || visiblePath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      const docidLine = docid ? `**docid:** \`#${docid}\`\n` : "";
+      const fileLine = `**file:** \`${visiblePath}\`\n`;
+      // With --full-path the on-disk path is the identifier; drop the docid line.
+      const docidLine = (docid && !opts.fullPath) ? `**docid:** \`#${docid}\`\n` : "";
       const contextLine = row.context ? `**context:** ${row.context}\n` : "";
-      console.log(`---\n# ${heading}\n${docidLine}${contextLine}\n${content}\n`);
+      console.log(`---\n# ${heading}\n${fileLine}${docidLine}${contextLine}\n${content}\n`);
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
@@ -2376,11 +2508,15 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      console.log(`<file docid="#${docid}" name="${toQmdPath(row.displayPath)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
+      const docidAttr = opts.fullPath ? "" : ` docid="#${docid}"`;
+      console.log(`<file${docidAttr} name="${displayPathFor(row)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
     }
   } else {
     // CSV format
-    console.log("docid,score,file,title,context,line,snippet");
+    const csvHeader = opts.fullPath
+      ? "score,file,title,context,line,snippet"
+      : "docid,score,file,title,context,line,snippet";
+    console.log(csvHeader);
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       let content = opts.full ? row.body : snippet;
@@ -2389,7 +2525,13 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const snippetText = content || "";
-      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`);
+      const path = escapeCSV(displayPathFor(row));
+      const tail = `${path},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`;
+      if (opts.fullPath) {
+        console.log(`${row.score.toFixed(4)},${tail}`);
+      } else {
+        console.log(`#${docid},${row.score.toFixed(4)},${tail}`);
+      }
     }
   }
 }
@@ -2792,6 +2934,9 @@ function parseCLI() {
       "min-score": { type: "string" },
       all: { type: "boolean" },
       full: { type: "boolean" },
+      format: { type: "string" },          // preferred: --format cli|json|csv|md|xml|files
+      // Legacy boolean format aliases. Kept working for back-compat but
+      // omitted from the documented help; prefer `--format <kind>`.
       csv: { type: "boolean" },
       md: { type: "boolean" },
       xml: { type: "boolean" },
@@ -2813,7 +2958,9 @@ function parseCLI() {
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
-      "line-numbers": { type: "boolean" },  // add line numbers to output
+      "line-numbers": { type: "boolean" },  // add line numbers to output (search; default on for get/multi-get)
+      "no-line-numbers": { type: "boolean" },  // disable line numbers for get/multi-get
+      "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
@@ -2852,9 +2999,21 @@ function parseCLI() {
     }
   }
 
-  // Determine output format
+  // Determine output format. Prefer --format <kind>; fall back to the
+  // legacy boolean aliases (--csv/--md/--xml/--files/--json) which remain
+  // wired up for back-compat but are no longer documented.
   let format: OutputFormat = "cli";
-  if (values.csv) format = "csv";
+  const rawFormat = typeof values.format === "string" ? values.format.toLowerCase().trim() : "";
+  const VALID_FORMATS: ReadonlyArray<OutputFormat> = ["cli", "json", "csv", "md", "xml", "files"];
+  if (rawFormat) {
+    if ((VALID_FORMATS as ReadonlyArray<string>).includes(rawFormat)) {
+      format = rawFormat as OutputFormat;
+    } else {
+      console.error(`Unknown --format value: ${values.format}`);
+      console.error(`Valid: ${VALID_FORMATS.join(", ")}`);
+      process.exit(1);
+    }
+  } else if (values.csv) format = "csv";
   else if (values.md) format = "md";
   else if (values.xml) format = "xml";
   else if (values.files) format = "files";
@@ -2878,6 +3037,7 @@ function parseCLI() {
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
+    fullPath: !!values["full-path"],
   };
 
   return {
@@ -3309,7 +3469,7 @@ function showHelp(): void {
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
-  console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
+  console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
@@ -3377,16 +3537,19 @@ function showHelp(): void {
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
-  console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
+  console.log("  -n <num>                   - Max results (default 5, or 20 for --format files|json)");
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
-  console.log("  --line-numbers             - Include line numbers in output");
-  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
-  console.log("  --files | --json | --csv | --md | --xml  - Output format");
+  console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
+  console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
+  console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
+  console.log("                                Paths are ./-prefixed when under $PWD, absolute otherwise");
+  console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
+  console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
   console.log("Embed/query options:");
@@ -3395,7 +3558,7 @@ function showHelp(): void {
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
-  console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
+  console.log("  --format <kind>            - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -3529,7 +3692,8 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
-  add("QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT", "disables macOS JSON-query safe exit workaround; may re-expose Metal finalizer crashes");
+  add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
+  add("GGML_METAL_NO_RESIDENCY", "set automatically by the launcher on darwin to disable Metal residency sets (avoids ggml-org/llama.cpp#22593); override via QMD_METAL_KEEP_RESIDENCY=1");
   add("NO_COLOR", "disables colored terminal output");
   add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
   add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
@@ -3808,6 +3972,29 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
         : `${parts.join("; ")}. Next: check QMD_LLAMA_GPU and llama.cpp backend support`);
       if (!device.gpuOffloading) {
         nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
+      }
+
+      // Surface the darwin residency-set mitigation. libggml-metal's
+      // process-static device dtor asserts on un-expired residency sets
+      // during libc exit() (ggml-org/llama.cpp#22593), producing a giant
+      // stderr backtrace after correct output. The bin/qmd launcher exports
+      // GGML_METAL_NO_RESIDENCY=1 on darwin to skip the assertion entirely.
+      // No measurable perf cost on short-lived CLI calls.
+      if (device.gpu === "metal" && process.platform === "darwin") {
+        if (isDarwinMetalMitigationActive()) {
+          doctorCheck(
+            "darwin metal residency",
+            true,
+            "GGML_METAL_NO_RESIDENCY=1 set by launcher; clean process exit (avoids ggml-org/llama.cpp#22593). Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you run long-lived qmd processes."
+          );
+        } else {
+          doctorCheck(
+            "darwin metal residency",
+            false,
+            "residency sets active (QMD_METAL_KEEP_RESIDENCY=1 or launcher bypassed); llama-using commands may dump a libggml-metal backtrace at exit (ggml-org/llama.cpp#22593) even when output succeeded."
+          );
+          nextSteps.push("Unset `QMD_METAL_KEEP_RESIDENCY` so the launcher can disable Metal residency sets; without this, query/vsearch/embed dump a stack trace at exit even on success.");
+        }
       }
     } else {
       const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
@@ -4135,24 +4322,28 @@ if (isMain) {
 
     case "get": {
       if (!cli.args[0]) {
-        console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
+        console.error("Usage: qmd get <filepath>[:from[:count]] [--from <line>] [-l <lines>] [--no-line-numbers] [--full-path]");
         process.exit(1);
       }
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      // Line numbers default ON for get; opt out with --no-line-numbers.
+      const getLineNumbers = !cli.values["no-line-numbers"];
+      getDocument(cli.args[0], fromLine, maxLines, getLineNumbers, !!cli.values["full-path"]);
       break;
     }
 
     case "multi-get": {
       if (!cli.args[0]) {
-        console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
+        console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--no-line-numbers] [--full-path] [--format json|csv|md|xml|files]");
         console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
         process.exit(1);
       }
       const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
       const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
-      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      // Line numbers default ON for multi-get; opt out with --no-line-numbers.
+      const mgLineNumbers = !cli.values["no-line-numbers"];
+      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format, mgLineNumbers, !!cli.values["full-path"]);
       break;
     }
 

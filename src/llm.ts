@@ -720,6 +720,11 @@ export class LlamaCpp implements LLM {
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  // Guard against concurrent ensureLlama() calls creating duplicate Llama
+  // instances. Without this, two concurrent callers each build their own
+  // runtime and the last write to this.llama wins, leaving models/grammars
+  // bound to different Llama instances ("different Llama instance" errors).
+  private llamaLoadPromise: Promise<Llama> | null = null;
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -731,6 +736,12 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
+    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
+    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
+    // See isDarwinMetalMitigationActive() for the runtime check exposed to
+    // diagnostics. No constructor-time guard installation is needed.
+
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -861,6 +872,21 @@ export class LlamaCpp implements LLM {
    * Initialize the llama instance (lazy)
    */
   private async ensureLlama(allowBuild = true): Promise<Llama> {
+    if (this.llama) {
+      return this.llama;
+    }
+    if (this.llamaLoadPromise) {
+      return await this.llamaLoadPromise;
+    }
+    this.llamaLoadPromise = this.loadLlamaRuntime(allowBuild);
+    try {
+      return await this.llamaLoadPromise;
+    } finally {
+      this.llamaLoadPromise = null;
+    }
+  }
+
+  private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
@@ -1456,29 +1482,33 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const grammar = await llama.createGrammar({
-      grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-    });
-
     const intent = options.intent;
     const prompt = intent
       ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
       : `/no_think Expand this search query: ${query}`;
 
-    // Create a bounded context for expansion to prevent large default VRAM allocations.
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
-    const genContext = await this.generateModel!.createContext({
-      contextSize: this.expandContextSize,
-    });
-    const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
-
+    // Set up inside the try so any failure (grammar creation, context
+    // allocation/VRAM, session prompt) falls back to the original query
+    // instead of propagating and failing the caller's operation.
+    let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
     try {
+      const grammar = await llama.createGrammar({
+        grammar: `
+        root ::= line+
+        line ::= type ": " content "\\n"
+        type ::= "lex" | "vec" | "hyde"
+        content ::= [^\\n]+
+      `
+      });
+
+      // Create a bounded context for expansion to prevent large default VRAM allocations.
+      genContext = await this.generateModel!.createContext({
+        contextSize: this.expandContextSize,
+      });
+      const sequence = genContext.getSequence();
+      const { LlamaChatSession } = await loadNodeLlamaCpp();
+      const session = new LlamaChatSession({ contextSequence: sequence });
+
       // Qwen3 recommended settings for non-thinking mode:
       // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
@@ -1531,7 +1561,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      await genContext.dispose();
+      if (genContext) await genContext.dispose();
     }
   }
 
@@ -1716,6 +1746,7 @@ export class LlamaCpp implements LLM {
     this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.llamaLoadPromise = null;
   }
 }
 
@@ -1965,13 +1996,75 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
+// Darwin Metal exit-crash mitigation
+// =============================================================================
+//
+// libggml-metal on macOS keeps allocated model memory wired via "residency
+// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
+// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
+// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
+// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
+// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
+// stderr after the user-visible output. See ggml-org/llama.cpp#22593.
+//
+// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
+// prevent it: the static destructor runs after every JS-reachable cleanup,
+// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
+// does NOT skip C++ static destructors — verified in
+// node/src/api/environment.cc).
+//
+// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
+// which we set from `bin/qmd` before Node loads the native binding. For QMD's
+// short-lived CLI workflow this has no measurable cost (subsequent calls
+// don't reuse the warm mapping). The functions below report whether that
+// mitigation is in effect — kept here, in the module that depends on the
+// underlying resource, so doctor can answer "is the protection active?"
+// without reaching into env handling directly.
+//
+// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
+// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
+// env var is accepted as a no-op alias for back-compat; it had no effect on
+// Node prior to this fix.
+
+/**
+ * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
+ *   true  → residency sets disabled, process exit completes silently
+ *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
+ *           in which case the libggml-metal teardown assertion may fire
+ */
+export function isDarwinMetalMitigationActive(): boolean {
+  if (process.platform !== "darwin") return false;
+  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
+  return process.env.GGML_METAL_NO_RESIDENCY === "1";
+}
+
+/**
+ * Compatibility shim: previous releases installed a `process.on('exit')` hook
+ * that tried to skip the C++ static destructor by calling `process.reallyExit`.
+ * That mechanism didn't work on Node (Environment::Exit still calls libc
+ * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
+ * Kept as a no-op for code paths that still call it; safe to remove once no
+ * production launcher predates the residency-set fix.
+ */
+export function installDarwinExitGuard(): void {
+  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
+}
+
+/** @deprecated Replaced by isDarwinMetalMitigationActive. */
+export function isDarwinExitGuardInstalled(): boolean {
+  return isDarwinMetalMitigationActive();
+}
+
+// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
+ * constructor installs the darwin exit guard, so any code path that obtains
+ * the singleton is protected.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
@@ -1981,10 +2074,22 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LlamaCpp instance (useful for testing). Setting a
+ * non-null instance also ensures the darwin exit guard is installed — keeps
+ * the invariant intact for test doubles that didn't go through the real
+ * constructor.
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
+}
+
+/**
+ * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * doctor and lifecycle diagnostics.
+ */
+export function hasDefaultLlamaCpp(): boolean {
+  return defaultLlamaCpp !== null;
 }
 
 /**

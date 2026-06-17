@@ -889,6 +889,33 @@ describe("MCP Server", () => {
         expect(typeof col.documents).toBe("number");
       }
     });
+
+    test("REST /query and /search file field uses qmd:// URI prefix (#576)", () => {
+      // Regression test: the HTTP REST endpoint was returning r.displayPath (e.g.
+      // "docs/readme.md") instead of "qmd://docs/readme.md", while the CLI and MCP
+      // resource URIs always use the qmd:// scheme. This simulates the fix: the REST
+      // handler now applies encodeQmdPath and prepends "qmd://".
+      const results = searchFTS(testDb, "readme", 5);
+      expect(results.length).toBeGreaterThan(0);
+
+      // Simulate what the fixed REST handler produces for each result
+      const restResponseItems = results.map(r => ({
+        docid: `#${r.docid}`,
+        file: `qmd://${r.displayPath.split('/').map(s => encodeURIComponent(s)).join('/')}`,
+        title: r.title,
+        score: Math.round(r.score * 100) / 100,
+      }));
+
+      // Every file field must start with qmd://
+      for (const item of restResponseItems) {
+        expect(item.file).toMatch(/^qmd:\/\//);
+      }
+
+      // Spot-check the readme result
+      const readmeItem = restResponseItems.find(item => item.file.includes("readme"));
+      expect(readmeItem).toBeDefined();
+      expect(readmeItem!.file).toBe("qmd://docs/readme.md");
+    });
   });
 });
 

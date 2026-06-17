@@ -1312,7 +1312,10 @@ export async function reindexCollection(
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    const path = handelize(relativeFile);
+    // Store the literal relative path so the filesystem path can always be
+    // reconstructed as: resolve(collection.path, storedPath).
+    // handelize() is NOT applied at index time — it is display-only.
+    const path = normalizePathSeparators(relativeFile);
     seenPaths.add(path);
 
     let content: string;
@@ -2541,12 +2544,34 @@ export function findOrMigrateLegacyDocument(
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
-  const legacy = db.prepare(`
+  // Case-insensitive match (legacy normalization: e.g. "README.md" → "readme.md").
+  const legacyCase = db.prepare(`
     SELECT id, hash, title FROM documents
     WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
     ORDER BY id
     LIMIT 1
   `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+
+  // Handalized-path match: existing DBs indexed with handelize() stored slugged paths
+  // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
+  // Try matching the handalized form of the incoming raw path against the DB so that
+  // qmd update on an old index can rename the row to the literal path.
+  let legacyHandalized: { id: number; hash: string; title: string } | undefined;
+  try {
+    const handleized = handelize(path);
+    if (handleized !== path) {
+      legacyHandalized = db.prepare(`
+        SELECT id, hash, title FROM documents
+        WHERE collection = ? AND path = ? AND active = 1
+        ORDER BY id
+        LIMIT 1
+      `).get(collectionName, handleized) as { id: number; hash: string; title: string } | undefined;
+    }
+  } catch {
+    // handelize throws on invalid paths; just skip
+  }
+
+  const legacy = legacyCase ?? legacyHandalized;
   if (!legacy) return null;
 
   // Wrap rename + FTS rebuild in a transaction for atomicity.
@@ -3395,6 +3420,27 @@ function sanitizeHyphenatedTerm(term: string): string {
 }
 
 /**
+ * Check if a token is a dotted version/version-like string (e.g., 2026.4.10, 3.14.0).
+ * Returns true if splitting on dots yields at least 2 non-empty parts consisting of
+ * word/digit characters only. This avoids incorrectly splitting tokens with leading/
+ * trailing dots. Version strings like "2026.4.10" split into ["2026","4","10"] (3 parts).
+ */
+function isDottedToken(token: string): boolean {
+  const parts = token.split('.');
+  return parts.length >= 2 && parts.every(p => p.length > 0 && /^[\p{L}\p{N}_]+$/u.test(p));
+}
+
+/**
+ * Sanitize a dotted term into individual FTS5 tokens joined with AND.
+ * e.g. "2026.4.10" → '"2026"* AND "4"* AND "10"*'
+ * The AND ensures all parts must appear, matching how the porter tokenizer
+ * indexes dotted strings.
+ */
+function sanitizeDottedTerm(term: string): string {
+  return term.split('.').map(t => sanitizeFTS5Term(t)).filter(t => t).map(t => `"${t}"*`).join(' AND ');
+}
+
+/**
  * Parse lex query syntax into FTS5 query.
  *
  * Supports:
@@ -3468,6 +3514,24 @@ function buildFTS5Query(query: string): string | null {
             negative.push(ftsPhrase);
           } else {
             positive.push(ftsPhrase);
+          }
+        }
+      } else if (isDottedToken(term)) {
+        // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
+        // The porter tokenizer splits on dots, so the index has individual tokens.
+        // We AND all parts together so the query matches documents containing all parts.
+        const sanitized = sanitizeDottedTerm(term);
+        if (sanitized) {
+          // sanitizeDottedTerm already wraps each part in quotes with prefix match
+          if (negated) {
+            // Wrap multi-token AND expression in parens for NOT negation
+            negative.push(`(${sanitized})`);
+          } else {
+            // Flatten individual AND'd terms into the positive list so they combine
+            // correctly with other terms (avoids double-wrapping in outer AND).
+            for (const part of sanitized.split(' AND ')) {
+              positive.push(part.trim());
+            }
           }
         }
       } else if (containsCjk(term)) {

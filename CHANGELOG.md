@@ -2,6 +2,131 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- README: documented collection filtering (`-c` semantics), the `collection
+  show`/`include`/`exclude`/`update-cmd` subcommands, the `--intent`/`--no-rerank`/
+  `-C`/`--full-path` search flags, the `--format <kind>` output selector (with the
+  legacy `--json`/`--csv`/`--md`/`--xml`/`--files` booleans noted as aliases),
+  `vector-search`/`deep-search` aliases, embed
+  memory flags (`--max-docs-per-batch`/`--max-batch-mb`), a sample `--explain`
+  score trace, the `qmd doctor`/`qmd init` commands, the `get` `:from:count`
+  suffix and `--no-line-numbers`, an MCP tool parameter reference, and a
+  Benchmarking section for `qmd bench`.
+- docs/SYNTAX.md: removed the non-existent `q` MCP parameter example (the `query`
+  tool and REST endpoint accept only the `searches` array) and added a Scoping
+  section.
+- README: removed the misleading `qmd update --pull` example. The `--pull` flag is
+  parsed but never consumed (`updateCollections()` ignores it); the real mechanism
+  for running `git pull` before re-indexing is a per-collection `update` command,
+  set via `qmd collection update-cmd`.
+
+### Fixed
+
+- MCP server instructions now tell agents to scope with the plural `collections`
+  parameter (matching the schema). The previous singular `collection` hint led
+  agents to pass a parameter that Zod silently strips, producing unscoped results.
+  The `get` instruction line also now documents the full `file.md:from:count`
+  range suffix instead of only the single-line `file.md:100` offset.
+
+- Filesystem paths with special characters (`#`, `&`, spaces, `[]`, `()`, etc.)
+  now round-trip correctly through index → search → get. Previously
+  `reindexCollection` called `handelize()` on relative paths before storing
+  them, turning `# Meeting - 234232 3432 __ 5.md` into
+  `Meeting-234232-3432-5.md` and making `qmd get <actual-path>`,
+  `qmd get --full-path`, and `qmd ls` return dead or garbled paths. Paths are
+  now stored verbatim. Existing indexes auto-migrate on the next `qmd update`.
+
+- FTS5 search now correctly matches dotted version strings like `2026.4.10`. The
+  `porter unicode61` tokenizer splits on dots (storing `2026`, `4`, `10` as
+  separate tokens), but the query sanitizer was stripping dots and producing
+  `2026410` which never matched. Dotted terms are now split and ANDed together
+  so version-string searches work as expected (#563).
+- HTTP REST endpoints `/query` and `/search` now return `qmd://collection/path`
+  URIs in the `file` field, matching the output format used by the CLI and MCP
+  resource URIs. Previously the raw `displayPath` (`collection/path`) was
+  returned without the scheme prefix (#576).
+- The embed session `maxDuration` is now env-configurable via
+  `QMD_EMBED_MAX_DURATION_MS` (default: 30 min). This prevents large-corpus
+  embeddings from being aborted by the hardcoded 30-minute ceiling (#673).
+
+## [2.5.3] - 2026-05-28
+
+### Features
+
+- `qmd get` now accepts a `:from:count` suffix on a path or docid (e.g.
+  `qmd get "#abc123:120:40"` reads 40 lines starting at line 120). Explicit
+  `--from`/`-l` flags still override the suffix. The MCP `get` tool accepts the
+  same suffix.
+- `qmd get` and `qmd multi-get` are now **line-numbered by default** and print
+  the document's `#docid` and `qmd://` path in the output header. Disable line
+  numbers with `--no-line-numbers`. The MCP `get`/`multi_get` tools default
+  `lineNumbers` to `true` to match.
+- `qmd multi-get` now includes the `#docid` in every output format
+  (`--md`, `--json`, `--csv`, `--xml`, `--files`, and the default CLI view),
+  consistent with `qmd search`.
+- `qmd get` and `qmd multi-get` accept `--full-path`, which replaces the
+  `qmd://` path + `#docid` with the document's on-disk filesystem path (handy for
+  piping into `Read`/`Edit`/an editor). Falls back to the canonical `qmd://` +
+  docid header when the file no longer exists on disk.
+- `qmd search` / `qmd query` now show a clearer hit identifier: the default CLI
+  view (and the new `**file:**` line in `--md` output) always prints the full
+  `qmd://collection/path` URI so you can pipe it straight back into `qmd get`.
+- `qmd search` / `qmd query` accept `--full-path` with the same semantics as
+  `qmd get`: the result label becomes the file's on-disk path — `./`-prefixed
+  relative path when the file lives in a subfolder of `$PWD`, absolute realpath
+  otherwise — and the per-result `#docid` is dropped because the path is the
+  identifier. The leading `./` is intentional so the output is unambiguously a
+  filesystem path. Applies to all output formats.
+- `qmd get` and `qmd multi-get` now also use the `./`-prefixed convention when
+  `--full-path` renders a path under `$PWD`, matching `search`/`query`.
+- New `--format <kind>` flag selects the output format (`cli` | `json` | `csv` |
+  `md` | `xml` | `files`) for `search`, `query`, and `multi-get`. The legacy
+  boolean aliases (`--json`/`--csv`/`--md`/`--xml`/`--files`) still work but are
+  no longer in `--help`; prefer `--format`.
+
+### Fixes
+
+- Launcher: source-mode runner selection now prefers Node + tsx over Bun when
+  both `package-lock.json` and `bun.lock` are present in the package root,
+  mirroring the dist-mode "npm priority" rule. Fixes pnpm-global installs that
+  copy the entire working tree (including `.git` and `bun.lock`) into the
+  install dir and previously routed through Bun, causing ABI mismatches with
+  the Node-built `better-sqlite3` / `sqlite-vec` native modules.
+- Darwin Metal: llama-using commands (`query`, `vsearch`, `embed`) no longer
+  dump a multi-kB GGML/Metal backtrace at process exit even when output
+  succeeded. The libggml-metal static `ggml_metal_device` destructor asserts
+  `[rsets->data count] == 0` during `__cxa_finalize_ranges`, but the
+  buffer-free path never calls the symmetric `ggml_metal_device_rsets_rm`
+  to remove released rsets from the device collection (upstream
+  ggml-org/llama.cpp#22593, one-line fix open as PR #22595). The assertion
+  only fires when `process.exit()` skips Node's `beforeExit` hook, which is
+  what node-llama-cpp uses to auto-dispose Metal contexts. Primary fix:
+  `finishSuccessfulCliCommand` now sets `process.exitCode = 0` and returns
+  instead of calling `process.exit(0)`, so `beforeExit` fires and the native
+  binding cleans up before libc's static destructor runs. Defense-in-depth:
+  the launcher (`bin/qmd`) and the npm test driver (`scripts/test-all.mjs`
+  + the `test:bun` / `test:unit` package.json scripts) also set
+  `GGML_METAL_NO_RESIDENCY=1` on darwin before spawning node/bun, covering
+  error paths and tests that still terminate via `process.exit()`. The env
+  var must be set before node/bun start — libggml-metal reads it via libc
+  `getenv` at module-load time, and Bun does not propagate `process.env`
+  mutations to libc `setenv` — so it lives in the launcher rather than in
+  test-preload. Residency sets give no measurable speedup for QMD's
+  short-lived CLI workflow (benchmarked on M3 Pro). Opt back in with
+  `QMD_METAL_KEEP_RESIDENCY=1` for long-lived qmd processes (e.g. the MCP
+  daemon may benefit on hot reload) or to triage the upstream fix.
+  `qmd doctor` reports the mitigation state. Minimal reproduction:
+  `scripts/repro-metal-rsets-crash.mjs`.
+
+### Docs
+
+- qmd skill: emphasize reading line ranges with `get`'s built-in
+  `:from:count` suffix / `--from`/`-l` flags instead of piping through
+  `sed`/`head`/`tail`; cite the docid and line numbers now present in retrieval
+  output; and author structured `intent:`/`lex:`/`vec:`/`hyde:` queries yourself
+  rather than relying on built-in query expansion.
+
 ## [2.5.2] - 2026-05-22
 
 ### Fixes

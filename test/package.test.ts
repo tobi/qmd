@@ -60,7 +60,8 @@ describe("package grammar distribution", () => {
     expect(firstSixtyLines).toContain('qmd multi-get "#abc123,#def432"');
     expect(firstSixtyLines).toContain("Retrieved:");
     expect(firstSixtyLines).toContain("qmd query");
-    expect(firstSixtyLines).toContain("structured queries");
+    // The skill must teach structured, self-authored queries near the top.
+    expect(firstSixtyLines).toContain("Default to structured");
 
     const scriptPath = join(root.pathname, "scripts", "check-package-grammars.mjs");
     const script = readFileSync(scriptPath, "utf8");

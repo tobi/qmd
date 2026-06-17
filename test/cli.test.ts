@@ -639,7 +639,7 @@ describe("CLI Status Command", () => {
       QMD_EMBED_CONTEXT_SIZE: "1024",
       QMD_EDITOR_URI: "vscode://file/{file}:{line}:{col}",
       QMD_SKILLS_DIR: "/tmp/qmd-skills",
-      QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT: "1",
+      QMD_METAL_KEEP_RESIDENCY: "1",
       NO_COLOR: "1",
       CI: "1",
       HF_ENDPOINT: "https://hf-mirror.com",
@@ -866,6 +866,69 @@ describe("CLI Multi-Get Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Project");
     expect(stdout).toContain("Team Meeting");
+  });
+
+  test("--md output includes a #docid for each file", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--md"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    // Every result carries a docid line, consistent with `search --md`.
+    expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
+  });
+
+  test("--json output includes a #docid for each file", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--json"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.docid).toMatch(/^#[a-f0-9]{6}$/);
+    }
+  });
+
+  test("shows line numbers by default and --no-line-numbers disables them", async () => {
+    const withNums = await runQmd(["multi-get", "README.md"], { dbPath: localDbPath });
+    expect(withNums.exitCode).toBe(0);
+    expect(withNums.stdout).toMatch(/^1: /m);
+
+    const raw = await runQmd(["multi-get", "README.md", "--no-line-numbers"], { dbPath: localDbPath });
+    expect(raw.exitCode).toBe(0);
+    expect(raw.stdout).not.toMatch(/^1: /m);
+  });
+
+  test("--full-path --md shows ./-prefixed on-disk paths and drops the docid", async () => {
+    // Default runQmd cwd is fixturesDir, so notes/*.md files are subpaths.
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--md", "--full-path"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    // Headings are ./-prefixed relative paths under fixturesDir.
+    expect(stdout).toMatch(/^## \.\/notes\/[^\s]+\.md$/m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/\*\*docid:\*\*/);
+  });
+
+  test("--full-path --json puts the ./-prefixed path in `file` and omits docid", async () => {
+    const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--json", "--full-path"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.file.startsWith("./notes/")).toBe(true);
+      expect(entry.docid).toBeUndefined();
+    }
+  });
+
+  test("--full-path --json uses absolute path when files are outside $PWD", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["multi-get", "notes/*.md", "--json", "--full-path"],
+      { dbPath: localDbPath, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const entry of parsed) {
+      expect(entry.file.startsWith("/")).toBe(true);
+      expect(entry.file).not.toMatch(/^\.\//);
+      expect(entry.docid).toBeUndefined();
+    }
   });
 });
 
@@ -1591,12 +1654,15 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
-  test("search --md includes docid and context", async () => {
+  test("search --md includes docid, context, and qmd:// file line", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "--md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
 
     expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
     expect(stdout).toContain("**context:** Test fixtures for QMD");
+    // The file path must be a qmd:// URI so the model can pipe it back into
+    // `qmd get` without having to reassemble a collection-relative string.
+    expect(stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
   });
 
   test("search --xml includes qmd:// path, docid, and context", async () => {
@@ -1610,6 +1676,93 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
+  test("search --full-path --json swaps qmd:// for absolute realpath when cwd is unrelated", async () => {
+    // Use "/" as cwd so the fixtures path (under tmpdir) is NOT a subpath of $PWD.
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--json", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    const result = results[0];
+    expect(result.file).not.toMatch(/^qmd:\/\//);
+    // Must be an absolute path ending in .md.
+    expect(result.file).toMatch(/^\/.+\.md$/);
+    // --full-path: the on-disk path replaces the docid as the identifier.
+    expect(result.docid).toBeUndefined();
+  });
+
+  test("search --full-path --json uses ./-prefixed $PWD-relative path when in a parent of the file", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--json", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: fixturesDir }
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    const result = results[0];
+    expect(result.file).not.toMatch(/^qmd:\/\//);
+    // Must start with "./" so it's unambiguously a filesystem path and not
+    // mistaken for a bare collection-relative string.
+    expect(result.file.startsWith("./")).toBe(true);
+    expect(result.file).not.toMatch(/^\.\.\//);
+    expect(result.file).toMatch(/\.md$/);
+  });
+
+  test("search --full-path default CLI format shows on-disk path and drops the docid", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    // eslint-disable-next-line no-control-regex
+    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
+    const plain = stripAnsi(stdout);
+    expect(plain).not.toMatch(/qmd:\/\//);
+    expect(plain).toMatch(/^\/.+\.md/m);
+    // No `#docid` suffix when --full-path is set.
+    expect(plain).not.toMatch(/#[a-f0-9]{6}\s*$/m);
+  });
+
+  test("search --full-path --md uses on-disk path in heading and drops the docid", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "test", "--full-path", "--md", "-n", "1"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toMatch(/qmd:\/\//);
+    expect(stdout).not.toMatch(/\*\*docid:\*\*/);
+    expect(stdout).toMatch(/\*\*file:\*\* `\/.+\.md`/);
+  });
+
+  test("search --format json matches the legacy --json behavior", async () => {
+    const a = await runQmd(["search", "test", "--format", "json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    const b = await runQmd(["search", "test", "--json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(a.exitCode).toBe(0);
+    expect(b.exitCode).toBe(0);
+    // Both must yield valid JSON with at least one result.
+    const ar = JSON.parse(a.stdout);
+    const br = JSON.parse(b.stdout);
+    expect(ar.length).toBeGreaterThan(0);
+    expect(br.length).toBeGreaterThan(0);
+    // Identical first-result file path (the rest may differ in score formatting only).
+    expect(ar[0].file).toBe(br[0].file);
+  });
+
+  test("search --format md works equivalent to legacy --md", async () => {
+    const a = await runQmd(["search", "test", "--format", "md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(a.exitCode).toBe(0);
+    expect(a.stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
+    expect(a.stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
+  });
+
+  test("search --format with an unknown kind fails cleanly", async () => {
+    const { exitCode, stderr } = await runQmd(["search", "test", "--format", "yaml", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Unknown --format value");
+  });
+
   test("search default CLI format includes plain qmd:// path, docid, and context in non-TTY mode", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1621,6 +1774,14 @@ describe("search output formats", () => {
     // Ensure no full filesystem paths
     expect(stdout).not.toMatch(/\/Users\//);
     expect(stdout).not.toMatch(/\/home\//);
+    // The visible path must NOT be the bare collection-relative form
+    // (a leading `${collName}/foo.md` would be "relative to nowhere").
+    // Strip ANSI and OSC 8 sequences then assert no result line starts with
+    // a bare collection-relative path missing the qmd:// scheme.
+    // eslint-disable-next-line no-control-regex
+    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
+    const plain = stripAnsi(stdout);
+    expect(plain).not.toMatch(new RegExp(`^${collName}/`, "m"));
   });
 });
 
@@ -1718,6 +1879,104 @@ describe("get command path normalization", () => {
     expect(exitCode).toBe(0);
     // Should start from line 3, not line 1
     expect(stdout).not.toMatch(/^# Test Document 1$/m);
+  });
+
+  test("get with path:from:count format reads a bounded range", async () => {
+    // Lines: 1 "# Test Document 1", 5 "It has multiple lines...",
+    //        6 "Line 6 is here.", 7 "Line 7 is here."
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).toContain("Line 6 is here.");
+    // Bounded to 2 lines: must not include the start of the file or line 7
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+    expect(stdout).not.toContain("Line 7 is here.");
+  });
+
+  test("get with qmd://path:from:count format reads a bounded range", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).toContain("Line 6 is here.");
+    expect(stdout).not.toMatch(/^# Test Document 1$/m);
+    expect(stdout).not.toContain("Line 7 is here.");
+  });
+
+  test("explicit -l overrides the :count in path:from:count", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`, "-l", "1"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("It has multiple lines");
+    expect(stdout).not.toContain("Line 6 is here.");
+  });
+
+  test("get header includes canonical qmd:// path and a #docid", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // First line of output identifies the document by path + docid.
+    expect(stdout).toMatch(new RegExp(`^qmd://${collName}/test1\\.md\\s+#[a-f0-9]{6}`, "m"));
+  });
+
+  test("get shows line numbers by default", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^1: # Test Document 1$/m);
+    expect(stdout).toMatch(/^6: Line 6 is here\.$/m);
+  });
+
+  test("get --no-line-numbers returns raw content", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "--no-line-numbers"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toMatch(/^1: /m);
+    expect(stdout).toMatch(/^# Test Document 1$/m);
+  });
+
+  test("get line numbers reflect the start line of a range", async () => {
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md:5:2`], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    // Numbering starts at the requested line, not at 1.
+    expect(stdout).toMatch(/^5: It has multiple lines/m);
+    expect(stdout).not.toMatch(/^1: /m);
+  });
+
+  test("get --full-path shows ./-prefixed path when file is under $PWD", async () => {
+    // Default runQmd cwd is fixturesDir, and test1.md lives in fixturesDir,
+    // so the rendered path must be relative-with-./ prefix.
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "--full-path"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^\.\/test1\.md$/m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/#[a-f0-9]{6}/);
+    // Body still present and line-numbered.
+    expect(stdout).toMatch(/^1: # Test Document 1$/m);
+  });
+
+  test("get --full-path shows absolute path when file is outside $PWD", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["get", `${collName}/test1.md`, "--full-path"],
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+    );
+    expect(exitCode).toBe(0);
+    // Absolute realpath (allow macOS /var → /private/var).
+    expect(stdout).toMatch(/^\/.+\/test1\.md$/m);
+    expect(stdout).not.toMatch(/^\.\//m);
+    expect(stdout).not.toContain("qmd://");
+    expect(stdout).not.toMatch(/#[a-f0-9]{6}/);
+  });
+
+  test("get --full-path falls back to qmd:// + docid when the file is gone", async () => {
+    // Index a doc, then delete the underlying file so the fs path no longer exists.
+    const env = await createIsolatedTestEnv("full-path-fallback");
+    const collectionDir = join(testDir, `gone-fixtures-${Date.now()}`);
+    await mkdir(collectionDir, { recursive: true });
+    const gonePath = join(collectionDir, "gone.md");
+    await writeFile(gonePath, "# Gone\n\nbody line\n");
+    const add = await runQmd(["collection", "add", collectionDir, "--name", "gonecoll"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+    await rm(gonePath);
+
+    const { stdout, exitCode } = await runQmd(["get", "gonecoll/gone.md", "--full-path"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(new RegExp(`^qmd://gonecoll/gone\\.md\\s+#[a-f0-9]{6}`, "m"));
   });
 });
 

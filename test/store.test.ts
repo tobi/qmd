@@ -1604,6 +1604,39 @@ describe("FTS Search", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS matches dotted version strings like 2026.4.10 (#563)", async () => {
+    // Regression test: porter unicode61 tokenizer splits on dots, so the index
+    // stores "2026", "4", "10" as separate tokens. Before the fix, sanitizeFTS5Term
+    // stripped the dots producing "2026410" which never matched anything.
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "release-notes",
+      title: "Release Notes",
+      body: "## Release 2026.4.10\n\nThis version introduces new features and bug fixes.",
+      displayPath: "test/release-notes.md",
+    });
+
+    // A document that does NOT contain the version string
+    await insertTestDocument(store.db, collectionName, {
+      name: "other-doc",
+      title: "Other Document",
+      body: "Unrelated content about gardening and cooking.",
+      displayPath: "test/other.md",
+    });
+
+    const results = store.searchFTS("2026.4.10", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.map(r => r.displayPath)).toContain(`${collectionName}/test/release-notes.md`);
+
+    // Partial version should also work
+    const partial = store.searchFTS("2026.4", 10);
+    expect(partial.map(r => r.displayPath)).toContain(`${collectionName}/test/release-notes.md`);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
@@ -2091,6 +2124,26 @@ describe("Snippet Extraction", () => {
     expect(linesBefore).toBe(0);  // Nothing before
     expect(snippetLines).toBe(3); // First, Second, Third (bestLine-1 to bestLine+3, clamped)
     expect(linesAfter).toBe(2);   // Fourth, Fifth
+  });
+
+  test("extractSnippet with leading blank/frontmatter lines reports 1 before, not 0", () => {
+    // Regression: a user looked at `@@ -2,4 @@ (1 before, 72 after)` and
+    // suspected "1 before" was wrong because the match appeared to be the
+    // topmost visible line. The math takes "before" from the absolute file
+    // line, not from the visible portion of the snippet — so when the
+    // snippet starts at line 2, "1 before" is the correct count. Lock that
+    // in with a 77-line document whose match sits on line 3.
+    const otherLines = Array.from({ length: 72 }, (_, i) => `body line ${i + 6}`).join("\n");
+    const body = `---\ntitle: Notes\n# Heading with keyword\nIntro paragraph.\nMore intro lines.\n${otherLines}`;
+
+    const { line, linesBefore, snippetLines, linesAfter, snippet } =
+      extractSnippet(body, "keyword", 500);
+
+    expect(line).toBe(3);             // match is on line 3
+    expect(linesBefore).toBe(1);      // exactly one line above the 4-line snippet window
+    expect(snippetLines).toBe(4);     // lines 2..5 form the snippet
+    expect(linesAfter).toBe(72);      // remaining body
+    expect(snippet).toContain("@@ -2,4 @@ (1 before, 72 after)");
   });
 
   test("extractSnippet at document end shows 0 after", () => {

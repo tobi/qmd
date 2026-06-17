@@ -226,6 +226,21 @@ describe("bin/qmd package wrapper", () => {
     expect(result.args).toEqual([realpathSync(join(packageRoot, "src", "cli", "qmd.ts")), "--version"]);
   });
 
+  test("source checkout with both bun.lock and package-lock.json prefers node+tsx", () => {
+    // Mirrors the dist-mode "npm priority" rule: a working tree that has both
+    // lockfiles (because the user ran `npm install` against a repo that also
+    // ships bun.lock) installed native modules for Node's ABI, so source mode
+    // must route through tsx to avoid better-sqlite3 / sqlite-vec mismatches.
+    const { root, runtimeBin, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "qmd", ["bun.lock", "package-lock.json"], { source: true, tsx: true, git: true });
+
+    const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
+
+    expect(result.runtime).toBe("node");
+    expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs")));
+    expect(result.args).toEqual([realpathSync(join(packageRoot, "src", "cli", "qmd.ts")), "--version"]);
+  });
+
   test("explains how to build when dist is missing and source cannot run", () => {
     const { root, runtimeBin } = makeTempFixture();
     const packageRoot = makePackage(root, "qmd", [], { dist: false });
