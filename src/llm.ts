@@ -1462,29 +1462,33 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const grammar = await llama.createGrammar({
-      grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-    });
-
     const intent = options.intent;
     const prompt = intent
       ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
       : `/no_think Expand this search query: ${query}`;
 
-    // Create a bounded context for expansion to prevent large default VRAM allocations.
-    const genContext = await this.generateModel!.createContext({
-      contextSize: this.expandContextSize,
-    });
-    const sequence = genContext.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
-    const session = new LlamaChatSession({ contextSequence: sequence });
-
+    // Set up inside the try so any failure (grammar creation, context
+    // allocation/VRAM, session prompt) falls back to the original query
+    // instead of propagating and failing the caller's operation.
+    let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
     try {
+      const grammar = await llama.createGrammar({
+        grammar: `
+        root ::= line+
+        line ::= type ": " content "\\n"
+        type ::= "lex" | "vec" | "hyde"
+        content ::= [^\\n]+
+      `
+      });
+
+      // Create a bounded context for expansion to prevent large default VRAM allocations.
+      genContext = await this.generateModel!.createContext({
+        contextSize: this.expandContextSize,
+      });
+      const sequence = genContext.getSequence();
+      const { LlamaChatSession } = await loadNodeLlamaCpp();
+      const session = new LlamaChatSession({ contextSequence: sequence });
+
       // Qwen3 recommended settings for non-thinking mode:
       // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
@@ -1537,7 +1541,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      await genContext.dispose();
+      if (genContext) await genContext.dispose();
     }
   }
 
