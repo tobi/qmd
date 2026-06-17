@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
+import * as remoteTokenizerModule from "../src/remote/tokenizer.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
@@ -1370,6 +1371,29 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS can skip body/context for retrieval-only paths", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      body: "searchable content",
+      displayPath: "doc1.md",
+    });
+
+    const results = store.searchFTS("searchable", 10, collectionName, {
+      includeBody: false,
+      includeContext: false,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.body).toBeUndefined();
+    expect(results[0]?.context).toBeNull();
+    expect(results[0]?.bodyLength).toBeGreaterThan(0);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS finds CJK documents by exact and mixed queries", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -2327,6 +2351,32 @@ describe("Reciprocal Rank Fusion", () => {
 // =============================================================================
 
 describe("Reindex Collection", () => {
+  test("stores source metadata so unchanged files can be skipped on later runs", async () => {
+    const store = await createTestStore();
+    const collectionName = "docs";
+    const collectionPath = join(testDir, `incremental-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+
+    const filepath = join(collectionPath, "note.md");
+    await writeFile(filepath, "# Incremental\n\nSame content");
+
+    const firstResult = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+    expect(firstResult.indexed).toBe(1);
+
+    const firstRow = store.db.prepare(`
+      SELECT source_mtime_ms, source_size
+      FROM documents
+      WHERE collection = ? AND path = ?
+    `).get(collectionName, "note.md") as { source_mtime_ms: number; source_size: number };
+    expect(firstRow.source_mtime_ms).toBeGreaterThan(0);
+    expect(firstRow.source_size).toBeGreaterThan(0);
+
+    const secondResult = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+    expect(secondResult).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+
+    await cleanupTestDb(store);
+  });
+
   test("preserves document id and embeddings when file path changes only by case", async () => {
     const store = await createTestStore();
     const collectionName = "docs";
@@ -2911,6 +2961,41 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchVec supports precomputed embeddings without hydrating body/context", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    const hash = "hash-precomputed";
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      hash,
+      body: "Content for precomputed vector search",
+      displayPath: "doc1.md",
+    });
+
+    store.ensureVecTable(3);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array([0.1, 0.2, 0.3]));
+
+    const results = await store.searchVec(
+      "ignored query",
+      "embeddinggemma",
+      10,
+      collectionName,
+      undefined,
+      [0.1, 0.2, 0.3],
+      undefined,
+      { includeBody: false, includeContext: false },
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.body).toBeUndefined();
+    expect(results[0]?.context).toBeNull();
+    expect(results[0]?.bodyLength).toBeGreaterThan(0);
+
+    await cleanupTestDb(store);
+  });
+
   // Regression test for https://github.com/tobi/qmd/pull/23
   // sqlite-vec virtual tables hang when combined with JOINs in the same query.
   // The fix uses a two-step approach: vector query first, then separate JOINs.
@@ -3398,20 +3483,26 @@ describe("Embedding batching", () => {
   test("vectorSearchQuery uses the active llm embed model for vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
+      embedding: [1, 2, 3],
+      model,
+    })));
     const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
 
     store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
-    store.llm = { embedModelName: model } as any;
+    store.llm = { embedModelName: model, embedBatch: embedBatchSpy } as any;
     store.searchVec = searchVecSpy as any;
     store.expandQuery = vi.fn(async () => []) as any;
 
     try {
       await vectorSearchQuery(store, "custom query", { limit: 7, minScore: 0 });
 
+      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("custom query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
       expect(searchVecSpy.mock.calls[0]?.[2]).toBe(7);
+      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
     } finally {
       await cleanupTestDb(store);
     }
@@ -3500,6 +3591,15 @@ describe("Embedding batching", () => {
 
 describe("Token chunking guardrails", () => {
   test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
+    const saved = {
+      remoteTokenizer: process.env.QMD_REMOTE_TOKENIZER,
+      embedBaseUrl: process.env.QMD_EMBED_BASE_URL,
+      embedModel: process.env.QMD_EMBED_MODEL,
+    };
+    process.env.QMD_REMOTE_TOKENIZER = "off";
+    delete process.env.QMD_EMBED_BASE_URL;
+    delete process.env.QMD_EMBED_MODEL;
+
     setDefaultLlamaCpp({
       async tokenize(text: string) {
         return Array.from({ length: text.length }, () => 1);
@@ -3518,6 +3618,62 @@ describe("Token chunking guardrails", () => {
         expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     } finally {
+      if (saved.remoteTokenizer === undefined) delete process.env.QMD_REMOTE_TOKENIZER;
+      else process.env.QMD_REMOTE_TOKENIZER = saved.remoteTokenizer;
+      if (saved.embedBaseUrl === undefined) delete process.env.QMD_EMBED_BASE_URL;
+      else process.env.QMD_EMBED_BASE_URL = saved.embedBaseUrl;
+      if (saved.embedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = saved.embedModel;
+
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens uses remote tokenizer endpoints when available", async () => {
+    const saved = {
+      remoteTokenizer: process.env.QMD_REMOTE_TOKENIZER,
+      embedBaseUrl: process.env.QMD_EMBED_BASE_URL,
+      embedModel: process.env.QMD_EMBED_MODEL,
+    };
+
+    process.env.QMD_REMOTE_TOKENIZER = "auto";
+    process.env.QMD_EMBED_BASE_URL = "http://unit-test-remote/v1";
+    process.env.QMD_EMBED_MODEL = "unit-test-model";
+
+    const availableSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteTokenizerAvailable")
+      .mockResolvedValue(true);
+    const tokenizeSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteTokenize")
+      .mockImplementation(async (_cfg, text) => Array.from({ length: text.length }, () => 1));
+    const detokenizeSpy = vi
+      .spyOn(remoteTokenizerModule, "remoteDetokenize")
+      .mockImplementation(async (_cfg, tokens) => "x".repeat(tokens.length));
+
+    try {
+      setDefaultLlamaCpp({
+        embedCfg: {
+          baseUrl: "http://unit-test-remote/v1",
+          model: "unit-test-model",
+        },
+      } as any);
+
+      const chunks = await chunkDocumentByTokens("x".repeat(900), 80, 10, 20);
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.tokens <= 80)).toBe(true);
+      expect(availableSpy).toHaveBeenCalled();
+      expect(tokenizeSpy).toHaveBeenCalled();
+    } finally {
+      if (saved.remoteTokenizer === undefined) delete process.env.QMD_REMOTE_TOKENIZER;
+      else process.env.QMD_REMOTE_TOKENIZER = saved.remoteTokenizer;
+      if (saved.embedBaseUrl === undefined) delete process.env.QMD_EMBED_BASE_URL;
+      else process.env.QMD_EMBED_BASE_URL = saved.embedBaseUrl;
+      if (saved.embedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = saved.embedModel;
+
+      availableSpy.mockRestore();
+      tokenizeSpy.mockRestore();
+      detokenizeSpy.mockRestore();
       setDefaultLlamaCpp(null);
     }
   });

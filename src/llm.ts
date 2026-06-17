@@ -4,6 +4,7 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
+import type { ModelsConfig } from './collections.js';
 import type {
   Llama,
   LlamaModel,
@@ -87,12 +88,24 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * Detect if a model URI refers to a remote API model (not a local GGUF model).
+ * Remote models handle their own prompt formatting, so no prefixes should be added.
+ * Returns true for model names that don't start with "hf:" and don't end in ".gguf".
+ */
+export function isRemoteModel(modelUri: string): boolean {
+  // Local models use hf: URIs (HuggingFace) or local file paths ending in .gguf
+  return !modelUri.startsWith("hf:") && !modelUri.endsWith(".gguf");
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * Remote models receive raw text — they handle their own formatting.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -103,9 +116,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields (default).
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
+ * Remote models receive raw text — they handle their own formatting.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -212,7 +227,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -520,9 +535,33 @@ export async function pullModels(
  */
 export interface LLM {
   /**
+   * Get the embedding model identifier string.
+   * Used by the store to pass model name to searchVec and other operations.
+   */
+  readonly embedModelName: string;
+
+  /**
+   * Get the generate model identifier string (optional).
+   * Used by the store for query expansion model fallback.
+   */
+  readonly generateModelName?: string;
+
+  /**
+   * Get the rerank model identifier string (optional).
+   * Used by the store for reranking model fallback.
+   */
+  readonly rerankModelName?: string;
+
+  /**
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for multiple texts in one batch call.
+   * Returns results in the same order as input texts.
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -538,7 +577,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -1739,11 +1778,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1779,7 +1818,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): LLM {
     return this.llm;
   }
 }
@@ -1952,7 +1991,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2036,36 +2075,144 @@ export function isDarwinExitGuardInstalled(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// NoopLlamaCpp — stub that throws helpful errors when remote is configured
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
-
 /**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * No-op LLM stub returned by getDefaultLlamaCpp() when a remote LLM provider
+ * is configured. This prevents accidental native llama.cpp compilation.
+ *
+ * Embed methods throw descriptive errors directing the user to use RemoteLLM.
+ * Query expansion and reranking return empty results (no-op).
+ * generate() returns null — text generation is not available without a local model.
+ *
+ * This class is never used directly by application code. It exists solely as a
+ * safety net: if any code path bypasses the isRemoteConfigured() guards and calls
+ * getDefaultLlamaCpp(), it gets a clear error instead of a native build.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
-  if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+export class NoopLlamaCpp implements LLM {
+  static readonly instance = new NoopLlamaCpp();
+  readonly embedModelName = 'noop-remote';
+
+  async embed(): Promise<EmbeddingResult | null> {
+    throw new Error(
+      'Remote LLM configured — no local embed model available. ' +
+      'Use RemoteLLM or configure the store with an LLM instance.'
+    );
   }
-  return defaultLlamaCpp;
+
+  async embedBatch(): Promise<(EmbeddingResult | null)[]> {
+    throw new Error(
+      'Remote LLM configured — no local embed model available. ' +
+      'Use RemoteLLM or configure the store with an LLM instance.'
+    );
+  }
+
+  async generate(): Promise<GenerateResult | null> {
+    return null;
+  }
+
+  async modelExists(): Promise<ModelInfo> {
+    return { name: 'remote', exists: true };
+  }
+
+  async expandQuery(): Promise<Queryable[]> {
+    return [];
+  }
+
+  async rerank(): Promise<RerankResult> {
+    return { results: [], model: 'remote' };
+  }
+
+  async dispose() {}
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
- * non-null instance also ensures the darwin exit guard is installed — keeps
- * the invariant intact for test doubles that didn't go through the real
- * constructor.
+ * Check whether any remote LLM endpoint is configured.
+ *
+ * Examines environment variables and YAML models config to determine if
+ * the user intends to use remote endpoints instead of local GGUF models.
+ * Used by getDefaultLlamaCpp() to decide whether to return a NoopLlamaCpp
+ * stub, and by chunkDocumentByTokens() to select the tokenization strategy.
+ *
+ * Detection triggers (any one suffices):
+ *   - Env vars: OPENAI_BASE_URL, QMD_EMBED_PROVIDER=remote, QMD_EMBED_BASE_URL,
+ *     QMD_EXPAND_BASE_URL, QMD_RERANK_BASE_URL, QMD_GENERATE_BASE_URL
+ *   - YAML config: embed_api_url, expand_api_url, rerank_api_url, generate_api_url
+ *
+ * @param models - Optional YAML models config from loadConfig()
+ * @returns true if any remote endpoint is configured
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function isRemoteConfigured(models?: ModelsConfig): boolean {
+  return !!(
+    process.env.OPENAI_BASE_URL ||
+    process.env.QMD_EMBED_PROVIDER === 'remote' ||
+    process.env.QMD_EMBED_BASE_URL ||
+    process.env.QMD_EXPAND_BASE_URL ||
+    process.env.QMD_RERANK_BASE_URL ||
+    process.env.QMD_GENERATE_BASE_URL ||
+    models?.embed_api_url ||
+    models?.expand_api_url ||
+    models?.rerank_api_url ||
+    models?.generate_api_url
+  );
+}
+
+// =============================================================================
+// Singleton for default LLM instance
+// =============================================================================
+
+/**
+ * Global singleton LLM instance.
+ *
+ * Lifecycle: Set once during store creation (by createStore or CLI getStore).
+ * May be a LlamaCpp (local), RemoteLLM (remote), or NoopLlamaCpp (stub).
+ * Callers should use getDefaultLlamaCpp() which handles lazy initialization
+ * and remote-fallback logic.
+ */
+let defaultLlamaCpp: LLM | null = null;
+
+/**
+ * Get the default LLM instance (creates a LlamaCpp if none is set).
+ *
+ * When a remote LLM is configured (detected via isRemoteConfigured()),
+ * returns a NoopLlamaCpp stub that throws descriptive errors instead of
+ * building a local llama.cpp instance. This prevents accidental native
+ * compilation when a remote provider is in use.
+ *
+ * Return type is `LlamaCpp` for backward compatibility — callers that
+ * use LlamaCpp-specific methods (like tokenize()) are guarded by
+ * isRemoteConfigured() checks at each call site.
+ *
+ * @returns The active LLM instance (never null — throws if uninitialized)
+ */
+export function getDefaultLlamaCpp(): LlamaCpp {
+  // When a remote LLM is configured, skip local model entirely
+  if (isRemoteConfigured()) {
+    return NoopLlamaCpp.instance as unknown as LlamaCpp;
+  }
+  if (!defaultLlamaCpp) {
+    defaultLlamaCpp = new LlamaCpp();
+  }
+  return defaultLlamaCpp as LlamaCpp;
+}
+
+/**
+ * Set the global default LLM instance.
+ *
+ * Accepts any LLM implementation — LlamaCpp (local), RemoteLLM (remote),
+ * or null to clear. Used by CLI getStore() to inject a RemoteLLM, and
+ * by LocalEmbeddingProvider to register itself as the default.
+ *
+ * @param llm - The LLM instance to set as default, or null to clear
+ */
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 
 /**
- * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * Peek at the default LLM instance without instantiating one. Used by
  * doctor and lifecycle diagnostics.
  */
 export function hasDefaultLlamaCpp(): boolean {
@@ -2073,8 +2220,12 @@ export function hasDefaultLlamaCpp(): boolean {
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
- * Call this before process exit to prevent NAPI crashes.
+ * Dispose the default LLM instance if it exists.
+ *
+ * Call this before process exit to prevent NAPI crashes from native
+ * llama.cpp backends. For RemoteLLM, dispose() is a no-op.
+ *
+ * @returns Promise that resolves when disposal is complete
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
   if (defaultLlamaCpp) {

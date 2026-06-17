@@ -1,6 +1,5 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
-import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -28,7 +27,6 @@ import {
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
-  hashContent,
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
@@ -43,15 +41,6 @@ import {
   isVirtualPath,
   resolveVirtualPath,
   toVirtualPath,
-  insertContent,
-  insertDocument,
-  findActiveDocument,
-  findOrMigrateLegacyDocument,
-  updateDocumentTitle,
-  updateDocument,
-  deactivateDocument,
-  getActiveDocumentPaths,
-  cleanupOrphanedContent,
   deleteLLMCache,
   deleteInactiveDocuments,
   cleanupOrphanedVectors,
@@ -81,7 +70,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, isRemoteConfigured } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../embedding-provider.js";
+import { buildBearerHeaders, nodeGet, nodePost } from "../remote/transport.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -134,11 +125,19 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      if (isRemoteConfigured(config.models)) {
+        // Remote LLM configured via env vars — use RemoteLLM instead of LlamaCpp
+        const remoteConfig = remoteConfigFromEnv(config.models);
+        const remoteLlm = new RemoteLLM(remoteConfig);
+        store.llm = remoteLlm;
+        setDefaultLlamaCpp(remoteLlm);
+      } else {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -464,6 +463,213 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
+type ModelEndpoint = 'embed' | 'expand' | 'rerank' | 'generate';
+
+type ResolvedModelEndpoint = {
+  model: string;
+  provider: string;
+  source: string;
+  baseUrl: string;
+  apiKey: string;
+  format: string;
+};
+
+type RemoteConnectionStatus = {
+  state: 'ok' | 'error';
+  detail: string;
+  latencyMs?: number;
+};
+
+function isStatusVerbose(): boolean {
+  const raw = process.env.QMD_STATUS_VERBOSE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function trimTrailingSlashes(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
+function appendPath(baseUrl: string, suffix: string): string {
+  return `${trimTrailingSlashes(baseUrl)}${suffix}`;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function buildMetadataProbeCandidates(baseUrl: string, format: string): string[] {
+  const trimmed = trimTrailingSlashes(baseUrl);
+  const lowerFormat = format.toLowerCase();
+  const ollamaLike = lowerFormat.startsWith('ollama_') || trimmed.includes(':11434') || trimmed.includes('/api');
+
+  const modelsCandidates = [appendPath(trimmed, '/models')];
+  if (trimmed.endsWith('/v1')) {
+    modelsCandidates.push(`${trimmed.slice(0, -3)}/models`);
+  }
+
+  const tagsCandidates = [
+    appendPath(trimmed, '/api/tags'),
+    appendPath(trimmed, '/tags'),
+  ];
+  if (trimmed.endsWith('/v1')) {
+    tagsCandidates.push(`${trimmed.slice(0, -3)}/api/tags`);
+  }
+
+  return ollamaLike
+    ? uniqueStrings([...tagsCandidates, ...modelsCandidates])
+    : uniqueStrings([...modelsCandidates, ...tagsCandidates]);
+}
+
+function buildRerankProbeCandidates(baseUrl: string): string[] {
+  const trimmed = trimTrailingSlashes(baseUrl);
+  const candidates = [appendPath(trimmed, '/rerank')];
+  if (trimmed.endsWith('/v1')) {
+    candidates.push(`${trimmed.slice(0, -3)}/rerank`);
+  } else {
+    candidates.push(appendPath(trimmed, '/v1/rerank'));
+  }
+  return uniqueStrings(candidates);
+}
+
+function extractModelIdsFromProbeResponse(data: unknown): string[] {
+  if (!data || typeof data !== 'object') return [];
+  const record = data as Record<string, unknown>;
+
+  const dataRows = Array.isArray(record.data) ? record.data : null;
+  if (dataRows) {
+    const ids = dataRows
+      .map((item) => (item && typeof item === 'object' ? (item as Record<string, unknown>).id : undefined))
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (ids.length > 0) return ids;
+  }
+
+  const models = Array.isArray(record.models) ? record.models : null;
+  if (models) {
+    const ids = models.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const row = item as Record<string, unknown>;
+      const out: string[] = [];
+      if (typeof row.name === 'string' && row.name.length > 0) out.push(row.name);
+      if (typeof row.model === 'string' && row.model.length > 0) out.push(row.model);
+      return out;
+    });
+    if (ids.length > 0) return ids;
+  }
+
+  return [];
+}
+
+function hasRerankResults(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+  const record = data as Record<string, unknown>;
+  return Array.isArray(record.results) || Array.isArray(record.data);
+}
+
+async function probeRerankRequest(
+  resolved: ResolvedModelEndpoint,
+  timeoutMs: number,
+): Promise<RemoteConnectionStatus> {
+  const verbose = isStatusVerbose();
+  const candidates = buildRerankProbeCandidates(resolved.baseUrl);
+  const headers = buildBearerHeaders(resolved.apiKey);
+  const body = {
+    model: resolved.model,
+    query: 'qmd status probe',
+    documents: ['qmd status probe document'],
+    top_n: 1,
+  };
+  let lastError = 'rerank endpoint unreachable';
+
+  for (const endpoint of candidates) {
+    const start = Date.now();
+    try {
+      const response = await nodePost(endpoint, headers, body, timeoutMs);
+      const latencyMs = Date.now() - start;
+      if (!hasRerankResults(response)) {
+        return {
+          state: 'error',
+          detail: verbose ? `${endpoint} responded without rerank results` : 'rerank probe malformed response',
+          latencyMs,
+        };
+      }
+      return {
+        state: 'ok',
+        detail: verbose ? `${endpoint} accepted rerank request` : 'rerank probe ok',
+        latencyMs,
+      };
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      lastError = sanitizeDiagnosticMessage(raw);
+    }
+  }
+
+  return { state: 'error', detail: lastError };
+}
+
+function modelNameMatches(availableId: string, configuredModel: string): boolean {
+  const a = availableId.trim();
+  const b = configuredModel.trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // Ollama tags: "model" in config can match "model:latest" from /api/tags.
+  if (a.startsWith(`${b}:`) || b.startsWith(`${a}:`)) return true;
+  return false;
+}
+
+async function probeRemoteModelEndpoint(
+  endpointRole: ModelEndpoint,
+  resolved: ResolvedModelEndpoint,
+): Promise<RemoteConnectionStatus> {
+  const timeoutMs = parseInt(process.env.QMD_STATUS_REMOTE_TIMEOUT_MS || '2500', 10);
+  const verbose = isStatusVerbose();
+  const candidates = buildMetadataProbeCandidates(resolved.baseUrl, resolved.format);
+  let lastError = 'unreachable';
+
+  for (const endpoint of candidates) {
+    const start = Date.now();
+    try {
+      const response = await nodeGet(endpoint, buildBearerHeaders(resolved.apiKey), timeoutMs);
+      const latencyMs = Date.now() - start;
+      const availableIds = extractModelIdsFromProbeResponse(response);
+      if (availableIds.length === 0) {
+        return { state: 'ok', detail: verbose ? `${endpoint} reachable` : 'metadata reachable', latencyMs };
+      }
+      const exists = availableIds.some((id) => modelNameMatches(id, resolved.model));
+      if (!exists && endpointRole === 'rerank') {
+        const rerankProbe = await probeRerankRequest(resolved, timeoutMs);
+        if (rerankProbe.state === 'ok') {
+          return {
+            state: 'ok',
+            detail: verbose
+              ? `${endpoint} reachable; model not listed in metadata, but ${rerankProbe.detail}`
+              : `metadata miss; ${rerankProbe.detail}`,
+            latencyMs: rerankProbe.latencyMs ?? latencyMs,
+          };
+        }
+        return {
+          state: 'error',
+          detail: verbose
+            ? `${endpoint} reachable; model not listed; ${rerankProbe.detail}`
+            : `metadata miss; ${rerankProbe.detail}`,
+          latencyMs: rerankProbe.latencyMs ?? latencyMs,
+        };
+      }
+      return {
+        state: exists ? 'ok' : 'error',
+        detail: exists
+          ? (verbose ? `${endpoint} reachable; model found` : 'metadata lists model')
+          : (verbose ? `${endpoint} reachable; model not listed` : 'metadata miss (model not listed)'),
+        latencyMs,
+      };
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      lastError = sanitizeDiagnosticMessage(raw);
+    }
+  }
+
+  return { state: 'error', detail: lastError };
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -604,18 +810,147 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
+  // Models — read config + env vars directly (no auto-save via ensureModelsConfiguredForCli)
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
+    const config = loadConfig();
+    const models = config.models ?? {};
+    const remoteCfg = remoteConfigFromEnv(models);
+    const endpointCfgByRole: Record<ModelEndpoint, { baseUrl: string; model: string; apiKey?: string; format?: string }> = {
+      embed: remoteCfg.embed!,
+      expand: remoteCfg.expand!,
+      rerank: remoteCfg.rerank!,
+      generate: remoteCfg.generate!,
     };
-    const activeModels = resolveModelsForCli();
+
+    // Env var mapping for each endpoint
+    const envMap: Record<ModelEndpoint, { model: string; baseUrl: string; apiKey: string; format: string }> = {
+      embed:    { model: 'QMD_EMBED_MODEL',    baseUrl: 'QMD_EMBED_BASE_URL',    apiKey: 'QMD_EMBED_API_KEY',    format: 'QMD_EMBED_API_FORMAT' },
+      expand:   { model: 'QMD_EXPAND_MODEL',   baseUrl: 'QMD_EXPAND_BASE_URL',   apiKey: 'QMD_EXPAND_API_KEY',   format: 'QMD_EXPAND_API_FORMAT' },
+      rerank:   { model: 'QMD_RERANK_MODEL',   baseUrl: 'QMD_RERANK_BASE_URL',   apiKey: 'QMD_RERANK_API_KEY',   format: 'QMD_RERANK_API_FORMAT' },
+      generate: { model: 'QMD_GENERATE_MODEL', baseUrl: 'QMD_GENERATE_BASE_URL', apiKey: 'QMD_GENERATE_API_KEY', format: 'QMD_GENERATE_API_FORMAT' },
+    };
+
+    // Config field mapping
+    const cfgMap: Record<ModelEndpoint, { model: string; url: string; key: string; format: string; flat?: string }> = {
+      embed:    { model: 'embed_api_model',    url: 'embed_api_url',    key: 'embed_api_key',    format: 'embed_api_format',    flat: 'embed' },
+      expand:   { model: 'expand_api_model',   url: 'expand_api_url',   key: 'expand_api_key',   format: 'expand_api_format' },
+      rerank:   { model: 'rerank_api_model',   url: 'rerank_api_url',   key: 'rerank_api_key',   format: 'rerank_api_format',   flat: 'rerank' },
+      generate: { model: 'generate_api_model', url: 'generate_api_url', key: 'generate_api_key', format: 'generate_api_format', flat: 'generate' },
+    };
+
+    // Default GGUF models
+    const defaults: Record<ModelEndpoint, string> = {
+      embed: DEFAULT_EMBED_MODEL,
+      expand: DEFAULT_QUERY_MODEL,
+      rerank: DEFAULT_RERANK_MODEL,
+      generate: DEFAULT_QUERY_MODEL,
+    };
+
+    // Determine provider label from URL
+    const providerLabel = (url: string): string => {
+      if (!url) return 'local (GGUF)';
+      try {
+        const u = new URL(url);
+        const host = u.hostname + (u.port && u.port !== '80' && u.port !== '443' ? `:${u.port}` : '');
+        if (u.hostname.includes('openrouter.ai')) return 'OpenRouter';
+        if (u.hostname.includes('api.openai.com')) return 'OpenAI';
+        if (u.hostname.includes('ollama')) return 'Ollama';
+        if (u.hostname.includes('api.x.ai')) return 'xAI';
+        return host;
+      } catch {
+        return url;
+      }
+    };
+
+    // Resolve each endpoint's model name, provider, and source tag
+    const resolveEndpoint = (ep: ModelEndpoint): ResolvedModelEndpoint => {
+      const env = envMap[ep];
+      const cfg = cfgMap[ep];
+      const envModel = process.env[env.model];
+      const envUrl = process.env[env.baseUrl];
+      const envKey = process.env[env.apiKey];
+      const envFormat = process.env[env.format];
+      const cfgModel = (models as Record<string, string | undefined>)[cfg.model];
+      const cfgUrl = (models as Record<string, string | undefined>)[cfg.url];
+      const cfgKey = (models as Record<string, string | undefined>)[cfg.key];
+      const cfgFormat = (models as Record<string, string | undefined>)[cfg.format];
+      const flatModel = cfg.flat ? (models as Record<string, string | undefined>)[cfg.flat] : undefined;
+      const fallback = endpointCfgByRole[ep];
+      const baseUrl = (envUrl || cfgUrl || fallback.baseUrl || '').trim();
+      const apiKey = (envKey || cfgKey || fallback.apiKey || '').trim();
+      const format = (envFormat || cfgFormat || fallback.format || 'auto').trim();
+      const provider = providerLabel(baseUrl);
+
+      // Source priority: env var > config (remote or flat) > default
+      if (envModel || envUrl) {
+        return {
+          model: envModel || cfgModel || defaults[ep],
+          provider,
+          source: `(env ${env.model})`,
+          baseUrl,
+          apiKey,
+          format,
+        };
+      }
+      if (cfgModel || cfgUrl) {
+        return {
+          model: cfgModel || flatModel || defaults[ep],
+          provider,
+          source: '(index.yml)',
+          baseUrl,
+          apiKey,
+          format,
+        };
+      }
+      if (flatModel) {
+        return {
+          model: flatModel,
+          provider,
+          source: '(index.yml)',
+          baseUrl,
+          apiKey,
+          format,
+        };
+      }
+      return {
+        model: defaults[ep],
+        provider,
+        source: '(default)',
+        baseUrl,
+        apiKey,
+        format,
+      };
+    };
+
+    const labelWidth = 11; // "Embed:     " = 11 chars
+    const eps: { ep: ModelEndpoint; label: string }[] = [
+      { ep: 'embed',   label: 'Embed:' },
+      { ep: 'expand',  label: 'Expand:' },
+      { ep: 'rerank',  label: 'Rerank:' },
+      { ep: 'generate', label: 'Generate:' },
+    ];
+    const resolvedEndpoints = eps.map(({ ep, label }) => ({ ep, label, resolved: resolveEndpoint(ep) }));
+    const probePromises = new Map<ModelEndpoint, Promise<RemoteConnectionStatus>>();
+    for (const { ep, resolved } of resolvedEndpoints) {
+      if (resolved.baseUrl) probePromises.set(ep, probeRemoteModelEndpoint(ep, resolved));
+    }
+
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    for (const { ep, label, resolved } of resolvedEndpoints) {
+      const { model, provider, source } = resolved;
+      const pad = ' '.repeat(Math.max(0, labelWidth - label.length));
+      console.log(`  ${label}${pad} ${c.cyan}${model}${c.reset} → ${c.dim}${provider}${c.reset} ${c.yellow}${source}${c.reset}`);
+
+      if (!resolved.baseUrl) {
+        console.log(`  ${' '.repeat(labelWidth)} ${c.dim}Connection: local (no remote endpoint configured)${c.reset}`);
+        continue;
+      }
+
+      const status = await probePromises.get(ep)!;
+      const statusColor = status.state === 'ok' ? c.green : c.yellow;
+      const latency = status.latencyMs !== undefined ? ` (${formatMs(status.latencyMs)})` : '';
+      console.log(`  ${' '.repeat(labelWidth)} ${c.dim}Connection:${c.reset} ${statusColor}${status.state}${c.reset}${latency} ${c.dim}— ${status.detail}${c.reset}`);
+    }
   }
 
 
@@ -1777,10 +2112,9 @@ function collectionRename(oldName: string, newName: string): void {
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
-  const db = getDb();
   const resolvedPwd = pwd || getPwd();
-  const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  const store = getStore();
+  const db = store.db;
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1793,119 +2127,28 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
-    ...(ignorePatterns || []),
-  ];
-  const allFiles: string[] = await fastGlob(globPattern, {
-    cwd: resolvedPwd,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: allIgnore,
-  });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
-
-  const total = files.length;
-  const hasNoFiles = total === 0;
-  if (hasNoFiles) {
-    progress.clear();
-    console.log("No files found matching pattern.");
-    // Continue so the deactivation pass can mark previously indexed docs as inactive.
-  }
-
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
-  const seenPaths = new Set<string>();
   const startTime = Date.now();
-
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    // Store the literal relative path — handelize() is NOT applied at index time.
-    const path = relativeFile.replace(/\\/g, '/');
-    seenPaths.add(path);
-
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
-      processed++;
-      progress.set((processed / total) * 100);
-      continue;
-    }
-
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
-
-    if (existing) {
-      if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-      } else {
-        // Content changed - insert new content hash and update document
-        insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
+  const result = await reindexCollection(store, resolvedPwd, globPattern, collectionName, {
+    ignorePatterns,
+    onProgress: (info) => {
+      if (info.total > 0) {
+        progress.set((info.current / info.total) * 100);
       }
-    } else {
-      // New document - insert content and document
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-    }
-
-    processed++;
-    progress.set((processed / total) * 100);
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
-  }
-
-  // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
-    }
-  }
-
-  // Clean up orphaned content hashes (content not referenced by any document)
-  const orphanedContent = cleanupOrphanedContent(db);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = info.current > 0 && elapsed > 0 ? info.current / elapsed : 0;
+      const remaining = rate > 0 ? (info.total - info.current) / rate : 0;
+      const eta = info.current > 2 && rate > 0 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+    },
+  });
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
-  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
-  if (orphanedContent > 0) {
-    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+  if (result.orphanedCleaned > 0) {
+    console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
@@ -1939,22 +2182,10 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  // Read-only resolution: config + env + defaults, no auto-save
   try {
     const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    return resolveModels(config.models);
   } catch {
     return resolveModels();
   }
@@ -3603,6 +3834,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
   add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
+  add("QMD_STATUS_VERBOSE", "shows full per-endpoint diagnostics in `qmd status` model connection output");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
   add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
@@ -4249,7 +4481,12 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          if (!cli.args[1]) {
+            console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
+            console.error("  Refusing to index the current working directory implicitly.");
+            process.exit(1);
+          }
+          const pwd = cli.args[1];
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
