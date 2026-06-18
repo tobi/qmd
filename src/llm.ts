@@ -1,7 +1,8 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - LLM abstraction layer for QMD
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings through an OpenAI-compatible API by default, with optional
+ * local GGUF embeddings plus local text generation and reranking via node-llama-cpp.
  */
 
 import type {
@@ -88,7 +89,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 
 /**
  * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma (default).
+ * Uses generic search task prefix format for default external embedding models.
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
@@ -246,10 +247,9 @@ export type RerankDocument = {
 // Model Configuration
 // =============================================================================
 
-// HuggingFace model URIs for node-llama-cpp
-// Format: hf:<user>/<repo>/<file>
-// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+// Embeddings use NVIDIA's OpenAI-compatible API by default.
+// Set QMD_ENABLE_LOCAL_MODELS=1 before using any local node-llama-cpp GGUF models.
+const DEFAULT_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -295,6 +295,26 @@ const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
   : join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
+
+const DEFAULT_EMBED_API_BASE_URL = "https://integrate.api.nvidia.com/v1";
+
+export function localModelsEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.QMD_ENABLE_LOCAL_MODELS ?? "");
+}
+
+function isLocalEmbeddingModel(model: string): boolean {
+  return model.startsWith("hf:") || model.endsWith(".gguf") || model.startsWith("/") || model.startsWith("./") || model.startsWith("../");
+}
+
+export function approximateTokenCount(text: string): number {
+  if (text.length === 0) return 0;
+  return Math.max(1, Math.ceil(text.length / 3));
+}
+
+export function truncateByApproxTokens(text: string, maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  return text.slice(0, Math.max(1, maxTokens * 3));
+}
 
 export type PullResult = {
   model: string;
@@ -558,6 +578,8 @@ export interface LLM {
 
 export type LlamaCppConfig = {
   embedModel?: string;
+  embedApiBaseUrl?: string;
+  embedApiKey?: string;
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
@@ -700,6 +722,8 @@ export class LlamaCpp implements LLM {
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
   private embedModelUri: string;
+  private embedApiBaseUrl: string;
+  private embedApiKey?: string;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
@@ -725,6 +749,11 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
+    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.embedApiBaseUrl = (config.embedApiBaseUrl || process.env.QMD_EMBED_API_BASE_URL || process.env.OPENAI_BASE_URL || DEFAULT_EMBED_API_BASE_URL).replace(/\/+$/, "");
+    this.embedApiKey = config.embedApiKey || process.env.QMD_EMBED_API_KEY || process.env.NVIDIA_API_KEY || process.env.OPENAI_API_KEY;
+    this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+    this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
     // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
     // on darwin BEFORE the native binding loads, which prevents the libggml-metal
     // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
@@ -744,6 +773,9 @@ export class LlamaCpp implements LLM {
     return this.embedModelUri;
   }
 
+  get usesLocalEmbedding(): boolean {
+    return isLocalEmbeddingModel(this.embedModelUri);
+    
   get generateModelName(): string {
     return this.generateModelUri;
   }
@@ -991,6 +1023,9 @@ export class LlamaCpp implements LLM {
    * Load embedding model (lazy)
    */
   private async ensureEmbedModel(): Promise<LlamaModel> {
+    if (!this.usesLocalEmbedding) {
+      throw new Error("Local embedding model requested while external embedding API is active");
+    }
     if (this.embedModel) {
       return this.embedModel;
     }
@@ -1228,10 +1263,17 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   /**
-   * Tokenize text using the embedding model's tokenizer
-   * Returns tokenizer tokens (opaque type from node-llama-cpp)
+   * Tokenize text using the embedding model's tokenizer when local embeddings
+   * are explicitly active. External embedding mode uses a conservative
+   * approximation and must not load a local tokenizer.
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    if (!this.usesLocalEmbedding) {
+      return Array.from(
+        { length: approximateTokenCount(text) },
+        (_, index) => index as unknown as LlamaToken,
+      );
+    }
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1240,17 +1282,25 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Count tokens in text using the embedding model's tokenizer
+   * Count tokens in text. External embedding mode uses an approximation so
+   * chunking never pulls in a local GGUF tokenizer by accident.
    */
   async countTokens(text: string): Promise<number> {
+    if (!this.usesLocalEmbedding) {
+      return approximateTokenCount(text);
+    }
     const tokens = await this.tokenize(text);
     return tokens.length;
   }
 
   /**
-   * Detokenize token IDs back to text
+   * Detokenize token IDs back to text. External embedding mode has no local
+   * tokenizer, so return an approximate-width placeholder for guardrail paths.
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    if (!this.usesLocalEmbedding) {
+      return " ".repeat(tokens.length * 3);
+    }
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1294,7 +1344,66 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
+  private isNvidiaEmbedApi(): boolean {
+    return /(^|\.)nvidia\.com$/i.test(new URL(this.embedApiBaseUrl).hostname);
+  }
+
+  private async embedExternal(texts: string[], model: string, options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+    if (!this.embedApiKey) {
+      throw new Error(
+        "External embedding API key is required. Set NVIDIA_API_KEY, QMD_EMBED_API_KEY, or OPENAI_API_KEY. " +
+        "For local embeddings, set QMD_EMBED_MODEL to an hf: or .gguf model URI."
+      );
+    }
+
+    const response = await fetch(`${this.embedApiBaseUrl}/embeddings`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.embedApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input: texts,
+        ...(this.isNvidiaEmbedApi() ? { input_type: options.isQuery ? "query" : "passage" } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Embedding API request failed: ${response.status} ${response.statusText}${body ? `\n${body}` : ""}`);
+    }
+
+    const payload = await response.json() as {
+      data?: { index?: number; embedding?: number[] }[];
+      model?: string;
+    };
+    const byIndex = new Map<number, number[]>();
+    const data = payload.data ?? [];
+    for (let i = 0; i < data.length; i++) {
+      const item = data[i]!;
+      if (Array.isArray(item.embedding)) {
+        byIndex.set(typeof item.index === "number" ? item.index : i, item.embedding);
+      }
+    }
+
+    return texts.map((_, index) => {
+      const embedding = byIndex.get(index);
+      return embedding ? { embedding, model: payload.model ?? model } : null;
+    });
+  }
+
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const model = options.model ?? this.embedModelUri;
+    if (!localModelsEnabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_ENABLE_LOCAL_MODELS=1 to use local GGUF models.");
+    }
+    if (!isLocalEmbeddingModel(model)) {
+      const results = await this.embedExternal([text], model, options);
+      return results[0] ?? null;
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1311,7 +1420,7 @@ export class LlamaCpp implements LLM {
 
       return {
         embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
+        model,
       };
     } catch (error) {
       console.error("Embedding error:", error);
@@ -1324,6 +1433,14 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    const model = options.model ?? this.embedModelUri;
+    if (!localModelsEnabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_ENABLE_LOCAL_MODELS=1 to use local GGUF models.");
+    }
+    if (!isLocalEmbeddingModel(model)) {
+      return this.embedExternal(texts, model, options);
+    }
+
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1346,7 +1463,7 @@ export class LlamaCpp implements LLM {
             }
             const embedding = await context.getEmbeddingFor(safeText);
             this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+            embeddings.push({ embedding: Array.from(embedding.vector), model });
           } catch (err) {
             console.error("Embedding error for text:", err);
             embeddings.push(null);
@@ -1373,7 +1490,7 @@ export class LlamaCpp implements LLM {
               }
               const embedding = await ctx.getEmbeddingFor(safeText);
               this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+              results.push({ embedding: Array.from(embedding.vector), model });
             } catch (err) {
               console.error("Embedding error for text:", err);
               results.push(null);
@@ -1452,6 +1569,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (!localModelsEnabled()) return [];
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1556,6 +1674,12 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (!localModelsEnabled()) {
+      return {
+        model: "disabled",
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0, index })),
+      };
+    }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();

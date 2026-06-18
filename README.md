@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking. Embeddings use an external OpenAI-compatible API by default; local GGUF embedding models are optional.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -505,26 +505,45 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   brew install sqlite
   ```
 
-### GGUF Models (via node-llama-cpp)
+### Models
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+QMD uses NVIDIA NIM's OpenAI-compatible `/embeddings` API for vector embeddings
+by default. Configure it with:
+
+```sh
+export NVIDIA_API_KEY="..."
+export QMD_EMBED_API_BASE_URL="https://integrate.api.nvidia.com/v1"
+export QMD_EMBED_MODEL="nvidia/llama-nemotron-embed-1b-v2"
+```
+
+QMD reads `NVIDIA_API_KEY` when `QMD_EMBED_API_KEY` is not set and sends
+NVIDIA's required `input_type` automatically (`passage` while indexing, `query`
+while searching).
+
+Local GGUF models are disabled by default. In the default mode QMD rejects local
+embedding model URIs, skips local query expansion, and search reranking uses RRF
+scores only while still using the configured external embedding service for
+vector search.
+
+Set `QMD_ENABLE_LOCAL_MODELS=1` to opt into local GGUF model loading. The first
+query expansion or reranking call can download and load the configured local
+model, which may take a while.
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
-### Custom Embedding Model
+### Local Embedding Model
 
-Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
-This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
-`embeddinggemma-300M` has limited coverage.
+Set `QMD_ENABLE_LOCAL_MODELS=1` and `QMD_EMBED_MODEL` to an `hf:` URI or `.gguf`
+path to opt into local node-llama-cpp embeddings.
 
 ```sh
-# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
+# Use Qwen3-Embedding-0.6B locally
+export QMD_ENABLE_LOCAL_MODELS=1
 export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
 
 # After changing the model, re-embed all collections:
@@ -532,7 +551,8 @@ qmd embed -f
 ```
 
 Supported model families:
-- **embeddinggemma** (default) — English-optimized, small footprint
+- **OpenAI-compatible embedding APIs** — default path
+- **embeddinggemma** — optional local model, English-optimized, small footprint
 - **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
 
 > **Note:** When switching embedding models, you must re-index with `qmd embed -f`
@@ -993,8 +1013,8 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                           "title | text"        embedBatch()
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► Embedding API ──► Store Vectors
+                │                           "title | text"        /embeddings
                 │
                 └─► Chunks stored with:
                     - hash: document hash
@@ -1086,12 +1106,22 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured in `src/llm.ts` as HuggingFace URIs:
+Models are configured in `src/llm.ts`:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+```
+
+YAML configuration can override those defaults; see `example-index.yml` for a complete config file:
+
+```yaml
+models:
+  embed: nvidia/llama-nemotron-embed-1b-v2
+  # Optional local models, used only when QMD_ENABLE_LOCAL_MODELS=1:
+  # rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  # generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
 ```
 
 ### EmbeddingGemma Prompt Format
