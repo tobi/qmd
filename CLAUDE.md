@@ -96,7 +96,16 @@ qmd get abc123              # Leading # is optional
 qmd multi-get "#abc123, #def456"
 ```
 
-## Options
+## Environment Variables
+
+### General
+- `QMD_LLAMA_GPU`: Set GPU backend (e.g., `cuda`, `vulkan`, `false`).
+- `QMD_LLAMA_RELEASE`: Set the `llama.cpp` release to use (e.g., `master` for latest, or a specific commit hash).
+
+### Models
+- `QMD_EMBED_MODEL`: Override the default embedding model.
+- `QMD_RERANK_MODEL`: Override the default reranking model.
+- `QMD_GENERATE_MODEL`: Override the default generation model.
 
 ```sh
 # Search & retrieval
