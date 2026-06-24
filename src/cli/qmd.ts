@@ -2279,6 +2279,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         console.log(`${c.dim}Explain: fts=[${ftsScores}] vec=[${vecScores}]${c.reset}`);
         console.log(`${c.dim}  RRF: total=${formatExplainNumber(explain.rrf.totalScore)} base=${formatExplainNumber(explain.rrf.baseScore)} bonus=${formatExplainNumber(explain.rrf.topRankBonus)} rank=${explain.rrf.rank}${c.reset}`);
         console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
+        if (explain.titleBoost !== 1) {
+          console.log(`${c.dim}  Title boost: ${formatExplainNumber(explain.titleBoost)}x (applied to ranking before final score)${c.reset}`);
+        }
         if (contribSummary.length > 0) {
           console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
         }
