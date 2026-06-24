@@ -32,6 +32,9 @@ import {
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 
+const DEFAULT_MCP_HTTP_SESSION_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_MCP_HTTP_MAX_SESSIONS = 64;
+
 // =============================================================================
 // Types for structured content
 // =============================================================================
@@ -70,6 +73,16 @@ type StatusResult = {
 function encodeQmdPath(path: string): string {
   // Encode each path segment separately to preserve slashes
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+function readNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return fallback;
+
+  return parsed;
 }
 
 /**
@@ -631,9 +644,62 @@ export async function startMcpHttpServer(
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
 
+  const sessionTtlMs = readNonNegativeIntegerEnv("QMD_MCP_SESSION_TTL_MS", DEFAULT_MCP_HTTP_SESSION_TTL_MS);
+  const maxSessions = readNonNegativeIntegerEnv("QMD_MCP_MAX_SESSIONS", DEFAULT_MCP_HTTP_MAX_SESSIONS);
+  const startTime = Date.now();
+  const quiet = options?.quiet ?? false;
+
+  /** Format timestamp for request logging */
+  function ts(): string {
+    return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
+  }
+
+  function log(msg: string): void {
+    if (!quiet) console.error(msg);
+  }
+
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+  const sessionLastSeen = new Map<string, number>();
+
+  async function closeSession(sessionId: string, reason: string): Promise<void> {
+    const transport = sessions.get(sessionId);
+    sessions.delete(sessionId);
+    sessionLastSeen.delete(sessionId);
+
+    if (!transport) return;
+
+    try {
+      await transport.close();
+    } catch (err) {
+      log(`${ts()} Failed to close session ${sessionId} (${reason}): ${String(err)}`);
+    }
+  }
+
+  async function reapSessions(reserveSlot: boolean): Promise<void> {
+    const now = Date.now();
+
+    if (sessionTtlMs > 0) {
+      for (const [sessionId, lastSeen] of sessionLastSeen) {
+        if (now - lastSeen >= sessionTtlMs) {
+          await closeSession(sessionId, "idle-timeout");
+        }
+      }
+    }
+
+    if (maxSessions <= 0) return;
+
+    const targetSize = reserveSlot ? Math.max(maxSessions - 1, 0) : maxSessions;
+    while (sessions.size > targetSize) {
+      const oldest = [...sessionLastSeen.entries()]
+        .filter(([sessionId]) => sessions.has(sessionId))
+        .sort((a, b) => a[1] - b[1])[0];
+
+      if (!oldest) return;
+      await closeSession(oldest[0], "max-sessions");
+    }
+  }
 
   async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
     const transport = new WebStandardStreamableHTTPServerTransport({
@@ -641,6 +707,7 @@ export async function startMcpHttpServer(
       enableJsonResponse: true,
       onsessioninitialized: (sessionId: string) => {
         sessions.set(sessionId, transport);
+        sessionLastSeen.set(sessionId, Date.now());
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
@@ -650,18 +717,11 @@ export async function startMcpHttpServer(
     transport.onclose = () => {
       if (transport.sessionId) {
         sessions.delete(transport.sessionId);
+        sessionLastSeen.delete(transport.sessionId);
       }
     };
 
     return transport;
-  }
-
-  const startTime = Date.now();
-  const quiet = options?.quiet ?? false;
-
-  /** Format timestamp for request logging */
-  function ts(): string {
-    return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
   }
 
   type JsonRpcLikeBody = {
@@ -692,10 +752,6 @@ export async function startMcpHttpServer(
       return `tools/call ${tool}`;
     }
     return method;
-  }
-
-  function log(msg: string): void {
-    if (!quiet) console.error(msg);
   }
 
   // Helper to collect request body
@@ -787,6 +843,7 @@ export async function startMcpHttpServer(
 
         // Route to existing session or create new one on initialize
         const sessionId = headers["mcp-session-id"];
+        await reapSessions(!sessionId && isInitializeRequest(body));
         let transport: WebStandardStreamableHTTPServerTransport;
 
         if (sessionId) {
@@ -801,6 +858,7 @@ export async function startMcpHttpServer(
             return;
           }
           transport = existing;
+          sessionLastSeen.set(sessionId, Date.now());
         } else if (isInitializeRequest(body)) {
           transport = await createSession();
         } else {
@@ -830,6 +888,7 @@ export async function startMcpHttpServer(
 
         // GET/DELETE must have a valid session
         const sessionId = headers["mcp-session-id"];
+        await reapSessions(false);
         if (!sessionId) {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({
@@ -849,6 +908,7 @@ export async function startMcpHttpServer(
           }));
           return;
         }
+        sessionLastSeen.set(sessionId, Date.now());
 
         const url = `http://localhost:${port}${pathname}`;
         const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
@@ -880,10 +940,11 @@ export async function startMcpHttpServer(
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    for (const transport of sessions.values()) {
-      await transport.close();
+    for (const sessionId of [...sessions.keys()]) {
+      await closeSession(sessionId, "shutdown");
     }
     sessions.clear();
+    sessionLastSeen.clear();
     httpServer.close();
     await store.close();
   };

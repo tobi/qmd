@@ -1059,6 +1059,83 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     return { status: res.status, json, contentType: res.headers.get("content-type") };
   }
 
+  type McpHttpResponse = {
+    status: number;
+    json: unknown;
+    contentType: string | null;
+    sessionId: string | null;
+  };
+
+  function initializeRequest(id: number): object {
+    return {
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "test-client", version: "1.0.0" },
+      },
+    };
+  }
+
+  function toolsListRequest(id: number): object {
+    return {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/list",
+      params: {},
+    };
+  }
+
+  function expectSessionId(value: string | null): asserts value is string {
+    expect(value).toEqual(expect.any(String));
+  }
+
+  async function mcpRequestTo(targetBaseUrl: string, body: object, requestSessionId?: string): Promise<McpHttpResponse> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (requestSessionId) headers["mcp-session-id"] = requestSessionId;
+
+    const res = await fetch(`${targetBaseUrl}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    return {
+      status: res.status,
+      json: await res.json(),
+      contentType: res.headers.get("content-type"),
+      sessionId: res.headers.get("mcp-session-id"),
+    };
+  }
+
+  async function withMcpHttpEnv(
+    env: Record<string, string>,
+    fn: (targetBaseUrl: string) => Promise<void>,
+  ): Promise<void> {
+    const previous = new Map<string, string | undefined>();
+    for (const key of Object.keys(env)) {
+      previous.set(key, process.env[key]);
+      process.env[key] = env[key];
+    }
+
+    let scopedHandle: HttpServerHandle | null = null;
+    try {
+      scopedHandle = await startMcpHttpServer(0, { quiet: true });
+      await fn(`http://localhost:${scopedHandle.port}`);
+    } finally {
+      if (scopedHandle) await scopedHandle.stop();
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
   test("POST /mcp initialize returns 200 JSON (not SSE)", async () => {
     const { status, json, contentType } = await mcpRequest({
       jsonrpc: "2.0",
@@ -1075,6 +1152,47 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.jsonrpc).toBe("2.0");
     expect(json.id).toBe(1);
     expect(json.result.serverInfo.name).toBe("qmd");
+  });
+
+  test("POST /mcp reaps idle sessions that clients never delete", async () => {
+    await withMcpHttpEnv({ QMD_MCP_SESSION_TTL_MS: "1" }, async (targetBaseUrl) => {
+      const first = await mcpRequestTo(targetBaseUrl, initializeRequest(1));
+      expectSessionId(first.sessionId);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const second = await mcpRequestTo(targetBaseUrl, initializeRequest(2));
+      expectSessionId(second.sessionId);
+
+      const stale = await mcpRequestTo(targetBaseUrl, toolsListRequest(3), first.sessionId);
+      expect(stale.status).toBe(404);
+      expect(stale.json).toMatchObject({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found" },
+      });
+    });
+  });
+
+  test("POST /mcp caps active sessions and evicts the oldest", async () => {
+    await withMcpHttpEnv({ QMD_MCP_MAX_SESSIONS: "2" }, async (targetBaseUrl) => {
+      const first = await mcpRequestTo(targetBaseUrl, initializeRequest(1));
+      expectSessionId(first.sessionId);
+      const second = await mcpRequestTo(targetBaseUrl, initializeRequest(2));
+      expectSessionId(second.sessionId);
+      const third = await mcpRequestTo(targetBaseUrl, initializeRequest(3));
+      expectSessionId(third.sessionId);
+
+      const evicted = await mcpRequestTo(targetBaseUrl, toolsListRequest(4), first.sessionId);
+      expect(evicted.status).toBe(404);
+      expect(evicted.json).toMatchObject({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found" },
+      });
+
+      const stillActive = await mcpRequestTo(targetBaseUrl, toolsListRequest(5), second.sessionId);
+      expect(stillActive.status).toBe(200);
+      expect(stillActive.contentType).toContain("application/json");
+    });
   });
 
   test("POST /mcp tools/list returns registered tools", async () => {
