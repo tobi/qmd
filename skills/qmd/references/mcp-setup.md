@@ -49,7 +49,7 @@ qmd mcp stop                # Stop daemon
 
 ## Tools
 
-### structured_search
+### query
 
 Search with pre-expanded queries.
 
@@ -89,7 +89,7 @@ Retrieve multiple documents.
 | Param | Type | Description |
 |-------|------|-------------|
 | `pattern` | string | Glob or comma-separated list |
-| `maxBytes` | number? | Skip large files (default 10KB) |
+| `maxBytes` | number? | Skip large files (default 64KB) |
 
 ### status
 

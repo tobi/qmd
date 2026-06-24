@@ -591,6 +591,41 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("qmd pull --refresh");
   }, 20000);
 
+  test("qmd doctor ignores .etag sidecars beside a valid cached model", async () => {
+    // `qmd pull` writes a `<filename>.etag` HTTP sidecar next to each model
+    // blob. That sidecar matches the model-cache lookup's `includes(filename)`
+    // test, so a naive scan inspects it as a GGUF and reports the model
+    // "invalid" — order-dependently, whenever readdir yields the sidecar
+    // before the blob. The sidecar must be skipped.
+    const env = await createIsolatedTestEnv("doctor-etag-sidecar");
+    const model = "hf:example/custom-model/custom.gguf";
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+    const cacheRoot = join(env.configDir, "cache");
+    const modelCacheDir = join(cacheRoot, "qmd", "models");
+    await mkdir(modelCacheDir, { recursive: true });
+    // Create the sidecar first so readdir is more likely to surface it before
+    // the blob on order-preserving filesystems (the bug's trigger condition).
+    await writeFile(join(modelCacheDir, "custom.gguf.etag"), '"a1b2c3d4e5"\n');
+    // A real blob: node-llama-cpp stores it `hf_<org>_<filename>`. Any name
+    // containing the filename works; it just needs the GGUF magic to be valid.
+    await writeFile(join(modelCacheDir, "hf_example_custom.gguf"), Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]));
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        XDG_CACHE_HOME: cacheRoot,
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("downloaded and valid GGUF");
+    // The sidecar must not be reported as a bad model.
+    expect(stdout).not.toContain("not valid GGUF");
+    expect(stdout).not.toContain(".etag");
+  }, 20000);
+
   test("qmd doctor says when models are overridden by env", async () => {
     const env = await createIsolatedTestEnv("doctor-env-models");
     await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
@@ -1977,6 +2012,69 @@ describe("get command path normalization", () => {
     const { stdout, exitCode } = await runQmd(["get", "gonecoll/gone.md", "--full-path"], { dbPath: env.dbPath, configDir: env.configDir });
     expect(exitCode).toBe(0);
     expect(stdout).toMatch(new RegExp(`^qmd://gonecoll/gone\\.md\\s+#[a-f0-9]{6}`, "m"));
+  });
+});
+
+describe("get command missing and ignored paths", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let getTestDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("get-missing-ignored");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    getTestDir = join(testDir, "get-missing-ignored-fixtures");
+
+    await mkdir(join(getTestDir, "public"), { recursive: true });
+    await mkdir(join(getTestDir, "private"), { recursive: true });
+    await writeFile(join(getTestDir, "public", "prompt-log.md"), "# Public Log\nThis indexed file must not be returned for missing paths.");
+    await writeFile(join(getTestDir, "private", "log.md"), "# Private Log\nThis ignored file must not be indexed.");
+
+    await writeFile(
+      join(localConfigDir, "index.yml"),
+      `collections:
+  gettst:
+    path: ${getTestDir}
+    pattern: "**/*.md"
+    ignore:
+      - "private/**"
+`
+    );
+
+    const { exitCode, stderr } = await runQmd(["update"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+    if (exitCode !== 0) console.error("update failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("get reports ignored paths instead of falling back to same-basename fuzzy match", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["get", "private/log.md"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("Public Log");
+    expect(stderr).toContain("excluded by ignore rule");
+    expect(stderr).toContain("private/log.md");
+    expect(stderr).toContain("private/**");
+  });
+
+  test("get does not fall back to same-basename fuzzy match for missing paths", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["get", "missing/log.md"], {
+      cwd: getTestDir,
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("Public Log");
+    expect(stderr).toContain("Document not found");
   });
 });
 

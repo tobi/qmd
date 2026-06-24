@@ -47,6 +47,8 @@ import {
   type Store as InternalStore,
   type DocumentResult,
   type DocumentNotFound,
+  type DocumentExcludedByIgnore,
+  type DocumentLookupError,
   type SearchResult,
   type HybridQueryResult,
   type HybridQueryOptions,
@@ -85,6 +87,8 @@ import {
 export type {
   DocumentResult,
   DocumentNotFound,
+  DocumentExcludedByIgnore,
+  DocumentLookupError,
   SearchResult,
   HybridQueryResult,
   HybridQueryOptions,
@@ -237,7 +241,7 @@ export interface QMDStore {
   // ── Document Retrieval ──────────────────────────────────────────────
 
   /** Get a single document by path or docid */
-  get(pathOrDocid: string, options?: { includeBody?: boolean }): Promise<DocumentResult | DocumentNotFound>;
+  get(pathOrDocid: string, options?: { includeBody?: boolean }): Promise<DocumentResult | DocumentLookupError>;
 
   /** Get the body content of a document, optionally sliced by line range */
   getDocumentBody(pathOrDocid: string, opts?: { fromLine?: number; maxLines?: number }): Promise<string | null>;

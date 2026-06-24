@@ -46,9 +46,10 @@ export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
-export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -755,6 +756,10 @@ const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\
 const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
 
+// Bump when any FTS sync trigger body in applyFtsSyncTriggers changes, so the
+// new definition is reapplied to existing databases on next open.
+const STORE_SCHEMA_VERSION = 1;
+
 /**
  * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
  * Normalize CJK runs by spacing every character so exact CJK queries can be
@@ -776,46 +781,177 @@ function sanitizeFTS5Phrase(phrase: string): string {
     .join(' ');
 }
 
-function rebuildFTSForCjkNormalization(db: Database): void {
+function getUserVersion(db: Database): number {
+  const row = db.prepare(`PRAGMA user_version`).get() as Record<string, number> | undefined;
+  const value = row ? Object.values(row)[0] : 0;
+  return typeof value === "number" ? value : Number(value) || 0;
+}
+
+// FTS sync triggers keep documents_fts current for callers that write directly
+// to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
+// first). The bodies use DROP+CREATE rather than CREATE IF NOT EXISTS so a
+// changed body propagates to existing databases. DROP and CREATE are separate
+// autocommit statements, so concurrent opens of one database interleave across
+// connections (A drops, B drops, A creates, B creates -> "trigger already
+// exists"); busy_timeout serializes individual statements but not the pair.
+// Gate the work behind PRAGMA user_version and apply it inside one IMMEDIATE
+// transaction: the DROP+CREATE pair is atomic across connections, and a
+// double-checked read skips it once any process has stamped the version.
+function applyFtsSyncTriggers(db: Database): void {
+  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) return;
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (getUserVersion(db) < STORE_SCHEMA_VERSION) {
+      db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+      db.exec(`
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents
+        WHEN new.active = 1
+        BEGIN
+          INSERT INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+      db.exec(`
+        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+      db.exec(`
+        CREATE TRIGGER documents_au AFTER UPDATE ON documents
+        BEGIN
+          -- Delete from FTS if no longer active
+          DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+          -- Update FTS if still/newly active
+          INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
+  }
+}
+
+function cjkRebuildVersion(db: Database): string | undefined {
   const version = db.prepare(`SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`).get() as { value?: string } | undefined;
-  if (version?.value === FTS_CJK_NORMALIZED_VERSION) return;
+  return version?.value;
+}
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+function dropTableIfExists(db: Database, tableName: string): void {
+  db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`);
+}
+
+function rebuildFTSForCjkNormalization(db: Database): void {
+  if (cjkRebuildVersion(db) === FTS_CJK_NORMALIZED_VERSION) return;
+
+  // Clean up the legacy fixed-name shadow table left by an interrupted older
+  // rebuild implementation. New concurrent rebuilds use per-process names below.
+  dropTableIfExists(db, "documents_fts_rebuild");
+
+  // Stream rows from disk and build into a per-process shadow FTS table. A fixed
+  // shadow name made concurrent cold opens collide (`database is locked`, then
+  // `no such table: documents_fts_rebuild`) before the schema version could be
+  // stamped. The final live-table swap is protected by BEGIN IMMEDIATE and a
+  // double-checked version read, so only one process publishes the rebuild.
+  const BATCH_SIZE = 500;
+  const rebuildTable = `documents_fts_rebuild_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const quotedRebuildTable = quoteSqlIdentifier(rebuildTable);
 
   try {
-    db.exec(`DELETE FROM documents_fts WHERE rowid >= 0`);
-  } catch {
-    // Some older/corrupt FTS5 shadow-table states can reject bulk deletes even
-    // though reads still work. Recreate the virtual table; documents_fts is a
-    // derived index, so rebuilding it from documents/content is safe.
-    db.exec(`DROP TABLE IF EXISTS documents_fts`);
     db.exec(`
-      CREATE VIRTUAL TABLE documents_fts USING fts5(
+      CREATE VIRTUAL TABLE ${quotedRebuildTable} USING fts5(
         filepath, title, body,
         tokenize='porter unicode61'
       )
     `);
-  }
-  const rows = db.prepare(`
-    SELECT d.id, d.collection, d.path, d.title, content.doc as body
-    FROM documents d
-    JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
-  `).all() as { id: number; collection: string; path: string; title: string; body: string }[];
-  const insert = db.prepare(`INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
-  const rebuild = db.transaction(() => {
-    for (const row of rows) {
-      insert.run(
-        row.id,
-        normalizeCjkForFTS(`${row.collection}/${row.path}`),
-        normalizeCjkForFTS(row.title),
-        normalizeCjkForFTS(row.body)
-      );
+
+    type FtsRow = { id: number; collection: string; path: string; title: string; body: string };
+
+    const insert = db.prepare(`INSERT INTO ${quotedRebuildTable}(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+
+    // The transaction closes over a mutable `batch` buffer rather than taking the
+    // batch as an argument: the wrapper's transaction() type only accepts scalar
+    // SQLiteValue args, and we want each commit to wrap a bounded set of inserts.
+    let batch: FtsRow[] = [];
+    const flushBatch = db.transaction(() => {
+      for (const row of batch) {
+        insert.run(
+          row.id,
+          normalizeCjkForFTS(`${row.collection}/${row.path}`),
+          normalizeCjkForFTS(row.title),
+          normalizeCjkForFTS(row.body)
+        );
+      }
+    });
+
+    // .iterate() pulls rows one at a time from SQLite rather than materializing
+    // the entire result set (every document body) into a JS array up front.
+    const iterator = db.prepare(`
+      SELECT d.id, d.collection, d.path, d.title, content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.active = 1
+    `).iterate<FtsRow>();
+
+    for (const row of iterator) {
+      batch.push(row);
+      if (batch.length >= BATCH_SIZE) {
+        flushBatch();
+        batch = [];
+      }
     }
-  });
-  rebuild();
-  db.prepare(`
-    INSERT OR REPLACE INTO store_config(key, value)
-    VALUES ('fts_cjk_normalized_version', ?)
-  `).run(FTS_CJK_NORMALIZED_VERSION);
+    if (batch.length > 0) {
+      flushBatch();
+    }
+
+    // Atomic publish: copy the completed shadow index into the live table and
+    // stamp the version while holding the writer lock. If another process won
+    // the race while this one was building its shadow, skip the publish and only
+    // drop this process's private shadow table.
+    db.exec(`BEGIN IMMEDIATE`);
+    try {
+      if (cjkRebuildVersion(db) !== FTS_CJK_NORMALIZED_VERSION) {
+        db.exec(`DELETE FROM documents_fts`);
+        db.exec(
+          `INSERT INTO documents_fts(rowid, filepath, title, body)
+           SELECT rowid, filepath, title, body FROM ${quotedRebuildTable}`
+        );
+        db.prepare(`
+          INSERT OR REPLACE INTO store_config(key, value)
+          VALUES ('fts_cjk_normalized_version', ?)
+        `).run(FTS_CJK_NORMALIZED_VERSION);
+      }
+      db.exec(`COMMIT`);
+    } catch (err) {
+      db.exec(`ROLLBACK`);
+      throw err;
+    }
+  } finally {
+    dropTableIfExists(db, rebuildTable);
+  }
 }
 
 function initializeDatabase(db: Database): void {
@@ -830,7 +966,6 @@ function initializeDatabase(db: Database): void {
     _sqliteVecUnavailableReason = getErrorMessage(err);
     console.warn(_sqliteVecUnavailableReason);
   }
-  db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -920,48 +1055,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers keep FTS in sync for callers that write directly to documents.
-  // Production indexing paths rebuild entries in TypeScript so CJK text can be
-  // normalized before it reaches the unicode61 tokenizer.
-  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
-  db.exec(`
-    CREATE TRIGGER documents_ai AFTER INSERT ON documents
-    WHEN new.active = 1
-    BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
-  db.exec(`
-    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-      DELETE FROM documents_fts WHERE rowid = old.id;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
-  db.exec(`
-    CREATE TRIGGER documents_au AFTER UPDATE ON documents
-    BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
+  applyFtsSyncTriggers(db);
 
   rebuildFTSForCjkNormalization(db);
 }
@@ -1222,7 +1316,7 @@ export type Store = {
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
-  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
+  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
   findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
 
@@ -1412,6 +1506,13 @@ export type EmbedOptions = {
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
+  /**
+   * Max wall-clock duration for the whole embed session, in milliseconds. When the
+   * cap is reached, remaining document batches are skipped (re-run `qmd embed` to
+   * continue). A value <= 0 disables the cap. Defaults to
+   * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
+   */
+  maxDurationMs?: number;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -1827,7 +1928,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -2086,6 +2187,16 @@ export type DocumentNotFound = {
   query: string;
   similarFiles: string[];
 };
+
+export type DocumentExcludedByIgnore = {
+  error: "excluded_by_ignore";
+  query: string;
+  collection: string;
+  path: string;
+  rule: string;
+};
+
+export type DocumentLookupError = DocumentNotFound | DocumentExcludedByIgnore;
 
 /**
  * Result from multi-get operations
@@ -3995,6 +4106,63 @@ type DbDocRow = {
   body?: string;
 };
 
+function normalizeLookupPathForIgnore(path: string): string {
+  let normalized = path.replace(/\\/g, '/').trim();
+  if (normalized.startsWith('~/')) {
+    normalized = homedir() + normalized.slice(1);
+  }
+  return normalized;
+}
+
+function matchesIgnoreRule(relativePath: string, rule: string): boolean {
+  const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const normalizedRule = rule.replace(/\\/g, '/').replace(/^\/+/, '');
+  const isMatch = picomatch(normalizedRule, { dot: true });
+  return isMatch(normalizedPath);
+}
+
+function getIgnoredLookupMatch(db: Database, query: string): DocumentExcludedByIgnore | null {
+  const normalizedQuery = normalizeLookupPathForIgnore(query);
+  const parsedVirtual = isVirtualPath(normalizedQuery) ? parseVirtualPath(normalizedQuery) : null;
+  const collections = getStoreCollections(db);
+
+  for (const coll of collections) {
+    if (!coll.ignore || coll.ignore.length === 0) continue;
+
+    const candidates: string[] = [];
+
+    if (parsedVirtual) {
+      if (parsedVirtual.collectionName !== coll.name) continue;
+      candidates.push(parsedVirtual.path);
+    } else if (normalizedQuery.startsWith(coll.path + '/')) {
+      candidates.push(normalizedQuery.slice(coll.path.length + 1));
+    } else if (!normalizedQuery.startsWith('/')) {
+      const collectionPrefix = `${coll.name}/`;
+      if (normalizedQuery.startsWith(collectionPrefix)) {
+        candidates.push(normalizedQuery.slice(collectionPrefix.length));
+      } else {
+        candidates.push(normalizedQuery);
+      }
+    }
+
+    for (const candidate of candidates) {
+      for (const rule of coll.ignore) {
+        if (matchesIgnoreRule(candidate, rule)) {
+          return {
+            error: "excluded_by_ignore",
+            query,
+            collection: coll.name,
+            path: candidate,
+            rule,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Find a document by filename/path, docid (#hash), or with fuzzy matching.
  * Returns document metadata without body by default.
@@ -4005,7 +4173,7 @@ type DbDocRow = {
  * - Relative paths: path/to/file.md
  * - Short docid: #abc123 (first 6 chars of hash)
  */
-export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
+export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentLookupError {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
@@ -4088,6 +4256,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
   }
 
   if (!doc) {
+    const ignored = getIgnoredLookupMatch(db, filepath);
+    if (ignored) return ignored;
+
     const similar = findSimilarFiles(db, filepath, 5, 5);
     return { error: "not_found", query: filename, similarFiles: similar };
   }

@@ -10,7 +10,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Resolve symlinks so global installs (npm link / npm install -g) can find
@@ -129,10 +129,31 @@ if (!useSourceMode && !existsSync(jsEntry)) {
 // modules for Node. The repo ships bun.lock, so without this check, source
 // builds that use npm would be incorrectly routed to bun, causing ABI
 // mismatches with better-sqlite3 / sqlite-vec (see #381).
+//
+// Package-manager installs keep their lockfile at the install root, above
+// node_modules/ — never inside the package directory itself. A bun global
+// install writes $BUN_INSTALL/install/global/bun.lock while the package
+// lands in .../install/global/node_modules/@tobilu/qmd/, so the package-dir
+// checks below can't match and qmd would run under whatever node is first
+// on PATH. The native modules were built by the installing runtime; after
+// the next Node major upgrade they fail to load (ERR_DLOPEN_FAILED,
+// NODE_MODULE_VERSION mismatch). Apply the same npm-priority rule at the
+// install root when the package directory itself has no lockfile.
+const pathParts = pkgDir.split(sep);
+const nodeModulesIndex = pathParts.lastIndexOf("node_modules");
+const installRoot = nodeModulesIndex === -1 ? null : pathParts.slice(0, nodeModulesIndex).join(sep);
+const hasRootNpmLock = installRoot !== null && existsSync(resolve(installRoot, "package-lock.json"));
+const hasRootBunLock = installRoot !== null
+  && (existsSync(resolve(installRoot, "bun.lock")) || existsSync(resolve(installRoot, "bun.lockb")));
+
 let runnerName = "node";
 if (existsSync(resolve(pkgDir, "package-lock.json"))) {
   runnerName = "node";
 } else if (existsSync(resolve(pkgDir, "bun.lock")) || existsSync(resolve(pkgDir, "bun.lockb"))) {
+  runnerName = "bun";
+} else if (hasRootNpmLock) {
+  runnerName = "node";
+} else if (hasRootBunLock) {
   runnerName = "bun";
 } else {
   runnerName = "node";

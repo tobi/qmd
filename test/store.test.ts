@@ -194,7 +194,7 @@ async function syncTestConfig(): Promise<void> {
 
 // Helper to create a test collection in YAML config
 async function createTestCollection(
-  options: { pwd?: string; glob?: string; name?: string } = {}
+  options: { pwd?: string; glob?: string; name?: string; ignore?: string[] } = {}
 ): Promise<string> {
   const pwd = options.pwd || "/test/collection";
   const glob = options.glob || "**/*.md";
@@ -210,6 +210,7 @@ async function createTestCollection(
   config.collections[name] = {
     path: pwd,
     pattern: glob,
+    ...(options.ignore ? { ignore: options.ignore } : {}),
   };
 
   // Write back
@@ -1726,8 +1727,54 @@ describe("Document Retrieval", () => {
       expect("error" in result).toBe(true);
       if ("error" in result) {
         expect(result.error).toBe("not_found");
-        // Levenshtein distance of 1 should be found with maxDistance 3
-        expect(result.similarFiles.length).toBeGreaterThanOrEqual(0); // May or may not find depending on distance calc
+        if (result.error === "not_found") {
+          // Levenshtein distance of 1 should be found with maxDistance 3
+          expect(result.similarFiles.length).toBeGreaterThanOrEqual(0); // May or may not find depending on distance calc
+        }
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocument reports ignored files separately from missing files", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({
+        pwd: "/path",
+        ignore: ["ignored/**"],
+      });
+
+      const result = store.findDocument("/path/ignored/secret.md");
+
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error).toBe("excluded_by_ignore");
+        if (result.error === "excluded_by_ignore") {
+          expect(result.collection).toBe(collectionName);
+          expect(result.path).toBe("ignored/secret.md");
+          expect(result.rule).toBe("ignored/**");
+        }
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocument detects ignore rules for virtual paths", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({
+        name: "vault",
+        ignore: ["private/*.md"],
+      });
+
+      const result = store.findDocument("qmd://vault/private/note.md");
+
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error).toBe("excluded_by_ignore");
+        if (result.error === "excluded_by_ignore") {
+          expect(result.collection).toBe(collectionName);
+          expect(result.path).toBe("private/note.md");
+          expect(result.rule).toBe("private/*.md");
+        }
       }
 
       await cleanupTestDb(store);
@@ -3203,6 +3250,44 @@ describe("Embedding batching", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings stops early when maxDurationMs is exceeded", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    // A slow embedder so the short session cap trips between document batches.
+    const embedBatchCalls: string[][] = [];
+    const slowLlm = {
+      async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return texts.map((_text, index) => ({ embedding: [index + 1, index + 2, index + 3], model: "fake-embed" }));
+      },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = slowLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,           // one doc per batch, so the cap can stop between docs
+        maxBatchBytes: 1024 * 1024,
+        maxDurationMs: 10,            // trips ~10ms in, well before the 80ms batches finish
+      });
+
+      // The first batch runs, then the session expires and the rest are skipped.
+      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
+      expect(embedBatchCalls.length).toBeLessThan(3);
+      expect(result.chunksEmbedded).toBeLessThan(3);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);

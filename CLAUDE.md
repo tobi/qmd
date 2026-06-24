@@ -9,19 +9,22 @@ qmd collection add . --name <n>   # Create/index collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
+qmd init                          # Create a project-local .qmd index
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
 qmd context check                 # Check for collections/paths missing context
 qmd context rm <path>             # Remove context
-qmd get <file>                    # Get document by path or docid (#abc123)
+qmd get <file>[:from[:count]]     # Get by path or docid (#abc123); optional line range
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
-qmd update [--pull]               # Re-index all collections (--pull: git pull first)
+qmd doctor                        # Diagnose config, index, model, and device issues
+qmd update                        # Re-index collections; configured update hooks run first
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
+qmd bench <fixture.json>          # Run search-quality benchmarks
 qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
@@ -42,6 +45,17 @@ qmd collection remove mynotes
 
 # Rename a collection
 qmd collection rename mynotes my-notes
+
+# Show collection details
+qmd collection show mynotes
+
+# Set or clear the pre-update hook (runs before re-indexing on `qmd update`)
+qmd collection update-cmd mynotes 'git pull --ff-only'
+qmd collection update-cmd mynotes            # clear
+
+# Include or exclude from default (unscoped) queries
+qmd collection exclude mynotes
+qmd collection include mynotes
 
 # List all files in a collection
 qmd ls mynotes
@@ -100,19 +114,23 @@ qmd multi-get "#abc123, #def456"
 
 ```sh
 # Search & retrieval
--c, --collection <name>  # Restrict search to a collection (matches pwd suffix)
+-c, --collection <name>  # Restrict search to collection(s) (repeatable)
 -n <num>                 # Number of results
 --all                    # Return all matches
 --min-score <num>        # Minimum score threshold
 --full                   # Show full document content
---line-numbers           # Add line numbers to output
+--intent <text>          # Describe what you're after to sharpen ranking (query)
+--no-rerank              # Skip LLM reranking (faster, lower quality)
+--full-path              # Show on-disk paths instead of qmd:// URIs
 
-# Multi-get specific
+# Get / multi-get
 -l <num>                 # Maximum lines per file
 --max-bytes <num>        # Skip files larger than this (default 10KB)
+--no-line-numbers        # Disable line numbers (on by default for get/multi-get)
 
-# Output formats (search and multi-get)
---json, --csv, --md, --xml, --files
+# Output format (search, query, multi-get)
+--format <kind>          # cli (default) | json | csv | md | xml | files
+                         # legacy --json/--csv/--md/--xml/--files still work as aliases
 ```
 
 ## Development

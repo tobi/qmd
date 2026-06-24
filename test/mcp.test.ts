@@ -475,7 +475,10 @@ describe("MCP Server", () => {
       const result = findDocument(testDb, "readm.md", { includeBody: false }); // typo
       expect("error" in result).toBe(true);
       if ("error" in result) {
-        expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        expect(result.error).toBe("not_found");
+        if (result.error === "not_found") {
+          expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        }
       }
     });
 
@@ -538,6 +541,13 @@ describe("MCP Server", () => {
       expect(docs.length).toBe(1);
       expect(errors.length).toBe(1);
       expect(errors[0]).toContain("not found");
+    });
+
+    test("default maxBytes includes normal wiki-sized files", () => {
+      expect(DEFAULT_MULTI_GET_MAX_BYTES).toBe(64 * 1024);
+      const { docs } = findDocuments(testDb, "large-file.md", { includeBody: true });
+      expect(docs.length).toBe(1);
+      expect(docs[0]!.skipped).toBe(false);
     });
 
     test("skips files larger than maxBytes", () => {

@@ -199,7 +199,10 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
       const result = await store.get(decodedPath, { includeBody: true });
 
       if ("error" in result) {
-        return { contents: [{ uri: uri.href, text: `Document not found: ${decodedPath}` }] };
+        const text = result.error === "excluded_by_ignore"
+          ? `Document excluded by ignore rule: ${decodedPath}\nCollection: ${result.collection}\nMatched path: ${result.path}\nIgnore rule: ${result.rule}`
+          : `Document not found: ${decodedPath}`;
+        return { contents: [{ uri: uri.href, text }] };
       }
 
       let text = addLineNumbers(result.body || "");  // Default to line numbers
@@ -268,11 +271,12 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
 | Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
+| Unknown vocabulary | Pass \`query\` with natural language so the server auto-expands it |
 
 ## Examples
 
@@ -299,8 +303,13 @@ Intent-aware lex (C++ performance, not sports):
 \`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
+        query: z.string().optional().describe(
+          "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
+          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+        ),
+        searches: z.array(subSearchSchema).max(10).optional().describe(
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
+          "control over retrieval strategy. Mutually exclusive with 'query'."
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
@@ -316,18 +325,32 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Map to internal format
-      const queries: ExpandedQuery[] = searches.map(s => ({
-        type: s.type,
-        query: s.query,
-      }));
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+      // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
+      if (!query && (!searches || searches.length === 0)) {
+        return {
+          content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
+          isError: true,
+        };
+      }
+      if (query && searches && searches.length > 0) {
+        return {
+          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
+          isError: true,
+        };
+      }
 
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
 
+      // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
+      // `searches` runs the caller's typed sub-queries directly.
+      const searchOptions = query
+        ? { query }
+        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
+
       const results = await store.search({
-        queries,
+        ...searchOptions,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
@@ -336,10 +359,12 @@ Intent-aware lex (C++ performance, not sports):
         intent,
       });
 
-      // Use first lex or vec query for snippet extraction
-      const primaryQuery = searches.find(s => s.type === 'lex')?.query
-        || searches.find(s => s.type === 'vec')?.query
-        || searches[0]?.query || "";
+      // Use the plain query, or the first lex/vec sub-query, for snippet extraction
+      const primaryQuery = query
+        || searches?.find(s => s.type === 'lex')?.query
+        || searches?.find(s => s.type === 'vec')?.query
+        || searches?.[0]?.query
+        || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
@@ -401,8 +426,10 @@ Intent-aware lex (C++ performance, not sports):
       const result = await store.get(lookup, { includeBody: false });
 
       if ("error" in result) {
-        let msg = `Document not found: ${file}`;
-        if (result.similarFiles.length > 0) {
+        let msg = result.error === "excluded_by_ignore"
+          ? `Document excluded by ignore rule: ${file}\nCollection: ${result.collection}\nMatched path: ${result.path}\nIgnore rule: ${result.rule}`
+          : `Document not found: ${file}`;
+        if (result.error === "not_found" && result.similarFiles.length > 0) {
           msg += `\n\nDid you mean one of these?\n${result.similarFiles.map(s => `  - ${s}`).join('\n')}`;
         }
         return {
@@ -449,7 +476,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: {
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
-        maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
+        maxBytes: z.number().optional().default(DEFAULT_MULTI_GET_MAX_BYTES).describe("Skip files larger than this (default: 65536 = 64KB)"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },
@@ -583,11 +610,13 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Binds to `options.host` (default "localhost", overridable via the QMD_HOST
+ * env var) — set "0.0.0.0" to accept connections from other hosts, e.g. a
+ * container liveness probe. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -839,9 +868,10 @@ export async function startMcpHttpServer(
     }
   });
 
+  const host = options.host ?? process.env.QMD_HOST ?? "localhost";
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -869,7 +899,7 @@ export async function startMcpHttpServer(
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 

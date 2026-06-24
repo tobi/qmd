@@ -21,8 +21,7 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
-  findDocumentByDocid,
-  isDocid,
+  findDocument,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -993,163 +992,37 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   if (fromLine !== undefined) fromLine = Math.max(1, fromLine);
 
   const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
-  if (parsedIndexPath?.indexName) {
-    setIndexName(parsedIndexPath.indexName);
-    setConfigIndexName(parsedIndexPath.indexName);
+  if (parsedIndexPath) {
+    if (parsedIndexPath.indexName) {
+      setIndexName(parsedIndexPath.indexName);
+      setConfigIndexName(parsedIndexPath.indexName);
+    }
+    inputPath = buildVirtualPath(parsedIndexPath.collectionName, parsedIndexPath.path);
   }
 
   const db = getDb();
-
-  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
-  if (isDocid(inputPath)) {
-    const docidMatch = findDocumentByDocid(db, inputPath);
-    if (docidMatch) {
-      inputPath = docidMatch.filepath;
+  const doc = findDocument(db, inputPath, { includeBody: true });
+  if ("error" in doc) {
+    if (doc.error === "excluded_by_ignore") {
+      console.error(`Document is excluded by ignore rule: ${filename}`);
+      console.error(`Collection: ${doc.collection}`);
+      console.error(`Matched path: ${doc.path}`);
+      console.error(`Ignore rule: ${doc.rule}`);
     } else {
       console.error(`Document not found: ${filename}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
-  let doc: { collectionName: string; path: string; body: string } | null = null;
-  let virtualPath: string;
-
-  // Handle virtual paths (qmd://collection/path)
-  if (isVirtualPath(inputPath)) {
-    const parsed = parseVirtualPath(inputPath);
-    if (!parsed) {
-      console.error(`Invalid virtual path: ${inputPath}`);
-      closeDb();
-      process.exit(1);
-    }
-
-    // Try exact match on collection + path
-    doc = db.prepare(`
-      SELECT d.collection as collectionName, d.path, content.doc as body
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(parsed.collectionName, parsed.path) as typeof doc;
-
-    if (!doc) {
-      // Try fuzzy match by path ending
-      doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-        LIMIT 1
-      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
-    }
-
-    virtualPath = inputPath;
-  } else {
-    // Try to interpret as collection/path format first (before filesystem path)
-    // If path is relative (no / or ~ prefix), check if first component is a collection name
-    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
-      const parts = inputPath.split('/');
-      if (parts.length >= 2) {
-        const possibleCollection = parts[0];
-        const possiblePath = parts.slice(1).join('/');
-
-        // Check if this collection exists
-        const collExists = possibleCollection ? db.prepare(`
-          SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
-        `).get(possibleCollection) : null;
-
-        if (collExists) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT d.collection as collectionName, d.path, content.doc as body
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
-
-          if (!doc) {
-            // Try fuzzy match by path ending
-            doc = db.prepare(`
-              SELECT d.collection as collectionName, d.path, content.doc as body
-              FROM documents d
-              JOIN content ON content.hash = d.hash
-              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-              LIMIT 1
-            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
-          }
-
-          if (doc) {
-            virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-            // Skip the filesystem path handling below
-          }
-        }
+      if (doc.similarFiles.length > 0) {
+        console.error("Similar files:");
+        for (const file of doc.similarFiles) console.error(`  ${file}`);
       }
     }
-
-    // If not found as collection/path, handle as filesystem paths
-    if (!doc) {
-      let fsPath = inputPath;
-
-      // Expand ~ to home directory
-      if (fsPath.startsWith('~/')) {
-        fsPath = homedir() + fsPath.slice(1);
-      } else if (!fsPath.startsWith('/')) {
-        // Relative path - resolve from current directory
-        fsPath = resolve(getPwd(), fsPath);
-      }
-      fsPath = getRealPath(fsPath);
-
-      // Try to detect which collection contains this path
-      const detected = detectCollectionFromPath(db, fsPath);
-
-      if (detected) {
-        // Found collection - query by collection name + relative path
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      // Fuzzy match by filename (last component of path)
-      if (!doc) {
-        const filename = inputPath.split('/').pop() || inputPath;
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      if (doc) {
-        virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-      } else {
-        virtualPath = inputPath;
-      }
-    }
-  }
-
-  // Ensure doc is not null before proceeding
-  if (!doc) {
-    console.error(`Document not found: ${filename}`);
     closeDb();
     process.exit(1);
   }
 
-  // Get context for this file
-  const context = getContextForPath(db, doc.collectionName, doc.path);
-
-  // Resolve the docid (first 6 chars of the content hash) so callers always
-  // know what they retrieved and can cite it back to `get`/`multi-get`.
-  const hashRow = db.prepare(`
-    SELECT d.hash as hash
-    FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
-  `).get(doc.collectionName, doc.path) as { hash: string } | null;
-  const docid = hashRow?.hash ? hashRow.hash.slice(0, 6) : undefined;
-  const canonicalPath = buildVirtualPath(doc.collectionName, doc.path);
+  // `findDocument` already computes the docid (first 6 hash chars) and the
+  // canonical display path, so we reuse them here instead of a second lookup.
+  const docid = doc.docid;
+  const canonicalPath = `qmd://${doc.displayPath}`;
 
   // --full-path: show the on-disk path instead of the qmd:// URL + docid, when
   // the file actually exists. Fall back to the canonical header otherwise.
@@ -1165,7 +1038,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
   }
 
-  let output = doc.body;
+  let output = doc.body || "";
   const startLine = fromLine || 1;
 
   // Apply line filtering if specified
@@ -1185,8 +1058,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   // Header: identify the document (path + docid, or the on-disk path with
   // --full-path), then optional context.
   console.log(header);
-  if (context) {
-    console.log(`Folder Context: ${context}`);
+  if (doc.context) {
+    console.log(`Folder Context: ${doc.context}`);
   }
   console.log("---\n");
   console.log(output);
@@ -1938,6 +1811,17 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
 }
 
+// --timeout for `qmd embed`: a cap on the whole embed session, in minutes. Returns
+// the value in milliseconds, or undefined to use the default. 0 disables the cap.
+function parseEmbedTimeoutOption(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    throw new Error(`--timeout must be a non-negative number of minutes (0 = no limit)`);
+  }
+  return minutes * 60 * 1000;
+}
+
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
     const config = loadConfig();
@@ -1979,7 +1863,7 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -2014,6 +1898,7 @@ async function vectorIndex(
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
+    maxDurationMs: batchOptions?.maxDurationMs,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       // Progress is measured by input bytes, not by chunks. The final chunk
@@ -2864,6 +2749,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
+      timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2885,6 +2771,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3401,6 +3288,7 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
+  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3467,10 +3355,11 @@ function showHelp(): void {
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
+  console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 65536)");
   console.log("  --format <kind>            - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
@@ -3546,7 +3435,11 @@ function findCachedModelInspection(model: string): CachedModelInspection {
     if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
     const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.includes(filename)) continue;
+      // Skip the `<filename>.etag` HTTP sidecar that `qmd pull` writes next to
+      // each blob. It satisfies `includes(filename)` but is not a GGUF, so
+      // inspecting it as one surfaces a spurious "invalid" model in `qmd
+      // doctor` whenever readdir happens to yield the sidecar before the blob.
+      if (!entry.isFile() || entry.name.endsWith(".etag") || !entry.name.includes(filename)) continue;
       const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
       const inspection = inspectGgufFile(candidate);
       if (inspection.valid) return { path: candidate, invalid };
@@ -4407,6 +4300,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        const embedMaxDurationMs = parseEmbedTimeoutOption(cli.values["timeout"]);
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
@@ -4418,6 +4312,7 @@ if (isMain) {
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
+          maxDurationMs: embedMaxDurationMs,
         });
       } catch (error) {
         exitWithError(error);
@@ -4525,6 +4420,10 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        // --host overrides the default localhost bind; QMD_HOST env is the
+        // fallback (resolved in startMcpHttpServer). Use "0.0.0.0" to accept
+        // off-host connections, e.g. a container liveness probe.
+        const host = cli.values.host ? String(cli.values.host) : undefined;
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -4544,9 +4443,10 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
+          const hostArgs = host ? ["--host", host] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4555,7 +4455,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -4566,7 +4466,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath() });
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
