@@ -65,7 +65,21 @@ if (isBun) {
  * Open a SQLite database. Works with both bun:sqlite and better-sqlite3.
  */
 export function openDatabase(path: string): Database {
-  return new _Database(path) as Database;
+  const db = new _Database(path) as Database;
+  // Queue concurrent writers instead of failing immediately: SQLite's default
+  // busy timeout is 0, so when two qmd processes overlap (a long `embed` plus
+  // an `update` from a cron job or a second shell, or the one-time schema
+  // migration racing a routine command), the second writer's first INSERT/DDL
+  // throws SQLITE_BUSY ("database is locked"). WAL mode (set in store.ts)
+  // allows exactly one writer at a time; briefly waiting for the lock is the
+  // right behavior for a CLI. Embeds commit per batch, so writers interleave
+  // at batch boundaries; 2 minutes outlasts worst-case commit pauses on a
+  // multi-GB index. Override with QMD_SQLITE_BUSY_TIMEOUT_MS (0 restores
+  // fail-fast).
+  const raw = Number(process.env.QMD_SQLITE_BUSY_TIMEOUT_MS);
+  const busyTimeoutMs = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 120_000;
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  return db;
 }
 
 /**
