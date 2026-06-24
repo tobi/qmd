@@ -9,7 +9,7 @@
  * instance.
  */
 
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { LlamaCpp, type RerankDocument, type Queryable, type RerankResult, type EmbeddingResult, type EmbedOptions } from "../src/llm.js";
 
 /**
@@ -73,6 +73,27 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
 }
 
 describe("LlamaCpp lowVram mode", () => {
+  // Two ambient env vars would otherwise distort these tests, so neutralize
+  // both for the suite and restore after:
+  //   CI — LlamaCpp captures `_ciMode = !!process.env.CI` at construction and
+  //   throws from embed/embedBatch/rerank/expand when set. These tests
+  //   monkey-patch the *Impl methods (no real model loads) to exercise the
+  //   reclaim/serialization wrappers, so they must take the non-CI path.
+  //   QMD_LOW_VRAM — `new LlamaCpp({})` resolves lowVram from this var, so the
+  //   lowVram=false cases would flip to true under a leaked QMD_LOW_VRAM=1.
+  const savedEnv: Record<string, string | undefined> = {};
+  beforeAll(() => {
+    for (const key of ["CI", "QMD_LOW_VRAM"]) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+  afterAll(() => {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value !== undefined) process.env[key] = value;
+    }
+  });
+
   test("serializes overlapping expandQuery calls — dispose never races with use", async () => {
     const { llm, events } = makeInstrumentedLlm();
 
