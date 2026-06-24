@@ -565,7 +565,7 @@ describe("LlamaCpp.getDeviceInfo", () => {
 // Integration Tests (require actual models)
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI || !!process.env.QMD_REMOTE_URL)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
   const llm = getDefaultLlamaCpp();
 

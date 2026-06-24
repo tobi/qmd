@@ -80,7 +80,27 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  setDefaultLlamaCpp,
+  setDefaultLLM,
+  LlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_MODEL_CACHE_DIR,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveRerankModel,
+  resolveModels,
+  inspectGgufFile,
+  isDarwinMetalMitigationActive,
+} from "../llm.js";
+import { RemoteQMD } from "../remote-qmd.js";
+import { startServer } from "../serve.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,11 +153,16 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      // Constructing a local LlamaCpp would defeat QMD_REMOTE_URL by reloading
+      // models the daemon already holds, allocating VRAM the user explicitly
+      // delegated to `qmd serve`.
+      if (!process.env.QMD_REMOTE_URL) {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -2764,6 +2789,7 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      "low-vram": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -2772,6 +2798,12 @@ function parseCLI() {
       daemon: { type: "boolean" },
       port: { type: "string" },
       host: { type: "string" },
+      // Remote model server options
+      "remote-url": { type: "string" },  // URL of a qmd serve instance (e.g. http://host:7832)
+      bind: { type: "string" },    // Bind address for qmd serve (default: 0.0.0.0)
+      backend: { type: "string" }, // Backend for qmd serve: "local" or "ollama"
+      "backend-url": { type: "string" }, // URL of Ollama-compatible server
+      "rkllama-url": { type: "string" }, // Deprecated alias for --backend-url
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2779,6 +2811,14 @@ function parseCLI() {
 
   if (values["no-gpu"]) {
     process.env.QMD_FORCE_CPU = "1";
+  }
+
+  if (values["low-vram"]) {
+    // Sequential model loading — disposes generate (~2 GB) and rerank (~2.3 GB)
+    // after each use, keeping only the tiny embed model (~320 MB) resident.
+    // Peak VRAM drops from ~5.4 GB to ~2.6 GB at the cost of per-stage load
+    // latency. The LlamaCpp constructor reads QMD_LOW_VRAM directly.
+    process.env.QMD_LOW_VRAM = "1";
   }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
@@ -3291,6 +3331,14 @@ function showHelp(): void {
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
+  console.log("Model server (shared models over network):");
+  console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
+  console.log("  qmd serve --low-vram                      - Local backend, one heavy model at a time (~2.6 GB peak)");
+  console.log("  qmd serve --backend ollama                - Use Ollama-compatible server");
+  console.log("  qmd serve --backend ollama --backend-url http://host:11434");
+  console.log("  qmd query --remote-url http://host:7832 <q>  - Use remote models instead of local");
+  console.log("  QMD_REMOTE_URL=http://host:7832 qmd query <q> - Same via env var");
+  console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
   console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
@@ -3345,6 +3393,7 @@ function showHelp(): void {
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
+  console.log("  --low-vram                 - Load one heavy model at a time (~2.6 GB peak; same as QMD_LOW_VRAM=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
@@ -3490,6 +3539,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
+  add("QMD_LOW_VRAM", "loads one heavy model at a time (expand → embed → rerank) so peak VRAM stays under ~2.6 GB; trades load latency for memory headroom");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
   add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
@@ -4023,6 +4073,16 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  // Configure remote model server if --remote-url is set or QMD_REMOTE_URL env var
+  const remoteUrl = (cli.values["remote-url"] as string) || process.env.QMD_REMOTE_URL;
+  if (remoteUrl && cli.command !== "serve") {
+    // Reflect --remote-url into the environment so downstream lookups (e.g.
+    // getStore's local-LlamaCpp guard, getDefaultLLM's auto-detect fallback)
+    // share one source of truth regardless of which entry point they came in.
+    process.env.QMD_REMOTE_URL = remoteUrl;
+    setDefaultLLM(new RemoteQMD({ serverUrl: remoteUrl }));
+  }
+
   switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
@@ -4386,6 +4446,26 @@ if (isMain) {
         collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
         dbPath: getDbPath(),
         configPath: configExists() ? getConfigPath() : undefined,
+      });
+      break;
+    }
+
+    case "serve": {
+      // Remove top-level cursor handlers so shutdown handlers work
+      process.removeAllListeners("SIGTERM");
+      process.removeAllListeners("SIGINT");
+      const servePort = Number(cli.values.port) || 7832;
+      const serveBind = (cli.values.bind as string) || "0.0.0.0";
+      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "ollama";
+      const backendUrl = (cli.values["backend-url"] as string) || (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:11434";
+      await startServer({
+        port: servePort,
+        bind: serveBind,
+        backend: serveBackend,
+        backendUrl: serveBackend === "ollama" ? backendUrl : undefined,
+        config: {
+          embedModel: process.env.QMD_EMBED_MODEL || undefined,
+        },
       });
       break;
     }
