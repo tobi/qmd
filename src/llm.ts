@@ -10,7 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
-import { RemoteLLM } from "./llm-remote.js";
+import { RemoteQMD } from "./remote-qmd.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -591,7 +591,7 @@ export interface LLM {
 
   /**
    * Optional warm-up hook. Backends that resolve metadata asynchronously
-   * (e.g. RemoteLLM fetching model names from `/health`) implement this so
+   * (e.g. RemoteQMD fetching model names from `/health`) implement this so
    * callers can await first-use readiness before reading `embedModelName`
    * and friends. Local backends omit it.
    */
@@ -2373,7 +2373,7 @@ let defaultLLM: LLM | null = null;
 /**
  * Get the default LLM instance.
  * If a remote server URL is configured (via QMD_REMOTE_URL or setDefaultLLM),
- * returns a RemoteLLM; otherwise returns the local LlamaCpp instance.
+ * returns a RemoteQMD; otherwise returns the local LlamaCpp instance.
  */
 export function getDefaultLLM(): LLM {
   if (defaultLLM) return defaultLLM;
@@ -2383,7 +2383,7 @@ export function getDefaultLLM(): LLM {
   // without the CLI having run setDefaultLLM first.
   const remoteUrl = process.env.QMD_REMOTE_URL;
   if (remoteUrl) {
-    const remote: LLM = new RemoteLLM({ serverUrl: remoteUrl });
+    const remote: LLM = new RemoteQMD({ serverUrl: remoteUrl });
     defaultLLM = remote;
     return remote;
   }

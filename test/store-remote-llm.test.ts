@@ -1,7 +1,7 @@
 /**
  * store-remote-llm.test.ts - Store layer routes through the polymorphic LLM
  * default (not the local-only LlamaCpp singleton), so QMD_REMOTE_URL actually
- * reaches RemoteLLM.
+ * reaches RemoteQMD.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
@@ -22,7 +22,7 @@ import {
   type RerankResult,
   type ModelInfo,
 } from "../src/llm.js";
-import { RemoteLLM } from "../src/llm-remote.js";
+import { RemoteQMD } from "../src/remote-qmd.js";
 import { expandQuery, rerank, createStore, generateEmbeddings, chunkDocumentByTokens } from "../src/store.js";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -155,8 +155,8 @@ describe("store layer routes through the polymorphic LLM default", () => {
     expect(fake.calls.rerank).toBe(1);
   });
 
-  test("generateEmbeddings accepts a real RemoteLLM (no requireLlamaCpp gate)", async () => {
-    // Spin a minimal /health responder so RemoteLLM can warm up.
+  test("generateEmbeddings accepts a real RemoteQMD (no requireLlamaCpp gate)", async () => {
+    // Spin a minimal /health responder so RemoteQMD can warm up.
     const server = createServer((req, res) => {
       if (req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -175,7 +175,7 @@ describe("store layer routes through the polymorphic LLM default", () => {
     const port = (server.address() as AddressInfo).port;
 
     try {
-      const remote = new RemoteLLM({ serverUrl: `http://127.0.0.1:${port}` });
+      const remote = new RemoteQMD({ serverUrl: `http://127.0.0.1:${port}` });
       store.llm = remote;
       // No documents inserted → early return path. Pre-fix this still threw
       // "requires a local LlamaCpp backend" because the gate ran before the

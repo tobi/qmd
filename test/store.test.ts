@@ -15,7 +15,7 @@ import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp, setDefaultLLM } from "../src/llm.js";
-import { RemoteLLM } from "../src/llm-remote.js";
+import { RemoteQMD } from "../src/remote-qmd.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -2876,7 +2876,7 @@ describe("Integration", () => {
 
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   // Opportunistic remote routing: when a local `qmd serve` is reachable, route
-  // these tests through it via RemoteLLM. Two wins: (a) the rerank tests pass
+  // these tests through it via RemoteQMD. Two wins: (a) the rerank tests pass
   // on VRAM-constrained dev boxes where the local 2.3GB rerank model can't
   // fit alongside a co-resident model (Ollama etc.), and (b) the integration
   // suite becomes an actual end-to-end regression check for the remote path.
@@ -2891,7 +2891,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       const res = await fetch(`${DEFAULT_QMD_SERVE_URL}/health`, { signal: ctrl.signal });
       clearTimeout(timer);
       if (res.ok) {
-        setDefaultLLM(new RemoteLLM({ serverUrl: DEFAULT_QMD_SERVE_URL }));
+        setDefaultLLM(new RemoteQMD({ serverUrl: DEFAULT_QMD_SERVE_URL }));
         routedRemote = true;
       }
     } catch {

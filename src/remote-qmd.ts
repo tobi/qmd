@@ -1,8 +1,10 @@
 /**
- * llm-remote.ts - Remote LLM implementation for QMD
+ * remote-qmd.ts - RemoteQMD: LLM-shaped client for a remote `qmd serve`
  *
  * Connects to a `qmd serve` instance over HTTP, implementing the same LLM
- * interface as LlamaCpp but without loading any models locally.
+ * interface as LlamaCpp but without loading any models locally. This is the
+ * client tier (qmd talking to a remote qmd), distinct from a remote model
+ * backend (qmd talking to a model provider).
  *
  * Usage:
  *   qmd query "search terms" --remote-url http://192.168.6.123:7832
@@ -25,7 +27,7 @@ import type {
 // Config
 // ---------------------------------------------------------------------------
 
-export interface RemoteLLMConfig {
+export interface RemoteQMDConfig {
   /** Base URL of the qmd serve instance, e.g. "http://192.168.6.123:7832" */
   serverUrl: string;
   /** Request timeout in ms (default: 300 000 — 5 minutes, generous for CPU-only ARM SBCs) */
@@ -36,7 +38,7 @@ export interface RemoteLLMConfig {
 // Implementation
 // ---------------------------------------------------------------------------
 
-export class RemoteLLM implements LLM {
+export class RemoteQMD implements LLM {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private _embedModelName?: string;
@@ -44,7 +46,7 @@ export class RemoteLLM implements LLM {
   private _rerankModelName?: string;
   private healthPromise?: Promise<void>;
 
-  constructor(config: RemoteLLMConfig) {
+  constructor(config: RemoteQMDConfig) {
     // Normalise: strip trailing slash
     this.baseUrl = config.serverUrl.replace(/\/+$/, "");
     this.timeoutMs = config.timeoutMs ?? 300_000;

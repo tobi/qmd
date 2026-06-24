@@ -99,7 +99,7 @@ import {
   inspectGgufFile,
   isDarwinMetalMitigationActive,
 } from "../llm.js";
-import { RemoteLLM } from "../llm-remote.js";
+import { RemoteQMD } from "../remote-qmd.js";
 import { startServer } from "../serve.js";
 import {
   formatSearchResults,
@@ -4080,7 +4080,7 @@ if (isMain) {
     // getStore's local-LlamaCpp guard, getDefaultLLM's auto-detect fallback)
     // share one source of truth regardless of which entry point they came in.
     process.env.QMD_REMOTE_URL = remoteUrl;
-    setDefaultLLM(new RemoteLLM({ serverUrl: remoteUrl }));
+    setDefaultLLM(new RemoteQMD({ serverUrl: remoteUrl }));
   }
 
   switch (cli.command) {
