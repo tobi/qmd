@@ -6,9 +6,20 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs =
     {
-      homeModules.default = { config, lib, pkgs, ... }:
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    {
+      homeModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         with lib;
         let
           cfg = config.programs.qmd;
@@ -29,8 +40,9 @@
             home.packages = [ cfg.package ];
           };
         };
-    } //
-    flake-utils.lib.eachDefaultSystem (system:
+    }
+    // flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
@@ -38,7 +50,7 @@
 
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
-          configureFlags = (old.configureFlags or []) ++ [
+          configureFlags = (old.configureFlags or [ ]) ++ [
             "--enable-load-extension"
           ];
         });
@@ -103,9 +115,10 @@
             pkgs.makeWrapper
             pkgs.nodejs
             pkgs.node-gyp
-            pkgs.python3  # needed by node-gyp to compile better-sqlite3
-          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
+            pkgs.python3
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.darwin.cctools
           ];
 
           buildInputs = [ pkgs.sqlite ];
@@ -130,7 +143,7 @@
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/cli/qmd.ts" \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
-              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
+              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib:${pkgs.stdenv.cc.libc.out}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
           '';
 
           meta = with pkgs.lib; {
