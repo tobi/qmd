@@ -18,7 +18,7 @@ import {
   handelize,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
-} from "../src/store";
+} from "../src/store.js";
 
 // =============================================================================
 // Path Utilities
