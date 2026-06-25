@@ -68,6 +68,8 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { RemoteLLM } from "./remote-llm.js";
+import { HybridLLM, type LLMBackend, type HybridLLMConfig } from "./hybrid-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -549,3 +551,34 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   return store;
 }
+
+// =============================================================================
+// Public LLM exports (remote-LLM port — see docs/qmd-remote-llm-port.md §D2)
+// =============================================================================
+//
+// Advanced consumers can compose their own LLM stack (e.g. wire a custom
+// HybridLLM composition without going through env vars). The default LLM
+// factory in src/llm.js reads QMD_REMOTE_* env vars; these exports let
+// callers bypass that path.
+export { LlamaCpp };
+export { RemoteLLM, type RemoteLLMConfig } from "./remote-llm.js";
+export { HybridLLM, type LLMBackend, type HybridLLMConfig, type HybridLLMDeviceInfo } from "./hybrid-llm.js";
+// Re-export the wider LLM interface (9 methods — embedBatch/tokenize/
+// detokenize added in the port) and the option bags, from the canonical
+// source of truth.
+export type {
+  LLM,
+  EmbedOptions,
+  EmbeddingResult,
+  GenerateOptions,
+  GenerateResult,
+  ModelInfo,
+  Queryable,
+  QueryType,
+  RerankDocument,
+  RerankOptions,
+  RerankResult,
+  RerankDocumentResult,
+  TokenLogProb,
+} from "./llm-types.js";
+export { getDefaultLLM, setDefaultLLM, hasDefaultLLM, disposeDefaultLLM } from "./llm.js";

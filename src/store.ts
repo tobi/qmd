@@ -21,6 +21,7 @@ import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
+  getDefaultLLM,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -30,6 +31,7 @@ import {
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
+  type LLM,
 } from "./llm.js";
 import type {
   NamedCollection,
@@ -78,11 +80,33 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * Get the LLM instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
+}
+
+/**
+ * Resolve the embed model name used for prompt formatting. When the store
+ * has its own LlamaCpp bound, prefer its `embedModelName` (since
+ * embeddinggemma uses different prompt templates than OpenAI's
+ * text-embedding-3-small). Otherwise fall back to the local default —
+ * HybridLLM/RemoteLLM paths route through `embedBatch(texts)` without
+ * needing the model name on the local side, and the format-function does
+ * its best with the default.
+ */
+function resolveEmbedModelForStore(store: Store): string {
+  if (store.llm) {
+    // LlamaCpp carries an authoritative embedModelName; the cast is safe
+    // because Store.llm is typed as LlamaCpp. Test fakes (e.g. sdk.test.ts)
+    // don't always set embedModelName, so fall back to the default rather
+    // than passing `undefined` through to insertEmbedding (which would
+    // bind as NULL and fail the NOT NULL constraint on content_vectors.model).
+    const name = (store.llm as LlamaCpp).embedModelName;
+    if (name) return name;
+  }
+  return DEFAULT_EMBED_MODEL;
 }
 
 // =============================================================================
@@ -1683,8 +1707,7 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const llm = getLlm(store);
-  const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+  const model = options?.model ?? resolveEmbedModelForStore(store);
   const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
@@ -1703,11 +1726,25 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's LlamaCpp or global singleton, wrapped in a session.
+  // withLLMSessionForLlm expects a concrete LlamaCpp-shaped instance because
+  // the session manager is LlamaCpp-specific. When we have a real LlamaCpp
+  // we use it directly; when we have a HybridLLM wrapping a LlamaCpp, we
+  // pull the concrete local backend through HybridLLM.getLocal(); for test
+  // doubles that aren't LlamaCpp (e.g. sdk.test.ts uses a plain fake), we
+  // cast the LLM we already have — the session manager only needs the
+  // shape, and the actual embed work goes through the session's embed call
+  // which routes to whichever LLM was bound to the manager.
+  const llm = getLlm(store);
+  const llmCpp: LlamaCpp = llm instanceof LlamaCpp
+    ? llm
+    : typeof (llm as unknown as { getLocal?: () => LLM }).getLocal === "function"
+    ? ((llm as unknown as { getLocal: () => LLM }).getLocal() as LlamaCpp)
+    : (llm as unknown as LlamaCpp);
   const embedModelUri = model;
 
   // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  const result = await withLLMSessionForLlm(llmCpp, async (session) => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
@@ -1958,9 +1995,13 @@ export function createStore(dbPath?: string): Store {
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
-    getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
-    getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    // Use resolveEmbedModelForStore(store) instead of store.llm?.embedModelName
+    // — the latter is concrete-LlamaCpp-only and would break for stores backed
+    // by HybridLLM/RemoteLLM (which don't expose embedModelName on the LLM
+    // interface). resolveEmbedModelForStore encapsulates the cast + fallback.
+    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? resolveEmbedModelForStore(store)),
+    getIndexHealth: (model?: string) => getIndexHealth(db, model ?? resolveEmbedModelForStore(store)),
+    getStatus: (model?: string) => getStatus(db, model ?? resolveEmbedModelForStore(store)),
 
     // Caching
     getCacheKey,
@@ -2297,8 +2338,11 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   const expectedHashSeq = `${sample.hash}_${sample.seq}`;
   const title = extractTitle(sample.body, sample.path);
   const llm = getLlm(store);
+  const llmCpp: LlamaCpp = llm instanceof LlamaCpp
+    ? llm
+    : (llm as unknown as { getLocal: () => LLM }).getLocal() as LlamaCpp;
 
-  return await withLLMSessionForLlm(llm, async (session) => {
+  return await withLLMSessionForLlm(llmCpp, async (session) => {
     const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
     const chunk = chunks[sample.seq];
     if (!chunk) {
@@ -2769,7 +2813,10 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  // Use the default LLM (HybridLLM-wrapped LlamaCpp). Tokenize/detokenize
+  // route via QMD_TOKENIZE_BACKEND (default: local) so chunking heuristics
+  // see the right tokenizer.
+  const llm = getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3729,12 +3776,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
+async function getEmbedding(text: string, model: string | undefined, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
+  // Format text using the appropriate prompt template. Pass model=undefined
+  // when the caller hasn't pinned one so each backend uses its own configured
+  // embedding model.
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -3889,9 +3938,13 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
-  // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
+export async function expandQuery(query: string, model: string | undefined = undefined, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
+  // Check cache first — stored as JSON preserving types.
+  // model is no longer the cache-key discriminator when llmOverride routes
+  // through HybridLLM (each backend uses its own configured model), but we
+  // keep it for callers that still want to force a specific model.
+  const effectiveModel = model ?? DEFAULT_QUERY_MODEL;
+  const cacheKey = getCacheKey("expandQuery", { query, model: effectiveModel, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -3909,8 +3962,12 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = llmOverride ?? getDefaultLLM();
+  // Don't pass a forced model — let each backend use its own configured
+  // generation/expansion model. The LLM interface accepts `model?` in
+  // ExpandOptions (or none for HybridLLM's expandQuery); passing undefined
+  // lets HybridLLM route to whichever backend (local or remote) the user
+  // selected via QMD_GENERATE_BACKEND.
   const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -3930,9 +3987,12 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string | undefined = undefined, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
+  const debugRerank = !!process.env.QMD_DEBUG_RERANK;
+  const cacheModel = model ?? DEFAULT_RERANK_MODEL;
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -3943,8 +4003,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
@@ -3953,25 +4013,46 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  if (debugRerank) {
+    const preOrder = documents.map((d) => d.file).join(", ");
+    process.stderr.write(`[rerank:store] query: ${JSON.stringify(rerankQuery)}\n`);
+    process.stderr.write(`[rerank:store] pre-rerank order (${documents.length}): ${preOrder}\n`);
+    process.stderr.write(`[rerank:store] cached: ${cachedResults.size}/${documents.length}, uncached: ${uncachedDocsByChunk.size}\n`);
+  }
+
+  // Rerank uncached documents via the LLM interface (HybridLLM-routed).
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLLM();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+
+    // NOTE: We pass an empty options bag (no `model`) so each backend uses
+    // its own configured rerank model. This avoids accidentally handing a
+    // HuggingFace `hf:ggml-org/...` URI to RemoteLLM's pi-ai OpenAI registry
+    // (see docs/qmd-remote-llm-port.md §"Rerank model passing — non-obvious
+    // gotcha"). Callers that genuinely want to force a model can pass one
+    // via the `model` parameter (the rerank function would then forward it).
+    const rerankOptions: { model?: string } = model ? { model } : {};
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, rerankOptions);
 
     // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+    const textByFile = new Map(uncachedDocs.map((d) => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
+    }
+
+    if (debugRerank) {
+      process.stderr.write(`[rerank:store] rerank model: ${rerankResult.model}\n`);
+      const postOrder = rerankResult.results.map((r) => r.file).join(", ");
+      process.stderr.write(`[rerank:store] post-rerank order: ${postOrder}\n`);
     }
   }
 
   // Return all results sorted by score
   return documents
-    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
+    .map((doc) => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
 }
 
@@ -4816,7 +4897,9 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
+    // Use resolveEmbedModelForStore(store) to keep the model-name resolution in one place;
+    // avoid reading `embedModelName` on the public LLM interface (concrete-LlamaCpp-only).
+    const embedModel = resolveEmbedModelForStore(store);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -5059,8 +5142,10 @@ export async function vectorSearchQuery(
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
-  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
+  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs.
+  // Use resolveEmbedModelForStore(store) to keep the model-name resolution in one place;
+  // avoid reading `embedModelName` on the public LLM interface (concrete-LlamaCpp-only).
+  const embedModel = resolveEmbedModelForStore(store);
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
@@ -5202,7 +5287,9 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
+      // Use resolveEmbedModelForStore(store) to keep the model-name resolution in one place;
+      // avoid reading `embedModelName` on the public LLM interface (concrete-LlamaCpp-only).
+      const embedModel = resolveEmbedModelForStore(store);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();

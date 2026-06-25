@@ -1062,6 +1062,141 @@ vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
 
+## Remote LLM & Embeddings
+
+By default QMD runs everything locally via node-llama-cpp. You can offload embeddings, query expansion, and/or reranking to any OpenAI-compatible API (OpenRouter, OpenAI, a local Ollama server, etc.) by setting environment variables — no code changes required.
+
+### Quick setup
+
+Create a `.env` file in your working directory (or export the variables in your shell):
+
+```sh
+# Required: your API key (get one at https://openrouter.ai/keys)
+QMD_REMOTE_API_KEY="***"
+
+# Base URL — defaults to OpenRouter; override for other providers
+QMD_REMOTE_BASE_URL="https://openrouter.ai/api/v1"
+# QMD_REMOTE_BASE_URL="https://api.openai.com/v1"
+# QMD_REMOTE_BASE_URL="http://localhost:11434/v1"   # Ollama
+
+# Which models to use on the remote API
+QMD_REMOTE_EMBED_MODEL="openai/text-embedding-3-small"
+QMD_REMOTE_GENERATE_MODEL="openrouter/openai/gpt-4o-mini"
+QMD_REMOTE_RERANK_MODEL="openrouter/deepseek/deepseek-v3.2"   # optional; falls back to GENERATE_MODEL if unset
+
+# Route each operation to 'local' or 'remote'
+QMD_EMBED_BACKEND="remote"      # default: remote when API key is set, otherwise local
+QMD_GENERATE_BACKEND="remote"   # default: remote when API key is set, otherwise local
+QMD_RERANK_BACKEND="remote"     # default: remote when QMD_REMOTE_RERANK_MODEL is set, otherwise local
+QMD_TOKENIZE_BACKEND="***"    # default: local
+
+# Request timeout in ms (default: 60000)
+QMD_REMOTE_TIMEOUT=60000
+```
+
+### How it works
+
+When `QMD_REMOTE_API_KEY` is set, QMD creates a `HybridLLM` that routes each operation independently:
+
+| Operation | Default backend | Notes |
+|-----------|----------------|-------|
+| Embeddings (`qmd embed`) | Remote | Sent as a batch to `/embeddings` |
+| Query expansion (`qmd query`) | Remote | Uses the chat completions API |
+| Reranking (`qmd query`) | Remote if `QMD_REMOTE_RERANK_MODEL` is set, else local | See below |
+| Tokenization | Local | Used for chunking; always runs locally |
+
+If no API key is set, all operations fall back to local node-llama-cpp models automatically.
+
+### Remote reranking
+
+Remote reranking uses a **listwise scoring** approach: the LLM receives a batch of document chunks alongside the query and returns a JSON array of relevance scores (0.0–1.0), one per chunk. Scores are min-max normalized within each batch so the model's scale doesn't matter.
+
+The reranker prompt includes:
+- The file path of each chunk (a strong signal when filenames match the query)
+- A scoring rubric with four bands (0.9–1.0 direct match → 0.0–0.2 unrelated)
+- An explicit format example to prevent the model from adding prose
+
+Documents are processed in batches of 15 to stay within context windows. Results are cached in SQLite so repeated queries don't re-call the API.
+
+**Tuning:**
+
+```sh
+# Limit how many characters of each chunk are sent to the reranker (default: 1200)
+# Reduce to lower latency/cost; increase for longer documents
+QMD_RERANK_CHUNK_CHARS=800
+```
+
+**Debugging rerank:**
+
+```sh
+# Print pre/post rerank order and LLM prompt+response to stderr
+QMD_DEBUG_RERANK=1 qmd query "your search"
+```
+
+This shows:
+- The ranked order before reranking (from RRF fusion)
+- Which docs were cached vs sent to the LLM
+- The exact prompt and raw JSON response for each batch
+- The parsed scores and any parse errors
+- The final ranked order with scores and position changes (e.g. `was #4`)
+
+### Recommended configurations
+
+**Fully remote** — all operations via API, no local models needed:
+```sh
+QMD_REMOTE_API_KEY="***"
+QMD_REMOTE_BASE_URL="https://openrouter.ai/api/v1"
+QMD_REMOTE_EMBED_MODEL="openai/text-embedding-3-small"
+QMD_REMOTE_GENERATE_MODEL="openrouter/openai/gpt-4o-mini"
+QMD_REMOTE_RERANK_MODEL="openrouter/deepseek/deepseek-v3.2"
+QMD_EMBED_BACKEND="remote"
+QMD_GENERATE_BACKEND="remote"
+QMD_RERANK_BACKEND="remote"
+```
+
+**Fastest indexing** — remote embeddings, local reranking:
+```sh
+QMD_REMOTE_API_KEY="***"
+QMD_REMOTE_BASE_URL="https://openrouter.ai/api/v1"
+QMD_REMOTE_EMBED_MODEL="openai/text-embedding-3-small"
+QMD_EMBED_BACKEND="remote"
+QMD_GENERATE_BACKEND="local"
+QMD_RERANK_BACKEND="local"
+```
+
+**Fully local** (default, no env vars needed):
+```sh
+# Just run qmd — all three models download automatically on first use
+qmd embed
+qmd query "my search"
+```
+
+**OpenAI directly** (instead of OpenRouter):
+```sh
+QMD_REMOTE_API_KEY="***"   # OpenAI key format
+QMD_REMOTE_BASE_URL="https://api.openai.com/v1"
+QMD_REMOTE_EMBED_MODEL="text-embedding-3-small"
+QMD_REMOTE_GENERATE_MODEL="openai/gpt-4o-mini"
+QMD_REMOTE_RERANK_MODEL="openai/gpt-4o-mini"
+QMD_EMBED_BACKEND="remote"
+QMD_GENERATE_BACKEND="remote"
+QMD_RERANK_BACKEND="remote"
+```
+
+**Ollama** (local server, OpenAI-compatible):
+```sh
+QMD_REMOTE_API_KEY="***"
+QMD_REMOTE_BASE_URL="http://localhost:11434/v1"
+QMD_REMOTE_EMBED_MODEL="nomic-embed-text"
+QMD_REMOTE_GENERATE_MODEL="qwen2.5:1.5b"
+QMD_REMOTE_RERANK_MODEL="qwen2.5:1.5b"
+QMD_EMBED_BACKEND="remote"
+QMD_GENERATE_BACKEND="remote"
+QMD_RERANK_BACKEND="remote"
+```
+
+> **Note:** Embeddings generated with a remote model are not compatible with embeddings generated by the local embeddinggemma model. If you switch `QMD_EMBED_BACKEND`, re-run `qmd embed -f` to regenerate all vectors.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1072,6 +1207,18 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| `QMD_REMOTE_API_KEY` | — | API key for remote LLM/embedding provider |
+| `QMD_REMOTE_BASE_URL` | `https://openrouter.ai/api/v1` | Base URL for OpenAI-compatible API |
+| `QMD_REMOTE_EMBED_MODEL` | `text-embedding-3-small` | Embedding model name on the remote API |
+| `QMD_REMOTE_GENERATE_MODEL` | `openai/gpt-3.5-turbo` | Generation/query-expansion model on the remote API |
+| `QMD_REMOTE_RERANK_MODEL` | — | Rerank model on the remote API; falls back to `QMD_REMOTE_GENERATE_MODEL` if unset |
+| `QMD_REMOTE_TIMEOUT` | `60000` | Remote request timeout in ms |
+| `QMD_EMBED_BACKEND` | `remote` if key set, else `local` | `local` or `remote` |
+| `QMD_GENERATE_BACKEND` | `remote` if key set, else `local` | `local` or `remote` |
+| `QMD_RERANK_BACKEND` | `remote` if `QMD_REMOTE_RERANK_MODEL` set, else `local` | `local` or `remote` |
+| `QMD_TOKENIZE_BACKEND` | `local` | `local` or `remote` |
+| `QMD_RERANK_CHUNK_CHARS` | `1200` | Max characters of each chunk sent to the remote reranker |
+| `QMD_DEBUG_RERANK` | — | Set to `1` to print rerank prompt, response, and score changes to stderr |
 
 ## How It Works
 

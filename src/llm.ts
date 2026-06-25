@@ -1,7 +1,10 @@
 /**
  * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking using local GGUF models
+ * (default) OR a remote OpenAI-compatible API (when QMD_REMOTE_API_KEY is set).
+ *
+ * The remote-LLM port is documented in docs/qmd-remote-llm-port.md.
  */
 
 import type {
@@ -10,6 +13,30 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+
+// Load .env into process.env before reading any QMD_REMOTE_* vars in the
+// factory below. dotenv defaults to non-overriding mode so explicit shell
+// exports still win. Placed after the type-only node-llama-cpp import so
+// the cli-lazy-llm-import test's regex (which rejects non-type imports
+// preceding `from "node-llama-cpp"`) keeps passing.
+import "dotenv/config";
+import { HybridLLM, type LLMBackend } from "./hybrid-llm.js";
+import { RemoteLLM } from "./remote-llm.js";
+import type {
+  LLM,
+  EmbedOptions,
+  EmbeddingResult,
+  GenerateOptions,
+  GenerateResult,
+  ModelInfo,
+  Queryable,
+  QueryType,
+  RerankDocument,
+  RerankOptions,
+  RerankResult,
+  RerankDocumentResult,
+  TokenLogProb,
+} from "./llm-types.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -117,86 +144,33 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
 // Types
 // =============================================================================
 
-/**
- * Token with log probability
- */
-export type TokenLogProb = {
-  token: string;
-  logprob: number;
-};
+// =============================================================================
+// Shared LLM types (re-exported from ./llm-types.js for back-compat)
+// =============================================================================
+//
+// The types below are defined in src/llm-types.ts and re-exported here so
+// existing imports (`import type { LLM, EmbedOptions, ... } from "./llm.js"`)
+// keep working unchanged. Source of truth for these shapes lives in
+// src/llm-types.ts.
+export type {
+  TokenLogProb,
+  EmbeddingResult,
+  GenerateResult,
+  RerankDocumentResult,
+  RerankResult,
+  ModelInfo,
+  EmbedOptions,
+  GenerateOptions,
+  RerankOptions,
+  QueryType,
+  Queryable,
+  RerankDocument,
+  LLM,
+} from "./llm-types.js";
 
-/**
- * Embedding result
- */
-export type EmbeddingResult = {
-  embedding: number[];
-  model: string;
-};
-
-/**
- * Generation result with optional logprobs
- */
-export type GenerateResult = {
-  text: string;
-  model: string;
-  logprobs?: TokenLogProb[];
-  done: boolean;
-};
-
-/**
- * Rerank result for a single document
- */
-export type RerankDocumentResult = {
-  file: string;
-  score: number;
-  index: number;
-};
-
-/**
- * Batch rerank result
- */
-export type RerankResult = {
-  results: RerankDocumentResult[];
-  model: string;
-};
-
-/**
- * Model info
- */
-export type ModelInfo = {
-  name: string;
-  exists: boolean;
-  path?: string;
-};
-
-/**
- * Options for embedding
- */
-export type EmbedOptions = {
-  model?: string;
-  isQuery?: boolean;
-  title?: string;
-};
-
-/**
- * Options for text generation
- */
-export type GenerateOptions = {
-  model?: string;
-  maxTokens?: number;
-  temperature?: number;
-};
-
-/**
- * Options for reranking
- */
-export type RerankOptions = {
-  model?: string;
-};
-
-/**
- * Options for LLM sessions
- */
+// LLMSessionOptions stays in this file because it's specific to the
+// session-manager lifecycle (maxDuration, abort signal) and doesn't belong on
+// the backend-agnostic LLM interface.
 export type LLMSessionOptions = {
   /** Max session duration in ms (default: 10 minutes) */
   maxDuration?: number;
@@ -219,28 +193,6 @@ export interface ILLMSession {
   /** Abort signal for this session (aborts on release or maxDuration) */
   readonly signal: AbortSignal;
 }
-
-/**
- * Supported query types for different search backends
- */
-export type QueryType = 'lex' | 'vec' | 'hyde';
-
-/**
- * A single query and its target backend type
- */
-export type Queryable = {
-  type: QueryType;
-  text: string;
-};
-
-/**
- * Document to rerank
- */
-export type RerankDocument = {
-  file: string;
-  text: string;
-  title?: string;
-};
 
 // =============================================================================
 // Model Configuration
@@ -514,43 +466,11 @@ export async function pullModels(
 // =============================================================================
 // LLM Interface
 // =============================================================================
-
-/**
- * Abstract LLM interface - implement this for different backends
- */
-export interface LLM {
-  /**
-   * Get embeddings for text
-   */
-  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
-
-  /**
-   * Generate text completion
-   */
-  generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
-
-  /**
-   * Check if a model exists/is available
-   */
-  modelExists(model: string): Promise<ModelInfo>;
-
-  /**
-   * Expand a search query into multiple variations for different backends.
-   * Returns a list of Queryable objects.
-   */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
-
-  /**
-   * Rerank documents by relevance to a query
-   * Returns list of documents with relevance scores (higher = more relevant)
-   */
-  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
-
-  /**
-   * Dispose of resources
-   */
-  dispose(): Promise<void>;
-}
+//
+// `LLM` is now declared in src/llm-types.ts (9 methods, including the new
+// embedBatch/tokenize/detokenize). The `export type { ... }` block above
+// re-exports it from there so existing imports of `LLM` from "./llm.js"
+// continue to work. See docs/qmd-remote-llm-port.md §"Interface shape".
 
 // =============================================================================
 // node-llama-cpp Implementation
@@ -1923,6 +1843,12 @@ function getSessionManager(): LLMSessionManager {
  * Execute a function with a scoped LLM session.
  * The session provides lifecycle guarantees - resources won't be disposed mid-operation.
  *
+ * For the default LlamaCpp singleton, the session is managed by
+ * LLMSessionManager (reference-counted, blocks idle unload). For HybridLLM
+ * or RemoteLLM, no idle-unload semantics apply (remote is HTTP-only;
+ * HybridLLM's local is only disposed when the wrapper is), so we build a
+ * thin proxy session that honours the abort signal and a maxDuration timer.
+ *
  * @example
  * ```typescript
  * await withLLMSession(async (session) => {
@@ -1937,13 +1863,27 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
-  const session = new LLMSession(manager, options);
+  const llm = getDefaultLLM();
 
+  if (llm instanceof LlamaCpp) {
+    // Existing path: full session manager with idle-unload protection.
+    const manager = getSessionManager();
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+
+  // HybridLLM / RemoteLLM path: thin proxy session. Aborts the work after
+  // maxDuration or when the caller-provided signal fires; no reference
+  // counting because the backend doesn't need idle-unload protection.
+  const proxy = createThinSession(llm, options);
   try {
-    return await fn(session);
+    return await fn(proxy);
   } finally {
-    session.release();
+    proxy._release();
   }
 }
 
@@ -1968,11 +1908,97 @@ export async function withLLMSessionForLlm<T>(
 
 /**
  * Check if idle unload is safe (no active sessions or operations).
- * Used internally by LlamaCpp idle timer.
+ * Used internally by LlamaCpp idle timer. For HybridLLM / RemoteLLM
+ * singletons this is always true because there's no idle-unload to block.
  */
 export function canUnloadLLM(): boolean {
+  if (!defaultLLM) return true;
+  if (!(defaultLLM instanceof LlamaCpp)) return true;
   if (!defaultSessionManager) return true;
   return defaultSessionManager.canUnload();
+}
+
+// =============================================================================
+// Thin ILLMSession proxy for HybridLLM / RemoteLLM
+// =============================================================================
+
+/**
+ * Minimal ILLMSession implementation that proxies through to a non-LlamaCpp
+ * LLM. Honours the abort signal (caller-provided + maxDuration timer) but
+ * does NOT participate in reference counting — there is no idle-unload
+ * equivalent for these backends.
+ */
+function createThinSession(llm: LLM, options?: LLMSessionOptions): ILLMSession & { _release: () => void } {
+  const abortController = new AbortController();
+  const maxDuration = options?.maxDuration ?? 10 * 60 * 1000;
+  const maxDurationTimer = setTimeout(() => {
+    abortController.abort(new Error("Session maxDuration exceeded"));
+  }, maxDuration);
+
+  // Chain caller-provided abort signal.
+  const externalSignal = options?.signal;
+  let externalAbortHandler: (() => void) | null = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortController.abort(externalSignal.reason ?? new Error("External signal aborted"));
+    } else {
+      externalAbortHandler = () => {
+        abortController.abort(externalSignal.reason ?? new Error("External signal aborted"));
+      };
+      externalSignal.addEventListener("abort", externalAbortHandler);
+    }
+  }
+
+  let released = false;
+  const isValid = (): boolean => !released && !abortController.signal.aborted;
+
+  const guard = async <R>(fn: () => Promise<R>): Promise<R> => {
+    if (!isValid()) {
+      throw new SessionReleasedError(
+        abortController.signal.reason?.message ?? "Session released"
+      );
+    }
+    try {
+      return await fn();
+    } catch (err) {
+      if (abortController.signal.aborted) {
+        throw new SessionReleasedError(
+          abortController.signal.reason?.message ?? "Session aborted"
+        );
+      }
+      throw err;
+    }
+  };
+
+  const session: ILLMSession & { _release: () => void } = {
+    get isValid() { return isValid(); },
+    get signal() { return abortController.signal; },
+    async embed(text, options) {
+      return guard(() => llm.embed(text, options));
+    },
+    async embedBatch(texts, options) {
+      // RemoteLLM's embedBatch takes only `texts`. HybridLLM forwards options.
+      return guard(() =>
+        (llm.embedBatch as (t: string[], o?: EmbedOptions) => Promise<(EmbeddingResult | null)[]>)(texts, options)
+      );
+    },
+    async expandQuery(query, options) {
+      return guard(() => llm.expandQuery(query, options));
+    },
+    async rerank(query, documents, options) {
+      return guard(() => llm.rerank(query, documents, options));
+    },
+    _release() {
+      if (released) return;
+      released = true;
+      if (maxDurationTimer) clearTimeout(maxDurationTimer);
+      if (externalSignal && externalAbortHandler) {
+        externalSignal.removeEventListener("abort", externalAbortHandler);
+      }
+      abortController.abort(new Error("Session released"));
+    },
+  };
+  return session;
 }
 
 // =============================================================================
@@ -2039,16 +2065,119 @@ export function isDarwinExitGuardInstalled(): boolean {
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
+// =============================================================================
+// Default LLM singleton (HybridLLM by default, LlamaCpp-only for back-compat)
+// =============================================================================
+//
+// `defaultLLM` is the new singleton. It is constructed lazily by
+// getDefaultLLM() and is a HybridLLM that wraps a LlamaCpp always and an
+// optional RemoteLLM (only constructed when QMD_REMOTE_API_KEY is set).
+//
+// `defaultLlamaCpp` is kept as a back-compat alias so existing callers of
+// getDefaultLlamaCpp() / setDefaultLlamaCpp() / disposeDefaultLlamaCpp()
+// continue to work — they all read/write the same underlying singleton via
+// the factory below.
+
+let defaultLLM: LLM | null = null;
 let defaultLlamaCpp: LlamaCpp | null = null;
+
+function backendFromEnv(name: string, fallback: LLMBackend): LLMBackend {
+  const raw = process.env[name];
+  if (raw === "remote" || raw === "local") return raw;
+  return fallback;
+}
+
+/**
+ * Construct (or return the cached) default LLM. Always returns a HybridLLM
+ * wrapping a LlamaCpp. A RemoteLLM is added when QMD_REMOTE_API_KEY is set.
+ *
+ * Per-operation backend routing is read from QMD_EMBED_BACKEND /
+ * QMD_GENERATE_BACKEND / QMD_RERANK_BACKEND / QMD_TOKENIZE_BACKEND with
+ * sensible defaults. When the user asks for `remote` but no API key is set,
+ * HybridLLM.getBackend() falls back to local and warns.
+ */
+export function getDefaultLLM(): LLM {
+  if (!defaultLLM) {
+    // When the caller has explicitly set defaultLlamaCpp (test injection
+    // or advanced override), reuse it as the local backend. Otherwise
+    // construct a fresh LlamaCpp. Either way, defaultLlamaCpp ends up
+    // pointing at the same instance as the HybridLLM's local field.
+    const local = defaultLlamaCpp ?? new LlamaCpp();
+    defaultLlamaCpp = local;
+
+    const apiKey = process.env.QMD_REMOTE_API_KEY;
+    let remote: RemoteLLM | undefined;
+    if (apiKey) {
+      remote = new RemoteLLM({
+        apiKey,
+        baseURL: process.env.QMD_REMOTE_BASE_URL,
+        embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
+        generateModel: process.env.QMD_REMOTE_GENERATE_MODEL,
+        rerankModel: process.env.QMD_REMOTE_RERANK_MODEL || undefined,
+        timeoutMs: process.env.QMD_REMOTE_TIMEOUT
+          ? parseInt(process.env.QMD_REMOTE_TIMEOUT, 10)
+          : undefined,
+      });
+    }
+
+    defaultLLM = new HybridLLM(local, remote, {
+      embedBackend: backendFromEnv("QMD_EMBED_BACKEND", apiKey ? "remote" : "local"),
+      generateBackend: backendFromEnv("QMD_GENERATE_BACKEND", apiKey ? "remote" : "local"),
+      rerankBackend: backendFromEnv(
+        "QMD_RERANK_BACKEND",
+        process.env.QMD_REMOTE_RERANK_MODEL ? "remote" : "local",
+      ),
+      tokenizeBackend: backendFromEnv("QMD_TOKENIZE_BACKEND", "local"),
+    });
+  }
+  return defaultLLM;
+}
+
+/**
+ * Set the default LLM singleton directly. Useful for tests that want to
+ * inject a fake or for advanced consumers that want to wire a custom
+ * HybridLLM composition. Pass null to clear.
+ */
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLLM = llm;
+  // If the wrapped LLM is a LlamaCpp (test double or factory output), keep
+  // defaultLlamaCpp in sync so getDefaultLlamaCpp() resolves to the same
+  // instance.
+  if (llm instanceof LlamaCpp) {
+    defaultLlamaCpp = llm;
+  } else if (llm && typeof (llm as { getLocal?: unknown }).getLocal === "function") {
+    const candidate = (llm as unknown as { getLocal: () => LLM }).getLocal();
+    if (candidate instanceof LlamaCpp) defaultLlamaCpp = candidate;
+  } else {
+    defaultLlamaCpp = null;
+  }
+}
+
+/**
+ * Peek at whether a default LLM is currently instantiated.
+ */
+export function hasDefaultLLM(): boolean {
+  return defaultLLM !== null;
+}
 
 /**
  * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
  * constructor installs the darwin exit guard, so any code path that obtains
  * the singleton is protected.
+ *
+ * This is the back-compat accessor used by chunkDocumentByTokens and other
+ * code paths that genuinely need the concrete LlamaCpp. It throws if the
+ * default LLM is a remote-only construction (no API key path bypasses this
+ * — `getDefaultLLM()` always wraps a LlamaCpp, but if a test has overridden
+ * defaultLLM with a RemoteLLM-only instance this throws).
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    // Eagerly construct the default so the local backend exists.
+    getDefaultLLM();
+  }
+  if (!defaultLlamaCpp) {
+    throw new Error("Default LlamaCpp backend is not available");
   }
   return defaultLlamaCpp;
 }
@@ -2062,6 +2191,29 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
+  // If the higher-level default LLM was a HybridLLM wrapping the previous
+  // LlamaCpp, invalidate it so the next getDefaultLLM() re-wraps the
+  // newly-set defaultLlamaCpp (instead of constructing a fresh real one).
+  if (defaultLLM && !(defaultLLM instanceof LlamaCpp)) {
+    defaultLLM = null;
+  }
+}
+
+/**
+ * Get the concrete LlamaCpp that the default HybridLLM wraps. When the
+ * caller has explicitly set `defaultLlamaCpp` (e.g. test fakes), return that
+ * instance. Otherwise, force-construct it through `getDefaultLLM()` so the
+ * HybridLLM local backend and `defaultLlamaCpp` stay in sync.
+ */
+function getOrCreateDefaultLlamaCpp(): LlamaCpp {
+  if (defaultLlamaCpp) return defaultLlamaCpp;
+  // Force HybridLLM construction; the factory sets defaultLlamaCpp as a
+  // side effect when it instantiates a new LlamaCpp.
+  getDefaultLLM();
+  if (!defaultLlamaCpp) {
+    throw new Error("Default LlamaCpp backend is not available");
+  }
+  return defaultLlamaCpp;
 }
 
 /**
@@ -2073,12 +2225,25 @@ export function hasDefaultLlamaCpp(): boolean {
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
- * Call this before process exit to prevent NAPI crashes.
+ * Dispose the default LLM (and its backends) if it exists.
  */
-export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
+export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultLLM) {
+    await defaultLLM.dispose();
+    defaultLLM = null;
   }
+  defaultLlamaCpp = null;
 }
+
+/**
+ * Back-compat alias for disposeDefaultLLM.
+ */
+export const disposeDefaultLlamaCpp = disposeDefaultLLM;
+
+// =============================================================================
+// Re-exports for downstream modules that want to construct backends directly
+// (e.g. custom HybridLLM compositions without going through env vars).
+// Spec decision D2: these are part of the public SDK surface.
+// =============================================================================
+export { HybridLLM, type LLMBackend, type HybridLLMConfig, type HybridLLMDeviceInfo } from "./hybrid-llm.js";
+export { RemoteLLM, type RemoteLLMConfig } from "./remote-llm.js";

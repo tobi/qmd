@@ -31,6 +31,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { disposeDefaultLLM } from "../llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -891,11 +892,17 @@ export async function startMcpHttpServer(
   process.on("SIGTERM", async () => {
     console.error("Shutting down (SIGTERM)...");
     await stop();
+    // Dispose HybridLLM (local + remote) explicitly. store.close() also
+    // disposes the store-bound LLM, but the default singleton is separate
+    // and would otherwise leak native resources on darwin (see docs/qmd-
+    // remote-llm-port.md §"src/cli/qmd.ts cleanup").
+    await disposeDefaultLLM();
     process.exit(0);
   });
   process.on("SIGINT", async () => {
     console.error("Shutting down (SIGINT)...");
     await stop();
+    await disposeDefaultLLM();
     process.exit(0);
   });
 

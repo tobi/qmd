@@ -42,7 +42,8 @@
     "rerank": "tsx src/cli/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",
     "release": "./scripts/release.sh",
-    "smoke:package-grammars": "node scripts/check-package-grammars.mjs"
+    "smoke:package-grammars": "node scripts/check-package-grammars.mjs",
+    "debug-config": "tsx scripts/debug-config.ts"
   },
   "publishConfig": {
     "access": "public"
@@ -56,8 +57,10 @@
     "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "^0.55.4",
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "12.10.0",
+    "dotenv": "^17.3.1",
     "fast-glob": "3.3.3",
     "node-llama-cpp": "3.18.1",
     "picomatch": "4.0.4",

@@ -1,4 +1,8 @@
 import { isBun, openDatabase } from "../db.js";
+// Load .env so QMD_REMOTE_* env vars are visible to the CLI before any LLM
+// is constructed. dotenv defaults to non-overriding mode — explicit shell
+// exports still win.
+import "dotenv/config";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
@@ -80,7 +84,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLLM, disposeDefaultLlamaCpp, getDefaultLLM, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, HybridLLM, RemoteLLM, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -243,7 +247,7 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
  * libggml-metal's static `ggml_metal_device` destructor asserts on a
  * non-empty residency-set collection during `__cxa_finalize_ranges` and
  * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
- * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
+ * PR #22595). Empirically, even with explicit `disposeDefaultLLM()` the
  * direct `process.exit(0)` path still trips the assertion — letting the
  * event loop drain naturally is what actually clears the rsets.
  *
@@ -264,7 +268,7 @@ export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCom
   await flushWritable(options.stdout ?? process.stdout);
 
   try {
-    await (options.cleanup ?? disposeDefaultLlamaCpp)();
+    await (options.cleanup ?? disposeDefaultLLM)();
   } catch (error) {
     stderr.write(
       `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
@@ -1880,7 +1884,14 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+  // The "Model: …" log is emitted AFTER the first successful batch rather
+  // than upfront. Reason: when QMD_EMBED_BACKEND=*** the actual model used
+  // (remote text-embedding-3-small, etc.) is configured on the backend and
+  // may differ from the local-default `model` argument above. Printing
+  // post-first-batch guarantees the label reflects what was actually used.
+  // See docs/qmd-remote-llm-port.md §"src/cli/qmd.ts — vectorIndex fix".
+  let modelLogged = false;
+
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1900,6 +1911,13 @@ async function vectorIndex(
     chunkStrategy: batchOptions?.chunkStrategy,
     maxDurationMs: batchOptions?.maxDurationMs,
     onProgress: (info) => {
+      if (!modelLogged) {
+        // First progress event → first batch has actually started. Print
+        // the model label now (overrides the upfront print that was
+        // removed above).
+        console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+        modelLogged = true;
+      }
       if (info.totalBytes === 0) return;
       // Progress is measured by input bytes, not by chunks. The final chunk
       // count is discovered lazily batch-by-batch, so displaying
@@ -3761,7 +3779,13 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    // Probe via the default LLM (HybridLLM). The HybridLLM.getDeviceInfo()
+    // implementation forwards the allowBuild flag to its local LlamaCpp
+    // backend (which is what carries the darwin exit-guard install hook).
+    // `getDeviceInfo` is not part of the LLM interface (it's a concrete
+    // method on LlamaCpp / HybridLLM only — see docs/qmd-remote-llm-port.md
+    // §"Interface shape"), so we cast.
+    const device = await (getDefaultLLM() as unknown as { getDeviceInfo: () => Promise<{ gpu: string | false; gpuOffloading: boolean; gpuDevices: string[]; vram?: { total: number; used: number; free: number }; cpuCores: number }> }).getDeviceInfo();
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
