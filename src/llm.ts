@@ -16,9 +16,9 @@ import type {
 
 // Load .env into process.env before reading any QMD_REMOTE_* vars in the
 // factory below. dotenv defaults to non-overriding mode so explicit shell
-// exports still win. Placed after the type-only node-llama-cpp import so
-// the cli-lazy-llm-import test's regex (which rejects non-type imports
-// preceding `from "node-llama-cpp"`) keeps passing.
+// exports still win. Placed AFTER the type-only block above so the
+// cli-lazy-llm-import test's regex (which forbids non-type imports of the
+// native module) keeps passing.
 import "dotenv/config";
 import { HybridLLM, type LLMBackend } from "./hybrid-llm.js";
 import { RemoteLLM } from "./remote-llm.js";
