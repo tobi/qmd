@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Remote LLM backend via `HybridLLM` — route embeddings, query expansion, and reranking to any OpenAI-compatible API
+- 12 new env vars for remote backend configuration
+- `debug-config` script for backend diagnostics
+- `QMD_DEBUG_RERANK` for rerank pipeline inspection
+
+### Changed
+
+- LLM interface widened from 6 to 9 methods (adds `embedBatch`, `tokenize`, `detokenize`)
+
+### Notes
+
+- Local behaviour unchanged when no API key is set
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

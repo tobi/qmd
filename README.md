@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking. By default everything runs locally via node-llama-cpp with GGUF models; embeddings, query expansion, and reranking can optionally be routed to any OpenAI-compatible API.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -472,6 +472,7 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 | **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
 | **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
 | **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| **Reranker (remote)** | LLM listwise scoring | min-max normalized per batch | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
@@ -1106,6 +1107,8 @@ When `QMD_REMOTE_API_KEY` is set, QMD creates a `HybridLLM` that routes each ope
 | Tokenization | Local | Used for chunking; always runs locally |
 
 If no API key is set, all operations fall back to local node-llama-cpp models automatically.
+
+`qmd status` reflects the active LLM implementation: when `QMD_REMOTE_API_KEY` is set it prints `LLM Class: HybridLLM`; otherwise it prints `LLM Class: LlamaCpp`.
 
 ### Remote reranking
 
