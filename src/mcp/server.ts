@@ -323,9 +323,15 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        pathPrefix: z.string().optional().describe(
+          "Filter to folder-prefix within collection(s), e.g. 'docs/'. Folder-only — file paths are not supported."
+        ),
+        explain: z.boolean().optional().default(false).describe(
+          "Include score breakdown per result: scoreType, backendSources, ftsScores, vectorScores, RRF trace, rerankScore, and blendedScore."
+        ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank, pathPrefix, explain }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -357,6 +363,8 @@ Intent-aware lex (C++ performance, not sports):
         candidateLimit,
         rerank,
         intent,
+        pathPrefix,
+        explain,
       });
 
       // Use the plain query, or the first lex/vec sub-query, for snippet extraction
@@ -372,10 +380,11 @@ Intent-aware lex (C++ performance, not sports):
           docid: `#${r.docid}`,
           file: r.displayPath,
           title: r.title,
-          score: Math.round(r.score * 100) / 100,
+          score: explain ? r.score : Math.round(r.score * 100) / 100,
           context: r.context,
           line,
           snippet: addLineNumbers(snippet, line),
+          ...(explain && r.explain ? { explain: r.explain } : {}),
         };
       });
 
@@ -718,16 +727,32 @@ export async function startMcpHttpServer(
         return;
       }
 
-      // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody) as Record<string, unknown>;
+        let params: Record<string, unknown>;
+        try {
+          params = JSON.parse(rawBody) as Record<string, unknown>;
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "invalid JSON" }));
+          return;
+        }
 
         // Validate required fields
         if (!params.searches || !Array.isArray(params.searches)) {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          return;
+        }
+        if (params.pathPrefix !== undefined && typeof params.pathPrefix !== "string") {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "pathPrefix must be string" }));
+          return;
+        }
+        if (params.explain !== undefined && typeof params.explain !== "boolean") {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "explain must be boolean" }));
           return;
         }
 
@@ -749,6 +774,8 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          pathPrefix: typeof params.pathPrefix === "string" ? params.pathPrefix : undefined,
+          explain: typeof params.explain === "boolean" ? params.explain : false,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -762,10 +789,11 @@ export async function startMcpHttpServer(
             docid: `#${r.docid}`,
             file: `qmd://${encodeQmdPath(r.displayPath)}`,
             title: r.title,
-            score: Math.round(r.score * 100) / 100,
+            score: params.explain ? r.score : Math.round(r.score * 100) / 100,
             context: r.context,
             line,
             snippet: addLineNumbers(snippet, line),
+            ...(params.explain && r.explain ? { explain: r.explain } : {}),
           };
         });
 
