@@ -160,6 +160,8 @@ export interface SearchOptions {
   collection?: string;
   /** Filter to specific collections */
   collections?: string[];
+  /** Filter to folder-prefix within collection(s); folder-only, not file-prefix. */
+  pathPrefix?: string;
   /** Max results (default: 10) */
   limit?: number;
   /** Max candidates to rerank (default: 40) */
@@ -178,6 +180,8 @@ export interface SearchOptions {
 export interface LexSearchOptions {
   limit?: number;
   collection?: string;
+  /** Filter to folder-prefix within collection; folder-only, not file-prefix. */
+  pathPrefix?: string;
 }
 
 /**
@@ -186,6 +190,8 @@ export interface LexSearchOptions {
 export interface VectorSearchOptions {
   limit?: number;
   collection?: string;
+  /** Filter to folder-prefix within collection; folder-only, not file-prefix. */
+  pathPrefix?: string;
 }
 
 /**
@@ -408,6 +414,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           explain: opts.explain,
           intent: opts.intent,
           candidateLimit: opts.candidateLimit,
+          pathPrefix: opts.pathPrefix,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
@@ -421,12 +428,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         explain: opts.explain,
         intent: opts.intent,
         candidateLimit: opts.candidateLimit,
+        pathPrefix: opts.pathPrefix,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.pathPrefix),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, opts?.pathPrefix),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
