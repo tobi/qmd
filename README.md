@@ -694,6 +694,7 @@ collections:
     ignore:                      # glob patterns to exclude from indexing
       - "Archive/**"
       - "**/drafts/**"
+    allowDotDirs: [".aidocs"]    # dot-dirs to index (hidden dirs are skipped by default)
     update: "git pull --rebase"  # bash command run before each `qmd update`
     includeByDefault: true       # include in unscoped queries (default: true)
     context:                     # path prefix → description; longest match wins
@@ -709,6 +710,7 @@ collections:
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
+| `collections.<name>.allowDotDirs` | per-collection | Dot-prefixed directory names to index even though hidden files/dirs are skipped by default (e.g. `[".aidocs"]`). Every other dot-prefixed segment (`.git`, `.cache`, …) stays excluded. **YAML-only.** Default: none (no dot-dirs indexed — unchanged behavior). |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
 | `collections.<name>.context` | per-collection | Path-prefix → description map; the most specific (longest) matching prefix wins. Set via `qmd context add`. |
