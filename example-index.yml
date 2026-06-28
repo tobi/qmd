@@ -76,6 +76,18 @@ collections:
       "/api": "API reference and endpoint docs"
       "/guides": "How-to guides and tutorials"
 
+  # ── Index hidden (dot-prefixed) directories ────────────────────────────────
+  # Hidden files/dirs are skipped by default. List the dot-dirs you want indexed
+  # via `allowDotDirs`; everything else dot-prefixed (.git, .cache, …) stays
+  # excluded. Useful for agent/tooling dirs like .aidocs that hold real docs.
+  agent-notes:
+    path: ~/work/project
+    pattern: "**/*.md"
+    allowDotDirs:
+      - ".aidocs"             # index .aidocs/ (AI session notes, plans, research)
+    context:
+      "/": "Project docs including .aidocs/ agent notes"
+
   # ── Exclude from default searches ──────────────────────────────────────────
   # includeByDefault: false → skipped unless you name it: qmd query -c vendor "..."
   # Set via CLI: qmd collection exclude vendor

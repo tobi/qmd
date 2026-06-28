@@ -28,6 +28,7 @@ export interface Collection {
   path: string;              // Absolute path to index
   pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
+  allowDotDirs?: string[];   // Dot-prefixed dir segments to index despite the default hidden-file skip (e.g., [".aidocs"])
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
