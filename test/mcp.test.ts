@@ -900,6 +900,56 @@ describe("MCP Server", () => {
       }
     });
 
+    test("semantic rerank score helper exposes pure reranker score only when meaningful", () => {
+      const explain = {
+        ftsScores: [0.4],
+        vectorScores: [0.5],
+        rrf: { rank: 2, positionScore: 0.5, weight: 0.6, baseScore: 0.1, topRankBonus: 0, totalScore: 0.1, contributions: [] },
+        rerankScore: 0.734567,
+        blendedScore: 0.593827,
+      };
+      expect(semanticRerankScoreOrNull({ explain }, true)).toBe(0.734567);
+      expect(semanticRerankScoreOrNull({ explain }, undefined)).toBe(0.734567);
+      expect(semanticRerankScoreOrNull({ explain }, false)).toBeNull();
+      expect(semanticRerankScoreOrNull({})).toBeNull();
+      expect(semanticRerankScoreOrNull({ explain: { ...explain, rrf: { ...explain.rrf, weight: 1.0 }, rerankScore: 0 } }, true)).toBeNull();
+    });
+
+    test("rerankScore response fields are default-off and full-precision when explain is true", () => {
+      const result = {
+        docid: "abc123",
+        displayPath: "docs/readme.md",
+        title: "Project README",
+        score: 0.876543,
+        context: null,
+        explain: {
+          ftsScores: [],
+          vectorScores: [],
+          rrf: { rank: 1, positionScore: 1, weight: 0.75, baseScore: 0.1, topRankBonus: 0.05, totalScore: 0.15, contributions: [] },
+          rerankScore: 0.503212345,
+          blendedScore: 0.876543,
+        },
+      };
+      const base = {
+        docid: `#${result.docid}`,
+        file: result.displayPath,
+        title: result.title,
+        score: Math.round(result.score * 100) / 100,
+        context: result.context,
+        line: 1,
+        snippet: "1: readme",
+      };
+      expect(base).not.toHaveProperty("rerankScore");
+      const explained = {
+        ...base,
+        rerankScore: semanticRerankScoreOrNull(result, true),
+        explain: result.explain,
+      };
+      expect(explained.score).toBe(0.88);                 // display score stays rounded
+      expect(explained.rerankScore).toBe(0.503212345);    // pure relevance score is raw
+      expect(explained.rerankScore).toBe(explained.explain.rerankScore);
+    });
+
     test("REST /query and /search file field uses qmd:// URI prefix (#576)", () => {
       // Regression test: the HTTP REST endpoint was returning r.displayPath (e.g.
       // "docs/readme.md") instead of "qmd://docs/readme.md", while the CLI and MCP
@@ -933,7 +983,7 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
+import { startMcpHttpServer, type HttpServerHandle, semanticRerankScoreOrNull } from "../src/mcp/server";
 import { enableProductionMode } from "../src/store";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
