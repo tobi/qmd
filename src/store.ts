@@ -2357,7 +2357,7 @@ export function getCacheKey(url: string, body: object): string {
 
 export function getCachedResult(db: Database, cacheKey: string): string | null {
   const row = db.prepare(`SELECT result FROM llm_cache WHERE hash = ?`).get(cacheKey) as { result: string } | null;
-  return row?.result || null;
+  return row?.result ?? null;
 }
 
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
@@ -3199,7 +3199,7 @@ export function renameCollection(db: Database, oldName: string, newName: string)
  */
 export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
   // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+  const coll = db.prepare(`SELECT name FROM store_collections WHERE id = ?`).get(collectionId) as { name: string } | null;
   if (!coll) {
     throw new Error(`Collection with id ${collectionId} not found`);
   }
