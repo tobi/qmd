@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- `RemoteLLM` backend that delegates LLM operations to external
+  OpenAI-compatible HTTP endpoints instead of loading local GGUF models.
+  Embeddings and reranking go to an `embed_reranker` service
+  (`QMD_REMOTE_EMBED_URL`, default `http://localhost:1235`); generation and
+  query expansion go to LM Studio or any OpenAI-compatible endpoint
+  (`QMD_REMOTE_LLM_URL`, default `http://localhost:1234`,
+  `QMD_REMOTE_LLM_MODEL`). Activated when either URL env var is set; otherwise
+  QMD falls back to the local `LlamaCpp` (GGUF) backend. Intended for serving
+  MLX models on macOS via LM Studio.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
