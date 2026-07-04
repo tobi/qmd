@@ -80,7 +80,8 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM, shouldUseRemoteLLM } from "../remote-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,11 +134,15 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      if (shouldUseRemoteLLM()) {
+        setDefaultLLM(new RemoteLLM());
+      } else {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -2511,7 +2516,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   const lines: string[] = [];
   lines.push(`${c.dim}├─ ${originalQuery}${c.reset}`);
   for (const q of expanded) {
-    let preview = q.query.replace(/\n/g, ' ');
+    let preview = String(q.query || "").replace(/\n/g, ' ');
     if (preview.length > 72) preview = preview.substring(0, 69) + '...';
     lines.push(`${c.dim}├─ ${q.type}: ${preview}${c.reset}`);
   }
@@ -2601,7 +2606,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
       // Log each sub-query
       for (const s of structuredQueries) {
-        let preview = s.query.replace(/\n/g, ' ');
+        let preview = String(s.query || "").replace(/\n/g, ' ');
         if (preview.length > 72) preview = preview.substring(0, 69) + '...';
         process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
       }

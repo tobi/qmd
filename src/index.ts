@@ -67,7 +67,9 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
+import { RemoteLLM, shouldUseRemoteLLM } from "./remote-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -372,15 +374,17 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
+  // Create a per-store LLM instance. Use RemoteLLM when env vars are set,
+  // otherwise fall back to LlamaCpp (lazy-loads GGUF models on first use).
+  const llm: LLM = shouldUseRemoteLLM()
+    ? new RemoteLLM()
+    : new LlamaCpp({
+        embedModel: config?.models?.embed,
+        generateModel: config?.models?.generate,
+        rerankModel: config?.models?.rerank,
+        inactivityTimeoutMs: 5 * 60 * 1000,
+        disposeModelsOnInactivity: true,
+      });
   internal.llm = llm;
 
   const store: QMDStore = {

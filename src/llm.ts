@@ -93,6 +93,8 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  // Remote LLM handles its own prefixes server-side
+  if (uri.startsWith("remote:")) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -106,6 +108,8 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  // Remote LLM handles its own prefixes server-side
+  if (uri.startsWith("remote:")) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -212,7 +216,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -520,9 +524,29 @@ export async function pullModels(
  */
 export interface LLM {
   /**
+   * Human-readable name of the active embedding model (used for logging/caching).
+   */
+  readonly embedModelName: string;
+
+  /**
+   * Human-readable name of the active generation model (used for logging/caching).
+   */
+  readonly generateModelName: string;
+
+  /**
+   * Human-readable name of the active rerank model (used for logging/caching).
+   */
+  readonly rerankModelName: string;
+
+  /**
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for multiple texts in a single call.
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -538,7 +562,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -1952,17 +1976,43 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
-  const session = new LLMSession(manager, options);
+  // LlamaCpp uses a session manager for concurrency control.
+  // Other LLM implementations (e.g. RemoteLLM) run operations directly.
+  if (llm instanceof LlamaCpp) {
+    const manager = new LLMSessionManager(llm);
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
 
+  // For non-LlamaCpp backends: create a pass-through session backed by the LLM directly.
+  const signal = new AbortController();
+  const maxDuration = options?.maxDuration ?? 10 * 60 * 1000; // Default 10 minutes
+  let maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+  if (maxDuration > 0) {
+    maxDurationTimer = setTimeout(() => {
+      signal.abort(new Error(`Session exceeded max duration of ${maxDuration}ms`));
+    }, maxDuration);
+  }
+  const passthroughSession: ILLMSession = {
+    embed: (text, opts) => llm.embed(text, opts),
+    embedBatch: (texts, opts) => llm.embedBatch(texts, opts),
+    expandQuery: (query, opts) => llm.expandQuery(query, opts),
+    rerank: (query, docs, opts) => llm.rerank(query, docs, opts),
+    get isValid() { return !signal.signal.aborted; },
+    get signal() { return signal.signal; },
+  };
   try {
-    return await fn(session);
+    return await fn(passthroughSession);
   } finally {
-    session.release();
+    if (maxDurationTimer) clearTimeout(maxDurationTimer);
   }
 }
 
@@ -2036,21 +2086,40 @@ export function isDarwinExitGuardInstalled(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLLMOverride: LLM | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
  * constructor installs the darwin exit guard, so any code path that obtains
  * the singleton is protected.
+ * Only use this when LlamaCpp-specific methods (tokenize, getDeviceInfo) are required.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
   }
   return defaultLlamaCpp;
+}
+
+/**
+ * Get the default LLM instance.
+ * Returns a RemoteLLM override if one was set via setDefaultLLM(),
+ * otherwise falls back to the default LlamaCpp instance.
+ */
+export function getDefaultLLM(): LLM {
+  return defaultLLMOverride ?? getDefaultLlamaCpp();
+}
+
+/**
+ * Set a custom default LLM instance (e.g. RemoteLLM for HTTP-based backends).
+ * Pass null to revert to the default LlamaCpp.
+ */
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLLMOverride = llm;
 }
 
 /**
@@ -2077,6 +2146,10 @@ export function hasDefaultLlamaCpp(): boolean {
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
+  if (defaultLLMOverride) {
+    await defaultLLMOverride.dispose();
+    defaultLLMOverride = null;
+  }
   if (defaultLlamaCpp) {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
