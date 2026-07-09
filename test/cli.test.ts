@@ -566,6 +566,31 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("qmd pull");
   }, 20000);
 
+  test("qmd doctor never collapses an explicit remote embed array back to a single identity string", async () => {
+    // Regression guard: ensureModelsConfiguredForCli must not clobber a
+    // user's fallback endpoint list with the collapsed canonical identity.
+    const env = await createIsolatedTestEnv("doctor-remote-embed-array");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      `collections: {}\nmodels:\n  embed:\n    - http://host-a:1234/v1#kure-v1\n    - http://host-b:1234/v1#kure-v1\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`
+    );
+
+    const { exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_DOCTOR_DEVICE_PROBE: "0" },
+    });
+    expect(exitCode).toBe(0);
+
+    const configText = readFileSync(join(env.configDir, "index.yml"), "utf-8");
+    expect(configText).toContain("http://host-a:1234/v1#kure-v1");
+    expect(configText).toContain("http://host-b:1234/v1#kure-v1");
+    // The collapsed identity ("kure-v1") must never appear as a replacement
+    // for the array — only as a substring of the URIs above, which already
+    // contain it after the '#'.
+    expect(configText).not.toMatch(/embed:\s*kure-v1\s*\n/);
+  }, 20000);
+
   test("qmd doctor identifies cached non-GGUF model files", async () => {
     const env = await createIsolatedTestEnv("doctor-invalid-model-cache");
     const model = "hf:example/custom-model/custom.gguf";

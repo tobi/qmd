@@ -544,6 +544,54 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Remote Embedding
+
+Instead of a local GGUF model, `models.embed` (or `QMD_EMBED_MODEL`) can point at
+one or more OpenAI-compatible `/v1/embeddings` servers (LM Studio, vLLM,
+text-embeddings-inference, Ollama's OpenAI-compatible endpoint, or the real
+OpenAI API). This is useful when you already run a shared embedding server, or
+want to offload embedding from a machine with no GPU.
+
+A remote embed URI has the form `http[s]://host:port/v1#model-id` — everything
+before the `#` is the API base (`/embeddings` and `/models` are appended to
+it), and the fragment after `#` is the model id sent in the request body.
+
+```yaml
+models:
+  embed: "http://localhost:1234/v1#text-embedding-kure-v1"
+```
+
+List multiple endpoints to get sequential fallback — each is tried in order,
+and a failed endpoint is skipped for 15s (configurable) before being retried,
+so one dead server doesn't block search on every request:
+
+```yaml
+models:
+  embed:
+    - "http://embed-host-1:1234/v1#text-embedding-kure-v1"
+    - "http://embed-host-2:1234/v1#text-embedding-kure-v1"
+```
+
+**All endpoints in a fallback list must serve the exact same model** (same
+`#model-id` fragment, same output dimensions) — QMD stores one canonical
+identity (the shared model id) per vector, so a chunk embedded via one
+endpoint is transparently found when searching through another. Mixing
+different models across endpoints is rejected at config-load time; mixing
+same-model endpoints with different vector dimensions will fail when the
+vector table is created.
+
+Auth and tuning are set via environment variables (never in the URI):
+
+| Env var | Purpose | Default |
+|---------|---------|---------|
+| `QMD_EMBED_API_KEY` (falls back to `OPENAI_API_KEY`) | `Authorization: Bearer <key>` sent to every endpoint; omitted entirely if unset (e.g. unauthenticated LM Studio) | unset |
+| `QMD_EMBED_TIMEOUT_MS` | Per-request timeout for `/embeddings` | `30000` |
+| `QMD_EMBED_HEALTH_TTL_MS` | How long a failed endpoint is skipped before retry | `15000` |
+
+`qmd doctor` reports configured remote endpoints, the shared model id, and
+whether an API key is set (never its value). `qmd pull` only downloads local
+GGUF entries — remote endpoints have nothing to fetch.
+
 ## Installation
 
 ```sh
@@ -705,7 +753,7 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. `models.embed` also accepts a remote endpoint or a list of endpoints — see [Remote Embedding](#remote-embedding). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |

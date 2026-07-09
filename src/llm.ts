@@ -73,6 +73,11 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import {
+  isRemoteEmbedModel,
+  parseRemoteEmbedUri,
+  RemoteEmbedder,
+} from "./remote-embed.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -270,8 +275,53 @@ export type ModelResolutionConfig = {
   rerank?: string;
 };
 
+/**
+ * Resolve the ordered try-list of embed model URIs from raw config + env,
+ * mirroring localcrab's comma-split `OPENAI_API_BASE="a,b"` convention for
+ * the env fallback. `rawEmbed` arrays are used as-is; a single string
+ * becomes a 1-element list.
+ */
+export function resolveEmbedEndpoints(
+  rawEmbed?: string | string[],
+  env = process.env.QMD_EMBED_MODEL
+): string[] {
+  if (Array.isArray(rawEmbed) && rawEmbed.length > 0) return rawEmbed;
+  if (typeof rawEmbed === "string" && rawEmbed) return [rawEmbed];
+
+  const envTrimmed = env?.trim();
+  if (envTrimmed) return envTrimmed.split(",").map((s) => s.trim()).filter(Boolean);
+
+  return [DEFAULT_EMBED_MODEL];
+}
+
+/**
+ * Resolve the single canonical identity string for a `models.embed` config.
+ * Remote endpoints (http/https) share one identity — the common `#model-id`
+ * fragment — since that's what gets stored as `content_vectors.model` and
+ * drives the embedding fingerprint; a local/`hf:` config's identity is just
+ * its own URI, preserving today's behavior exactly.
+ */
+export function resolveEmbedIdentity(
+  rawEmbed?: string | string[],
+  env = process.env.QMD_EMBED_MODEL
+): string {
+  const endpoints = resolveEmbedEndpoints(rawEmbed, env);
+  const remoteEntries = endpoints.filter(isRemoteEmbedModel);
+  if (remoteEntries.length === 0) {
+    return endpoints[0]!;
+  }
+
+  const modelIds = new Set(remoteEntries.map((uri) => parseRemoteEmbedUri(uri).modelId));
+  if (modelIds.size > 1) {
+    throw new Error(
+      `All remote embed endpoints must share the same '#model-id' fragment, got: ${[...modelIds].join(", ")}`
+    );
+  }
+  return [...modelIds][0]!;
+}
+
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  return resolveEmbedIdentity(config?.embed, process.env.QMD_EMBED_MODEL);
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {
@@ -557,7 +607,7 @@ export interface LLM {
 // =============================================================================
 
 export type LlamaCppConfig = {
-  embedModel?: string;
+  embedModel?: string | string[];
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
@@ -700,6 +750,8 @@ export class LlamaCpp implements LLM {
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
   private embedModelUri: string;
+  private embedEndpoints: string[];
+  private remoteEmbedder: RemoteEmbedder | null = null;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
@@ -731,7 +783,8 @@ export class LlamaCpp implements LLM {
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
 
-    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    this.embedEndpoints = resolveEmbedEndpoints(config.embedModel);
+    this.embedModelUri = resolveEmbedIdentity(config.embedModel);
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -742,6 +795,23 @@ export class LlamaCpp implements LLM {
 
   get embedModelName(): string {
     return this.embedModelUri;
+  }
+
+  /** True when this config resolves to at least one remote (http/https) embed endpoint. */
+  isRemoteEmbed(): boolean {
+    return this.embedEndpoints.some(isRemoteEmbedModel);
+  }
+
+  private ensureRemoteEmbedder(): RemoteEmbedder {
+    if (!this.remoteEmbedder) {
+      const endpoints = this.embedEndpoints.filter(isRemoteEmbedModel).map(parseRemoteEmbedUri);
+      this.remoteEmbedder = new RemoteEmbedder(endpoints, {
+        apiKey: process.env.QMD_EMBED_API_KEY ?? process.env.OPENAI_API_KEY,
+        timeoutMs: Number(process.env.QMD_EMBED_TIMEOUT_MS) || undefined,
+        healthTtlMs: Number(process.env.QMD_EMBED_HEALTH_TTL_MS) || undefined,
+      });
+    }
+    return this.remoteEmbedder;
   }
 
   get generateModelName(): string {
@@ -1295,6 +1365,16 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (this.isRemoteEmbed()) {
+      try {
+        const embedding = await this.ensureRemoteEmbedder().embed(text);
+        return { embedding, model: options.model ?? this.embedModelUri };
+      } catch (error) {
+        console.error("Embedding error:", error);
+        return null;
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1324,6 +1404,17 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (this.isRemoteEmbed()) {
+      if (texts.length === 0) return [];
+      try {
+        const vectors = await this.ensureRemoteEmbedder().embedBatch(texts);
+        return vectors.map((embedding) => ({ embedding, model: options.model ?? this.embedModelUri }));
+      } catch (error) {
+        console.error("Batch embedding error:", error);
+        return texts.map(() => null);
+      }
+    }
+
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();

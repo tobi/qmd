@@ -80,7 +80,8 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, withLLMSessionForLlm, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveEmbedIdentity, resolveEmbedEndpoints, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { isRemoteEmbedModel } from "../remote-embed.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -134,7 +135,7 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
+        embedModel: config.models?.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
       }));
@@ -1825,16 +1826,27 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
     const config = loadConfig();
-    const models = resolveModels(config.models);
     const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+    // `embed` identity is resolved separately (not through resolveModels) since
+    // config.models.embed can be string|string[] while ModelResolutionConfig.embed
+    // stays a single string identity.
+    const embedIdentity = resolveEmbedIdentity(current.embed, process.env.QMD_EMBED_MODEL);
+    const { generate, rerank } = resolveModels({ generate: current.generate, rerank: current.rerank });
+    const models = { embed: embedIdentity, generate, rerank };
+
+    // Only fill in `embed` when it was never configured — an explicit string or
+    // array config (including remote endpoint lists) must never be clobbered
+    // with the collapsed identity.
+    const needsEmbedWrite = current.embed === undefined;
+    const needsOtherWrite = current.generate !== generate || current.rerank !== rerank;
+    if (needsEmbedWrite || needsOtherWrite) {
       saveConfig({
         ...config,
         models: {
           ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
+          ...(needsEmbedWrite ? { embed: embedIdentity } : {}),
+          generate,
+          rerank,
         },
       });
     }
@@ -3472,10 +3484,16 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     if (!raw) return;
     overrides.push({ name, value: envValueForDisplay(raw), consequence });
   };
+  const addSecret = (name: string, consequence: string) => {
+    const raw = process.env[name]?.trim();
+    if (!raw) return;
+    overrides.push({ name, value: "<set>", consequence });
+  };
   const addModel = (name: string, key: "embed" | "generate" | "rerank", active: string) => {
     const raw = process.env[name]?.trim();
     if (!raw) return;
-    const configured = configModels[key];
+    const configuredRaw = configModels[key];
+    const configured = Array.isArray(configuredRaw) ? configuredRaw.join(", ") : configuredRaw;
     const consequence = configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
@@ -3489,6 +3507,9 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
+  addSecret("QMD_EMBED_API_KEY", "sets the Bearer token used for remote embedding endpoints");
+  add("QMD_EMBED_TIMEOUT_MS", "overrides the remote embedding request timeout (default 30000ms)");
+  add("QMD_EMBED_HEALTH_TTL_MS", "overrides how long a failed remote embedding endpoint is skipped before retry (default 15000ms)");
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
@@ -3548,8 +3569,9 @@ function checkEnvironmentOverrides(activeModels: { embed: string; generate: stri
 }
 
 function checkModelDefaults(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
+  const configuredEmbed = Array.isArray(configModels.embed) ? configModels.embed.join(", ") : configModels.embed;
   const checks = [
-    { role: "embedding", key: "embed", active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
+    { role: "embedding", key: "embed", active: activeModels.embed, configured: configuredEmbed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
     { role: "generation", key: "generate", active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
     { role: "reranking", key: "rerank", active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
   ] as const;
@@ -3574,12 +3596,14 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
   doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
 }
 
-function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
-  const models = [
-    ["embedding", activeModels.embed],
+function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[], embedIsRemote: boolean = false): void {
+  const models: (readonly [string, string])[] = [
     ["generation", activeModels.generate],
     ["reranking", activeModels.rerank],
-  ] as const;
+  ];
+  // Remote embed identities (e.g. a shared #model-id) aren't a local GGUF
+  // path, so there's nothing in the model cache to check for them.
+  if (!embedIsRemote) models.unshift(["embedding", activeModels.embed]);
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
     unique.set(model, [...(unique.get(model) ?? []), role]);
@@ -3618,7 +3642,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   }
 }
 
-async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, llm: LlamaCpp, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
     return { ok: true, details: "no active documents indexed" };
@@ -3647,10 +3671,10 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   const threshold = 0.0001;
   const mismatches: string[] = [];
 
-  await withLLMSession(async (session) => {
+  await withLLMSessionForLlm(llm, async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunks = await chunkDocumentByTokens(sample.body, llm, undefined, undefined, undefined, sample.path, undefined, session.signal);
       const chunk = chunks[sample.seq];
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
@@ -3854,9 +3878,20 @@ async function showDoctor(): Promise<void> {
 
   const configCheck = checkDoctorIndexConfig(nextSteps);
   const configModels = configCheck.config?.models ?? {};
+  const embedIsRemote = (storeInstance.llm ?? getDefaultLlamaCpp()).isRemoteEmbed();
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
+  checkModelCache(activeModels, nextSteps, embedIsRemote);
+  if (embedIsRemote) {
+    const rawEndpoints = resolveEmbedEndpoints(configModels.embed);
+    const remoteEndpoints = rawEndpoints.filter(isRemoteEmbedModel);
+    const hasApiKey = !!(process.env.QMD_EMBED_API_KEY || process.env.OPENAI_API_KEY);
+    doctorCheck(
+      "remote embedding",
+      true,
+      `${remoteEndpoints.length} endpoint${remoteEndpoints.length === 1 ? "" : "s"} configured, shared model id "${activeModels.embed}", API key ${hasApiKey ? "set" : "not set"}`
+    );
+  }
 
   await runDoctorDeviceChecks(nextSteps);
 
@@ -3920,7 +3955,7 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint, storeInstance.llm ?? getDefaultLlamaCpp());
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
@@ -4322,8 +4357,13 @@ if (isMain) {
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const activeModels = resolveModelsForCli();
+      // Embed models are pulled from the raw config (not the collapsed
+      // identity) so a remote endpoint list doesn't get treated as a GGUF
+      // URI; remote entries have nothing to download and are filtered out.
+      const rawEmbed = loadConfig().models?.embed;
+      const localEmbedModels = resolveEmbedEndpoints(rawEmbed).filter((uri) => !isRemoteEmbedModel(uri));
       const models = [
-        activeModels.embed,
+        ...localEmbedModels,
         activeModels.generate,
         activeModels.rerank,
       ];
