@@ -2530,10 +2530,10 @@ describe("Index Status", () => {
   test("two remote endpoints sharing the same #model-id resolve to the same identity and fingerprint", () => {
     // This is the core vector-compatibility guarantee for fallback groups:
     // a chunk embedded via host A must be found when searching via host B.
-    const identityA = llmModule.resolveEmbedIdentity("http://host-a:1234/v1#kure-v1");
-    const identityB = llmModule.resolveEmbedIdentity("http://host-b:5678/v1#kure-v1");
+    const identityA = llmModule.resolveEmbedIdentity("http://host-a:1234/v1#test-embed-model");
+    const identityB = llmModule.resolveEmbedIdentity("http://host-b:5678/v1#test-embed-model");
 
-    expect(identityA).toBe("kure-v1");
+    expect(identityA).toBe("test-embed-model");
     expect(identityA).toBe(identityB);
     expect(getEmbeddingFingerprint(identityA)).toBe(getEmbeddingFingerprint(identityB));
   });
@@ -3653,7 +3653,7 @@ describe("Token chunking guardrails", () => {
     // A real LlamaCpp instance configured for remote embedding: isRemoteEmbed()
     // is true, and it deliberately has no working local tokenizer/GGUF to fall
     // back to, so any accidental tokenize() call here would throw.
-    const remoteLlm = new llmModule.LlamaCpp({ embedModel: "http://localhost:1234/v1#kure-v1" });
+    const remoteLlm = new llmModule.LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
 
     const content = "# Doc\n\n" + "remote chunking should not need a tokenizer. ".repeat(300);
     const chunks = await chunkDocumentByTokens(content, remoteLlm as any);

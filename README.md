@@ -558,7 +558,7 @@ it), and the fragment after `#` is the model id sent in the request body.
 
 ```yaml
 models:
-  embed: "http://localhost:1234/v1#text-embedding-kure-v1"
+  embed: "http://localhost:1234/v1#text-embedding-3-small"
 ```
 
 List multiple endpoints to get sequential fallback — each is tried in order,
@@ -568,8 +568,8 @@ so one dead server doesn't block search on every request:
 ```yaml
 models:
   embed:
-    - "http://embed-host-1:1234/v1#text-embedding-kure-v1"
-    - "http://embed-host-2:1234/v1#text-embedding-kure-v1"
+    - "http://embed-host-1:1234/v1#text-embedding-3-small"
+    - "http://embed-host-2:1234/v1#text-embedding-3-small"
 ```
 
 **All endpoints in a fallback list must serve the exact same model** (same

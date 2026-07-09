@@ -357,13 +357,13 @@ describe("remote embedding routing", () => {
       return new Response(JSON.stringify({ data: [{ embedding: [0.6, 0.8] }] }), { status: 200 });
     });
 
-    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#kure-v1" });
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
     try {
       expect(llm.isRemoteEmbed()).toBe(true);
-      expect(llm.embedModelName).toBe("kure-v1");
+      expect(llm.embedModelName).toBe("test-embed-model");
 
       const result = await llm.embed("hello remote world");
-      expect(result?.model).toBe("kure-v1");
+      expect(result?.model).toBe("test-embed-model");
       // Response vector [0.6, 0.8] has norm 1, so L2-normalize leaves it unchanged.
       expect(result?.embedding).toEqual([0.6, 0.8]);
 
@@ -381,7 +381,7 @@ describe("remote embedding routing", () => {
 
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       const body = JSON.parse(String(init?.body));
-      expect(body.model).toBe("kure-v1");
+      expect(body.model).toBe("test-embed-model");
       expect(body.input).toEqual(["one", "two"]);
       return new Response(
         JSON.stringify({ data: [{ embedding: [1, 0] }, { embedding: [0, 1] }] }),
@@ -389,12 +389,12 @@ describe("remote embedding routing", () => {
       );
     });
 
-    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#kure-v1" });
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
     try {
       const results = await llm.embedBatch(["one", "two"]);
       expect(results).toHaveLength(2);
-      expect(results[0]).toEqual({ embedding: [1, 0], model: "kure-v1" });
-      expect(results[1]).toEqual({ embedding: [0, 1], model: "kure-v1" });
+      expect(results[0]).toEqual({ embedding: [1, 0], model: "test-embed-model" });
+      expect(results[1]).toEqual({ embedding: [0, 1], model: "test-embed-model" });
       expect(mockModule.getLlama).not.toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();
@@ -407,7 +407,7 @@ describe("remote embedding routing", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#kure-v1" });
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
     try {
       expect(await llm.embed("hello")).toBeNull();
       expect(await llm.embedBatch(["a", "b"])).toEqual([null, null]);
@@ -439,7 +439,7 @@ describe("remote embedding routing", () => {
 
   test("mismatched #model-id fragments across remote endpoints throw a clear error", () => {
     expect(() => new LlamaCpp({
-      embedModel: ["http://host-a:1234/v1#kure-v1", "http://host-b:1234/v1#other-model"],
+      embedModel: ["http://host-a:1234/v1#test-embed-model", "http://host-b:1234/v1#other-model"],
     })).toThrow(/must share the same/);
   });
 });

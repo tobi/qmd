@@ -572,7 +572,7 @@ describe("CLI Status Command", () => {
     const env = await createIsolatedTestEnv("doctor-remote-embed-array");
     await writeFile(
       join(env.configDir, "index.yml"),
-      `collections: {}\nmodels:\n  embed:\n    - http://host-a:1234/v1#kure-v1\n    - http://host-b:1234/v1#kure-v1\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`
+      `collections: {}\nmodels:\n  embed:\n    - http://host-a:1234/v1#test-embed-model\n    - http://host-b:1234/v1#test-embed-model\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`
     );
 
     const { exitCode } = await runQmd(["doctor"], {
@@ -583,12 +583,12 @@ describe("CLI Status Command", () => {
     expect(exitCode).toBe(0);
 
     const configText = readFileSync(join(env.configDir, "index.yml"), "utf-8");
-    expect(configText).toContain("http://host-a:1234/v1#kure-v1");
-    expect(configText).toContain("http://host-b:1234/v1#kure-v1");
-    // The collapsed identity ("kure-v1") must never appear as a replacement
+    expect(configText).toContain("http://host-a:1234/v1#test-embed-model");
+    expect(configText).toContain("http://host-b:1234/v1#test-embed-model");
+    // The collapsed identity ("test-embed-model") must never appear as a replacement
     // for the array — only as a substring of the URIs above, which already
     // contain it after the '#'.
-    expect(configText).not.toMatch(/embed:\s*kure-v1\s*\n/);
+    expect(configText).not.toMatch(/embed:\s*test-embed-model\s*\n/);
   }, 20000);
 
   test("qmd doctor identifies cached non-GGUF model files", async () => {

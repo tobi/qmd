@@ -12,7 +12,7 @@
 
 /** A single remote embedding endpoint, parsed from a `http[s]://host/v1#model-id` URI. */
 export interface RemoteEmbedEndpoint {
-  /** The original URI as configured, e.g. `http://localhost:1234/v1#kure-v1`. */
+  /** The original URI as configured, e.g. `http://localhost:1234/v1#text-embedding-3-small`. */
   raw: string;
   /** Everything before the `#` fragment, e.g. `http://localhost:1234/v1`. `/embeddings` and `/models` are appended to this. */
   apiBase: string;

@@ -31,7 +31,7 @@ afterEach(() => {
 
 describe("isRemoteEmbedModel", () => {
   test("true for http/https URIs", () => {
-    expect(isRemoteEmbedModel("http://localhost:1234/v1#kure-v1")).toBe(true);
+    expect(isRemoteEmbedModel("http://localhost:1234/v1#test-embed-model")).toBe(true);
     expect(isRemoteEmbedModel("https://api.openai.com/v1#text-embedding-3-small")).toBe(true);
   });
 
@@ -44,17 +44,17 @@ describe("isRemoteEmbedModel", () => {
   });
 
   test("false for a plain model name", () => {
-    expect(isRemoteEmbedModel("text-embedding-kure-v1")).toBe(false);
+    expect(isRemoteEmbedModel("test-embed-model")).toBe(false);
   });
 });
 
 describe("parseRemoteEmbedUri", () => {
   test("parses http URI with fragment", () => {
-    const result = parseRemoteEmbedUri("http://localhost:1234/v1#kure-v1");
+    const result = parseRemoteEmbedUri("http://localhost:1234/v1#test-embed-model");
     expect(result).toEqual({
-      raw: "http://localhost:1234/v1#kure-v1",
+      raw: "http://localhost:1234/v1#test-embed-model",
       apiBase: "http://localhost:1234/v1",
-      modelId: "kure-v1",
+      modelId: "test-embed-model",
     });
   });
 
@@ -65,14 +65,14 @@ describe("parseRemoteEmbedUri", () => {
   });
 
   test("preserves trailing slash before fragment", () => {
-    const result = parseRemoteEmbedUri("http://localhost:1234/v1/#kure-v1");
+    const result = parseRemoteEmbedUri("http://localhost:1234/v1/#test-embed-model");
     expect(result.apiBase).toBe("http://localhost:1234/v1/");
-    expect(result.modelId).toBe("kure-v1");
+    expect(result.modelId).toBe("test-embed-model");
   });
 
   test("percent-decodes the model id fragment", () => {
-    const result = parseRemoteEmbedUri("http://localhost:1234/v1#text-embedding%2Fkure");
-    expect(result.modelId).toBe("text-embedding/kure");
+    const result = parseRemoteEmbedUri("http://localhost:1234/v1#org%2Ftext-embedding-3-small");
+    expect(result.modelId).toBe("org/text-embedding-3-small");
   });
 
   test("throws when there is no fragment", () => {

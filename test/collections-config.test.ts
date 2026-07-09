@@ -121,8 +121,8 @@ describe("models.embed config round-trip", () => {
         collections: {},
         models: {
           embed: [
-            "http://host-a:1234/v1#kure-v1",
-            "http://host-b:1234/v1#kure-v1",
+            "http://host-a:1234/v1#test-embed-model",
+            "http://host-b:1234/v1#test-embed-model",
             "hf:user/repo/model.gguf",
           ],
         },
@@ -130,8 +130,8 @@ describe("models.embed config round-trip", () => {
       saveConfig(config);
       const loaded = loadConfig();
       expect(loaded.models?.embed).toEqual([
-        "http://host-a:1234/v1#kure-v1",
-        "http://host-b:1234/v1#kure-v1",
+        "http://host-a:1234/v1#test-embed-model",
+        "http://host-b:1234/v1#test-embed-model",
         "hf:user/repo/model.gguf",
       ]);
     });
@@ -170,7 +170,7 @@ describe("models.embed config round-trip", () => {
     await withTempConfigDir(() => {
       saveConfig({
         collections: {},
-        models: { embed: ["http://host-a:1234/v1#kure-v1", "http://host-b:1234/v1#other-model"] },
+        models: { embed: ["http://host-a:1234/v1#test-embed-model", "http://host-b:1234/v1#other-model"] },
       });
       expect(() => loadConfig()).toThrow(/must share the same/);
     });
@@ -189,8 +189,8 @@ describe("validateEmbedConfig", () => {
   test("passes for an array of remote URIs sharing the same #model-id", () => {
     expect(() =>
       validateEmbedConfig([
-        "http://host-a:1234/v1#kure-v1",
-        "https://host-b:1234/v1#kure-v1",
+        "http://host-a:1234/v1#test-embed-model",
+        "https://host-b:1234/v1#test-embed-model",
       ])
     ).not.toThrow();
   });
@@ -202,7 +202,7 @@ describe("validateEmbedConfig", () => {
   test("throws for an array of remote URIs with mismatched #model-id fragments", () => {
     expect(() =>
       validateEmbedConfig([
-        "http://host-a:1234/v1#kure-v1",
+        "http://host-a:1234/v1#test-embed-model",
         "http://host-b:1234/v1#other-model",
       ])
     ).toThrow(/must share the same/);
