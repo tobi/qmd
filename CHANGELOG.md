@@ -97,6 +97,15 @@
   header, always printed with `docid`. Column positions are now stable across
   runs and formats.
 
+### Fixed
+
+- `qmd mcp` (stdio) now shuts down gracefully when stdin reaches EOF instead
+  of orphaning to PID 1 when the parent MCP client dies (#751): the server
+  closes its transport, gives in-flight request handlers a bounded window to
+  settle, closes the store (which disposes its llama.cpp instance), and lets
+  the process drain via `process.exitCode` (no forced `process.exit()`, which
+  has caused exit-time native crashes before).
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
