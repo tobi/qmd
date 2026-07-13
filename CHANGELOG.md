@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `cleanupOrphanedVectors` now runs its orphan count and both DELETEs in a
+  single immediate transaction. An interruption between the two DELETEs
+  (crash, `SQLITE_BUSY`) could desync `vectors_vec` from `content_vectors`,
+  leaving stale metadata rows that make a later reactivation of the same
+  content hash look already-embedded — so `qmd embed` skips it and the
+  document becomes silently unsearchable by vector, with no orphan left to
+  clean up.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

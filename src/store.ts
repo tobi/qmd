@@ -2431,36 +2431,55 @@ export function cleanupOrphanedVectors(db: Database): number {
   }
 
   return withLazyContentVectorMigration(db, () => {
-    // Count orphaned vectors first
-    const countResult = db.prepare(`
-      SELECT COUNT(*) as c FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
-    `).get() as { c: number };
-
-    if (countResult.c === 0) {
-      return 0;
-    }
-
-    // Delete from vectors_vec first
-    db.exec(`
-      DELETE FROM vectors_vec WHERE hash_seq IN (
-        SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+    // Count and both DELETEs share one transaction. An interruption between the
+    // two DELETEs (crash, SQLITE_BUSY) desyncs the tables: vectors_vec loses
+    // the rows while content_vectors still records the chunks as embedded.
+    // These rows are orphaned (no active document), so live vector search —
+    // which post-filters on documents.active = 1 — is unaffected right away.
+    // The failure is latent: if that content hash is later reactivated (qmd is
+    // content-addressable, so the same content returning revives the hash), the
+    // stale content_vectors rows make getHashesNeedingEmbedding treat it as
+    // already embedded, so qmd embed skips it and the document is silently
+    // unsearchable by vector with no orphan left to clean up. Keeping the count
+    // inside the same transaction also makes the returned number match the rows
+    // the DELETEs actually remove if another connection mutates documents
+    // concurrently. Run it BEGIN IMMEDIATE: the count reads before the DELETEs
+    // write, and upgrading a deferred read snapshot under a concurrent WAL
+    // writer fails with SQLITE_BUSY_SNAPSHOT instead of honoring the busy
+    // timeout. Nested callers still get a savepoint.
+    const cleanup = db.transaction(() => {
+      const countResult = db.prepare(`
+        SELECT COUNT(*) as c FROM content_vectors cv
         WHERE NOT EXISTS (
           SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
         )
-      )
-    `);
+      `).get() as { c: number };
 
-    // Delete from content_vectors
-    db.exec(`
-      DELETE FROM content_vectors WHERE hash NOT IN (
-        SELECT hash FROM documents WHERE active = 1
-      )
-    `);
+      if (countResult.c === 0) {
+        return 0;
+      }
 
-    return countResult.c;
+      // Delete from vectors_vec first
+      db.exec(`
+        DELETE FROM vectors_vec WHERE hash_seq IN (
+          SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+          WHERE NOT EXISTS (
+            SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+          )
+        )
+      `);
+
+      // Delete from content_vectors
+      db.exec(`
+        DELETE FROM content_vectors WHERE hash NOT IN (
+          SELECT hash FROM documents WHERE active = 1
+        )
+      `);
+
+      return countResult.c;
+    });
+
+    return cleanup.immediate();
   });
 }
 

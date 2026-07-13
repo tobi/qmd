@@ -129,7 +129,9 @@ export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
-  transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
+  // Both drivers return the wrapped function with variant methods attached
+  // (better-sqlite3 and bun:sqlite each expose .immediate/.deferred/.exclusive).
+  transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T & { immediate: T };
   close(): void;
 }
 
