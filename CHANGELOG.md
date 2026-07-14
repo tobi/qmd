@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Markdown title extraction now prefers a non-empty string `title` from leading
+  YAML frontmatter and ignores that metadata when falling back to a heading.
+  The embedding fingerprint is bumped so existing documents are marked pending
+  and re-embedded with their corrected title on the next `qmd embed`.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

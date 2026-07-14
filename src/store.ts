@@ -18,6 +18,7 @@ import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import YAML from "yaml";
 import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
@@ -54,6 +55,9 @@ export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
 const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
+// Bump whenever extractTitle changes text that is fed into document embeddings.
+const TITLE_EXTRACTION_VERSION = 2;
+const LEGACY_EMPTY_FINGERPRINT_TITLE_EXTRACTION_VERSION = 1;
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -71,6 +75,7 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `model:${model}`,
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
+    `title_extraction:${TITLE_EXTRACTION_VERSION}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
   ].join("\n");
@@ -2037,7 +2042,7 @@ export function createStore(dbPath?: string): Store {
 export type DocumentResult = {
   filepath: string;           // Full filesystem path
   displayPath: string;        // Short display path (e.g., "docs/readme.md")
-  title: string;              // Document title (from first heading or filename)
+  title: string;              // Document title (from frontmatter, first heading, or filename)
   context: string | null;     // Folder context description if configured
   hash: string;               // Content hash for caching/change detection
   docid: string;              // Short docid (first 6 chars of hash) for quick reference
@@ -2273,6 +2278,13 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   if (legacyCount === 0) {
     return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
   }
+  if (TITLE_EXTRACTION_VERSION > LEGACY_EMPTY_FINGERPRINT_TITLE_EXTRACTION_VERSION) {
+    return {
+      checked: true,
+      adopted: 0,
+      reason: `legacy empty fingerprints predate title extraction version ${TITLE_EXTRACTION_VERSION}`,
+    };
+  }
 
   const sample = withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
@@ -2482,6 +2494,36 @@ export async function hashContent(content: string): Promise<string> {
   return hash.digest("hex");
 }
 
+type MarkdownFrontmatter = {
+  body: string;
+  data: Record<string, unknown> | null;
+};
+
+function splitMarkdownFrontmatter(content: string): MarkdownFrontmatter | null {
+  const withoutBom = content.startsWith("\uFEFF") ? content.slice(1) : content;
+  const opening = withoutBom.match(/^---[ \t]*\r?\n/);
+  if (!opening) return null;
+  const remainder = withoutBom.slice(opening[0].length);
+  const closing = remainder.match(/^(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/m);
+  if (closing?.index === undefined) return null;
+  const raw = remainder.slice(0, closing.index);
+
+  let data: Record<string, unknown> | null = null;
+  try {
+    const parsed = YAML.parse(raw) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      data = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // A malformed metadata block must not hide a valid body heading.
+  }
+
+  return {
+    body: remainder.slice(closing.index + closing[0].length),
+    data,
+  };
+}
+
 const titleExtractors: Record<string, (content: string) => string | null> = {
   '.md': (content) => {
     const match = content.match(/^##?\s+(.+)$/m);
@@ -2506,9 +2548,16 @@ const titleExtractors: Record<string, (content: string) => string | null> = {
 
 export function extractTitle(content: string, filename: string): string {
   const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
+  const frontmatter = ext === '.md' ? splitMarkdownFrontmatter(content) : null;
+  const frontmatterTitle = frontmatter?.data?.title;
+  if (typeof frontmatterTitle === "string") {
+    const normalizedTitle = frontmatterTitle.trim().replace(/\s+/g, " ");
+    if (normalizedTitle) return normalizedTitle;
+  }
+
   const extractor = titleExtractors[ext];
   if (extractor) {
-    const title = extractor(content);
+    const title = extractor(frontmatter?.body ?? content);
     if (title) return title;
   }
   return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
