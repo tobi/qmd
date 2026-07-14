@@ -1299,6 +1299,19 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
+      // QMD_OLLAMA_EMBED_URL: use remote Ollama for embeddings instead of local llama.cpp
+      const _ollamaUrl = process.env.QMD_OLLAMA_EMBED_URL;
+      if (_ollamaUrl) {
+        const _ollamaModel = process.env.QMD_OLLAMA_EMBED_MODEL || 'nomic-embed-text';
+        const res = await fetch(`${_ollamaUrl}/api/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: _ollamaModel, input: text }),
+        });
+        if (!res.ok) throw new Error(`Ollama embed error: ${res.status} ${await res.text()}`);
+        const data = await res.json();
+        return { embedding: data.embeddings[0], model: _ollamaModel };
+      }
       const context = await this.ensureEmbedContext();
 
       // Guard: truncate text that exceeds model context window to prevent GGML crash
@@ -1331,6 +1344,19 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
+      // QMD_OLLAMA_EMBED_URL: use remote Ollama for batch embeddings
+      const _ollamaUrl = process.env.QMD_OLLAMA_EMBED_URL;
+      if (_ollamaUrl) {
+        const _ollamaModel = process.env.QMD_OLLAMA_EMBED_MODEL || 'nomic-embed-text';
+        const res = await fetch(`${_ollamaUrl}/api/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: _ollamaModel, input: texts }),
+        });
+        if (!res.ok) throw new Error(`Ollama embed batch error: ${res.status} ${await res.text()}`);
+        const data = await res.json();
+        return data.embeddings.map(emb => ({ embedding: emb, model: _ollamaModel }));
+      }
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
 

@@ -2531,7 +2531,10 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  // QMD_OLLAMA_EMBED_URL: skip local LLM session, run search directly
+  const _useOllamaEmbed = !!process.env.QMD_OLLAMA_EMBED_URL;
+
+  const runVsearch = async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2569,7 +2572,13 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  };
+
+  if (_useOllamaEmbed) {
+    await runVsearch();
+  } else {
+    await withLLMSession(runVsearch, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  }
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
