@@ -16,7 +16,8 @@ import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, Mod
 // Mock HTTP server
 // =============================================================================
 
-type MockHandler = (req: IncomingMessage, body: string) => { status: number; body: any };
+type MockResponse = { status: number; body: unknown };
+type MockHandler = (req: IncomingMessage, body: string) => MockResponse | Promise<MockResponse>;
 
 let server: Server;
 let serverPort: number;
@@ -35,7 +36,7 @@ beforeAll(async () => {
     const body = Buffer.concat(chunks).toString();
 
     try {
-      const result = mockHandler(req, body);
+      const result = await mockHandler(req, body);
       res.writeHead(result.status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result.body));
     } catch (err: any) {
@@ -188,6 +189,51 @@ describe("RemoteLLM", () => {
       expect(results[1]!.embedding).toEqual([0.2]);
       expect(results[2]!.embedding).toEqual([0.3]);
     });
+
+    it("rejects a response with missing embeddings", async () => {
+      setMockHandler(() => ({ status: 200, body: {} }));
+
+      await expect(createRemoteLLM().embed("test"))
+        .rejects.toThrow(/invalid embedding api response.*data/i);
+    });
+
+    it("rejects missing, duplicate, or out-of-range embedding indices", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.1], index: 0 },
+            { embedding: [0.2], index: 0 },
+          ],
+        },
+      }));
+
+      await expect(createRemoteLLM().embedBatch(["a", "b"]))
+        .rejects.toThrow(/invalid embedding api response.*index/i);
+    });
+
+    it("rejects non-finite or inconsistent embeddings within one response", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.1, 0.2], index: 0 },
+            { embedding: [0.3], index: 1 },
+          ],
+        },
+      }));
+
+      await expect(createRemoteLLM().embedBatch(["a", "b"]))
+        .rejects.toThrow(/dimension mismatch/i);
+
+      setMockHandler(() => ({
+        status: 200,
+        body: { data: [{ embedding: [0.1, null], index: 0 }] },
+      }));
+
+      await expect(createRemoteLLM().embed("a"))
+        .rejects.toThrow(/invalid embedding api response.*finite/i);
+    });
   });
 
   describe("auth", () => {
@@ -267,6 +313,19 @@ describe("RemoteLLM", () => {
       // Next call should fail immediately with circuit breaker message
       await expect(llm.embed("test")).rejects.toThrow("circuit breaker");
     });
+
+    it("honors the connect timeout while waiting for response headers", async () => {
+      setMockHandler(async () => {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        return {
+          status: 200,
+          body: { data: [{ embedding: [1], index: 0 }] },
+        };
+      });
+
+      const llm = createRemoteLLM({ connectTimeoutMs: 20, embedReadTimeoutMs: 1000 });
+      await expect(llm.embed("test")).rejects.toThrow(/connect timed out/i);
+    });
   });
 
   describe("rerank", () => {
@@ -332,6 +391,44 @@ describe("RemoteLLM", () => {
       ]);
       expect(result.results.find(r => r.file === "a.md")!.score).toBe(0.9);
       expect(result.results.find(r => r.file === "b.md")!.score).toBe(0.2);
+    });
+
+    it("accepts score as an OpenAI-compatible rerank score alias", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          results: [
+            { index: 0, score: 0.8 },
+            { index: 1, score: 0.3 },
+          ],
+        },
+      }));
+
+      const result = await createRemoteLLM({ rerankApiModel: "rerank-model" }).rerank("q", [
+        { file: "a.md", text: "doc a" },
+        { file: "b.md", text: "doc b" },
+      ]);
+      expect(result.results.map(item => item.score)).toEqual([0.8, 0.3]);
+    });
+
+    it("rejects incomplete, invalid, or duplicate rerank results", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: { results: [{ index: 3, relevance_score: 0.9 }] },
+      }));
+
+      const llm = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      await expect(llm.rerank("q", [{ file: "a.md", text: "doc a" }]))
+        .rejects.toThrow(/invalid rerank api response.*index/i);
+
+      setMockHandler(() => ({
+        status: 200,
+        body: { results: [{ index: 0, relevance_score: null }] },
+      }));
+      await expect(createRemoteLLM({ rerankApiModel: "rerank-model" }).rerank(
+        "q",
+        [{ file: "a.md", text: "doc a" }],
+      )).rejects.toThrow(/invalid rerank api response.*score/i);
     });
 
     it("recovers from an oversized rerank batch by splitting", async () => {
@@ -488,6 +585,13 @@ describe("RemoteLLM", () => {
 
       await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
       expect(requestCount).toBe(3);
+    });
+
+    it("rejects malformed chat completion responses", async () => {
+      setMockHandler(() => ({ status: 200, body: { choices: [{}] } }));
+
+      await expect(createRemoteLLM({ expandApiModel: "remote-chat" }).expandQuery("test query"))
+        .rejects.toThrow(/invalid expand api response/i);
     });
 
     it("should fall back to the default expansion triple when no expand model is configured", async () => {

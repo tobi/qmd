@@ -1235,6 +1235,16 @@ QMD can offload embedding, reranking, and query expansion to remote OpenAI-compa
 | `QMD_EXPAND_API_URL` | No | Query expansion chat endpoint (defaults to embed URL) |
 | `QMD_EXPAND_API_MODEL` | No | Chat model for query expansion |
 | `QMD_EXPAND_API_KEY` | No | Query expansion auth (defaults to embed key) |
+| `QMD_REMOTE_CONNECT_TIMEOUT` | No | Time to wait for response headers in milliseconds (default: `5000`) |
+| `QMD_REMOTE_READ_TIMEOUT` | No | Embedding response-body timeout in milliseconds (default: `30000`) |
+| `QMD_REMOTE_RERANK_TIMEOUT` | No | Rerank response-body timeout in milliseconds (default: `60000`) |
+| `QMD_REMOTE_EXPAND_TIMEOUT` | No | Query-expansion response-body timeout in milliseconds (default: `30000`) |
+| `QMD_REMOTE_BATCH_SIZE` | No | Maximum texts per embedding request (default: `32`) |
+
+Successful responses are validated before use. Embedding responses must contain
+exactly one finite, consistently sized vector per input; rerank responses must
+contain one finite score per document. Invalid or incomplete responses fail the
+operation instead of writing partial vectors or silently dropping candidates.
 
 **YAML config** (`~/.config/qmd/index.yml`):
 ```yaml

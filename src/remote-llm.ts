@@ -246,37 +246,32 @@ export class RemoteLLM implements LLM {
     });
 
     try {
-      const response = await fetchWithTimeout(url, {
+      const { response, body: responseBody } = await fetchTextWithTimeout(url, {
         method: "POST",
         headers,
         body,
-      }, this.config.embedReadTimeoutMs);
+      }, this.config.connectTimeoutMs, this.config.embedReadTimeoutMs);
 
       if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(`Embedding API returned ${response.status}: ${errText}`);
+        throw new Error(`Embedding API returned ${response.status}: ${formatErrorBody(responseBody)}`);
       }
 
-      const json = await response.json() as {
-        data: { embedding: number[]; index: number }[];
-      };
+      const data = parseEmbeddingResponse(
+        parseJsonResponse(responseBody, "Embedding"),
+        texts.length,
+      );
 
-      // Validate dimensions consistency
-      if (json.data.length > 0) {
-        const dim = json.data[0]!.embedding.length;
-        if (this.expectedDimensions === null) {
-          this.expectedDimensions = dim;
-        } else if (dim !== this.expectedDimensions) {
-          throw new Error(
-            `Embedding dimension mismatch: expected ${this.expectedDimensions}, got ${dim}. ` +
-            `This usually means the remote model changed.`
-          );
-        }
+      const dimensions = data[0]!.embedding.length;
+      if (this.expectedDimensions === null) {
+        this.expectedDimensions = dimensions;
+      } else if (dimensions !== this.expectedDimensions) {
+        throw new Error(
+          `Embedding dimension mismatch: expected ${this.expectedDimensions}, got ${dimensions}. ` +
+          `This usually means the remote model changed.`
+        );
       }
 
-      // Sort by index to match input order
-      const sorted = [...json.data].sort((a, b) => a.index - b.index);
-      const results: (EmbeddingResult | null)[] = sorted.map(item => ({
+      const results: (EmbeddingResult | null)[] = data.map(item => ({
         embedding: item.embedding,
         model: this.config.embedApiModel,
       }));
@@ -324,7 +319,7 @@ export class RemoteLLM implements LLM {
       batch: RerankDocument[],
       start: number,
     ): Promise<RerankDocumentResult[]> => {
-      const response = await fetchWithTimeout(url, {
+      const { response, body: responseBody } = await fetchTextWithTimeout(url, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -332,22 +327,22 @@ export class RemoteLLM implements LLM {
           query,
           documents: batch.map(d => d.text),
         }),
-      }, this.config.rerankReadTimeoutMs);
+      }, this.config.connectTimeoutMs, this.config.rerankReadTimeoutMs);
 
       if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(`Rerank API returned ${response.status}: ${errText}`);
+        throw new Error(`Rerank API returned ${response.status}: ${formatErrorBody(responseBody)}`);
       }
 
-      const json = await response.json() as {
-        results: { index: number; relevance_score: number }[];
-      };
+      const results = parseRerankResponse(
+        parseJsonResponse(responseBody, "Rerank"),
+        batch.length,
+      );
 
-      return json.results.map(r => {
+      return results.map(r => {
         const documentIndex = start + r.index;
         return {
           file: documents[documentIndex]!.file,
-          score: r.relevance_score, // raw; normalized once in the caller
+          score: r.score, // raw; normalized once in the caller
           index: documentIndex,
         };
       });
@@ -507,19 +502,16 @@ export class RemoteLLM implements LLM {
 
     let content = "";
     try {
-      const response = await fetchWithTimeout(
+      const { response, body: responseBody } = await fetchTextWithTimeout(
         url,
         { method: "POST", headers, body },
+        this.config.connectTimeoutMs,
         this.config.expandReadTimeoutMs ?? 30000,
       );
       if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(`Expand API returned ${response.status}: ${errText}`);
+        throw new Error(`Expand API returned ${response.status}: ${formatErrorBody(responseBody)}`);
       }
-      const json = (await response.json()) as {
-        choices?: { message?: { content?: string } }[];
-      };
-      content = json.choices?.[0]?.message?.content ?? "";
+      content = parseExpandResponse(parseJsonResponse(responseBody, "Expand"));
     } catch (err) {
       this.expandBreaker.onFailure();
       // Network error, timeout, or non-2xx. Let HybridLLM fall back to local
@@ -586,18 +578,157 @@ function normalizeUrl(baseUrl: string, path: string): string {
   return `${base}${path}`;
 }
 
+type EmbeddingResponseItem = {
+  embedding: number[];
+  index: number;
+};
+
+type RerankResponseItem = {
+  index: number;
+  score: number;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonResponse(body: string, operation: string): unknown {
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    throw new Error(`Invalid ${operation} API response: expected a JSON object`);
+  }
+}
+
+function parseEmbeddingResponse(value: unknown, expectedCount: number): EmbeddingResponseItem[] {
+  if (!isRecord(value) || !Array.isArray(value.data)) {
+    throw new Error("Invalid Embedding API response: data must be an array");
+  }
+  if (value.data.length !== expectedCount) {
+    throw new Error(
+      `Invalid Embedding API response: expected ${expectedCount} data items, got ${value.data.length}`,
+    );
+  }
+
+  const seen = new Set<number>();
+  let dimensions: number | null = null;
+  const data = value.data.map((item, position): EmbeddingResponseItem => {
+    if (!isRecord(item)) {
+      throw new Error(`Invalid Embedding API response: data[${position}] must be an object`);
+    }
+    const index = item.index;
+    if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= expectedCount) {
+      throw new Error(`Invalid Embedding API response: data[${position}].index is out of range`);
+    }
+    if (seen.has(index as number)) {
+      throw new Error(`Invalid Embedding API response: duplicate index ${index}`);
+    }
+    seen.add(index as number);
+
+    const embedding = item.embedding;
+    if (!Array.isArray(embedding) || embedding.length === 0) {
+      throw new Error(`Invalid Embedding API response: data[${position}].embedding must be a non-empty array`);
+    }
+    if (!embedding.every(component => typeof component === "number" && Number.isFinite(component))) {
+      throw new Error(`Invalid Embedding API response: data[${position}].embedding must contain finite numbers`);
+    }
+    if (dimensions === null) {
+      dimensions = embedding.length;
+    } else if (embedding.length !== dimensions) {
+      throw new Error(
+        `Embedding dimension mismatch within response: expected ${dimensions}, got ${embedding.length} at index ${index}`,
+      );
+    }
+    return { embedding: embedding as number[], index: index as number };
+  });
+
+  return data.sort((a, b) => a.index - b.index);
+}
+
+function parseRerankResponse(value: unknown, expectedCount: number): RerankResponseItem[] {
+  if (!isRecord(value) || !Array.isArray(value.results)) {
+    throw new Error("Invalid Rerank API response: results must be an array");
+  }
+  if (value.results.length !== expectedCount) {
+    throw new Error(
+      `Invalid Rerank API response: expected ${expectedCount} results, got ${value.results.length}`,
+    );
+  }
+
+  const seen = new Set<number>();
+  return value.results.map((item, position): RerankResponseItem => {
+    if (!isRecord(item)) {
+      throw new Error(`Invalid Rerank API response: results[${position}] must be an object`);
+    }
+    const index = item.index;
+    if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= expectedCount) {
+      throw new Error(`Invalid Rerank API response: results[${position}].index is out of range`);
+    }
+    if (seen.has(index as number)) {
+      throw new Error(`Invalid Rerank API response: duplicate index ${index}`);
+    }
+    seen.add(index as number);
+
+    const score = item.relevance_score ?? item.score;
+    if (typeof score !== "number" || !Number.isFinite(score)) {
+      throw new Error(
+        `Invalid Rerank API response: results[${position}].relevance_score or .score must be a finite number`,
+      );
+    }
+    return { index: index as number, score };
+  });
+}
+
+function parseExpandResponse(value: unknown): string {
+  if (!isRecord(value) || !Array.isArray(value.choices) || value.choices.length === 0) {
+    throw new Error("Invalid Expand API response: choices must be a non-empty array");
+  }
+  const choice = value.choices[0];
+  if (!isRecord(choice) || !isRecord(choice.message) || typeof choice.message.content !== "string") {
+    throw new Error("Invalid Expand API response: choices[0].message.content must be a string");
+  }
+  return choice.message.content;
+}
+
+function formatErrorBody(body: string): string {
+  const limit = 2048;
+  return body.length <= limit ? body : `${body.slice(0, limit)}…`;
+}
+
 /**
- * Fetch with a timeout using AbortSignal.timeout().
+ * Fetch response headers within the connect timeout, then consume the response
+ * body within the operation-specific read timeout.
  */
-async function fetchWithTimeout(
+async function fetchTextWithTimeout(
   url: string,
   init: RequestInit,
-  timeoutMs: number
-): Promise<Response> {
-  return fetch(url, {
-    ...init,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  connectTimeoutMs: number,
+  readTimeoutMs: number,
+): Promise<{ response: Response; body: string }> {
+  const controller = new AbortController();
+  const signal = init.signal
+    ? AbortSignal.any([init.signal, controller.signal])
+    : controller.signal;
+  let timer = setTimeout(() => {
+    controller.abort(new Error(`Remote API connect timed out after ${connectTimeoutMs}ms`));
+  }, connectTimeoutMs);
+
+  try {
+    const response = await fetch(url, { ...init, signal });
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      controller.abort(new Error(`Remote API response timed out after ${readTimeoutMs}ms`));
+    }, readTimeoutMs);
+    const body = await response.text();
+    return { response, body };
+  } catch (error) {
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+      throw controller.signal.reason;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // =============================================================================

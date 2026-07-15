@@ -9,7 +9,8 @@
   (and optionally `QMD_RERANK_API_*` / `QMD_EXPAND_API_*`) env vars or add
   the equivalent keys to `models:` in `index.yml`. Local generation and
   tokenization are preserved via a hybrid routing layer. Includes circuit
-  breakers, dimension validation, and batch splitting.
+  breakers, strict response validation, separate connect/read timeouts,
+  dimension validation, and batch splitting.
 
 ## [2.6.3] - 2026-06-24
 
