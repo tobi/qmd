@@ -16,7 +16,7 @@ import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, Mod
 // Mock HTTP server
 // =============================================================================
 
-type MockResponse = { status: number; body: unknown };
+type MockResponse = { status: number; body?: unknown; rawBody?: string };
 type MockHandler = (req: IncomingMessage, body: string) => MockResponse | Promise<MockResponse>;
 
 let server: Server;
@@ -38,7 +38,7 @@ beforeAll(async () => {
     try {
       const result = await mockHandler(req, body);
       res.writeHead(result.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result.body));
+      res.end(result.rawBody ?? JSON.stringify(result.body));
     } catch (err: any) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
@@ -299,6 +299,24 @@ describe("RemoteLLM", () => {
       await expect(llm.embed("test")).rejects.toThrow("500");
     });
 
+    it("sanitizes control characters from HTTP error bodies", async () => {
+      setMockHandler(() => ({
+        status: 500,
+        rawBody: "upstream failed\u001b]0;forged title\u0007\nforged log line",
+      }));
+
+      let message = "";
+      try {
+        await createRemoteLLM().embed("test");
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("upstream failed");
+      expect(message).not.toContain("\u001b");
+      expect(message).not.toContain("\u0007");
+      expect(message).not.toContain("\n");
+    });
+
     it("should open circuit breaker after failures", async () => {
       setMockHandler(() => ({
         status: 500,
@@ -312,6 +330,30 @@ describe("RemoteLLM", () => {
       }
       // Next call should fail immediately with circuit breaker message
       await expect(llm.embed("test")).rejects.toThrow("circuit breaker");
+    });
+
+    it("preserves base query parameters but redacts them from breaker errors", async () => {
+      let requestUrl = "";
+      setMockHandler(req => {
+        requestUrl = req.url ?? "";
+        return { status: 500, body: { error: "down" } };
+      });
+
+      const llm = createRemoteLLM({ embedApiUrl: `${baseUrl()}?api_key=secret` });
+      for (let i = 0; i < 3; i++) {
+        await expect(llm.embed("test")).rejects.toThrow("500");
+      }
+      expect(requestUrl).toBe("/v1/embeddings?api_key=secret");
+
+      let message = "";
+      try {
+        await llm.embed("test");
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("circuit breaker");
+      expect(message).not.toContain("secret");
+      expect(message).not.toContain("api_key");
     });
 
     it("honors the connect timeout while waiting for response headers", async () => {

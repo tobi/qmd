@@ -216,7 +216,7 @@ export class RemoteLLM implements LLM {
 
     if (!this.embedBreaker.canAttempt()) {
       throw new Error(
-        `Remote embedding circuit breaker is open — endpoint ${this.config.embedApiUrl} is unavailable. ` +
+        `Remote embedding circuit breaker is open — endpoint ${formatEndpointForError(this.config.embedApiUrl)} is unavailable. ` +
         `Will retry after cooldown.`
       );
     }
@@ -299,7 +299,7 @@ export class RemoteLLM implements LLM {
 
     if (!this.rerankBreaker.canAttempt()) {
       throw new Error(
-        `Remote rerank circuit breaker is open — endpoint ${rerankUrl} is unavailable. ` +
+        `Remote rerank circuit breaker is open — endpoint ${formatEndpointForError(rerankUrl)} is unavailable. ` +
         `Will retry after cooldown.`
       );
     }
@@ -456,7 +456,7 @@ export class RemoteLLM implements LLM {
 
     if (!this.expandBreaker.canAttempt()) {
       throw new Error(
-        `Remote expand circuit breaker is open — endpoint ${expandUrl} is unavailable. ` +
+        `Remote expand circuit breaker is open — endpoint ${formatEndpointForError(expandUrl)} is unavailable. ` +
         `Will retry after cooldown.`
       );
     }
@@ -574,8 +574,31 @@ export class RemoteLLM implements LLM {
  * Normalize a base URL and append a path, handling trailing slashes.
  */
 function normalizeUrl(baseUrl: string, path: string): string {
-  const base = baseUrl.replace(/\/+$/, "");
-  return `${base}${path}`;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new Error("Invalid remote API base URL: expected an absolute HTTP(S) URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Invalid remote API base URL: expected an HTTP(S) URL");
+  }
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}${path}`;
+  url.hash = "";
+  return url.toString();
+}
+
+function formatEndpointForError(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return "<invalid remote endpoint>";
+  }
 }
 
 type EmbeddingResponseItem = {
@@ -692,7 +715,11 @@ function parseExpandResponse(value: unknown): string {
 
 function formatErrorBody(body: string): string {
   const limit = 2048;
-  return body.length <= limit ? body : `${body.slice(0, limit)}…`;
+  const sanitized = body
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.length <= limit ? sanitized : `${sanitized.slice(0, limit)}…`;
 }
 
 /**
