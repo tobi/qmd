@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `qmd embed` no longer splits a UTF-16 surrogate pair (emoji, etc.) across a
+  chunk boundary. A chunk ending or starting mid-pair produced an unpaired
+  surrogate in the chunk text, which some remote embedding APIs reject as
+  invalid JSON — permanently failing that chunk on every retry, since the
+  boundary calculation is deterministic.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

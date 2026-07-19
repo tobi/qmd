@@ -1046,6 +1046,42 @@ describe("chunkDocumentWithBreakPoints", () => {
       expect(chunksNew[i]!.pos).toBe(chunksOriginal[i]!.pos);
     }
   });
+
+  test("does not split a surrogate pair at the raw chunk boundary", () => {
+    // "🚀" is a two-code-unit surrogate pair (high 0xD83D, low 0xDE80).
+    // Place it so the raw fallback boundary (charPos + maxChars) falls
+    // exactly between the two code units: 99 "x" chars, then the emoji at
+    // indices 99-100, so targetEndPos=100 lands right after the high
+    // surrogate.
+    const maxChars = 100;
+    const overlapChars = 20;
+    const windowChars = 10;
+    const content = "x".repeat(99) + "\u{1F680}" + "y".repeat(50);
+
+    const chunks = chunkDocumentWithBreakPoints(content, [], [], maxChars, overlapChars, windowChars);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.isWellFormed()).toBe(true);
+    }
+  });
+
+  test("does not split a surrogate pair at the overlap-derived chunk start", () => {
+    // Place the emoji so the boundary itself (charPos + maxChars = 100) is
+    // clean, but the next chunk's start (endPos - overlapChars = 100 - 20 = 80)
+    // falls between the high surrogate (index 79) and low surrogate (index 80).
+    const maxChars = 100;
+    const overlapChars = 20;
+    const windowChars = 10;
+    const content = "x".repeat(79) + "\u{1F680}" + "y".repeat(69);
+
+    const chunks = chunkDocumentWithBreakPoints(content, [], [], maxChars, overlapChars, windowChars);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.isWellFormed()).toBe(true);
+    }
+  });
 });
 
 describe("AST-aware chunkDocumentAsync", () => {

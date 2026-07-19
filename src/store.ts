@@ -270,6 +270,32 @@ export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[]
 }
 
 /**
+ * True if `pos` sits between a UTF-16 high surrogate (at pos-1) and a low
+ * surrogate (at pos) — i.e. slicing at `pos` would split an astral-plane
+ * character (emoji, etc.) into two unpaired surrogates.
+ */
+function isSurrogatePairBoundary(content: string, pos: number): boolean {
+  if (pos <= 0 || pos >= content.length) return false;
+  const high = content.charCodeAt(pos - 1);
+  const low = content.charCodeAt(pos);
+  return high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff;
+}
+
+/**
+ * Nudges `pos` back by one code unit when it splits a surrogate pair, so a
+ * slice ending or starting at `pos` never contains an unpaired surrogate.
+ * Returns `pos` unchanged when the adjustment would move at or before
+ * `floor` (caller-supplied lower bound, e.g. the previous chunk's start) —
+ * preserving forward progress takes priority over the (extremely rare)
+ * pathological case where a surrogate pair can't be avoided.
+ */
+function adjustSurrogateBoundary(content: string, pos: number, floor: number): number {
+  if (!isSurrogatePairBoundary(content, pos)) return pos;
+  const adjusted = pos - 1;
+  return adjusted > floor ? adjusted : pos;
+}
+
+/**
  * Core chunk algorithm that operates on precomputed break points and code fences.
  * This is the shared implementation used by both regex-only and AST-aware chunking.
  */
@@ -310,6 +336,11 @@ export function chunkDocumentWithBreakPoints(
       endPos = Math.min(charPos + maxChars, content.length);
     }
 
+    // Never slice through the middle of a surrogate pair (e.g. an emoji) —
+    // an unpaired surrogate in the chunk text breaks JSON serialization for
+    // remote embedding APIs.
+    endPos = adjustSurrogateBoundary(content, endPos, charPos);
+
     chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
 
     if (endPos >= content.length) {
@@ -320,6 +351,7 @@ export function chunkDocumentWithBreakPoints(
     if (charPos <= lastChunkPos) {
       charPos = endPos;
     }
+    charPos = adjustSurrogateBoundary(content, charPos, lastChunkPos);
   }
 
   return chunks;
