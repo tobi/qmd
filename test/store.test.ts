@@ -3642,6 +3642,84 @@ describe("Token chunking guardrails", () => {
       setDefaultLlamaCpp(null);
     }
   });
+
+  test("chunkDocumentByTokens keeps surrogate pairs intact when the token budget shrinks the char budget below 2", async () => {
+    // A tokenizer that reports one token per UTF-16 code unit makes
+    // astral-plane content (emoji) look 2x as "expensive" as it actually
+    // is, driving pushChunkWithinTokenLimit's recursive safeMaxChars
+    // calculation down to 1 char — exactly the case that used to make
+    // chunkDocument() slice a surrogate pair in half.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const content = "\u{1F680}".repeat(30); // 30 emoji, 60 UTF-16 code units
+      const chunks = await chunkDocumentByTokens(content, 2, 0, 0);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens drops rather than emits an unpaired surrogate from the detokenize() truncation fallback", async () => {
+    // Simulates a tokenizer that encodes a single astral-plane character
+    // across multiple tokens and, when the truncation fallback slices the
+    // token list down to a single token, detokenizes it back into a lone
+    // high surrogate — the shape a real BPE-style tokenizer can produce.
+    // This exercises the results.push() site fed by llm.detokenize()
+    // rather than by chunkDocument()'s char-slicing.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return tokens.length === 1 ? "\uD83D" : "\u{1F680}".repeat(Math.ceil(tokens.length / 2));
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("\u{1F680}", 1, 0, 0);
+
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens drops rather than emits an already-malformed lone surrogate from source content", async () => {
+    // Defense-in-depth for the text.length <= 1 base case: a bare lone
+    // surrogate that was already malformed in the source document (e.g.
+    // from an unrelated upstream encoding bug) should never reach the
+    // embedding pipeline as a 1-character chunk.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("\uD800", 900, 135);
+
+      expect(chunks.length).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
 });
 
 // =============================================================================

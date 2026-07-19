@@ -282,17 +282,27 @@ function isSurrogatePairBoundary(content: string, pos: number): boolean {
 }
 
 /**
- * Nudges `pos` back by one code unit when it splits a surrogate pair, so a
- * slice ending or starting at `pos` never contains an unpaired surrogate.
- * Returns `pos` unchanged when the adjustment would move at or before
- * `floor` (caller-supplied lower bound, e.g. the previous chunk's start) —
- * preserving forward progress takes priority over the (extremely rare)
- * pathological case where a surrogate pair can't be avoided.
+ * Nudges `pos` off a surrogate-pair boundary so a slice ending or starting
+ * at `pos` never contains an unpaired surrogate. Prefers retreating by one
+ * code unit (excludes the pair from this slice, deferring it to the next
+ * chunk); when that would violate forward progress (`pos - 1 <= floor`,
+ * the caller-supplied lower bound, e.g. the previous chunk's start),
+ * advances by one code unit instead (includes the whole pair in this
+ * slice, slightly exceeding the caller's target width).
+ *
+ * Advancing is always safe: `isSurrogatePairBoundary` only returns true
+ * for `pos < content.length`, so `pos + 1 <= content.length`; and every
+ * call site already guarantees `pos > floor` before calling this function,
+ * so `pos + 1 > floor` too. This means a surrogate pair is never split —
+ * unlike a plain "give up and leave pos unchanged" fallback, which would
+ * let recursive re-chunking (e.g. chunkDocumentByTokens shrinking maxChars
+ * toward 1 for astral-dense content) reproduce the exact bug this exists
+ * to prevent.
  */
 function adjustSurrogateBoundary(content: string, pos: number, floor: number): number {
   if (!isSurrogatePairBoundary(content, pos)) return pos;
-  const adjusted = pos - 1;
-  return adjusted > floor ? adjusted : pos;
+  const retreat = pos - 1;
+  return retreat > floor ? retreat : pos + 1;
 }
 
 /**
@@ -2786,6 +2796,30 @@ export async function chunkDocumentAsync(
 }
 
 /**
+ * Strips a leading lone low surrogate and/or a trailing lone high surrogate
+ * from `text`, so the result is always well-formed UTF-16. Defense-in-depth
+ * for chunkDocumentByTokens: chunkDocumentWithBreakPoints (via chunkDocument)
+ * never itself produces a split surrogate pair (see adjustSurrogateBoundary),
+ * but the tokenizer's detokenize() truncation fallback below reconstructs
+ * text from raw token IDs — a different code path this doesn't cover, since
+ * a tokenizer is free to encode a single astral-plane character as multiple
+ * tokens and truncate between them.
+ */
+function stripUnpairedSurrogates(text: string): string {
+  let start = 0;
+  let end = text.length;
+  if (end > 0) {
+    const first = text.charCodeAt(0);
+    if (first >= 0xdc00 && first <= 0xdfff) start = 1;
+  }
+  if (end > start) {
+    const last = text.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  }
+  return start === 0 && end === text.length ? text : text.slice(start, end);
+}
+
+/**
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
  *
@@ -2826,7 +2860,12 @@ export async function chunkDocumentByTokens(
 
     const tokens = await llm.tokenize(text);
     if (tokens.length <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokens.length });
+      // Safety net: text.length <= 1 can only legitimately be a single
+      // BMP character (a well-formed astral character needs 2 code units),
+      // so this only ever strips something for already-malformed input.
+      const safeText = stripUnpairedSurrogates(text);
+      if (safeText.length === 0) return;
+      results.push({ text: safeText, pos, tokens: tokens.length });
       return;
     }
 
@@ -2861,7 +2900,11 @@ export async function chunkDocumentByTokens(
       || subChunks[0]?.text.length === text.length
     ) {
       const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      const truncatedText = await llm.detokenize(fallbackTokens);
+      // Safety net: detokenize() reconstructs text from raw token IDs, and
+      // a tokenizer can encode a single astral-plane character across
+      // multiple tokens — truncating the token list can land mid-character.
+      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+      if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
         pos,

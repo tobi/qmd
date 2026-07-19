@@ -8,7 +8,10 @@
   chunk boundary. A chunk ending or starting mid-pair produced an unpaired
   surrogate in the chunk text, which some remote embedding APIs reject as
   invalid JSON — permanently failing that chunk on every retry, since the
-  boundary calculation is deterministic.
+  boundary calculation is deterministic. This covers both the character-based
+  chunker and `chunkDocumentByTokens`'s recursive re-splitting for
+  astral-plane-dense content, which could previously drive the char budget
+  low enough to reproduce the same split.
 
 ## [2.6.3] - 2026-06-24
 
