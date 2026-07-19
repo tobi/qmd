@@ -2796,13 +2796,25 @@ export async function chunkDocumentAsync(
 }
 
 /**
- * Strips a leading lone low surrogate and/or a trailing lone high surrogate
- * from `text`, so the result is always well-formed UTF-16. Defense-in-depth
- * for chunkDocumentByTokens: chunkDocumentWithBreakPoints (via chunkDocument)
- * never itself produces a split surrogate pair (see adjustSurrogateBoundary),
- * but the tokenizer's detokenize() truncation fallback below reconstructs
- * text from raw token IDs — a different code path this doesn't cover, since
- * a tokenizer is free to encode a single astral-plane character as multiple
+ * Strips any unpaired surrogate at the start or end of `text`, so the
+ * result is always well-formed UTF-16. Handles all four ways a lone
+ * surrogate can sit at a boundary:
+ *   - leading lone low surrogate (never valid as the first unit of a pair)
+ *   - leading lone high surrogate NOT followed by a matching low surrogate
+ *     (a leading high surrogate that IS followed by its low surrogate is a
+ *     complete, valid pair and must be left alone)
+ *   - trailing lone high surrogate (never valid as the last unit of a pair)
+ *   - trailing lone low surrogate NOT preceded by a matching high surrogate
+ *     (mirrors the leading-high case)
+ *
+ * Defense-in-depth for chunkDocumentByTokens: chunkDocumentWithBreakPoints
+ * (via chunkDocument) never itself produces a split surrogate pair (see
+ * adjustSurrogateBoundary), but a lone surrogate can already be present in
+ * the source document (unrelated upstream encoding bug) and land at an
+ * ordinary chunk boundary by coincidence, and the tokenizer's detokenize()
+ * truncation fallback below reconstructs text from raw token IDs — a
+ * different code path chunk-boundary adjustment doesn't cover, since a
+ * tokenizer is free to encode a single astral-plane character as multiple
  * tokens and truncate between them.
  */
 function stripUnpairedSurrogates(text: string): string {
@@ -2810,11 +2822,27 @@ function stripUnpairedSurrogates(text: string): string {
   let end = text.length;
   if (end > 0) {
     const first = text.charCodeAt(0);
-    if (first >= 0xdc00 && first <= 0xdfff) start = 1;
+    const firstIsLow = first >= 0xdc00 && first <= 0xdfff;
+    const firstIsHigh = first >= 0xd800 && first <= 0xdbff;
+    if (firstIsLow) {
+      start = 1;
+    } else if (firstIsHigh) {
+      const second = end > 1 ? text.charCodeAt(1) : NaN;
+      const secondIsLow = second >= 0xdc00 && second <= 0xdfff;
+      if (!secondIsLow) start = 1;
+    }
   }
   if (end > start) {
     const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    const lastIsHigh = last >= 0xd800 && last <= 0xdbff;
+    const lastIsLow = last >= 0xdc00 && last <= 0xdfff;
+    if (lastIsHigh) {
+      end -= 1;
+    } else if (lastIsLow) {
+      const prev = end - 1 > start ? text.charCodeAt(end - 2) : NaN;
+      const prevIsHigh = prev >= 0xd800 && prev <= 0xdbff;
+      if (!prevIsHigh) end -= 1;
+    }
   }
   return start === 0 && end === text.length ? text : text.slice(start, end);
 }
