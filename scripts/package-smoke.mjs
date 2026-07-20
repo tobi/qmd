@@ -35,6 +35,21 @@ function assertPath(path, label = path) {
   return full;
 }
 
+// prepare must be pure Node (no POSIX test/[) so Windows cmd.exe can run it,
+// and must still invoke the build so git installs produce dist/.
+{
+  const prepare = pkg.scripts?.prepare ?? "";
+  if (/\[\s*-d/.test(prepare) || prepare.includes("install-hooks.sh")) {
+    console.error("Package smoke failed: prepare still uses a POSIX shell hook installer");
+    process.exit(1);
+  }
+  if (!prepare.includes("install-hooks.mjs") || !prepare.includes("scripts/build.mjs")) {
+    console.error("Package smoke failed: prepare must run install-hooks.mjs and build.mjs");
+    process.exit(1);
+  }
+  console.log("==> prepare script is Windows-safe and builds dist");
+}
+
 run("build compiled package", process.execPath, ["scripts/build.mjs"]);
 run("AST grammar runtime packages", process.execPath, ["scripts/check-package-grammars.mjs"]);
 

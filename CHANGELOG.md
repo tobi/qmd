@@ -23,6 +23,8 @@
 
 ### Fixed
 
+- `npm install` / `prepare` no longer fails on Windows in a git checkout (#778). The hook installer is now cross-platform `scripts/install-hooks.mjs` instead of a POSIX shell script; `prepare` still runs `node scripts/build.mjs` so git installs keep producing `dist/` (#824).
+
 - `qmd mcp` (stdio) now shuts down gracefully when stdin reaches EOF instead
   of orphaning to PID 1 when the parent MCP client dies (#751): the server
   closes its transport, gives in-flight request handlers a bounded window to
