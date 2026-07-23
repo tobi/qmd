@@ -1170,10 +1170,8 @@ export class LlamaCpp implements LLM {
    * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
    * Each context has its own sequence, so they can evaluate independently.
    *
-   * Tuning choices:
-   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
-   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
-   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
+   * VRAM per context is governed by contextSize alone —
+   * LlamaRankingContextOptions has no flashAttention option.
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Default 2048 was too small for longer documents (e.g. session transcripts,
@@ -1203,18 +1201,16 @@ export class LlamaCpp implements LLM {
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
-        } catch {
+        } catch (error) {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
+            // Surface the underlying failure (e.g. out of VRAM) — an OOM and a
+            // broken install must be distinguishable from the message alone.
+            throw new Error(
+              `Failed to create any rerank context: ${error instanceof Error ? error.message : String(error)}`,
+              { cause: error }
+            );
           }
+          // At least one context exists — continue with reduced parallelism.
           break;
         }
       }
