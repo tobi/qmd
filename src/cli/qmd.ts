@@ -57,7 +57,7 @@ import {
   vacuumDatabase,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
-  handelize,
+  escapeLikePattern,
   hybridQuery,
   vectorSearchQuery,
   structuredSearch,
@@ -1122,9 +1122,9 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
               d.path
             FROM documents d
             JOIN content ON content.hash = d.hash
-            WHERE d.path LIKE ? AND d.active = 1
+            WHERE d.path LIKE ? ESCAPE '\\' AND d.active = 1
             LIMIT 1
-          `).get(`%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+          `).get(`%${escapeLikePattern(name)}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
         }
       }
 
@@ -1461,10 +1461,10 @@ function listFiles(pathArg?: string): void {
       SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+      WHERE d.collection = ? AND d.path LIKE ? ESCAPE '\\' AND d.active = 1
       ORDER BY d.path
     `;
-    params = [coll.name, `${pathPrefix}%`];
+    params = [coll.name, `${escapeLikePattern(pathPrefix)}%`];
   } else {
     // List all files in the collection
     query = `
@@ -1693,6 +1693,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  // Literal paths of every file in this scan. Passed to the legacy-path
+  // migration so it never adopts a row that still belongs to a live file.
+  const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
 
   for (const relativeFile of files) {
@@ -1721,7 +1724,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {

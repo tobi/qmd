@@ -16,6 +16,7 @@ import {
   normalizeDocid,
   isDocid,
   handelize,
+  escapeLikePattern,
   cleanupOrphanedVectors,
   sanitizeFTS5Term,
 } from "../src/store";
@@ -218,6 +219,15 @@ describe("handelize", () => {
     expect(handelize("a")).toBe("a");
     expect(handelize("1")).toBe("1");
     expect(handelize("a.md")).toBe("a.md");
+  });
+
+  test("escapes SQL LIKE wildcards in literal paths", () => {
+    // "_" and "%" are LIKE wildcards — filenames containing them must not
+    // match sibling files (issue #717).
+    expect(escapeLikePattern("2026_06_16.md")).toBe("2026\\_06\\_16.md");
+    expect(escapeLikePattern("100%.md")).toBe("100\\%.md");
+    expect(escapeLikePattern("back\\slash.md")).toBe("back\\\\slash.md");
+    expect(escapeLikePattern("plain-file.md")).toBe("plain-file.md");
   });
 
   test("normalizes virtual paths", () => {

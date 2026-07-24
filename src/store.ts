@@ -401,6 +401,17 @@ export function normalizePathSeparators(path: string): string {
 }
 
 /**
+ * Escape a literal string for use inside a SQL LIKE pattern.
+ *
+ * `_` and `%` are LIKE wildcards, and filenames contain both — without this,
+ * looking up "2026_06_16.md" also matches "2026-06-16.md" and can return the
+ * wrong document (issue #717). Queries using this must declare ESCAPE '\'.
+ */
+export function escapeLikePattern(literal: string): string {
+  return literal.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/**
  * Detect if running inside WSL (Windows Subsystem for Linux).
  * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths.
  */
@@ -1397,6 +1408,9 @@ export async function reindexCollection(
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  // Literal paths of every file in this scan. Passed to the legacy-path
+  // migration so it never adopts a row that still belongs to a live file.
+  const livePaths = new Set(files.map(f => normalizePathSeparators(f)));
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
@@ -1423,7 +1437,7 @@ export async function reindexCollection(
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -2062,6 +2076,15 @@ export function getDocid(hash: string): string {
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
  * - Preserve original case (important for case-sensitive filesystems)
+ *
+ * NOT used at index time — documents are stored under their literal
+ * filesystem path. The only remaining caller is
+ * findOrMigrateLegacyDocument(), which uses it to reconstruct the path a
+ * pre-2.6 index would have stored for a given file so that row can be renamed
+ * in place. Its output is therefore fixed by that old format: keeping `_` in
+ * the dash-separated character class (and `___` → `/`) is what lets
+ * snake_case corpora — the ones worst hit by the old slugging — migrate
+ * without losing their rows. Do not "fix" it to preserve underscores.
  */
 /** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
 function emojiToHex(str: string): string {
@@ -2596,39 +2619,56 @@ export function findActiveDocument(
  * FTS entry. Embeddings are keyed by content hash, so the rename is
  * safe — no re-embedding required.
  *
+ * `livePaths`, when given, is the set of literal paths of every file in the
+ * current scan of this collection. A legacy row whose path is in that set
+ * belongs to a *different* file that still exists on disk, so it must never be
+ * adopted — renaming it would evict that file from the index. See the comment
+ * on the legacy lookups below.
+ *
  * @internal Used by reindexCollection and indexFiles during qmd update.
  * Returns null if the document does not exist under either path.
  */
 export function findOrMigrateLegacyDocument(
   db: Database,
   collectionName: string,
-  path: string
+  path: string,
+  livePaths?: ReadonlySet<string>
 ): { id: number; hash: string; title: string } | null {
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
+  // Both fallbacks below are *lossy inverses*: many literal paths map onto the
+  // same legacy path ("a b.md", "a_b.md" and "a-b.md" all handalize to
+  // "a-b.md"), so a match is only evidence of a legacy row when no live file
+  // already owns that path. Without this guard, indexing "2026_06_16.md" next
+  // to an existing "2026-06-16.md" renames the latter's row and the hyphenated
+  // file silently disappears from the index (issue #717).
+  type LegacyRow = { id: number; hash: string; title: string; path: string };
+  const claimable = (row: LegacyRow | undefined): LegacyRow | undefined =>
+    row && !livePaths?.has(row.path) ? row : undefined;
+
   // Case-insensitive match (legacy normalization: e.g. "README.md" → "readme.md").
-  const legacyCase = db.prepare(`
-    SELECT id, hash, title FROM documents
+  const legacyCase = claimable(db.prepare(`
+    SELECT id, hash, title, path FROM documents
     WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
     ORDER BY id
     LIMIT 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  `).get(collectionName, path) as LegacyRow | undefined);
 
   // Handalized-path match: existing DBs indexed with handelize() stored slugged paths
   // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
   // Try matching the handalized form of the incoming raw path against the DB so that
   // qmd update on an old index can rename the row to the literal path.
-  let legacyHandalized: { id: number; hash: string; title: string } | undefined;
+  let legacyHandalized: LegacyRow | undefined;
   try {
     const handleized = handelize(path);
     if (handleized !== path) {
-      legacyHandalized = db.prepare(`
-        SELECT id, hash, title FROM documents
+      legacyHandalized = claimable(db.prepare(`
+        SELECT id, hash, title, path FROM documents
         WHERE collection = ? AND path = ? AND active = 1
         ORDER BY id
         LIMIT 1
-      `).get(collectionName, handleized) as { id: number; hash: string; title: string } | undefined;
+      `).get(collectionName, handleized) as LegacyRow | undefined);
     }
   } catch {
     // handelize throws on invalid paths; just skip
@@ -4217,15 +4257,15 @@ export function findDocument(db: Database, filename: string, options: { includeB
     WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
   `).get(filepath) as DbDocRow | null;
 
-  // Try fuzzy match by virtual path
+  // Try fuzzy match by virtual path (suffix match on the literal path)
   if (!doc) {
     doc = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? ESCAPE '\\' AND d.active = 1
       LIMIT 1
-    `).get(`%${filepath}`) as DbDocRow | null;
+    `).get(`%${escapeLikePattern(filepath)}`) as DbDocRow | null;
   }
 
   // Try to match by absolute path (requires looking up collection paths from DB)
@@ -4373,9 +4413,9 @@ export function findDocuments(
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
-          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? ESCAPE '\\' AND d.active = 1
           LIMIT 1
-        `).get(`%${name}`) as DbDocRow | null;
+        `).get(`%${escapeLikePattern(name)}`) as DbDocRow | null;
       }
       if (doc) {
         fileRows.push(doc);

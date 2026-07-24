@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Files whose names differ only in the characters the legacy slug collapsed to
+  `-` (spaces, underscores) no longer evict each other from the index (#717).
+  The legacy-path migration reconstructs the slug a pre-2.6 index would have
+  stored (`2026_06_16.md` → `2026-06-16.md`) and adopts the matching row — but
+  it did so even when that row belonged to a live file, renaming it onto the new
+  document. Indexing `2026-06-16.md` and `2026_06_16.md` in the same collection
+  silently dropped one of them; a `qmd update` after adding an underscored twin
+  removed the hyphenated file from the index entirely. The migration now skips
+  any row whose path is still owned by a file in the current scan, so it only
+  ever adopts genuinely stale rows. `handelize()` is unchanged — it exists only
+  to reconstruct pre-2.6 paths, and altering its output would strand snake_case
+  corpora on the old index format.
+- `qmd get`, `qmd multi-get` and `qmd ls <prefix>` now match `_` and `%` in
+  paths literally instead of as SQL `LIKE` wildcards (#717). `qmd get
+  2026_06_16.md` could return the contents of a sibling `2026-06-16.md`, and
+  `qmd ls notes/2026_06` listed files it did not match.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

@@ -333,6 +333,161 @@ describe("Path fidelity — CLI integration", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Separator collisions: files whose names differ only in the characters the
+// legacy slug collapsed to "-" (spaces, underscores) must all survive indexing.
+// Regression for #717 — the legacy-path migration used to adopt the row of a
+// live file, evicting it from the index.
+// ---------------------------------------------------------------------------
+
+// Helper: build an isolated env with an arbitrary set of files.
+async function createCollectionWith(
+  prefix: string,
+  files: Array<{ name: string; content: string }>
+): Promise<{ collectionDir: string; dbPath: string; configDir: string }> {
+  const envDir = join(testDir, prefix);
+  const collectionDir = join(envDir, "corpus");
+  const dbPath = join(envDir, "test.sqlite");
+  const configDir = join(envDir, "config");
+
+  await mkdir(collectionDir, { recursive: true });
+  await mkdir(configDir, { recursive: true });
+  for (const f of files) {
+    await writeFile(join(collectionDir, f.name), f.content);
+  }
+  await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+
+  return { collectionDir: realpathSync(collectionDir), dbPath, configDir };
+}
+
+function activePaths(dbPath: string): string[] {
+  const db = openDatabase(dbPath);
+  const rows = db.prepare(
+    "SELECT path FROM documents WHERE active = 1 ORDER BY path"
+  ).all() as { path: string }[];
+  db.close();
+  return rows.map((r) => r.path);
+}
+
+describe("Path fidelity — separator collisions (#717)", () => {
+  const twins: Array<{ name: string; content: string }> = [
+    { name: "2026-06-16.md", content: "# Hyphen\n\nJournal searchterm-twin hyphenated.\n" },
+    { name: "2026_06_16.md", content: "# Underscore\n\nJournal searchterm-twin underscored.\n" },
+    { name: "my file.md", content: "# Spaced\n\nFile searchterm-twin with spaces.\n" },
+    { name: "my-file.md", content: "# Hyphenated\n\nFile searchterm-twin hyphenated.\n" },
+  ];
+
+  test("a fresh index keeps every file whose name differs only by separators", async () => {
+    const { collectionDir, dbPath, configDir } = await createCollectionWith("collide-fresh", twins);
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+
+    const paths = activePaths(dbPath);
+    for (const f of twins) {
+      expect(paths, `${f.name} missing from index`).toContain(f.name);
+    }
+    expect(paths).toHaveLength(twins.length);
+  });
+
+  test("adding an underscore twin to an indexed collection does not evict the hyphen file", async () => {
+    // Index the hyphenated file on its own first, then add its underscore twin.
+    // handelize("2026_06_16.md") === "2026-06-16.md", so the legacy-path lookup
+    // matches the live hyphen row — it must not be renamed onto the new file.
+    const { collectionDir, dbPath, configDir } = await createCollectionWith(
+      "collide-incremental",
+      [twins[0]!]
+    );
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+    expect(activePaths(dbPath)).toEqual(["2026-06-16.md"]);
+
+    await writeFile(join(collectionDir, twins[1]!.name), twins[1]!.content);
+    const update = await runQmd(["update"], { cwd: collectionDir, dbPath, configDir });
+    expect(update.exitCode, `qmd update failed: ${update.stderr}`).toBe(0);
+
+    expect(activePaths(dbPath)).toEqual(["2026-06-16.md", "2026_06_16.md"]);
+
+    // Each path resolves to its own content — no row was repointed.
+    const hyphen = await runQmd(["get", "2026-06-16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(hyphen.exitCode, `get hyphen failed: ${hyphen.stderr}`).toBe(0);
+    expect(hyphen.stdout).toContain("hyphenated");
+
+    const underscore = await runQmd(["get", "2026_06_16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(underscore.exitCode, `get underscore failed: ${underscore.stderr}`).toBe(0);
+    expect(underscore.stdout).toContain("underscored");
+  });
+
+  test("underscores in a path are matched literally, not as LIKE wildcards", async () => {
+    const { collectionDir, dbPath, configDir } = await createCollectionWith("collide-like", twins);
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+
+    // multi-get by name must return only the underscored file
+    const mg = await runQmd(
+      ["multi-get", "2026_06_16.md", "--format", "files"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(mg.exitCode, `multi-get failed: ${mg.stderr}`).toBe(0);
+    expect(mg.stdout).toContain("2026_06_16.md");
+    expect(mg.stdout).not.toContain("2026-06-16.md");
+
+    // `ls <prefix>` must not treat "_" as "any character"
+    const ls = await runQmd(["ls", "collide/2026_06"], { cwd: collectionDir, dbPath, configDir });
+    expect(ls.exitCode, `ls failed: ${ls.stderr}`).toBe(0);
+    expect(ls.stdout).toContain("2026_06_16.md");
+    expect(ls.stdout).not.toContain("2026-06-16.md");
+  });
+
+  test("legacy rows still migrate when a live file shares the slug", async () => {
+    // Old index built by the pre-2.6 slugging code: the underscore file was
+    // stored as "2026-06-16.md". The collection now also contains a real
+    // "2026-06-16.md". After `qmd update`, both files must be present and the
+    // legacy row must not have been renamed away from the file that owns it.
+    const { collectionDir, dbPath, configDir } = await createCollectionWith(
+      "collide-legacy",
+      [twins[0]!, twins[1]!]
+    );
+
+    const store = createStore(dbPath);
+    const now = new Date().toISOString();
+    const legacyYaml = `collections:\n  collide:\n    path: "${collectionDir}"\n    mask: "**/*.md"\n`;
+    await writeFile(join(configDir, "index.yml"), legacyYaml);
+    syncConfigToDb(store.db, YAML.parse(legacyYaml) as CollectionConfig);
+
+    // Only one row exists — the old slugging collapsed both names onto it.
+    const legacyPath = handelize(normalizePathSeparators(twins[1]!.name));
+    expect(legacyPath).toBe("2026-06-16.md");
+    const legacyHash = await hashContent(twins[1]!.content);
+    insertContent(store.db, legacyHash, twins[1]!.content, now);
+    insertDocument(store.db, "collide", legacyPath, "Underscore", legacyHash, now, now);
+    store.close();
+
+    const update = await runQmd(["update"], { cwd: collectionDir, dbPath, configDir });
+    expect(update.exitCode, `qmd update failed: ${update.stderr}`).toBe(0);
+
+    expect(activePaths(dbPath)).toEqual(["2026-06-16.md", "2026_06_16.md"]);
+
+    const hyphen = await runQmd(["get", "2026-06-16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(hyphen.exitCode).toBe(0);
+    expect(hyphen.stdout).toContain("hyphenated");
+
+    const underscore = await runQmd(["get", "2026_06_16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(underscore.exitCode).toBe(0);
+    expect(underscore.stdout).toContain("underscored");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Migration test: old handalized DB upgraded by `qmd update`
 // ---------------------------------------------------------------------------
 
