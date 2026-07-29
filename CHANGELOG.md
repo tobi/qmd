@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- LLM idle unloading is configurable independently for embedding, reranking,
+  and query generation with `QMD_EMBED_IDLE_TIMEOUT_MINUTES`,
+  `QMD_RERANK_IDLE_TIMEOUT_MINUTES`, and
+  `QMD_GENERATE_IDLE_TIMEOUT_MINUTES`, plus the SDK
+  `llmIdleTimeoutMinutes` option. Each defaults to five minutes, accepts
+  `0..34560`, and uses `0` to keep that resource group warm.
+- `qmd doctor` reports all three effective idle timeouts. Invalid timeout
+  settings are diagnosed without skipping later checks and make Doctor exit
+  nonzero; other CLI, SDK, and MCP startup paths reject them immediately.
+
+### Changed
+
+- Idle cleanup now unloads each resource group's contexts and model
+  independently, resets lazy-load guards for transparent reload, and defers
+  cleanup while that QMD store has an active LLM session or operation. Explicit
+  shutdown still releases all resources regardless of idle-timeout settings.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

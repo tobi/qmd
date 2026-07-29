@@ -69,6 +69,23 @@ describe("CLI successful-exit lifecycle", () => {
     }
   });
 
+  test("cleans up while preserving a nonzero diagnostic exit code", async () => {
+    const exitCodes: number[] = [];
+    const calls: string[] = [];
+
+    await finishSuccessfulCliCommand({
+      command: "doctor",
+      exitCode: 1,
+      cleanup: async () => { calls.push("cleanup"); },
+      exit: (code) => { exitCodes.push(code); },
+      stdout: { write: (_chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { calls.push("stdout-flush"); cb?.(); return true; } },
+      stderr: { write: (_chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { calls.push("stderr-flush"); cb?.(); return true; } },
+    });
+
+    expect(calls).toEqual(["stdout-flush", "cleanup", "stderr-flush"]);
+    expect(exitCodes).toEqual([1]);
+  });
+
   test("darwin Metal mitigation reflects launcher-exported env on darwin", () => {
     // The real mitigation lives in bin/qmd, which sets GGML_METAL_NO_RESIDENCY=1
     // before Node loads the llama.cpp native binding. The JS-side predicate
@@ -98,7 +115,9 @@ describe("CLI successful-exit lifecycle", () => {
 
   test("disposes Llama resources in dependency order before CLI exit", async () => {
     const calls: string[] = [];
-    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 0, generate: 0 },
+    });
     const disposable = (name: string) => ({
       dispose: async () => {
         calls.push(name);

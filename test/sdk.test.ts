@@ -5,7 +5,7 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -104,6 +104,96 @@ describe("createStore", () => {
     await expect(
       createStore({ dbPath: "", config: { collections: {} } })
     ).rejects.toThrow("dbPath is required");
+  });
+
+  test("rejects an invalid SDK idle timeout before opening the database", async () => {
+    const dbPath = freshDbPath();
+
+    await expect(createStore({
+      dbPath,
+      config: { collections: {} },
+      llmIdleTimeoutMinutes: { generate: Number.POSITIVE_INFINITY },
+    })).rejects.toThrow(
+      "llmIdleTimeoutMinutes.generate must be a finite number between 0 and 34560 minutes",
+    );
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  test("protects public SDK LLM operations with the store instance lifecycle", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      llmIdleTimeoutMinutes: { embed: 0, rerank: 0, generate: 0 },
+    });
+    const llm = store.internal.llm as any;
+    llm.expandQuery = vi.fn(async () => {
+      expect(llm.canUnloadIdleResources()).toBe(false);
+      return [];
+    });
+
+    try {
+      await store.expandQuery("lifecycle protection");
+      expect(llm.expandQuery).toHaveBeenCalledOnce();
+      expect(llm.canUnloadIdleResources()).toBe(true);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("routes vector search through the store-specific LLM session", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      llmIdleTimeoutMinutes: { embed: 0 },
+    });
+    const llm = store.internal.llm as any;
+    const searchVec = vi.fn(async (
+      _query: string,
+      _model: string,
+      _limit?: number,
+      _collection?: string,
+      session?: unknown,
+    ) => {
+      expect(session).toBeDefined();
+      expect(llm.canUnloadIdleResources()).toBe(false);
+      return [];
+    });
+    store.internal.searchVec = searchVec;
+
+    try {
+      await store.searchVector("store-specific embedding");
+      expect(searchVec).toHaveBeenCalledOnce();
+      expect(llm.canUnloadIdleResources()).toBe(true);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("resolves SDK, environment, and default timeout precedence per resource", async () => {
+    const previousEmbed = process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES;
+    const previousRerank = process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES;
+    process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES = "9";
+    process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES = "0.25";
+
+    let store: QMDStore | undefined;
+    try {
+      store = await createStore({
+        dbPath: freshDbPath(),
+        config: { collections: {} },
+        llmIdleTimeoutMinutes: { embed: 0 },
+      });
+      expect((store.internal.llm as any).idleTimeoutMs).toEqual({
+        embed: 0,
+        rerank: 15_000,
+        generate: 300_000,
+      });
+    } finally {
+      await store?.close();
+      if (previousEmbed === undefined) delete process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES;
+      else process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES = previousEmbed;
+      if (previousRerank === undefined) delete process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES;
+      else process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES = previousRerank;
+    }
   });
 
   test("opens with just dbPath (DB-only mode)", async () => {
