@@ -83,8 +83,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `collection_list` — List configured collections, including ones not indexed yet
 - `collection_show` — Show one configured collection
 
-Local stdio servers can additionally opt in to three collection configuration
-writes with `qmd mcp --enable-collection-management`:
+Three collection configuration writes are off by default and require an explicit
+opt-in with `qmd mcp --enable-collection-management`:
 
 - `collection_add` — Register a local directory without indexing it
 - `collection_rename` — Rename a collection and its indexed paths
@@ -150,28 +150,27 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
-The stdio and HTTP transports expose the same centrally registered search,
-retrieval, status, collection-read, update, and embed tools. The deliberate
-transport-parity exception is limited to the three writing collection tools:
-they are never registered over HTTP.
+The stdio and HTTP transports expose the same centrally registered tools.
 
 #### Collection Management
 
-Collection configuration writes are disabled by default. Enable them only for a
-trusted local stdio client:
+Collection configuration writes are disabled by default. Enable them with an
+explicit startup flag, on either transport:
 
 ```sh
 qmd mcp --enable-collection-management
+qmd mcp --http --enable-collection-management
 ```
 
 For client configuration, add the flag after `mcp`, for example
-`"args": ["mcp", "--enable-collection-management"]`. The flag cannot be combined
-with `--http`; QMD rejects that startup combination. These tools accept local
-filesystem paths, change collection configuration, and can rename or remove
-indexed data. Keeping them off the shared HTTP transport avoids turning a
-network-facing search service into a remote filesystem/configuration
-administration API. There is intentionally no environment-variable or config
-file equivalent for this opt-in.
+`"args": ["mcp", "--enable-collection-management"]`. There is intentionally no
+environment-variable or config file equivalent, so the opt-in cannot be
+inherited by a child process.
+
+These tools accept local filesystem paths, change collection configuration, and
+can rename or remove indexed data. The HTTP transport has no authentication —
+run it on a loopback or otherwise trusted network only, as with any other QMD
+HTTP deployment.
 
 The safe add workflow is `collection_add`, then `update`, then inspect
 `status.needsEmbedding`; call `embed` only when that value is greater than zero.

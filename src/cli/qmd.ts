@@ -3275,7 +3275,7 @@ function showHelp(): void {
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
-  console.log("    --enable-collection-management - Enable collection write tools over stdio only");
+  console.log("    --enable-collection-management - Enable collection_add/rename/remove tools");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
@@ -4423,14 +4423,6 @@ if (isMain) {
       const enableCollectionManagement = Boolean(
         cli.values["enable-collection-management"]
       );
-      if (cli.values.http && enableCollectionManagement) {
-        console.error(
-          "--enable-collection-management is not supported with --http: " +
-          "the HTTP transport has no authentication, so collection management " +
-          "is only available over stdio. Start without --http to use it."
-        );
-        process.exit(1);
-      }
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
@@ -4458,9 +4450,12 @@ if (isMain) {
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
+          const managementArgs = enableCollectionManagement
+            ? ["--enable-collection-management"]
+            : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...managementArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...managementArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4480,7 +4475,11 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          await startMcpHttpServer(port, {
+            dbPath: getDbPath(),
+            host,
+            enableCollectionManagement,
+          });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);

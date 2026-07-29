@@ -129,10 +129,7 @@ function createStoreDouble(
 
 async function createHarness(
   store: QMDStore,
-  options: {
-    transport: "stdio" | "http";
-    enableCollectionManagement?: boolean;
-  } = { transport: "stdio" },
+  options: { enableCollectionManagement?: boolean } = {},
 ) {
   const server = await createMcpServer(store, options);
   const client = new Client({ name: "qmd-maintenance-test", version: "1.0.0" });
@@ -175,30 +172,18 @@ afterEach(async () => {
 });
 
 describe("MCP maintenance tools", () => {
-  test("collection management registration preserves the transport security boundary", async () => {
-    const namesFor = async (options: {
-      transport: "stdio" | "http";
-      enableCollectionManagement?: boolean;
-    }) => {
+  test("collection management registration depends only on the operator opt-in", async () => {
+    const namesFor = async (options: { enableCollectionManagement?: boolean }) => {
       const { store } = createStoreDouble();
       const { client } = await createHarness(store, options);
       return (await client.listTools()).tools.map(tool => tool.name).sort();
     };
 
-    const httpDisabled = await namesFor({ transport: "http" });
-    const httpEnabled = await namesFor({
-      transport: "http",
-      enableCollectionManagement: true,
-    });
-    const stdioDisabled = await namesFor({ transport: "stdio" });
-    const stdioEnabled = await namesFor({
-      transport: "stdio",
-      enableCollectionManagement: true,
-    });
+    const disabled = await namesFor({});
+    const enabled = await namesFor({ enableCollectionManagement: true });
 
-    expect(httpEnabled).toEqual(httpDisabled);
-    expect(stdioDisabled).toEqual(httpDisabled);
-    expect(stdioEnabled.filter(name => !stdioDisabled.includes(name))).toEqual([
+    expect(disabled).not.toContain("collection_add");
+    expect(enabled.filter(name => !disabled.includes(name))).toEqual([
       "collection_add",
       "collection_remove",
       "collection_rename",
@@ -208,7 +193,6 @@ describe("MCP maintenance tools", () => {
   test("tools/list exposes collection_add as an opt-in local non-destructive write", async () => {
     const { store } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -253,7 +237,6 @@ describe("MCP maintenance tools", () => {
       });
     });
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -316,7 +299,6 @@ describe("MCP maintenance tools", () => {
       });
     });
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -359,7 +341,6 @@ describe("MCP maintenance tools", () => {
       includeByDefault: true,
     }];
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -398,7 +379,6 @@ describe("MCP maintenance tools", () => {
     const { store, addCollection } = createStoreDouble();
     store.listCollections = async () => [];
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -432,7 +412,6 @@ describe("MCP maintenance tools", () => {
   test("tools/list exposes collection_rename as an opt-in destructive local write", async () => {
     const { store } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -472,7 +451,6 @@ describe("MCP maintenance tools", () => {
       return true;
     });
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -499,7 +477,6 @@ describe("MCP maintenance tools", () => {
   test("collection_rename rejects unknown sources and occupied targets before the Store write", async () => {
     const { store, renameCollection } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -522,7 +499,6 @@ describe("MCP maintenance tools", () => {
   test("collection_rename reports unconfirmed outcomes without recommending a blind retry", async () => {
     const { store, renameCollection } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -558,7 +534,6 @@ describe("MCP maintenance tools", () => {
       new Error("sensitive read failure")
     );
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -576,7 +551,6 @@ describe("MCP maintenance tools", () => {
   test("tools/list exposes collection_remove as an opt-in destructive local write", async () => {
     const { store } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -608,7 +582,6 @@ describe("MCP maintenance tools", () => {
       return { removed: true, deletedDocs: 7, cleanedHashes: 5 };
     });
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -631,7 +604,6 @@ describe("MCP maintenance tools", () => {
   test("collection_remove rejects an unknown collection before the Store write", async () => {
     const { store, removeCollection } = createStoreDouble();
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -661,7 +633,6 @@ describe("MCP maintenance tools", () => {
         },
       ]);
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -692,7 +663,6 @@ describe("MCP maintenance tools", () => {
       cleanedHashes: 0,
     });
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -863,7 +833,6 @@ describe("MCP maintenance tools", () => {
     };
     const { client } = await createHarness(store);
     const { client: enabledClient } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -976,7 +945,6 @@ describe("MCP maintenance tools", () => {
     });
     const { client } = await createHarness(store);
     const { client: managementClient } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -1551,7 +1519,6 @@ describe("MCP maintenance tools", () => {
     });
     const first = await createHarness(store);
     const second = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -1671,11 +1638,9 @@ describe("MCP maintenance tools", () => {
       });
     });
     const first = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
     const second = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 
@@ -1745,7 +1710,6 @@ describe("MCP maintenance tools", () => {
     const { store, renameCollection, update } = createStoreDouble();
     renameCollection.mockRejectedValueOnce(new Error("rename failed"));
     const { client } = await createHarness(store, {
-      transport: "stdio",
       enableCollectionManagement: true,
     });
 

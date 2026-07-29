@@ -167,7 +167,7 @@ async function buildInstructions(
 
   if (collectionManagementEnabled) {
     lines.push("");
-    lines.push("Collection management is enabled for this local stdio session:");
+    lines.push("Collection management is enabled for this session:");
     lines.push("  - Use `collection_list` and `collection_show` to inspect configured collections.");
     lines.push("  - To register a directory, call `collection_add`, then `update`, inspect `needsEmbedding`, and call `embed` only when `needsEmbedding` is greater than 0.");
     lines.push("  - Use `collection_rename` to rename a collection and its indexed paths.");
@@ -315,7 +315,6 @@ function sanitizeEmbedFailureReason(reason: string): string {
 }
 
 export type McpServerOptions = {
-  transport: "stdio" | "http";
   enableCollectionManagement?: boolean;
 };
 
@@ -324,7 +323,6 @@ export async function createMcpServer(
   options: McpServerOptions,
 ): Promise<McpServer> {
   const collectionManagementEnabled =
-    options.transport === "stdio" &&
     options.enableCollectionManagement === true;
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
@@ -1033,7 +1031,7 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: collection_add (Opt-in stdio-only collection configuration write)
+  // Tool: collection_add (Opt-in collection configuration write)
   // ---------------------------------------------------------------------------
 
   if (collectionManagementEnabled) {
@@ -1539,7 +1537,6 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     ...(existsSync(configPath) ? { configPath } : {}),
   });
   const server = await createMcpServer(store, {
-    transport: "stdio",
     enableCollectionManagement: options.enableCollectionManagement,
   });
   const transport = new StdioServerTransport();
@@ -1593,7 +1590,6 @@ export async function startMcpHttpServer(
       },
     });
     const server = await createMcpServer(store, {
-      transport: "http",
       enableCollectionManagement: options.enableCollectionManagement,
     });
     await server.connect(transport);

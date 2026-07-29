@@ -5,10 +5,11 @@
 ### Added
 
 - MCP now exposes read-only `collection_list` and `collection_show` tools on
-  both transports. Trusted local stdio clients can explicitly enable
-  `collection_add`, `collection_rename`, and destructive `collection_remove`
-  with `qmd mcp --enable-collection-management`. The writing tools are
-  deliberately excluded from HTTP, validate names and local paths, return
+  both transports. `collection_add`, `collection_rename`, and destructive
+  `collection_remove` are off by default and require the explicit
+  `qmd mcp --enable-collection-management` startup flag, which works on either
+  transport and has no environment-variable equivalent. The writing tools
+  validate names and local paths, return
   structured results, preserve source files, and share the fail-fast Store
   maintenance lock with `update` and `embed`. The documented add workflow is
   `collection_add`, `update`, inspect `needsEmbedding`, then `embed` only when

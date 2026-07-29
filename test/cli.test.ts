@@ -2142,22 +2142,6 @@ describe("status and collection list hide filesystem paths", () => {
 // =============================================================================
 
 describe("mcp http daemon", () => {
-  test("rejects collection management over unauthenticated HTTP before startup", async () => {
-    const result = await runQmd([
-      "mcp",
-      "--http",
-      "--enable-collection-management",
-      "--port",
-      "0",
-    ]);
-
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toMatch(
-      /enable-collection-management.*not supported with --http.*no authentication.*stdio/is
-    );
-  });
-
   let daemonTestDir: string;
   let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
   let daemonDbPath: string;
