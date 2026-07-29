@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Case-sensitive collections no longer collapse distinct document identities that
+  differ only by path casing. The implicit `COLLATE NOCASE` legacy migration was
+  unsafe for filesystems that contain both `README.md` and `readme.md`; case-only
+  legacy migrations must now be explicit and operator-reviewed.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
