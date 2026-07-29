@@ -191,28 +191,69 @@ describe("collection management", () => {
     expect(collections.find(c => c.name === "notes")).toBeDefined();
   });
 
-  test("removeCollection removes existing collection", async () => {
+  test("removeCollection reports and removes indexed documents and content", async () => {
     await store.addCollection("docs", { path: docsDir, pattern: "**/*.md" });
-    const removed = await store.removeCollection("docs");
+    await store.update();
 
-    expect(removed).toBe(true);
+    expect(await store.searchLex("Authentication", { collection: "docs" })).not.toHaveLength(0);
+    const expectedDeletedDocs = (
+      store.internal.db.prepare(
+        "SELECT COUNT(*) AS count FROM documents WHERE collection = ?"
+      ).get("docs") as { count: number }
+    ).count;
+    const expectedCleanedHashes = (
+      store.internal.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM content
+        WHERE hash NOT IN (
+          SELECT DISTINCT hash
+          FROM documents
+          WHERE collection <> ?
+        )
+      `).get("docs") as { count: number }
+    ).count;
+
+    const result = await store.removeCollection("docs");
+
+    expect(result).toEqual({
+      removed: true,
+      deletedDocs: expectedDeletedDocs,
+      cleanedHashes: expectedCleanedHashes,
+    });
+    expect(result.deletedDocs).toBeGreaterThan(0);
+    expect(result.cleanedHashes).toBeGreaterThan(0);
     const collections = await store.listCollections();
     expect(collections.map(c => c.name)).not.toContain("docs");
+    expect(await store.searchLex("Authentication", { collection: "docs" })).toHaveLength(0);
+    expect((await store.getStatus()).collections.map(c => c.name)).not.toContain("docs");
+    expect(existsSync(join(docsDir, "auth.md"))).toBe(true);
   });
 
-  test("removeCollection returns false for non-existent collection", async () => {
-    const removed = await store.removeCollection("nonexistent");
-    expect(removed).toBe(false);
+  test("removeCollection distinguishes a non-existent collection", async () => {
+    const result = await store.removeCollection("nonexistent");
+    expect(result).toEqual({
+      removed: false,
+      deletedDocs: 0,
+      cleanedHashes: 0,
+    });
   });
 
-  test("renameCollection renames a collection", async () => {
+  test("renameCollection renames the collection and its indexed documents", async () => {
     await store.addCollection("old-name", { path: docsDir, pattern: "**/*.md" });
+    await store.update();
+    expect(await store.searchLex("Authentication", { collection: "old-name" })).not.toHaveLength(0);
+
     const renamed = await store.renameCollection("old-name", "new-name");
 
     expect(renamed).toBe(true);
     const names = (await store.listCollections()).map(c => c.name);
     expect(names).toContain("new-name");
     expect(names).not.toContain("old-name");
+    expect(await store.searchLex("Authentication", { collection: "new-name" })).not.toHaveLength(0);
+    expect(await store.searchLex("Authentication", { collection: "old-name" })).toHaveLength(0);
+    const statusNames = (await store.getStatus()).collections.map(c => c.name);
+    expect(statusNames).toContain("new-name");
+    expect(statusNames).not.toContain("old-name");
   });
 
   test("renameCollection returns false for non-existent source", async () => {
@@ -223,8 +264,11 @@ describe("collection management", () => {
   test("renameCollection throws if target exists", async () => {
     await store.addCollection("a", { path: docsDir, pattern: "**/*.md" });
     await store.addCollection("b", { path: notesDir, pattern: "**/*.md" });
+    await store.update();
 
     await expect(store.renameCollection("a", "b")).rejects.toThrow("already exists");
+    expect(await store.searchLex("Authentication", { collection: "a" })).not.toHaveLength(0);
+    expect((await store.listCollections()).map(c => c.name).sort()).toEqual(["a", "b"]);
   });
 
   test("listCollections returns empty array for empty config", async () => {

@@ -48,6 +48,9 @@ import {
   isDocid,
   syncConfigToDb,
   reindexCollection,
+  removeCollection,
+  upsertStoreCollection,
+  deleteInactiveDocuments,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   insertContent,
@@ -2429,6 +2432,66 @@ describe("Reindex Collection", () => {
 });
 
 // =============================================================================
+// Maintenance Operations
+// =============================================================================
+
+describe("Maintenance Operations", () => {
+  test("deleteInactiveDocuments reports the measured number of deleted document rows", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    try {
+      await insertTestDocument(store.db, collectionName, { name: "active" });
+      await insertTestDocument(store.db, collectionName, { name: "inactive-a", active: 0 });
+      await insertTestDocument(store.db, collectionName, { name: "inactive-b", active: 0 });
+      await insertTestDocument(store.db, collectionName, { name: "inactive-c", active: 0 });
+
+      // Seed stale FTS rows so the documents_ad trigger performs observable
+      // work when the inactive document rows are hard-deleted. Databases from
+      // before the current trigger generation can retain these rows because
+      // schema upgrades recreate triggers without cleaning existing FTS data.
+      store.db.exec(`
+        INSERT INTO documents_fts(rowid, filepath, title, body)
+        SELECT
+          documents.id,
+          documents.collection || '/' || documents.path,
+          documents.title,
+          content.doc
+        FROM documents
+        JOIN content ON content.hash = documents.hash
+        WHERE documents.active = 0
+      `);
+
+      const { count: measuredInactive } = store.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM documents
+        WHERE active = 0
+      `).get() as { count: number };
+
+      const deleted = deleteInactiveDocuments(store.db);
+
+      expect(deleted).toBe(measuredInactive);
+      expect(
+        (store.db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM documents
+          WHERE active = 0
+        `).get() as { count: number }).count
+      ).toBe(0);
+      expect(
+        (store.db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM documents
+          WHERE active = 1
+        `).get() as { count: number }).count
+      ).toBe(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+});
+
+// =============================================================================
 // Index Status Tests
 // =============================================================================
 
@@ -2772,6 +2835,85 @@ describe("Integration", () => {
       expect(contentCount.count).toBe(5);
     } finally {
       await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("removing another collection preserves inactive tombstone identity and content", async () => {
+    const store = await createTestStore();
+    const removedDir = await mkdtemp(join(testDir, "remove-target-"));
+    const survivorDir = await mkdtemp(join(testDir, "inactive-survivor-"));
+    const removedFile = join(removedDir, "unique.md");
+    const survivorFile = join(survivorDir, "returning.md");
+    const removedBody = "# Removed\n\nUnique removed collection content.";
+    const survivorBody = "# Returning\n\nUnique reactivation marker.";
+
+    try {
+      await writeFile(removedFile, removedBody);
+      await writeFile(survivorFile, survivorBody);
+      upsertStoreCollection(store.db, "remove-target", {
+        path: removedDir,
+        pattern: "**/*.md",
+      });
+      upsertStoreCollection(store.db, "survivor", {
+        path: survivorDir,
+        pattern: "**/*.md",
+      });
+
+      await reindexCollection(store, removedDir, "**/*.md", "remove-target");
+      await reindexCollection(store, survivorDir, "**/*.md", "survivor");
+
+      const removedHash = await hashContent(removedBody);
+      const survivorHash = await hashContent(survivorBody);
+      const original = store.db.prepare(`
+        SELECT id
+        FROM documents
+        WHERE collection = 'survivor' AND path = 'returning.md'
+      `).get() as { id: number };
+
+      await rm(survivorFile);
+      await reindexCollection(store, survivorDir, "**/*.md", "survivor");
+
+      const inactive = store.db.prepare(`
+        SELECT id, active
+        FROM documents
+        WHERE collection = 'survivor' AND path = 'returning.md'
+      `).get() as { id: number; active: number };
+      expect(inactive).toEqual({ id: original.id, active: 0 });
+
+      removeCollection(store.db, "remove-target");
+
+      const preserved = store.db.prepare(`
+        SELECT id, active
+        FROM documents
+        WHERE collection = 'survivor' AND path = 'returning.md'
+      `).get() as { id: number; active: number } | undefined;
+      expect(preserved).toEqual({ id: original.id, active: 0 });
+      expect(store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(survivorHash))
+        .toBeTruthy();
+      expect(
+        store.db.prepare(`SELECT hash FROM content WHERE hash = ?`).get(removedHash)
+          ?? undefined
+      ).toBeUndefined();
+
+      await writeFile(survivorFile, survivorBody);
+      await reindexCollection(store, survivorDir, "**/*.md", "survivor");
+
+      const reactivated = store.db.prepare(`
+        SELECT id, active
+        FROM documents
+        WHERE collection = 'survivor' AND path = 'returning.md'
+      `).get() as { id: number; active: number };
+      expect(reactivated).toEqual({ id: original.id, active: 1 });
+      expect(
+        (store.db.prepare(`SELECT doc FROM content WHERE hash = ?`).get(
+          survivorHash
+        ) as { doc: string }).doc
+      ).toBe(survivorBody);
+      expect(store.searchFTS("reactivation marker", 10, "survivor")).toHaveLength(1);
+    } finally {
+      await rm(removedDir, { recursive: true, force: true });
+      await rm(survivorDir, { recursive: true, force: true });
       await cleanupTestDb(store);
     }
   });

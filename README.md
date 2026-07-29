@@ -80,6 +80,15 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `status` — Index health and collection info
 - `update` — Synchronize configured collections into QMD's derived index
 - `embed` — Generate pending vector embeddings with QMD's configured model
+- `collection_list` — List configured collections, including ones not indexed yet
+- `collection_show` — Show one configured collection
+
+Local stdio servers can additionally opt in to three collection configuration
+writes with `qmd mcp --enable-collection-management`:
+
+- `collection_add` — Register a local directory without indexing it
+- `collection_rename` — Rename a collection and its indexed paths
+- `collection_remove` — Remove a collection and its indexed data; source files remain unchanged
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -141,7 +150,34 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
-The stdio and HTTP transports expose the same centrally registered tools.
+The stdio and HTTP transports expose the same centrally registered search,
+retrieval, status, collection-read, update, and embed tools. The deliberate
+transport-parity exception is limited to the three writing collection tools:
+they are never registered over HTTP.
+
+#### Collection Management
+
+Collection configuration writes are disabled by default. Enable them only for a
+trusted local stdio client:
+
+```sh
+qmd mcp --enable-collection-management
+```
+
+For client configuration, add the flag after `mcp`, for example
+`"args": ["mcp", "--enable-collection-management"]`. The flag cannot be combined
+with `--http`; QMD rejects that startup combination. These tools accept local
+filesystem paths, change collection configuration, and can rename or remove
+indexed data. Keeping them off the shared HTTP transport avoids turning a
+network-facing search service into a remote filesystem/configuration
+administration API. There is intentionally no environment-variable or config
+file equivalent for this opt-in.
+
+The safe add workflow is `collection_add`, then `update`, then inspect
+`status.needsEmbedding`; call `embed` only when that value is greater than zero.
+All collection writes share the same per-process, per-store fail-fast lock as
+`update` and `embed`. Concurrent writers return busy immediately, while read
+tools remain available.
 
 #### MCP Tool Parameters
 
@@ -169,6 +205,15 @@ The stdio and HTTP transports expose the same centrally registered tools.
 | `embed` | `maxDocsPerBatch` | positive integer | Optional document limit per embedding batch |
 | `embed` | `maxBatchMiB` | positive number | Optional embedding batch-size limit in MiB |
 | `embed` | `timeoutMinutes` | non-negative number | Runtime limit (default **30**, maximum **35791**); use `0` for no runtime limit |
+| `collection_list` | — | — | Read-only; returns configured collections sorted by name, including zero-document collections |
+| `collection_show` | `name` | string | **Required.** Read-only lookup using the same collection result shape as list/add/rename |
+| `collection_add` | `path` | string | **Required.** Existing local directory; resolved to its real path. Registers only, without update/embed |
+| `collection_add` | `name` | string | Optional; defaults to the resolved directory basename |
+| `collection_add` | `pattern` | string | Optional Markdown glob; defaults to `**/*.md` |
+| `collection_add` | `ignore` | string[] | Optional exclusion globs. Forwarded to the Store, but not returned by collection read tools |
+| `collection_rename` | `oldName` | string | **Required.** Existing collection name |
+| `collection_rename` | `newName` | string | **Required.** Unused name; existing indexed `qmd://` paths follow the rename |
+| `collection_remove` | `name` | string | **Required.** Removes collection config and indexed documents, then cleans globally orphaned content rows; source files remain unchanged |
 
 For safe maintenance, call `update`, then call `status` and inspect
 `needsEmbedding`. Call `embed` only when that count is greater than zero. Both
@@ -176,8 +221,10 @@ tools write only to QMD's derived index; `update` does not modify source files
 or execute configured collection update commands. If the request includes an
 MCP progress token, `update` reports file progress and `embed` reports chunk,
 byte, and error counters. Only one `update` or `embed` operation can run for a
-shared store within one MCP server process/store instance at a time; another
-writer fails immediately as busy while read tools remain available. Separate
+shared store within one MCP server process/store instance at a time; this lock
+also covers enabled `collection_add`, `collection_rename`, and
+`collection_remove` calls. Another writer fails immediately as busy while read
+tools remain available. Separate
 CLI or server processes rely on SQLite/WAL/busy-timeout instead of this
 fail-fast lock. Busy, cancelled, and failed calls set `isError`.
 `embed` also sets `isError` for partial failures while retaining its result

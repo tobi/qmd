@@ -10,7 +10,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { basename, join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -33,6 +34,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import {
+  DEFAULT_GLOB,
   EMBED_FAILURE_BATCH_NO_VECTOR_REASON,
   EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX,
   EMBED_FAILURE_ERROR_RATE_REASON,
@@ -53,6 +55,16 @@ type SearchResultItem = {
   context: string | null;
   line: number;   // Absolute line in source markdown
   snippet: string;
+};
+
+type CollectionResult = {
+  name: string;
+  path: string;
+  pattern: string;
+  documents: number;
+  indexedDocuments: number;
+  lastUpdated: string | null;
+  includeByDefault: boolean;
 };
 
 type StatusResult = {
@@ -98,6 +110,20 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
+function toCollectionResult(
+  collection: Awaited<ReturnType<QMDStore["listCollections"]>>[number]
+): CollectionResult {
+  return {
+    name: collection.name,
+    path: collection.pwd,
+    pattern: collection.glob_pattern,
+    documents: collection.active_count,
+    indexedDocuments: collection.doc_count,
+    lastUpdated: collection.last_modified,
+    includeByDefault: collection.includeByDefault,
+  };
+}
+
 function getPackageVersion(): string {
   try {
     const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
@@ -117,7 +143,10 @@ function getPackageVersion(): string {
  * Injected into the LLM's system prompt via MCP initialize response —
  * gives the LLM immediate context about what's searchable without a tool call.
  */
-async function buildInstructions(store: QMDStore): Promise<string> {
+async function buildInstructions(
+  store: QMDStore,
+  collectionManagementEnabled: boolean,
+): Promise<string> {
   const status = await store.getStatus();
   const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
@@ -134,6 +163,16 @@ async function buildInstructions(store: QMDStore): Promise<string> {
     const names = status.collections.map(c => c.name).join(", ");
     lines.push(`Collections (scope with \`collections\` parameter): ${names}`);
     lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
+  }
+
+  if (collectionManagementEnabled) {
+    lines.push("");
+    lines.push("Collection management is enabled for this local stdio session:");
+    lines.push("  - Use `collection_list` and `collection_show` to inspect configured collections.");
+    lines.push("  - To register a directory, call `collection_add`, then `update`, inspect `needsEmbedding`, and call `embed` only when `needsEmbedding` is greater than 0.");
+    lines.push("  - Use `collection_rename` to rename a collection and its indexed paths.");
+    lines.push("  - Use destructive `collection_remove` to delete a collection from QMD's index; source files stay unchanged.");
+    lines.push("  - Ignore patterns can be supplied to `collection_add`, but collection read tools cannot return configured ignore patterns.");
   }
 
   // --- Maintenance workflow ---
@@ -187,7 +226,12 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-type MaintenanceOperation = "update" | "embed";
+type MaintenanceOperation =
+  | "update"
+  | "embed"
+  | "collection_add"
+  | "collection_rename"
+  | "collection_remove";
 
 type MaintenanceLease =
   | { acquired: true; release: () => void }
@@ -270,10 +314,26 @@ function sanitizeEmbedFailureReason(reason: string): string {
   return "embedding backend or index write failed";
 }
 
-export async function createMcpServer(store: QMDStore): Promise<McpServer> {
+export type McpServerOptions = {
+  transport: "stdio" | "http";
+  enableCollectionManagement?: boolean;
+};
+
+export async function createMcpServer(
+  store: QMDStore,
+  options: McpServerOptions,
+): Promise<McpServer> {
+  const collectionManagementEnabled =
+    options.transport === "stdio" &&
+    options.enableCollectionManagement === true;
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
-    { instructions: await buildInstructions(store) },
+    {
+      instructions: await buildInstructions(
+        store,
+        collectionManagementEnabled,
+      ),
+    },
   );
 
   // Pre-fetch default collection names for search tools
@@ -973,6 +1033,454 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: collection_add (Opt-in stdio-only collection configuration write)
+  // ---------------------------------------------------------------------------
+
+  if (collectionManagementEnabled) {
+    server.registerTool(
+      "collection_add",
+      {
+        title: "Add Collection",
+        description: "Register a local directory as a QMD collection without indexing it. Call update afterward, then embed if documents need embeddings.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          path: z.string().min(1).describe(
+            "Existing local directory to register. Absolute paths are recommended; relative paths resolve against the server process working directory."
+          ),
+          name: z.string().min(1).optional().describe(
+            "Optional collection name; defaults to the resolved directory basename"
+          ),
+          pattern: z.string().min(1).optional().default(DEFAULT_GLOB).describe(
+            `Markdown glob pattern (default: ${DEFAULT_GLOB})`
+          ),
+          ignore: z.array(z.string().min(1)).optional().describe(
+            "Optional glob patterns to exclude"
+          ),
+        },
+      },
+      async ({ path, name, pattern, ignore }) => {
+        const maintenance = acquireMaintenance(store, "collection_add");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let resolvedPath: string;
+          try {
+            resolvedPath = await realpath(path);
+          } catch (error) {
+            if (
+              typeof error === "object" &&
+              error !== null &&
+              "code" in error
+            ) {
+              if (error.code === "ENOENT") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Collection path does not exist: ${path}. Check the path and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+              if (error.code === "EACCES") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Collection path is not accessible: ${path}. Check directory permissions and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+              if (error.code === "ENOTDIR") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `A collection path component is not a directory: ${path}. Check the path and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+            }
+            return {
+              content: [{
+                type: "text",
+                text: "Could not resolve the collection path. Check access and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            if (!(await stat(resolvedPath)).isDirectory()) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection path is not a directory: ${path}. Choose a directory and retry.`,
+                }],
+                isError: true,
+              };
+            }
+
+            const collectionName = (name ?? basename(resolvedPath)) || "root";
+            const collections = await store.listCollections();
+            if (collections.some(collection => collection.name === collectionName)) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection '${collectionName}' already exists. Choose a different name.`,
+                }],
+                isError: true,
+              };
+            }
+
+            const duplicate = collections.find(collection =>
+              collection.pwd === resolvedPath && collection.glob_pattern === pattern
+            );
+            if (duplicate) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection '${duplicate.name}' already uses this path and pattern. Call update for it or remove it first.`,
+                }],
+                isError: true,
+              };
+            }
+
+            await store.addCollection(collectionName, {
+              path: resolvedPath,
+              pattern,
+              ...(ignore === undefined ? {} : { ignore }),
+            });
+
+            const created = (await store.listCollections()).find(
+              collection => collection.name === collectionName
+            );
+            if (!created) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Collection may have been registered but could not be read back. Call collection_list to check before retrying.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Added collection '${collectionName}' without indexing. Call update next, then call embed if documents need embeddings.`,
+              }],
+              structuredContent: { collection: toCollectionResult(created) },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not add the collection. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+
+    server.registerTool(
+      "collection_rename",
+      {
+        title: "Rename Collection",
+        description: "Rename a configured QMD collection and its existing indexed document paths.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          oldName: z.string().min(1).describe("Existing collection name"),
+          newName: z.string().min(1).describe("New, unused collection name"),
+        },
+      },
+      async ({ oldName, newName }) => {
+        const maintenance = acquireMaintenance(store, "collection_rename");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let collections: Awaited<ReturnType<QMDStore["listCollections"]>>;
+          try {
+            collections = await store.listCollections();
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not read the configured collections. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          if (!collections.some(collection => collection.name === oldName)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${oldName}' does not exist. Call collection_list to check the current names.`,
+              }],
+              isError: true,
+            };
+          }
+          if (collections.some(collection => collection.name === newName)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${newName}' already exists. Choose a different name.`,
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            const renamedSuccessfully = await store.renameCollection(oldName, newName);
+            if (!renamedSuccessfully) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "No collection was renamed. Call collection_list to check the current names.",
+                }],
+                isError: true,
+              };
+            }
+
+            const renamed = (await store.listCollections()).find(
+              collection => collection.name === newName
+            );
+            if (!renamed) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Collection may have been renamed but could not be read back. Call collection_show to verify the new name before retrying.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Renamed collection '${oldName}' to '${newName}'. Existing indexed documents now use qmd://${newName}/... paths.`,
+              }],
+              structuredContent: { collection: toCollectionResult(renamed) },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Collection may have been renamed. Call collection_show to verify the new name before retrying.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+
+    server.registerTool(
+      "collection_remove",
+      {
+        title: "Remove Collection",
+        description: "Remove a QMD collection and its indexed data. Also cleans up content rows that no document references anymore, across all collections. Source files remain unchanged.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          name: z.string().min(1).describe("Existing collection name"),
+        },
+      },
+      async ({ name }) => {
+        const maintenance = acquireMaintenance(store, "collection_remove");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let collections: Awaited<ReturnType<QMDStore["listCollections"]>>;
+          try {
+            collections = await store.listCollections();
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not read the configured collections. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          if (!collections.some(collection => collection.name === name)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${name}' does not exist. Call collection_list to check the current names.`,
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            const result = await store.removeCollection(name);
+            if (!result.removed) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "No collection was removed. Call collection_list to check the current names.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Removed collection '${name}': deleted ${result.deletedDocs} indexed documents and cleaned ${result.cleanedHashes} globally orphaned content hashes. Source files remain unchanged.`,
+              }],
+              structuredContent: {
+                removed: result.removed,
+                deletedDocs: result.deletedDocs,
+                cleanedHashes: result.cleanedHashes,
+              },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Collection may have been removed. Call collection_list to verify before retrying.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tools: collection_list and collection_show (Read-only collection state)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "collection_list",
+    {
+      title: "List Collections",
+      description: "List all configured QMD collections, including ones not indexed yet; status only reports collections with active documents. Each result includes active documents and all indexed documents (active plus inactive), paths, glob patterns, last changes, and unscoped-search defaults.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const collections = (await store.listCollections())
+          .map(toCollectionResult)
+          .sort((left, right) =>
+            left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+          );
+        return {
+          content: [{
+            type: "text",
+            text: `${collections.length} configured ${collections.length === 1 ? "collection" : "collections"}.`,
+          }],
+          structuredContent: { collections },
+        };
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: "Could not list collections. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "collection_show",
+    {
+      title: "Show Collection",
+      description: "Show configuration and index counts for one configured QMD collection, including active documents and all indexed documents (active plus inactive).",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        name: z.string().min(1).describe("Configured collection name"),
+      },
+    },
+    async ({ name }) => {
+      try {
+        const collection = (await store.listCollections()).find(
+          configured => configured.name === name
+        );
+        if (!collection) {
+          return {
+            content: [{
+              type: "text",
+              text: `Unknown collection: ${name}. Call collection_list to list configured collections.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const result = toCollectionResult(collection);
+        return {
+          content: [{
+            type: "text",
+            text: `Collection ${result.name}: ${result.path} (${result.documents} active of ${result.indexedDocuments} indexed documents).`,
+          }],
+          structuredContent: { collection: result },
+        };
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: "Could not show the collection. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: qmd_status (Index status)
   // ---------------------------------------------------------------------------
 
@@ -1015,6 +1523,7 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  enableCollectionManagement?: boolean;
 };
 
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
@@ -1029,7 +1538,10 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
-  const server = await createMcpServer(store);
+  const server = await createMcpServer(store, {
+    transport: "stdio",
+    enableCollectionManagement: options.enableCollectionManagement,
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -1080,7 +1592,10 @@ export async function startMcpHttpServer(
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store);
+    const server = await createMcpServer(store, {
+      transport: "http",
+      enableCollectionManagement: options.enableCollectionManagement,
+    });
     await server.connect(transport);
 
     transport.onclose = () => {

@@ -33,8 +33,8 @@ import {
   getStoreGlobalContext,
   getStoreContexts,
   upsertStoreCollection,
-  deleteStoreCollection,
-  renameStoreCollection,
+  removeCollection as removeStoreCollection,
+  renameCollection as renameCollectionInStore,
   updateStoreContext,
   removeStoreContext,
   setStoreGlobalContext,
@@ -211,6 +211,13 @@ export interface StoreOptions {
   config?: CollectionConfig;
 }
 
+export interface RemoveCollectionResult {
+  removed: boolean;
+  deletedDocs: number;
+  /** Number of globally orphaned content hashes cleaned up by the removal. */
+  cleanedHashes: number;
+}
+
 /**
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
@@ -254,8 +261,8 @@ export interface QMDStore {
   /** Add or update a collection */
   addCollection(name: string, opts: { path: string; pattern?: string; ignore?: string[] }): Promise<void>;
 
-  /** Remove a collection */
-  removeCollection(name: string): Promise<boolean>;
+  /** Remove a collection and report its indexing impact */
+  removeCollection(name: string): Promise<RemoveCollectionResult>;
 
   /** Rename a collection */
   renameCollection(oldName: string, newName: string): Promise<boolean>;
@@ -449,14 +456,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       }
     },
     removeCollection: async (name) => {
-      const result = deleteStoreCollection(db, name);
+      if (!getStoreCollection(db, name)) {
+        return { removed: false, deletedDocs: 0, cleanedHashes: 0 };
+      }
+
+      const result = removeStoreCollection(db, name);
       if (hasYamlConfig || options.config) {
         collectionsRemoveCollection(name);
       }
-      return result;
+      return { removed: true, ...result };
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
+      const result = renameCollectionInStore(db, oldName, newName);
       if (hasYamlConfig || options.config) {
         collectionsRenameCollection(oldName, newName);
       }

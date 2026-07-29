@@ -2767,7 +2767,8 @@ function parseCLI() {
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
-      // MCP HTTP transport options
+      // MCP transport options
+      "enable-collection-management": { type: "boolean" },
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
@@ -3274,6 +3275,7 @@ function showHelp(): void {
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("    --enable-collection-management - Enable collection write tools over stdio only");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
@@ -4418,6 +4420,18 @@ if (isMain) {
         process.exit(0);
       }
 
+      const enableCollectionManagement = Boolean(
+        cli.values["enable-collection-management"]
+      );
+      if (cli.values.http && enableCollectionManagement) {
+        console.error(
+          "--enable-collection-management is not supported with --http: " +
+          "the HTTP transport has no authentication, so collection management " +
+          "is only available over stdio. Start without --http to use it."
+        );
+        process.exit(1);
+      }
+
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
         // --host overrides the default localhost bind; QMD_HOST env is the
@@ -4477,7 +4491,10 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await startMcpServer({
+          dbPath: getDbPath(),
+          enableCollectionManagement,
+        });
       }
       break;
     }

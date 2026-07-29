@@ -2395,6 +2395,13 @@ export function clearCache(db: Database): void {
 // Cleanup and maintenance operations
 // =============================================================================
 
+// Inactive documents are soft-deleted tombstones. Treating only active
+// documents as references would delete their content and cascade-delete the
+// tombstones through content(hash) -> documents(hash).
+const orphanedContentWhere = `
+  hash NOT IN (SELECT DISTINCT hash FROM documents)
+`;
+
 /**
  * Delete cached LLM API responses.
  * Returns the number of cached responses deleted.
@@ -2409,8 +2416,19 @@ export function deleteLLMCache(db: Database): number {
  * Returns the number of inactive documents deleted.
  */
 export function deleteInactiveDocuments(db: Database): number {
-  const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
-  return result.changes;
+  return db.transaction(() => {
+    // Count explicitly instead of using `.changes`: Bun includes changes made
+    // by the documents FTS triggers in the DELETE result.
+    const { count } = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM documents
+      WHERE active = 0
+    `).get() as { count: number };
+
+    db.prepare(`DELETE FROM documents WHERE active = 0`).run();
+
+    return count;
+  })();
 }
 
 /**
@@ -2422,7 +2440,7 @@ export function deleteInactiveDocuments(db: Database): number {
 export function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
+    WHERE ${orphanedContentWhere}
   `).run();
   return result.changes;
 }
@@ -3174,39 +3192,56 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
 }
 
 /**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
+ * Transactionally remove a collection's documents and store configuration,
+ * then clean up globally orphaned content hashes.
  */
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
+  return db.transaction(() => {
+    // Count explicitly instead of using `.changes`: Bun's SQLite result can
+    // include changes made by the documents FTS triggers.
+    const { count: deletedDocs } = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM documents
+      WHERE collection = ?
+    `).get(collectionName) as { count: number };
 
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
+    db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
-  // Remove from store_collections
-  deleteStoreCollection(db, collectionName);
+    // Measure the global orphan cleanup explicitly for the same reason.
+    const { count: cleanedHashes } = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM content
+      WHERE ${orphanedContentWhere}
+    `).get() as { count: number };
 
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
+    db.prepare(`
+      DELETE FROM content
+      WHERE ${orphanedContentWhere}
+    `).run();
+
+    // Remove from store_collections
+    deleteStoreCollection(db, collectionName);
+
+    return {
+      deletedDocs,
+      cleanedHashes
+    };
+  })();
 }
 
 /**
- * Rename a collection.
- * Updates both YAML config and database documents table.
+ * Transactionally rename a collection in indexed documents and
+ * store_collections. Returns whether the source collection existed.
  */
-export function renameCollection(db: Database, oldName: string, newName: string): void {
-  // Update all documents with the new collection name in database
-  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
-    .run(newName, oldName);
+export function renameCollection(db: Database, oldName: string, newName: string): boolean {
+  return db.transaction(() => {
+    // Update all documents with the new collection name in database
+    db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
+      .run(newName, oldName);
 
-  // Rename in store_collections
-  renameStoreCollection(db, oldName, newName);
+    // Rename in store_collections
+    return renameStoreCollection(db, oldName, newName);
+  })();
 }
 
 // =============================================================================
