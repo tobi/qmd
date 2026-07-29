@@ -26,11 +26,20 @@ import {
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
   type QMDStore,
+  type EmbedProgress,
+  type UpdateProgress,
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import {
+  EMBED_FAILURE_BATCH_NO_VECTOR_REASON,
+  EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX,
+  EMBED_FAILURE_ERROR_RATE_REASON,
+  EMBED_FAILURE_NO_VECTOR_REASON,
+  EMBED_FAILURE_SESSION_EXPIRED_REASON,
+  enableProductionMode,
+} from "../store.js";
 
 // =============================================================================
 // Types for structured content
@@ -62,6 +71,9 @@ type StatusResult = {
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+const MAX_NODE_TIMER_MS = 2_147_483_647;
+const MAX_EMBED_TIMEOUT_MINUTES = Math.floor(MAX_NODE_TIMER_MS / 60_000);
 
 /**
  * Encode a path for use in qmd:// URIs.
@@ -124,13 +136,20 @@ async function buildInstructions(store: QMDStore): Promise<string> {
     lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
   }
 
+  // --- Maintenance workflow ---
+  lines.push("");
+  lines.push("Maintenance:");
+  lines.push("  - Call the `update` MCP tool to synchronize configured collections into the derived index.");
+  lines.push("  - After update, call `status` and inspect `needsEmbedding`.");
+  lines.push("  - Call the `embed` MCP tool only when `needsEmbedding` is greater than 0.");
+
   // --- Capability gaps ---
   if (!status.hasVectorIndex) {
     lines.push("");
-    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
+    lines.push("Note: No vector embeddings yet; semantic search (vec/hyde) remains unavailable until pending embeddings are generated.");
   } else if (status.needsEmbedding > 0) {
     lines.push("");
-    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
+    lines.push(`Note: ${status.needsEmbedding} documents currently need embedding.`);
   }
 
   // --- Search tool ---
@@ -168,7 +187,90 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+type MaintenanceOperation = "update" | "embed";
+
+type MaintenanceLease =
+  | { acquired: true; release: () => void }
+  | { acquired: false; active: MaintenanceOperation };
+
+class MaintenanceCancelledError extends Error {}
+
+const maintenanceStates = new WeakMap<
+  QMDStore,
+  { active?: { operation: MaintenanceOperation; leaseId: symbol } }
+>();
+
+function throwIfMaintenanceAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new MaintenanceCancelledError();
+  }
+}
+
+function acquireMaintenance(
+  store: QMDStore,
+  operation: MaintenanceOperation
+): MaintenanceLease {
+  let state = maintenanceStates.get(store);
+  if (!state) {
+    state = {};
+    maintenanceStates.set(store, state);
+  }
+
+  if (state.active) {
+    return { acquired: false, active: state.active.operation };
+  }
+
+  const leaseId = Symbol(operation);
+  state.active = { operation, leaseId };
+  return {
+    acquired: true,
+    release: () => {
+      if (state.active?.leaseId === leaseId) {
+        state.active = undefined;
+      }
+    },
+  };
+}
+
+function enqueueBestEffortNotification(
+  pendingNotifications: Set<Promise<void>>,
+  send: () => Promise<void>
+): void {
+  const pendingNotification = (async () => {
+    try {
+      await send();
+    } catch {
+      // Progress notifications are best-effort and never change tool results.
+    }
+  })();
+  pendingNotifications.add(pendingNotification);
+  void pendingNotification.then(() => {
+    pendingNotifications.delete(pendingNotification);
+  });
+}
+
+const SAFE_EMBED_FAILURE_REASONS = new Set([
+  EMBED_FAILURE_NO_VECTOR_REASON,
+  EMBED_FAILURE_SESSION_EXPIRED_REASON,
+  EMBED_FAILURE_ERROR_RATE_REASON,
+  EMBED_FAILURE_BATCH_NO_VECTOR_REASON,
+]);
+
+function sanitizeEmbedFailureReason(reason: string): string {
+  if (SAFE_EMBED_FAILURE_REASONS.has(reason)) {
+    return reason;
+  }
+
+  if (
+    reason.startsWith(`${EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX}: `)
+  ) {
+    return EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX;
+  }
+
+  return "embedding backend or index write failed";
+}
+
+export async function createMcpServer(store: QMDStore): Promise<McpServer> {
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
@@ -533,6 +635,340 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return { content };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: update (Synchronize configured collections into the derived index)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "update",
+    {
+      title: "Update Index",
+      description: "Synchronize configured Markdown collections into the derived index. Omit collections to update all configured collections. This writes only to QMD's index; source files are unchanged and configured update commands are not executed. With an MCP progress token it reports file progress. Progress notifications are best-effort and never change the tool result. Busy, cancelled, and failed runs return isError. Inspect the structured needsEmbedding count afterward and call embed only when it is greater than 0.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        collections: z.array(z.string()).min(1).optional().describe(
+          "Optional non-empty list of configured collection names. Omit to update all collections."
+        ),
+      },
+    },
+    async ({ collections }, extra) => {
+      if (extra.signal.aborted) {
+        return {
+          content: [{
+            type: "text",
+            text: "Update cancelled by the MCP client. Retry when ready.",
+          }],
+          isError: true,
+        };
+      }
+
+      const maintenance = acquireMaintenance(store, "update");
+      if (!maintenance.acquired) {
+        return {
+          content: [{
+            type: "text",
+            text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        throwIfMaintenanceAborted(extra.signal);
+
+        if (collections) {
+          const configuredNames = new Set(
+            (await store.listCollections()).map(collection => collection.name)
+          );
+          throwIfMaintenanceAborted(extra.signal);
+          const unknownCollections = collections.filter(
+            name => !configuredNames.has(name)
+          );
+
+          if (unknownCollections.length > 0) {
+            return {
+              content: [{
+                type: "text",
+                text: `Unknown collection(s): ${unknownCollections.join(", ")}. Call status to list configured collections.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        const progressToken = extra._meta?.progressToken;
+        const pendingNotifications = new Set<Promise<void>>();
+        let activeCollection: string | undefined;
+        let completedFiles = 0;
+        let activeCollectionTotal = 0;
+        let lastProgress = 0;
+        let lastTotal = 0;
+
+        const onProgress = (info: UpdateProgress) => {
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (progressToken === undefined) {
+            return;
+          }
+
+          if (
+            activeCollection !== undefined &&
+            activeCollection !== info.collection
+          ) {
+            completedFiles += activeCollectionTotal;
+          }
+          activeCollection = info.collection;
+          activeCollectionTotal = info.total;
+
+          const progress = Math.max(lastProgress, completedFiles + info.current);
+          const total = Math.max(
+            lastTotal,
+            completedFiles + info.total,
+            progress
+          );
+          lastProgress = progress;
+          lastTotal = total;
+
+          enqueueBestEffortNotification(pendingNotifications, () =>
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress,
+                total,
+                message: `${info.collection}/${info.file}`,
+              },
+            })
+          );
+        };
+
+        const result = await store.update({
+          ...(collections === undefined ? {} : { collections }),
+          onProgress,
+        });
+        await Promise.all(pendingNotifications);
+        throwIfMaintenanceAborted(extra.signal);
+
+        const summary =
+          `Updated ${result.collections} collection(s): ${result.indexed} indexed, ` +
+          `${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed. ` +
+          `${result.needsEmbedding} document(s) need embedding.`;
+
+        return {
+          content: [{ type: "text", text: summary }],
+          structuredContent: result,
+        };
+      } catch (error) {
+        if (error instanceof MaintenanceCancelledError || extra.signal.aborted) {
+          return {
+            content: [{
+              type: "text",
+              text: "Update cancelled by the MCP client. Retry when ready.",
+            }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: "Update failed. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      } finally {
+        maintenance.release();
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: embed (Generate vector embeddings for the derived index)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "embed",
+    {
+      title: "Embed Documents",
+      description: "Generate vector embeddings for pending indexed documents using QMD's centrally configured model. Defaults: force false and a runtime limit of 30 minutes; omit collection to process all pending collections. This writes only to the derived index and may download the configured model if it is not cached. With an MCP progress token it reports chunks, bytes, and errors. Busy, cancelled, failed, and partial-error runs return isError while preserving available counters. Per-document failure reasons are sanitized at the MCP boundary; they are categories, not raw backend errors.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        collection: z.string().min(1).optional().describe(
+          "Optional configured collection name. Omit to embed pending documents from all collections."
+        ),
+        force: z.boolean().optional().default(false).describe(
+          "Rebuild existing embeddings in the selected scope (default: false)."
+        ),
+        chunkStrategy: z.enum(["auto", "regex"]).optional().describe(
+          "Chunking strategy. Omit to use QMD's configured default."
+        ),
+        maxDocsPerBatch: z.number().int().positive().optional().describe(
+          "Maximum documents per embedding batch."
+        ),
+        maxBatchMiB: z.number().positive().optional().describe(
+          "Maximum embedding batch size in MiB."
+        ),
+        timeoutMinutes: z.number()
+          .nonnegative()
+          .max(
+            MAX_EMBED_TIMEOUT_MINUTES,
+            `timeoutMinutes must be at most ${MAX_EMBED_TIMEOUT_MINUTES} minutes. Use 0 for no runtime limit.`
+          )
+          .optional()
+          .default(30)
+          .describe(
+            `Maximum runtime in minutes (default: 30, maximum: ${MAX_EMBED_TIMEOUT_MINUTES}). Use 0 for no runtime limit.`
+          ),
+      },
+    },
+    async ({
+      collection,
+      force,
+      chunkStrategy,
+      maxDocsPerBatch,
+      maxBatchMiB,
+      timeoutMinutes,
+    }, extra) => {
+      if (extra.signal.aborted) {
+        return {
+          content: [{
+            type: "text",
+            text: "Embedding cancelled by the MCP client. Retry when ready.",
+          }],
+          isError: true,
+        };
+      }
+
+      const maintenance = acquireMaintenance(store, "embed");
+      if (!maintenance.acquired) {
+        return {
+          content: [{
+            type: "text",
+            text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        throwIfMaintenanceAborted(extra.signal);
+
+        if (collection !== undefined) {
+          const configuredNames = new Set(
+            (await store.listCollections()).map(configured => configured.name)
+          );
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (!configuredNames.has(collection)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Unknown collection: ${collection}. Call status to list configured collections.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        const progressToken = extra._meta?.progressToken;
+        const pendingNotifications = new Set<Promise<void>>();
+        let lastProgress = 0;
+        let lastTotal = 0;
+        const onProgress = (info: EmbedProgress) => {
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (progressToken === undefined) {
+            return;
+          }
+
+          const progress = Math.max(lastProgress, info.chunksEmbedded);
+          const total = Math.max(lastTotal, info.totalChunks, progress);
+          lastProgress = progress;
+          lastTotal = total;
+
+          enqueueBestEffortNotification(pendingNotifications, () =>
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress,
+                total,
+                message:
+                  `${info.chunksEmbedded}/${info.totalChunks} chunks; ` +
+                  `${info.bytesProcessed}/${info.totalBytes} bytes; ` +
+                  `${info.errors} errors`,
+              },
+            })
+          );
+        };
+
+        const embedOptions: NonNullable<Parameters<QMDStore["embed"]>[0]> = {
+          force,
+          maxDurationMs: Math.round(timeoutMinutes * 60 * 1000),
+          ...(collection === undefined ? {} : { collection }),
+          ...(chunkStrategy === undefined ? {} : { chunkStrategy }),
+          ...(maxDocsPerBatch === undefined ? {} : { maxDocsPerBatch }),
+          ...(maxBatchMiB === undefined
+            ? {}
+            : { maxBatchBytes: maxBatchMiB * 1024 * 1024 }),
+          onProgress,
+        };
+        const result = await store.embed(embedOptions);
+        await Promise.all(pendingNotifications);
+        throwIfMaintenanceAborted(extra.signal);
+        const failures = result.failures ?? [];
+        const structured = {
+          ...result,
+          failureCount: result.errors,
+          failures: failures.slice(0, 20).map(failure => ({
+            ...failure,
+            reason: sanitizeEmbedFailureReason(failure.reason),
+          })),
+          failuresTruncated: failures.length > 20,
+        };
+        const summary =
+          `Embedded ${result.docsProcessed} document(s) into ${result.chunksEmbedded} chunk(s) ` +
+          `in ${result.durationMs}ms with ${result.errors} error(s).`;
+
+        return {
+          content: [{ type: "text", text: summary }],
+          structuredContent: structured,
+          isError: result.errors > 0,
+        };
+      } catch (error) {
+        if (error instanceof MaintenanceCancelledError || extra.signal.aborted) {
+          return {
+            content: [{
+              type: "text",
+              text: "Embedding cancelled by the MCP client. Retry when ready.",
+            }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: "Embedding failed. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      } finally {
+        maintenance.release();
+      }
     }
   );
 

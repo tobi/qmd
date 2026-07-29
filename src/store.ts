@@ -50,6 +50,16 @@ export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
+export const EMBED_FAILURE_NO_VECTOR_REASON =
+  "embedding returned no vector";
+export const EMBED_FAILURE_SESSION_EXPIRED_REASON =
+  "LLM session expired before embedding chunk";
+export const EMBED_FAILURE_ERROR_RATE_REASON =
+  "embedding aborted because error rate was too high";
+export const EMBED_FAILURE_BATCH_NO_VECTOR_REASON =
+  "batch embedding returned no vector";
+export const EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX =
+  "batch failed and session expired";
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -1748,7 +1758,7 @@ export async function generateEmbeddings(
         const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
         const result = await session.embed(text, { model });
         if (!result) {
-          recordFailure(chunk, "embedding returned no vector");
+          recordFailure(chunk, EMBED_FAILURE_NO_VECTOR_REASON);
           return false;
         }
         insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
@@ -1852,7 +1862,9 @@ export async function generateEmbeddings(
         // Abort early if session has been invalidated (e.g. max duration exceeded)
         if (!session.isValid) {
           const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
+          for (const chunk of remainingChunks) {
+            recordFailure(chunk, EMBED_FAILURE_SESSION_EXPIRED_REASON);
+          }
           console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
           break;
         }
@@ -1861,7 +1873,9 @@ export async function generateEmbeddings(
         const processed = chunksEmbedded + activeErrorCount();
         if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
           const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
+          for (const chunk of remainingChunks) {
+            recordFailure(chunk, EMBED_FAILURE_ERROR_RATE_REASON);
+          }
           console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
           break;
         }
@@ -1881,7 +1895,7 @@ export async function generateEmbeddings(
               successesSinceRetry++;
               clearFailure(chunk);
             } else {
-              recordFailure(chunk, "batch embedding returned no vector");
+              recordFailure(chunk, EMBED_FAILURE_BATCH_NO_VECTOR_REASON);
             }
             batchChunkBytesProcessed += chunk.bytes;
           }
@@ -1892,7 +1906,12 @@ export async function generateEmbeddings(
           // cleared, so the visible error count reflects outstanding failures.
           const batchReason = reasonFromError(error);
           if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+            for (const chunk of chunkBatch) {
+              recordFailure(
+                chunk,
+                `${EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX}: ${batchReason}`
+              );
+            }
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {

@@ -78,6 +78,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info
+- `update` — Synchronize configured collections into QMD's derived index
+- `embed` — Generate pending vector embeddings with QMD's configured model
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -139,6 +141,7 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
+The stdio and HTTP transports expose the same centrally registered tools.
 
 #### MCP Tool Parameters
 
@@ -159,6 +162,29 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `multi_get` | `maxBytes` | number | Skip files larger than N (default 10240) |
 | `multi_get` | `maxLines` | number | Limit lines per file |
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
+| `update` | `collections` | string[] | Optional non-empty list of configured collections; omit to update all |
+| `embed` | `collection` | string | Optional configured collection; omit to process all pending collections |
+| `embed` | `force` | boolean | Rebuild existing embeddings in scope (default **false**) |
+| `embed` | `chunkStrategy` | `"auto"` or `"regex"` | Optional chunking strategy; omit to use QMD's configured default |
+| `embed` | `maxDocsPerBatch` | positive integer | Optional document limit per embedding batch |
+| `embed` | `maxBatchMiB` | positive number | Optional embedding batch-size limit in MiB |
+| `embed` | `timeoutMinutes` | non-negative number | Runtime limit (default **30**, maximum **35791**); use `0` for no runtime limit |
+
+For safe maintenance, call `update`, then call `status` and inspect
+`needsEmbedding`. Call `embed` only when that count is greater than zero. Both
+tools write only to QMD's derived index; `update` does not modify source files
+or execute configured collection update commands. If the request includes an
+MCP progress token, `update` reports file progress and `embed` reports chunk,
+byte, and error counters. Only one `update` or `embed` operation can run for a
+shared store within one MCP server process/store instance at a time; another
+writer fails immediately as busy while read tools remain available. Separate
+CLI or server processes rely on SQLite/WAL/busy-timeout instead of this
+fail-fast lock. Busy, cancelled, and failed calls set `isError`.
+`embed` also sets `isError` for partial failures while retaining its result
+counters and a bounded failure list. Failure reasons in that list are sanitized
+MCP categories, not raw model, download, backend, or database error messages.
+The 30-minute default embed limit provides a final safety boundary when an
+active native model computation cannot stop immediately.
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return

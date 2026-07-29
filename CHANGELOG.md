@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- The MCP server now exposes `update` and `embed` through the same central tool
+  registration for stdio and Streamable HTTP. The documented maintenance flow
+  is `update`, inspect `status.needsEmbedding`, then `embed` only when work is
+  pending. Both tools report progress when the client supplies a progress
+  token, return structured counters, and write only to QMD's derived index.
+  Progress delivery is best-effort and cannot change a successful tool result.
+  `update` never modifies source files or executes configured update commands;
+  `embed` uses only the centrally configured model and defaults to a 30-minute
+  runtime limit. Values above the documented safe Node timer maximum are
+  rejected; `0` remains unlimited. A per-process, per-store fail-fast lock
+  permits one maintenance writer while reads remain available, and
+  cancellation/error paths release the lock. Separate processes continue to
+  rely on SQLite/WAL/busy-timeout. Busy, cancelled, failed, and partial
+  embedding results are surfaced with `isError` without adding REST maintenance
+  endpoints. MCP failure details preserve known safe Store categories and
+  sanitize raw backend, model, download, and database error text.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

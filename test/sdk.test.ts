@@ -5,7 +5,16 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  test,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +32,7 @@ import {
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
+import * as llmModule from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -991,6 +1001,117 @@ describe("embed", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
     } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed forwards the max runtime budget", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const embedBatchCalls: string[][] = [];
+    const slowLlm = {
+      async embed() {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = slowLlm as any;
+
+    try {
+      await store.update();
+      const result = await store.embed({
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+        maxDurationMs: 10,
+      });
+
+      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
+      expect(sessionSpy).toHaveBeenCalledWith(
+        slowLlm,
+        expect.any(Function),
+        { maxDuration: 10, name: "generateEmbeddings" },
+      );
+      expect(result.chunksEmbedded).toBeLessThan(3);
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed preserves zero as an unlimited runtime budget", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      await store.embed({ maxDurationMs: 0 });
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        { maxDuration: 0, name: "generateEmbeddings" },
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed applies the default runtime budget when omitted", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      await store.embed();
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        { maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" },
+      );
+    } finally {
+      sessionSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await store.close();
     }
