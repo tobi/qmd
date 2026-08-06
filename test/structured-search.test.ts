@@ -572,6 +572,16 @@ describe("buildFTS5Query (lex parser)", () => {
     expect(buildFTS5Query("gpt-4")).toBe('"gpt 4"');
   });
 
+  test("git-hook style hyphenated term post-commit → phrase match (#regression v1.0.0)", () => {
+    expect(buildFTS5Query("post-commit")).toBe('"post commit"');
+  });
+
+  test("post-commit in multi-term query does not concatenate into postcommit", () => {
+    expect(buildFTS5Query("qmd embed index post-commit hook")).toBe(
+      '"qmd"* AND "embed"* AND "index"* AND "post commit" AND "hook"*'
+    );
+  });
+
   test("multi-hyphen term → phrase match", () => {
     expect(buildFTS5Query("foo-bar-baz")).toBe('"foo bar baz"');
   });

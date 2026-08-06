@@ -1638,6 +1638,35 @@ describe("FTS Search", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS matches hyphenated git-hook terms like post-commit", async () => {
+    // Regression: v1.0.0 stripped hyphens (post-commit → postcommit) while the
+    // unicode61 tokenizer indexes the body as adjacent tokens post + commit.
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "hook-doc",
+      title: "QMD post-commit hook regression",
+      body: "The repo-local post-commit hook chains to ~/.githooks dispatcher.",
+      displayPath: "test/hook-doc.md",
+    });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "other-doc",
+      title: "Unrelated",
+      body: "Gardening and cooking with no hooks.",
+      displayPath: "test/other.md",
+    });
+
+    const single = store.searchFTS("post-commit", 10);
+    expect(single.map(r => r.displayPath)).toContain(`${collectionName}/test/hook-doc.md`);
+
+    const multi = store.searchFTS("post-commit hook dispatcher", 10);
+    expect(multi.map(r => r.displayPath)).toContain(`${collectionName}/test/hook-doc.md`);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
