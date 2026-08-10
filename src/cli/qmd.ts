@@ -740,7 +740,7 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -1773,7 +1773,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
