@@ -615,6 +615,10 @@ qmd query "auth flow" --chunk-strategy auto
 # Memory control for large corpora / constrained systems
 qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
+
+# Time control for very large indexes
+qmd embed --timeout 180             # extend the embed session cap (default 120 min)
+qmd embed --timeout 0               # remove the cap entirely
 ```
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code

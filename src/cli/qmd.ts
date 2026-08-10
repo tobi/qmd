@@ -2749,7 +2749,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
-      timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 120)
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3288,7 +3288,7 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+    console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 120)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3355,7 +3355,7 @@ function showHelp(): void {
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
-  console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 120)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
