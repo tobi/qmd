@@ -59,7 +59,7 @@
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "12.10.0",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.18.1",
+    "node-llama-cpp": "3.19.1",
     "picomatch": "4.0.4",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
@@ -118,5 +118,8 @@
     "llm"
   ],
   "author": "Tobi Lutke <tobi@lutke.com>",
-  "license": "MIT"
+  "license": "MIT",
+  "trustedDependencies": [
+    "node-llama-cpp"
+  ]
 }
