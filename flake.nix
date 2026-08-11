@@ -44,12 +44,12 @@
         });
 
         nodeModulesHashes = {
-          x86_64-linux = "sha256-sVXoNWIcx1RYRtRWB4F2j7x8/cabFBKq+plFhPU7tBc=";
-          aarch64-darwin = "sha256-gDyJ5boyH44SeXlKo+W4G36GSUejyXP5PFvW+dFS1Mk=";
+          x86_64-linux = "sha256-9BlPX7AwkxFt7jFFscrN8hjWKdSNUjmnf+g/NwLHn5s=";
+          aarch64-darwin = "sha256-iSa+uWpfEwegmUStBjZm4xgKMcINSUMHuoQ7M5cw3rM=";
+          x86_64-darwin = "sha256-iSa+uWpfEwegmUStBjZm4xgKMcINSUMHuoQ7M5cw3rM=";
 
           # Populate these on first build for additional hosts if/when needed.
           aarch64-linux = pkgs.lib.fakeHash;
-          x86_64-darwin = pkgs.lib.fakeHash;
         };
 
         nodeModules = pkgs.stdenvNoCC.mkDerivation {
