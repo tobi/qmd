@@ -21,6 +21,7 @@
 import { createRequire } from "node:module";
 import { extname } from "node:path";
 import type { BreakPoint } from "./store.js";
+import { detectTemplateAdapter, getTemplateBreakPoints } from "./templates.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
 type ParserType = import("web-tree-sitter").Parser;
@@ -31,7 +32,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "php";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,13 +46,15 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".php": "php",
 };
 
 /**
  * Detect language from file path extension.
- * Returns null for unsupported or unknown extensions (including .md).
+ * Returns null for template files (e.g. .blade.php) or unsupported/unknown extensions (including .md).
  */
 export function detectLanguage(filepath: string): SupportedLanguage | null {
+  if (detectTemplateAdapter(filepath)) return null;
   const ext = extname(filepath).toLowerCase();
   return EXTENSION_MAP[ext] ?? null;
 }
@@ -70,6 +73,7 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; versio
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.23.4" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.23.4" },
   rust:       { pkg: "tree-sitter-rust",       wasm: "tree-sitter-rust.wasm",       version: "0.24.0" },
+  php:        { pkg: "tree-sitter-php",        wasm: "tree-sitter-php.wasm",        version: "0.24.2" },
 };
 
 export function formatGrammarLoadError(language: SupportedLanguage, err: unknown): string {
@@ -148,6 +152,19 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  php: `
+    (class_declaration) @class
+    (interface_declaration) @iface
+    (trait_declaration) @trait
+    (enum_declaration) @enum
+    (method_declaration) @method
+    (function_definition) @func
+    (namespace_definition) @ns
+    (namespace_use_declaration) @import
+    (use_declaration) @import
+    (property_declaration) @prop
+    (const_declaration) @const
+  `,
 };
 
 /**
@@ -162,6 +179,7 @@ const SCORE_MAP: Record<string, number> = {
   trait:     100,
   impl:      100,
   mod:       100,
+  ns:        100,
   export:     90,
   func:       90,
   method:     90,
@@ -169,6 +187,8 @@ const SCORE_MAP: Record<string, number> = {
   type:       80,
   enum:       80,
   import:     60,
+  prop:       60,
+  const:      60,
 };
 
 // =============================================================================
@@ -275,6 +295,11 @@ export async function getASTBreakPoints(
   content: string,
   filepath: string,
 ): Promise<BreakPoint[]> {
+  const templateAdapter = detectTemplateAdapter(filepath);
+  if (templateAdapter) {
+    return templateAdapter.getBreakPoints(content);
+  }
+
   const language = detectLanguage(filepath);
   if (!language) return [];
 
