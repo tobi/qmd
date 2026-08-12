@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- `qmd mcp` (stdio) now shuts down gracefully when stdin reaches EOF instead
+  of orphaning to PID 1 when the parent MCP client dies (#751): the server
+  closes its transport, gives in-flight request handlers a bounded window to
+  settle, closes the store (which disposes its llama.cpp instance), and lets
+  the process drain via `process.exitCode` (no forced `process.exit()`, which
+  has caused exit-time native crashes before).
 - `qmd --version` no longer reports an unrelated repository's commit (#787).
   The commit was discovered at runtime with `git -C <installDir> rev-parse`,
   and `git -C` walks *up*, so any install nested inside another checkout
@@ -38,13 +44,11 @@
   misleading one. The lookup also no longer interpolates the install path into
   a shell string, so a path containing a space stops silently dropping the
   commit, and `--version` from a build runs no subprocess at all.
-
 - `qmd doctor` no longer false-positives `.etag` HTTP sidecars (written by
   `qmd pull` next to each download) as invalid GGUF models. The model-cache
   check now only inspects real `.gguf` files, so a sidecar that happens to
   sort before the blob no longer poisons the report. #812
 - `qmd mcp stop` and `qmd mcp --http --daemon` now verify that a pidfile PID still belongs to a qmd process before signalling it or refusing to start. Recycled PIDs (common after reboot) are treated as stale: the pidfile is unlinked instead of SIGTERM'ing an unrelated process or blocking daemon start with a false "Already running" error (#806).
-
 - `qmd collection add` now rejects missing paths and regular files before
   creating collection configuration or index state. The error reports both the
   received and resolved path so malformed shell arguments can be corrected.
@@ -62,40 +66,7 @@
   today, despite the qmd skill nearly tripling in size since). Also bumps
   the plugin to `2.6.3` as a one-time catch-up so existing installs pick
   up the current skill on their next `claude plugin update`. (#789)
-- `qmd --version` no longer reports an unrelated repository's commit (#787).
-  The commit was discovered at runtime with `git -C <installDir> rev-parse`,
-  and `git -C` walks *up*, so any install nested inside another checkout
-  reported that checkout's HEAD — a global npm install under a git-managed
-  prefix such as Homebrew's `/opt/homebrew` claimed Homebrew's commit as
-  qmd's. Identical tarballs reported different "commits" depending only on
-  where they were installed, which is why one issue can collect three distinct
-  hashes for the same published build. `scripts/build.mjs` now stamps the
-  commit it built from into `dist/cli/build-info.json` (suffixed `-dirty` when
-  built from a modified tree), and the runtime prefers that. Source checkouts
-  still resolve their own HEAD, but only after confirming the enclosing
-  repository is qmd's; anything else reports no commit rather than a
-  misleading one. The lookup also no longer interpolates the install path into
-  a shell string, so a path containing a space stops silently dropping the
-  commit, and `--version` from a build runs no subprocess at all.
 
-### Changed
-
-- `--full-path` no longer degrades silently when a result cannot be resolved on
-  disk (#785). A fallback there means the file moved or was deleted since the
-  last index, so `search`, `query`, `get` and `multi-get` now print a notice to
-  stderr naming how many results fell back and suggesting `qmd update`; stdout
-  stays machine-readable.
-- `search`/`query` now decide per result whether to show the docid under
-  `--full-path`, matching `multi-get` and `get`: a result that resolved shows
-  its on-disk path and no docid, one that did not keeps its `qmd://` URI *and*
-  its docid, so it is still addressable. Previously the docid was dropped for
-  every row whenever the flag was set, leaving unresolved rows with neither a
-  usable path nor an identifier.
-- `search --format csv` always emits the `docid` column, empty for rows that
-  resolved to an on-disk path. Under `--full-path` the header previously
-  dropped the column entirely — which also disagreed with the empty-result
-  header, always printed with `docid`. Column positions are now stable across
-  runs and formats.
 
 ## [2.6.3] - 2026-06-24
 

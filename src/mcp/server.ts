@@ -168,7 +168,10 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promise<McpServer> {
+  // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
+  // work to settle before disposing the store/llm underneath it.
+  const track = inflight?.track ?? (<T,>(fn: T): T => fn);
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
@@ -190,7 +193,7 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
       description: "A markdown document from your QMD knowledge base. Use search tools to discover documents.",
       mimeType: "text/markdown",
     },
-    async (uri, { path }) => {
+    track(async (uri, { path }) => {
       // Decode URL-encoded path (MCP clients send encoded URIs)
       const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
       const decodedPath = decodeURIComponent(pathStr);
@@ -219,7 +222,7 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
           text,
         }],
       };
-    }
+    })
   );
 
   // ---------------------------------------------------------------------------
@@ -325,7 +328,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -383,7 +386,7 @@ Intent-aware lex (C++ performance, not sports):
         content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
         structuredContent: { results: filtered },
       };
-    }
+    })
   );
 
   // ---------------------------------------------------------------------------
@@ -403,7 +406,7 @@ Intent-aware lex (C++ performance, not sports):
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },
-    async ({ file, fromLine, maxLines, lineNumbers }) => {
+    track(async ({ file, fromLine, maxLines, lineNumbers }) => {
       // Support :line and :from:count suffixes in `file` (e.g. "foo.md:120" or
       // "foo.md:120:40"). Explicit fromLine/maxLines args take precedence.
       let parsedFromLine = fromLine;
@@ -460,7 +463,7 @@ Intent-aware lex (C++ performance, not sports):
           },
         }],
       };
-    }
+    })
   );
 
   // ---------------------------------------------------------------------------
@@ -480,7 +483,7 @@ Intent-aware lex (C++ performance, not sports):
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
       },
     },
-    async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
+    track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
       const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {
@@ -533,7 +536,7 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return { content };
-    }
+    })
   );
 
   // ---------------------------------------------------------------------------
@@ -548,7 +551,7 @@ Intent-aware lex (C++ performance, not sports):
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {},
     },
-    async () => {
+    track(async () => {
       const status: StatusResult = await store.getStatus();
 
       const summary = [
@@ -567,7 +570,7 @@ Intent-aware lex (C++ performance, not sports):
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: status,
       };
-    }
+    })
   );
 
   return server;
@@ -581,6 +584,211 @@ export type McpStartupOptions = {
   dbPath?: string;
 };
 
+/**
+ * Counts running request handlers so shutdown can wait for them to settle
+ * before tearing down their llm/store dependencies. The SDK aborts in-flight
+ * request controllers on close, but qmd's handlers finish their current
+ * store/llm work rather than observing the signal mid-operation.
+ */
+export type InflightGate = {
+  /** Wraps a handler so the gate counts it while it runs. */
+  track<T extends (...args: never[]) => unknown>(fn: T): T;
+  /** Resolves once no tracked handler runs, or after timeoutMs. Returns whether idle was reached. */
+  waitForIdle(timeoutMs: number): Promise<boolean>;
+};
+
+export function createInflightGate(): InflightGate {
+  // `active` is a running-handler counter, not a closed admission barrier.
+  // The barrier comes from the caller's ordering: registerStdioEofShutdown
+  // runs closeServer() (which stops the transport from dispatching new
+  // requests) BEFORE waitForIdle(), so by the time we wait, the only handlers
+  // that can still be running are ones already dispatched — there is no source
+  // of late admissions to guard against under the stdio transport.
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return {
+    track(fn) {
+      const wrapped = async (...args: never[]) => {
+        active += 1;
+        try {
+          return await fn(...args);
+        } finally {
+          active -= 1;
+          if (active === 0) {
+            while (waiters.length > 0) waiters.shift()!();
+          }
+        }
+      };
+      return wrapped as typeof fn;
+    },
+    waitForIdle(timeoutMs: number): Promise<boolean> {
+      if (active === 0) return Promise.resolve(true);
+      return new Promise((resolve) => {
+        const onIdle = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        const timer = setTimeout(() => {
+          const i = waiters.indexOf(onIdle);
+          if (i >= 0) waiters.splice(i, 1);
+          resolve(false);
+        }, timeoutMs);
+        timer.unref?.();
+        waiters.push(onIdle);
+      });
+    },
+  };
+}
+
+/** Minimal stdin surface consumed by registerStdioEofShutdown, injectable for tests. */
+export type StdioShutdownStdin = {
+  once(event: "end" | "close", listener: () => void): unknown;
+  off(event: "end" | "close", listener: () => void): unknown;
+  readableEnded?: boolean;
+  destroyed?: boolean;
+};
+
+export type StdioShutdownOptions = {
+  /** Closes the MCP server and its transport. */
+  closeServer: () => Promise<void>;
+  /** Closes the SQLite store (owns disposing the per-store llama.cpp instance). */
+  closeStore: () => void | Promise<void>;
+  /**
+   * Optional extra llama.cpp teardown, run before closeStore. The MCP store
+   * disposes its own per-store LlamaCpp inside closeStore, so this is left
+   * unset there; it exists for callers that own a separate instance. If
+   * omitted, the step is skipped (do NOT default it to the global
+   * disposeDefaultLlamaCpp — that would tear down an unrelated instance in an
+   * embedded process).
+   */
+  disposeLlm?: () => Promise<void>;
+  /** Waits for in-flight handlers to settle (see InflightGate.waitForIdle). */
+  waitForIdle?: (timeoutMs: number) => Promise<boolean>;
+  /** Deadline for the in-flight wait. Defaults to 5000 ms. */
+  idleTimeoutMs?: number;
+  /** Defaults to process.stdin. */
+  stdin?: StdioShutdownStdin;
+  /** Defaults to assigning process.exitCode. */
+  setExitCode?: (code: number) => void;
+  /** Defaults to reading process.exitCode. */
+  getExitCode?: () => number | undefined;
+  /** Defaults to process.stderr. */
+  stderr?: { write(chunk: string): unknown; on?(event: "error", listener: (err: unknown) => void): unknown };
+};
+
+/**
+ * Shut the stdio MCP server down when stdin reaches EOF (#751).
+ *
+ * The SDK's StdioServerTransport subscribes to stdin "data"/"error" only and
+ * never notices "end"/"close". When the parent MCP client dies, nothing tears
+ * the process down: the warm llama.cpp model's native handles keep the event
+ * loop alive, so the server reparents to PID 1, leaks RAM, and keeps the
+ * SQLite index open. stdin EOF means the client is gone, so this treats it as
+ * a disconnect: no new requests are accepted and nobody is left to read a
+ * response — but handlers that are already running get a bounded window to
+ * settle (waitForIdle) before their llm/store dependencies are torn down.
+ *
+ * Teardown order matters. Close the transport first so no further requests
+ * are dispatched, wait for in-flight handlers, then close the store last —
+ * which disposes the store's own llama.cpp instance and then the database, so
+ * the dispose path cannot hit an already-closed DB. (disposeLlm is an optional
+ * extra step for callers that own a separate instance; the MCP store does
+ * not.) Failures are logged best-effort (the parent's death may have closed
+ * stderr too) and do not stop the remaining steps. The function sets process.exitCode
+ * instead of calling process.exit() so `beforeExit` still fires and
+ * node-llama-cpp's auto-dispose runs before libc's static destructors —
+ * process.exit() during native-addon unload has caused exit-time crashes
+ * before (#59, #129; same rationale as finishSuccessfulCliCommand in the CLI).
+ *
+ * Returns the idempotent shutdown function: every invocation (manual, "end",
+ * "close", or already-ended stdin) shares one promise, and the promise never
+ * rejects.
+ */
+export function registerStdioEofShutdown(options: StdioShutdownOptions): () => Promise<void> {
+  const stdin = options.stdin ?? process.stdin;
+  const stderr = options.stderr ?? process.stderr;
+  const setExitCode = options.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  const getExitCode = options.getExitCode ?? (() => (typeof process.exitCode === "number" ? process.exitCode : undefined));
+  let shutdownPromise: Promise<void> | null = null;
+
+  // If the parent died, its stderr pipe may be gone: writes can throw
+  // synchronously or emit an async stream error. Logging must never take the
+  // teardown down with it.
+  stderr.on?.("error", () => {});
+  const safeWrite = (chunk: string): void => {
+    try {
+      stderr.write(chunk);
+    } catch {
+      // stderr went away with the parent
+    }
+  };
+
+  const performShutdown = async (): Promise<void> => {
+    try {
+      stdin.off("end", onStdinEof);
+      stdin.off("close", onStdinEof);
+    } catch {
+      // an exotic stdin may throw on off(); shutdown continues regardless
+    }
+
+    // Same stderr breadcrumb style as the HTTP transport's SIGTERM/SIGINT
+    // handlers; also gives tests an observable signal that the EOF path ran.
+    safeWrite("Shutting down (stdin closed)...\n");
+
+    let failed = false;
+    const step = async (name: string, run: () => void | Promise<void>): Promise<void> => {
+      try {
+        await run();
+      } catch (error) {
+        failed = true;
+        safeWrite(
+          `QMD Warning: ${name} failed during stdio shutdown (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
+        );
+      }
+    };
+
+    await step("server.close()", options.closeServer);
+    if (options.waitForIdle) {
+      await step("in-flight drain", async () => {
+        const idle = await options.waitForIdle!(options.idleTimeoutMs ?? 5000);
+        if (!idle) {
+          safeWrite("QMD Warning: in-flight request did not settle before the shutdown deadline; continuing shutdown.\n");
+        }
+      });
+    }
+    if (options.disposeLlm) {
+      await step("llama disposal", options.disposeLlm);
+    }
+    await step("store.close()", options.closeStore);
+
+    try {
+      const prior = getExitCode();
+      if (failed) {
+        setExitCode(1);
+      } else if (prior === undefined || prior === 0) {
+        setExitCode(0);
+      }
+      // else: keep an earlier nonzero status instead of masking it
+    } catch {
+      // injected setExitCode/getExitCode must not break the shutdown promise
+    }
+  };
+
+  const shutdown = (): Promise<void> => (shutdownPromise ??= performShutdown());
+  const onStdinEof = (): void => { void shutdown().catch(() => {}); };
+
+  stdin.once("end", onStdinEof);
+  stdin.once("close", onStdinEof);
+
+  // The parent can die between spawn and listener registration; check the
+  // stream flags after subscribing so an already-ended stdin still shuts down.
+  if (stdin.readableEnded || stdin.destroyed) {
+    onStdinEof();
+  }
+
+  return shutdown;
+}
+
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
@@ -593,9 +801,21 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
-  const server = await createMcpServer(store);
+  const inflight = createInflightGate();
+  const server = await createMcpServer(store, inflight);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
+  // and the server must exit instead of orphaning to PID 1 (#751). No
+  // disposeLlm here — store.close() disposes this store's own LlamaCpp
+  // instance, so passing the global disposeDefaultLlamaCpp would only risk
+  // tearing down an unrelated instance in an embedded process.
+  registerStdioEofShutdown({
+    closeServer: () => server.close(),
+    waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
+    closeStore: () => store.close(),
+  });
 }
 
 // =============================================================================
