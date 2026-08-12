@@ -10,7 +10,14 @@ import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
+import {
+  getConfigPath,
+  loadConfig,
+  saveConfig,
+  setConfigIndexName,
+  validateEmbedConfig,
+  type CollectionConfig,
+} from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -94,5 +101,114 @@ describe("getConfigDir via getConfigPath", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("models.embed config round-trip", () => {
+  async function withTempConfigDir(fn: () => void): Promise<void> {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-config-"));
+    try {
+      process.env.QMD_CONFIG_DIR = dir;
+      fn();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("array embed config round-trips through saveConfig/loadConfig preserving order", async () => {
+    await withTempConfigDir(() => {
+      const config: CollectionConfig = {
+        collections: {},
+        models: {
+          embed: [
+            "http://host-a:1234/v1#test-embed-model",
+            "http://host-b:1234/v1#test-embed-model",
+            "hf:user/repo/model.gguf",
+          ],
+        },
+      };
+      saveConfig(config);
+      const loaded = loadConfig();
+      expect(loaded.models?.embed).toEqual([
+        "http://host-a:1234/v1#test-embed-model",
+        "http://host-b:1234/v1#test-embed-model",
+        "hf:user/repo/model.gguf",
+      ]);
+    });
+  });
+
+  test("single string embed config still round-trips exactly as before", async () => {
+    await withTempConfigDir(() => {
+      const config: CollectionConfig = {
+        collections: {},
+        models: {
+          embed: "hf:user/repo/model.gguf",
+          rerank: "hf:user/repo/rerank.gguf",
+          generate: "hf:user/repo/generate.gguf",
+        },
+      };
+      saveConfig(config);
+      const loaded = loadConfig();
+      expect(loaded.models?.embed).toBe("hf:user/repo/model.gguf");
+      expect(loaded.models?.rerank).toBe("hf:user/repo/rerank.gguf");
+      expect(loaded.models?.generate).toBe("hf:user/repo/generate.gguf");
+    });
+  });
+
+  test("loadConfig rejects an on-disk empty embed array instead of silently defaulting", async () => {
+    // Regression guard: validateEmbedConfig must actually run inside loadConfig,
+    // not just exist as an unwired helper — an empty array is otherwise a
+    // silent no-op (resolveEmbedEndpoints would fall through to the default
+    // model without ever surfacing the malformed config to the user).
+    await withTempConfigDir(() => {
+      saveConfig({ collections: {}, models: { embed: [] } });
+      expect(() => loadConfig()).toThrow(/must not be empty/);
+    });
+  });
+
+  test("loadConfig rejects mismatched #model-id fragments in an on-disk embed array", async () => {
+    await withTempConfigDir(() => {
+      saveConfig({
+        collections: {},
+        models: { embed: ["http://host-a:1234/v1#test-embed-model", "http://host-b:1234/v1#other-model"] },
+      });
+      expect(() => loadConfig()).toThrow(/must share the same/);
+    });
+  });
+});
+
+describe("validateEmbedConfig", () => {
+  test("passes for a single string", () => {
+    expect(() => validateEmbedConfig("hf:user/repo/model.gguf")).not.toThrow();
+  });
+
+  test("passes for undefined", () => {
+    expect(() => validateEmbedConfig(undefined)).not.toThrow();
+  });
+
+  test("passes for an array of remote URIs sharing the same #model-id", () => {
+    expect(() =>
+      validateEmbedConfig([
+        "http://host-a:1234/v1#test-embed-model",
+        "https://host-b:1234/v1#test-embed-model",
+      ])
+    ).not.toThrow();
+  });
+
+  test("throws for an empty array", () => {
+    expect(() => validateEmbedConfig([])).toThrow(/must not be empty/);
+  });
+
+  test("throws for an array of remote URIs with mismatched #model-id fragments", () => {
+    expect(() =>
+      validateEmbedConfig([
+        "http://host-a:1234/v1#test-embed-model",
+        "http://host-b:1234/v1#other-model",
+      ])
+    ).toThrow(/must share the same/);
+  });
+
+  test("throws for a malformed http entry with no #fragment", () => {
+    expect(() => validateEmbedConfig(["http://host-a:1234/v1"])).toThrow(/Malformed remote embed URI/);
   });
 });

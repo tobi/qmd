@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- `models.embed` (and `QMD_EMBED_MODEL`) can now point at one or more
+  OpenAI-compatible `/v1/embeddings` servers instead of a local GGUF model,
+  via `http[s]://host:port/v1#model-id` URIs. Multiple endpoints are tried in
+  sequential order with independent per-endpoint unhealthy backoff (default
+  15s), so search keeps working if one embedding server goes down. All
+  endpoints in a fallback list must share the same model id and vector
+  dimensions — this is validated at config-load time. Auth (`QMD_EMBED_API_KEY`
+  / `OPENAI_API_KEY`), timeout (`QMD_EMBED_TIMEOUT_MS`), and failover TTL
+  (`QMD_EMBED_HEALTH_TTL_MS`) are configured via environment variables, never
+  in the URI. `qmd doctor` reports configured remote endpoints and key
+  presence; `qmd pull` skips remote entries since there's nothing to download.
+  See [Remote Embedding](README.md#remote-embedding) in the README.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

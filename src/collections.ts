@@ -37,7 +37,7 @@ export interface Collection {
  * Model configuration for embedding, reranking, and generation
  */
 export interface ModelsConfig {
-  embed?: string;
+  embed?: string | string[];
   rerank?: string;
   generate?: string;
 }
@@ -176,6 +176,7 @@ function ensureConfigDir(): void {
 export function loadConfig(): CollectionConfig {
   // SDK inline config mode
   if (configSource.type === 'inline') {
+    validateEmbedConfig(configSource.config.models?.embed);
     return configSource.config;
   }
 
@@ -185,20 +186,22 @@ export function loadConfig(): CollectionConfig {
     return { collections: {} };
   }
 
+  let config: CollectionConfig;
   try {
     const content = readFileSync(configPath, "utf-8");
     const parsed = YAML.parse(content) as CollectionConfig | null | undefined;
-    const config = parsed ?? { collections: {} };
+    config = parsed ?? { collections: {} };
 
     // Ensure collections object exists
     if (!config.collections) {
       config.collections = {};
     }
-
-    return config;
   } catch (error) {
     throw new Error(`Failed to parse ${configPath}: ${error}`);
   }
+
+  validateEmbedConfig(config.models?.embed);
+  return config;
 }
 
 /**
@@ -536,4 +539,58 @@ export function configExists(): boolean {
 export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+// ============================================================================
+// Model config validation
+// ============================================================================
+
+// Mirrors isRemoteEmbedModel in src/remote-embed.ts; duplicated here to avoid
+// a cross-module dependency during parallel development.
+function looksLikeRemoteEmbedUri(uri: string): boolean {
+  return uri.startsWith("http://") || uri.startsWith("https://");
+}
+
+/**
+ * Validate a `models.embed` config value.
+ * - Array form must be non-empty.
+ * - Remote entries (http/https) must include a `#model-id` fragment.
+ * - When multiple remote entries are present, they must all share the same
+ *   `#model-id` fragment (the fallback group must resolve to one vector identity).
+ */
+export function validateEmbedConfig(embed: string | string[] | undefined): void {
+  if (embed === undefined || typeof embed === "string") {
+    return;
+  }
+
+  if (embed.length === 0) {
+    throw new Error("models.embed array must not be empty");
+  }
+
+  const remoteFragments = new Map<string, string>(); // uri -> fragment
+
+  for (const uri of embed) {
+    if (!looksLikeRemoteEmbedUri(uri)) continue;
+
+    const hashIndex = uri.indexOf("#");
+    if (hashIndex === -1 || hashIndex === uri.length - 1) {
+      throw new Error(
+        `Malformed remote embed URI '${uri}': expected a '#model-id' fragment (e.g. http://host:port/v1#model-id)`
+      );
+    }
+
+    remoteFragments.set(uri, uri.slice(hashIndex + 1));
+  }
+
+  if (remoteFragments.size > 1) {
+    const fragments = new Set(remoteFragments.values());
+    if (fragments.size > 1) {
+      const mismatched = [...remoteFragments.entries()]
+        .map(([uri, fragment]) => `${uri} (#${fragment})`)
+        .join(", ");
+      throw new Error(
+        `All remote embed endpoints must share the same '#model-id' fragment, got mismatched URIs: ${mismatched}`
+      );
+    }
+  }
 }

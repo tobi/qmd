@@ -27,6 +27,14 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 #   embed: "hf:<user>/<repo>/<file>.gguf"
 #   rerank: "hf:<user>/<repo>/<file>.gguf"
 #   generate: "hf:<user>/<repo>/<file>.gguf"
+#
+# `embed` can also be a remote OpenAI-compatible server (or a list of them,
+# tried in order as fallback) instead of a local GGUF — see "Remote Embedding"
+# in the README:
+#   embed: "http://localhost:1234/v1#model-id"
+#   embed:
+#     - "http://embed-host-1:1234/v1#model-id"
+#     - "http://embed-host-2:1234/v1#model-id"
 
 # ─── Collections ─────────────────────────────────────────────────────────────
 collections:

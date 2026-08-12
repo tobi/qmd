@@ -333,6 +333,118 @@ describe("native llama stdout containment", () => {
   });
 });
 
+describe("remote embedding routing", () => {
+  function neverCalledNodeLlamaCppMock() {
+    return {
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(async () => {
+        throw new Error("resolveModelFile should never be called for a remote embed model");
+      }),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async () => {
+        throw new Error("getLlama should never be called for a remote embed model");
+      }),
+    };
+  }
+
+  test("embed() routes to fetch and returns the shared model id, without touching node-llama-cpp", async () => {
+    const mockModule = neverCalledNodeLlamaCppMock();
+    setNodeLlamaCppModuleForTest(mockModule);
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toBe("http://localhost:1234/v1/embeddings");
+      return new Response(JSON.stringify({ data: [{ embedding: [0.6, 0.8] }] }), { status: 200 });
+    });
+
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
+    try {
+      expect(llm.isRemoteEmbed()).toBe(true);
+      expect(llm.embedModelName).toBe("test-embed-model");
+
+      const result = await llm.embed("hello remote world");
+      expect(result?.model).toBe("test-embed-model");
+      // Response vector [0.6, 0.8] has norm 1, so L2-normalize leaves it unchanged.
+      expect(result?.embedding).toEqual([0.6, 0.8]);
+
+      expect(mockModule.getLlama).not.toHaveBeenCalled();
+      expect(mockModule.resolveModelFile).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+    }
+  });
+
+  test("embedBatch() routes multiple texts through fetch in order, without touching node-llama-cpp", async () => {
+    const mockModule = neverCalledNodeLlamaCppMock();
+    setNodeLlamaCppModuleForTest(mockModule);
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.model).toBe("test-embed-model");
+      expect(body.input).toEqual(["one", "two"]);
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [1, 0] }, { embedding: [0, 1] }] }),
+        { status: 200 }
+      );
+    });
+
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
+    try {
+      const results = await llm.embedBatch(["one", "two"]);
+      expect(results).toHaveLength(2);
+      expect(results[0]).toEqual({ embedding: [1, 0], model: "test-embed-model" });
+      expect(results[1]).toEqual({ embedding: [0, 1], model: "test-embed-model" });
+      expect(mockModule.getLlama).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+    }
+  });
+
+  test("embed()/embedBatch() return null on total remote failure, matching the local-failure contract", async () => {
+    setNodeLlamaCppModuleForTest(neverCalledNodeLlamaCppMock());
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const llm = new LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
+    try {
+      expect(await llm.embed("hello")).toBeNull();
+      expect(await llm.embedBatch(["a", "b"])).toEqual([null, null]);
+    } finally {
+      fetchSpy.mockRestore();
+      errorSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+    }
+  });
+
+  test("a plain local/hf: embed config is unaffected: isRemoteEmbed() is false and identity is unchanged", () => {
+    const local = new LlamaCpp({ embedModel: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf" });
+    expect(local.isRemoteEmbed()).toBe(false);
+    expect(local.embedModelName).toBe("hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf");
+
+    // No embedModel override at all: falls back through QMD_EMBED_MODEL / DEFAULT_EMBED_MODEL,
+    // exactly as resolveEmbedModel did before remote-embed support existed.
+    const prevEnv = process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+    try {
+      const withDefault = new LlamaCpp();
+      expect(withDefault.isRemoteEmbed()).toBe(false);
+      expect(withDefault.embedModelName).toBe(resolveEmbedModel());
+    } finally {
+      if (prevEnv === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prevEnv;
+    }
+  });
+
+  test("mismatched #model-id fragments across remote endpoints throw a clear error", () => {
+    expect(() => new LlamaCpp({
+      embedModel: ["http://host-a:1234/v1#test-embed-model", "http://host-b:1234/v1#other-model"],
+    })).toThrow(/must share the same/);
+  });
+
+});
+
 describe("LLM context parallelism safety", () => {
   test("defaults Windows CUDA to one context to avoid ggml-cuda.cu:98 crashes", () => {
     expect(resolveSafeParallelism({
