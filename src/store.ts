@@ -2769,6 +2769,8 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  // QMD_OLLAMA_EMBED_URL: skip local tokenizer, use char-based estimation
+  const _useOllamaEmbed = !!process.env.QMD_OLLAMA_EMBED_URL;
   const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
@@ -2792,14 +2794,31 @@ export async function chunkDocumentByTokens(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
-    if (tokens.length <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokens.length });
-      return;
-    }
+    // QMD_OLLAMA_EMBED_URL: use char-based estimation instead of local tokenizer
+    if (_useOllamaEmbed) {
+      const estimatedTokens = Math.ceil(text.length / avgCharsPerToken);
+      if (estimatedTokens <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: estimatedTokens });
+        return;
+      }
+      const actualCharsPerToken = avgCharsPerToken;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+      if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+        safeMaxChars = Math.floor(text.length / 2);
+      }
+      safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+      let nextOverlapChars = clampOverlapChars(overlapChars * actualCharsPerToken / 2, safeMaxChars);
+      let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+      let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+    } else {
+      const tokens = await llm.tokenize(text);
+      if (tokens.length <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: tokens.length });
+        return;
+      }
 
-    const actualCharsPerToken = text.length / tokens.length;
-    let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+      const actualCharsPerToken = text.length / tokens.length;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
     if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
       safeMaxChars = Math.floor(text.length / 2);
     }
@@ -3890,6 +3909,65 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  // QMD_EXPAND_URL: remote Ollama query expansion via /api/generate
+  if (process.env.QMD_EXPAND_URL) {
+    const _expandUrl = process.env.QMD_EXPAND_URL;
+    const _expandModel = process.env.QMD_EXPAND_MODEL || 'qwen3:0.6b';
+    const cacheKey = getCacheKey("expandQuery", { query, model: "remote-expand", ...(intent && { intent }) });
+    const cached = getCachedResult(db, cacheKey);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed)) {
+          return parsed.map((r) => ({ type: r.type, query: String(r.query) }));
+        }
+      } catch { /* re-expand */ }
+    }
+    try {
+      const expandPrompt = intent
+        ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+        : `/no_think Expand this search query: ${query}`;
+      const expandResponse = await fetch(`${_expandUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: _expandModel,
+          prompt: expandPrompt,
+          stream: false,
+          options: { temperature: 0.7, top_k: 20, top_p: 0.8, num_predict: 600 },
+        }),
+      });
+      if (!expandResponse.ok) throw new Error(`Expand service error: ${expandResponse.status}`);
+      const expandData = await expandResponse.json();
+      const rawText = expandData.response || '';
+      const lines = rawText.trim().split('\n');
+      const expanded: ExpandedQuery[] = [];
+      for (const line of lines) {
+        const match = line.match(/^(lex|vec|hyde):\s+(.+)$/i);
+        if (match) {
+          const type = match[1].toLowerCase() as "lex" | "vec" | "hyde";
+          const text = match[2].trim();
+          if (text.length > 0) {
+            expanded.push({ type, query: text });
+          }
+        }
+      }
+      if (!expanded.some(e => e.query === query)) {
+        expanded.unshift({ type: "vec", query });
+      }
+      if (expanded.length > 0) {
+        setCachedResult(db, cacheKey, JSON.stringify(expanded));
+      }
+      return expanded;
+    } catch (err) {
+      console.error(`QMD_EXPAND_URL error, using raw query:`, (err as Error).message);
+      return [{ type: "vec", query }];
+    }
+  }
+  // QMD_OLLAMA_EMBED_URL: skip LLM-based query expansion, use raw query only
+  if (process.env.QMD_OLLAMA_EMBED_URL) {
+    return [{ type: "vec", query }];
+  }
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3931,6 +4009,54 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // =============================================================================
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+  // QMD_RERANK_URL: remote reranker service via HTTP /rerank endpoint
+  if (process.env.QMD_RERANK_URL) {
+    const _rerankUrl = process.env.QMD_RERANK_URL;
+    const _rerankQuery = intent ? `${intent}\n\n${query}` : query;
+    const _cachedRerankResults = new Map<string, number>();
+    const _uncachedRerankDocs: { file: string; text: string }[] = [];
+    for (const doc of documents) {
+      const cacheKey = getCacheKey("rerank", { query: _rerankQuery, model: "qwen3-reranker-v2", chunk: doc.text });
+      const cached = getCachedResult(db, cacheKey);
+      if (cached !== null) {
+        _cachedRerankResults.set(doc.text, parseFloat(cached));
+      } else {
+        _uncachedRerankDocs.push(doc);
+      }
+    }
+    if (_uncachedRerankDocs.length > 0) {
+      try {
+        const _rerankResponse = await fetch(`${_rerankUrl}/rerank`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: _rerankQuery,
+            documents: _uncachedRerankDocs.map(d => d.text),
+          }),
+        });
+        if (!_rerankResponse.ok) throw new Error(`Reranker service error: ${_rerankResponse.status}`);
+        const _rerankData = await _rerankResponse.json();
+        for (const result of _rerankData.results) {
+          const doc = _uncachedRerankDocs[result.index];
+          if (doc) {
+            const cacheKey = getCacheKey("rerank", { query: _rerankQuery, model: "qwen3-reranker-v2", chunk: doc.text });
+            setCachedResult(db, cacheKey, result.score.toString());
+            _cachedRerankResults.set(doc.text, result.score);
+          }
+        }
+      } catch (err) {
+        console.error(`QMD_RERANK_URL error, falling back to RRF scores:`, (err as Error).message);
+        return documents.map(doc => ({ file: doc.file, score: _cachedRerankResults.get(doc.text) || 0.5 }));
+      }
+    }
+    return documents
+      .map(doc => ({ file: doc.file, score: _cachedRerankResults.get(doc.text) || 0 }))
+      .sort((a, b) => b.score - a.score);
+  }
+  // QMD_OLLAMA_EMBED_URL: skip LLM-based reranking, return documents with RRF scores as-is
+  if (process.env.QMD_OLLAMA_EMBED_URL) {
+    return documents.map(doc => ({ file: doc.file, score: 0.5 }));
+  }
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
