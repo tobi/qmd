@@ -67,6 +67,8 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  resolveLlmIdleTimeoutMs,
+  withLLMSessionForLlm,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -209,6 +211,12 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Per-resource LLM idle timeouts in minutes (0..34560). Defaults to 5; `0` keeps that resource warm. */
+  llmIdleTimeoutMinutes?: {
+    embed?: number;
+    rerank?: number;
+    generate?: number;
+  };
 }
 
 /**
@@ -350,6 +358,24 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
+  const llmIdleTimeoutMs = {
+    embed: resolveLlmIdleTimeoutMs(
+      "embed",
+      options.llmIdleTimeoutMinutes?.embed,
+      process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES,
+    ),
+    rerank: resolveLlmIdleTimeoutMs(
+      "rerank",
+      options.llmIdleTimeoutMinutes?.rerank,
+      process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES,
+    ),
+    generate: resolveLlmIdleTimeoutMs(
+      "generate",
+      options.llmIdleTimeoutMinutes?.generate,
+      process.env.QMD_GENERATE_IDLE_TIMEOUT_MINUTES,
+    ),
+  };
+
   // Create the internal store (opens DB, creates tables)
   const internal = createStoreInternal(options.dbPath);
   const db = internal.db;
@@ -372,14 +398,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // Create a per-store LlamaCpp instance. Each model group lazy-loads on
+  // demand and independently unloads after its configured idle timeout.
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
+    idleTimeoutMs: llmIdleTimeoutMs,
   });
   internal.llm = llm;
 
@@ -388,7 +413,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     dbPath: internal.dbPath,
 
     // Search
-    search: async (opts) => {
+    search: async (opts) => withLLMSessionForLlm(llm, async () => {
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -424,10 +449,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
-    },
+    }),
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    searchVector: async (q, opts) => withLLMSessionForLlm(
+      llm,
+      async (session) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, session),
+    ),
+    expandQuery: async (q, opts) => withLLMSessionForLlm(
+      llm,
+      async () => internal.expandQuery(q, undefined, opts?.intent),
+    ),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });

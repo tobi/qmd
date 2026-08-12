@@ -47,6 +47,25 @@ qmd mcp --http --daemon     # Background
 qmd mcp stop                # Stop daemon
 ```
 
+Embedding, reranking, and query-generation resources each unload after five
+idle minutes by default. Configure them independently with
+`QMD_EMBED_IDLE_TIMEOUT_MINUTES`, `QMD_RERANK_IDLE_TIMEOUT_MINUTES`, and
+`QMD_GENERATE_IDLE_TIMEOUT_MINUTES`. `0` keeps that resource group warm; the
+maximum is `34560` minutes. For example:
+
+```bash
+QMD_EMBED_IDLE_TIMEOUT_MINUTES=0 QMD_RERANK_IDLE_TIMEOUT_MINUTES=10 QMD_GENERATE_IDLE_TIMEOUT_MINUTES=30 qmd mcp --http
+```
+
+The `query` tool uses embedding resources for `vec`/`hyde` searches and uses
+reranking unless the caller disables it. Its searches are already expanded, so
+the MCP tool does not invoke query generation itself; the CLI `qmd query` and a
+simple SDK `store.search()` can use all three groups. Each group's activity and
+timer are independent. Retrieved Markdown content is index data, not a live GPU
+context. Stopping the server explicitly releases all contexts and models,
+including groups configured with `0`. Use `qmd doctor` to inspect the effective
+values.
+
 ## Tools
 
 ### query

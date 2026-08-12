@@ -80,7 +80,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, resolveLlmIdleTimeoutMs, type LlmResourceGroup } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -125,21 +125,67 @@ let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
 
-function getStore(): ReturnType<typeof createStore> {
+const LLM_IDLE_TIMEOUT_ENV_NAMES: Record<LlmResourceGroup, string> = {
+  embed: "QMD_EMBED_IDLE_TIMEOUT_MINUTES",
+  rerank: "QMD_RERANK_IDLE_TIMEOUT_MINUTES",
+  generate: "QMD_GENERATE_IDLE_TIMEOUT_MINUTES",
+};
+
+type LlmIdleTimeoutDiagnostic = {
+  group: LlmResourceGroup;
+  milliseconds: number;
+  source: string;
+  error?: Error;
+};
+
+function inspectLlmIdleTimeoutConfiguration(): LlmIdleTimeoutDiagnostic[] {
+  return (Object.keys(LLM_IDLE_TIMEOUT_ENV_NAMES) as LlmResourceGroup[]).map((group) => {
+    const envName = LLM_IDLE_TIMEOUT_ENV_NAMES[group];
+    const rawValue = process.env[envName];
+    try {
+      return {
+        group,
+        milliseconds: resolveLlmIdleTimeoutMs(group, undefined, rawValue),
+        source: rawValue === undefined ? "default" : envName,
+      };
+    } catch (error) {
+      return {
+        group,
+        milliseconds: resolveLlmIdleTimeoutMs(group, undefined, undefined),
+        source: envName,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  });
+}
+
+function validateLlmIdleTimeoutEnvironment(): void {
+  const invalid = inspectLlmIdleTimeoutConfiguration().find((diagnostic) => diagnostic.error);
+  if (invalid?.error) throw invalid.error;
+}
+
+function getStore(idleTimeoutMs?: Record<LlmResourceGroup, number>): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB.
+    // Only configuration loading is optional; LLM configuration errors must
+    // remain visible to normal CLI commands.
+    let activeModels: ReturnType<typeof resolveModelsForCli> | undefined;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
+      activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+    } catch {
+      // Config may not exist yet — that's fine, DB works without it.
+    }
+
+    if (activeModels) {
       setDefaultLlamaCpp(new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
+        idleTimeoutMs,
       }));
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
     }
   }
   return store;
@@ -222,6 +268,7 @@ type CliLifecycleWritable = {
 type FinishSuccessfulCliCommandOptions = {
   command: string;
   format?: OutputFormat;
+  exitCode?: number;
   cleanup?: () => Promise<void>;
   exit?: (code: number) => void;
   stdout?: CliLifecycleWritable;
@@ -260,24 +307,26 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
+  const exitCode = options.exitCode ?? 0;
 
   await flushWritable(options.stdout ?? process.stdout);
 
   try {
     await (options.cleanup ?? disposeDefaultLlamaCpp)();
   } catch (error) {
+    const outputDescription = exitCode === 0 ? "successful output" : "command output";
     stderr.write(
-      `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
+      `QMD Warning: cleanup after ${outputDescription} failed (${error instanceof Error ? error.message : String(error)}); exiting ${exitCode} because command output completed.\n`
     );
   }
   await flushWritable(stderr);
 
   if (options.exit) {
-    options.exit(0);
+    options.exit(exitCode);
     return;
   }
 
-  process.exitCode = 0;
+  process.exitCode = exitCode;
 }
 
 // Ensure cursor is restored on exit
@@ -3492,6 +3541,9 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
+  add("QMD_EMBED_IDLE_TIMEOUT_MINUTES", "sets embedding model/context idle unload in minutes; 0 keeps them loaded");
+  add("QMD_RERANK_IDLE_TIMEOUT_MINUTES", "sets reranking model/context idle unload in minutes; 0 keeps them loaded");
+  add("QMD_GENERATE_IDLE_TIMEOUT_MINUTES", "sets generation model idle unload in minutes; 0 keeps it loaded");
   add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
   add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
   add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
@@ -3532,6 +3584,21 @@ function checkDoctorIndexConfig(nextSteps: string[]): DoctorConfigCheck {
     nextSteps.push(`Fix invalid YAML in ${configPath}, then rerun \`qmd doctor\`.`);
     return { config: null, valid: false };
   }
+}
+
+function checkLlmIdleTimeouts(diagnostics: LlmIdleTimeoutDiagnostic[]): boolean {
+  for (const diagnostic of diagnostics) {
+    const label = `LLM idle timeout (${diagnostic.group})`;
+    if (diagnostic.error) {
+      doctorCheck(label, false, diagnostic.error.message);
+      continue;
+    }
+
+    const minutes = diagnostic.milliseconds / 60_000;
+    doctorCheck(label, true, `${minutes} minutes (${diagnostic.source})`);
+  }
+
+  return diagnostics.every((diagnostic) => diagnostic.error === undefined);
 }
 
 function checkEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
@@ -3823,7 +3890,11 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
 }
 
 async function showDoctor(): Promise<void> {
-  const storeInstance = getStore();
+  const idleTimeoutDiagnostics = inspectLlmIdleTimeoutConfiguration();
+  const idleTimeoutMs = Object.fromEntries(
+    idleTimeoutDiagnostics.map((diagnostic) => [diagnostic.group, diagnostic.milliseconds]),
+  ) as Record<LlmResourceGroup, number>;
+  const storeInstance = getStore(idleTimeoutMs);
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
@@ -3841,6 +3912,8 @@ async function showDoctor(): Promise<void> {
   } catch (error) {
     doctorCheck("SQLite runtime", false, error instanceof Error ? error.message : String(error));
   }
+
+  const idleTimeoutsValid = checkLlmIdleTimeouts(idleTimeoutDiagnostics);
 
   const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
   doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
@@ -3940,6 +4013,7 @@ async function showDoctor(): Promise<void> {
   }
 
   closeDb();
+  if (!idleTimeoutsValid) process.exitCode = 1;
 }
 
 function printDoctorHint(): void {
@@ -4021,6 +4095,14 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  if (cli.command !== "doctor") {
+    try {
+      validateLlmIdleTimeoutEnvironment();
+    } catch (error) {
+      exitWithError(error);
+    }
   }
 
   switch (cli.command) {
@@ -4581,6 +4663,7 @@ if (isMain) {
     await finishSuccessfulCliCommand({
       command: cli.command,
       format: cli.opts.format,
+      exitCode: Number(process.exitCode ?? 0),
     });
   }
 

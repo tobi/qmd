@@ -136,7 +136,34 @@ The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
 - `GET /health` — liveness check with uptime
 
-LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+LLM resources are shared across HTTP requests, but they do not stay in VRAM
+indefinitely by default. Embedding, reranking, and query-generation resources
+each have an independent five-minute idle timeout. When one expires, QMD
+disposes that group's contexts before its model and transparently reloads both
+on the next request.
+
+Configure the three timeouts in minutes:
+
+```sh
+# Keep embeddings permanently warm, use the default for reranking,
+# and unload query generation after 30 minutes.
+export QMD_EMBED_IDLE_TIMEOUT_MINUTES=0
+export QMD_RERANK_IDLE_TIMEOUT_MINUTES=5
+export QMD_GENERATE_IDLE_TIMEOUT_MINUTES=30
+qmd mcp --http
+```
+
+`0` disables idle unloading for that resource group and therefore uses more
+RAM/VRAM. Values may range from `0` through `34560` minutes (24 days). An
+explicit server shutdown still releases every context and model. `qmd doctor`
+shows all three effective values and reports invalid settings while continuing
+the remaining diagnostics.
+
+The CLI `qmd search` command is lexical BM25 search and needs no LLM.
+`qmd vsearch` needs the embedding model and its contexts. `qmd query` can use
+query generation, embedding, and reranking, so each of the three timers may be
+active independently. Retrieved document text comes from the index; holding
+search results or document content does not keep a GPU context alive.
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
@@ -204,6 +231,11 @@ import { createStore } from '@tobilu/qmd'
 // 1. Inline config — no files needed besides the DB
 const store = await createStore({
   dbPath: './index.sqlite',
+  llmIdleTimeoutMinutes: {
+    embed: 0,       // Keep embedding resources warm
+    rerank: 5,      // Default behavior
+    generate: 30,
+  },
   config: {
     collections: {
       docs: { path: '/path/to/docs', pattern: '**/*.md' },
@@ -222,9 +254,18 @@ const store2 = await createStore({
 const store3 = await createStore({ dbPath: './index.sqlite' })
 ```
 
+`llmIdleTimeoutMinutes` follows the same `0..34560` range and per-resource
+semantics as the environment variables. Explicit SDK values take precedence
+over the corresponding environment variables; omitted values use the
+environment and then the five-minute default. `store.close()` always releases
+all LLM resources, including groups configured with `0`.
+
 #### Search
 
-The unified `search()` method handles both simple queries and pre-expanded structured queries:
+The SDK's unified `search()` method handles both simple queries and
+pre-expanded structured queries. Unlike the lexical-only CLI command
+`qmd search`, `store.search()` is a hybrid operation and may use query
+generation, embeddings, and reranking:
 
 ```typescript
 // Simple query — auto-expanded via LLM, then BM25 + vector + reranking
@@ -1071,6 +1112,9 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
+| `QMD_EMBED_IDLE_TIMEOUT_MINUTES` | `5` | Unload embedding contexts and model after this many idle minutes. `0` keeps them warm; maximum `34560`. |
+| `QMD_RERANK_IDLE_TIMEOUT_MINUTES` | `5` | Unload reranking contexts and model after this many idle minutes. `0` keeps them warm; maximum `34560`. |
+| `QMD_GENERATE_IDLE_TIMEOUT_MINUTES` | `5` | Unload the query-generation model after this many idle minutes. `0` keeps it warm; maximum `34560`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 
 ## How It Works

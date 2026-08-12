@@ -21,12 +21,531 @@ import {
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  resolveLlmIdleTimeoutMs,
   withLLMSession,
+  withLLMSessionForLlm,
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("LLM idle timeout resolution", () => {
+  test("uses the five-minute default when SDK and environment values are absent", () => {
+    expect(resolveLlmIdleTimeoutMs("embed", undefined, undefined)).toBe(300_000);
+  });
+
+  test("an explicit SDK zero overrides the environment value", () => {
+    expect(resolveLlmIdleTimeoutMs("embed", 0, "12.5")).toBe(0);
+  });
+
+  test("parses a decimal environment value in minutes", () => {
+    expect(resolveLlmIdleTimeoutMs("rerank", undefined, "0.1")).toBe(6_000);
+  });
+
+  test("accepts the documented maximum of 24 days", () => {
+    expect(resolveLlmIdleTimeoutMs("generate", 34_560, undefined)).toBe(2_073_600_000);
+  });
+
+  test.each(["", "-1", "NaN", "Infinity", "abc", "34560.1"])(
+    "rejects invalid embedding environment value %j with an actionable error",
+    (value) => {
+      expect(() => resolveLlmIdleTimeoutMs("embed", undefined, value)).toThrow(
+        "QMD_EMBED_IDLE_TIMEOUT_MINUTES must be a finite number between 0 and 34560 minutes",
+      );
+    },
+  );
+
+  test("LlamaCpp validates timeout environment variables for direct CLI use", () => {
+    const previous = process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES;
+    process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES = "invalid";
+    try {
+      expect(() => new LlamaCpp()).toThrow(
+        "QMD_RERANK_IDLE_TIMEOUT_MINUTES must be a finite number between 0 and 34560 minutes",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES;
+      else process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES = previous;
+    }
+  });
+});
+
+async function advanceFakeTimersByTime(ms: number): Promise<void> {
+  vi.advanceTimersByTime(ms);
+  for (let pendingMicrotask = 0; pendingMicrotask < 10; pendingMicrotask += 1) {
+    await Promise.resolve();
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+describe("LlamaCpp idle resource timers", () => {
+  test("embedding activity schedules only the embedding timer", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 60_000, rerank: 120_000, generate: 180_000 },
+    }) as any;
+    llm._ciMode = false;
+    const context = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    llm.embedContexts = [context];
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(context);
+
+    try {
+      await llm.embed("timer isolation");
+
+      expect(llm.idleTimers.embed).not.toBeNull();
+      expect(llm.idleTimers.rerank).toBeNull();
+      expect(llm.idleTimers.generate).toBeNull();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("embedding timeout disposes contexts before its model and leaves other groups warm", async () => {
+    vi.useFakeTimers();
+    const disposalOrder: string[] = [];
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 200, generate: 300 },
+    }) as any;
+    llm._ciMode = false;
+    const embedContext = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn(async () => { disposalOrder.push("embed-context"); }),
+    };
+    const embedModel = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn(async () => { disposalOrder.push("embed-model"); }),
+    };
+    const rerankContext = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const rerankModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const generateModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    llm.embedContexts = [embedContext];
+    llm.embedModel = embedModel;
+    llm.rerankContexts = [rerankContext];
+    llm.rerankModel = rerankModel;
+    llm.generateModel = generateModel;
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(embedContext);
+
+    try {
+      await llm.embed("resource isolation");
+      await advanceFakeTimersByTime(100);
+
+      expect(disposalOrder).toEqual(["embed-context", "embed-model"]);
+      expect(rerankContext.dispose).not.toHaveBeenCalled();
+      expect(rerankModel.dispose).not.toHaveBeenCalled();
+      expect(generateModel.dispose).not.toHaveBeenCalled();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a per-store session defers idle unload for its own LlamaCpp instance", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    llm._ciMode = false;
+    const context = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const model = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    llm.embedContexts = [context];
+    llm.embedModel = model;
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(context);
+
+    try {
+      await withLLMSessionForLlm(llm, async (session) => {
+        await session.embed("active session");
+        await advanceFakeTimersByTime(100);
+        expect(context.dispose).not.toHaveBeenCalled();
+      });
+
+      await advanceFakeTimersByTime(100);
+      expect(context.dispose).toHaveBeenCalledOnce();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a completed operation receives a full idle interval before unloading", async () => {
+    vi.useFakeTimers();
+    const ranking = deferred<number[]>();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 100, generate: 0 },
+    }) as any;
+    llm._ciMode = false;
+    const context = {
+      rankAll: vi.fn(() => ranking.promise),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    llm.rerankContexts = [context];
+    llm.rerankModel = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+
+    try {
+      const operation = withLLMSessionForLlm(
+        llm,
+        async (session) => session.rerank("query", [{ file: "doc.md", text: "text" }]),
+      );
+      await advanceFakeTimersByTime(150);
+      expect(context.dispose).not.toHaveBeenCalled();
+
+      ranking.resolve([0.75]);
+      await operation;
+      await advanceFakeTimersByTime(50);
+      expect(context.dispose).not.toHaveBeenCalled();
+
+      await advanceFakeTimersByTime(50);
+      expect(context.dispose).toHaveBeenCalledOnce();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a new operation waits for an in-progress idle unload before reloading", async () => {
+    vi.useFakeTimers();
+    const contextDisposal = deferred<void>();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    llm._ciMode = false;
+    const oldContext = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn(() => contextDisposal.promise),
+    };
+    const oldModel = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const newModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const loadModel = vi.fn().mockResolvedValue(newModel);
+    llm.embedContexts = [oldContext];
+    llm.embedModel = oldModel;
+    llm.llama = { loadModel, dispose: vi.fn().mockResolvedValue(undefined) };
+    llm.resolveModel = vi.fn().mockResolvedValue("/tmp/fake-embed.gguf");
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(oldContext);
+
+    try {
+      await llm.embed("first operation");
+      await advanceFakeTimersByTime(100);
+      expect(oldContext.dispose).toHaveBeenCalledOnce();
+
+      const reload = llm.ensureEmbedModel();
+      await Promise.resolve();
+      expect(loadModel).not.toHaveBeenCalled();
+
+      contextDisposal.resolve();
+      expect(await reload).toBe(newModel);
+      expect(oldModel.dispose).toHaveBeenCalledOnce();
+      expect(loadModel).toHaveBeenCalledOnce();
+    } finally {
+      contextDisposal.resolve();
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a rejected idle context dispose still releases the model and allows reload", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    const oldContext = {
+      dispose: vi.fn().mockRejectedValue(new Error("native context dispose failed")),
+    };
+    const oldModel = {
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const newModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const loadModel = vi.fn().mockResolvedValue(newModel);
+    llm.embedContexts = [oldContext];
+    llm.embedModel = oldModel;
+    llm.llama = { loadModel, dispose: vi.fn().mockResolvedValue(undefined) };
+    llm.resolveModel = vi.fn().mockResolvedValue("/tmp/fake-embed.gguf");
+    llm.touchActivity("embed");
+
+    try {
+      await advanceFakeTimersByTime(100);
+      expect(oldModel.dispose).toHaveBeenCalledOnce();
+      expect(await llm.ensureEmbedModel()).toBe(newModel);
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a hanging idle context dispose times out without blocking reload", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    const oldContext = {
+      dispose: vi.fn(() => new Promise<void>(() => {})),
+    };
+    const oldModel = {
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const newModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const loadModel = vi.fn().mockResolvedValue(newModel);
+    llm.embedContexts = [oldContext];
+    llm.embedModel = oldModel;
+    llm.llama = { loadModel, dispose: vi.fn().mockResolvedValue(undefined) };
+    llm.resolveModel = vi.fn().mockResolvedValue("/tmp/fake-embed.gguf");
+    llm.touchActivity("embed");
+
+    try {
+      await advanceFakeTimersByTime(100);
+      const reload = llm.ensureEmbedModel();
+      await Promise.resolve();
+      expect(loadModel).not.toHaveBeenCalled();
+
+      await advanceFakeTimersByTime(1_000);
+      expect(await reload).toBe(newModel);
+      expect(oldModel.dispose).toHaveBeenCalledOnce();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("timeout zero keeps embedding resources warm without creating a timer", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 100, generate: 100 },
+    }) as any;
+    llm._ciMode = false;
+    const context = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const model = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    llm.embedContexts = [context];
+    llm.embedModel = model;
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(context);
+
+    try {
+      await llm.embed("stay warm");
+      await advanceFakeTimersByTime(1_000);
+
+      expect(llm.idleTimers.embed).toBeNull();
+      expect(context.dispose).not.toHaveBeenCalled();
+      expect(model.dispose).not.toHaveBeenCalled();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("repeated embedding activity resets its idle deadline", async () => {
+    vi.useFakeTimers();
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    llm._ciMode = false;
+    const context = {
+      getEmbeddingFor: vi.fn().mockResolvedValue({ vector: new Float32Array([0.5]) }),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const model = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    llm.embedContexts = [context];
+    llm.embedModel = model;
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue(context);
+
+    try {
+      await llm.embed("first");
+      await advanceFakeTimersByTime(50);
+      await llm.embed("second");
+      await advanceFakeTimersByTime(50);
+      expect(context.dispose).not.toHaveBeenCalled();
+
+      await advanceFakeTimersByTime(50);
+      expect(context.dispose).toHaveBeenCalledOnce();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("reranking and generation unload independently and leave embedding warm", async () => {
+    vi.useFakeTimers();
+    const disposalOrder: string[] = [];
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 100, generate: 200 },
+    }) as any;
+    llm._ciMode = false;
+    const embedContext = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const embedModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const rerankContext = {
+      rankAll: vi.fn().mockResolvedValue([0.75]),
+      dispose: vi.fn(async () => { disposalOrder.push("rerank-context"); }),
+    };
+    const rerankModel = {
+      tokenize: vi.fn().mockReturnValue([]),
+      detokenize: vi.fn().mockReturnValue(""),
+      dispose: vi.fn(async () => { disposalOrder.push("rerank-model"); }),
+    };
+    const generateModel = {
+      dispose: vi.fn(async () => { disposalOrder.push("generate-model"); }),
+    };
+    llm.embedContexts = [embedContext];
+    llm.embedModel = embedModel;
+    llm.rerankContexts = [rerankContext];
+    llm.rerankModel = rerankModel;
+    llm.generateModel = generateModel;
+
+    try {
+      await llm.rerank("query", [{ file: "doc.md", text: "text" }]);
+      await llm.ensureGenerateModel();
+      await advanceFakeTimersByTime(100);
+
+      expect(disposalOrder).toEqual(["rerank-context", "rerank-model"]);
+      expect(embedContext.dispose).not.toHaveBeenCalled();
+      expect(embedModel.dispose).not.toHaveBeenCalled();
+      expect(generateModel.dispose).not.toHaveBeenCalled();
+
+      await advanceFakeTimersByTime(100);
+      expect(disposalOrder).toEqual([
+        "rerank-context",
+        "rerank-model",
+        "generate-model",
+      ]);
+      expect(embedContext.dispose).not.toHaveBeenCalled();
+      expect(embedModel.dispose).not.toHaveBeenCalled();
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("concurrent rerank requests create one shared context pool", async () => {
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 0, generate: 0 },
+    }) as any;
+    const context = {
+      rankAll: vi.fn().mockResolvedValue([0.75]),
+      dispose: vi.fn().mockResolvedValue(undefined),
+    };
+    const createRankingContext = vi.fn().mockResolvedValue(context);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(1);
+
+    try {
+      const [first, second] = await Promise.all([
+        llm.ensureRerankContexts(),
+        llm.ensureRerankContexts(),
+      ]);
+
+      expect(createRankingContext).toHaveBeenCalledOnce();
+      expect(first).toBe(second);
+    } finally {
+      await llm.dispose();
+    }
+  });
+
+  test("an embedding model can load again after its idle timeout", async () => {
+    vi.useFakeTimers();
+    const firstModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const secondModel = { dispose: vi.fn().mockResolvedValue(undefined) };
+    const loadModel = vi.fn()
+      .mockResolvedValueOnce(firstModel)
+      .mockResolvedValueOnce(secondModel);
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 100, rerank: 0, generate: 0 },
+    }) as any;
+    llm.llama = { loadModel, dispose: vi.fn().mockResolvedValue(undefined) };
+    llm.resolveModel = vi.fn().mockResolvedValue("/tmp/fake-embed.gguf");
+
+    try {
+      expect(await llm.ensureEmbedModel()).toBe(firstModel);
+      await advanceFakeTimersByTime(100);
+      expect(firstModel.dispose).toHaveBeenCalledOnce();
+
+      expect(await llm.ensureEmbedModel()).toBe(secondModel);
+      expect(loadModel).toHaveBeenCalledTimes(2);
+    } finally {
+      await llm.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("explicit dispose releases permanently warm resources and resets lifecycle state", async () => {
+    const disposalOrder: string[] = [];
+    const llm = new LlamaCpp({
+      idleTimeoutMs: { embed: 0, rerank: 0, generate: 0 },
+    }) as any;
+    llm.embedContexts = [{
+      dispose: vi.fn(async () => { disposalOrder.push("embed-context"); }),
+    }];
+    llm.rerankContexts = [{
+      dispose: vi.fn(async () => { disposalOrder.push("rerank-context"); }),
+    }];
+    llm.embedModel = {
+      dispose: vi.fn(async () => { disposalOrder.push("embed-model"); }),
+    };
+    llm.generateModel = {
+      dispose: vi.fn(async () => { disposalOrder.push("generate-model"); }),
+    };
+    llm.rerankModel = {
+      dispose: vi.fn(async () => { disposalOrder.push("rerank-model"); }),
+    };
+    llm.llama = {
+      dispose: vi.fn(async () => { disposalOrder.push("llama"); }),
+    };
+    llm.embedModelLoadPromise = Promise.resolve(llm.embedModel);
+    llm.generateModelLoadPromise = Promise.resolve(llm.generateModel);
+    llm.rerankModelLoadPromise = Promise.resolve(llm.rerankModel);
+    llm.embedContextsCreatePromise = Promise.resolve(llm.embedContexts);
+    llm.rerankContextsCreatePromise = Promise.resolve(llm.rerankContexts);
+
+    await llm.dispose();
+
+    expect(disposalOrder).toEqual([
+      "embed-context",
+      "rerank-context",
+      "embed-model",
+      "generate-model",
+      "rerank-model",
+      "llama",
+    ]);
+    expect(llm.embedModelLoadPromise).toBeNull();
+    expect(llm.generateModelLoadPromise).toBeNull();
+    expect(llm.rerankModelLoadPromise).toBeNull();
+    expect(llm.embedContextsCreatePromise).toBeNull();
+    expect(llm.rerankContextsCreatePromise).toBeNull();
+  });
+});
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {

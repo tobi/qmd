@@ -290,6 +290,37 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
   };
 }
 
+
+export type LlmResourceGroup = "embed" | "rerank" | "generate";
+
+export function resolveLlmIdleTimeoutMs(
+  group: LlmResourceGroup,
+  sdkValue: number | undefined,
+  envValue: string | undefined,
+): number {
+  const envNames: Record<LlmResourceGroup, string> = {
+    embed: "QMD_EMBED_IDLE_TIMEOUT_MINUTES",
+    rerank: "QMD_RERANK_IDLE_TIMEOUT_MINUTES",
+    generate: "QMD_GENERATE_IDLE_TIMEOUT_MINUTES",
+  };
+  const optionName = sdkValue === undefined
+    ? envNames[group]
+    : `llmIdleTimeoutMinutes.${group}`;
+  const minutes = sdkValue ?? (
+    envValue === undefined
+      ? 5
+      : envValue.trim() === ""
+        ? Number.NaN
+        : Number(envValue)
+  );
+
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > 34_560) {
+    throw new Error(`${optionName} must be a finite number between 0 and 34560 minutes`);
+  }
+
+  return minutes * 60 * 1000;
+}
+
 // Local model cache directory
 const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
@@ -566,28 +597,13 @@ export type LlamaCppConfig = {
    * Default: 2048. Can also be set via QMD_EXPAND_CONTEXT_SIZE.
    */
   expandContextSize?: number;
-  /**
-   * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
-   *
-   * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
-   * contexts when idle, since contexts (and their sequences) are the heavy per-session objects.
-   * @see https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
-   */
-  inactivityTimeoutMs?: number;
-  /**
-   * Whether to dispose models on inactivity (default: false).
-   *
-   * Keeping models loaded avoids repeated VRAM thrash; set to true only if you need aggressive
-   * memory reclaim.
-   */
-  disposeModelsOnInactivity?: boolean;
+  /** Resolved per-resource idle timeouts in milliseconds. */
+  idleTimeoutMs?: Record<LlmResourceGroup, number>;
 };
 
 /**
  * LLM implementation using node-llama-cpp
  */
-// Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
-const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
@@ -709,19 +725,30 @@ export class LlamaCpp implements LLM {
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  private rerankContextsCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> | null = null;
   // Guard against concurrent ensureLlama() calls creating duplicate Llama
   // instances. Without this, two concurrent callers each build their own
   // runtime and the last write to this.llama wins, leaving models/grammars
   // bound to different Llama instances ("different Llama instance" errors).
   private llamaLoadPromise: Promise<Llama> | null = null;
 
-  // Inactivity timer for auto-unloading models
-  private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
-  private inactivityTimeoutMs: number;
-  private disposeModelsOnInactivity: boolean;
+  // Independent inactivity timers for each resource group.
+  private readonly idleTimers: Record<LlmResourceGroup, ReturnType<typeof setTimeout> | null> = {
+    embed: null,
+    rerank: null,
+    generate: null,
+  };
+  private readonly idleUnloadPromises: Record<LlmResourceGroup, Promise<void> | null> = {
+    embed: null,
+    rerank: null,
+    generate: null,
+  };
+  private readonly idleTimeoutMs: Record<LlmResourceGroup, number>;
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
+  private activeLifecycleSessions = 0;
+  private inFlightLifecycleOperations = 0;
 
 
   constructor(config: LlamaCppConfig = {}) {
@@ -736,8 +763,23 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
-    this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
-    this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.idleTimeoutMs = config.idleTimeoutMs ?? {
+      embed: resolveLlmIdleTimeoutMs(
+        "embed",
+        undefined,
+        process.env.QMD_EMBED_IDLE_TIMEOUT_MINUTES,
+      ),
+      rerank: resolveLlmIdleTimeoutMs(
+        "rerank",
+        undefined,
+        process.env.QMD_RERANK_IDLE_TIMEOUT_MINUTES,
+      ),
+      generate: resolveLlmIdleTimeoutMs(
+        "generate",
+        undefined,
+        process.env.QMD_GENERATE_IDLE_TIMEOUT_MINUTES,
+      ),
+    };
   }
 
   get embedModelName(): string {
@@ -752,93 +794,139 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
-  /**
-   * Reset the inactivity timer. Called after each model operation.
-   * When timer fires, models are unloaded to free memory (if no active sessions).
-   */
-  private touchActivity(): void {
-    // Clear existing timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
-    }
+  acquireLifecycleSession(): void {
+    this.activeLifecycleSessions++;
+  }
 
-    // Only set timer if we have disposable contexts and timeout is enabled
-    if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
-      this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
-          // Active sessions/operations - reschedule timer
-          this.touchActivity();
-          return;
-        }
-        this.unloadIdleResources().catch(err => {
-          console.error("Error unloading idle resources:", err);
-        });
-      }, this.inactivityTimeoutMs);
-      // Don't keep process alive just for this timer
-      this.inactivityTimer.unref();
-    }
+  releaseLifecycleSession(): void {
+    this.activeLifecycleSessions = Math.max(0, this.activeLifecycleSessions - 1);
+  }
+
+  lifecycleOperationStart(): void {
+    this.inFlightLifecycleOperations++;
+  }
+
+  lifecycleOperationEnd(): void {
+    this.inFlightLifecycleOperations = Math.max(0, this.inFlightLifecycleOperations - 1);
+  }
+
+  canUnloadIdleResources(): boolean {
+    return this.activeLifecycleSessions === 0 && this.inFlightLifecycleOperations === 0;
   }
 
   /**
-   * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
+   * Reset one resource group's inactivity timer after model activity.
+   * The timer unloads that group's contexts and model once the instance is idle.
    */
-  private hasLoadedContexts(): boolean {
-    return !!(this.embedContexts.length > 0 || this.rerankContexts.length > 0);
+  private touchActivity(group: LlmResourceGroup): void {
+    if (this.disposed) return;
+
+    const currentTimer = this.idleTimers[group];
+    if (currentTimer) {
+      clearTimeout(currentTimer);
+      this.idleTimers[group] = null;
+    }
+
+    const timeoutMs = this.idleTimeoutMs[group];
+    if (timeoutMs === 0 || !this.hasLoadedResources(group)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (!this.canUnloadIdleResources()) {
+        this.touchActivity(group);
+        return;
+      }
+      this.startIdleUnload(group);
+    }, timeoutMs);
+    timer.unref();
+    this.idleTimers[group] = timer;
+  }
+
+  private startIdleUnload(group: LlmResourceGroup): void {
+    if (this.idleUnloadPromises[group]) return;
+
+    const unloadPromise = this.unloadIdleResources(group).catch((error) => {
+      console.error(`Error unloading idle ${group} resources:`, error);
+    });
+    this.idleUnloadPromises[group] = unloadPromise;
+    void unloadPromise.finally(() => {
+      if (this.idleUnloadPromises[group] === unloadPromise) {
+        this.idleUnloadPromises[group] = null;
+      }
+    });
+  }
+
+  private async waitForIdleUnload(group: LlmResourceGroup): Promise<void> {
+    const unloadPromise = this.idleUnloadPromises[group];
+    if (unloadPromise) await unloadPromise;
   }
 
   /**
-   * Unload idle resources but keep the instance alive for future use.
-   *
-   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
-   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
+   * Check whether this resource group currently holds a model or context.
    */
-  async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
+  private hasLoadedResources(group: LlmResourceGroup): boolean {
+    if (group === "embed") {
+      return this.embedModel !== null || this.embedContexts.length > 0;
+    }
+    if (group === "rerank") {
+      return this.rerankModel !== null || this.rerankContexts.length > 0;
+    }
+    return this.generateModel !== null;
+  }
+
+  /**
+   * Unload one idle resource group while keeping the instance reusable.
+   * Contexts are disposed before their owning model; load guards are reset so
+   * the next operation can transparently recreate the complete resource group.
+   */
+  private async unloadIdleResources(group: LlmResourceGroup): Promise<void> {
     if (this.disposed) {
       return;
     }
 
-    // Clear timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
-    }
+    const timer = this.idleTimers[group];
+    if (timer) clearTimeout(timer);
+    this.idleTimers[group] = null;
 
-    // Dispose contexts first
-    for (const ctx of this.embedContexts) {
-      await ctx.dispose();
-    }
-    this.embedContexts = [];
-    for (const ctx of this.rerankContexts) {
-      await ctx.dispose();
-    }
-    this.rerankContexts = [];
-
-    // Optionally dispose models too (opt-in)
-    if (this.disposeModelsOnInactivity) {
-      if (this.embedModel) {
-        await this.embedModel.dispose();
-        this.embedModel = null;
-      }
-      if (this.generateModel) {
-        await this.generateModel.dispose();
-        this.generateModel = null;
-      }
-      if (this.rerankModel) {
-        await this.rerankModel.dispose();
-        this.rerankModel = null;
-      }
-      // Reset load promises so models can be reloaded later
+    if (group === "embed") {
+      const contexts = this.embedContexts;
+      const model = this.embedModel;
+      this.embedContexts = [];
+      this.embedModel = null;
       this.embedModelLoadPromise = null;
-      this.generateModelLoadPromise = null;
-      this.rerankModelLoadPromise = null;
+      this.embedContextsCreatePromise = null;
+      for (const context of contexts) {
+        await disposeWithTimeout("idle embedding context", () => context.dispose());
+      }
+      if (model) {
+        await disposeWithTimeout("idle embedding model", () => model.dispose());
+      }
+      return;
     }
 
-    // Note: We keep llama instance alive - it's lightweight
+    if (group === "rerank") {
+      const contexts = this.rerankContexts;
+      const model = this.rerankModel;
+      this.rerankContexts = [];
+      this.rerankModel = null;
+      this.rerankModelLoadPromise = null;
+      this.rerankContextsCreatePromise = null;
+      for (const context of contexts) {
+        await disposeWithTimeout("idle rerank context", () => context.dispose());
+      }
+      if (model) {
+        await disposeWithTimeout("idle rerank model", () => model.dispose());
+      }
+      return;
+    }
+
+    const model = this.generateModel;
+    this.generateModel = null;
+    this.generateModelLoadPromise = null;
+    if (model) {
+      await disposeWithTimeout("idle generation model", () => model.dispose());
+    }
   }
 
   /**
@@ -991,6 +1079,7 @@ export class LlamaCpp implements LLM {
    * Load embedding model (lazy)
    */
   private async ensureEmbedModel(): Promise<LlamaModel> {
+    await this.waitForIdleUnload("embed");
     if (this.embedModel) {
       return this.embedModel;
     }
@@ -1004,7 +1093,7 @@ export class LlamaCpp implements LLM {
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.embedModel = model;
       // Model loading counts as activity - ping to keep alive
-      this.touchActivity();
+      this.touchActivity("embed");
       return model;
     })();
 
@@ -1064,8 +1153,9 @@ export class LlamaCpp implements LLM {
   private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
 
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
+    await this.waitForIdleUnload("embed");
     if (this.embedContexts.length > 0) {
-      this.touchActivity();
+      this.touchActivity("embed");
       return this.embedContexts;
     }
 
@@ -1089,7 +1179,7 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
-      this.touchActivity();
+      this.touchActivity("embed");
       return this.embedContexts;
     })();
 
@@ -1112,6 +1202,7 @@ export class LlamaCpp implements LLM {
    * Load generation model (lazy) - context is created fresh per call
    */
   private async ensureGenerateModel(): Promise<LlamaModel> {
+    await this.waitForIdleUnload("generate");
     if (!this.generateModel) {
       if (this.generateModelLoadPromise) {
         return await this.generateModelLoadPromise;
@@ -1131,7 +1222,7 @@ export class LlamaCpp implements LLM {
         this.generateModelLoadPromise = null;
       }
     }
-    this.touchActivity();
+    this.touchActivity("generate");
     if (!this.generateModel) {
       throw new Error("Generate model not loaded");
     }
@@ -1142,6 +1233,7 @@ export class LlamaCpp implements LLM {
    * Load rerank model (lazy)
    */
   private async ensureRerankModel(): Promise<LlamaModel> {
+    await this.waitForIdleUnload("rerank");
     if (this.rerankModel) {
       return this.rerankModel;
     }
@@ -1155,7 +1247,7 @@ export class LlamaCpp implements LLM {
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
-      this.touchActivity();
+      this.touchActivity("rerank");
       return model;
     })();
 
@@ -1192,7 +1284,16 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    await this.waitForIdleUnload("rerank");
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity("rerank");
+      return this.rerankContexts;
+    }
+    if (this.rerankContextsCreatePromise) {
+      return await this.rerankContextsCreatePromise;
+    }
+
+    this.rerankContextsCreatePromise = (async () => {
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
       const n = Math.min(await this.computeParallelism(1000), 4);
@@ -1205,7 +1306,6 @@ export class LlamaCpp implements LLM {
           }));
         } catch {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
             try {
               this.rerankContexts.push(await model.createRankingContext({
                 contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
@@ -1218,9 +1318,15 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
+      this.touchActivity("rerank");
+      return this.rerankContexts;
+    })();
+
+    try {
+      return await this.rerankContextsCreatePromise;
+    } finally {
+      this.rerankContextsCreatePromise = null;
     }
-    this.touchActivity();
-    return this.rerankContexts;
   }
 
   // ==========================================================================
@@ -1296,7 +1402,7 @@ export class LlamaCpp implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    this.touchActivity("embed");
 
     try {
       const context = await this.ensureEmbedContext();
@@ -1316,6 +1422,8 @@ export class LlamaCpp implements LLM {
     } catch (error) {
       console.error("Embedding error:", error);
       return null;
+    } finally {
+      this.touchActivity("embed");
     }
   }
 
@@ -1326,7 +1434,7 @@ export class LlamaCpp implements LLM {
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    this.touchActivity("embed");
 
     if (texts.length === 0) return [];
 
@@ -1345,7 +1453,7 @@ export class LlamaCpp implements LLM {
               console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
             const embedding = await context.getEmbeddingFor(safeText);
-            this.touchActivity();
+            this.touchActivity("embed");
             embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
@@ -1372,7 +1480,7 @@ export class LlamaCpp implements LLM {
                 console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
               const embedding = await ctx.getEmbeddingFor(safeText);
-              this.touchActivity();
+              this.touchActivity("embed");
               results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
             } catch (err) {
               console.error("Embedding error for text:", err);
@@ -1387,13 +1495,15 @@ export class LlamaCpp implements LLM {
     } catch (error) {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
+    } finally {
+      this.touchActivity("embed");
     }
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    this.touchActivity("generate");
 
     // Ensure model is loaded
     await this.ensureGenerateModel();
@@ -1428,7 +1538,11 @@ export class LlamaCpp implements LLM {
       };
     } finally {
       // Dispose context (which disposes dependent sequences/sessions per lifecycle rules)
-      await context.dispose();
+      try {
+        await context.dispose();
+      } finally {
+        this.touchActivity("generate");
+      }
     }
   }
 
@@ -1454,7 +1568,7 @@ export class LlamaCpp implements LLM {
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    this.touchActivity("generate");
 
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
@@ -1541,7 +1655,11 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      if (genContext) await genContext.dispose();
+      try {
+        if (genContext) await genContext.dispose();
+      } finally {
+        this.touchActivity("generate");
+      }
     }
   }
 
@@ -1558,92 +1676,96 @@ export class LlamaCpp implements LLM {
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    this.touchActivity("rerank");
 
-    const contexts = await this.ensureRerankContexts();
-    const model = await this.ensureRerankModel();
+    try {
+      const contexts = await this.ensureRerankContexts();
+      const model = await this.ensureRerankModel();
 
-    // Truncate documents that would exceed the rerank context size.
-    // Budget = contextSize - template overhead - query tokens
-    const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
-    const truncationCache = new Map<string, string>();
+      // Truncate documents that would exceed the rerank context size.
+      // Budget = contextSize - template overhead - query tokens
+      const queryTokens = model.tokenize(query).length;
+      const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+      const truncationCache = new Map<string, string>();
 
-    const truncatedDocs = documents.map((doc) => {
-      const cached = truncationCache.get(doc.text);
-      if (cached !== undefined) {
-        return cached === doc.text ? doc : { ...doc, text: cached };
+      const truncatedDocs = documents.map((doc) => {
+        const cached = truncationCache.get(doc.text);
+        if (cached !== undefined) {
+          return cached === doc.text ? doc : { ...doc, text: cached };
+        }
+
+        const tokens = model.tokenize(doc.text);
+        const truncatedText = tokens.length <= maxDocTokens
+          ? doc.text
+          : model.detokenize(tokens.slice(0, maxDocTokens));
+        truncationCache.set(doc.text, truncatedText);
+
+        if (truncatedText === doc.text) return doc;
+        return { ...doc, text: truncatedText };
+      });
+
+      // Deduplicate identical effective texts before scoring.
+      // This avoids redundant work for repeated chunks and fixes collisions where
+      // multiple docs map to the same chunk text.
+      const textToDocs = new Map<string, { file: string; index: number }[]>();
+      truncatedDocs.forEach((doc, index) => {
+        const existing = textToDocs.get(doc.text);
+        if (existing) {
+          existing.push({ file: doc.file, index });
+        } else {
+          textToDocs.set(doc.text, [{ file: doc.file, index }]);
+        }
+      });
+
+      // Extract just the text for ranking
+      const texts = Array.from(textToDocs.keys());
+
+      // Split documents across contexts for parallel evaluation.
+      // Each context has its own sequence with a lock, so parallelism comes
+      // from multiple contexts evaluating different chunks simultaneously.
+      const activeContextCount = Math.max(
+        1,
+        Math.min(
+          contexts.length,
+          Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+        )
+      );
+      const activeContexts = contexts.slice(0, activeContextCount);
+      const chunkSize = Math.ceil(texts.length / activeContexts.length);
+      const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
+        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+      ).filter(chunk => chunk.length > 0);
+
+      const allScores = await Promise.all(
+        chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
+      );
+
+      // Reassemble scores in original order and sort
+      const flatScores = allScores.flat();
+      const ranked = texts
+        .map((text, i) => ({ document: text, score: flatScores[i]! }))
+        .sort((a, b) => b.score - a.score);
+
+      // Map back to our result format.
+      const results: RerankDocumentResult[] = [];
+      for (const item of ranked) {
+        const docInfos = textToDocs.get(item.document) ?? [];
+        for (const docInfo of docInfos) {
+          results.push({
+            file: docInfo.file,
+            score: item.score,
+            index: docInfo.index,
+          });
+        }
       }
 
-      const tokens = model.tokenize(doc.text);
-      const truncatedText = tokens.length <= maxDocTokens
-        ? doc.text
-        : model.detokenize(tokens.slice(0, maxDocTokens));
-      truncationCache.set(doc.text, truncatedText);
-
-      if (truncatedText === doc.text) return doc;
-      return { ...doc, text: truncatedText };
-    });
-
-    // Deduplicate identical effective texts before scoring.
-    // This avoids redundant work for repeated chunks and fixes collisions where
-    // multiple docs map to the same chunk text.
-    const textToDocs = new Map<string, { file: string; index: number }[]>();
-    truncatedDocs.forEach((doc, index) => {
-      const existing = textToDocs.get(doc.text);
-      if (existing) {
-        existing.push({ file: doc.file, index });
-      } else {
-        textToDocs.set(doc.text, [{ file: doc.file, index }]);
-      }
-    });
-
-    // Extract just the text for ranking
-    const texts = Array.from(textToDocs.keys());
-
-    // Split documents across contexts for parallel evaluation.
-    // Each context has its own sequence with a lock, so parallelism comes
-    // from multiple contexts evaluating different chunks simultaneously.
-    const activeContextCount = Math.max(
-      1,
-      Math.min(
-        contexts.length,
-        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
-      )
-    );
-    const activeContexts = contexts.slice(0, activeContextCount);
-    const chunkSize = Math.ceil(texts.length / activeContexts.length);
-    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
-      texts.slice(i * chunkSize, (i + 1) * chunkSize)
-    ).filter(chunk => chunk.length > 0);
-
-    const allScores = await Promise.all(
-      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
-    );
-
-    // Reassemble scores in original order and sort
-    const flatScores = allScores.flat();
-    const ranked = texts
-      .map((text, i) => ({ document: text, score: flatScores[i]! }))
-      .sort((a, b) => b.score - a.score);
-
-    // Map back to our result format.
-    const results: RerankDocumentResult[] = [];
-    for (const item of ranked) {
-      const docInfos = textToDocs.get(item.document) ?? [];
-      for (const docInfo of docInfos) {
-        results.push({
-          file: docInfo.file,
-          score: item.score,
-          index: docInfo.index,
-        });
-      }
+      return {
+        results,
+        model: this.rerankModelUri,
+      };
+    } finally {
+      this.touchActivity("rerank");
     }
-
-    return {
-      results,
-      model: this.rerankModelUri,
-    };
   }
 
   /**
@@ -1684,9 +1806,16 @@ export class LlamaCpp implements LLM {
     this.disposed = true;
 
     // Clear inactivity timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
+    for (const group of ["embed", "rerank", "generate"] as const) {
+      const timer = this.idleTimers[group];
+      if (timer) clearTimeout(timer);
+      this.idleTimers[group] = null;
+    }
+    await Promise.allSettled(
+      (Object.values(this.idleUnloadPromises).filter(Boolean) as Promise<void>[]),
+    );
+    for (const group of ["embed", "rerank", "generate"] as const) {
+      this.idleUnloadPromises[group] = null;
     }
 
     // Explicitly dispose in dependency order: contexts first, then models, then llama.
@@ -1726,6 +1855,7 @@ export class LlamaCpp implements LLM {
     this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.rerankContextsCreatePromise = null;
     this.llamaLoadPromise = null;
   }
 }
@@ -1755,28 +1885,31 @@ class LLMSessionManager {
     return this._inFlightOperations;
   }
 
-  /**
-   * Returns true only when both session count and in-flight operations are 0.
-   * Used by LlamaCpp to determine if idle unload is safe.
-   */
   canUnload(): boolean {
-    return this._activeSessionCount === 0 && this._inFlightOperations === 0;
+    return this.llm.canUnloadIdleResources?.()
+      ?? (this._activeSessionCount === 0 && this._inFlightOperations === 0);
   }
 
   acquire(): void {
     this._activeSessionCount++;
+    this.llm.acquireLifecycleSession?.();
   }
 
   release(): void {
-    this._activeSessionCount = Math.max(0, this._activeSessionCount - 1);
+    if (this._activeSessionCount === 0) return;
+    this._activeSessionCount--;
+    this.llm.releaseLifecycleSession?.();
   }
 
   operationStart(): void {
     this._inFlightOperations++;
+    this.llm.lifecycleOperationStart?.();
   }
 
   operationEnd(): void {
-    this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
+    if (this._inFlightOperations === 0) return;
+    this._inFlightOperations--;
+    this.llm.lifecycleOperationEnd?.();
   }
 
   getLlamaCpp(): LlamaCpp {

@@ -505,6 +505,56 @@ describe("CLI Status Command", () => {
     await runQmd(["collection", "add", "."]);
   });
 
+  test("qmd doctor lists effective LLM idle timeouts", async () => {
+    const env = await createIsolatedTestEnv("doctor-idle-timeouts");
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_EMBED_IDLE_TIMEOUT_MINUTES: "0",
+        QMD_RERANK_IDLE_TIMEOUT_MINUTES: "0.25",
+        QMD_GENERATE_IDLE_TIMEOUT_MINUTES: "34560",
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("LLM idle timeout (embed): 0 minutes");
+    expect(stdout).toContain("LLM idle timeout (rerank): 0.25 minutes");
+    expect(stdout).toContain("LLM idle timeout (generate): 34560 minutes");
+  }, 20000);
+
+  test("qmd doctor reports an invalid idle timeout, continues diagnostics, and exits nonzero", async () => {
+    const env = await createIsolatedTestEnv("doctor-invalid-idle-timeout");
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_RERANK_IDLE_TIMEOUT_MINUTES: "invalid" },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).toContain("QMD Doctor");
+    expect(stdout).toContain("SQLite runtime");
+    expect(stdout).toContain("LLM idle timeout (rerank)");
+    expect(stdout).toContain(
+      "QMD_RERANK_IDLE_TIMEOUT_MINUTES must be a finite number between 0 and 34560 minutes",
+    );
+  }, 20000);
+
+  test("normal commands fail immediately for an invalid idle timeout", async () => {
+    const env = await createIsolatedTestEnv("status-invalid-idle-timeout");
+    const { stdout, stderr, exitCode } = await runQmd(["status"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_GENERATE_IDLE_TIMEOUT_MINUTES: "-1" },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("QMD Status");
+    expect(stderr).toContain(
+      "QMD_GENERATE_IDLE_TIMEOUT_MINUTES must be a finite number between 0 and 34560 minutes",
+    );
+  }, 20000);
+
   test("qmd doctor reports core index health checks", async () => {
     const { stdout, exitCode } = await runQmd(["doctor"]);
     expect(exitCode).toBe(0);
@@ -668,6 +718,9 @@ describe("CLI Status Command", () => {
       QMD_DOCTOR_DEVICE_PROBE: "0",
       QMD_FORCE_CPU: "1",
       QMD_LLAMA_GPU: "metal",
+      QMD_EMBED_IDLE_TIMEOUT_MINUTES: "1",
+      QMD_RERANK_IDLE_TIMEOUT_MINUTES: "2",
+      QMD_GENERATE_IDLE_TIMEOUT_MINUTES: "3",
       QMD_EMBED_PARALLELISM: "2",
       QMD_EXPAND_CONTEXT_SIZE: "4096",
       QMD_RERANK_CONTEXT_SIZE: "8192",
