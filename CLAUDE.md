@@ -21,6 +21,7 @@ qmd status                        # Show index status and collections
 qmd doctor                        # Diagnose config, index, model, and device issues
 qmd update                        # Re-index collections; configured update hooks run first
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed --timeout <minutes>     # Override the embed session cap (default 120; 0 = no limit)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)

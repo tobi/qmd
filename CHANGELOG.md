@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Default embed session cap (`DEFAULT_EMBED_MAX_DURATION_MS`) raised from 30 to
+  120 minutes. A full re-embed of a mid-size index (e.g. ~1,500 documents with a
+  4B embedding model) takes ~40 minutes and was silently truncated at the
+  30-minute mark, leaving remaining chunks marked "LLM session expired". The
+  `--timeout <minutes>` flag still overrides the cap and `--timeout 0` removes
+  it; re-running `qmd embed` resumes where a capped run left off.
+- `node-llama-cpp` upgraded 3.18.1 → 3.19.1 (llama.cpp b8390 → b10068). On
+  Apple Silicon running macOS 26.4, the Metal 4 tensor-API self-test probe
+  fails to JIT-compile (upstream llama.cpp#21048 fixed the probe dimensions,
+  but the probe still fails on M5 + macOS 26.4 — see tobi/qmd#735). On b8390
+  this failure was ungraceful: embed could deadlock at 0% CPU mid-run
+  (node-llama-cpp#595). On b10068 the same probe failure degrades gracefully —
+  Metal stays enabled, tensor API disables cleanly, no deadlock. Stored vectors
+  verified compatible post-upgrade (`qmd doctor` vector-sample check passes).
+- README/CLAUDE.md: documented `qmd embed --timeout` alongside the memory flags
+  and updated CLI help text for the new default.
+
+### Fixed
+
+- `qmd update` and the single-collection reindex computed the "N unique hashes
+  need vectors" notice with the built-in default embedding model instead of the
+  configured one (`models.embed` in `index.yml` / `QMD_EMBED_MODEL`). With a
+  non-default embedding model, every active hash was falsely reported as
+  needing vectors after each update. Both call sites now resolve the configured
+  model, matching `qmd status` and `qmd embed`.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
