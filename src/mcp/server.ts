@@ -26,6 +26,7 @@ import {
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
   type QMDStore,
+  type HybridQueryResult,
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
@@ -44,6 +45,8 @@ type SearchResultItem = {
   context: string | null;
   line: number;   // Absolute line in source markdown
   snippet: string;
+  rerankScore?: number | null;
+  explain?: HybridQueryResult["explain"] | null;
 };
 
 type StatusResult = {
@@ -84,6 +87,16 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   return lines.join('\n');
+}
+
+export function semanticRerankScoreOrNull(result: Pick<HybridQueryResult, "explain">, rerankArg?: boolean): number | null {
+  if (rerankArg === false) return null;
+  const score = result.explain?.rerankScore;
+  if (typeof score !== "number") return null;
+  // skipRerank uses explain.rerankScore=0 as an internal sentinel with rrf.weight=1.0;
+  // do not expose that as a semantic relevance score.
+  if (score === 0 && result.explain?.rrf?.weight === 1.0) return null;
+  return score;
 }
 
 function getPackageVersion(): string {
@@ -323,9 +336,12 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        explain: z.boolean().optional().default(false).describe(
+          "Include per-result RRF/blend traces plus top-level rerankScore (the pure reranker relevance score, or null when reranking is disabled). Off by default."
+        ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank, explain }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -356,6 +372,7 @@ Intent-aware lex (C++ performance, not sports):
         minScore,
         candidateLimit,
         rerank,
+        explain,
         intent,
       });
 
@@ -376,6 +393,7 @@ Intent-aware lex (C++ performance, not sports):
           context: r.context,
           line,
           snippet: addLineNumbers(snippet, line),
+          ...(explain ? { rerankScore: semanticRerankScoreOrNull(r, rerank), explain: r.explain ?? null } : {}),
         };
       });
 
@@ -749,6 +767,7 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          ...(params.explain === true ? { explain: true } : {}),
         });
 
         // Use first lex or vec query for snippet extraction
@@ -766,6 +785,10 @@ export async function startMcpHttpServer(
             context: r.context,
             line,
             snippet: addLineNumbers(snippet, line),
+            ...(params.explain === true ? {
+              rerankScore: semanticRerankScoreOrNull(r, typeof params.rerank === "boolean" ? params.rerank : undefined),
+              explain: r.explain ?? null,
+            } : {}),
           };
         });
 

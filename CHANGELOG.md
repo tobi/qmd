@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- MCP `query` and HTTP REST `/query`/`/search` accept `explain: true` and expose
+  a top-level `rerankScore` per result: the raw LLM reranker relevance score from
+  `explain.rerankScore` (or `null` when reranking is disabled). Default responses
+  are unchanged unless `explain` is requested.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
