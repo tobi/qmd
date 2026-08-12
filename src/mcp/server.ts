@@ -323,9 +323,12 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        recencyDays: z.number().optional().describe(
+          "Boost recent documents with temporal decay. Value is the half-life in days (e.g. 30 = documents from 30 days ago score ~7.5% lower). Useful for journals, meeting notes, and evolving knowledge bases."
+        ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank, recencyDays }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -357,6 +360,7 @@ Intent-aware lex (C++ performance, not sports):
         candidateLimit,
         rerank,
         intent,
+        recency: recencyDays ? { halfLife: recencyDays, weight: 0.15 } : undefined,
       });
 
       // Use the plain query, or the first lex/vec sub-query, for snippet extraction
