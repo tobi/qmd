@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### Added
+
+- MCP now exposes read-only `collection_list` and `collection_show` tools on
+  both transports. `collection_add`, `collection_rename`, and destructive
+  `collection_remove` are off by default and require the explicit
+  `qmd mcp --enable-collection-management` startup flag, which works on either
+  transport and has no environment-variable equivalent. The writing tools
+  validate names and local paths, return
+  structured results, preserve source files, and share the fail-fast Store
+  maintenance lock with `update` and `embed`. The documented add workflow is
+  `collection_add`, `update`, inspect `needsEmbedding`, then `embed` only when
+  needed. Ignore patterns can be supplied during add but are not returned by
+  collection read tools.
+- The MCP server now exposes `update` and `embed` through the same central tool
+  registration for stdio and Streamable HTTP. The documented maintenance flow
+  is `update`, inspect `status.needsEmbedding`, then `embed` only when work is
+  pending. Both tools report progress when the client supplies a progress
+  token, return structured counters, and write only to QMD's derived index.
+  Progress delivery is best-effort and cannot change a successful tool result.
+  `update` never modifies source files or executes configured update commands;
+  `embed` uses only the centrally configured model and defaults to a 30-minute
+  runtime limit. Values above the documented safe Node timer maximum are
+  rejected; `0` remains unlimited. A per-process, per-store fail-fast lock
+  permits one maintenance writer while reads remain available, and
+  cancellation/error paths release the lock. Separate processes continue to
+  rely on SQLite/WAL/busy-timeout. Busy, cancelled, failed, and partial
+  embedding results are surfaced with `isError` without adding REST maintenance
+  endpoints. MCP failure details preserve known safe Store categories and
+  sanitize raw backend, model, download, and database error text.
+
+### Fixed
+
+- SDK `removeCollection` now removes the collection's indexed documents,
+  transactionally cleans globally orphaned content hashes, and reports
+  `{ removed, deletedDocs, cleanedHashes }`. Previously it removed only the
+  Store/config entry and left documents searchable.
+- SDK `renameCollection` now transactionally renames both the configured
+  collection and its indexed documents, so search, status, and `qmd://` paths
+  follow the new name. Previously indexed documents remained under the old
+  collection name.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

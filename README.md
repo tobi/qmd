@@ -78,6 +78,17 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info
+- `update` — Synchronize configured collections into QMD's derived index
+- `embed` — Generate pending vector embeddings with QMD's configured model
+- `collection_list` — List configured collections, including ones not indexed yet
+- `collection_show` — Show one configured collection
+
+Three collection configuration writes are off by default and require an explicit
+opt-in with `qmd mcp --enable-collection-management`:
+
+- `collection_add` — Register a local directory without indexing it
+- `collection_rename` — Rename a collection and its indexed paths
+- `collection_remove` — Remove a collection and its indexed data; source files remain unchanged
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -139,6 +150,33 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
+The stdio and HTTP transports expose the same centrally registered tools.
+
+#### Collection Management
+
+Collection configuration writes are disabled by default. Enable them with an
+explicit startup flag, on either transport:
+
+```sh
+qmd mcp --enable-collection-management
+qmd mcp --http --enable-collection-management
+```
+
+For client configuration, add the flag after `mcp`, for example
+`"args": ["mcp", "--enable-collection-management"]`. There is intentionally no
+environment-variable or config file equivalent, so the opt-in cannot be
+inherited by a child process.
+
+These tools accept local filesystem paths, change collection configuration, and
+can rename or remove indexed data. The HTTP transport has no authentication —
+run it on a loopback or otherwise trusted network only, as with any other QMD
+HTTP deployment.
+
+The safe add workflow is `collection_add`, then `update`, then inspect
+`status.needsEmbedding`; call `embed` only when that value is greater than zero.
+All collection writes share the same per-process, per-store fail-fast lock as
+`update` and `embed`. Concurrent writers return busy immediately, while read
+tools remain available.
 
 #### MCP Tool Parameters
 
@@ -159,6 +197,40 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `multi_get` | `maxBytes` | number | Skip files larger than N (default 10240) |
 | `multi_get` | `maxLines` | number | Limit lines per file |
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
+| `update` | `collections` | string[] | Optional non-empty list of configured collections; omit to update all |
+| `embed` | `collection` | string | Optional configured collection; omit to process all pending collections |
+| `embed` | `force` | boolean | Rebuild existing embeddings in scope (default **false**) |
+| `embed` | `chunkStrategy` | `"auto"` or `"regex"` | Optional chunking strategy; omit to use QMD's configured default |
+| `embed` | `maxDocsPerBatch` | positive integer | Optional document limit per embedding batch |
+| `embed` | `maxBatchMiB` | positive number | Optional embedding batch-size limit in MiB |
+| `embed` | `timeoutMinutes` | non-negative number | Runtime limit (default **30**, maximum **35791**); use `0` for no runtime limit |
+| `collection_list` | — | — | Read-only; returns configured collections sorted by name, including zero-document collections |
+| `collection_show` | `name` | string | **Required.** Read-only lookup using the same collection result shape as list/add/rename |
+| `collection_add` | `path` | string | **Required.** Existing local directory; resolved to its real path. Registers only, without update/embed |
+| `collection_add` | `name` | string | Optional; defaults to the resolved directory basename |
+| `collection_add` | `pattern` | string | Optional Markdown glob; defaults to `**/*.md` |
+| `collection_add` | `ignore` | string[] | Optional exclusion globs. Forwarded to the Store, but not returned by collection read tools |
+| `collection_rename` | `oldName` | string | **Required.** Existing collection name |
+| `collection_rename` | `newName` | string | **Required.** Unused name; existing indexed `qmd://` paths follow the rename |
+| `collection_remove` | `name` | string | **Required.** Removes collection config and indexed documents, then cleans globally orphaned content rows; source files remain unchanged |
+
+For safe maintenance, call `update`, then call `status` and inspect
+`needsEmbedding`. Call `embed` only when that count is greater than zero. Both
+tools write only to QMD's derived index; `update` does not modify source files
+or execute configured collection update commands. If the request includes an
+MCP progress token, `update` reports file progress and `embed` reports chunk,
+byte, and error counters. Only one `update` or `embed` operation can run for a
+shared store within one MCP server process/store instance at a time; this lock
+also covers enabled `collection_add`, `collection_rename`, and
+`collection_remove` calls. Another writer fails immediately as busy while read
+tools remain available. Separate
+CLI or server processes rely on SQLite/WAL/busy-timeout instead of this
+fail-fast lock. Busy, cancelled, and failed calls set `isError`.
+`embed` also sets `isError` for partial failures while retaining its result
+counters and a bounded failure list. Failure reasons in that list are sanitized
+MCP categories, not raw model, download, backend, or database error messages.
+The 30-minute default embed limit provides a final safety boundary when an
+active native model computation cannot stop immediately.
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return

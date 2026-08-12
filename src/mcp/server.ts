@@ -10,7 +10,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { basename, join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -26,11 +27,21 @@ import {
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
   type QMDStore,
+  type EmbedProgress,
+  type UpdateProgress,
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import {
+  DEFAULT_GLOB,
+  EMBED_FAILURE_BATCH_NO_VECTOR_REASON,
+  EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX,
+  EMBED_FAILURE_ERROR_RATE_REASON,
+  EMBED_FAILURE_NO_VECTOR_REASON,
+  EMBED_FAILURE_SESSION_EXPIRED_REASON,
+  enableProductionMode,
+} from "../store.js";
 
 // =============================================================================
 // Types for structured content
@@ -44,6 +55,16 @@ type SearchResultItem = {
   context: string | null;
   line: number;   // Absolute line in source markdown
   snippet: string;
+};
+
+type CollectionResult = {
+  name: string;
+  path: string;
+  pattern: string;
+  documents: number;
+  indexedDocuments: number;
+  lastUpdated: string | null;
+  includeByDefault: boolean;
 };
 
 type StatusResult = {
@@ -62,6 +83,9 @@ type StatusResult = {
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+const MAX_NODE_TIMER_MS = 2_147_483_647;
+const MAX_EMBED_TIMEOUT_MINUTES = Math.floor(MAX_NODE_TIMER_MS / 60_000);
 
 /**
  * Encode a path for use in qmd:// URIs.
@@ -86,6 +110,20 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
+function toCollectionResult(
+  collection: Awaited<ReturnType<QMDStore["listCollections"]>>[number]
+): CollectionResult {
+  return {
+    name: collection.name,
+    path: collection.pwd,
+    pattern: collection.glob_pattern,
+    documents: collection.active_count,
+    indexedDocuments: collection.doc_count,
+    lastUpdated: collection.last_modified,
+    includeByDefault: collection.includeByDefault,
+  };
+}
+
 function getPackageVersion(): string {
   try {
     const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
@@ -105,7 +143,10 @@ function getPackageVersion(): string {
  * Injected into the LLM's system prompt via MCP initialize response —
  * gives the LLM immediate context about what's searchable without a tool call.
  */
-async function buildInstructions(store: QMDStore): Promise<string> {
+async function buildInstructions(
+  store: QMDStore,
+  collectionManagementEnabled: boolean,
+): Promise<string> {
   const status = await store.getStatus();
   const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
@@ -124,13 +165,30 @@ async function buildInstructions(store: QMDStore): Promise<string> {
     lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
   }
 
+  if (collectionManagementEnabled) {
+    lines.push("");
+    lines.push("Collection management is enabled for this session:");
+    lines.push("  - Use `collection_list` and `collection_show` to inspect configured collections.");
+    lines.push("  - To register a directory, call `collection_add`, then `update`, inspect `needsEmbedding`, and call `embed` only when `needsEmbedding` is greater than 0.");
+    lines.push("  - Use `collection_rename` to rename a collection and its indexed paths.");
+    lines.push("  - Use destructive `collection_remove` to delete a collection from QMD's index; source files stay unchanged.");
+    lines.push("  - Ignore patterns can be supplied to `collection_add`, but collection read tools cannot return configured ignore patterns.");
+  }
+
+  // --- Maintenance workflow ---
+  lines.push("");
+  lines.push("Maintenance:");
+  lines.push("  - Call the `update` MCP tool to synchronize configured collections into the derived index.");
+  lines.push("  - After update, call `status` and inspect `needsEmbedding`.");
+  lines.push("  - Call the `embed` MCP tool only when `needsEmbedding` is greater than 0.");
+
   // --- Capability gaps ---
   if (!status.hasVectorIndex) {
     lines.push("");
-    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
+    lines.push("Note: No vector embeddings yet; semantic search (vec/hyde) remains unavailable until pending embeddings are generated.");
   } else if (status.needsEmbedding > 0) {
     lines.push("");
-    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
+    lines.push(`Note: ${status.needsEmbedding} documents currently need embedding.`);
   }
 
   // --- Search tool ---
@@ -168,10 +226,112 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+type MaintenanceOperation =
+  | "update"
+  | "embed"
+  | "collection_add"
+  | "collection_rename"
+  | "collection_remove";
+
+type MaintenanceLease =
+  | { acquired: true; release: () => void }
+  | { acquired: false; active: MaintenanceOperation };
+
+class MaintenanceCancelledError extends Error {}
+
+const maintenanceStates = new WeakMap<
+  QMDStore,
+  { active?: { operation: MaintenanceOperation; leaseId: symbol } }
+>();
+
+function throwIfMaintenanceAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new MaintenanceCancelledError();
+  }
+}
+
+function acquireMaintenance(
+  store: QMDStore,
+  operation: MaintenanceOperation
+): MaintenanceLease {
+  let state = maintenanceStates.get(store);
+  if (!state) {
+    state = {};
+    maintenanceStates.set(store, state);
+  }
+
+  if (state.active) {
+    return { acquired: false, active: state.active.operation };
+  }
+
+  const leaseId = Symbol(operation);
+  state.active = { operation, leaseId };
+  return {
+    acquired: true,
+    release: () => {
+      if (state.active?.leaseId === leaseId) {
+        state.active = undefined;
+      }
+    },
+  };
+}
+
+function enqueueBestEffortNotification(
+  pendingNotifications: Set<Promise<void>>,
+  send: () => Promise<void>
+): void {
+  const pendingNotification = (async () => {
+    try {
+      await send();
+    } catch {
+      // Progress notifications are best-effort and never change tool results.
+    }
+  })();
+  pendingNotifications.add(pendingNotification);
+  void pendingNotification.then(() => {
+    pendingNotifications.delete(pendingNotification);
+  });
+}
+
+const SAFE_EMBED_FAILURE_REASONS = new Set([
+  EMBED_FAILURE_NO_VECTOR_REASON,
+  EMBED_FAILURE_SESSION_EXPIRED_REASON,
+  EMBED_FAILURE_ERROR_RATE_REASON,
+  EMBED_FAILURE_BATCH_NO_VECTOR_REASON,
+]);
+
+function sanitizeEmbedFailureReason(reason: string): string {
+  if (SAFE_EMBED_FAILURE_REASONS.has(reason)) {
+    return reason;
+  }
+
+  if (
+    reason.startsWith(`${EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX}: `)
+  ) {
+    return EMBED_FAILURE_BATCH_SESSION_EXPIRED_PREFIX;
+  }
+
+  return "embedding backend or index write failed";
+}
+
+export type McpServerOptions = {
+  enableCollectionManagement?: boolean;
+};
+
+export async function createMcpServer(
+  store: QMDStore,
+  options: McpServerOptions,
+): Promise<McpServer> {
+  const collectionManagementEnabled =
+    options.enableCollectionManagement === true;
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
-    { instructions: await buildInstructions(store) },
+    {
+      instructions: await buildInstructions(
+        store,
+        collectionManagementEnabled,
+      ),
+    },
   );
 
   // Pre-fetch default collection names for search tools
@@ -537,6 +697,788 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: update (Synchronize configured collections into the derived index)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "update",
+    {
+      title: "Update Index",
+      description: "Synchronize configured Markdown collections into the derived index. Omit collections to update all configured collections. This writes only to QMD's index; source files are unchanged and configured update commands are not executed. With an MCP progress token it reports file progress. Progress notifications are best-effort and never change the tool result. Busy, cancelled, and failed runs return isError. Inspect the structured needsEmbedding count afterward and call embed only when it is greater than 0.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        collections: z.array(z.string()).min(1).optional().describe(
+          "Optional non-empty list of configured collection names. Omit to update all collections."
+        ),
+      },
+    },
+    async ({ collections }, extra) => {
+      if (extra.signal.aborted) {
+        return {
+          content: [{
+            type: "text",
+            text: "Update cancelled by the MCP client. Retry when ready.",
+          }],
+          isError: true,
+        };
+      }
+
+      const maintenance = acquireMaintenance(store, "update");
+      if (!maintenance.acquired) {
+        return {
+          content: [{
+            type: "text",
+            text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        throwIfMaintenanceAborted(extra.signal);
+
+        if (collections) {
+          const configuredNames = new Set(
+            (await store.listCollections()).map(collection => collection.name)
+          );
+          throwIfMaintenanceAborted(extra.signal);
+          const unknownCollections = collections.filter(
+            name => !configuredNames.has(name)
+          );
+
+          if (unknownCollections.length > 0) {
+            return {
+              content: [{
+                type: "text",
+                text: `Unknown collection(s): ${unknownCollections.join(", ")}. Call status to list configured collections.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        const progressToken = extra._meta?.progressToken;
+        const pendingNotifications = new Set<Promise<void>>();
+        let activeCollection: string | undefined;
+        let completedFiles = 0;
+        let activeCollectionTotal = 0;
+        let lastProgress = 0;
+        let lastTotal = 0;
+
+        const onProgress = (info: UpdateProgress) => {
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (progressToken === undefined) {
+            return;
+          }
+
+          if (
+            activeCollection !== undefined &&
+            activeCollection !== info.collection
+          ) {
+            completedFiles += activeCollectionTotal;
+          }
+          activeCollection = info.collection;
+          activeCollectionTotal = info.total;
+
+          const progress = Math.max(lastProgress, completedFiles + info.current);
+          const total = Math.max(
+            lastTotal,
+            completedFiles + info.total,
+            progress
+          );
+          lastProgress = progress;
+          lastTotal = total;
+
+          enqueueBestEffortNotification(pendingNotifications, () =>
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress,
+                total,
+                message: `${info.collection}/${info.file}`,
+              },
+            })
+          );
+        };
+
+        const result = await store.update({
+          ...(collections === undefined ? {} : { collections }),
+          onProgress,
+        });
+        await Promise.all(pendingNotifications);
+        throwIfMaintenanceAborted(extra.signal);
+
+        const summary =
+          `Updated ${result.collections} collection(s): ${result.indexed} indexed, ` +
+          `${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed. ` +
+          `${result.needsEmbedding} document(s) need embedding.`;
+
+        return {
+          content: [{ type: "text", text: summary }],
+          structuredContent: result,
+        };
+      } catch (error) {
+        if (error instanceof MaintenanceCancelledError || extra.signal.aborted) {
+          return {
+            content: [{
+              type: "text",
+              text: "Update cancelled by the MCP client. Retry when ready.",
+            }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: "Update failed. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      } finally {
+        maintenance.release();
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: embed (Generate vector embeddings for the derived index)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "embed",
+    {
+      title: "Embed Documents",
+      description: "Generate vector embeddings for pending indexed documents using QMD's centrally configured model. Defaults: force false and a runtime limit of 30 minutes; omit collection to process all pending collections. This writes only to the derived index and may download the configured model if it is not cached. With an MCP progress token it reports chunks, bytes, and errors. Busy, cancelled, failed, and partial-error runs return isError while preserving available counters. Per-document failure reasons are sanitized at the MCP boundary; they are categories, not raw backend errors.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        collection: z.string().min(1).optional().describe(
+          "Optional configured collection name. Omit to embed pending documents from all collections."
+        ),
+        force: z.boolean().optional().default(false).describe(
+          "Rebuild existing embeddings in the selected scope (default: false)."
+        ),
+        chunkStrategy: z.enum(["auto", "regex"]).optional().describe(
+          "Chunking strategy. Omit to use QMD's configured default."
+        ),
+        maxDocsPerBatch: z.number().int().positive().optional().describe(
+          "Maximum documents per embedding batch."
+        ),
+        maxBatchMiB: z.number().positive().optional().describe(
+          "Maximum embedding batch size in MiB."
+        ),
+        timeoutMinutes: z.number()
+          .nonnegative()
+          .max(
+            MAX_EMBED_TIMEOUT_MINUTES,
+            `timeoutMinutes must be at most ${MAX_EMBED_TIMEOUT_MINUTES} minutes. Use 0 for no runtime limit.`
+          )
+          .optional()
+          .default(30)
+          .describe(
+            `Maximum runtime in minutes (default: 30, maximum: ${MAX_EMBED_TIMEOUT_MINUTES}). Use 0 for no runtime limit.`
+          ),
+      },
+    },
+    async ({
+      collection,
+      force,
+      chunkStrategy,
+      maxDocsPerBatch,
+      maxBatchMiB,
+      timeoutMinutes,
+    }, extra) => {
+      if (extra.signal.aborted) {
+        return {
+          content: [{
+            type: "text",
+            text: "Embedding cancelled by the MCP client. Retry when ready.",
+          }],
+          isError: true,
+        };
+      }
+
+      const maintenance = acquireMaintenance(store, "embed");
+      if (!maintenance.acquired) {
+        return {
+          content: [{
+            type: "text",
+            text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        throwIfMaintenanceAborted(extra.signal);
+
+        if (collection !== undefined) {
+          const configuredNames = new Set(
+            (await store.listCollections()).map(configured => configured.name)
+          );
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (!configuredNames.has(collection)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Unknown collection: ${collection}. Call status to list configured collections.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        const progressToken = extra._meta?.progressToken;
+        const pendingNotifications = new Set<Promise<void>>();
+        let lastProgress = 0;
+        let lastTotal = 0;
+        const onProgress = (info: EmbedProgress) => {
+          throwIfMaintenanceAborted(extra.signal);
+
+          if (progressToken === undefined) {
+            return;
+          }
+
+          const progress = Math.max(lastProgress, info.chunksEmbedded);
+          const total = Math.max(lastTotal, info.totalChunks, progress);
+          lastProgress = progress;
+          lastTotal = total;
+
+          enqueueBestEffortNotification(pendingNotifications, () =>
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress,
+                total,
+                message:
+                  `${info.chunksEmbedded}/${info.totalChunks} chunks; ` +
+                  `${info.bytesProcessed}/${info.totalBytes} bytes; ` +
+                  `${info.errors} errors`,
+              },
+            })
+          );
+        };
+
+        const embedOptions: NonNullable<Parameters<QMDStore["embed"]>[0]> = {
+          force,
+          maxDurationMs: Math.round(timeoutMinutes * 60 * 1000),
+          ...(collection === undefined ? {} : { collection }),
+          ...(chunkStrategy === undefined ? {} : { chunkStrategy }),
+          ...(maxDocsPerBatch === undefined ? {} : { maxDocsPerBatch }),
+          ...(maxBatchMiB === undefined
+            ? {}
+            : { maxBatchBytes: maxBatchMiB * 1024 * 1024 }),
+          onProgress,
+        };
+        const result = await store.embed(embedOptions);
+        await Promise.all(pendingNotifications);
+        throwIfMaintenanceAborted(extra.signal);
+        const failures = result.failures ?? [];
+        const structured = {
+          ...result,
+          failureCount: result.errors,
+          failures: failures.slice(0, 20).map(failure => ({
+            ...failure,
+            reason: sanitizeEmbedFailureReason(failure.reason),
+          })),
+          failuresTruncated: failures.length > 20,
+        };
+        const summary =
+          `Embedded ${result.docsProcessed} document(s) into ${result.chunksEmbedded} chunk(s) ` +
+          `in ${result.durationMs}ms with ${result.errors} error(s).`;
+
+        return {
+          content: [{ type: "text", text: summary }],
+          structuredContent: structured,
+          isError: result.errors > 0,
+        };
+      } catch (error) {
+        if (error instanceof MaintenanceCancelledError || extra.signal.aborted) {
+          return {
+            content: [{
+              type: "text",
+              text: "Embedding cancelled by the MCP client. Retry when ready.",
+            }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: "Embedding failed. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      } finally {
+        maintenance.release();
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: collection_add (Opt-in collection configuration write)
+  // ---------------------------------------------------------------------------
+
+  if (collectionManagementEnabled) {
+    server.registerTool(
+      "collection_add",
+      {
+        title: "Add Collection",
+        description: "Register a local directory as a QMD collection without indexing it. Call update afterward, then embed if documents need embeddings.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          path: z.string().min(1).describe(
+            "Existing local directory to register. Absolute paths are recommended; relative paths resolve against the server process working directory."
+          ),
+          name: z.string().min(1).optional().describe(
+            "Optional collection name; defaults to the resolved directory basename"
+          ),
+          pattern: z.string().min(1).optional().default(DEFAULT_GLOB).describe(
+            `Markdown glob pattern (default: ${DEFAULT_GLOB})`
+          ),
+          ignore: z.array(z.string().min(1)).optional().describe(
+            "Optional glob patterns to exclude"
+          ),
+        },
+      },
+      async ({ path, name, pattern, ignore }) => {
+        const maintenance = acquireMaintenance(store, "collection_add");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let resolvedPath: string;
+          try {
+            resolvedPath = await realpath(path);
+          } catch (error) {
+            if (
+              typeof error === "object" &&
+              error !== null &&
+              "code" in error
+            ) {
+              if (error.code === "ENOENT") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Collection path does not exist: ${path}. Check the path and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+              if (error.code === "EACCES") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Collection path is not accessible: ${path}. Check directory permissions and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+              if (error.code === "ENOTDIR") {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `A collection path component is not a directory: ${path}. Check the path and retry.`,
+                  }],
+                  isError: true,
+                };
+              }
+            }
+            return {
+              content: [{
+                type: "text",
+                text: "Could not resolve the collection path. Check access and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            if (!(await stat(resolvedPath)).isDirectory()) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection path is not a directory: ${path}. Choose a directory and retry.`,
+                }],
+                isError: true,
+              };
+            }
+
+            const collectionName = (name ?? basename(resolvedPath)) || "root";
+            const collections = await store.listCollections();
+            if (collections.some(collection => collection.name === collectionName)) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection '${collectionName}' already exists. Choose a different name.`,
+                }],
+                isError: true,
+              };
+            }
+
+            const duplicate = collections.find(collection =>
+              collection.pwd === resolvedPath && collection.glob_pattern === pattern
+            );
+            if (duplicate) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `Collection '${duplicate.name}' already uses this path and pattern. Call update for it or remove it first.`,
+                }],
+                isError: true,
+              };
+            }
+
+            await store.addCollection(collectionName, {
+              path: resolvedPath,
+              pattern,
+              ...(ignore === undefined ? {} : { ignore }),
+            });
+
+            const created = (await store.listCollections()).find(
+              collection => collection.name === collectionName
+            );
+            if (!created) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Collection may have been registered but could not be read back. Call collection_list to check before retrying.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Added collection '${collectionName}' without indexing. Call update next, then call embed if documents need embeddings.`,
+              }],
+              structuredContent: { collection: toCollectionResult(created) },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not add the collection. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+
+    server.registerTool(
+      "collection_rename",
+      {
+        title: "Rename Collection",
+        description: "Rename a configured QMD collection and its existing indexed document paths.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          oldName: z.string().min(1).describe("Existing collection name"),
+          newName: z.string().min(1).describe("New, unused collection name"),
+        },
+      },
+      async ({ oldName, newName }) => {
+        const maintenance = acquireMaintenance(store, "collection_rename");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let collections: Awaited<ReturnType<QMDStore["listCollections"]>>;
+          try {
+            collections = await store.listCollections();
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not read the configured collections. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          if (!collections.some(collection => collection.name === oldName)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${oldName}' does not exist. Call collection_list to check the current names.`,
+              }],
+              isError: true,
+            };
+          }
+          if (collections.some(collection => collection.name === newName)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${newName}' already exists. Choose a different name.`,
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            const renamedSuccessfully = await store.renameCollection(oldName, newName);
+            if (!renamedSuccessfully) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "No collection was renamed. Call collection_list to check the current names.",
+                }],
+                isError: true,
+              };
+            }
+
+            const renamed = (await store.listCollections()).find(
+              collection => collection.name === newName
+            );
+            if (!renamed) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Collection may have been renamed but could not be read back. Call collection_show to verify the new name before retrying.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Renamed collection '${oldName}' to '${newName}'. Existing indexed documents now use qmd://${newName}/... paths.`,
+              }],
+              structuredContent: { collection: toCollectionResult(renamed) },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Collection may have been renamed. Call collection_show to verify the new name before retrying.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+
+    server.registerTool(
+      "collection_remove",
+      {
+        title: "Remove Collection",
+        description: "Remove a QMD collection and its indexed data. Also cleans up content rows that no document references anymore, across all collections. Source files remain unchanged.",
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+        inputSchema: {
+          name: z.string().min(1).describe("Existing collection name"),
+        },
+      },
+      async ({ name }) => {
+        const maintenance = acquireMaintenance(store, "collection_remove");
+        if (!maintenance.acquired) {
+          return {
+            content: [{
+              type: "text",
+              text: `QMD maintenance is busy with ${maintenance.active}. Retry after it finishes.`,
+            }],
+            isError: true,
+          };
+        }
+
+        try {
+          let collections: Awaited<ReturnType<QMDStore["listCollections"]>>;
+          try {
+            collections = await store.listCollections();
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Could not read the configured collections. Check QMD status and server logs, then retry.",
+              }],
+              isError: true,
+            };
+          }
+
+          if (!collections.some(collection => collection.name === name)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Collection '${name}' does not exist. Call collection_list to check the current names.`,
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            const result = await store.removeCollection(name);
+            if (!result.removed) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "No collection was removed. Call collection_list to check the current names.",
+                }],
+                isError: true,
+              };
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `Removed collection '${name}': deleted ${result.deletedDocs} indexed documents and cleaned ${result.cleanedHashes} globally orphaned content hashes. Source files remain unchanged.`,
+              }],
+              structuredContent: {
+                removed: result.removed,
+                deletedDocs: result.deletedDocs,
+                cleanedHashes: result.cleanedHashes,
+              },
+            };
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: "Collection may have been removed. Call collection_list to verify before retrying.",
+              }],
+              isError: true,
+            };
+          }
+        } finally {
+          maintenance.release();
+        }
+      }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tools: collection_list and collection_show (Read-only collection state)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "collection_list",
+    {
+      title: "List Collections",
+      description: "List all configured QMD collections, including ones not indexed yet; status only reports collections with active documents. Each result includes active documents and all indexed documents (active plus inactive), paths, glob patterns, last changes, and unscoped-search defaults.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const collections = (await store.listCollections())
+          .map(toCollectionResult)
+          .sort((left, right) =>
+            left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+          );
+        return {
+          content: [{
+            type: "text",
+            text: `${collections.length} configured ${collections.length === 1 ? "collection" : "collections"}.`,
+          }],
+          structuredContent: { collections },
+        };
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: "Could not list collections. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "collection_show",
+    {
+      title: "Show Collection",
+      description: "Show configuration and index counts for one configured QMD collection, including active documents and all indexed documents (active plus inactive).",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        name: z.string().min(1).describe("Configured collection name"),
+      },
+    },
+    async ({ name }) => {
+      try {
+        const collection = (await store.listCollections()).find(
+          configured => configured.name === name
+        );
+        if (!collection) {
+          return {
+            content: [{
+              type: "text",
+              text: `Unknown collection: ${name}. Call collection_list to list configured collections.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const result = toCollectionResult(collection);
+        return {
+          content: [{
+            type: "text",
+            text: `Collection ${result.name}: ${result.path} (${result.documents} active of ${result.indexedDocuments} indexed documents).`,
+          }],
+          structuredContent: { collection: result },
+        };
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: "Could not show the collection. Check QMD status and server logs, then retry.",
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: qmd_status (Index status)
   // ---------------------------------------------------------------------------
 
@@ -579,6 +1521,7 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  enableCollectionManagement?: boolean;
 };
 
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
@@ -593,7 +1536,9 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
-  const server = await createMcpServer(store);
+  const server = await createMcpServer(store, {
+    enableCollectionManagement: options.enableCollectionManagement,
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -644,7 +1589,9 @@ export async function startMcpHttpServer(
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store);
+    const server = await createMcpServer(store, {
+      enableCollectionManagement: options.enableCollectionManagement,
+    });
     await server.connect(transport);
 
     transport.onclose = () => {

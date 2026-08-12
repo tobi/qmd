@@ -88,17 +88,15 @@ function initTestDatabase(db: Database): void {
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      name, body,
-      content='documents',
-      content_rowid='id',
+      filepath, title, body,
       tokenize='porter unicode61'
     )
   `);
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body)
-      SELECT new.id, new.path, content.doc
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT new.id, new.collection || '/' || new.path, new.title, content.doc
       FROM content
       WHERE content.hash = new.hash;
     END
@@ -946,10 +944,15 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   const origConfigDir = process.env.QMD_CONFIG_DIR;
 
   beforeAll(async () => {
-    // Create isolated test database with seeded data
+    // Initialize the HTTP fixture through the production schema and triggers.
     httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
+    const schemaStore = createStore(httpTestDbPath);
+    schemaStore.ensureVecTable(768);
+    schemaStore.close();
+
+    // Reopen only after production initialization, then seed through its triggers.
     const db = openDatabase(httpTestDbPath);
-    initTestDatabase(db);
+    loadSqliteVec(db);
     seedTestData(db);
 
     // 300 pad lines (37 chars each = 11100 chars) puts the marker past the
@@ -1094,6 +1097,10 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
+    expect(toolNames).toContain("update");
+    expect(toolNames).toContain("embed");
+    expect(toolNames).toContain("collection_list");
+    expect(toolNames).toContain("collection_show");
   });
 
   test("POST /mcp tools/call query returns results", async () => {

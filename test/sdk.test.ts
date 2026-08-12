@@ -5,7 +5,16 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  test,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +32,7 @@ import {
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
+import * as llmModule from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -181,28 +191,69 @@ describe("collection management", () => {
     expect(collections.find(c => c.name === "notes")).toBeDefined();
   });
 
-  test("removeCollection removes existing collection", async () => {
+  test("removeCollection reports and removes indexed documents and content", async () => {
     await store.addCollection("docs", { path: docsDir, pattern: "**/*.md" });
-    const removed = await store.removeCollection("docs");
+    await store.update();
 
-    expect(removed).toBe(true);
+    expect(await store.searchLex("Authentication", { collection: "docs" })).not.toHaveLength(0);
+    const expectedDeletedDocs = (
+      store.internal.db.prepare(
+        "SELECT COUNT(*) AS count FROM documents WHERE collection = ?"
+      ).get("docs") as { count: number }
+    ).count;
+    const expectedCleanedHashes = (
+      store.internal.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM content
+        WHERE hash NOT IN (
+          SELECT DISTINCT hash
+          FROM documents
+          WHERE collection <> ?
+        )
+      `).get("docs") as { count: number }
+    ).count;
+
+    const result = await store.removeCollection("docs");
+
+    expect(result).toEqual({
+      removed: true,
+      deletedDocs: expectedDeletedDocs,
+      cleanedHashes: expectedCleanedHashes,
+    });
+    expect(result.deletedDocs).toBeGreaterThan(0);
+    expect(result.cleanedHashes).toBeGreaterThan(0);
     const collections = await store.listCollections();
     expect(collections.map(c => c.name)).not.toContain("docs");
+    expect(await store.searchLex("Authentication", { collection: "docs" })).toHaveLength(0);
+    expect((await store.getStatus()).collections.map(c => c.name)).not.toContain("docs");
+    expect(existsSync(join(docsDir, "auth.md"))).toBe(true);
   });
 
-  test("removeCollection returns false for non-existent collection", async () => {
-    const removed = await store.removeCollection("nonexistent");
-    expect(removed).toBe(false);
+  test("removeCollection distinguishes a non-existent collection", async () => {
+    const result = await store.removeCollection("nonexistent");
+    expect(result).toEqual({
+      removed: false,
+      deletedDocs: 0,
+      cleanedHashes: 0,
+    });
   });
 
-  test("renameCollection renames a collection", async () => {
+  test("renameCollection renames the collection and its indexed documents", async () => {
     await store.addCollection("old-name", { path: docsDir, pattern: "**/*.md" });
+    await store.update();
+    expect(await store.searchLex("Authentication", { collection: "old-name" })).not.toHaveLength(0);
+
     const renamed = await store.renameCollection("old-name", "new-name");
 
     expect(renamed).toBe(true);
     const names = (await store.listCollections()).map(c => c.name);
     expect(names).toContain("new-name");
     expect(names).not.toContain("old-name");
+    expect(await store.searchLex("Authentication", { collection: "new-name" })).not.toHaveLength(0);
+    expect(await store.searchLex("Authentication", { collection: "old-name" })).toHaveLength(0);
+    const statusNames = (await store.getStatus()).collections.map(c => c.name);
+    expect(statusNames).toContain("new-name");
+    expect(statusNames).not.toContain("old-name");
   });
 
   test("renameCollection returns false for non-existent source", async () => {
@@ -213,8 +264,11 @@ describe("collection management", () => {
   test("renameCollection throws if target exists", async () => {
     await store.addCollection("a", { path: docsDir, pattern: "**/*.md" });
     await store.addCollection("b", { path: notesDir, pattern: "**/*.md" });
+    await store.update();
 
     await expect(store.renameCollection("a", "b")).rejects.toThrow("already exists");
+    expect(await store.searchLex("Authentication", { collection: "a" })).not.toHaveLength(0);
+    expect((await store.listCollections()).map(c => c.name).sort()).toEqual(["a", "b"]);
   });
 
   test("listCollections returns empty array for empty config", async () => {
@@ -991,6 +1045,117 @@ describe("embed", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
     } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed forwards the max runtime budget", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const embedBatchCalls: string[][] = [];
+    const slowLlm = {
+      async embed() {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = slowLlm as any;
+
+    try {
+      await store.update();
+      const result = await store.embed({
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+        maxDurationMs: 10,
+      });
+
+      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
+      expect(sessionSpy).toHaveBeenCalledWith(
+        slowLlm,
+        expect.any(Function),
+        { maxDuration: 10, name: "generateEmbeddings" },
+      );
+      expect(result.chunksEmbedded).toBeLessThan(3);
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed preserves zero as an unlimited runtime budget", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      await store.embed({ maxDurationMs: 0 });
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        { maxDuration: 0, name: "generateEmbeddings" },
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed applies the default runtime budget when omitted", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      await store.embed();
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        { maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" },
+      );
+    } finally {
+      sessionSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await store.close();
     }

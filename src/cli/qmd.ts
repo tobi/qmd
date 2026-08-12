@@ -2767,7 +2767,8 @@ function parseCLI() {
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
-      // MCP HTTP transport options
+      // MCP transport options
+      "enable-collection-management": { type: "boolean" },
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
@@ -3274,6 +3275,7 @@ function showHelp(): void {
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("    --enable-collection-management - Enable collection_add/rename/remove tools");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
@@ -4418,6 +4420,10 @@ if (isMain) {
         process.exit(0);
       }
 
+      const enableCollectionManagement = Boolean(
+        cli.values["enable-collection-management"]
+      );
+
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
         // --host overrides the default localhost bind; QMD_HOST env is the
@@ -4444,9 +4450,12 @@ if (isMain) {
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
+          const managementArgs = enableCollectionManagement
+            ? ["--enable-collection-management"]
+            : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...managementArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...managementArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4466,7 +4475,11 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          await startMcpHttpServer(port, {
+            dbPath: getDbPath(),
+            host,
+            enableCollectionManagement,
+          });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -4477,7 +4490,10 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await startMcpServer({
+          dbPath: getDbPath(),
+          enableCollectionManagement,
+        });
       }
       break;
     }
