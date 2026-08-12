@@ -1019,6 +1019,31 @@ ${token}
     const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
     expect(after.exitCode).toBe(1);
   });
+
+  test("updates only the collection named with -c", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-filter");
+    const dirA = join(testDir, `update-filter-a-${Date.now()}`);
+    const dirB = join(testDir, `update-filter-b-${Date.now()}`);
+    await mkdir(dirA, { recursive: true });
+    await mkdir(dirB, { recursive: true });
+    await writeFile(join(dirA, "a.md"), "# Collection A\n");
+    await writeFile(join(dirB, "b.md"), "# Collection B\n");
+
+    expect((await runQmd(["collection", "add", dirA, "--name", "col-a"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", dirB, "--name", "col-b"], { dbPath, configDir })).exitCode).toBe(0);
+
+    const { stdout, exitCode } = await runQmd(["update", "-c", "col-b"], { dbPath, configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Updating 1 collection(s)");
+    expect(stdout).toContain("col-b");
+    expect(stdout).not.toContain("col-a");
+  });
+
+  test("rejects -c with an unknown collection name", async () => {
+    const { stderr, exitCode } = await runQmd(["update", "-c", "no-such-collection"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection not found: no-such-collection");
+  });
 });
 
 describe("CLI Add-Context Command", () => {

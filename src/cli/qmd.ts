@@ -656,7 +656,7 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(only: string[] = []): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -664,7 +664,14 @@ async function updateCollections(): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
+
+  // Filter to specific collections when requested via -c / --collection
+  // (names are pre-validated by resolveCollectionFilter).
+  if (only.length > 0) {
+    const nameSet = new Set(only);
+    collections = collections.filter((col) => nameSet.has(col.name));
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -3284,7 +3291,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update [--pull] [-c name] - Re-index collections (optionally git pull first)");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -4292,7 +4299,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(resolveCollectionFilter(cli.opts.collection, false));
       break;
 
     case "embed":
