@@ -25,6 +25,7 @@ import {
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
+  type RerankDocumentResult,
   type ILLMSession,
 } from "../src/llm.js";
 
@@ -528,7 +529,7 @@ describe("LlamaCpp rerank deduping", () => {
     expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
     expect(result.results).toHaveLength(3);
 
-    const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
+    const scoreByFile = new Map(result.results.map((item: RerankDocumentResult) => [item.file, item.score]));
     expect(scoreByFile.get("a.md")).toBe(0.9);
     expect(scoreByFile.get("b.md")).toBe(0.9);
     expect(scoreByFile.get("c.md")).toBe(0.2);

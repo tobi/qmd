@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
+import { finishSuccessfulCliCommand } from "../src/cli/qmd.js";
+import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.js";
 
 describe("CLI successful-exit lifecycle", () => {
   test("exits 0 after successful output when post-output LLM cleanup fails", async () => {

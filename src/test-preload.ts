@@ -16,7 +16,7 @@
  * See CLAUDE.md for invoking `bun test` manually on darwin.
  */
 import { afterAll } from "bun:test";
-import { disposeDefaultLlamaCpp } from "./llm";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // Global afterAll runs after all test files complete
 afterAll(async () => {

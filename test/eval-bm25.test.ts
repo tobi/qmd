@@ -17,7 +17,7 @@ import {
   searchFTS,
   insertDocument,
   insertContent,
-} from "../src/store";
+} from "../src/store.js";
 
 // Set INDEX_PATH before importing store to prevent using global index
 const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-unit-"));

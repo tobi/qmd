@@ -17,6 +17,7 @@ import {
   LlamaLogLevel,
   type Llama,
   type LlamaModel,
+  type LlamaRankingContext,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
@@ -109,7 +110,7 @@ async function benchmarkConfig(
 
   // Create contexts. On CPU, split threads evenly across contexts.
   const cpuThreads = !llama.gpu ? Math.floor(llama.cpuMathCores / parallelism) : 0;
-  const contexts = [];
+  const contexts: LlamaRankingContext[] = [];
   for (let i = 0; i < parallelism; i++) {
     try {
       contexts.push(await model.createRankingContext({
