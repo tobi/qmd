@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- **PHP Tree-sitter Support**: AST-aware chunking support for `.php` files using `tree-sitter-php` WASM grammar.
+- **PHP AST Content Enrichment**: Framework-agnostic structural context propagation for PHP chunks (namespaces, containing types, inheritance, attributes, and PHPDoc comments) when using `--chunk-strategy auto`.
+- **Template-Aware Code Retrieval**: Dedicated template engine adapter architecture for Laravel Blade (`.blade.php`), Twig (`.twig`, `.html.twig`), Smarty (`.tpl`, `.smarty`), and Latte (`.latte`).
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

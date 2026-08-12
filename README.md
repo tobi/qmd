@@ -618,10 +618,10 @@ qmd embed --max-batch-mb 64         # cap batch size in MB
 ```
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
-files at function, class, and import boundaries instead of arbitrary text
-positions. This produces higher-quality chunks and better search results for
-codebases. Markdown and other file types always use regex-based chunking
-regardless of strategy.
+files at function, class, namespace, and import boundaries instead of arbitrary text
+positions, and enriches PHP chunks with structural context (namespace, class, methods, attributes, PHPDoc).
+It also provides template-aware chunking for Blade (`.blade.php`), Twig (`.twig`), Smarty (`.tpl`), and Latte (`.latte`).
+This produces higher-quality chunks and better search results for codebases. Markdown and other unsupported file types always use regex-based chunking regardless of strategy.
 
 The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
 opt in. Run `qmd status` to verify which grammars are available.
@@ -1141,12 +1141,12 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 
 | AST Node | Score | Languages |
 |----------|-------|-----------|
-| Class / interface / struct / impl / trait | 100 | All |
-| Function / method | 90 | All |
+| Class / interface / struct / impl / trait / namespace / layout | 100 | All |
+| Function / method / section / block | 90 | All |
 | Type alias / enum | 80 | All |
-| Import / use declaration | 60 | All |
+| Import / use declaration / property / const / directive | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.rs`, and `.php` files, plus template-aware retrieval for Blade (`.blade.php`), Twig (`.twig`, `.html.twig`), Smarty (`.tpl`, `.smarty`), and Latte (`.latte`). Enable with `--chunk-strategy auto`. PHP chunks are enriched with structural AST context (namespace, class, methods, attributes, PHPDoc). Markdown and other unsupported file types always use regex chunking.
 
 ### Query Flow (Hybrid)
 

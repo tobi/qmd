@@ -2750,7 +2750,57 @@ export async function chunkDocumentAsync(
     }
   }
 
-  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+  let chunks = chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+
+  if (chunkStrategy === "auto" && filepath) {
+    try {
+      const { detectTemplateAdapter, getTemplateContext } = await import("./templates.js");
+      const tplAdapter = detectTemplateAdapter(filepath);
+
+      if (tplAdapter) {
+        const tplCtx = getTemplateContext(content, filepath);
+        if (tplCtx) {
+          const parts: string[] = [`engine ${tplCtx.engine}`];
+          if (tplCtx.extendsLayout) parts.push(`extends ${tplCtx.extendsLayout}`);
+          if (tplCtx.sections?.length) parts.push(`sections [${tplCtx.sections.join(", ")}]`);
+          if (tplCtx.components?.length) parts.push(`components [${tplCtx.components.join(", ")}]`);
+          const header = `// [Template Context: ${parts.join(" | ")}]\n`;
+          chunks = chunks.map(c => ({ ...c, text: `${header}${c.text}` }));
+        }
+      } else {
+        const { extname } = await import("node:path");
+        const ext = extname(filepath).toLowerCase();
+        if (ext === ".php") {
+          const { detectLanguage } = await import("./ast.js");
+          if (detectLanguage(filepath) === "php") {
+            const mod = await import("web-tree-sitter");
+            const { createRequire } = await import("node:module");
+            const req = createRequire(import.meta.url);
+            const wasmPath = req.resolve("tree-sitter-php/tree-sitter-php.wasm");
+            await mod.Parser.init();
+            const lang = await mod.Language.load(wasmPath);
+            const parser = new mod.Parser();
+            parser.setLanguage(lang);
+            const tree = parser.parse(content);
+            if (tree) {
+              const { extractPHPContextFromAST, formatPHPContext } = await import("./php-enrichment.js");
+              chunks = chunks.map(c => {
+                const ctx = extractPHPContextFromAST(tree.rootNode, content, c.pos);
+                const header = formatPHPContext(ctx);
+                return header ? { ...c, text: `${header}\n${c.text}` } : c;
+              });
+              tree.delete();
+              parser.delete();
+            }
+          }
+        }
+      }
+    } catch {
+      // Degrade gracefully if enrichment fails
+    }
+  }
+
+  return chunks;
 }
 
 /**

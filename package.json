@@ -63,6 +63,7 @@
     "picomatch": "4.0.4",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
+    "tree-sitter-php": "0.24.2",
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
@@ -89,6 +90,7 @@
       "node-llama-cpp",
       "tree-sitter-go",
       "tree-sitter-javascript",
+      "tree-sitter-php",
       "tree-sitter-python",
       "tree-sitter-rust",
       "tree-sitter-typescript"

@@ -9,6 +9,7 @@ const grammars = [
   "tree-sitter-python/tree-sitter-python.wasm",
   "tree-sitter-go/tree-sitter-go.wasm",
   "tree-sitter-rust/tree-sitter-rust.wasm",
+  "tree-sitter-php/tree-sitter-php.wasm",
 ];
 
 let ok = true;
