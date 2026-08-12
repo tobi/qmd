@@ -1033,11 +1033,19 @@ function initializeDatabase(db: Database): void {
       path TEXT NOT NULL,
       pattern TEXT NOT NULL DEFAULT '**/*.md',
       ignore_patterns TEXT,
+      allow_dot_dirs TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
       context TEXT
     )
   `);
+  // Migrate older DBs that predate the allow_dot_dirs column (idempotent).
+  try {
+    db.exec(`ALTER TABLE store_collections ADD COLUMN allow_dot_dirs TEXT`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("duplicate column name")) throw error;
+  }
 
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
@@ -1069,6 +1077,7 @@ type StoreCollectionRow = {
   path: string;
   pattern: string;
   ignore_patterns: string | null;
+  allow_dot_dirs: string | null;
   include_by_default: number;
   update_command: string | null;
   context: string | null;
@@ -1080,6 +1089,7 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
+    ...(row.allow_dot_dirs ? { allowDotDirs: JSON.parse(row.allow_dot_dirs) as string[] } : {}),
     ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
@@ -1126,12 +1136,13 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
   db.prepare(`
-    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, allow_dot_dirs, include_by_default, update_command, context)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       path = excluded.path,
       pattern = excluded.pattern,
       ignore_patterns = excluded.ignore_patterns,
+      allow_dot_dirs = excluded.allow_dot_dirs,
       include_by_default = excluded.include_by_default,
       update_command = excluded.update_command,
       context = excluded.context
@@ -1140,6 +1151,7 @@ export function upsertStoreCollection(db: Database, name: string, collection: Om
     collection.path,
     collection.pattern || '**/*.md',
     collection.ignore ? JSON.stringify(collection.ignore) : null,
+    collection.allowDotDirs ? JSON.stringify(collection.allowDotDirs) : null,
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
     collection.context ? JSON.stringify(collection.context) : null,
@@ -1370,6 +1382,7 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    allowDotDirs?: string[];
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1381,17 +1394,21 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
+  // Hidden (dot-prefixed) files/dirs are skipped by default. A collection can opt
+  // specific dot-dirs back in via `allowDotDirs` (e.g. [".aidocs"]); every other
+  // dot-prefixed segment (.git, .cache, …) stays excluded.
+  const allowDotDirs = options?.allowDotDirs ?? [];
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: collectionPath,
     onlyFiles: true,
     followSymbolicLinks: false,
-    dot: false,
+    dot: allowDotDirs.length > 0,
     ignore: allIgnore,
   });
-  // Filter hidden files/folders
+  // Filter hidden files/folders, except dot-dirs explicitly allowed by the collection
   const files = allFiles.filter(file => {
     const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
+    return !parts.some(part => part.startsWith(".") && !allowDotDirs.includes(part));
   });
 
   const total = files.length;

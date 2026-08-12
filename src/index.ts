@@ -501,6 +501,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          allowDotDirs: col.allowDotDirs,
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,

@@ -721,6 +721,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      allowDotDirs: yamlCol?.allowDotDirs,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1596,7 +1597,7 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
   const newColl = getCollectionFromYaml(collName);
-  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore, newColl?.allowDotDirs);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1649,7 +1650,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[], allowDotDirs?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1670,17 +1671,18 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
+  const allowedDotDirs = allowDotDirs ?? [];
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
-    dot: false,
+    dot: allowedDotDirs.length > 0,
     ignore: allIgnore,
   });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
+  // Filter hidden files/folders, except dot-dirs explicitly allowed by the collection
   const files = allFiles.filter(file => {
     const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
+    return !parts.some(part => part.startsWith(".") && !allowedDotDirs.includes(part));
   });
 
   const total = files.length;

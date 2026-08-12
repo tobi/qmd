@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `allowDotDirs` per-collection config: opt specific dot-prefixed directories
+  (e.g. `.aidocs`) back into indexing. Hidden files/dirs are skipped by default;
+  list the dot-dirs you want indexed and everything else dot-prefixed (`.git`,
+  `.cache`, …) stays excluded. YAML-only; defaults to none, so existing setups
+  are unaffected.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added
