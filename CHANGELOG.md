@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Remote embedding, reranking, and query expansion via OpenAI-compatible API
+  (vLLM, Ollama, OpenAI, etc.). Set `QMD_EMBED_API_URL` / `QMD_EMBED_API_MODEL`
+  (and optionally `QMD_RERANK_API_*` / `QMD_EXPAND_API_*`) env vars or add
+  the equivalent keys to `models:` in `index.yml`. Local generation and
+  tokenization are preserved via a hybrid routing layer. Includes circuit
+  breakers, dimension validation, and batch splitting.
+
 ### Fixed
 
 - `qmd doctor` no longer false-positives `.etag` HTTP sidecars (written by
@@ -198,7 +207,6 @@
 ### Fixes
 
 - Launcher: Rewrite `bin/qmd` as a Node-based shebang polyglot to fix global npm installation execution failures on Windows (#668 / #452), while supporting seamless fallback to Bun in Node-less environments.
-
 
 ## [2.5.1] - 2026-05-20
 
