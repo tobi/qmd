@@ -113,6 +113,24 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
   return `title: ${title || "none"} | text: ${text}`;
 }
 
+/**
+ * Detect node-llama-cpp's pre-allocation VRAM ceiling errors and its native
+ * out-of-memory variants. Used by lowVram embed reclaim to decide whether
+ * disposing the heavy generate/rerank models could free enough VRAM to
+ * recover. Conservative on purpose — too broad and we'd evict on unrelated
+ * failures; too narrow and we'd miss the case the feature targets.
+ */
+export function isInsufficientVramError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /too large for the available VRAM/i.test(message)
+    || /Failed to create any (embedding|rerank) context/i.test(message)
+    || /insufficient VRAM/i.test(message)
+    || /out of memory/i.test(message)
+  );
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -581,6 +599,26 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Low-VRAM mode (default: false).
+   *
+   * The pipeline stages (expand → embed → search → rerank) are inherently sequential,
+   * so when this is enabled the heavy generate (~2 GB) and rerank (~2.3 GB) models are
+   * disposed immediately after each use, while the tiny embed model (~320 MB) stays
+   * resident. Peak VRAM drops from ~5.4 GB to ~2.6 GB at the cost of per-stage load
+   * latency (~3 s → ~5.6 s on a typical GPU).
+   *
+   * Use when the GPU is shared with another large model (e.g. Ollama) or on
+   * memory-constrained GPUs where loading all three at once fails. Addresses #275
+   * for both `qmd serve` and one-shot commands like `qmd query`.
+   *
+   * Concurrency: `expandQuery` and `rerank` calls are serialized internally so a
+   * dispose can never race with another caller's in-flight use of the same model.
+   * `embed` / `embedBatch` continue to run in parallel.
+   *
+   * Can also be set via QMD_LOW_VRAM=1.
+   */
+  lowVram?: boolean;
 };
 
 /**
@@ -720,6 +758,14 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
+  // Low-VRAM mode: dispose generate/rerank models after each use so peak VRAM
+  // stays under ~2.6 GB instead of ~5.4 GB. Calls to expandQuery and rerank
+  // serialize through per-method chains to prevent dispose from racing with
+  // another caller's in-flight use of the same model.
+  private lowVram: boolean;
+  private generateChain: Promise<unknown> = Promise.resolve();
+  private rerankChain: Promise<unknown> = Promise.resolve();
+
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
@@ -738,6 +784,7 @@ export class LlamaCpp implements LLM {
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.lowVram = config.lowVram ?? process.env.QMD_LOW_VRAM === "1";
   }
 
   get embedModelName(): string {
@@ -817,6 +864,7 @@ export class LlamaCpp implements LLM {
       await ctx.dispose();
     }
     this.rerankContexts = [];
+    this.rerankContextSize = null;
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
@@ -1182,10 +1230,55 @@ export class LlamaCpp implements LLM {
   // was insufficient.  4096 comfortably fits the largest real-world chunks
   // while staying well below the 40 960-token auto size.
   // Override with QMD_RERANK_CONTEXT_SIZE env var if you need more headroom.
-  private static readonly RERANK_CONTEXT_SIZE: number = (() => {
-    const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : 4096;
-  })();
+  private static readonly RERANK_CONTEXT_SIZE_DEFAULT = 4096;
+  // Shrink-under-pressure fallback when free VRAM cannot fit the default.
+  private static readonly RERANK_CONTEXT_SIZE_TIGHT = 2048;
+  // Threshold below which we shrink to the tight size.  The default 4096
+  // context costs ~1.15 GB with flash attention; the threshold also holds
+  // back ~350 MB for the rerank model itself and a margin for concurrent
+  // allocations.  Picked empirically — see the cost model below.
+  private static readonly RERANK_VRAM_SHRINK_THRESHOLD_MB = 1500;
+  // Cost model: a rerank context with flash attention is roughly 0.28 MB
+  // per token (measured: 4096-ctx ≈ 1146 MB, 2048-ctx ≈ 568 MB).  Used by
+  // `computeParallelism` to budget each context's VRAM footprint against
+  // the actual chosen size, not a constant that assumed 2048.
+  private static readonly RERANK_CTX_MB_PER_TOKEN = 0.28;
+
+  // Tracks the size actually used to allocate the live rerank contexts.
+  // `rerankImpl` needs this to compute the truncation budget against the
+  // real allocation, not a static guess.  Cleared whenever the contexts
+  // are torn down so the next `ensureRerankContexts` call re-probes VRAM.
+  private rerankContextSize: number | null = null;
+
+  /**
+   * Pick a rerank context size that fits available VRAM.
+   *
+   * Order:
+   * 1. `QMD_RERANK_CONTEXT_SIZE` env override — always wins, no probe.
+   * 2. CPU mode (CPU offload forced or no GPU) — keeps the 4096 default
+   *    since CPU RAM is plentiful and the cost model doesn't apply.
+   * 3. GPU probe — query `getVramState`, shrink to 2048 when free VRAM
+   *    is below the threshold.  A probe failure conservatively falls
+   *    back to the 4096 default (caller's existing reclaim/retry path
+   *    will catch a VRAM-too-tight allocation).
+   */
+  private async resolveRerankContextSize(): Promise<number> {
+    const envValue = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
+    if (Number.isFinite(envValue) && envValue > 0) return envValue;
+    const llama = await this.ensureLlama();
+    if (this.isCpuOffloadForced() || !llama.gpu) {
+      return LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    }
+    try {
+      const vram = await llama.getVramState();
+      const freeMB = vram.free / (1024 * 1024);
+      return freeMB < LlamaCpp.RERANK_VRAM_SHRINK_THRESHOLD_MB
+        ? LlamaCpp.RERANK_CONTEXT_SIZE_TIGHT
+        : LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    } catch {
+      return LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    }
+  }
 
   private static readonly EMBED_CONTEXT_SIZE: number = (() => {
     const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
@@ -1194,26 +1287,24 @@ export class LlamaCpp implements LLM {
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
-      const n = Math.min(await this.computeParallelism(1000), 4);
+      const contextSize = await this.resolveRerankContextSize();
+      this.rerankContextSize = contextSize;
+      // perContextMB derives from the *actual* chosen size, not a constant
+      // that assumed 2048.  Pre-fix this was hardcoded to 1000 MB, which
+      // both under-budgeted the 4096 default (~1146 MB) and over-budgeted
+      // the 2048 fallback (~568 MB), skewing parallelism in both directions.
+      const perContextMB = Math.ceil(contextSize * LlamaCpp.RERANK_CTX_MB_PER_TOKEN);
+      const n = Math.min(await this.computeParallelism(perContextMB), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
-            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            contextSize,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
+            throw new Error("Failed to create any rerank context");
           }
           break;
         }
@@ -1299,24 +1390,28 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
-      const context = await this.ensureEmbedContext();
-
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
-      }
-
-      const embedding = await context.getEmbeddingFor(safeText);
-
-      return {
-        embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
-      };
+      return await this.withReclaim("embed", () => this.embedImpl(text, options));
     } catch (error) {
       console.error("Embedding error:", error);
       return null;
     }
+  }
+
+  private async embedImpl(text: string, options: EmbedOptions): Promise<EmbeddingResult> {
+    const context = await this.ensureEmbedContext();
+
+    // Guard: truncate text that exceeds model context window to prevent GGML crash
+    const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+    if (truncated) {
+      console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+    }
+
+    const embedding = await context.getEmbeddingFor(safeText);
+
+    return {
+      embedding: Array.from(embedding.vector),
+      model: options.model ?? this.embedModelUri,
+    };
   }
 
   /**
@@ -1331,63 +1426,67 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
-      const contexts = await this.ensureEmbedContexts();
-      const n = contexts.length;
+      return await this.withReclaim("embed", () => this.embedBatchImpl(texts, options));
+    } catch (error) {
+      console.error("Batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
 
-      if (n === 1) {
-        // Single context: sequential (no point splitting)
-        const context = contexts[0]!;
-        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
-        for (const text of texts) {
+  private async embedBatchImpl(texts: string[], options: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    const contexts = await this.ensureEmbedContexts();
+    const n = contexts.length;
+
+    if (n === 1) {
+      // Single context: sequential (no point splitting)
+      const context = contexts[0]!;
+      const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
+      for (const text of texts) {
+        try {
+          const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+          if (truncated) {
+            console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
+          }
+          const embedding = await context.getEmbeddingFor(safeText);
+          this.touchActivity();
+          embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+        } catch (err) {
+          console.error("Embedding error for text:", err);
+          embeddings.push(null);
+        }
+      }
+      return embeddings;
+    }
+
+    // Multiple contexts: split texts across contexts for parallel evaluation
+    const chunkSize = Math.ceil(texts.length / n);
+    const chunks = Array.from({ length: n }, (_, i) =>
+      texts.slice(i * chunkSize, (i + 1) * chunkSize)
+    );
+
+    const chunkResults = await Promise.all(
+      chunks.map(async (chunk, i) => {
+        const ctx = contexts[i]!;
+        const results: (EmbeddingResult | null)[] = [];
+        for (const text of chunk) {
           try {
             const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
             if (truncated) {
               console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
-            const embedding = await context.getEmbeddingFor(safeText);
+            const embedding = await ctx.getEmbeddingFor(safeText);
             this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+            results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
-            embeddings.push(null);
+            results.push(null);
           }
         }
-        return embeddings;
-      }
+        return results;
+      })
+    );
 
-      // Multiple contexts: split texts across contexts for parallel evaluation
-      const chunkSize = Math.ceil(texts.length / n);
-      const chunks = Array.from({ length: n }, (_, i) =>
-        texts.slice(i * chunkSize, (i + 1) * chunkSize)
-      );
-
-      const chunkResults = await Promise.all(
-        chunks.map(async (chunk, i) => {
-          const ctx = contexts[i]!;
-          const results: (EmbeddingResult | null)[] = [];
-          for (const text of chunk) {
-            try {
-              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-              if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
-              }
-              const embedding = await ctx.getEmbeddingFor(safeText);
-              this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-            } catch (err) {
-              console.error("Embedding error for text:", err);
-              results.push(null);
-            }
-          }
-          return results;
-        })
-      );
-
-      return chunkResults.flat();
-    } catch (error) {
-      console.error("Batch embedding error:", error);
-      return texts.map(() => null);
-    }
+    return chunkResults.flat();
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
@@ -1452,6 +1551,25 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (!this.lowVram) {
+      return this.expandQueryImpl(query, options);
+    }
+    // Low-VRAM: serialize and dispose the generate model after each call so
+    // peak VRAM stays bounded. Concurrent callers queue through generateChain.
+    // withReclaim retries once if loading generate fails for lack of VRAM:
+    // it drains the rerank chain and disposes rerank, then retries.
+    const next = this.generateChain.then(async () => {
+      try {
+        return await this.withReclaim("generate", () => this.expandQueryImpl(query, options));
+      } finally {
+        await this.disposeGenerateModel();
+      }
+    });
+    this.generateChain = next.catch(() => undefined);
+    return next as Promise<Queryable[]>;
+  }
+
+  private async expandQueryImpl(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1556,6 +1674,28 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (!this.lowVram) {
+      return this.rerankImpl(query, documents, options);
+    }
+    // Low-VRAM: serialize and dispose the rerank model after each call.
+    // withReclaim retries once if loading rerank fails for lack of VRAM:
+    // it drains the generate chain and disposes generate, then retries.
+    const next = this.rerankChain.then(async () => {
+      try {
+        return await this.withReclaim("rerank", () => this.rerankImpl(query, documents, options));
+      } finally {
+        await this.disposeRerankModel();
+      }
+    });
+    this.rerankChain = next.catch(() => undefined);
+    return next as Promise<RerankResult>;
+  }
+
+  private async rerankImpl(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1564,9 +1704,13 @@ export class LlamaCpp implements LLM {
     const model = await this.ensureRerankModel();
 
     // Truncate documents that would exceed the rerank context size.
-    // Budget = contextSize - template overhead - query tokens
+    // Budget = contextSize - template overhead - query tokens.
+    // The size matches whatever `ensureRerankContexts` actually allocated
+    // (`resolveRerankContextSize` may have shrunk it under VRAM pressure),
+    // so the budget never under-truncates relative to the live context.
     const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const contextSize = this.rerankContextSize ?? LlamaCpp.RERANK_CONTEXT_SIZE_DEFAULT;
+    const maxDocTokens = contextSize - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
     const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
@@ -1676,6 +1820,156 @@ export class LlamaCpp implements LLM {
     };
   }
 
+  /**
+   * Wrap a heavy-model operation so that, in lowVram mode, an insufficient-VRAM
+   * failure triggers a one-shot recovery: drain the OTHER models' chains (so
+   * their in-flight callers complete their own finally-dispose), dispose those
+   * models defensively, then retry the operation once.
+   *
+   * The `needs` argument names which model the operation requires — we never
+   * dispose or await our own chain. `"generate"` (used by expandQuery) frees
+   * rerank; `"rerank"` (used by rerank) frees generate; `"embed"` frees both,
+   * since embed doesn't sit on either chain.
+   *
+   * Awaiting our own chain would deadlock — we're already inside its current
+   * link. The `needs` discrimination prevents that.
+   *
+   * Outside lowVram mode, this is a pass-through.
+   */
+  private async withReclaim<T>(needs: "embed" | "generate" | "rerank", fn: () => Promise<T>): Promise<T> {
+    if (!this.lowVram) return fn();
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isInsufficientVramError(error)) throw error;
+      await this.reclaimNonNeededHeavies(needs);
+      try {
+        return await fn();
+      } catch (retryError) {
+        if (!isInsufficientVramError(retryError)) throw retryError;
+        // Second pass: the embed model is the only heavy weight we held back
+        // on pass one. Drop it now (~568 MB) and try once more. Skip when the
+        // caller is embed itself — it cannot make progress without the model.
+        if (needs === "embed") throw retryError;
+        await this.bestEffort(() => this.disposeEmbedModel(), "disposeEmbedModel");
+        return await fn();
+      }
+    }
+  }
+
+  /**
+   * First-pass reclaim: drop everything that isn't what the caller needs.
+   * Generate + rerank models go entirely; embed contexts are released but
+   * the embed model is kept (small, and reload cost dominates the win on
+   * cards with plenty of headroom). The embed-model evict is the second-
+   * pass escalation in `withReclaim`.
+   *
+   * Each dispose runs best-effort: a failure is logged but does not skip
+   * the remaining disposes or abort the retry. A retry against a partially
+   * reclaimed state is still more likely to succeed than no retry at all,
+   * and the original VRAM error is more informative than a dispose error.
+   */
+  private async reclaimNonNeededHeavies(needs: "embed" | "generate" | "rerank"): Promise<void> {
+    const drains: Promise<unknown>[] = [];
+    const disposes: { label: string; fn: () => Promise<void> }[] = [];
+    if (needs !== "generate") {
+      drains.push(this.generateChain);
+      disposes.push({ label: "disposeGenerateModel", fn: () => this.disposeGenerateModel() });
+    }
+    if (needs !== "rerank") {
+      drains.push(this.rerankChain);
+      disposes.push({ label: "disposeRerankModel", fn: () => this.disposeRerankModel() });
+    }
+    if (needs !== "embed") {
+      disposes.push({ label: "disposeEmbedContexts", fn: () => this.disposeEmbedContexts() });
+    }
+    await Promise.allSettled(drains);
+    for (const { label, fn } of disposes) {
+      await this.bestEffort(fn, label);
+    }
+  }
+
+  private async bestEffort(fn: () => Promise<void>, label: string): Promise<void> {
+    try {
+      await fn();
+    } catch (error) {
+      console.warn(`LlamaCpp reclaim: ${label} failed, continuing:`, error);
+    }
+  }
+
+  /**
+   * Dispose the generate model and reset its load promise so the next call
+   * to expandQuery lazily reloads it. Only safe to call between serialized
+   * expandQuery calls — the lowVram chain handles that.
+   */
+  private async disposeGenerateModel(): Promise<void> {
+    if (this.disposed) return;
+    const model = this.generateModel;
+    this.generateModel = null;
+    this.generateModelLoadPromise = null;
+    if (model) {
+      await model.dispose();
+    }
+  }
+
+  /**
+   * Dispose embedding contexts (~143 MB each) but keep the embed model
+   * resident. Used by withReclaim on non-embed paths to free a few hundred MB
+   * of context VRAM without paying the embed model's reload cost. The next
+   * embed call lazily recreates the contexts.
+   *
+   * Embed has no serialization chain, so a concurrent in-flight embed could
+   * be mid-call against a context we dispose here. That collision implies
+   * VRAM is already exhausted (which is why withReclaim fired); the embed
+   * caller's null-return contract absorbs the failure on retry.
+   */
+  private async disposeEmbedContexts(): Promise<void> {
+    if (this.disposed) return;
+    const contexts = this.embedContexts;
+    this.embedContexts = [];
+    this.embedContextsCreatePromise = null;
+    for (const ctx of contexts) {
+      await ctx.dispose();
+    }
+  }
+
+  /**
+   * Drop the embed model and any live contexts that depend on it. Used as
+   * `withReclaim`'s second-pass escalation when first-pass eviction (which
+   * keeps the embed model resident) didn't free enough VRAM. Next embed call
+   * pays a one-time reload cost (~200 ms from a hot disk cache).
+   */
+  private async disposeEmbedModel(): Promise<void> {
+    if (this.disposed) return;
+    await this.disposeEmbedContexts();
+    const model = this.embedModel;
+    this.embedModel = null;
+    this.embedModelLoadPromise = null;
+    if (model) {
+      await model.dispose();
+    }
+  }
+
+  /**
+   * Dispose the rerank model and its ranking contexts, then reset the load
+   * promise. Only safe to call between serialized rerank calls.
+   */
+  private async disposeRerankModel(): Promise<void> {
+    if (this.disposed) return;
+    const contexts = this.rerankContexts;
+    const model = this.rerankModel;
+    this.rerankContexts = [];
+    this.rerankContextSize = null;
+    this.rerankModel = null;
+    this.rerankModelLoadPromise = null;
+    for (const ctx of contexts) {
+      await ctx.dispose();
+    }
+    if (model) {
+      await model.dispose();
+    }
+  }
+
   async dispose(): Promise<void> {
     // Prevent double-dispose
     if (this.disposed) {
@@ -1702,6 +1996,7 @@ export class LlamaCpp implements LLM {
       await disposeWithTimeout("rerank context", () => ctx.dispose());
     }
     this.rerankContexts = [];
+    this.rerankContextSize = null;
 
     if (this.embedModel) {
       await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
