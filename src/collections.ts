@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
+import type { LexicalBackendConfig } from "./lexical-backends.js";
 
 // ============================================================================
 // Types
@@ -51,6 +52,10 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  search?: {
+    /** Lexical lexical backend. Defaults to SQLite FTS5. */
+    lexicalBackend?: LexicalBackendConfig;
+  };
 }
 
 /**
