@@ -878,7 +878,7 @@ Template placeholders:
 
 - **Path**: Collection-relative path (e.g., `docs/guide.md`)
 - **Docid**: Short hash identifier (e.g., `#a1b2c3`) - use with `qmd get #a1b2c3`
-- **Title**: Extracted from document (first heading or filename)
+- **Title**: Extracted from document (frontmatter `title`, first heading, or filename)
 - **Context**: Path context if configured via `qmd context add`
 - **Score**: Color-coded (green >70%, yellow >40%, dim otherwise)
 - **Snippet**: Context around match with query terms highlighted

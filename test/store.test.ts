@@ -12,6 +12,7 @@ import type { Database } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
@@ -27,6 +28,9 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
+  maybeAdoptLegacyEmbeddingFingerprint,
+  CHUNK_SIZE_TOKENS,
+  CHUNK_OVERLAP_TOKENS,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -507,6 +511,249 @@ describe("Document Helpers", () => {
   test("extractTitle extracts H1 heading", () => {
     const content = "# My Title\n\nSome content here.";
     expect(extractTitle(content, "file.md")).toBe("My Title");
+  });
+
+  test("extractTitle prefers a string title from leading YAML frontmatter", () => {
+    const content = `---
+title: "Frontmatter: Canonical Title"
+---
+
+# Heading Title
+`;
+    expect(extractTitle(content, "file.md")).toBe("Frontmatter: Canonical Title");
+  });
+
+  test("extractTitle accepts the YAML document end marker", () => {
+    const content = `---
+title: Dotted End Marker
+...
+
+# Heading Title
+`;
+    expect(extractTitle(content, "file.md")).toBe("Dotted End Marker");
+  });
+
+  test("extractTitle normalizes multiline YAML titles to one line", () => {
+    const literal = `---
+title: |
+  Canonical
+  Score: 100%
+---
+
+# Heading Title
+`;
+    const folded = `---
+title: >
+  Folded
+  Canonical Title
+---
+`;
+
+    expect(extractTitle(literal, "literal.md")).toBe("Canonical Score: 100%");
+    expect(extractTitle(folded, "folded.md")).toBe("Folded Canonical Title");
+  });
+
+  test("extractTitle ignores frontmatter while falling back to a heading", () => {
+    const content = `---
+# This metadata comment is not the title
+summary: No explicit title
+---
+
+# Actual Title
+`;
+    expect(extractTitle(content, "file.md")).toBe("Actual Title");
+  });
+
+  test("extractTitle ignores empty and non-string frontmatter titles", () => {
+    const emptyTitle = `---
+title: "   "
+---
+
+# Empty Title Fallback
+`;
+    const nonStringTitle = `---
+title:
+  - not
+  - a string
+---
+
+# Non-string Title Fallback
+`;
+
+    expect(extractTitle(emptyTitle, "file.md")).toBe("Empty Title Fallback");
+    expect(extractTitle(nonStringTitle, "file.md")).toBe("Non-string Title Fallback");
+  });
+
+  test("extractTitle falls back safely when leading YAML is malformed", () => {
+    const content = `---
+title: [unterminated
+---
+
+# Valid Body Heading
+`;
+    expect(extractTitle(content, "file.md")).toBe("Valid Body Heading");
+  });
+
+  test("extractTitle does not treat a later thematic break as frontmatter", () => {
+    const content = `Introductory prose.
+
+---
+title: Not Frontmatter
+---
+
+# Real Heading
+`;
+    expect(extractTitle(content, "file.md")).toBe("Real Heading");
+  });
+
+  test("frontmatter title extraction invalidates legacy embedding fingerprints", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "title-fingerprint-"));
+    const collectionName = await createTestCollection({
+      pwd: collectionDir,
+      name: "title-fingerprint",
+    });
+    const body = `---
+title: Frontmatter Title
+---
+
+# Heading Title
+
+Body text.
+`;
+    const model = "hf:test/embed-model.gguf";
+    const legacySignificant = [
+      `model:${model}`,
+      `query:${formatQueryForEmbedding("__qmd_embedding_query_probe__", model)}`,
+      `doc:${formatDocForEmbedding("__qmd_embedding_document_probe__", "__qmd_embedding_title_probe__", model)}`,
+      `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
+      `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    ].join("\n");
+    const legacyFingerprint = createHash("sha256")
+      .update(legacySignificant)
+      .digest("hex")
+      .slice(0, 6);
+
+    try {
+      await writeFile(join(collectionDir, "doc.md"), body);
+      const hash = await hashContent(body);
+      await insertTestDocument(store.db, collectionName, {
+        displayPath: "doc.md",
+        title: "Heading Title",
+        hash,
+        body,
+      });
+      store.llm = { embedModelName: model } as any;
+      store.ensureVecTable(3);
+      store.insertEmbedding(
+        hash,
+        0,
+        0,
+        new Float32Array([1, 2, 3]),
+        model,
+        new Date().toISOString(),
+        1,
+        legacyFingerprint,
+      );
+
+      const result = await reindexCollection(
+        store,
+        collectionDir,
+        "**/*.md",
+        collectionName,
+      );
+      const indexed = store.findDocument("title-fingerprint/doc.md");
+
+      expect(result.updated).toBe(1);
+      expect("title" in indexed && indexed.title).toBe("Frontmatter Title");
+      expect(getEmbeddingFingerprint(model)).not.toBe(legacyFingerprint);
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+    } finally {
+      await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy empty fingerprints stay pending across heterogeneous titles", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const frontmatterBody = `---
+title: Frontmatter Title
+---
+
+# Heading Title
+
+Frontmatter body.
+`;
+    const frontmatterHash = await hashContent(frontmatterBody);
+    let plainBody = "# Plain Title\n\nPlain body.";
+    let plainHash = await hashContent(plainBody);
+    let suffix = 0;
+    while (plainHash >= frontmatterHash) {
+      plainBody += `\n${suffix++}`;
+      plainHash = await hashContent(plainBody);
+    }
+
+    setDefaultLlamaCpp({
+      async tokenize(_text: string) { return [1]; },
+      async detokenize(_tokens: readonly number[]) { return plainBody; },
+    } as any);
+    store.llm = {
+      embedModelName: model,
+      async embed(_text: string) {
+        return { embedding: [1, 0, 0], model };
+      },
+    } as any;
+
+    try {
+      await insertTestDocument(store.db, "legacy-mixed", {
+        displayPath: "plain.md",
+        title: "Plain Title",
+        hash: plainHash,
+        body: plainBody,
+      });
+      await insertTestDocument(store.db, "legacy-mixed", {
+        displayPath: "frontmatter.md",
+        title: "Heading Title",
+        hash: frontmatterHash,
+        body: frontmatterBody,
+      });
+      store.ensureVecTable(3);
+      const embeddedAt = new Date().toISOString();
+      store.insertEmbedding(
+        plainHash,
+        0,
+        0,
+        new Float32Array([1, 0, 0]),
+        model,
+        embeddedAt,
+        1,
+        "",
+      );
+      store.insertEmbedding(
+        frontmatterHash,
+        0,
+        0,
+        new Float32Array([0, 1, 0]),
+        model,
+        embeddedAt,
+        1,
+        "",
+      );
+
+      expect(store.getHashesNeedingEmbedding()).toBe(2);
+      const adoption = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
+
+      expect(adoption).toEqual({
+        checked: true,
+        adopted: 0,
+        reason: "legacy empty fingerprints predate title extraction version 2",
+      });
+      expect(store.getHashesNeedingEmbedding()).toBe(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
   });
 
   test("extractTitle extracts H2 heading if no H1", () => {
