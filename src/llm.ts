@@ -691,7 +691,15 @@ function isCpuModeRequested(): boolean {
 }
 
 export class LlamaCpp implements LLM {
-  private readonly _ciMode = !!process.env.CI;
+  // CI kill-switch: prevents CI test pipelines from downloading/loading models.
+  // Agent harnesses also set CI=1, so QMD_ALLOW_LLM=1 explicitly re-enables LLM
+  // ops (QMD_ALLOW_LLM=0 force-disables, even outside CI).
+  private readonly _ciMode = (() => {
+    const override = process.env.QMD_ALLOW_LLM?.trim().toLowerCase();
+    if (override === "1" || override === "true") return false;
+    if (override === "0" || override === "false") return true;
+    return !!process.env.CI;
+  })();
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
@@ -703,6 +711,14 @@ export class LlamaCpp implements LLM {
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
+
+  private assertLlmEnabled(): void {
+    if (this._ciMode) {
+      throw new Error(
+        "LLM operations are disabled (CI env detected or QMD_ALLOW_LLM=0). Set QMD_ALLOW_LLM=1 to override."
+      );
+    }
+  }
   private expandContextSize: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
@@ -1324,7 +1340,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
-    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    this.assertLlmEnabled();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1391,7 +1407,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
-    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    this.assertLlmEnabled();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1452,7 +1468,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
-    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    this.assertLlmEnabled();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1556,7 +1572,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
-    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    this.assertLlmEnabled();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
