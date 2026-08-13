@@ -604,6 +604,56 @@ describe("LlamaCpp rerank deduping", () => {
   });
 });
 
+describe("LlamaCpp ensureRerankContexts error reporting", () => {
+  test("warns with the underlying error and does not retry identical options", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const createRankingContext = vi.fn().mockRejectedValue(
+        new Error("A context size of 40960 is too large for the available VRAM"),
+      );
+      llm.computeParallelism = vi.fn().mockResolvedValue(2);
+      llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+      llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+      const contexts = await llm.ensureRerankContexts();
+
+      expect(contexts).toEqual([]);
+      expect(createRankingContext).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("A context size of 40960 is too large for the available VRAM"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("keeps already-created contexts when a later createRankingContext fails", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx1 = { id: 1 };
+      let calls = 0;
+      const createRankingContext = vi.fn().mockImplementation(async () => {
+        calls++;
+        if (calls === 1) return ctx1;
+        throw new Error("out of VRAM");
+      });
+      llm.computeParallelism = vi.fn().mockResolvedValue(3);
+      llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+      llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+      const contexts = await llm.ensureRerankContexts();
+
+      expect(contexts).toEqual([ctx1]);
+      expect(createRankingContext).toHaveBeenCalledTimes(2);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("LlamaCpp.getDeviceInfo", () => {
   test("can skip build attempts for status probes", async () => {
     const llm = new LlamaCpp({}) as any;

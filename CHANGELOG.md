@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- Rerank context creation no longer swallows the real failure. A VRAM OOM or
+  corrupt model previously produced only `Reranker unavailable — skipping
+  reranking` (and a dead identical retry whose comment claimed it disabled
+  flash attention, which ranking contexts never supported). The warning now
+  includes the underlying message so the two cases are distinguishable (#782).
+
 - The Nix flake package now ships `skills/` next to `src/` in `$out/lib/qmd/`.
   `findPackageRoot()` walks up from the wrapped `src/cli/qmd.ts` looking for a
   sibling `skills/` directory; without it, `qmd skill show` and `qmd skills list`
