@@ -816,10 +816,18 @@ function containsCjk(text: string): boolean {
 }
 
 function sanitizeFTS5Phrase(phrase: string): string {
+  // Dotted tokens (1.0.21, 2026.4.10) are indexed as adjacent parts by the
+  // porter unicode61 tokenizer. Stripping the dots would produce "1021",
+  // which never matches — split them into phrase terms instead (#757).
   return normalizeCjkForFTS(phrase)
     .split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t)
+    .flatMap(t => {
+      if (isDottedToken(t)) {
+        return t.split('.').map(p => sanitizeFTS5Term(p)).filter(p => p);
+      }
+      const sanitized = sanitizeFTS5Term(t);
+      return sanitized ? [sanitized] : [];
+    })
     .join(' ');
 }
 

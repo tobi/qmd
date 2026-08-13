@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- Quoted FTS phrases containing dotted tokens (e.g. `"1.0.21"`) now match the
+  indexed document. The porter unicode61 tokenizer stores dotted strings as
+  adjacent parts, but phrase sanitization stripped the dots into a single
+  token (`1021`) that could never hit. Dotted tokens inside quotes are split
+  into adjacent phrase terms, matching the bare-term rewrite from #563 (#757).
+
 - `scripts/build.mjs` no longer passes `shell: true` to `spawnSync` on Windows.
   With the default Node install path (`C:\Program Files\nodejs\node.exe`),
   `cmd.exe` split the unquoted `process.execPath` at the space, the `tsc`

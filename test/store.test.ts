@@ -1790,6 +1790,38 @@ describe("FTS Search", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS matches quoted phrases containing dotted tokens (#757)", async () => {
+    // Phrase-path half of #563: quoted "1.0.21" used to strip dots into "1021",
+    // which never matches the adjacent 1/0/21 tokens the tokenizer stored.
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "staging-notes",
+      title: "Staging Notes",
+      body: "Staging RapidLEI was `1.0.21`.",
+      displayPath: "test/staging.md",
+    });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "other-doc",
+      title: "Other Document",
+      body: "Unrelated content about gardening and cooking.",
+      displayPath: "test/other.md",
+    });
+
+    const quoted = store.searchFTS('"1.0.21"', 10);
+    expect(quoted.map(r => r.displayPath)).toContain(`${collectionName}/test/staging.md`);
+
+    const phrase = store.searchFTS('"RapidLEI was 1.0.21"', 10);
+    expect(phrase.map(r => r.displayPath)).toContain(`${collectionName}/test/staging.md`);
+
+    const bare = store.searchFTS("1.0.21", 10);
+    expect(bare.map(r => r.displayPath)).toContain(`${collectionName}/test/staging.md`);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
