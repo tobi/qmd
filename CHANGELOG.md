@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- Files whose names differ only in the characters the legacy slug collapsed to
+  `-` (spaces, underscores) no longer evict each other from the index (#717).
+  The handalized-path migration now skips any row whose path is still owned by
+  a file in the current scan, so it only adopts genuinely stale pre-2.6 rows.
+  `qmd get` and `qmd ls <prefix>` also match `_` and `%` in paths literally
+  instead of as SQL `LIKE` wildcards, so `qmd get 2026_06_16.md` no longer
+  returns a sibling `2026-06-16.md`.
+
 - CLI `multi-get` and SDK/MCP `multi_get` now share one comma-list resolver.
   Collection-prefixed paths (`qmd/docs/SYNTAX.md`) work in both transports,
   unanchored `LIKE '%name'` no longer silently fetches a different document

@@ -1540,6 +1540,9 @@ export async function reindexCollection(
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  // Literal paths of every file in this scan. Passed to the legacy-path
+  // migration so it never adopts a row that still belongs to a live file.
+  const livePaths = new Set(files.map(f => normalizePathSeparators(f)));
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
@@ -1566,7 +1569,7 @@ export async function reindexCollection(
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -2802,10 +2805,15 @@ export function findActiveDocument(
 }
 
 /**
- * Find an active document, falling back to a case-insensitive path match.
- * If found under a different casing, renames it in-place and rebuilds the
+ * Find an active document, falling back to a legacy handalized-path match.
+ * If found under the pre-2.6 slug, renames it in-place and rebuilds the
  * FTS entry. Embeddings are keyed by content hash, so the rename is
  * safe — no re-embedding required.
+ *
+ * `livePaths`, when given, is the set of literal paths of every file in the
+ * current scan of this collection. A legacy row whose path is in that set
+ * belongs to a *different* file that still exists on disk, so it must never be
+ * adopted — renaming it would evict that file from the index (#717).
  *
  * @internal Used by reindexCollection and indexFiles during qmd update.
  * Returns null if the document does not exist under either path.
@@ -2813,7 +2821,8 @@ export function findActiveDocument(
 export function findOrMigrateLegacyDocument(
   db: Database,
   collectionName: string,
-  path: string
+  path: string,
+  livePaths?: ReadonlySet<string>
 ): { id: number; hash: string; title: string } | null {
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
@@ -2827,16 +2836,24 @@ export function findOrMigrateLegacyDocument(
   // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
   // Try matching the handalized form of the incoming raw path against the DB so that
   // qmd update on an old index can rename the row to the literal path.
-  let legacyHandalized: { id: number; hash: string; title: string } | undefined;
+  //
+  // Many literal paths map onto the same slug ("a b.md", "a_b.md", "a-b.md"), so
+  // a match is only evidence of a stale row when no live file already owns that
+  // path. Without this guard, indexing "2026_06_16.md" next to an existing
+  // "2026-06-16.md" renames the latter's row and the hyphenated file silently
+  // disappears from the index (#717).
+  type LegacyRow = { id: number; hash: string; title: string; path: string };
+  let legacyHandalized: LegacyRow | undefined;
   try {
     const handleized = handelize(path);
     if (handleized !== path) {
-      legacyHandalized = db.prepare(`
-        SELECT id, hash, title FROM documents
+      const row = db.prepare(`
+        SELECT id, hash, title, path FROM documents
         WHERE collection = ? AND path = ? AND active = 1
         ORDER BY id
         LIMIT 1
-      `).get(collectionName, handleized) as { id: number; hash: string; title: string } | undefined;
+      `).get(collectionName, handleized) as LegacyRow | undefined;
+      if (row && !livePaths?.has(row.path)) legacyHandalized = row;
     }
   } catch {
     // handelize throws on invalid paths; just skip
@@ -4580,9 +4597,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? ESCAPE '#' AND d.active = 1
       LIMIT 1
-    `).get(`%${filepath}`) as DbDocRow | null;
+    `).get(`%${escapeLikePattern(filepath)}`) as DbDocRow | null;
   }
 
   // Try to match by absolute path (requires looking up collection paths from DB)
