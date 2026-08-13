@@ -104,7 +104,21 @@ function realOrResolve(p: string): string {
   try {
     return realpathSync(p);
   } catch {
-    return resolve(p);
+    // Walk up to an ancestor that exists so macOS /tmp -> /private/tmp (and
+    // /var -> /private/var) does not make an in-project relative path look
+    // like an escape when the collection directory has not been created yet.
+    let cur = resolve(p);
+    const tail: string[] = [];
+    while (true) {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p);
+      tail.unshift(basename(cur));
+      try {
+        return resolve(realpathSync(parent), ...tail);
+      } catch {
+        cur = parent;
+      }
+    }
   }
 }
 
@@ -115,8 +129,8 @@ function realOrResolve(p: string): string {
  */
 export function resolveConfigCollectionPath(configPath: string, collectionPath: string): string {
   const expanded = expandUserPath(collectionPath.trim());
-  if (isAbsolute(expanded)) return resolve(expanded);
-  return resolve(projectRootFromConfigPath(configPath), expanded);
+  if (isAbsolute(expanded)) return realOrResolve(expanded);
+  return realOrResolve(resolve(realOrResolve(projectRootFromConfigPath(configPath)), expanded));
 }
 
 /** True if `target` is `dir` or a descendant. Lexical after realpath/resolve. */
