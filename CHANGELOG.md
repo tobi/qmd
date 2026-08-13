@@ -27,6 +27,11 @@
 
 ### Fixed
 
+- `qmd bench` no longer runs to a wall of 0.00 when the fixture collection is
+  missing or empty (#716). It errors up front with the same "Collection not
+  found" / index hint as `qmd search -c`, and if every backend still scores
+  zero it warns on stderr to check `qmd ls`.
+
 - `qmd cleanup` now reclaims the content and FTS space left behind after a
   wrong-directory `qmd update`. Deactivating files (the next update in the
   right directory) only tombstoned the `documents` rows; cleanup deleted those
