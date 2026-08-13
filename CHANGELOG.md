@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Security
+
+- `qmd mcp --http` now validates the `Origin` and `Host` headers on every
+  request and answers `403` when they name anything but a loopback address
+  (#881). Without this, any web page the user visited could re-point its own
+  hostname at `127.0.0.1` (DNS rebinding) and read the entire indexed corpus
+  through `POST /query` or `POST /mcp` — binding to localhost is no defence
+  against a request made by the user's own browser. Requests with no `Origin`
+  header (curl, MCP clients, editors) are unaffected. Extend the allowlists with
+  `QMD_ALLOWED_ORIGINS` / `QMD_ALLOWED_HOSTS`, or set `QMD_ALLOWED_ORIGINS=*`
+  to opt out behind your own authenticating proxy. A wildcard bind
+  (`--host 0.0.0.0`) skips the host check, since the legitimate `Host` is then
+  unknowable, and warns at startup.
+
 ### Changed
 
 - `qmd pull` (and implicit model downloads in `embed`/`query`) no longer print
