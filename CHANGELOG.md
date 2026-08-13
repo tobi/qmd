@@ -4,6 +4,17 @@
 
 ### Changed
 
+- MCP server now speaks protocol revision **2026-07-28** via the official
+  TypeScript SDK 2.x (`@modelcontextprotocol/server`). HTTP is sessionless
+  (no `Mcp-Session-Id`, no initialize handshake, no idle-session TTL / #816
+  reaper). Clients send version and capabilities in `_meta`; `server/discover`
+  is implemented; Streamable HTTP POST requires `Mcp-Method` / `Mcp-Name`
+  (mismatch → `-32020`); `tools/list` is deterministic and carries `ttlMs` /
+  `cacheScope`. 2025-era stdio clients still work (`serveStdio` dual-speak);
+  2025-era HTTP `initialize` is answered per-request without minting a
+  session. Existing tools (`query` / `get` / `multi_get` / `status`), stdio
+  EOF shutdown, and named-index daemon PIDs are unchanged. No release.
+
 - `qmd pull` (and implicit model downloads in `embed`/`query`) no longer print
   node-llama-cpp's download progress bar. The bar redraws every few kilobytes
   and flooded agent transcripts with thousands of tokens (#776). Pass

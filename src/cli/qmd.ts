@@ -2834,7 +2834,6 @@ function parseCLI() {
       daemon: { type: "boolean" },
       port: { type: "string" },
       host: { type: "string" },
-      "session-ttl": { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -4517,10 +4516,6 @@ if (isMain) {
         // fallback (resolved in startMcpHttpServer). Use "0.0.0.0" to accept
         // off-host connections, e.g. a container liveness probe.
         const host = cli.values.host ? String(cli.values.host) : undefined;
-        // --session-ttl overrides the idle session TTL in seconds;
-        // QMD_MCP_SESSION_TTL env is the fallback and 0 disables expiry
-        // (resolved in startMcpHttpServer).
-        const sessionTtl = cli.values["session-ttl"] !== undefined ? Number(cli.values["session-ttl"]) : undefined;
 
         if (cli.values.daemon) {
           // Guard: check if already running (identity-checked — recycled PIDs are stale)
@@ -4539,10 +4534,9 @@ if (isMain) {
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
-          const sessionTtlArgs = sessionTtl !== undefined ? ["--session-ttl", String(sessionTtl)] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...sessionTtlArgs]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...sessionTtlArgs];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4578,7 +4572,7 @@ if (isMain) {
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host, ...(sessionTtl !== undefined ? { sessionTtlSeconds: sessionTtl } : {}) });
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
