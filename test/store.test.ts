@@ -2941,6 +2941,83 @@ describe("Integration", () => {
 });
 
 // =============================================================================
+// Vector Search collection filter (no LLM — uses precomputed embeddings)
+// =============================================================================
+
+describe("Vector Search collection filter", () => {
+  test("searchVec finds docs in a small collection crowded by a large one (#791, #803)", async () => {
+    const store = await createTestStore();
+    const large = await createTestCollection({ name: "large", pwd: "/test/large" });
+    const small = await createTestCollection({ name: "small", pwd: "/test/small" });
+
+    const dims = 8;
+    store.ensureVecTable(dims);
+    const now = new Date().toISOString();
+    const queryEmbedding = Array(dims).fill(0);
+    queryEmbedding[0] = 1;
+
+    // 250 nearer neighbours in the large collection. With limit=3:
+    //   - old global k=limit*3=9 never sees `small`
+    //   - a plain multiplier (limit*30=90) still misses it
+    //   - sqlite-vec also caps k at 4096, so multipliers cannot fix tiny
+    //     collections in huge indexes. Collection-scoped exact scan does.
+    for (let i = 0; i < 250; i++) {
+      const hash = `largehash${String(i).padStart(3, "0")}`;
+      await insertTestDocument(store.db, large, {
+        name: `noise-${i}`,
+        hash,
+        body: `Noise document ${i}`,
+        displayPath: `noise-${i}.md`,
+      });
+      const embedding = new Float32Array(dims);
+      embedding[0] = 1;
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+    }
+
+    const targetHash = "smallhash001";
+    await insertTestDocument(store.db, small, {
+      name: "target",
+      hash: targetHash,
+      body: "Target document in the small collection",
+      displayPath: "target.md",
+    });
+    // Farther than the noise vectors — only found via collection-scoped scan.
+    const targetEmbedding = new Float32Array(dims);
+    targetEmbedding[0] = 0.6;
+    targetEmbedding[1] = 0.8;
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(targetHash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${targetHash}_0`, targetEmbedding);
+
+    const filtered = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      small,
+      undefined,
+      queryEmbedding,
+    );
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.collectionName).toBe(small);
+    expect(filtered[0]!.displayPath).toBe(`${small}/target.md`);
+
+    // Unfiltered search still ranks the closer large-collection docs first.
+    const unfiltered = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      undefined,
+      undefined,
+      queryEmbedding,
+    );
+    expect(unfiltered).toHaveLength(3);
+    expect(unfiltered.every((r) => r.collectionName === large)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 

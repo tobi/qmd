@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- `vsearch -c <collection>` no longer returns empty results for small
+  collections crowded out of the global ANN candidate pool. `searchVec` now
+  exact-scans the collection's vectors with `vec_distance_cosine` when the
+  set is within 20k rows (ANN + post-filter cannot see collections that never
+  enter global top-k, and sqlite-vec caps `k` at 4096 so a larger multiplier
+  alone is not enough). Larger collections still use capped ANN over-fetch
+  (#791, #803).
+
 - `multi-get --format files` now emits the docid as its own CSV field
   (`#docid,path,...`) instead of prepending it into the path field with a
   space (`#docid path,...`), matching `search --format files` and keeping
