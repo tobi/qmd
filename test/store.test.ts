@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
   getDefaultDbPath,
   homedir,
@@ -1149,6 +1150,17 @@ describe("Caching", () => {
     expect(key1).not.toBe(key2);
   });
 
+  test("rerank cache keys differ when the rerank model differs (#764)", () => {
+    const query = "same query";
+    const chunk = "same chunk";
+    const keyA = getCacheKey("rerank", { query, model: "hf:example/rerank-a/a.gguf", chunk });
+    const keyB = getCacheKey("rerank", { query, model: "hf:example/rerank-b/b.gguf", chunk });
+    const keyNoModel = getCacheKey("rerank", { query, chunk });
+    expect(keyA).not.toBe(keyB);
+    expect(keyA).not.toBe(keyNoModel);
+    expect(keyB).not.toBe(keyNoModel);
+  });
+
   test("store cache operations work correctly", async () => {
     const store = await createTestStore();
 
@@ -1169,6 +1181,91 @@ describe("Caching", () => {
     expect(store.getCachedResult(key)).toBeNull();
 
     await cleanupTestDb(store);
+  });
+
+  test("rerank cache key includes the resolved rerank model (#764)", async () => {
+    const store = await createTestStore();
+    const query = "rerank cache model swap";
+    const chunk = "identical chunk text";
+    const docs = [{ file: "doc.md", text: chunk }];
+
+    const makeMock = (modelName: string, score: number) => {
+      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
+        model: modelName,
+      }));
+      return {
+        spy: rerankSpy,
+        llm: { rerank: rerankSpy, rerankModelName: modelName },
+      };
+    };
+
+    const modelA = "hf:example/rerank-a/a.gguf";
+    const modelB = "hf:example/rerank-b/b.gguf";
+    const mockA = makeMock(modelA, 0.11);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
+
+    try {
+      const first = await store.rerank(query, docs);
+      expect(first[0]!.score).toBe(0.11);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+
+      const keyA = getCacheKey("rerank", { query, model: modelA, chunk });
+      const keyB = getCacheKey("rerank", { query, model: modelB, chunk });
+      const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk });
+      const keyNoModel = getCacheKey("rerank", { query, chunk });
+
+      expect(store.getCachedResult(keyA)).toBe("0.11");
+      expect(store.getCachedResult(keyNoModel)).toBeNull();
+      expect(store.getCachedResult(keyDefault)).toBeNull();
+
+      const mockB = makeMock(modelB, 0.99);
+      llmSpy.mockReturnValue(mockB.llm as any);
+
+      const second = await store.rerank(query, docs);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(second[0]!.score).toBe(0.99);
+      expect(store.getCachedResult(keyB)).toBe("0.99");
+
+      const third = await store.rerank(query, docs);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(third[0]!.score).toBe(0.99);
+    } finally {
+      llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rerank cache key follows store.llm.rerankModelName (#764)", async () => {
+    const store = await createTestStore();
+    const query = "store.llm model swap";
+    const docs = [{ file: "doc.md", text: "chunk" }];
+
+    const makeMock = (modelName: string, score: number) => {
+      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
+        model: modelName,
+      }));
+      return { spy: rerankSpy, llm: { rerank: rerankSpy, rerankModelName: modelName } };
+    };
+
+    const mockA = makeMock("hf:example/store-llm-a/a.gguf", 0.21);
+    const mockB = makeMock("hf:example/store-llm-b/b.gguf", 0.87);
+    store.llm = mockA.llm as any;
+
+    try {
+      const first = await store.rerank(query, docs);
+      expect(first[0]!.score).toBe(0.21);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+
+      store.llm = mockB.llm as any;
+      const second = await store.rerank(query, docs);
+      expect(second[0]!.score).toBe(0.87);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
   });
 });
 
@@ -3236,6 +3333,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       await cleanupTestDb(store);
     }
   });
+
 });
 
 // =============================================================================

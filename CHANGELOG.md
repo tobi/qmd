@@ -23,6 +23,10 @@
 
 ### Fixed
 
+- Rerank cache keys now include the resolved `models.rerank` URI, so swapping
+  the configured reranker no longer serves the previous model's cached scores
+  (#764).
+
 - `vsearch -c <collection>` no longer returns empty results for small
   collections crowded out of the global ANN candidate pool. `searchVec` now
   exact-scans the collection's vectors with `vec_distance_cosine` when the

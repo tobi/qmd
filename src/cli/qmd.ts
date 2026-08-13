@@ -138,11 +138,13 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      const llm = new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
-      }));
+      });
+      setDefaultLlamaCpp(llm);
+      store.llm = llm;
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
