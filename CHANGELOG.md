@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- The Nix flake wrapper now seeds the same pre-import env as `bin/qmd`.
+  Nix installs exec `bun src/cli/qmd.ts` directly, so they previously skipped
+  the launcher: `qmd mcp` could leak llama/ggml native logs onto JSON-RPC
+  stdio, and Darwin CLI exits dumped a ggml Metal residency-set stack trace
+  after an otherwise successful query. The wrapper now quiets those logs for
+  `mcp` and sets `GGML_METAL_NO_RESIDENCY=1` on Darwin unless
+  `QMD_METAL_KEEP_RESIDENCY=1` (#723).
+
 - Rerank context creation no longer swallows the real failure. A VRAM OOM or
   corrupt model previously produced only `Reranker unavailable — skipping
   reranking` (and a dead identical retry whose comment claimed it disabled

@@ -752,9 +752,10 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
-    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
-    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
+    // set GGML_METAL_NO_RESIDENCY=1 on darwin BEFORE the native binding loads,
+    // which prevents the libggml-metal static destructor assertion at process
+    // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
 
