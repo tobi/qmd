@@ -70,19 +70,25 @@ describe("local .qmd project config", () => {
     writeFileSync(join(root, ".qmd", "index.yaml"), `collections:\n  docs:\n    path: ${JSON.stringify(join(root, "docs"))}\n    pattern: "**/*.md"\n    context:\n      /: Local test docs\nmodels:\n  embed: local-embed-model\n  rerank: local-rerank-model\n  generate: local-generate-model\n`);
 
     const home = join(root, "home");
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, ".config"),
+      XDG_CACHE_HOME: join(home, ".cache"),
+      QMD_EMBED_MODEL: "env-embed-model",
+      QMD_RERANK_MODEL: "env-rerank-model",
+      QMD_GENERATE_MODEL: "env-generate-model",
+    };
+    // Custom model URIs in a checked-in .qmd config need an explicit approval
+    // (#889). The user owns this fixture, so trust it before asserting that
+    // local config overrides env vars.
+    const trust = cliCommandArgs("trust");
+    execFileSync(trust.bin, trust.args, { cwd: root, encoding: "utf-8", env });
     const { bin, args } = cliCommandArgs("status");
     const output = execFileSync(bin, args, {
       cwd: root,
       encoding: "utf-8",
-      env: {
-        ...process.env,
-        HOME: home,
-        XDG_CONFIG_HOME: join(home, ".config"),
-        XDG_CACHE_HOME: join(home, ".cache"),
-        QMD_EMBED_MODEL: "env-embed-model",
-        QMD_RERANK_MODEL: "env-rerank-model",
-        QMD_GENERATE_MODEL: "env-generate-model",
-      },
+      env,
     });
 
     const localIndex = join(root, ".qmd", "index.sqlite");

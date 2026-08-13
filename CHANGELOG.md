@@ -17,6 +17,17 @@
   `~/.config/qmd/*.yml`, including anything `qmd collection update-cmd` writes,
   are unaffected.
 
+- The same project-local trust gate now covers collection `path` values that
+  resolve outside the project and `models.*` URIs that are not the built-in
+  defaults (#889). A checked-in `.qmd/index.yml` could previously point
+  `qmd update` at any readable directory and `qmd embed` / `qmd query` /
+  `qmd pull` at any `hf:` repo or local GGUF, with no prompt. In-project paths
+  (`./docs`) and default model URIs still apply without approval. Untrusted
+  out-of-project collections are skipped (other collections still index);
+  untrusted model URIs fall back to the built-in defaults or `QMD_*_MODEL`.
+  Approvals reuse `<config dir>/trusted.json`; a hooks-only digest is unchanged
+  so existing `qmd trust` records still match.
+
 - Indexing no longer follows file symlinks or glob `../` / absolute patterns
   out of the collection directory. `fast-glob` already skipped symlinked
   directories, but a file symlink (or a mask like `../**/*.md`) still resolved
@@ -35,6 +46,8 @@
   bind (`--host 0.0.0.0`) skips the host check and warns at startup.
 
 ### Changed
+
+- Nested picomatch min-bumps for high GHSA-c2c7-rcm5-vvqj / GHSA-3v7f-55p6-f55p: micromatch 2.3.1 -> 2.3.2, vite/tinyglobby 4.0.3 -> 4.0.5. Direct picomatch stays 4.0.5. No zod/vitest majors. flake.nix FOD hashes not updated.
 
 - Dependencies: `node-llama-cpp` 3.18.1 → **3.20.0** (llama.cpp b8390 → b10361, 2026-08-11). Also safe patch/minors: `picomatch` 4.0.4 → 4.0.5, `web-tree-sitter` 0.26.8 → 0.26.12, `tsx` 4.21.0 → 4.23.12, `vitest` 3.2.4 → 3.2.7. No zod/vitest major; `@modelcontextprotocol/server` stays 2.0.0 (no 2.x patch). `flake.nix` FOD hashes are not updated here.
 - `generate` and query expansion now await `LlamaContextSequence.dispose()` before disposing the parent context. node-llama-cpp 3.20 made sequence dispose async; the library's context-onDispose path does not wait.

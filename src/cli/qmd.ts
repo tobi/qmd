@@ -117,13 +117,15 @@ import {
   type ModelsConfig,
 } from "../collections.js";
 import {
-  decideHookGate,
-  hookDigest,
+  collectGatedSurfaces,
+  configDigest,
+  decideConfigGate,
+  hasGatedSurfaces,
   isLocalConfigPath,
   listTrusted,
   recordTrust,
   revokeTrust,
-  type UpdateHook,
+  type GatedConfig,
 } from "../trust.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -696,24 +698,70 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-/**
- * Every `update:` hook the active config defines. Read from the YAML rather
- * than the synced SQLite copy so `qmd trust` and `qmd update` always digest the
- * same set.
- */
-function collectUpdateHooks(): UpdateHook[] {
-  const config = loadConfig();
-  return Object.entries(config.collections ?? {})
-    .filter(([, col]) => !!col.update)
-    .map(([name, col]) => ({ collection: name, command: col.update! }));
+function defaultModelsForTrust(): { embed: string; generate: string; rerank: string } {
+  return {
+    embed: DEFAULT_EMBED_MODEL,
+    generate: DEFAULT_QUERY_MODEL,
+    rerank: DEFAULT_RERANK_MODEL,
+  };
 }
 
-/** Record the active config's current hook set as approved. */
-function trustCurrentConfigHooks(): void {
+function currentGatedConfig(): { configPath: string; gated: GatedConfig } {
   const configPath = getConfigPath();
-  if (!isLocalConfigPath(configPath)) return;
-  recordTrust(configPath, hookDigest(collectUpdateHooks()));
+  return {
+    configPath,
+    gated: collectGatedSurfaces(configPath, loadConfig(), defaultModelsForTrust()),
+  };
 }
+
+/** Record the active config's current gated surfaces as approved. */
+function trustCurrentConfigHooks(): void {
+  const { configPath, gated } = currentGatedConfig();
+  if (!isLocalConfigPath(configPath)) return;
+  recordTrust(configPath, configDigest(gated));
+}
+
+function printGatedSurfaces(configPath: string, gated: GatedConfig): void {
+  if (gated.hooks.length > 0) {
+    console.log(`${c.yellow}This project's ${configPath} defines update commands:${c.reset}`);
+    for (const hook of gated.hooks) {
+      console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
+    }
+    console.log(`${c.dim}They run as a shell script before indexing.${c.reset}`);
+  }
+  if (gated.paths.length > 0) {
+    console.log(`${c.yellow}This project's ${configPath} names collection paths outside the project:${c.reset}`);
+    for (const p of gated.paths) {
+      console.log(`  ${c.bold}${p.collection}${c.reset}: ${p.path}`);
+    }
+    console.log(`${c.dim}Those directories would be indexed on update.${c.reset}`);
+  }
+  if (gated.models.embed || gated.models.rerank || gated.models.generate) {
+    console.log(`${c.yellow}This project's ${configPath} names model URIs:${c.reset}`);
+    if (gated.models.embed) console.log(`  embed: ${gated.models.embed}`);
+    if (gated.models.rerank) console.log(`  rerank: ${gated.models.rerank}`);
+    if (gated.models.generate) console.log(`  generate: ${gated.models.generate}`);
+    console.log(`${c.dim}Those would be downloaded or loaded on embed/query/pull.${c.reset}`);
+  }
+  console.log(`${c.dim}Config that came with a checkout is not trusted by default.${c.reset}`);
+}
+
+function warnUntrustedModels(): void {
+  const { configPath, gated } = currentGatedConfig();
+  if (!gated.models.embed && !gated.models.rerank && !gated.models.generate) return;
+  const decision = decideConfigGate({
+    configPath,
+    gated,
+    isInteractive: false,
+  });
+  if (decision.action === "run") return;
+  console.log(`${c.yellow}Skipping project-local model URIs from ${configPath} — not trusted.${c.reset}`);
+  if (gated.models.embed) console.log(`  embed: ${gated.models.embed}`);
+  if (gated.models.rerank) console.log(`  rerank: ${gated.models.rerank}`);
+  if (gated.models.generate) console.log(`  generate: ${gated.models.generate}`);
+  console.log(`${c.dim}Built-in defaults (or QMD_*_MODEL) apply instead. Approve with 'qmd trust', or set QMD_TRUST_UPDATE_HOOKS=1.${c.reset}`);
+}
+
 
 /** Ask the user a yes/no question. Only called when stdin and stdout are TTYs. */
 async function confirmOnTty(question: string): Promise<boolean> {
@@ -728,48 +776,49 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 /**
- * Decide whether this run may execute the configured `update:` hooks, prompting
- * when there is a human to ask. Returns false when the hooks must be skipped —
+ * Decide whether this run may apply gated project-local config (update hooks,
+ * out-of-project collection paths, custom model URIs), prompting when there is
+ * a human to ask. Returns false when those surfaces must be skipped — in-project
  * indexing still proceeds, since that is what the caller asked for.
  */
-async function resolveUpdateHookTrust(): Promise<boolean> {
-  const hooks = collectUpdateHooks();
-  if (hooks.length === 0) return true;
+async function resolveUpdateHookTrust(): Promise<{ allowed: boolean; gated: GatedConfig }> {
+  const { configPath, gated } = currentGatedConfig();
+  if (!hasGatedSurfaces(gated)) return { allowed: true, gated };
 
-  const configPath = getConfigPath();
-  const decision = decideHookGate({
+  const decision = decideConfigGate({
     configPath,
-    hooks,
+    gated,
     isInteractive: !!process.stdin.isTTY && !!process.stdout.isTTY,
   });
 
-  if (decision.action === "run") return true;
+  if (decision.action === "run") return { allowed: true, gated };
 
-  console.log(`${c.yellow}This project's ${configPath} defines update commands:${c.reset}`);
-  for (const hook of hooks) {
-    console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
-  }
-  console.log(`${c.dim}They run as a shell script before indexing. Config that came with a checkout is not trusted by default.${c.reset}`);
+  printGatedSurfaces(configPath, gated);
 
   if (decision.action === "skip") {
     console.log(`${c.yellow}Skipping them — no terminal to confirm on. Indexing continues.${c.reset}`);
-    console.log(`${c.dim}Approve with 'qmd trust', or set QMD_TRUST_UPDATE_HOOKS=1 for unattended runs.${c.reset}\n`);
-    return false;
+    console.log(`${c.dim}Approve with 'qmd trust', or set QMD_TRUST_UPDATE_HOOKS=1 for unattended runs.${c.reset}` + "\n");
+    return { allowed: false, gated };
   }
 
-  const approved = await confirmOnTty("Run these update commands? [y/N] ");
+  const hooksOnly = gated.hooks.length > 0 && gated.paths.length === 0
+    && !gated.models.embed && !gated.models.rerank && !gated.models.generate;
+  const approved = await confirmOnTty(hooksOnly
+    ? "Run these update commands? [y/N] "
+    : "Apply this checked-in config? [y/N] ");
   if (!approved) {
-    console.log(`${c.yellow}Skipped. Indexing continues.${c.reset}\n`);
-    return false;
+    console.log(`${c.yellow}Skipped. Indexing continues.${c.reset}` + "\n");
+    return { allowed: false, gated };
   }
   recordTrust(configPath, decision.digest);
-  console.log(`${c.green}Trusted ${configPath}.${c.reset} ${c.dim}Editing a command will ask again.${c.reset}\n`);
-  return true;
+  console.log(`${c.green}Trusted ${configPath}.${c.reset} ${c.dim}Editing a command, path, or model URI will ask again.${c.reset}` + "\n");
+  return { allowed: true, gated };
 }
 
 /**
- * `qmd trust [list|revoke]` — approve, inspect or drop the update-hook
- * approval for the project-local config in scope.
+ * `qmd trust [list|revoke]` — approve, inspect or drop the approval for
+ * gated surfaces in the project-local config in scope (update hooks,
+ * out-of-project collection paths, custom model URIs).
  */
 function manageTrust(subcommand?: string): void {
   const configPath = getConfigPath();
@@ -806,22 +855,20 @@ function manageTrust(subcommand?: string): void {
   }
 
   if (!isLocalConfigPath(configPath)) {
-    console.log(`${c.dim}${configPath} is your own config — update commands there always run. Nothing to trust.${c.reset}`);
+    console.log(`${c.dim}${configPath} is your own config — update commands, paths, and models there always apply. Nothing to trust.${c.reset}`);
     return;
   }
 
-  const hooks = collectUpdateHooks();
-  if (hooks.length === 0) {
-    console.log(`${c.dim}${configPath} defines no update commands. Nothing to trust.${c.reset}`);
+  const { gated } = currentGatedConfig();
+  if (!hasGatedSurfaces(gated)) {
+    console.log(`${c.dim}${configPath} defines no update commands, out-of-project paths, or custom model URIs. Nothing to trust.${c.reset}`);
     return;
   }
 
-  for (const hook of hooks) {
-    console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
-  }
-  recordTrust(configPath, hookDigest(hooks));
+  printGatedSurfaces(configPath, gated);
+  recordTrust(configPath, configDigest(gated));
   console.log(`${c.green}✓ Trusted ${configPath}${c.reset}`);
-  console.log(`${c.dim}Editing any of these commands will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
+  console.log(`${c.dim}Editing an update command, collection path, or model URI will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
 }
 
 async function updateCollections(): Promise<void> {
@@ -841,8 +888,11 @@ async function updateCollections(): Promise<void> {
   }
 
   // A project-local .qmd/index.yml travels with a `git clone`, so its `update:`
-  // hooks are somebody else's shell commands until the user says otherwise (#886).
-  const hooksAllowed = await resolveUpdateHookTrust();
+  // hooks, out-of-project collection paths, and custom model URIs are somebody
+  // else's say-so until the user says otherwise (#886, #889).
+  const trust = await resolveUpdateHookTrust();
+  const hooksAllowed = trust.allowed;
+  const skippedPaths = new Set(trust.allowed ? [] : trust.gated.paths.map(p => p.collection));
 
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
@@ -850,6 +900,11 @@ async function updateCollections(): Promise<void> {
     const col = collections[i];
     if (!col) continue;
     console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+    if (skippedPaths.has(col.name)) {
+      console.log(`${c.yellow}    Skipping — path ${col.pwd} is outside the project and this config is not trusted.${c.reset}`);
+      console.log(`${c.dim}    Approve with 'qmd trust'.${c.reset}` + "\n");
+      continue;
+    }
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
@@ -1765,6 +1820,9 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
   resyncConfig();
+  // The user just typed this path, so an out-of-project root needs no separate
+  // approval; re-record so the digest covers the new path set (#889).
+  trustCurrentConfigHooks();
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
@@ -2033,18 +2091,31 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
     const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
+    const configPath = getConfigPath();
+    const gated = collectGatedSurfaces(configPath, config, defaultModelsForTrust());
+    const decision = decideConfigGate({
+      configPath,
+      gated,
+      isInteractive: false,
+    });
+    // Untrusted project-local model URIs are not applied (#889). Env vars and
+    // built-in defaults still work. Do not write the fallback back into the
+    // YAML — that would erase the untrusted values the user may yet approve.
+    const applyConfigModels = decision.action === "run";
+    const models = resolveModels(applyConfigModels ? config.models : undefined);
+    if (applyConfigModels) {
+      const current = config.models ?? {};
+      if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+        saveConfig({
+          ...config,
+          models: {
+            ...current,
+            embed: models.embed,
+            generate: models.generate,
+            rerank: models.rerank,
+          },
+        });
+      }
     }
     return models;
   } catch {
@@ -3502,7 +3573,7 @@ function showHelp(): void {
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's update commands");
+  console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks, paths, and models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -4555,6 +4626,7 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
+        warnUntrustedModels();
         await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
@@ -4569,6 +4641,7 @@ if (isMain) {
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      warnUntrustedModels();
       const activeModels = resolveModelsForCli();
       const models = [
         activeModels.embed,
@@ -4607,6 +4680,7 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
+      warnUntrustedModels();
       await vectorSearch(cli.query, cli.opts);
       break;
 
@@ -4616,6 +4690,7 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
+      warnUntrustedModels();
       await querySearch(cli.query, cli.opts);
       break;
 
