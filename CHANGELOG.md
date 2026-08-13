@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- `/release` step 1 no longer points at a missing script. `skills/release/scripts/release-context.sh`
+  now exists: it silently installs git hooks and prints version info, working-tree
+  status, commits and files since the last tag, `[Unreleased]`, and the previous
+  changelog entry. The skill's process list also drops the duplicate step 7 and
+  checks dependency updates before cutting the release (#796).
+
 - `store.searchVec()` (and SDK `searchVector()`) now embed the query with the
   store's pinned embed model instead of the global `QMD_EMBED_MODEL`. A store
   created with a non-default `models.embed` previously failed with
