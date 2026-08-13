@@ -1480,7 +1480,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1491,10 +1491,12 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const intent = options.intent;
-    const prompt = intent
-      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
-      : `/no_think Expand this search query: ${query}`;
+    // The expansion prompt consumes ONLY the query text. Caller intent is
+    // free-form meta-language that the expansion model reproduced verbatim as
+    // lex/vec sub-queries — degenerate terms that match nothing. Intent still
+    // shapes retrieval where it belongs: the reranker query prefix and
+    // keyword-based chunk/snippet selection.
+    const prompt = `/no_think Expand this search query: ${query}`;
 
     // Set up inside the try so any failure (grammar creation, context
     // allocation/VRAM, session prompt) falls back to the original query

@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
   getDefaultDbPath,
@@ -1305,6 +1306,70 @@ describe("Caching", () => {
     }
   });
 });
+
+describe("Query expansion cache (#818)", () => {
+  test("expandQuery serves cached expansions without invoking the LLM", async () => {
+    const store = await createTestStore();
+    try {
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const seeded = [{ type: "lex", query: "seeded-term" }];
+      store.setCachedResult(getCacheKey("expandQuery", { query: "cached question", model }), JSON.stringify(seeded));
+
+      // CI mode makes any real generation throw, so a passing call proves the
+      // cache path; locally the seed always hits, so the LLM is never
+      // consulted either way.
+      const out = await store.expandQuery("cached question");
+      expect(out).toEqual([{ type: "lex", query: "seeded-term" }]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery drops a cached expansion whose sub-queries contributed nothing", async () => {
+    const store = await createTestStore();
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "alpha",
+        title: "Alpha Bravo",
+        body: "# Alpha\n\nalpha bravo charlie content.",
+      });
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
+      store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "zzzqqq wwwuuu" }]));
+
+      // intent disables the strong-signal bypass so the cached expansion is
+      // actually consulted; it no longer reaches the expansion model itself.
+      await hybridQuery(store, "alpha bravo", { limit: 5, minScore: 0, skipRerank: true, intent: "unrelated meta commentary" });
+
+      // The dud expansion found nothing — it must not survive to poison the
+      // next warm repeat of this query.
+      expect(store.getCachedResult(cacheKey)).toBeNull();
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery keeps a cached expansion that contributed results", async () => {
+    const store = await createTestStore();
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "alpha",
+        title: "Alpha Bravo",
+        body: "# Alpha\n\nalpha bravo charlie content.",
+      });
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
+      store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "charlie" }]));
+
+      await hybridQuery(store, "alpha bravo", { limit: 5, minScore: 0, skipRerank: true, intent: "unrelated meta commentary" });
+
+      expect(store.getCachedResult(cacheKey)).not.toBeNull();
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+});
+
 
 // =============================================================================
 // Context Tests

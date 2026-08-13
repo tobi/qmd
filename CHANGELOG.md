@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- Query expansion no longer consumes caller `intent`, and a cached expansion
+  whose sub-queries all miss is dropped instead of replaying forever (#818).
+  Intent still steers reranking and snippet/chunk selection; it just no longer
+  enters the expansion prompt or cache key, where the model copied meta-language
+  ("so I can compare spend settings") into lex/vec terms that matched nothing.
+
 - Files whose names differ only in the characters the legacy slug collapsed to
   `-` (spaces, underscores) no longer evict each other from the index (#717).
   The handalized-path migration now skips any row whose path is still owned by

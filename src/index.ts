@@ -152,7 +152,7 @@ export interface SearchOptions {
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
   queries?: ExpandedQuery[];
-  /** Domain intent hint — steers expansion and reranking */
+  /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
   /** Rerank results using LLM (default: true) */
   rerank?: boolean;
@@ -192,6 +192,12 @@ export interface VectorSearchOptions {
  * Options for expandQuery() — manual query expansion.
  */
 export interface ExpandQueryOptions {
+  /**
+   * @deprecated Ignored. Intent no longer feeds the expansion model — caller
+   * intent is meta-language the model reproduced verbatim as sub-queries.
+   * Pass intent via SearchOptions instead, where it shapes reranking and
+   * snippet selection.
+   */
   intent?: string;
 }
 
@@ -427,7 +433,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });
