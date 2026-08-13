@@ -934,7 +934,7 @@ describe("MCP Server", () => {
 // =============================================================================
 
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { enableProductionMode } from "../src/store";
+import { _resetProductionModeForTesting } from "../src/store";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
@@ -1200,6 +1200,69 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       expect(newSid).not.toBe(sid);
     } finally {
       await ttlHandle.stop();
+    }
+  });
+});
+
+
+// =============================================================================
+// HTTP Transport — CI-visible legacy FTS open (#792)
+// =============================================================================
+//
+// The suite above is skipIf(CI) because query tests load models. The original
+// #792 failure was in that suite's beforeAll: initTestDatabase still creates
+// fts5(name, body, content='documents'), then startMcpHttpServer -> createStore
+// -> rebuildFTSForCjkNormalization ran DELETE FROM documents_fts and threw
+// `no such column: T.name`. Keep this helper seed and assert open succeeds
+// even when CI=true.
+
+describe("MCP HTTP Transport — legacy FTS seed (#792)", () => {
+  test("startMcpHttpServer opens a DB seeded like the MCP helper (name/body + content='documents')", async () => {
+    const origIndexPath = process.env.INDEX_PATH;
+    const origConfigDir = process.env.QMD_CONFIG_DIR;
+    const dbPath = `/tmp/qmd-mcp-http-legacy-fts-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`;
+    let configDir: string | undefined;
+    let handle: HttpServerHandle | undefined;
+
+    try {
+      const db = openDatabase(dbPath);
+      initTestDatabase(db);
+      seedTestData(db);
+      const testConfig: CollectionConfig = {
+        collections: {
+          docs: { path: "/test/docs", pattern: "**/*.md" },
+        },
+      };
+      syncConfigToDb(db, testConfig);
+      db.close();
+
+      const configPrefix = join(tmpdir(), `qmd-mcp-http-legacy-config-${Date.now()}-`);
+      configDir = await mkdtemp(configPrefix);
+      await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
+
+      process.env.INDEX_PATH = dbPath;
+      process.env.QMD_CONFIG_DIR = configDir;
+
+      handle = await startMcpHttpServer(0, { quiet: true, dbPath });
+      const res = await fetch(`http://localhost:${handle.port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { status?: string };
+      expect(body.status).toBe("ok");
+    } finally {
+      if (handle) await handle.stop();
+      _resetProductionModeForTesting();
+      if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+      else delete process.env.INDEX_PATH;
+      if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+      else delete process.env.QMD_CONFIG_DIR;
+      try { unlinkSync(dbPath); } catch {}
+      if (configDir) {
+        try {
+          const files = await readdir(configDir);
+          for (const f of files) await unlink(join(configDir, f));
+          await rmdir(configDir);
+        } catch {}
+      }
     }
   });
 });

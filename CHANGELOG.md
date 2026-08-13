@@ -27,6 +27,13 @@
 
 ### Fixed
 
+- CJK FTS rebuild no longer skips leftover `fts5(name, body, content='documents')`
+  tables when `fts_cjk_normalized_version` is already stamped, and schema
+  repair now checks live FTS columns (`PRAGMA table_info`) as well as
+  `sqlite_master.sql`. The MCP HTTP test helper still seeds that legacy
+  table; `startMcpHttpServer` / `createStore` on it must not throw
+  `no such column: T.name` (#792 regression).
+
 - `qmd collection add --glob` is no longer silently ignored. parseArgs ran
   with `strict: false`, so OpenClaw's `--glob memory.md` (and any other
   `--glob`) fell through, the default `**/*.md` was used, and a second

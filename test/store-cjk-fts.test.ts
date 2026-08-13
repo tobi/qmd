@@ -193,6 +193,14 @@ describe("rebuildFTSForCjkNormalization — bounded source scan", () => {
     // 3.25+ re-validation of dependent trigger bodies).
     expect(fnBody).toContain("documents_fts_rebuild");
     expect(fnBody).toContain("INSERT INTO documents_fts");
+    // DELETE FROM documents_fts on leftover content-external FTS compiles as
+    // SELECT T.name FROM documents (#792). Repair must run inside this
+    // function *before* that DELETE (and before the version-stamp early
+    // return), not only in initializeDatabase.
+    const ensureIdx = fnBody.indexOf("ensureDocumentsFtsSchema");
+    const deleteIdx = fnBody.indexOf("DELETE FROM documents_fts");
+    expect(ensureIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(ensureIdx);
   });
 });
 
@@ -644,6 +652,79 @@ describe("rebuildFTSForCjkNormalization — legacy external-content FTS schema (
       expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
 
       const hits = store.searchFTS("UNIQUE_KEYWORD_XYZ", 10, "docs");
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.displayPath).toBe("docs/readme.md");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("repairs leftover name/body FTS even when the CJK version is already stamped", async () => {
+    {
+      const seed = openDatabase(dbPath);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS content (
+          hash TEXT PRIMARY KEY,
+          doc TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          collection TEXT NOT NULL,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          modified_at TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+          UNIQUE(collection, path)
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS store_config (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      `);
+      seed.exec(`
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          name, body,
+          content='documents',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        )
+      `);
+      seed.prepare(`
+        INSERT INTO store_config(key, value) VALUES ('fts_cjk_normalized_version', ?)
+      `).run(FTS_CJK_NORMALIZED_VERSION);
+      seedDocument(seed, {
+        id: 1,
+        collection: "docs",
+        path: "readme.md",
+        title: "Project README",
+        body: "stamped-legacy canary STAMPED_LEGACY_XYZ",
+      });
+      seed.close();
+    }
+
+    const store = createStore(dbPath);
+    try {
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).not.toMatch(/content\s*=/);
+
+      const cols = store.db.prepare(`PRAGMA table_info(documents_fts)`).all() as { name: string }[];
+      const names = cols.map(c => c.name);
+      expect(names).toContain("filepath");
+      expect(names).not.toContain("name");
+
+      const hits = store.searchFTS("STAMPED_LEGACY_XYZ", 10, "docs");
       expect(hits.length).toBe(1);
       expect(hits[0]!.displayPath).toBe("docs/readme.md");
     } finally {

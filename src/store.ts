@@ -956,13 +956,30 @@ function applyFtsSyncTriggers(db: Database): void {
  * then runs `DELETE FROM documents_fts`, which FTS5 compiles against the
  * external content table as `SELECT T.name FROM documents AS T` — documents
  * has no `name` column, so open throws `no such column: T.name` (#792).
+ *
+ * sqlite_master.sql is the usual signal, but PRAGMA table_info is the live
+ * virtual-table schema: a leftover `name` column with no `filepath` is never
+ * current, even if CREATE IF NOT EXISTS rewrote the sql text.
  */
+function documentsFtsColumnNames(db: Database): string[] {
+  try {
+    const cols = db.prepare(`PRAGMA table_info(documents_fts)`).all() as { name?: string }[];
+    return cols.map(c => (c.name ?? "").toLowerCase()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function documentsFtsSchemaIsCurrent(db: Database): boolean {
   const row = db.prepare(
     `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
   ).get() as { sql?: string } | undefined | null;
   const sql = (row?.sql ?? "").toLowerCase().replace(/\s+/g, "");
-  return sql.includes("filepath") && sql.includes("title") && !sql.includes("content=");
+  if (!sql.includes("filepath") || !sql.includes("title") || sql.includes("content=")) {
+    return false;
+  }
+  const names = new Set(documentsFtsColumnNames(db));
+  return names.has("filepath") && names.has("title") && names.has("body") && !names.has("name");
 }
 
 function recreateDocumentsFts(db: Database): void {
@@ -1004,6 +1021,11 @@ function dropTableIfExists(db: Database, tableName: string): void {
 }
 
 function rebuildFTSForCjkNormalization(db: Database): void {
+  // Repair leftover content-external FTS *before* the version check or the
+  // later `DELETE FROM documents_fts`. A stamped CJK version with a legacy
+  // `name` column would otherwise skip the rebuild, and DELETE still compiles
+  // as SELECT T.name FROM documents (#792).
+  ensureDocumentsFtsSchema(db);
   if (cjkRebuildVersion(db) === FTS_CJK_NORMALIZED_VERSION) return;
 
   // Clean up the legacy fixed-name shadow table left by an interrupted older
