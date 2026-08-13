@@ -11,14 +11,20 @@ import { join } from "node:path";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import {
   decideHookGate,
+  decideLocalConfigGate,
   getTrustFilePath,
   hookDigest,
+  isCollectionPathInsideProject,
   isLocalConfigPath,
   isTrusted,
   listTrusted,
   loadTrustStore,
   recordTrust,
+  resolveConfigCollectionPath,
   revokeTrust,
+  sensitiveDigest,
+  type BuiltinModels,
+  type SensitiveSnapshot,
   type UpdateHook,
 } from "../src/trust.js";
 
@@ -195,5 +201,210 @@ describe("decideHookGate", () => {
       trustedCheck: untrusted,
     });
     expect(decision.action).toBe("skip");
+  });
+});
+
+const builtins: BuiltinModels = {
+  embed: "hf:default/embed/model.gguf",
+  rerank: "hf:default/rerank/model.gguf",
+  generate: "hf:default/generate/model.gguf",
+};
+
+function snapshot(overrides: Partial<SensitiveSnapshot> = {}): SensitiveSnapshot {
+  return {
+    hooks: [],
+    paths: [{ collection: "docs", path: "./docs" }],
+    models: {},
+    ...overrides,
+  };
+}
+
+describe("isCollectionPathInsideProject", () => {
+  test("allows relative paths inside the project", () => {
+    const configPath = "/home/me/project/.qmd/index.yml";
+    expect(isCollectionPathInsideProject(configPath, "./docs")).toBe(true);
+    expect(isCollectionPathInsideProject(configPath, ".")).toBe(true);
+    expect(isCollectionPathInsideProject(configPath, "docs/notes")).toBe(true);
+  });
+
+  test("rejects paths that leave the project", () => {
+    const configPath = "/home/me/project/.qmd/index.yml";
+    expect(isCollectionPathInsideProject(configPath, "..")).toBe(false);
+    expect(isCollectionPathInsideProject(configPath, "../other")).toBe(false);
+    expect(isCollectionPathInsideProject(configPath, "/etc")).toBe(false);
+    expect(isCollectionPathInsideProject(configPath, "/home/me/secrets")).toBe(false);
+  });
+
+  test("expands ~ to the home directory, which is outside the project", () => {
+    const configPath = "/home/me/project/.qmd/index.yml";
+    const origHome = process.env.HOME;
+    process.env.HOME = "/home/me";
+    try {
+      expect(isCollectionPathInsideProject(configPath, "~/secrets")).toBe(false);
+      expect(resolveConfigCollectionPath("~/secrets", configPath)).toBe("/home/me/secrets");
+    } finally {
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+    }
+  });
+});
+
+describe("sensitiveDigest", () => {
+  const project = "/home/me/project/.qmd/index.yml";
+
+  test("is stable across collection ordering", () => {
+    const a = snapshot({
+      paths: [
+        { collection: "docs", path: "./docs" },
+        { collection: "notes", path: "./notes" },
+      ],
+    });
+    const b = snapshot({
+      paths: [
+        { collection: "notes", path: "./notes" },
+        { collection: "docs", path: "./docs" },
+      ],
+    });
+    expect(sensitiveDigest(a, project, builtins)).toBe(sensitiveDigest(b, project, builtins));
+  });
+
+  test("in-project paths and default models do not change the digest", () => {
+    const empty = snapshot({ paths: [], models: {} });
+    const inProject = snapshot({
+      paths: [{ collection: "docs", path: "./docs" }],
+      models: { embed: builtins.embed, rerank: builtins.rerank, generate: builtins.generate },
+    });
+    expect(sensitiveDigest(empty, project, builtins)).toBe(sensitiveDigest(inProject, project, builtins));
+  });
+
+  test("changes when a collection path leaves the project", () => {
+    const inside = snapshot({ paths: [{ collection: "docs", path: "./docs" }] });
+    const outside = snapshot({ paths: [{ collection: "docs", path: "/etc" }] });
+    expect(sensitiveDigest(inside, project, builtins)).not.toBe(sensitiveDigest(outside, project, builtins));
+  });
+
+  test("changes when a custom model URI is set", () => {
+    const defaults = snapshot({ models: {} });
+    const custom = snapshot({ models: { embed: "hf:evil/embed/x.gguf" } });
+    expect(sensitiveDigest(defaults, project, builtins)).not.toBe(sensitiveDigest(custom, project, builtins));
+  });
+});
+
+describe("decideLocalConfigGate", () => {
+  const project = "/home/me/project/.qmd/index.yml";
+  const global = "/home/me/.config/qmd/index.yml";
+  const noEnv = {} as NodeJS.ProcessEnv;
+  const untrusted = () => false;
+  const outside = snapshot({ paths: [{ collection: "secrets", path: "/etc" }] });
+  const customModel = snapshot({ models: { embed: "hf:evil/embed/x.gguf" } });
+
+  test("in-project paths and default models need no decision", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: snapshot(),
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("run");
+  });
+
+  test("the user's own config always runs, even with an outside path", () => {
+    const decision = decideLocalConfigGate({
+      configPath: global,
+      snapshot: outside,
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("run");
+  });
+
+  test("an untrusted outside path prompts on a terminal", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: outside,
+      builtins,
+      isInteractive: true,
+      env: noEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("prompt");
+  });
+
+  test("an untrusted outside path is skipped with nobody to ask", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: outside,
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("skip");
+  });
+
+  test("an untrusted custom model is skipped with nobody to ask", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: customModel,
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("skip");
+  });
+
+  test("a previously approved snapshot runs unattended", () => {
+    const digest = sensitiveDigest(outside, project, builtins);
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: outside,
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: (path, d) => path === project && d === digest,
+    });
+    expect(decision.action).toBe("run");
+  });
+
+  test("pointing an approved collection outside the project re-arms the gate", () => {
+    const approved = sensitiveDigest(snapshot({ paths: [{ collection: "docs", path: "./docs" }] }), project, builtins);
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: snapshot({ paths: [{ collection: "docs", path: "/etc" }] }),
+      builtins,
+      isInteractive: false,
+      env: noEnv,
+      trustedCheck: (_path, d) => d === approved,
+    });
+    expect(decision.action).toBe("skip");
+  });
+
+  test("QMD_TRUST_LOCAL_CONFIG opts unattended runs back in", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: outside,
+      builtins,
+      isInteractive: false,
+      env: { QMD_TRUST_LOCAL_CONFIG: "1" } as NodeJS.ProcessEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("run");
+  });
+
+  test("QMD_TRUST_UPDATE_HOOKS also opts the path/model gate in", () => {
+    const decision = decideLocalConfigGate({
+      configPath: project,
+      snapshot: customModel,
+      builtins,
+      isInteractive: false,
+      env: { QMD_TRUST_UPDATE_HOOKS: "1" } as NodeJS.ProcessEnv,
+      trustedCheck: untrusted,
+    });
+    expect(decision.action).toBe("run");
   });
 });

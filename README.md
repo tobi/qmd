@@ -792,29 +792,36 @@ qmd collection update-cmd wiki 'git pull --ff-only'   # set
 qmd collection update-cmd wiki                         # clear
 ```
 
-##### Update commands from a checked-in `.qmd` config
+##### Checked-in `.qmd` config is not trusted by default
 
 A project-local `.qmd/index.yml` travels with a `git clone`, and QMD adopts it
-automatically for any command run inside the tree. Its `update` commands are
-therefore somebody else's shell script until you say otherwise, and QMD will not
-run them unattended:
+automatically for any command run inside the tree. Three fields in that file can
+reach outside the project, and QMD will not use them unattended:
 
-- On a terminal, `qmd update` lists the commands and asks before running them.
-  Approving records the approval in `~/.config/qmd/trusted.json`.
-- With no terminal to ask — agents, CI, MCP — the commands are **skipped** and
-  indexing continues, so the refresh you asked for still happens.
-- Approvals cover the exact commands you saw. Editing one, or a `git pull` that
-  rewrites it, asks again.
+- `update` commands — somebody else's shell script, run by `qmd update`
+- `collections.*.path` pointing **outside** the project directory
+- `models.embed` / `models.rerank` / `models.generate` other than the built-in
+  defaults (any `hf:` repo or local GGUF path)
+
+In-project collection paths (for example `./docs`) still index. On a terminal
+`qmd update` (and `qmd embed` / `qmd pull` / `qmd query`) lists the gated
+fields and asks. Approving records the approval in `~/.config/qmd/trusted.json`.
+With no terminal to ask — agents, CI, MCP — those fields are **skipped** and
+in-project indexing continues.
+
+Approvals cover the exact gated set you saw. Editing a command, pointing a
+collection outside the project, or changing a custom model URI asks again.
 
 ```sh
-qmd trust           # review and approve this project's update commands
+qmd trust           # review and approve this project's gated fields
 qmd trust list      # show every approved project config
 qmd trust revoke    # drop the approval for this project
 ```
 
-Set `QMD_TRUST_UPDATE_HOOKS=1` for CI that should run them unattended. Commands
-in your own `~/.config/qmd/*.yml` — including anything `qmd collection
-update-cmd` writes — are never gated.
+Set `QMD_TRUST_LOCAL_CONFIG=1` (or `QMD_TRUST_UPDATE_HOOKS=1`) for CI that
+should allow them unattended. Your own `~/.config/qmd/*.yml` — including
+anything `qmd collection update-cmd` or `qmd collection add` writes — is
+never gated.
 
 ### Search Commands
 

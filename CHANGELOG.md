@@ -17,6 +17,14 @@
   `~/.config/qmd/*.yml`, including anything `qmd collection update-cmd` writes,
   are unaffected.
 
+- The same project-local trust gate now covers collection `path` values that
+  resolve outside the project and non-default `models.embed` / `models.rerank`
+  / `models.generate` URIs (#889). In-project paths still index unattended;
+  out-of-project directories are skipped until `qmd trust`, and custom model
+  URIs are not loaded or downloaded. `QMD_TRUST_LOCAL_CONFIG=1` opts unattended
+  runs back in (and `QMD_TRUST_UPDATE_HOOKS=1` still does). `qmd collection
+  add` records trust as it writes, the same way `update-cmd` does.
+
 - Indexing no longer follows file symlinks or glob `../` / absolute patterns
   out of the collection directory. `fast-glob` already skipped symlinked
   directories, but a file symlink (or a mask like `../**/*.md`) still resolved
