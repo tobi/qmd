@@ -23,6 +23,13 @@
 
 ### Fixed
 
+- Multi-collection `-c A -c B` (and SDK/MCP `collections: [A, B]`) no longer
+  searches globally then post-filters. A large unrelated collection could fill
+  the FTS/ANN top-k so the requested collections vanished, yielding false-empty
+  results even though each collection matched on its own. `searchFTS` /
+  `searchVec` now search each requested collection, then merge by score
+  (#775). Single-collection exact-scan (#791, #803) is unchanged.
+
 - Query expansion no longer consumes caller `intent`, and a cached expansion
   whose sub-queries all miss is dropped instead of replaying forever (#818).
   Intent still steers reranking and snippet/chunk selection; it just no longer

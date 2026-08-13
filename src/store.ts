@@ -1451,8 +1451,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -2163,8 +2163,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store)),
+    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => searchFTS(db, query, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store)),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -3855,7 +3855,39 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+/** One collection, several (OR), or all (undefined). */
+export type CollectionScope = string | readonly string[] | undefined;
+
+function scopedCollectionNames(scope: CollectionScope): string[] | undefined {
+  if (scope == null) return undefined;
+  const names = (typeof scope === "string" ? [scope] : Array.from(scope))
+    .map(n => n.trim())
+    .filter(n => n.length > 0);
+  return names.length > 0 ? names : undefined;
+}
+
+function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): SearchResult[] {
+  const best = new Map<string, SearchResult>();
+  for (const list of lists) {
+    for (const r of list) {
+      const prev = best.get(r.filepath);
+      if (!prev || r.score > prev.score) best.set(r.filepath, r);
+    }
+  }
+  return Array.from(best.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[]): SearchResult[] {
+  const names = scopedCollectionNames(collectionName);
+  // Search each requested collection before merging/truncating so a large
+  // unrelated collection cannot occupy global top-k and starve the rest (#775).
+  if (names && names.length > 1) {
+    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name)), limit);
+  }
+  const collectionFilter = names?.[0];
+
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3869,7 +3901,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // When filtering by collection, fetch extra candidates from the FTS index
   // since some will be filtered out. Without a collection filter we can
   // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  const ftsLimit = collectionFilter ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -3892,9 +3924,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     WHERE d.active = 1
   `;
 
-  if (collectionName) {
+  if (collectionFilter) {
     sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
+    params.push(String(collectionFilter));
   }
 
   // bm25 lower is better; sort ascending.
@@ -3988,12 +4020,21 @@ function annVecScan(
   `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
+
+  const names = scopedCollectionNames(collectionName);
+  if (names && names.length > 1) {
+    const lists = await Promise.all(
+      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm)),
+    );
+    return mergeSearchResultsByScore(lists, limit);
+  }
+  const collectionFilter = names?.[0];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4010,14 +4051,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // enough, and only then fall back to capped ANN + post-filter.
   let vecResults: { hash_seq: string; distance: number }[];
 
-  if (collectionName) {
+  if (collectionFilter) {
     const collectionHashSeqs = withLazyContentVectorMigration(db, () =>
       db.prepare(`
         SELECT cv.hash || '_' || cv.seq AS hash_seq
         FROM content_vectors cv
         JOIN documents d ON d.hash = cv.hash AND d.active = 1
         WHERE d.collection = ?
-      `).all(collectionName) as { hash_seq: string }[],
+      `).all(collectionFilter) as { hash_seq: string }[],
     ).map((r) => r.hash_seq);
 
     if (collectionHashSeqs.length === 0) return [];
@@ -4056,9 +4097,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
+  if (collectionFilter) {
     docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+    params.push(collectionFilter);
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
@@ -5177,7 +5218,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collection?: string | readonly string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -5532,7 +5573,7 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
-  collection?: string;
+  collection?: string | readonly string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation

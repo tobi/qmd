@@ -1588,6 +1588,44 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS multi-collection union is not starved by a third collection (#775)", async () => {
+    const store = await createTestStore();
+    const noise = await createTestCollection({ name: "noise", pwd: "/test/noise" });
+    const knowledge = await createTestCollection({ name: "knowledge-base", pwd: "/test/knowledge" });
+    const notes = await createTestCollection({ name: "project-notes", pwd: "/test/notes" });
+
+    // Unrelated collection occupies global top-k with strong title matches.
+    for (let i = 0; i < 12; i++) {
+      await insertTestDocument(store.db, noise, {
+        name: `noise-${i}`,
+        title: "memory workspace",
+        body: `Noise ${i} about memory workspace`,
+        displayPath: `noise-${i}.md`,
+      });
+    }
+    await insertTestDocument(store.db, knowledge, {
+      name: "kb",
+      title: "Notes",
+      body: "A mention of memory in the knowledge base.",
+      displayPath: "kb.md",
+    });
+    await insertTestDocument(store.db, notes, {
+      name: "pn",
+      title: "Scratch",
+      body: "project-notes also talk about memory.",
+      displayPath: "pn.md",
+    });
+
+    const global = store.searchFTS("memory", 3);
+    expect(global.every(r => r.collectionName === noise)).toBe(true);
+
+    const union = store.searchFTS("memory", 3, [knowledge, notes]);
+    expect(union.map(r => r.collectionName).sort()).toEqual([knowledge, notes].sort());
+    expect(union.every(r => r.collectionName !== noise)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS finds CJK documents by exact and mixed queries", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -3492,6 +3530,83 @@ describe("Vector Search collection filter", () => {
     );
     expect(unfiltered).toHaveLength(3);
     expect(unfiltered.every((r) => r.collectionName === large)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec multi-collection union is not starved by a third collection (#775)", async () => {
+    const store = await createTestStore();
+    const large = await createTestCollection({ name: "large", pwd: "/test/large" });
+    const knowledge = await createTestCollection({ name: "knowledge-base", pwd: "/test/knowledge" });
+    const notes = await createTestCollection({ name: "project-notes", pwd: "/test/notes" });
+
+    const dims = 8;
+    store.ensureVecTable(dims);
+    const now = new Date().toISOString();
+    const queryEmbedding = Array(dims).fill(0);
+    queryEmbedding[0] = 1;
+
+    for (let i = 0; i < 40; i++) {
+      const hash = `largehash${String(i).padStart(3, "0")}`;
+      await insertTestDocument(store.db, large, {
+        name: `noise-${i}`,
+        hash,
+        body: `Noise document ${i}`,
+        displayPath: `noise-${i}.md`,
+      });
+      const embedding = new Float32Array(dims);
+      embedding[0] = 1;
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+    }
+
+    const kbHash = "kbhash001";
+    await insertTestDocument(store.db, knowledge, {
+      name: "kb",
+      hash: kbHash,
+      body: "Target document in knowledge-base",
+      displayPath: "kb.md",
+    });
+    const kbEmbedding = new Float32Array(dims);
+    kbEmbedding[0] = 0.55;
+    kbEmbedding[1] = 0.84;
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(kbHash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${kbHash}_0`, kbEmbedding);
+
+    const notesHash = "noteshash001";
+    await insertTestDocument(store.db, notes, {
+      name: "pn",
+      hash: notesHash,
+      body: "Target document in project-notes",
+      displayPath: "pn.md",
+    });
+    const notesEmbedding = new Float32Array(dims);
+    notesEmbedding[0] = 0.5;
+    notesEmbedding[1] = 0.87;
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(notesHash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${notesHash}_0`, notesEmbedding);
+
+    const global = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      undefined,
+      undefined,
+      queryEmbedding,
+    );
+    expect(global).toHaveLength(3);
+    expect(global.every((r) => r.collectionName === large)).toBe(true);
+
+    const union = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      [knowledge, notes],
+      undefined,
+      queryEmbedding,
+    );
+    expect(union.map(r => r.collectionName).sort()).toEqual([knowledge, notes].sort());
+    expect(union.every((r) => r.collectionName !== large)).toBe(true);
 
     await cleanupTestDb(store);
   });
