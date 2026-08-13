@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- `insertContext` looks up `store_collections` by name. #754 retargeted the
+  query from the dropped `collections` table but left `WHERE id = ?`, and
+  `store_collections` has `name TEXT PRIMARY KEY` with no `id` column — the
+  call threw `no such column: id`. Matches `deleteContext` /
+  `updateStoreContext` (#853).
+
 - `qmd collection add` with no path argument now errors with usage instead of
   silently indexing the current working directory (#684). Pass `.` to index
   CWD, matching the documented examples.

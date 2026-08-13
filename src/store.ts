@@ -3292,15 +3292,17 @@ export function renameCollection(db: Database, oldName: string, newName: string)
 
 /**
  * Insert or update a context for a specific collection and path prefix.
+ *
+ * `store_collections` is keyed by name (`TEXT PRIMARY KEY`), not an integer id.
+ * #754 retargeted this query from the dropped `collections` table but left
+ * `WHERE id = ?`, which throws `no such column: id`.
  */
-export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
-  // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM store_collections WHERE id = ?`).get(collectionId) as { name: string } | null;
+export function insertContext(db: Database, collectionName: string, pathPrefix: string, context: string): void {
+  const coll = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(collectionName) as { name: string } | null;
   if (!coll) {
-    throw new Error(`Collection with id ${collectionId} not found`);
+    throw new Error(`Collection '${collectionName}' not found`);
   }
 
-  // Add context to store_collections
   updateStoreContext(db, coll.name, pathPrefix, context);
 }
 
