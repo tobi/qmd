@@ -1398,3 +1398,58 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
     });
   });
 });
+
+describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
+  test("awaits async sequence.dispose before context.dispose", async () => {
+    const order: string[] = [];
+    let sequenceDisposedResolved = false;
+    const sequence = {
+      dispose: vi.fn(async () => {
+        order.push("sequence-start");
+        await new Promise((r) => setTimeout(r, 20));
+        sequenceDisposedResolved = true;
+        order.push("sequence-end");
+      }),
+    };
+    const context = {
+      getSequence: vi.fn(() => sequence),
+      dispose: vi.fn(async () => {
+        order.push("context");
+        expect(sequenceDisposedResolved).toBe(true);
+      }),
+    };
+
+    const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false;
+    llm.touchActivity = vi.fn();
+    llm.ensureGenerateModel = vi.fn(async () => {});
+    llm.generateModel = { createContext: vi.fn(async () => context) };
+    llm.generateModelUri = "hf:test/gen.gguf";
+
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: class {
+        async prompt(_prompt: string, options?: { onTextChunk?: (text: string) => void }) {
+          options?.onTextChunk?.("ok");
+          return "ok";
+        }
+      } as any,
+      getLlama: vi.fn(),
+    });
+
+    try {
+      const result = await llm.generate("hello");
+      expect(result).toEqual({
+        text: "ok",
+        model: "hf:test/gen.gguf",
+        done: true,
+      });
+      expect(sequence.dispose).toHaveBeenCalledTimes(1);
+      expect(context.dispose).toHaveBeenCalledTimes(1);
+      expect(order).toEqual(["sequence-start", "sequence-end", "context"]);
+    } finally {
+      setNodeLlamaCppModuleForTest(null);
+    }
+  });
+});

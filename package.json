@@ -59,14 +59,14 @@
     "@modelcontextprotocol/server": "2.0.0",
     "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.18.1",
-    "picomatch": "4.0.4",
+    "node-llama-cpp": "3.20.0",
+    "picomatch": "4.0.5",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "web-tree-sitter": "0.26.8",
+    "web-tree-sitter": "0.26.12",
     "yaml": "2.9.0",
     "zod": "4.2.1"
   },
@@ -79,8 +79,8 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
-    "tsx": "4.21.0",
-    "vitest": "3.2.4"
+    "tsx": "4.23.12",
+    "vitest": "3.2.7"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

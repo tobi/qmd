@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Dependencies: `node-llama-cpp` 3.18.1 → **3.20.0** (llama.cpp b8390 → b10361, 2026-08-11). Also safe patch/minors: `picomatch` 4.0.4 → 4.0.5, `web-tree-sitter` 0.26.8 → 0.26.12, `tsx` 4.21.0 → 4.23.12, `vitest` 3.2.4 → 3.2.7. No zod/vitest major; `@modelcontextprotocol/server` stays 2.0.0 (no 2.x patch). `flake.nix` FOD hashes are not updated here.
+- `generate` and query expansion now await `LlamaContextSequence.dispose()` before disposing the parent context. node-llama-cpp 3.20 made sequence dispose async; the library's context-onDispose path does not wait.
+
 - MCP server now speaks protocol revision **2026-07-28** via the official
   TypeScript SDK 2.x (`@modelcontextprotocol/server`). HTTP is sessionless
   (no `Mcp-Session-Id`, no initialize handshake, no idle-session TTL / #816
