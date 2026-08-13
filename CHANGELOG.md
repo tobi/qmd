@@ -38,6 +38,10 @@
 
 ### Fixed
 
+- Nix flake `qmd-node-modules` FOD hashes updated for x86_64-linux and
+  aarch64-darwin after the MCP SDK 2.0 bump. `nix build` / Nix GHA was
+  failing with a fixed-output hash mismatch.
+
 - CJK FTS rebuild no longer skips leftover `fts5(name, body, content='documents')`
   tables when `fts_cjk_normalized_version` is already stamped, and schema
   repair now checks live FTS columns (`PRAGMA table_info`) as well as
