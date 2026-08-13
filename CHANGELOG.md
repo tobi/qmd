@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- Case-sensitive collections no longer collapse distinct document identities that
+  differ only by path casing. The implicit `COLLATE NOCASE` legacy migration was
+  unsafe for filesystems that contain both `README.md` and `readme.md`; case-only
+  legacy migrations must now be explicit and operator-reviewed (#801).
+
 - `cleanupOrphanedVectors` now runs its orphan count and both DELETEs in a
   single immediate transaction. An interruption between the two DELETEs
   (crash, `SQLITE_BUSY`) could desync `vectors_vec` from `content_vectors`,

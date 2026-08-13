@@ -2579,7 +2579,7 @@ describe("Reciprocal Rank Fusion", () => {
 // =============================================================================
 
 describe("Reindex Collection", () => {
-  test("preserves document id and embeddings when file path changes only by case", async () => {
+  test("treats a case-only rename as a new identity on a case-sensitive collection", async () => {
     const store = await createTestStore();
     const collectionName = "docs";
     const collectionPath = join(testDir, `case-rename-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -2607,27 +2607,34 @@ describe("Reindex Collection", () => {
     await rename(originalPath, renamedPath);
 
     const secondResult = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
-    expect(secondResult.indexed).toBe(0);
-    expect(secondResult.unchanged).toBe(1);
-    expect(secondResult.removed).toBe(0);
+    expect(secondResult.indexed).toBe(1);
+    expect(secondResult.unchanged).toBe(0);
+    expect(secondResult.removed).toBe(1);
 
     const afterRows = store.db.prepare(`
       SELECT id, path, hash, active FROM documents
       WHERE collection = ?
       ORDER BY id
     `).all(collectionName) as { id: number; path: string; hash: string; active: number }[];
-    expect(afterRows).toHaveLength(1);
-    expect(afterRows[0]).toMatchObject({ id: before.id, path: "readme.md", hash: before.hash, active: 1 });
+    expect(afterRows).toHaveLength(2);
+    expect(afterRows).toEqual([
+      { id: before.id, path: "README.md", hash: before.hash, active: 0 },
+      { id: expect.any(Number), path: "readme.md", hash: before.hash, active: 1 }
+    ]);
 
+    // Embeddings remain content-addressed, so the case-distinct document can
+    // safely share existing vectors without collapsing document identity.
     const vectorCount = store.db.prepare(`
       SELECT COUNT(*) AS count FROM content_vectors WHERE hash = ?
     `).get(before.hash) as { count: number };
     expect(vectorCount.count).toBe(1);
 
     const ftsRows = store.db.prepare(`
-      SELECT rowid, filepath FROM documents_fts WHERE rowid = ?
-    `).all(before.id) as { rowid: number; filepath: string }[];
-    expect(ftsRows).toEqual([{ rowid: before.id, filepath: "docs/readme.md" }]);
+      SELECT rowid, filepath FROM documents_fts WHERE filepath = ?
+    `).all("docs/readme.md") as { rowid: number; filepath: string }[];
+    expect(ftsRows).toEqual([
+      { rowid: expect.any(Number), filepath: "docs/readme.md" }
+    ]);
 
     await cleanupTestDb(store);
   });
@@ -4375,35 +4382,24 @@ describe("Content-Addressable Storage", () => {
     await cleanupTestDb(store);
   });
 
-  test("findOrMigrateLegacyDocument renames lowercase path to case-preserved", async () => {
+  test("does not collapse distinct case-sensitive paths through legacy migration", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
     const now = new Date().toISOString();
 
-    const content = "# My Skill";
-    const hash = await hashContent(content);
-    store.insertContent(hash, content, now);
-    // Simulate legacy index: path stored as lowercase
-    store.insertDocument(collectionName, "skills/skill.md", "My Skill", hash, now, now);
+    const lowerHash = await hashContent("# lowercase");
+    const upperHash = await hashContent("# uppercase");
+    store.insertContent(lowerHash, "# lowercase", now);
+    store.insertContent(upperHash, "# uppercase", now);
+    store.insertDocument(collectionName, "skills/skill.md", "lowercase", lowerHash, now, now);
 
-    // Migration: look up case-preserved path, expect rename
-    const result = store.findOrMigrateLegacyDocument(collectionName, "skills/SKILL.md");
-    expect(result).not.toBeNull();
-    expect(result!.hash).toBe(hash);
+    // On case-sensitive collections this is a separate source identity, not a
+    // legacy spelling of the existing path.
+    expect(store.findOrMigrateLegacyDocument(collectionName, "skills/SKILL.md")).toBeNull();
+    store.insertDocument(collectionName, "skills/SKILL.md", "uppercase", upperHash, now, now);
 
-    // Old lowercase path should no longer be findable
-    expect(store.findActiveDocument(collectionName, "skills/skill.md")).toBeNull();
-    // New case-preserved path should be active
-    const migrated = store.findActiveDocument(collectionName, "skills/SKILL.md");
-    expect(migrated).not.toBeNull();
-    expect(migrated!.hash).toBe(hash);
-
-    // FTS should reflect the new path (documents_au trigger)
-    const ftsRow = store.db.prepare(
-      `SELECT filepath FROM documents_fts WHERE rowid = ?`
-    ).get(result!.id) as { filepath: string } | undefined;
-    expect(ftsRow).toBeDefined();
-    expect(ftsRow!.filepath).toContain("SKILL.md");
+    expect(store.findActiveDocument(collectionName, "skills/skill.md")?.hash).toBe(lowerHash);
+    expect(store.findActiveDocument(collectionName, "skills/SKILL.md")?.hash).toBe(upperHash);
 
     await cleanupTestDb(store);
   });

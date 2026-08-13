@@ -2764,13 +2764,10 @@ export function findOrMigrateLegacyDocument(
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
-  // Case-insensitive match (legacy normalization: e.g. "README.md" → "readme.md").
-  const legacyCase = db.prepare(`
-    SELECT id, hash, title FROM documents
-    WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
-    ORDER BY id
-    LIMIT 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  // Do not use a case-insensitive fallback here. Case-sensitive filesystems can
+  // contain distinct paths such as `README.md` and `readme.md`; collapsing them
+  // makes one document disappear on every update. Legacy case-only migrations
+  // require an explicit, operator-reviewed migration instead of implicit lookup.
 
   // Handalized-path match: existing DBs indexed with handelize() stored slugged paths
   // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
@@ -2791,7 +2788,7 @@ export function findOrMigrateLegacyDocument(
     // handelize throws on invalid paths; just skip
   }
 
-  const legacy = legacyCase ?? legacyHandalized;
+  const legacy = legacyHandalized;
   if (!legacy) return null;
 
   // Wrap rename + FTS rebuild in a transaction for atomicity.
