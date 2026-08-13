@@ -22,6 +22,10 @@ import {
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
+  computeGpuContextPoolSize,
+  estimateEmbedContextMB,
+  BASELINE_EMBED_CONTEXT_MB,
+  EMBED_POOL_RERANK_RESERVE_MB,
   resolveEmbedModel,
   resolveGenerateModel,
   resolveRerankModel,
@@ -505,6 +509,50 @@ describe("LLM context parallelism safety", () => {
     } finally {
       stderrSpy.mockRestore();
     }
+  });
+});
+
+describe("embedding context VRAM pool (#799)", () => {
+  test("keeps the nomic/embeddinggemma baseline for small GGUFs so default embed throughput is unchanged", () => {
+    const gemmaBytes = 308 * 1024 * 1024;
+    expect(estimateEmbedContextMB({ modelBytes: gemmaBytes })).toBe(BASELINE_EMBED_CONTEXT_MB);
+    expect(estimateEmbedContextMB({ modelBytes: 137 * 1024 * 1024 })).toBe(BASELINE_EMBED_CONTEXT_MB);
+  });
+
+  test("scales Qwen3-Embedding-0.6B-class GGUFs to ~1190 MB per context", () => {
+    const qwenBytes = 640 * 1024 * 1024;
+    expect(estimateEmbedContextMB({ modelBytes: qwenBytes })).toBe(Math.round(640 * 1.85));
+    expect(estimateEmbedContextMB({ modelBytes: qwenBytes, contextSize: 1024 })).toBe(Math.round(640 * 1.85 * 0.5));
+  });
+
+  test("falls back to the baseline when the file size is unknown", () => {
+    expect(estimateEmbedContextMB({ modelBytes: 0 })).toBe(BASELINE_EMBED_CONTEXT_MB);
+    expect(estimateEmbedContextMB({ modelBytes: Number.NaN })).toBe(BASELINE_EMBED_CONTEXT_MB);
+  });
+
+  test("on 8 GB VRAM, a Qwen 0.6B pool is 1 context so the reranker still fits", () => {
+    const perContextMB = estimateEmbedContextMB({ modelBytes: 640 * 1024 * 1024 });
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(1);
+  });
+
+  test("on 8 GB VRAM, the default 150 MB estimate still allows the 8-context cap", () => {
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB: BASELINE_EMBED_CONTEXT_MB,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(8);
+  });
+
+  test("the old hardcoded 150 MB estimate would still open 8 Qwen contexts and OOM the reranker", () => {
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB: 150,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(8);
   });
 });
 

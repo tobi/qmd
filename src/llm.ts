@@ -667,6 +667,62 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   return Math.max(1, options.computed);
 }
 
+/** Measured nomic-embed / embeddinggemma-300M embedding-context cost at 2048 tokens. */
+export const BASELINE_EMBED_CONTEXT_MB = 150;
+
+/**
+ * VRAM to leave free when sizing the embedding-context pool so `query` can
+ * still create a rerank context afterwards. Matches the 1000 MB figure
+ * `ensureRerankContexts` already uses as its per-context cost.
+ */
+export const EMBED_POOL_RERANK_RESERVE_MB = 1000;
+
+/**
+ * GPU embedding-context pool size from free VRAM.
+ *
+ * Uses 25% of (free − reserve), then clamps to `[1, cap]`. The reserve keeps
+ * the pool from consuming the memory `query` needs next for the reranker (#799).
+ */
+export function computeGpuContextPoolSize(options: {
+  freeMB: number;
+  perContextMB: number;
+  reserveMB?: number;
+  cap?: number;
+}): number {
+  const perContextMB = Math.max(1, options.perContextMB);
+  const reserveMB = Math.max(0, options.reserveMB ?? 0);
+  const cap = options.cap ?? 8;
+  const usableMB = Math.max(0, options.freeMB - reserveMB);
+  const maxByVram = Math.floor((usableMB * 0.25) / perContextMB);
+  return Math.max(1, Math.min(cap, maxByVram));
+}
+
+/**
+ * Estimate one embedding context's VRAM from the GGUF weight-file size.
+ *
+ * Small models (nomic / embeddinggemma-class, ≲350 MB) stay at the measured
+ * 150 MB baseline so default `qmd embed` throughput is unchanged. Larger
+ * files — Qwen3-Embedding-0.6B-Q8 is ~640 MB — were measured at ~1190 MB per
+ * 2048-token context, about 1.85× the weight file, because the KV cache
+ * dominates (#799).
+ */
+export function estimateEmbedContextMB(options: {
+  modelBytes: number;
+  contextSize?: number;
+}): number {
+  const contextSize = options.contextSize && options.contextSize > 0 ? options.contextSize : 2048;
+  const modelMB = options.modelBytes / (1024 * 1024);
+  const ctxScale = contextSize / 2048;
+  if (!(modelMB > 0) || !Number.isFinite(modelMB)) {
+    return Math.max(1, Math.round(BASELINE_EMBED_CONTEXT_MB * ctxScale));
+  }
+  const SMALL_MODEL_MB = 350;
+  if (modelMB <= SMALL_MODEL_MB) {
+    return Math.max(1, Math.round(BASELINE_EMBED_CONTEXT_MB * ctxScale));
+  }
+  return Math.max(1, Math.round(modelMB * 1.85 * ctxScale));
+}
+
 export function resolveLlamaGpuMode(
   envValue = process.env.QMD_LLAMA_GPU,
   forceCpuValue = process.env.QMD_FORCE_CPU
@@ -735,6 +791,7 @@ export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
+  private embedModelPath: string | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
@@ -865,6 +922,7 @@ export class LlamaCpp implements LLM {
       if (this.embedModel) {
         await this.embedModel.dispose();
         this.embedModel = null;
+        this.embedModelPath = null;
       }
       if (this.generateModel) {
         await this.generateModel.dispose();
@@ -1047,6 +1105,7 @@ export class LlamaCpp implements LLM {
       const modelPath = await this.resolveModel(this.embedModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.embedModel = model;
+      this.embedModelPath = modelPath;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
@@ -1068,15 +1127,14 @@ export class LlamaCpp implements LLM {
    *      true parallelism (each context runs on its own cores). Use at most
    *      half the math cores, with at least 4 threads per context.
    */
-  private async computeParallelism(perContextMB: number): Promise<number> {
+  private async computeParallelism(perContextMB: number, reserveMB = 0): Promise<number> {
     const llama = await this.ensureLlama();
 
     if (!this.isCpuOffloadForced() && llama.gpu) {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
-        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        const computed = Math.max(1, Math.min(8, maxByVram));
+        const computed = computeGpuContextPoolSize({ freeMB, perContextMB, reserveMB });
         return resolveSafeParallelism({ gpu: llama.gpu, computed });
       } catch {
         return resolveSafeParallelism({ gpu: llama.gpu, computed: 2 });
@@ -1119,8 +1177,21 @@ export class LlamaCpp implements LLM {
 
     this.embedContextsCreatePromise = (async () => {
       const model = await this.ensureEmbedModel();
-      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
-      const n = await this.computeParallelism(150);
+      // Per-context cost depends on the loaded GGUF. The old hardcoded 150 MB
+      // figure was measured for nomic-embed; Qwen3-Embedding-0.6B is ~1190 MB
+      // and opening 8 of those exhausted VRAM so the reranker could not load (#799).
+      let perContextMB = BASELINE_EMBED_CONTEXT_MB;
+      if (this.embedModelPath) {
+        try {
+          perContextMB = estimateEmbedContextMB({
+            modelBytes: statSync(this.embedModelPath).size,
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+          });
+        } catch {
+          // Keep the baseline if the file cannot be stat'd.
+        }
+      }
+      const n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
@@ -1757,6 +1828,7 @@ export class LlamaCpp implements LLM {
     if (this.embedModel) {
       await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
       this.embedModel = null;
+      this.embedModelPath = null;
     }
     if (this.generateModel) {
       await disposeWithTimeout("generation model", () => this.generateModel!.dispose());

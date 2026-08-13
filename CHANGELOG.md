@@ -27,6 +27,15 @@
 
 ### Fixed
 
+- Embedding-context pool size no longer assumes every GGUF costs 150 MB of
+  VRAM (the nomic-embed figure). Larger models such as Qwen3-Embedding-0.6B
+  are ~1190 MB per 2048-token context; opening 8 of those exhausted an 8 GB
+  card so `qmd query` failed with `Failed to create any rerank context` even
+  though the reranker itself was fine. The pool is now sized from the weight
+  file, and 1 GB is reserved for the reranker (#799). Default
+  embeddinggemma/nomic throughput is unchanged. `QMD_EMBED_PARALLELISM` still
+  overrides.
+
 - Multi-collection `-c A -c B` (and SDK/MCP `collections: [A, B]`) no longer
   searches globally then post-filters. A large unrelated collection could fill
   the FTS/ANN top-k so the requested collections vanished, yielding false-empty
