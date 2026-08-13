@@ -4245,7 +4245,12 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          const pwd = cli.args[1];
+          if (!pwd) {
+            console.error("Usage: qmd collection add <path> [--name NAME]");
+            console.error("  Pass '.' to index the current directory.");
+            process.exit(1);
+          }
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;

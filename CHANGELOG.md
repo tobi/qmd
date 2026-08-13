@@ -23,6 +23,10 @@
 
 ### Fixed
 
+- `qmd collection add` with no path argument now errors with usage instead of
+  silently indexing the current working directory (#684). Pass `.` to index
+  CWD, matching the documented examples.
+
 - `qmd status` reports orphaned embedding chunks, `qmd update` hints when they
   exceed 10% of vectors, and `qmd cleanup --dry-run` previews what would be
   removed. Incremental update still does not auto-prune vectors (a transient

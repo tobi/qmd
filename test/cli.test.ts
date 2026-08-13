@@ -477,6 +477,26 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("Collection 'fixtures' created successfully");
   });
 
+  test("requires a path argument instead of silently indexing CWD (#684)", async () => {
+    const env = await createIsolatedTestEnv("collection-add-no-path");
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Usage: qmd collection add <path>");
+    expect(stderr).toContain("Pass '.' to index the current directory");
+    expect(stdout).not.toContain("created successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+
+    const listResult = await runQmd(["collection", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(listResult.stdout).toContain("No collections found");
+  });
+
   test("rejects a nonexistent collection path without persisting it", async () => {
     const env = await createIsolatedTestEnv("missing-collection-path");
     const missingPath = join(fixturesDir, "does-not-exist");
