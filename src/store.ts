@@ -670,7 +670,15 @@ export function getRealPath(path: string): string {
  * Used to keep indexing and qmd:// filesystem resolution inside a collection.
  */
 export function isPathInsideDir(dir: string, target: string): boolean {
-  return getRelativePathFromPrefix(getRealPath(target), getRealPath(dir)) !== null;
+  const realDir = getRealPath(dir);
+  try {
+    return getRelativePathFromPrefix(realpathSync(target), realDir) !== null;
+  } catch {
+    // Unreadable or dangling: realpath fails. Compare lexically so a mode-0
+    // file inside the collection is not treated as an escape (macOS /var vs
+    // /private/var). Readable out-of-tree symlinks still hit the try path.
+    return getRelativePathFromPrefix(resolve(target), resolve(dir)) !== null;
+  }
 }
 
 

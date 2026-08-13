@@ -3,7 +3,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -125,6 +125,19 @@ describe("Path Utilities", () => {
       expect(isPathInsideDir(dir, join(dir, "alias.md"))).toBe(true);
     } finally {
       rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("isPathInsideDir still treats an unreadable in-tree file as inside", () => {
+    const root = mkdtempSync(join(tmpdir(), "qmd-mode0-"));
+    const file = join(root, "bad.md");
+    writeFileSync(file, "x\n");
+    try {
+      chmodSync(file, 0);
+      expect(isPathInsideDir(root, file)).toBe(true);
+    } finally {
+      try { chmodSync(file, 0o644); } catch { /* ignore */ }
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
