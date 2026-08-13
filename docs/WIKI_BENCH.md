@@ -14,6 +14,7 @@ only.** It does **not** vendor wiki page bodies.
 | Fixture (queries + expected paths) | `src/bench/fixtures/wiki-v0.json` | Yes |
 | Fixture schema test | `test/wiki-bench-fixture.test.ts` | Yes |
 | Optional BM25 floors (env-gated) | `test/wiki-bench-bm25.test.ts` | Yes (skips without corpus) |
+| Local BM25 runner (temp index) | `scripts/run-wiki-bench-local.mjs` | Yes (requires local corpus) |
 | Wiki markdown corpus | private `tobi/wiki` (or a local checkout) | **No — never commit** |
 
 Do **not** add `test/wiki-bench-docs/**` or any wiki `.md` bodies to this repo.
@@ -62,6 +63,27 @@ qmd bench src/bench/fixtures/wiki-v0.json -c wiki-bench --json
 ```
 
 Usage (from CLI): `qmd bench <fixture.json> [--json] [-c collection]`.
+
+## Local BM25 runner (private corpus)
+
+`scripts/run-wiki-bench-local.mjs` indexes a **temporary** collection named
+`wiki-bench` (under `$TMPDIR`; never writes into the git tree), runs BM25 via
+`runBenchmark`, prints summary metrics, and exits non-zero if quality floors
+fail. Same env vars / floors as the skip-gated vitest suite:
+
+```bash
+QMD_WIKI_PATH=~/src/wiki node scripts/run-wiki-bench-local.mjs
+# or:
+QMD_WIKI_BENCH_DOCS=/path/to/wiki/wiki node scripts/run-wiki-bench-local.mjs
+```
+
+- `QMD_WIKI_PATH` — checkout of private `tobi/wiki`; docs root is
+  `$QMD_WIKI_PATH/wiki`
+- `QMD_WIKI_BENCH_DOCS` — directory already laid out as
+  `concepts|sources|entities/...`
+
+Exits with a clear error if neither env var is set or the path is missing.
+Does **not** copy or commit wiki markdown into this repository.
 
 ## Optional BM25 quality floors (local corpus)
 
