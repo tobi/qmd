@@ -37,6 +37,7 @@ export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null):
   failedGpuInitModes.clear();
   noGpuAccelerationWarningShown = false;
   cpuForcedPrebuiltFallbackWarningShown = false;
+  llamaDirWritableOverride = undefined;
 }
 
 type StdoutWrite = typeof process.stdout.write;
@@ -71,8 +72,9 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 }
 
 import { homedir } from "os";
-import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { dirname, join } from "path";
+import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { createRequire } from "node:module";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -111,6 +113,31 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+// =============================================================================
+// Build Writability Check
+// =============================================================================
+
+const llamaCppRequire = createRequire(import.meta.url);
+
+/** Test override for canWriteLlamaDir(); `undefined` uses the real probe. */
+let llamaDirWritableOverride: boolean | undefined;
+
+export function setLlamaDirWritableForTest(writable: boolean | undefined): void {
+  llamaDirWritableOverride = writable;
+}
+
+/** Whether node-llama-cpp can write to its llama/ directory (false on NixOS). */
+export function canWriteLlamaDir(pkgDir?: string): boolean {
+  if (llamaDirWritableOverride !== undefined) return llamaDirWritableOverride;
+  try {
+    const dir = pkgDir ?? dirname(llamaCppRequire.resolve("node-llama-cpp/package.json"));
+    accessSync(join(dir, "llama"), constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -871,9 +898,11 @@ export class LlamaCpp implements LLM {
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
+      // Skip source build when install dir is read-only (e.g. NixOS store).
+      const canBuild = allowBuild && canWriteLlamaDir();
 
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
-      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
+      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
           // node-llama-cpp documents gpu:"auto" as the best default: Metal on

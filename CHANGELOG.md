@@ -23,6 +23,13 @@
 
 ### Fixed
 
+- NixOS / immutable-root installs no longer crash `qmd embed` with EACCES
+  when node-llama-cpp tries to compile llama.cpp into a read-only
+  `node_modules`. The flake wrapper puts Nix's glibc and libstdc++ on
+  `LD_LIBRARY_PATH` so prebuilt binaries can `dlopen` them, and
+  `getLlama()` uses `build: "never"` when the llama directory is not
+  writable (#574).
+
 - CJK FTS rebuild no longer raises "database is busy" when flushing insert
   batches. The streaming `.iterate()` cursor stayed open across
   `BEGIN` on the same connection; the scan now uses keyset-paginated

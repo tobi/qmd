@@ -8,12 +8,17 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
   setNodeLlamaCppModuleForTest,
+  setLlamaDirWritableForTest,
+  canWriteLlamaDir,
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
@@ -27,6 +32,70 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("canWriteLlamaDir", () => {
+  test("returns true when llama/ exists and is writable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "qmd-llama-rw-"));
+    mkdirSync(join(dir, "llama"));
+    try {
+      expect(canWriteLlamaDir(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns false when the package directory is missing", () => {
+    expect(canWriteLlamaDir("/tmp/qmd-no-such-llama-pkg")).toBe(false);
+  });
+
+  test("returns false when llama/ exists but is not writable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "qmd-llama-ro-"));
+    const llamaDir = join(dir, "llama");
+    mkdirSync(llamaDir, { mode: 0o555 });
+    chmodSync(llamaDir, 0o555);
+    try {
+      expect(canWriteLlamaDir(dir)).toBe(false);
+    } finally {
+      chmodSync(llamaDir, 0o755);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureLlama uses build:never when the llama dir is read-only", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    delete process.env.QMD_LLAMA_GPU;
+    delete process.env.QMD_FORCE_CPU;
+
+    const calls: Array<Record<string, unknown>> = [];
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options);
+        return { gpu: false, cpuMathCores: 4, dispose: async () => {} } as any;
+      }),
+    });
+    // After the module mock: that helper clears the writability override.
+    setLlamaDirWritableForTest(false);
+
+    try {
+      const llm = new LlamaCpp();
+      await (llm as any).ensureLlama();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]?.build).toBe("never");
+      expect(calls[0]?.skipDownload).toBe(true);
+    } finally {
+      setLlamaDirWritableForTest(undefined);
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+});
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
