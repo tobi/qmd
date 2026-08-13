@@ -75,6 +75,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
+  splitGlobMask,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
@@ -1742,7 +1743,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(globPattern, {
+  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
@@ -4247,8 +4248,9 @@ if (isMain) {
         case "add": {
           const pwd = cli.args[1];
           if (!pwd) {
-            console.error("Usage: qmd collection add <path> [--name NAME]");
+            console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
             console.error("  Pass '.' to index the current directory.");
+            console.error("  --mask: glob (default **/*.md), brace group, or comma-separated list");
             process.exit(1);
           }
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
@@ -4375,7 +4377,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--mask GLOB]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
@@ -4385,6 +4387,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection add ~/notes --name notes --mask 'a.md,journals/*.md'");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);

@@ -2611,6 +2611,24 @@ describe("Reciprocal Rank Fusion", () => {
 // =============================================================================
 
 describe("Reindex Collection", () => {
+  test("indexes comma-separated glob masks as a union (#557)", async () => {
+    const store = await createTestStore();
+    const collectionName = "comma-mask";
+    const collectionPath = join(testDir, `comma-mask-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "alpha\n");
+    await writeFile(join(collectionPath, "X - b.md"), "bravo\n");
+    await writeFile(join(collectionPath, "skip.txt"), "nope\n");
+
+    const result = await reindexCollection(store, collectionPath, "a.md,X - *.md", collectionName);
+    expect(result.indexed).toBe(2);
+
+    const paths = store.db.prepare(`
+      SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path
+    `).all(collectionName) as { path: string }[];
+    expect(paths.map(r => r.path)).toEqual(["X - b.md", "a.md"]);
+  });
+
   test("treats a case-only rename as a new identity on a case-sensitive collection", async () => {
     const store = await createTestStore();
     const collectionName = "docs";

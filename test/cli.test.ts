@@ -580,6 +580,43 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("notes/*.md");
   });
 
+  test("indexes comma-separated --mask patterns as a union (#557)", async () => {
+    const env = await createIsolatedTestEnv("comma-mask");
+    const collectionDir = join(testDir, `comma-mask-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "a.md"), "alpha\n");
+    await writeFile(join(collectionDir, "X - b.md"), "bravo\n");
+    await writeFile(join(collectionDir, "skip.txt"), "nope\n");
+
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["collection", "add", collectionDir, "--name", "bug-demo", "--mask", "a.md,X - *.md"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed: 2 new");
+  });
+
+  test("still accepts brace-expansion --mask (#557)", async () => {
+    const env = await createIsolatedTestEnv("brace-mask");
+    const collectionDir = join(testDir, `brace-mask-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "a.md"), "alpha\n");
+    await writeFile(join(collectionDir, "X - b.md"), "bravo\n");
+
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["collection", "add", collectionDir, "--name", "bug-demo", "--mask", "{a.md,X - *.md}"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed: 2 new");
+  });
+
   test("can recreate collection with remove and add", async () => {
     // First add
     await runQmd(["collection", "add", "."]);

@@ -46,6 +46,51 @@ export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
+
+/**
+ * Split a collection glob mask into fast-glob patterns.
+ *
+ * `--mask "a.md,*.txt"` is a comma-separated union (issue #557), but
+ * fast-glob treats a comma outside `{...}` as a literal character, so
+ * the joined string matches nothing. Brace form `{a.md,*.txt}` is
+ * already valid glob syntax and is left intact.
+ *
+ * Commas inside `{...}` or `[...]` are not separators. Empty segments
+ * after the split are dropped.
+ */
+export function splitGlobMask(mask: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let braceDepth = 0;
+  let bracketDepth = 0;
+
+  for (const ch of mask) {
+    if (ch === "{") {
+      braceDepth++;
+      current += ch;
+    } else if (ch === "}" && braceDepth > 0) {
+      braceDepth--;
+      current += ch;
+    } else if (ch === "[") {
+      bracketDepth++;
+      current += ch;
+    } else if (ch === "]" && bracketDepth > 0) {
+      bracketDepth--;
+      current += ch;
+    } else if (ch === "," && braceDepth === 0 && bracketDepth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) parts.push(trimmed);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+
+  const trimmed = current.trim();
+  if (trimmed) parts.push(trimmed);
+  return parts.length > 0 ? parts : [mask];
+}
+
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
@@ -1479,7 +1524,7 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(globPattern, {
+  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
     cwd: collectionPath,
     onlyFiles: true,
     followSymbolicLinks: false,

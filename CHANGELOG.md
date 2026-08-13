@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- `qmd collection add --mask "a.md,*.txt"` now indexes the union of each
+  pattern. The comma-separated form was documented and commonly guessed, but
+  the joined string was passed to fast-glob as one literal glob, so it
+  matched zero files with no error. Brace form `{a.md,*.txt}` is unchanged.
+  The same split applies on `qmd update` for stored comma-list masks (#557).
+
 - NixOS / immutable-root installs no longer crash `qmd embed` with EACCES
   when node-llama-cpp tries to compile llama.cpp into a read-only
   `node_modules`. The flake wrapper puts Nix's glibc and libstdc++ on
