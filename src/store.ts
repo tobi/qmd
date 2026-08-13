@@ -2486,6 +2486,30 @@ export function cleanupOrphanedContent(db: Database): number {
   return result.changes;
 }
 
+const ORPHANED_VECTOR_COUNT_SQL = `
+  SELECT COUNT(*) as c FROM content_vectors cv
+  WHERE NOT EXISTS (
+    SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+  )
+`;
+
+/**
+ * Count embedding chunks whose hash is not referenced by any active document.
+ * Reads `content_vectors` only, so this works even when sqlite-vec is unavailable (#768).
+ */
+export function countOrphanedVectors(db: Database): number {
+  try {
+    return withLazyContentVectorMigration(db, () => {
+      const row = db.prepare(ORPHANED_VECTOR_COUNT_SQL).get() as { c: number };
+      return row.c;
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no such table/i.test(message)) return 0;
+    throw error;
+  }
+}
+
 /**
  * Remove orphaned vector embeddings that are not referenced by any active document.
  * Returns the number of orphaned embedding chunks deleted.
@@ -2508,18 +2532,12 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
-  return withLazyContentVectorMigration(db, () => {
-    // Count orphaned vectors first
-    const countResult = db.prepare(`
-      SELECT COUNT(*) as c FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
-    `).get() as { c: number };
+  const orphaned = countOrphanedVectors(db);
+  if (orphaned === 0) {
+    return 0;
+  }
 
-    if (countResult.c === 0) {
-      return 0;
-    }
+  return withLazyContentVectorMigration(db, () => {
 
     // Delete from vectors_vec first
     db.exec(`
@@ -2538,7 +2556,7 @@ export function cleanupOrphanedVectors(db: Database): number {
       )
     `);
 
-    return countResult.c;
+    return orphaned;
   });
 }
 

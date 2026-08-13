@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- `qmd status` reports orphaned embedding chunks, `qmd update` hints when they
+  exceed 10% of vectors, and `qmd cleanup --dry-run` previews what would be
+  removed. Incremental update still does not auto-prune vectors (a transient
+  empty mount would otherwise force a full re-embed) (#768).
+
 - `qmd --index <name> mcp --http --daemon` now scopes PID/log files per index
   (`mcp-<name>.pid`) and passes the resolved database path to the child, so a
   named-index daemon no longer collides with the default `mcp.pid` or opens

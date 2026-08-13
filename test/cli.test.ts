@@ -1202,6 +1202,96 @@ describe("CLI Cleanup Command", () => {
   });
 });
 
+describe("orphaned embedding vectors (#768)", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+
+  function seedOrphans(opts: { live?: number; orphaned?: number; cache?: number; inactive?: number } = {}) {
+    const live = opts.live ?? 1;
+    const orphaned = opts.orphaned ?? 3;
+    const cache = opts.cache ?? 2;
+    const inactive = opts.inactive ?? 1;
+    const db = openDatabase(localDbPath);
+    const now = new Date().toISOString();
+    const doc = db.prepare(`SELECT hash FROM documents WHERE active = 1 LIMIT 1`).get() as { hash: string } | undefined;
+    if (doc) {
+      for (let i = 0; i < live; i++) {
+        db.prepare(`
+          INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+          VALUES (?, ?, 0, 'test', '', 1, ?)
+        `).run(doc.hash, i, now);
+      }
+    }
+    for (let i = 0; i < orphaned; i++) {
+      db.prepare(`
+        INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, 0, 0, 'test', '', 1, ?)
+      `).run(`orphan-hash-${i}`, now);
+    }
+    for (let i = 0; i < cache; i++) {
+      db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, '{}', ?)`).run(`cache-${i}`, now);
+    }
+    for (let i = 0; i < inactive; i++) {
+      const hash = `inactive-hash-${i}`;
+      db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, 'gone', ?)`).run(hash, now);
+      db.prepare(`
+        INSERT OR REPLACE INTO documents (collection, path, title, hash, created_at, modified_at, active)
+        VALUES ('fixtures', ?, 'Gone', ?, ?, ?, 0)
+      `).run(`gone-${i}.md`, hash, now, now);
+    }
+    db.close();
+  }
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("orphan-vectors");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", fixturesDir, "--name", "fixtures"],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+    if (exitCode !== 0) console.error("collection add failed:", stderr);
+    expect(exitCode).toBe(0);
+    seedOrphans();
+  });
+
+  test("status reports orphaned embedding chunks", async () => {
+    const { stdout, exitCode } = await runQmd(["status"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/Orphaned:\s+3 embedding chunks \(75%\)/);
+    expect(stdout).toContain("qmd cleanup");
+  });
+
+  test("update hints when orphan ratio exceeds 10%", async () => {
+    const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("3 orphaned embedding chunks (75% of vectors)");
+    expect(stdout).toContain("run 'qmd cleanup' to reclaim space");
+  });
+
+  test("cleanup --dry-run reports what would be removed without deleting", async () => {
+    // `qmd update` clears llm_cache; re-seed so dry-run has something to report.
+    seedOrphans({ live: 0, orphaned: 0, cache: 2, inactive: 0 });
+    const { stdout, exitCode } = await runQmd(["cleanup", "--dry-run"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Dry run — no changes made");
+    expect(stdout).toContain("Would clear 2 cached API responses");
+    expect(stdout).toContain("Would remove 3 orphaned embedding chunks");
+    expect(stdout).toContain("Would remove 1 inactive document records");
+    expect(stdout).toContain("Would vacuum the database");
+    expect(stdout).not.toContain("Database vacuumed");
+
+    const db = openDatabase(localDbPath);
+    const vectors = (db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number }).c;
+    const cache = (db.prepare(`SELECT COUNT(*) as c FROM llm_cache`).get() as { c: number }).c;
+    const inactive = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
+    db.close();
+    expect(vectors).toBe(4);
+    expect(cache).toBe(2);
+    expect(inactive).toBe(1);
+  });
+});
+
 describe("CLI Error Handling", () => {
   test("handles unknown command", async () => {
     const { stderr, exitCode } = await runQmd(["unknowncommand"]);

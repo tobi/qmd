@@ -58,6 +58,7 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   cleanupOrphanedVectors,
+  countOrphanedVectors,
   vacuumDatabase,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
@@ -482,6 +483,14 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
+/** Hint after `qmd update` when orphaned embedding chunks exceed this share of vectors (#768). */
+const ORPHAN_VECTOR_HINT_RATIO = 0.1;
+
+function formatOrphanedVectorHint(orphaned: number, total: number): string {
+  const pct = total > 0 ? Math.round((orphaned / total) * 100) : 0;
+  return `${orphaned} orphaned embedding chunks (${pct}% of vectors) — run 'qmd cleanup' to reclaim space`;
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -525,9 +534,15 @@ async function showStatus(): Promise<void> {
   }
   console.log("");
 
+  const orphanedVectors = countOrphanedVectors(db);
+
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
   console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  if (orphanedVectors > 0) {
+    const pct = vectorCount.count > 0 ? Math.round((orphanedVectors / vectorCount.count) * 100) : 0;
+    console.log(`  ${c.yellow}Orphaned: ${orphanedVectors} embedding chunks (${pct}%)${c.reset} — run 'qmd cleanup'`);
+  }
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
@@ -756,11 +771,16 @@ async function updateCollections(): Promise<void> {
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
+  const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
+  const orphanedVectors = countOrphanedVectors(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+  if (vectorTotal > 0 && orphanedVectors / vectorTotal >= ORPHAN_VECTOR_HINT_RATIO) {
+    console.log(`\n${formatOrphanedVectorHint(orphanedVectors, vectorTotal)}`);
   }
 }
 
@@ -2836,6 +2856,7 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
+      "dry-run": { type: "boolean" },  // cleanup: report what would be removed
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -3372,7 +3393,7 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("  qmd cleanup [--dry-run]       - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4657,6 +4678,26 @@ if (isMain) {
 
     case "cleanup": {
       const db = getDb();
+      const dryRun = Boolean(cli.values["dry-run"]);
+
+      if (dryRun) {
+        const cacheCount = (db.prepare(`SELECT COUNT(*) as c FROM llm_cache`).get() as { c: number }).c;
+        const orphanedVecs = countOrphanedVectors(db);
+        const inactiveDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
+        console.log("Dry run — no changes made.\n");
+        console.log(`Would clear ${cacheCount} cached API responses`);
+        if (orphanedVecs > 0) {
+          console.log(`Would remove ${orphanedVecs} orphaned embedding chunks`);
+        } else {
+          console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+        }
+        if (inactiveDocs > 0) {
+          console.log(`Would remove ${inactiveDocs} inactive document records`);
+        }
+        console.log("Would vacuum the database");
+        closeDb();
+        break;
+      }
 
       // 1. Clear llm_cache
       const cacheCount = deleteLLMCache(db);

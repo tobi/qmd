@@ -17,6 +17,7 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  countOrphanedVectors,
   sanitizeFTS5Term,
 } from "../src/store";
 
@@ -90,6 +91,26 @@ describe("Path Utilities", () => {
 // =============================================================================
 // Handelize Tests
 // =============================================================================
+
+describe("countOrphanedVectors", () => {
+  test("returns 0 when content_vectors is missing", () => {
+    const db = {
+      prepare: () => { throw new Error("no such table: content_vectors"); },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(0);
+  });
+
+  test("returns the COUNT of hashes not referenced by an active document (#768)", () => {
+    const db = {
+      prepare: (sql: string) => {
+        expect(sql).toContain("content_vectors");
+        expect(sql).toContain("d.active = 1");
+        return { get: () => ({ c: 42 }) };
+      },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(42);
+  });
+});
 
 describe("cleanupOrphanedVectors", () => {
   test("returns 0 when vec table exists in schema but sqlite-vec is unavailable", () => {
