@@ -23,6 +23,15 @@
 
 ### Fixed
 
+- `qmd embed` no longer splits a UTF-16 surrogate pair (emoji, etc.) across a
+  chunk boundary. A chunk ending or starting mid-pair produced an unpaired
+  surrogate in the chunk text, which some remote embedding APIs reject as
+  invalid JSON — permanently failing that chunk on every retry, since the
+  boundary calculation is deterministic. This covers both the character-based
+  chunker and `chunkDocumentByTokens`'s recursive re-splitting for
+  astral-plane-dense content, which could previously drive the char budget
+  low enough to reproduce the same split (#777).
+
 - `insertContext` looks up `store_collections` by name. #754 retargeted the
   query from the dropped `collections` table but left `WHERE id = ?`, and
   `store_collections` has `name TEXT PRIMARY KEY` with no `id` column — the

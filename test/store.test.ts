@@ -1065,6 +1065,42 @@ describe("chunkDocumentWithBreakPoints", () => {
       expect(chunksNew[i]!.pos).toBe(chunksOriginal[i]!.pos);
     }
   });
+
+  test("does not split a surrogate pair at the raw chunk boundary", () => {
+    // "🚀" is a two-code-unit surrogate pair (high 0xD83D, low 0xDE80).
+    // Place it so the raw fallback boundary (charPos + maxChars) falls
+    // exactly between the two code units: 99 "x" chars, then the emoji at
+    // indices 99-100, so targetEndPos=100 lands right after the high
+    // surrogate.
+    const maxChars = 100;
+    const overlapChars = 20;
+    const windowChars = 10;
+    const content = "x".repeat(99) + "\u{1F680}" + "y".repeat(50);
+
+    const chunks = chunkDocumentWithBreakPoints(content, [], [], maxChars, overlapChars, windowChars);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.isWellFormed()).toBe(true);
+    }
+  });
+
+  test("does not split a surrogate pair at the overlap-derived chunk start", () => {
+    // Place the emoji so the boundary itself (charPos + maxChars = 100) is
+    // clean, but the next chunk's start (endPos - overlapChars = 100 - 20 = 80)
+    // falls between the high surrogate (index 79) and low surrogate (index 80).
+    const maxChars = 100;
+    const overlapChars = 20;
+    const windowChars = 10;
+    const content = "x".repeat(79) + "\u{1F680}" + "y".repeat(69);
+
+    const chunks = chunkDocumentWithBreakPoints(content, [], [], maxChars, overlapChars, windowChars);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.isWellFormed()).toBe(true);
+    }
+  });
 });
 
 describe("AST-aware chunkDocumentAsync", () => {
@@ -3847,6 +3883,148 @@ describe("Token chunking guardrails", () => {
       expect(chunks.every((chunk) => chunk.tokens <= 100)).toBe(true);
       for (let i = 1; i < chunks.length; i++) {
         expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens keeps surrogate pairs intact when the token budget shrinks the char budget below 2", async () => {
+    // A tokenizer that reports one token per UTF-16 code unit makes
+    // astral-plane content (emoji) look 2x as "expensive" as it actually
+    // is, driving pushChunkWithinTokenLimit's recursive safeMaxChars
+    // calculation down to 1 char — exactly the case that used to make
+    // chunkDocument() slice a surrogate pair in half.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const content = "\u{1F680}".repeat(30); // 30 emoji, 60 UTF-16 code units
+      const chunks = await chunkDocumentByTokens(content, 2, 0, 0);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens drops rather than emits an unpaired surrogate from the detokenize() truncation fallback", async () => {
+    // Simulates a tokenizer that encodes a single astral-plane character
+    // across multiple tokens and, when the truncation fallback slices the
+    // token list down to a single token, detokenizes it back into a lone
+    // high surrogate — the shape a real BPE-style tokenizer can produce.
+    // This exercises the results.push() site fed by llm.detokenize()
+    // rather than by chunkDocument()'s char-slicing.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return tokens.length === 1 ? "\uD83D" : "\u{1F680}".repeat(Math.ceil(tokens.length / 2));
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("\u{1F680}", 1, 0, 0);
+
+      // A single emoji at maxTokens=1 has no valid within-budget
+      // representation once the malformed detokenize() output is
+      // stripped, so the safety net drops it entirely rather than
+      // emitting a broken fragment. Asserting the exact count (rather
+      // than leaving it unchecked) makes that intentional outcome
+      // explicit and avoids a vacuous pass on an empty array.
+      expect(chunks.length).toBe(0);
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens drops rather than emits an already-malformed lone surrogate from source content", async () => {
+    // Defense-in-depth for the text.length <= 1 base case: a bare lone
+    // surrogate that was already malformed in the source document (e.g.
+    // from an unrelated upstream encoding bug) should never reach the
+    // embedding pipeline as a 1-character chunk.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("\uD800", 900, 135);
+
+      expect(chunks.length).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens strips a lone high surrogate that lands at an ordinary chunk's leading edge", async () => {
+    // The lone high surrogate is already malformed in the source content
+    // (not produced by chunking) and happens to fall exactly on a normal,
+    // non-degenerate chunk boundary — reached via the plain base case
+    // (tokens.length <= maxTokens on the first try), not the recursive
+    // re-split or single-character-chunk paths already covered above.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: Math.ceil(text.length / 3) }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      // maxChars = maxTokens(10) * avgCharsPerToken(3) = 30, so the first
+      // chunk boundary lands at index 30 — exactly where the lone high
+      // surrogate sits, making it the leading character of chunk 2.
+      const content = "x".repeat(30) + "\uD800" + "y".repeat(29);
+      const chunks = await chunkDocumentByTokens(content, 10, 0, 0);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens strips a lone low surrogate that lands at an ordinary chunk's trailing edge", async () => {
+    // Mirror of the leading-high case: a lone low surrogate already
+    // malformed in the source content falls exactly at the end of the
+    // first chunk, reached via the same plain base case.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: Math.ceil(text.length / 3) }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const content = "x".repeat(29) + "\uDC00" + "y".repeat(30);
+      const chunks = await chunkDocumentByTokens(content, 10, 0, 0);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.text.isWellFormed()).toBe(true);
       }
     } finally {
       setDefaultLlamaCpp(null);
