@@ -4,7 +4,24 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
-![QMD Architecture](assets/qmd-architecture.png)
+```mermaid
+flowchart LR
+  Q[User Query] --> X[Query Expansion]
+  Q --> FTS[BM25 Search]
+  Q --> VS[Vector Search]
+  X --> HYDE[HyDE]
+  X --> VEC[Vec dense sentences]
+  X --> LEX[Lex BM25 keywords]
+  HYDE --> VS
+  VEC --> VS
+  LEX --> FTS
+  VS --> RRF[Reciprocal Rank Fusion]
+  FTS --> RRF
+  RRF --> RR[LLM Reranker]
+  RR --> OUT[Final ranked results]
+```
+
+Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. The original query is sent to both backends, then fused with RRF and reranked.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 

@@ -27,6 +27,10 @@
 
 ### Fixed
 
+- The architecture diagram no longer draws Vec expansions into BM25 search
+  (#680). `lex` expansions are FTS-only; `vec` and `hyde` expansions are
+  vector-only. The original query still goes to both backends.
+
 - `qmd bench` no longer runs to a wall of 0.00 when the fixture collection is
   missing or empty (#716). It errors up front with the same "Collection not
   found" / index hint as `qmd search -c`, and if every backend still scores

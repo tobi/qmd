@@ -4330,6 +4330,46 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("hybridQuery routes lex expansions to FTS and vec/hyde to vector search (#680)", async () => {
+    const store = await createTestStore();
+    const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
+      embedding: [1, 2, 3],
+      model,
+    })));
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchFtsSpy = vi.fn(() => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: embedBatchSpy,
+    } as any;
+    store.searchVec = searchVecSpy as any;
+    store.searchFTS = searchFtsSpy as any;
+    store.expandQuery = vi.fn(async () => [
+      { type: "lex", query: "keyword terms" },
+      { type: "vec", query: "semantic sentence" },
+      { type: "hyde", query: "hypothetical snippet" },
+    ]) as any;
+
+    try {
+      await hybridQuery(store, "user query", { limit: 5, minScore: 0, skipRerank: true });
+
+      const ftsQueries = searchFtsSpy.mock.calls.map((call: unknown[]) => call[0]);
+      const vecQueries = searchVecSpy.mock.calls.map((call: unknown[]) => call[0]);
+
+      expect(ftsQueries).toEqual(["user query", "keyword terms"]);
+      expect(ftsQueries).not.toContain("semantic sentence");
+      expect(ftsQueries).not.toContain("hypothetical snippet");
+
+      expect(vecQueries).toEqual(["user query", "semantic sentence", "hypothetical snippet"]);
+      expect(vecQueries).not.toContain("keyword terms");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
