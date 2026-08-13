@@ -2313,6 +2313,98 @@ describe("Document Retrieval", () => {
 
       await cleanupTestDb(store);
     });
+
+    test("findDocuments matches collection-prefixed paths (#759)", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({ name: "qmd", pwd: "/test/qmd" });
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "syntax",
+        displayPath: "docs/SYNTAX.md",
+        body: "# Syntax\n\nThe real document.",
+      });
+
+      const { docs, errors } = store.findDocuments(`${collectionName}/docs/SYNTAX.md, missing.md`);
+      expect(docs).toHaveLength(1);
+      expect(docs[0]!.doc.displayPath).toBe(`${collectionName}/docs/SYNTAX.md`);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("File not found: missing.md");
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments does not suffix-match a filename fragment (#759)", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({ name: "qmd", pwd: "/test/qmd" });
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "syntax",
+        displayPath: "docs/SYNTAX.md",
+        body: "# Syntax\n\nThe real document.",
+      });
+
+      const { docs, errors } = store.findDocuments("NTAX.md, ZZZ-nonexistent.md");
+      expect(docs).toHaveLength(0);
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toContain("File not found: NTAX.md");
+      expect(errors[0]).not.toContain("SYNTAX.md");
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments suffix-matches at a path boundary (#759)", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({ name: "qmd", pwd: "/test/qmd" });
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "syntax",
+        displayPath: "docs/SYNTAX.md",
+        body: "# Syntax\n\nThe real document.",
+      });
+
+      const { docs, errors } = store.findDocuments("SYNTAX.md, missing.md");
+      expect(docs).toHaveLength(1);
+      expect(docs[0]!.doc.displayPath).toBe(`${collectionName}/docs/SYNTAX.md`);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("File not found: missing.md");
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments errors on ambiguous names instead of LIMIT 1 (#759)", async () => {
+      const store = await createTestStore();
+      const collA = await createTestCollection({ name: "tweet", pwd: "/test/tweet" });
+      const collB = await createTestCollection({ name: "bird", pwd: "/test/bird" });
+
+      await insertTestDocument(store.db, collA, {
+        name: "readme-a",
+        displayPath: "README.md",
+        body: "# Tweet readme",
+      });
+      await insertTestDocument(store.db, collB, {
+        name: "readme-b",
+        displayPath: "README.md",
+        body: "# Bird readme",
+      });
+
+      const { docs, errors } = store.findDocuments("README.md, missing.md");
+      expect(docs).toHaveLength(0);
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toContain("Ambiguous path README.md");
+      expect(errors[0]).toContain("qmd://bird/README.md");
+      expect(errors[0]).toContain("qmd://tweet/README.md");
+      expect(errors[1]).toContain("File not found: missing.md");
+
+      const prefixed = store.findDocuments("tweet/README.md, bird/README.md");
+      expect(prefixed.errors).toHaveLength(0);
+      expect(prefixed.docs).toHaveLength(2);
+      expect(prefixed.docs.map(d => d.doc.displayPath).sort()).toEqual([
+        "bird/README.md",
+        "tweet/README.md",
+      ]);
+
+      await cleanupTestDb(store);
+    });
   });
 
 });

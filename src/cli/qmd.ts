@@ -24,7 +24,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocument,
-  findDocumentByDocid,
+  resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -1141,66 +1141,17 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       : [pattern.trim()].filter(Boolean);
     files = [];
     for (const name of names) {
-      let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
-      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
-      const lookupName = docidMatch?.filepath ?? name;
-
-      // Handle virtual paths
-      if (isVirtualPath(lookupName)) {
-        const parsed = parseVirtualPath(lookupName);
-        if (parsed) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(parsed.collectionName, parsed.path) as typeof doc;
-        }
-      } else if (!docidMatch) {
-        // Try exact match on path
-        doc = db.prepare(`
-          SELECT
-            'qmd://' || d.collection || '/' || d.path as virtual_path,
-            LENGTH(content.doc) as body_length,
-            d.collection,
-            d.path
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path = ? AND d.active = 1
-          LIMIT 1
-        `).get(lookupName) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-
-        // Try suffix match
-        if (!doc) {
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.path LIKE ? AND d.active = 1
-            LIMIT 1
-          `).get(`%${lookupName}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-        }
-      }
-
-      if (doc) {
+      const resolved = resolveCommaListName(db, name);
+      if (resolved.ok) {
         files.push({
-          filepath: doc.virtual_path,
-          displayPath: doc.virtual_path,
-          bodyLength: doc.body_length,
-          collection: doc.collection,
-          path: doc.path
+          filepath: resolved.match.virtualPath,
+          displayPath: resolved.match.virtualPath,
+          bodyLength: resolved.match.bodyLength,
+          collection: resolved.match.collection,
+          path: resolved.match.path
         });
       } else {
-        console.error(`File not found: ${name}`);
+        console.error(resolved.error);
       }
     }
     if (isSingleDocid && files.length === 0) {

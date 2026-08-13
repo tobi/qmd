@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- CLI `multi-get` and SDK/MCP `multi_get` now share one comma-list resolver.
+  Collection-prefixed paths (`qmd/docs/SYNTAX.md`) work in both transports,
+  unanchored `LIKE '%name'` no longer silently fetches a different document
+  for a filename fragment (`NTAX.md` ≠ `SYNTAX.md`), and ambiguous names
+  across collections error with the candidate list instead of `LIMIT 1` (#759).
+
 - The Nix flake wrapper now seeds the same pre-import env as `bin/qmd`.
   Nix installs exec `bun src/cli/qmd.ts` directly, so they previously skipped
   the launcher: `qmd mcp` could leak llama/ggml native logs onto JSON-RPC

@@ -4688,6 +4688,128 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   return body;
 }
 
+
+/**
+ * Escape a user-supplied string so it is matched literally by SQLite LIKE.
+ * Uses '#' as the ESCAPE character (avoids quote-escaping pitfalls with '\\').
+ */
+export function escapeLikePattern(value: string): string {
+  return value.replace(/#/g, "##").replace(/%/g, "#%").replace(/_/g, "#_");
+}
+
+export type CommaListMatch = {
+  collection: string;
+  path: string;
+  virtualPath: string;
+  bodyLength: number;
+};
+
+export type CommaListResolve =
+  | { ok: true; match: CommaListMatch }
+  | { ok: false; error: string };
+
+type CommaListRow = {
+  collection: string;
+  path: string;
+  virtual_path: string;
+  body_length: number;
+};
+
+function commaListSelect(db: Database, whereSql: string, params: string[]): CommaListRow[] {
+  return db.prepare(`
+    SELECT
+      d.collection,
+      d.path,
+      'qmd://' || d.collection || '/' || d.path as virtual_path,
+      LENGTH(content.doc) as body_length
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.active = 1 AND (${whereSql})
+    ORDER BY d.collection, d.path
+  `).all(...params) as CommaListRow[];
+}
+
+function finishCommaListResolve(db: Database, name: string, rows: CommaListRow[]): CommaListResolve {
+  if (rows.length === 1) {
+    const row = rows[0]!;
+    return {
+      ok: true,
+      match: {
+        collection: row.collection,
+        path: row.path,
+        virtualPath: row.virtual_path,
+        bodyLength: row.body_length,
+      },
+    };
+  }
+  if (rows.length > 1) {
+    return {
+      ok: false,
+      error: `Ambiguous path ${name}: ${rows.map(r => r.virtual_path).join(", ")}`,
+    };
+  }
+  const similar = findSimilarFiles(db, name, 5, 3);
+  let msg = `File not found: ${name}`;
+  if (similar.length > 0) {
+    msg += ` (did you mean: ${similar.join(", ")}?)`;
+  }
+  return { ok: false, error: msg };
+}
+
+/**
+ * Resolve one comma-list name for multi-get (shared by CLI and SDK/MCP).
+ *
+ * Match order: docid / qmd:// URI (exact only), then exact collection-prefixed
+ * path, then exact document path, then a path-boundary suffix (`.../name`).
+ * Unanchored LIKE is never used, so a fragment like `NTAX.md` cannot silently
+ * fetch `SYNTAX.md`. Multiple hits at the same tier error with the candidate
+ * list instead of `LIMIT 1` (#759).
+ */
+export function resolveCommaListName(db: Database, name: string): CommaListResolve {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return { ok: false, error: `File not found: ${name}` };
+  }
+
+  if (isDocid(trimmed)) {
+    const docidMatch = findDocumentByDocid(db, trimmed);
+    if (!docidMatch) return finishCommaListResolve(db, trimmed, []);
+    const rows = commaListSelect(
+      db,
+      `'qmd://' || d.collection || '/' || d.path = ?`,
+      [docidMatch.filepath],
+    );
+    return finishCommaListResolve(db, trimmed, rows);
+  }
+
+  if (isVirtualPath(trimmed)) {
+    const parsed = parseVirtualPath(trimmed);
+    if (!parsed) return finishCommaListResolve(db, trimmed, []);
+    const rows = commaListSelect(
+      db,
+      `d.collection = ? AND d.path = ?`,
+      [parsed.collectionName, parsed.path],
+    );
+    return finishCommaListResolve(db, trimmed, rows);
+  }
+
+  // 1. Exact collection-prefixed path (collection/relpath)
+  let rows = commaListSelect(db, `d.collection || '/' || d.path = ?`, [trimmed]);
+  if (rows.length > 0) return finishCommaListResolve(db, trimmed, rows);
+
+  // 2. Exact document path
+  rows = commaListSelect(db, `d.path = ?`, [trimmed]);
+  if (rows.length > 0) return finishCommaListResolve(db, trimmed, rows);
+
+  // 3. Path-boundary suffix: matches `dir/name`, not mid-filename fragments
+  rows = commaListSelect(
+    db,
+    `d.path LIKE ? ESCAPE '#'`,
+    [`%/${escapeLikePattern(trimmed)}`],
+  );
+  return finishCommaListResolve(db, trimmed, rows);
+}
+
 /**
  * Find multiple documents by glob pattern or comma-separated list
  * Returns documents without body by default (use getDocumentBody to load)
@@ -4722,32 +4844,21 @@ export function findDocuments(
       : [pattern.trim()].filter(Boolean);
     fileRows = [];
     for (const name of names) {
-      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
-      const lookupName = docidMatch?.filepath ?? name;
-      let doc = db.prepare(`
+      const resolved = resolveCommaListName(db, name);
+      if (!resolved.ok) {
+        errors.push(resolved.error);
+        continue;
+      }
+      const doc = db.prepare(`
         SELECT ${selectCols}
         FROM documents d
         JOIN content ON content.hash = d.hash
-        WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-      `).get(lookupName) as DbDocRow | null;
-      if (!doc && !docidMatch) {
-        doc = db.prepare(`
-          SELECT ${selectCols}
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${lookupName}`) as DbDocRow | null;
-      }
+        WHERE d.collection = ? AND d.path = ? AND d.active = 1
+      `).get(resolved.match.collection, resolved.match.path) as DbDocRow | null;
       if (doc) {
         fileRows.push(doc);
       } else {
-        const similar = findSimilarFiles(db, name, 5, 3);
-        let msg = `File not found: ${name}`;
-        if (similar.length > 0) {
-          msg += ` (did you mean: ${similar.join(', ')}?)`;
-        }
-        errors.push(msg);
+        errors.push(`File not found: ${name}`);
       }
     }
   } else {

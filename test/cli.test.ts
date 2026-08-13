@@ -1036,6 +1036,28 @@ describe("CLI Multi-Get Command", () => {
     expect(stdout).toContain("Team Meeting");
   });
 
+  test("comma-list accepts collection-prefixed paths (#759)", async () => {
+    const { stdout, stderr, exitCode } = await runQmd([
+      "multi-get",
+      "fixtures/docs/api.md, fixtures/README.md",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("File not found");
+    expect(stdout).toContain("API Documentation");
+    expect(stdout).toContain("Test Project");
+  });
+
+  test("comma-list does not fetch a document from a filename fragment (#759)", async () => {
+    const { stdout, stderr, exitCode } = await runQmd([
+      "multi-get",
+      "pi.md, ZZZ-nonexistent.md",
+    ], { dbPath: localDbPath });
+    expect(stdout).not.toContain("API Documentation");
+    expect(stderr).toContain("File not found: pi.md");
+    expect(stderr).toContain("File not found: ZZZ-nonexistent.md");
+    expect(stderr).not.toMatch(/api\.md/i);
+  });
+
   test("--md output includes a #docid for each file", async () => {
     const { stdout, exitCode } = await runQmd(["multi-get", "notes/*.md", "--md"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
