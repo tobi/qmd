@@ -1357,7 +1357,8 @@ describe("orphaned embedding vectors (#768)", () => {
     expect(stdout).toContain("Would clear 2 cached API responses");
     expect(stdout).toContain("Would remove 3 orphaned embedding chunks");
     expect(stdout).toContain("Would remove 1 inactive document records");
-    expect(stdout).toContain("Would vacuum the database");
+    expect(stdout).toContain("Would remove 1 orphaned content hashes");
+    expect(stdout).toContain("Would compact FTS and vacuum the database");
     expect(stdout).not.toContain("Database vacuumed");
 
     const db = openDatabase(localDbPath);

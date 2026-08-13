@@ -55,11 +55,9 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
-  deleteLLMCache,
-  deleteInactiveDocuments,
-  cleanupOrphanedVectors,
   countOrphanedVectors,
-  vacuumDatabase,
+  previewCleanup,
+  runCleanup,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
@@ -3327,7 +3325,7 @@ function showHelp(): void {
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
-  console.log("  qmd cleanup [--dry-run]       - Clear caches, vacuum DB");
+  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4628,45 +4626,39 @@ if (isMain) {
       const dryRun = Boolean(cli.values["dry-run"]);
 
       if (dryRun) {
-        const cacheCount = (db.prepare(`SELECT COUNT(*) as c FROM llm_cache`).get() as { c: number }).c;
-        const orphanedVecs = countOrphanedVectors(db);
-        const inactiveDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
+        const stats = previewCleanup(db);
         console.log("Dry run — no changes made.\n");
-        console.log(`Would clear ${cacheCount} cached API responses`);
-        if (orphanedVecs > 0) {
-          console.log(`Would remove ${orphanedVecs} orphaned embedding chunks`);
+        console.log(`Would clear ${stats.cacheCount} cached API responses`);
+        if (stats.orphanedVectors > 0) {
+          console.log(`Would remove ${stats.orphanedVectors} orphaned embedding chunks`);
         } else {
           console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
         }
-        if (inactiveDocs > 0) {
-          console.log(`Would remove ${inactiveDocs} inactive document records`);
+        if (stats.inactiveDocs > 0) {
+          console.log(`Would remove ${stats.inactiveDocs} inactive document records`);
         }
-        console.log("Would vacuum the database");
+        if (stats.orphanedContent > 0) {
+          console.log(`Would remove ${stats.orphanedContent} orphaned content hashes`);
+        }
+        console.log("Would compact FTS and vacuum the database");
         closeDb();
         break;
       }
 
-      // 1. Clear llm_cache
-      const cacheCount = deleteLLMCache(db);
-      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
-
-      // 2. Remove orphaned vectors
-      const orphanedVecs = cleanupOrphanedVectors(db);
-      if (orphanedVecs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      const stats = runCleanup(db);
+      console.log(`${c.green}✓${c.reset} Cleared ${stats.cacheCount} cached API responses`);
+      if (stats.orphanedVectors > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedVectors} orphaned embedding chunks`);
       } else {
         console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
       }
-
-      // 3. Remove inactive documents
-      const inactiveDocs = deleteInactiveDocuments(db);
-      if (inactiveDocs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      if (stats.inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.inactiveDocs} inactive document records`);
       }
-
-      // 4. Vacuum to reclaim space
-      vacuumDatabase(db);
-      console.log(`${c.green}✓${c.reset} Database vacuumed`);
+      if (stats.orphanedContent > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedContent} orphaned content hashes`);
+      }
+      console.log(`${c.green}✓${c.reset} FTS compacted, database vacuumed`);
 
       closeDb();
       break;

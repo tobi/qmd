@@ -27,6 +27,14 @@
 
 ### Fixed
 
+- `qmd cleanup` now reclaims the content and FTS space left behind after a
+  wrong-directory `qmd update`. Deactivating files (the next update in the
+  right directory) only tombstoned the `documents` rows; cleanup deleted those
+  rows and vacuumed, but never dropped the unreferenced `content` hashes and
+  never ran FTS5 `optimize`, so `documents_fts_data` kept the old bodies
+  (#550). Cleanup now deletes inactive docs, then orphaned content, then
+  compact FTS, then vacuum. `--dry-run` reports the content hashes too.
+
 - Concurrent `query` calls with `rerank: true` on a cold MCP server no longer
   race `ensureRerankContexts()`. Embed already serialized context creation;
   rerank did not, so two overlapping first queries both saw an empty pool,

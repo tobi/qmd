@@ -2588,6 +2588,18 @@ export function cleanupOrphanedContent(db: Database): number {
   return result.changes;
 }
 
+/**
+ * Count content hashes that would be unreferenced after inactive documents
+ * are hard-deleted. Shared hashes still used by an active document are kept.
+ */
+export function countOrphanedContent(db: Database): number {
+  const row = db.prepare(`
+    SELECT COUNT(*) as c FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+  `).get() as { c: number };
+  return row.c;
+}
+
 const ORPHANED_VECTOR_COUNT_SQL = `
   SELECT COUNT(*) as c FROM content_vectors cv
   WHERE NOT EXISTS (
@@ -2687,6 +2699,50 @@ export function cleanupOrphanedVectors(db: Database): number {
  */
 export function vacuumDatabase(db: Database): void {
   db.exec(`VACUUM`);
+}
+
+/**
+ * Merge FTS5 b-trees so deleted rows (deactivated / hard-deleted documents)
+ * leave `documents_fts_data`. VACUUM alone does not compact FTS5 (#550).
+ */
+export function optimizeDocumentsFts(db: Database): void {
+  try {
+    db.exec(`INSERT INTO documents_fts(documents_fts) VALUES('optimize')`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no such table/i.test(message)) return;
+    throw error;
+  }
+}
+
+export type CleanupStats = {
+  cacheCount: number;
+  orphanedVectors: number;
+  inactiveDocs: number;
+  orphanedContent: number;
+};
+
+/** Counts what `runCleanup` would remove, including content only held by inactive docs. */
+export function previewCleanup(db: Database): CleanupStats {
+  const cacheCount = (db.prepare(`SELECT COUNT(*) as c FROM llm_cache`).get() as { c: number }).c;
+  const orphanedVectors = countOrphanedVectors(db);
+  const inactiveDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
+  const orphanedContent = countOrphanedContent(db);
+  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent };
+}
+
+/**
+ * Full `qmd cleanup` sequence: drop cache, orphaned vectors, inactive document
+ * rows, then the content those rows were pinning, compact FTS5, vacuum.
+ */
+export function runCleanup(db: Database): CleanupStats {
+  const cacheCount = deleteLLMCache(db);
+  const orphanedVectors = cleanupOrphanedVectors(db);
+  const inactiveDocs = deleteInactiveDocuments(db);
+  const orphanedContent = cleanupOrphanedContent(db);
+  optimizeDocumentsFts(db);
+  vacuumDatabase(db);
+  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent };
 }
 
 // =============================================================================
