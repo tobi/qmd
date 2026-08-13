@@ -763,6 +763,7 @@ async function updateCollections(): Promise<void> {
 
     progress.clear();
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
     }
@@ -1715,6 +1716,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const skippedFiles: { file: string; code: string }[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
   // migration so it never adopts a row that still belongs to a live file.
@@ -1730,9 +1732,10 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+    } catch (err) {
+      // Skip files that can't be read (ETIMEDOUT, EAGAIN, EACCES, …) (#460)
       processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       progress.set((processed / total) * 100);
       continue;
     }
@@ -1803,6 +1806,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  reportSkippedReads(skippedFiles);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
@@ -1812,6 +1816,22 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   closeDb();
+}
+
+function fsErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+  }
+  return "ERROR";
+}
+
+function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
+  if (skippedFiles.length === 0) return;
+  for (const skipped of skippedFiles) {
+    console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
+  }
+  console.warn(`Skipped ${skippedFiles.length} unreadable file(s)`);
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {

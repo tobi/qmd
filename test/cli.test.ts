@@ -617,6 +617,42 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("Indexed: 2 new");
   });
 
+  test("warns and continues when a file is unreadable (#460)", async () => {
+    const env = await createIsolatedTestEnv("skip-unreadable");
+    const collectionDir = join(testDir, `skip-unreadable-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    const goodPath = join(collectionDir, "good.md");
+    const badPath = join(collectionDir, "bad.md");
+    await writeFile(goodPath, "alpha\n");
+    await writeFile(badPath, "bravo\n");
+    await chmod(badPath, 0o000);
+
+    try {
+      let stillReadable = false;
+      try {
+        readFileSync(badPath, "utf-8");
+        stillReadable = true;
+      } catch {
+        stillReadable = false;
+      }
+      if (stillReadable) return;
+
+      const { stdout, stderr, exitCode } = await runQmd(
+        ["collection", "add", collectionDir, "--name", "skip-unreadable"],
+        { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+      );
+      if (exitCode !== 0) {
+        console.error("Command failed:", stderr);
+      }
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("Indexed: 1 new");
+      expect(stderr).toMatch(/Skipped unreadable file: bad\.md \((?:EACCES|EPERM)\)/);
+      expect(stderr).toContain("Skipped 1 unreadable file(s)");
+    } finally {
+      try { await chmod(badPath, 0o644); } catch { /* restore so cleanup can unlink */ }
+    }
+  });
+
   test("can recreate collection with remove and add", async () => {
     // First add
     await runQmd(["collection", "add", "."]);

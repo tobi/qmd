@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -2822,6 +2822,48 @@ describe("Reindex Collection", () => {
       SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path
     `).all(collectionName) as { path: string }[];
     expect(paths.map(r => r.path)).toEqual(["X - b.md", "a.md"]);
+  });
+
+  test("skips unreadable files and reports the error code (#460)", async () => {
+    const store = await createTestStore();
+    const collectionName = "skip-unreadable";
+    const collectionPath = join(testDir, `skip-unreadable-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    const goodPath = join(collectionPath, "good.md");
+    const badPath = join(collectionPath, "bad.md");
+    await writeFile(goodPath, "# Good\n\nreadable body\n");
+    await writeFile(badPath, "# Bad\n\nunreadable body\n");
+    await chmod(badPath, 0o000);
+
+    try {
+      let stillReadable = false;
+      try {
+        await readFile(badPath, "utf-8");
+        stillReadable = true;
+      } catch {
+        stillReadable = false;
+      }
+      if (stillReadable) {
+        // Windows / root: mode bits are not enforced, so this repro cannot run.
+        return;
+      }
+
+      const result = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(result.indexed).toBe(1);
+      expect(result.skipped).toBe(1);
+      expect(result.skippedFiles).toHaveLength(1);
+      expect(result.skippedFiles[0]!.file).toBe("bad.md");
+      expect(["EACCES", "EPERM"]).toContain(result.skippedFiles[0]!.code);
+
+      const paths = store.db.prepare(`
+        SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path
+      `).all(collectionName) as { path: string }[];
+      expect(paths.map(r => r.path)).toEqual(["good.md"]);
+    } finally {
+      try { await chmod(badPath, 0o644); } catch { /* already restored / missing */ }
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
   });
 
   test("treats a case-only rename as a new identity on a case-sensitive collection", async () => {

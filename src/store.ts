@@ -1490,10 +1490,23 @@ export type Store = {
 // Reindex & Embed — pure-logic functions for SDK and CLI
 // =============================================================================
 
+function fsErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+  }
+  return "ERROR";
+}
+
 export type ReindexProgress = {
   file: string;
   current: number;
   total: number;
+};
+
+export type ReindexSkippedFile = {
+  file: string;
+  code: string;
 };
 
 export type ReindexResult = {
@@ -1502,6 +1515,8 @@ export type ReindexResult = {
   unchanged: number;
   removed: number;
   orphanedCleaned: number;
+  skipped: number;
+  skippedFiles: ReindexSkippedFile[];
 };
 
 /**
@@ -1541,6 +1556,7 @@ export async function reindexCollection(
 
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const skippedFiles: ReindexSkippedFile[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
   // migration so it never adopts a row that still belongs to a live file.
@@ -1557,8 +1573,12 @@ export async function reindexCollection(
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
+    } catch (err) {
+      // Skip files that can't be read (ETIMEDOUT on APFS compressed files,
+      // EAGAIN on iCloud evicted files, EACCES, etc.) instead of aborting
+      // the rest of the collection (#460).
       processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
     }
@@ -1613,7 +1633,7 @@ export async function reindexCollection(
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned };
+  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
 }
 
 export type EmbedFailure = {

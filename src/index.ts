@@ -141,6 +141,7 @@ export type UpdateResult = {
   updated: number;
   unchanged: number;
   removed: number;
+  skipped: number;
   needsEmbedding: number;
 };
 
@@ -502,7 +503,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       internal.clearCache();
 
-      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0;
+      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
@@ -515,6 +516,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         totalUpdated += result.updated;
         totalUnchanged += result.unchanged;
         totalRemoved += result.removed;
+        totalSkipped += result.skipped;
       }
 
       return {
@@ -523,6 +525,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         updated: totalUpdated,
         unchanged: totalUnchanged,
         removed: totalRemoved,
+        skipped: totalSkipped,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
       };
     },

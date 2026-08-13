@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- `qmd update` / `qmd collection add` no longer swallow unreadable files
+  silently (#460). `readFileSync` failures (ETIMEDOUT on APFS compressed
+  files, EAGAIN, EACCES, …) still skip the file so the rest of the collection
+  indexes, but the CLI now warns with the path and error code and reports
+  the skip count. The SDK `update()` result includes `skipped`.
+
 - The architecture diagram no longer draws Vec expansions into BM25 search
   (#680). `lex` expansions are FTS-only; `vec` and `hyde` expansions are
   vector-only. The original query still goes to both backends.
