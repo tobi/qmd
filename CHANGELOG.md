@@ -23,6 +23,13 @@
 
 ### Fixed
 
+- `store.searchVec()` (and SDK `searchVector()`) now embed the query with the
+  store's pinned embed model instead of the global `QMD_EMBED_MODEL`. A store
+  created with a non-default `models.embed` previously failed with
+  `Dimension mismatch ... Expected N ... received M` and loaded the wrong
+  (often much larger) model at query time. Hybrid/precomputed/session search
+  paths were unaffected and stay unchanged (#690).
+
 - `qmd collection add --mask "a.md,*.txt"` now indexes the union of each
   pattern. The comma-separated form was documented and commonly guessed, but
   the joined string was passed to fast-glob as one literal glob, so it
