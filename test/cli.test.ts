@@ -2450,6 +2450,141 @@ describe("mcp http daemon", () => {
     }
   }, 10000);
 
+  test("daemon HTTP server honors --index, scopes pidfile, and queries the named store (#772)", async () => {
+    const customIndex = "mcp-daemon-alt-index";
+    const customCacheDir = join(daemonTestDir, `cache-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const customConfigDir = join(daemonTestDir, `config-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await mkdir(customCacheDir, { recursive: true });
+    await mkdir(customConfigDir, { recursive: true });
+
+    const addResult = await runQmd(
+      ["--index", customIndex, "collection", "add", fixturesDir, "--name", "mcp-fixtures"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const updateResult = await runQmd(
+      ["--index", customIndex, "update"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(updateResult.exitCode).toBe(0);
+
+    const port = randomPort();
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["--index", customIndex, "mcp", "--http", "--daemon", "--port", String(port)],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("Already running");
+    expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+    const namedPidPath = join(customCacheDir, "qmd", `mcp-${customIndex}.pid`);
+    const defaultPidPath = join(customCacheDir, "qmd", "mcp.pid");
+    expect(existsSync(namedPidPath)).toBe(true);
+    expect(existsSync(defaultPidPath)).toBe(false);
+
+    const pid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+    spawnedPids.push(pid);
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://localhost:${port}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const files = body.results.map((r: { file: string }) => r.file);
+      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+
+      const { stdout: stopOut, exitCode: stopCode } = await runQmd(
+        ["--index", customIndex, "mcp", "stop"],
+        {
+          dbPath: daemonDbPath,
+          configDir: customConfigDir,
+          env: {
+            INDEX_PATH: "",
+            XDG_CACHE_HOME: customCacheDir,
+          },
+        },
+      );
+      expect(stopCode).toBe(0);
+      expect(stopOut).toContain("Stopped");
+      expect(existsSync(namedPidPath)).toBe(false);
+    } finally {
+      try { process.kill(pid, "SIGTERM"); } catch { /* already stopped */ }
+      await sleep(300);
+      try { unlinkSync(namedPidPath); } catch {}
+    }
+  }, 15000);
+
+  test("named-index daemon does not collide with the default daemon pidfile (#772)", async () => {
+    const portDefault = randomPort();
+    const portNamed = randomPort();
+    const namedIndex = "other-index";
+
+    const { exitCode: defaultCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(portDefault),
+    ]);
+    expect(defaultCode).toBe(0);
+    expect(existsSync(pidPath())).toBe(true);
+    const defaultPid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(defaultPid);
+
+    const { stdout, stderr, exitCode: namedCode } = await runDaemonQmd([
+      "--index", namedIndex, "mcp", "--http", "--daemon", "--port", String(portNamed),
+    ]);
+    const namedPidPath = join(daemonCacheDir, "qmd", `mcp-${namedIndex}.pid`);
+    try {
+      expect(namedCode).toBe(0);
+      expect(stderr).not.toContain("Already running");
+      expect(stdout).toContain(`http://localhost:${portNamed}/mcp`);
+      expect(existsSync(namedPidPath)).toBe(true);
+
+      const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+      spawnedPids.push(namedPid);
+      expect(namedPid).not.toBe(defaultPid);
+
+      expect(await waitForServer(portDefault)).toBe(true);
+      expect(await waitForServer(portNamed)).toBe(true);
+    } finally {
+      try { process.kill(defaultPid, "SIGTERM"); } catch {}
+      try {
+        if (existsSync(namedPidPath)) {
+          const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+          try { process.kill(namedPid, "SIGTERM"); } catch {}
+        }
+      } catch {}
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+      try { unlinkSync(namedPidPath); } catch {}
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Daemon lifecycle
   // -------------------------------------------------------------------------

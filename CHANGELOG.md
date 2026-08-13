@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- `qmd --index <name> mcp --http --daemon` now scopes PID/log files per index
+  (`mcp-<name>.pid`) and passes the resolved database path to the child, so a
+  named-index daemon no longer collides with the default `mcp.pid` or opens
+  the default store (#772).
+
 - Opening a store no longer throws `SQLiteError: no such column: T.name` when
   `documents_fts` is still the legacy `fts5(name, body, content='documents')`
   schema. `CREATE VIRTUAL TABLE IF NOT EXISTS` left that table in place, and

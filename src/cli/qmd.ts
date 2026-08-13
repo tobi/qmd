@@ -2,7 +2,7 @@ import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid } from "./mcp-pid.js";
+import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -182,6 +182,18 @@ function getDbPath(): string {
 
 function getActiveIndexName(): string {
   return currentIndexName;
+}
+
+function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string } {
+  const cacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const { pidFile, logFile } = mcpDaemonStateFiles(getActiveIndexName());
+  return {
+    cacheDir,
+    pidPath: resolve(cacheDir, pidFile),
+    logPath: resolve(cacheDir, logFile),
+  };
 }
 
 function setIndexName(name: string | null): void {
@@ -500,11 +512,8 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = process.env.XDG_CACHE_HOME
-    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-    : resolve(homedir(), ".cache", "qmd");
-  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
+  // MCP daemon status (check PID file liveness; scoped per --index)
+  const { pidPath: mcpPidPath } = mcpDaemonPaths();
   if (existsSync(mcpPidPath)) {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
     if (isQmdMcpPid(mcpPid)) {
@@ -4482,11 +4491,9 @@ if (isMain) {
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
 
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = process.env.XDG_CACHE_HOME
-        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
+      // Cache dir for PID/log files — scoped per --index so named daemons
+      // do not collide with the default index (#772).
+      const { cacheDir, pidPath, logPath } = mcpDaemonPaths();
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -4531,7 +4538,6 @@ if (isMain) {
           }
 
           mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
@@ -4542,6 +4548,12 @@ if (isMain) {
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
+            env: {
+              ...process.env,
+              // Explicit resolved DB path so the child does not depend on
+              // re-parsing --index (and cannot inherit a stale INDEX_PATH).
+              INDEX_PATH: getDbPath(),
+            },
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
