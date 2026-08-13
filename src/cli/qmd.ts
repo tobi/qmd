@@ -115,6 +115,15 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
+import {
+  decideHookGate,
+  hookDigest,
+  isLocalConfigPath,
+  listTrusted,
+  recordTrust,
+  revokeTrust,
+  type UpdateHook,
+} from "../trust.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -686,6 +695,134 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
+/**
+ * Every `update:` hook the active config defines. Read from the YAML rather
+ * than the synced SQLite copy so `qmd trust` and `qmd update` always digest the
+ * same set.
+ */
+function collectUpdateHooks(): UpdateHook[] {
+  const config = loadConfig();
+  return Object.entries(config.collections ?? {})
+    .filter(([, col]) => !!col.update)
+    .map(([name, col]) => ({ collection: name, command: col.update! }));
+}
+
+/** Record the active config's current hook set as approved. */
+function trustCurrentConfigHooks(): void {
+  const configPath = getConfigPath();
+  if (!isLocalConfigPath(configPath)) return;
+  recordTrust(configPath, hookDigest(collectUpdateHooks()));
+}
+
+/** Ask the user a yes/no question. Only called when stdin and stdout are TTYs. */
+async function confirmOnTty(question: string): Promise<boolean> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Decide whether this run may execute the configured `update:` hooks, prompting
+ * when there is a human to ask. Returns false when the hooks must be skipped —
+ * indexing still proceeds, since that is what the caller asked for.
+ */
+async function resolveUpdateHookTrust(): Promise<boolean> {
+  const hooks = collectUpdateHooks();
+  if (hooks.length === 0) return true;
+
+  const configPath = getConfigPath();
+  const decision = decideHookGate({
+    configPath,
+    hooks,
+    isInteractive: !!process.stdin.isTTY && !!process.stdout.isTTY,
+  });
+
+  if (decision.action === "run") return true;
+
+  console.log(`${c.yellow}This project's ${configPath} defines update commands:${c.reset}`);
+  for (const hook of hooks) {
+    console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
+  }
+  console.log(`${c.dim}They run as a shell script before indexing. Config that came with a checkout is not trusted by default.${c.reset}`);
+
+  if (decision.action === "skip") {
+    console.log(`${c.yellow}Skipping them — no terminal to confirm on. Indexing continues.${c.reset}`);
+    console.log(`${c.dim}Approve with 'qmd trust', or set QMD_TRUST_UPDATE_HOOKS=1 for unattended runs.${c.reset}\n`);
+    return false;
+  }
+
+  const approved = await confirmOnTty("Run these update commands? [y/N] ");
+  if (!approved) {
+    console.log(`${c.yellow}Skipped. Indexing continues.${c.reset}\n`);
+    return false;
+  }
+  recordTrust(configPath, decision.digest);
+  console.log(`${c.green}Trusted ${configPath}.${c.reset} ${c.dim}Editing a command will ask again.${c.reset}\n`);
+  return true;
+}
+
+/**
+ * `qmd trust [list|revoke]` — approve, inspect or drop the update-hook
+ * approval for the project-local config in scope.
+ */
+function manageTrust(subcommand?: string): void {
+  const configPath = getConfigPath();
+
+  if (subcommand === "list") {
+    const records = listTrusted();
+    if (records.length === 0) {
+      console.log(`${c.dim}No trusted project configs.${c.reset}`);
+      return;
+    }
+    for (const record of records) {
+      console.log(`${record.path} ${c.dim}(trusted ${record.trustedAt})${c.reset}`);
+    }
+    return;
+  }
+
+  if (subcommand === "revoke") {
+    if (!isLocalConfigPath(configPath)) {
+      console.log(`${c.dim}No project-local .qmd config in scope — ${configPath} is your own config and is never gated.${c.reset}`);
+      console.log(`${c.dim}Run this from inside the project, or see 'qmd trust list'.${c.reset}`);
+      return;
+    }
+    if (revokeTrust(configPath)) {
+      console.log(`${c.green}✓ Revoked trust for ${configPath}${c.reset}`);
+    } else {
+      console.log(`${c.dim}${configPath} was not trusted.${c.reset}`);
+    }
+    return;
+  }
+
+  if (subcommand) {
+    console.error(`Usage: qmd trust [list|revoke]`);
+    process.exit(1);
+  }
+
+  if (!isLocalConfigPath(configPath)) {
+    console.log(`${c.dim}${configPath} is your own config — update commands there always run. Nothing to trust.${c.reset}`);
+    return;
+  }
+
+  const hooks = collectUpdateHooks();
+  if (hooks.length === 0) {
+    console.log(`${c.dim}${configPath} defines no update commands. Nothing to trust.${c.reset}`);
+    return;
+  }
+
+  for (const hook of hooks) {
+    console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
+  }
+  recordTrust(configPath, hookDigest(hooks));
+  console.log(`${c.green}✓ Trusted ${configPath}${c.reset}`);
+  console.log(`${c.dim}Editing any of these commands will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
+}
+
 async function updateCollections(): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
@@ -702,6 +839,10 @@ async function updateCollections(): Promise<void> {
     return;
   }
 
+  // A project-local .qmd/index.yml travels with a `git clone`, so its `update:`
+  // hooks are somebody else's shell commands until the user says otherwise (#886).
+  const hooksAllowed = await resolveUpdateHookTrust();
+
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
@@ -711,7 +852,7 @@ async function updateCollections(): Promise<void> {
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
-    if (yamlCol?.update) {
+    if (yamlCol?.update && hooksAllowed) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
@@ -3348,6 +3489,7 @@ function showHelp(): void {
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's update commands");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -4275,6 +4417,9 @@ if (isMain) {
             process.exit(1);
           }
           updateCollectionSettings(name, { update: cmd });
+          // The user just typed this command, so it needs no separate approval;
+          // re-record so the digest covers the new hook set (#886).
+          trustCurrentConfigHooks();
           if (cmd) {
             console.log(`✓ Set update command for '${name}': ${cmd}`);
           } else {
@@ -4379,6 +4524,10 @@ if (isMain) {
 
     case "update":
       await updateCollections();
+      break;
+
+    case "trust":
+      manageTrust(cli.args[0]);
       break;
 
     case "embed":

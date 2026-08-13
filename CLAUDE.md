@@ -20,6 +20,7 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd doctor                        # Diagnose config, index, model, and device issues
 qmd update                        # Re-index collections; configured update hooks run first
+qmd trust [list|revoke]           # Approve a checked-in .qmd config's update hooks
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)

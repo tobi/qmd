@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Security
+
+- `qmd update` no longer runs a project-local `.qmd/index.yml`'s `update:`
+  commands without approval (#886). That file arrives with a `git clone` and is
+  adopted automatically for any command run inside the tree, so cloning a
+  repository and running `qmd update` executed shell commands chosen by whoever
+  wrote it. On a terminal QMD now lists the commands and asks; with nobody to
+  ask it skips them and keeps indexing. Approvals are recorded per config file
+  and per command set in `<config dir>/trusted.json`, so editing a command — or
+  a `git pull` that rewrites one — asks again. New `qmd trust`,
+  `qmd trust list` and `qmd trust revoke` manage approvals, and
+  `QMD_TRUST_UPDATE_HOOKS=1` opts unattended runs back in. Commands in your own
+  `~/.config/qmd/*.yml`, including anything `qmd collection update-cmd` writes,
+  are unaffected.
+
 ### Changed
 
 - `qmd pull` (and implicit model downloads in `embed`/`query`) no longer print

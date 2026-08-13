@@ -768,6 +768,30 @@ qmd collection update-cmd wiki 'git pull --ff-only'   # set
 qmd collection update-cmd wiki                         # clear
 ```
 
+##### Update commands from a checked-in `.qmd` config
+
+A project-local `.qmd/index.yml` travels with a `git clone`, and QMD adopts it
+automatically for any command run inside the tree. Its `update` commands are
+therefore somebody else's shell script until you say otherwise, and QMD will not
+run them unattended:
+
+- On a terminal, `qmd update` lists the commands and asks before running them.
+  Approving records the approval in `~/.config/qmd/trusted.json`.
+- With no terminal to ask — agents, CI, MCP — the commands are **skipped** and
+  indexing continues, so the refresh you asked for still happens.
+- Approvals cover the exact commands you saw. Editing one, or a `git pull` that
+  rewrites it, asks again.
+
+```sh
+qmd trust           # review and approve this project's update commands
+qmd trust list      # show every approved project config
+qmd trust revoke    # drop the approval for this project
+```
+
+Set `QMD_TRUST_UPDATE_HOOKS=1` for CI that should run them unattended. Commands
+in your own `~/.config/qmd/*.yml` — including anything `qmd collection
+update-cmd` writes — are never gated.
+
 ### Search Commands
 
 ```

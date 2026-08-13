@@ -109,7 +109,7 @@ export function setConfigIndexName(name: string): void {
   }
 }
 
-function getConfigDir(): string {
+export function getConfigDir(): string {
   // Allow override via QMD_CONFIG_DIR for testing
   if (process.env.QMD_CONFIG_DIR) {
     return process.env.QMD_CONFIG_DIR;
