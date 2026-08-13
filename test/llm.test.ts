@@ -768,6 +768,35 @@ describe("LlamaCpp ensureRerankContexts error reporting", () => {
       warn.mockRestore();
     }
   });
+
+  test("serializes concurrent cold-start callers so ranking contexts are created once", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const ctx = { id: 1 };
+    let inflight = 0;
+    let maxInflight = 0;
+    const createRankingContext = vi.fn().mockImplementation(async () => {
+      inflight++;
+      maxInflight = Math.max(maxInflight, inflight);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inflight--;
+      return ctx;
+    });
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+    const [a, b, c] = await Promise.all([
+      llm.ensureRerankContexts(),
+      llm.ensureRerankContexts(),
+      llm.ensureRerankContexts(),
+    ]);
+
+    expect(a).toEqual([ctx]);
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+    expect(createRankingContext).toHaveBeenCalledTimes(1);
+    expect(maxInflight).toBe(1);
+  });
 });
 
 describe("LlamaCpp.getDeviceInfo", () => {

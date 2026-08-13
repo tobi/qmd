@@ -807,6 +807,7 @@ export class LlamaCpp implements LLM {
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  private rerankContextsCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> | null = null;
   // Guard against concurrent ensureLlama() calls creating duplicate Llama
   // instances. Without this, two concurrent callers each build their own
   // runtime and the last write to this.llama wins, leaving models/grammars
@@ -936,6 +937,7 @@ export class LlamaCpp implements LLM {
       this.embedModelLoadPromise = null;
       this.generateModelLoadPromise = null;
       this.rerankModelLoadPromise = null;
+      this.rerankContextsCreatePromise = null;
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -1305,7 +1307,20 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity();
+      return this.rerankContexts;
+    }
+
+    if (this.rerankContextsCreatePromise) {
+      return await this.rerankContextsCreatePromise;
+    }
+
+    // Same mutex as ensureEmbedContexts: two overlapping query/rerank calls on a
+    // cold MCP server both saw length === 0, both created ranking contexts, and
+    // the inactivity timer disposed the loser → "Object is disposed" (#682).
+    this.rerankContextsCreatePromise = (async () => {
+      this.touchActivity();
       const model = await this.ensureRerankModel();
       const n = Math.min(await this.computeParallelism(1000), 4);
       const threads = await this.threadsPerContext(n);
@@ -1332,9 +1347,15 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
+      this.touchActivity();
+      return this.rerankContexts;
+    })();
+
+    try {
+      return await this.rerankContextsCreatePromise;
+    } finally {
+      this.rerankContextsCreatePromise = null;
     }
-    this.touchActivity();
-    return this.rerankContexts;
   }
 
   // ==========================================================================
@@ -1849,6 +1870,7 @@ export class LlamaCpp implements LLM {
     this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.rerankContextsCreatePromise = null;
     this.llamaLoadPromise = null;
   }
 }

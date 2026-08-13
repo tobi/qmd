@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- Concurrent `query` calls with `rerank: true` on a cold MCP server no longer
+  race `ensureRerankContexts()`. Embed already serialized context creation;
+  rerank did not, so two overlapping first queries both saw an empty pool,
+  both created ranking contexts, and the inactivity timer disposed the loser
+  (`Object is disposed`, #682). Callers now await the in-flight create.
+
 - Embedding-context pool size no longer assumes every GGUF costs 150 MB of
   VRAM (the nomic-embed figure). Larger models such as Qwen3-Embedding-0.6B
   are ~1190 MB per 2048-token context; opening 8 of those exhausted an 8 GB
