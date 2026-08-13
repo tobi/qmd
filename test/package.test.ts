@@ -69,3 +69,16 @@ describe("package grammar distribution", () => {
     expect(script).toContain("tree-sitter-typescript/tree-sitter-tsx.wasm");
   });
 });
+
+describe("Nix flake package layout", () => {
+  test("installPhase copies skills/ next to src/ so findPackageRoot can resolve them (#722)", () => {
+    const flake = readFileSync(new URL("flake.nix", root), "utf8");
+
+    // The bun wrapper runs $out/lib/qmd/src/cli/qmd.ts. findPackageRoot() walks
+    // up from that file looking for a sibling skills/ directory, so skills must
+    // land at the same $out/lib/qmd prefix as src — not only in the source tree.
+    expect(flake).toContain("cp -r src $out/lib/qmd/");
+    expect(flake).toContain("cp -r skills $out/lib/qmd/");
+    expect(flake).toContain("cp package.json $out/lib/qmd/");
+  });
+});

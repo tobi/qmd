@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- The Nix flake package now ships `skills/` next to `src/` in `$out/lib/qmd/`.
+  `findPackageRoot()` walks up from the wrapped `src/cli/qmd.ts` looking for a
+  sibling `skills/` directory; without it, `qmd skill show` and `qmd skills list`
+  always failed with "QMD skill not found" on Nix-installed binaries (#722).
+
 - `/release` step 1 no longer points at a missing script. `skills/release/scripts/release-context.sh`
   now exists: it silently installs git hooks and prints version info, working-tree
   status, commits and files since the last tag, `[Unreleased]`, and the previous
