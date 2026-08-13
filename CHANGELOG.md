@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- `multi-get --format files` now emits the docid as its own CSV field
+  (`#docid,path,...`) instead of prepending it into the path field with a
+  space (`#docid path,...`), matching `search --format files` and keeping
+  naive comma-splitting usable (#760).
+
 - `qmd embed` now takes an exclusive process lock (`.qmd-embed.lock` next to
   the index DB) so concurrent invocations no longer race on `vectors_vec`
   and fail with `UNIQUE constraint failed: vectors_vec.hash_seq`. A second

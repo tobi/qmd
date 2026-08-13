@@ -1317,9 +1317,12 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       console.log([docidVal ? `#${docidVal}` : "", identOf(r), r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
+    // Headerless CSV: docid,filepath[,context][,status] — docid is its own
+    // field (comma-separated), matching search --format files shape so naive
+    // comma-splitting stays usable (#760).
     for (const r of results) {
       const docidVal = docidOf(r);
-      const id = docidVal ? `#${docidVal} ` : "";
+      const id = docidVal ? `#${docidVal},` : "";
       const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
       const status = r.skipped ? "[SKIPPED]" : "";
       console.log(`${id}${identOf(r)}${ctx}${status ? `,${status}` : ""}`);

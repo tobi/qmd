@@ -996,6 +996,20 @@ describe("CLI Multi-Get Command", () => {
     }
   });
 
+  test("--format files emits docid as its own CSV field (#760)", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["multi-get", "README.md", "--format", "files"],
+      { dbPath: localDbPath },
+    );
+    expect(exitCode).toBe(0);
+    const line = stdout.trim().split("\n")[0] ?? "";
+    // Shape: #docid,path[,"context"] — not "#docid path,..."
+    expect(line).toMatch(/^#[a-f0-9]{6},[^,\s]+/);
+    expect(line).not.toMatch(/^#[a-f0-9]{6} /);
+    const firstField = line.split(",")[0] ?? "";
+    expect(firstField).toMatch(/^#[a-f0-9]{6}$/);
+  });
+
   test("retrieves a document by docid", async () => {
     const lookup = await runQmd(["multi-get", "README.md", "--json"], { dbPath: localDbPath });
     expect(lookup.exitCode).toBe(0);
