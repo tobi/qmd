@@ -69,3 +69,17 @@ describe("package grammar distribution", () => {
     expect(script).toContain("tree-sitter-typescript/tree-sitter-tsx.wasm");
   });
 });
+
+describe("prepare script Windows safety", () => {
+  test("uses Node install-hooks.mjs and still builds dist", () => {
+    expect(pkg.scripts.prepare).toContain("node scripts/install-hooks.mjs");
+    expect(pkg.scripts.prepare).toContain("node scripts/build.mjs");
+    expect(pkg.scripts.prepare).not.toContain("install-hooks.sh");
+    expect(pkg.scripts.prepare).not.toContain("[ -d .git ]");
+
+    const hooksInstaller = readFileSync(new URL("scripts/install-hooks.mjs", root), "utf8");
+    expect(hooksInstaller).toContain("pre-push");
+    expect(hooksInstaller).toContain(".git");
+    expect(hooksInstaller).toContain("Not a git repository, skipping hook install");
+  });
+});
