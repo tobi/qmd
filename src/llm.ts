@@ -17,7 +17,10 @@ type WriteCallback = (err?: Error | null) => void;
 type NodeLlamaCppModule = {
   getLlama: (options: Record<string, unknown>) => Promise<Llama>;
   getLlamaGpuTypes?: (include?: "supported" | "allValid") => Promise<LlamaGpuMode[]>;
-  resolveModelFile: (model: string, cacheDir: string) => Promise<string>;
+  resolveModelFile: (
+    model: string,
+    optionsOrDirectory?: string | { directory?: string; cli?: boolean },
+  ) => Promise<string>;
   LlamaChatSession: new (options: { contextSequence: unknown }) => {
     prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
   };
@@ -478,9 +481,20 @@ function validateGgufFile(filePath: string, modelUri: string): void {
   );
 }
 
+
+/**
+ * node-llama-cpp prints a multi-line download progress bar when the second
+ * argument is a directory string (`cli` defaults to true). Agent transcripts
+ * capture that as thousands of tokens. Always pass an options object so the
+ * bar is off unless the caller opts in (#776).
+ */
+function resolveModelFileArgs(cacheDir: string, cli = false): { directory: string; cli: boolean } {
+  return { directory: cacheDir, cli };
+}
+
 export async function pullModels(
   models: string[],
-  options: { refresh?: boolean; cacheDir?: string } = {}
+  options: { refresh?: boolean; cacheDir?: string; cli?: boolean } = {}
 ): Promise<PullResult[]> {
   const cacheDir = options.cacheDir || MODEL_CACHE_DIR;
   if (!existsSync(cacheDir)) {
@@ -523,7 +537,7 @@ export async function pullModels(
     }
 
     const { resolveModelFile } = await loadNodeLlamaCpp();
-    const path = await resolveModelFile(model, cacheDir);
+    const path = await resolveModelFile(model, resolveModelFileArgs(cacheDir, options.cli === true));
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
@@ -1012,7 +1026,7 @@ export class LlamaCpp implements LLM {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
     const { resolveModelFile } = await loadNodeLlamaCpp();
-    const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
+    const modelPath = await resolveModelFile(modelUri, resolveModelFileArgs(this.modelCacheDir));
     validateGgufFile(modelPath, modelUri);
     return modelPath;
   }

@@ -4,6 +4,10 @@
 
 ### Changed
 
+- `qmd pull` (and implicit model downloads in `embed`/`query`) no longer print
+  node-llama-cpp's download progress bar. The bar redraws every few kilobytes
+  and flooded agent transcripts with thousands of tokens (#776). Pass
+  `qmd pull --progress` to show it on an interactive terminal.
 - `--full-path` no longer degrades silently when a result cannot be resolved on
   disk (#785). A fallback there means the file moved or was deleted since the
   last index, so `search`, `query`, `get` and `multi-get` now print a notice to
