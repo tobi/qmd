@@ -1584,6 +1584,13 @@ function collectionList(): void {
   closeDb();
 }
 
+/** Canonical --mask, with --glob as the alias OpenClaw and others already pass (#536). */
+function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): string {
+  const mask = typeof values.mask === "string" && values.mask.length > 0 ? values.mask : undefined;
+  const glob = typeof values.glob === "string" && values.glob.length > 0 ? values.glob : undefined;
+  return mask ?? glob ?? DEFAULT_GLOB;
+}
+
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
   // If name not provided, generate from pwd basename
   let collName = name;
@@ -2797,6 +2804,7 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -4201,11 +4209,11 @@ if (isMain) {
           if (!pwd) {
             console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
             console.error("  Pass '.' to index the current directory.");
-            console.error("  --mask: glob (default **/*.md), brace group, or comma-separated list");
+            console.error("  --mask / --glob: glob (default **/*.md), brace group, or comma-separated list");
             process.exit(1);
           }
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const globPattern = collectionGlobFromCli(cli.values);
           const name = cli.values.name as string | undefined;
 
           if (!existsSync(resolvedPwd)) {
@@ -4328,7 +4336,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME] [--mask GLOB]  Add a collection");
+          console.log("  add <path> [--name NAME] [--mask|--glob GLOB]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");

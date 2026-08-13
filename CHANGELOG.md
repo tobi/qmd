@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- `qmd collection add --glob` is no longer silently ignored. parseArgs ran
+  with `strict: false`, so OpenClaw's `--glob memory.md` (and any other
+  `--glob`) fell through, the default `**/*.md` was used, and a second
+  collection on the same path collided as a duplicate instead of indexing
+  the requested mask (#536). `--glob` is now an alias for `--mask`.
+
 - The `bin/qmd` trampoline now execs `process.execPath` instead of
   re-resolving `node` from PATH. Native addons (`better-sqlite3`) are
   compiled for the Node that installed qmd; a version manager (nvm, fnm,

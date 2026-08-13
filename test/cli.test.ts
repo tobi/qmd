@@ -580,6 +580,40 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("notes/*.md");
   });
 
+  test("accepts --glob as an alias for --mask so same-path collections do not collide (#536)", async () => {
+    const env = await createIsolatedTestEnv("glob-alias");
+    const collectionDir = join(testDir, `glob-alias-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "MEMORY.md"), "root memory\n");
+    await writeFile(join(collectionDir, "memory.md"), "alt memory\n");
+    await writeFile(join(collectionDir, "other.md"), "other\n");
+
+    const root = await runQmd(
+      ["collection", "add", collectionDir, "--name", "memory-root"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    expect(root.exitCode).toBe(0);
+
+    const alt = await runQmd(
+      ["collection", "add", collectionDir, "--name", "memory-alt", "--glob", "memory.md"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    if (alt.exitCode !== 0) {
+      console.error("Command failed:", alt.stderr);
+    }
+    expect(alt.exitCode).toBe(0);
+    expect(alt.stderr).not.toContain("already exists for this path and pattern");
+    expect(alt.stdout).toContain("memory.md");
+
+    const list = await runQmd(["collection", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(list.stdout).toContain("memory-root");
+    expect(list.stdout).toContain("memory-alt");
+    expect(list.stdout).toContain("memory.md");
+  });
+
   test("indexes comma-separated --mask patterns as a union (#557)", async () => {
     const env = await createIsolatedTestEnv("comma-mask");
     const collectionDir = join(testDir, `comma-mask-${testCounter}`);
