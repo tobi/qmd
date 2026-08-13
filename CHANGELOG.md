@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- `scripts/build.mjs` no longer passes `shell: true` to `spawnSync` on Windows.
+  With the default Node install path (`C:\Program Files\nodejs\node.exe`),
+  `cmd.exe` split the unquoted `process.execPath` at the space, the `tsc`
+  spawn failed, and `prepare` could still report success with no `dist/` —
+  leaving `bin/qmd` at "not built". The helper always receives a real binary
+  path plus an args array, so no shell is needed. A spawn error now prints
+  the missing binary path instead of failing silently. (#681)
+
 - Case-sensitive collections no longer collapse distinct document identities that
   differ only by path casing. The implicit `COLLATE NOCASE` legacy migration was
   unsafe for filesystems that contain both `README.md` and `readme.md`; case-only

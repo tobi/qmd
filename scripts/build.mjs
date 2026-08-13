@@ -10,10 +10,16 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
-    shell: process.platform === "win32",
+    // Never shell:true — on Windows, cmd.exe splits unquoted process.execPath
+    // at spaces (C:\Program Files\nodejs\node.exe) and the build can exit 0
+    // with no dist/. spawnSync can spawn the binary + args array directly. (#681)
+    shell: false,
     ...options,
   });
-  if (result.status !== 0) {
+  if (result.error || result.status !== 0) {
+    if (result.error) {
+      console.error(`build: failed to spawn ${command}: ${result.error.message}`);
+    }
     process.exit(result.status ?? 1);
   }
 }
