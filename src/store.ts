@@ -665,6 +665,15 @@ export function getRealPath(path: string): string {
   }
 }
 
+/**
+ * True if `target` is `dir` or a descendant, after resolving symlinks.
+ * Used to keep indexing and qmd:// filesystem resolution inside a collection.
+ */
+export function isPathInsideDir(dir: string, target: string): boolean {
+  return getRelativePathFromPrefix(getRealPath(target), getRealPath(dir)) !== null;
+}
+
+
 // =============================================================================
 // Virtual Path Utilities (qmd://)
 // =============================================================================
@@ -769,7 +778,9 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
   const coll = getCollectionByName(db, parsed.collectionName);
   if (!coll) return null;
 
-  return resolve(coll.pwd, parsed.path);
+  const resolved = resolve(coll.pwd, parsed.path);
+  if (!isPathInsideDir(coll.pwd, resolved)) return null;
+  return resolved;
 }
 
 /**
@@ -1590,6 +1601,15 @@ export async function reindexCollection(
     // reconstructed as: resolve(collection.path, storedPath).
     // handelize() is NOT applied at index time — it is display-only.
     const path = normalizePathSeparators(relativeFile);
+    // Glob `../` segments, absolute patterns, and file symlinks can resolve
+    // outside the collection root. Do not ingest those files, and do not mark
+    // them seen so a previous escaped row is deactivated on this pass.
+    if (!isPathInsideDir(collectionPath, filepath)) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
     seenPaths.add(path);
 
     let content: string;

@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -50,6 +50,7 @@ import {
   isDocid,
   syncConfigToDb,
   reindexCollection,
+  resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   insertContent,
@@ -2822,6 +2823,95 @@ describe("Reindex Collection", () => {
       SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path
     `).all(collectionName) as { path: string }[];
     expect(paths.map(r => r.path)).toEqual(["X - b.md", "a.md"]);
+  });
+
+  test("does not index a file symlink whose target is outside the collection", async () => {
+    const store = await createTestStore();
+    const parent = join(testDir, `escape-sym-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const collectionPath = join(parent, "col");
+    await mkdir(collectionPath, { recursive: true });
+    const marker = `OUTSIDE_TOKEN_${Date.now()}`;
+    await writeFile(join(parent, "secret.md"), `# Secret\n\n${marker}\n`);
+    await writeFile(join(collectionPath, "inside.md"), "# Inside\n\nsafe\n");
+    try {
+      await symlink(join(parent, "secret.md"), join(collectionPath, "link.md"));
+    } catch {
+      await rm(parent, { recursive: true, force: true });
+      await cleanupTestDb(store);
+      return;
+    }
+    try {
+      const result = await reindexCollection(store, collectionPath, "**/*.md", "docs");
+      expect(result.indexed).toBe(1);
+      const bodies = store.db.prepare(`
+        SELECT content.doc as body FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.collection = ? AND d.active = 1
+      `).all("docs") as { body: string }[];
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]!.body).toContain("safe");
+      expect(bodies.map(b => b.body).join("")).not.toContain(marker);
+      // fast-glob + onlyFiles may omit the symlink entirely; if it is listed,
+      // containment must skip it rather than ingest the target.
+      if (result.skippedFiles.length > 0) {
+        expect(result.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
+      }
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("does not index files matched by a glob that walks out of the collection", async () => {
+    const store = await createTestStore();
+    const parent = join(testDir, `escape-glob-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const collectionPath = join(parent, "col");
+    await mkdir(collectionPath, { recursive: true });
+    const marker = `GLOB_OUTSIDE_${Date.now()}`;
+    await writeFile(join(parent, "outside.md"), `# Outside\n\n${marker}\n`);
+    await writeFile(join(collectionPath, "inside.md"), "# Inside\n\nsafe\n");
+    try {
+      const result = await reindexCollection(store, collectionPath, "../outside.md,**/*.md", "docs");
+      const bodies = store.db.prepare(`
+        SELECT content.doc as body FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.collection = ? AND d.active = 1
+      `).all("docs") as { body: string }[];
+      expect(bodies.map(b => b.body).join("")).not.toContain(marker);
+      expect(bodies.some(b => b.body.includes("safe"))).toBe(true);
+      expect(result.indexed).toBeGreaterThanOrEqual(1);
+
+      store.db.prepare(`DELETE FROM documents`).run();
+      const abs = await reindexCollection(store, collectionPath, join(parent, "outside.md"), "docs");
+      expect(abs.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
+      const absBodies = store.db.prepare(`
+        SELECT content.doc as body FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.collection = ? AND d.active = 1
+      `).all("docs") as { body: string }[];
+      expect(absBodies.map(b => b.body).join("")).not.toContain(marker);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("resolveVirtualPath refuses .. segments that leave the collection", async () => {
+    const store = await createTestStore();
+    const collectionPath = join(testDir, `vp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "ok.md"), "# Ok\n");
+    syncConfigToDb(store.db, {
+      collections: { docs: { path: collectionPath, pattern: "**/*.md" } },
+    });
+    try {
+      const ok = resolveVirtualPath(store.db, "qmd://docs/ok.md");
+      expect(ok).toBe(resolve(collectionPath, "ok.md"));
+      expect(resolveVirtualPath(store.db, "qmd://docs/../../../etc/passwd")).toBeNull();
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
   });
 
   test("skips unreadable files and reports the error code (#460)", async () => {

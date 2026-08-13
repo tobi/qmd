@@ -3,6 +3,9 @@
  */
 
 import { describe, test, expect } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   homedir,
   resolve,
@@ -10,6 +13,7 @@ import {
   _resetProductionModeForTesting,
   getPwd,
   getRealPath,
+  isPathInsideDir,
   isVirtualPath,
   parseVirtualPath,
   normalizeVirtualPath,
@@ -86,6 +90,42 @@ describe("Path Utilities", () => {
     const result = getRealPath("/tmp");
     expect(result).toBeTruthy();
     expect(result === "/tmp" || result === "/private/tmp").toBe(true);
+  });
+
+  test("isPathInsideDir accepts descendants and rejects escapes", () => {
+    const root = mkdtempSync(join(tmpdir(), "qmd-inside-"));
+    try {
+      mkdirSync(join(root, "sub"));
+      writeFileSync(join(root, "sub", "a.md"), "ok\n");
+      expect(isPathInsideDir(root, join(root, "sub", "a.md"))).toBe(true);
+      expect(isPathInsideDir(root, root)).toBe(true);
+      expect(isPathInsideDir(root, join(root, "..", "nope.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isPathInsideDir rejects a file symlink that points outside the dir", () => {
+    const parent = mkdtempSync(join(tmpdir(), "qmd-sym-"));
+    const dir = join(parent, "col");
+    mkdirSync(dir);
+    const outside = join(parent, "secret.md");
+    writeFileSync(outside, "secret\n");
+    const link = join(dir, "link.md");
+    try {
+      symlinkSync(outside, link);
+    } catch {
+      rmSync(parent, { recursive: true, force: true });
+      return;
+    }
+    try {
+      expect(isPathInsideDir(dir, link)).toBe(false);
+      writeFileSync(join(dir, "inside.md"), "ok\n");
+      symlinkSync(join(dir, "inside.md"), join(dir, "alias.md"));
+      expect(isPathInsideDir(dir, join(dir, "alias.md"))).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 });
 

@@ -28,6 +28,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
 // Types for structured content
@@ -851,7 +852,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -935,11 +936,40 @@ export async function startMcpHttpServer(
     return Buffer.concat(chunks).toString();
   }
 
+  const host = options.host ?? process.env.QMD_HOST ?? "localhost";
+  const originGuard = resolveOriginGuard({
+    host,
+    ...(options.allowedOrigins ? { allowedOrigins: options.allowedOrigins } : {}),
+    ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
+  });
+
   const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
     const reqStart = Date.now();
-    const pathname = nodeReq.url || "/";
+    const pathname = (nodeReq.url || "/").split("?")[0];
 
     try {
+      // DNS-rebinding screen, ahead of routing so REST /query /search are
+      // covered too — they bypass the MCP transport entirely (#881).
+      const origin = nodeReq.headers.origin;
+      const hostHeader = nodeReq.headers.host;
+      const verdict = checkRequestOrigin(
+        {
+          origin: typeof origin === "string" ? origin : undefined,
+          host: typeof hostHeader === "string" ? hostHeader : undefined,
+        },
+        originGuard,
+      );
+      if (!verdict.ok) {
+        nodeRes.writeHead(403, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32003, message: `Forbidden: ${verdict.reason}` },
+          id: null,
+        }));
+        log(`${ts()} ${nodeReq.method} ${pathname} 403 — ${verdict.reason}`);
+        return;
+      }
+
       if (pathname === "/health" && nodeReq.method === "GET") {
         const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
@@ -1047,7 +1077,6 @@ export async function startMcpHttpServer(
     }
   });
 
-  const host = options.host ?? process.env.QMD_HOST ?? "localhost";
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
     httpServer.listen(port, host, () => resolve());
@@ -1076,6 +1105,11 @@ export async function startMcpHttpServer(
   });
 
   log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
+  if (originGuard.disabled) {
+    log("Warning: QMD_ALLOWED_ORIGINS=* — DNS-rebinding protection is off. Only do this behind your own authenticating proxy.");
+  } else if (!originGuard.enforceHost) {
+    log(`Warning: bound to ${host} with no QMD_ALLOWED_HOSTS — Host validation is off and the index is readable by anyone who can reach this port.`);
+  }
   return { httpServer, port: actualPort, stop };
 }
 

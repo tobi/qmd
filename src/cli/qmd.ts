@@ -12,6 +12,7 @@ import { createInterface } from "readline/promises";
 import {
   getPwd,
   getRealPath,
+  isPathInsideDir,
   homedir,
   resolve,
   enableProductionMode,
@@ -1875,6 +1876,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     // Store the literal relative path — handelize() is NOT applied at index time.
     const path = relativeFile.replace(/\\/g, '/');
+    if (!isPathInsideDir(resolvedPwd, filepath)) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      progress.set((processed / total) * 100);
+      continue;
+    }
     seenPaths.add(path);
 
     let content: string;
@@ -1977,9 +1984,16 @@ function fsErrorCode(err: unknown): string {
 function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
   if (skippedFiles.length === 0) return;
   for (const skipped of skippedFiles) {
-    console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
+    if (skipped.code === "OUTSIDE_COLLECTION") {
+      console.warn(`⚠ Skipped file outside collection: ${skipped.file}`);
+    } else {
+      console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
+    }
   }
-  console.warn(`Skipped ${skippedFiles.length} unreadable file(s)`);
+  const escaped = skippedFiles.filter(f => f.code === "OUTSIDE_COLLECTION").length;
+  const unreadable = skippedFiles.length - escaped;
+  if (escaped) console.warn(`Skipped ${escaped} file(s) outside the collection root`);
+  if (unreadable) console.warn(`Skipped ${unreadable} unreadable file(s)`);
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
