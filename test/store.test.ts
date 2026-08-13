@@ -53,6 +53,7 @@ import {
   STRONG_SIGNAL_MIN_GAP,
   insertContent,
   insertDocument,
+  cleanupOrphanedVectors,
   generateEmbeddings,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
@@ -2743,6 +2744,138 @@ describe("Index Status", () => {
     expect(health.totalDocs).toBe(1);
 
     await cleanupTestDb(store);
+  });
+});
+
+describe("cleanupOrphanedVectors atomicity", () => {
+  // Seeds one active document (1 chunk) and one inactive document (2 chunks),
+  // so cleanup should remove exactly the 2 orphaned chunks from both tables.
+  async function seedOrphanFixture(store: Store): Promise<void> {
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "kept-doc", hash: "keephash" });
+    await insertTestDocument(store.db, collectionName, { name: "orphaned-doc", hash: "orphanhash", active: 0 });
+    store.insertEmbedding("keephash", 0, 0, new Float32Array([1, 2, 3]), "test-model", now, 1);
+    store.insertEmbedding("orphanhash", 0, 0, new Float32Array([4, 5, 6]), "test-model", now, 2);
+    store.insertEmbedding("orphanhash", 1, 10, new Float32Array([7, 8, 9]), "test-model", now, 2);
+  }
+
+  function vecCounts(db: Database): { vec: number; meta: number } {
+    const vec = (db.prepare(`SELECT COUNT(*) AS c FROM vectors_vec`).get() as { c: number }).c;
+    const meta = (db.prepare(`SELECT COUNT(*) AS c FROM content_vectors`).get() as { c: number }).c;
+    return { vec, meta };
+  }
+
+  // Fault injection: same connection, but the content_vectors DELETE throws —
+  // after the vectors_vec DELETE already executed inside the transaction.
+  function makeFailingDb(db: Database): Database {
+    return {
+      prepare: (sql: string) => db.prepare(sql),
+      transaction: (fn: () => unknown) => db.transaction(fn),
+      exec: (sql: string) => {
+        if (sql.includes("DELETE FROM content_vectors")) {
+          throw new Error("injected failure between deletes");
+        }
+        return db.exec(sql);
+      },
+    } as unknown as Database;
+  }
+
+  test("removes orphaned chunks from both tables and returns the count", async () => {
+    const store = await createTestStore();
+    try {
+      await seedOrphanFixture(store);
+      expect(vecCounts(store.db)).toEqual({ vec: 3, meta: 3 });
+
+      expect(cleanupOrphanedVectors(store.db)).toBe(2);
+
+      expect(vecCounts(store.db)).toEqual({ vec: 1, meta: 1 });
+      const survivor = store.db.prepare(`SELECT hash FROM content_vectors`).get() as { hash: string };
+      expect(survivor.hash).toBe("keephash");
+      const survivorVec = store.db.prepare(`SELECT hash_seq FROM vectors_vec`).get() as { hash_seq: string };
+      expect(survivorVec.hash_seq).toBe("keephash_0");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rolls back the vectors_vec DELETE when the content_vectors DELETE fails", async () => {
+    const store = await createTestStore();
+    try {
+      await seedOrphanFixture(store);
+      const db = store.db;
+
+      // Without the transaction wrap this used to leave vectors_vec already
+      // purged while content_vectors still claimed the chunks were embedded
+      // (silent desync).
+      expect(() => cleanupOrphanedVectors(makeFailingDb(db))).toThrow("injected failure between deletes");
+
+      // Both tables must be untouched — the vectors_vec DELETE was rolled back.
+      expect(vecCounts(db)).toEqual({ vec: 3, meta: 3 });
+
+      // The connection is left in a clean state: a plain retry succeeds.
+      expect(cleanupOrphanedVectors(db)).toBe(2);
+      expect(vecCounts(db)).toEqual({ vec: 1, meta: 1 });
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("participates in an outer transaction via savepoint and rolls back with it", async () => {
+    const store = await createTestStore();
+    try {
+      await seedOrphanFixture(store);
+      const db = store.db;
+
+      const outer = db.transaction(() => {
+        const removed = cleanupOrphanedVectors(db);
+        if (removed !== 2) {
+          throw new Error(`expected 2 removed inside outer transaction, got ${removed}`);
+        }
+        throw new Error("outer rollback");
+      });
+
+      expect(() => outer()).toThrow("outer rollback");
+
+      // The outer rollback must also restore the cleanup's deletions.
+      expect(vecCounts(db)).toEqual({ vec: 3, meta: 3 });
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("runs as an inner savepoint: a caught cleanup failure rolls back alone, the outer transaction commits", async () => {
+    const store = await createTestStore();
+    try {
+      await seedOrphanFixture(store);
+      const db = store.db;
+
+      const outer = db.transaction(() => {
+        try {
+          cleanupOrphanedVectors(makeFailingDb(db));
+          throw new Error("expected the injected failure to propagate");
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "injected failure between deletes") {
+            throw error;
+          }
+        }
+        // If the cleanup ran inline instead of inside its own savepoint, the
+        // vectors_vec DELETE would survive the caught failure and commit with
+        // the outer transaction below.
+        db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+          .run("outer-survivor", "outer doc", new Date().toISOString());
+      });
+      outer();
+
+      // Cleanup rolled back alone; the unrelated outer write committed.
+      expect(vecCounts(db)).toEqual({ vec: 3, meta: 3 });
+      const kept = db.prepare(`SELECT COUNT(*) AS c FROM content WHERE hash = 'outer-survivor'`).get() as { c: number };
+      expect(kept.c).toBe(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
   });
 });
 

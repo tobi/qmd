@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- `cleanupOrphanedVectors` now runs its orphan count and both DELETEs in a
+  single immediate transaction. An interruption between the two DELETEs
+  (crash, `SQLITE_BUSY`) could desync `vectors_vec` from `content_vectors`,
+  leaving stale metadata rows that make a later reactivation of the same
+  content hash look already-embedded — so `qmd embed` skips it and the
+  document becomes silently unsearchable by vector, with no orphan left to
+  clean up (#766).
+
 - `qmd embed` no longer splits a UTF-16 surrogate pair (emoji, etc.) across a
   chunk boundary. A chunk ending or starting mid-pair produced an unpaired
   surrogate in the chunk text, which some remote embedding APIs reject as
