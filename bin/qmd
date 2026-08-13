@@ -159,7 +159,16 @@ if (existsSync(resolve(pkgDir, "package-lock.json"))) {
   runnerName = "node";
 }
 
-const runner = useSourceMode ? sourceRunner : (runnerName === "node" ? "node" : "bun");
+const selected = useSourceMode ? sourceRunner : (runnerName === "node" ? "node" : "bun");
+// Pin Node to the binary that launched this trampoline. Native addons
+// (better-sqlite3) are compiled for that install's ABI; spawning PATH
+// `node` picks up nvm/fnm/mise shims in the project directory and fails
+// with NODE_MODULE_VERSION / ERR_DLOPEN_FAILED (leftover from #577; #319).
+// If the trampoline itself is running under bun (`bun bin/qmd`), keep
+// PATH `node` so we don't load Node-ABI addons into bun.
+const runner = selected === "node" && typeof process.versions.bun !== "string"
+  ? process.execPath
+  : selected;
 const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
 const needsShell = (runner === "bun") && process.platform === "win32";
 

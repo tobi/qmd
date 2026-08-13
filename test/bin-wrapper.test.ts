@@ -8,6 +8,19 @@ import { fileURLToPath } from "node:url";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const fixtures: string[] = [];
 
+// Shebang-forward for bin/qmd must exec a real Node binary, not bun.
+// `bun test` sets process.execPath to bun; interpolating that would run the
+// trampoline under bun and hit the PATH-`node` fallback, which is the
+// opposite of the NODE_MODULE_VERSION case this suite pins.
+function realNodeExecPath(): string {
+  if (typeof process.versions.bun !== "string") return process.execPath;
+  const result = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+  const resolved = result.stdout?.trim();
+  if (result.status === 0 && resolved) return resolved;
+  return "node";
+}
+const REAL_NODE = realNodeExecPath();
+
 function makeTempFixture() {
   const root = mkdtempSync(join(tmpdir(), "qmd-bin-wrapper-"));
   fixtures.push(root);
@@ -18,18 +31,18 @@ function makeTempFixture() {
   for (const runtime of ["node", "bun"]) {
     const runtimePath = join(runtimeBin, runtime);
     if (runtime === "node") {
+      // Shebang of bin/qmd is `#!/usr/bin/env node`, so PATH `node` must
+      // still launch the trampoline. The trampoline itself must NOT
+      // re-resolve `node` from PATH for the child (#577 leftover): that
+      // is the NODE_MODULE_VERSION bug. Exit 42 if it does.
       writeFileSync(
         runtimePath,
         `#!/bin/sh
 if [ "$(basename "$1")" = "qmd" ]; then
-  exec "${process.execPath}" "$@"
+  exec "${REAL_NODE}" "$@"
 else
-  {
-    printf '%s\\n' 'node'
-    printf '%s\\n' "$1"
-    shift
-    printf '%s\\n' "$@"
-  } > "$QMD_WRAPPER_CAPTURE"
+  echo "qmd launcher must not re-resolve node from PATH" >&2
+  exit 42
 fi
 `,
       );
@@ -53,7 +66,17 @@ function makePackage(root: string, packagePath: string, lockfiles: string[] = []
   chmodSync(join(packageRoot, "bin", "qmd"), 0o755);
   if (includeDist) {
     mkdirSync(join(packageRoot, "dist", "cli"), { recursive: true });
-    writeFileSync(join(packageRoot, "dist", "cli", "qmd.js"), "// fixture\n");
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      [
+        'const { writeFileSync } = require("node:fs");',
+        'const capture = process.env.QMD_WRAPPER_CAPTURE;',
+        'if (capture) {',
+        '  writeFileSync(capture, ["node", process.argv[1], ...process.argv.slice(2)].join("\\n") + "\\n");',
+        '}',
+        '',
+      ].join("\n"),
+    );
   }
   if (options.source) {
     mkdirSync(join(packageRoot, "src", "cli"), { recursive: true });
@@ -61,7 +84,17 @@ function makePackage(root: string, packagePath: string, lockfiles: string[] = []
   }
   if (options.tsx) {
     mkdirSync(join(packageRoot, "node_modules", "tsx", "dist"), { recursive: true });
-    writeFileSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs"), "// tsx fixture\n");
+    writeFileSync(
+      join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs"),
+      [
+        'import { writeFileSync } from "node:fs";',
+        'const capture = process.env.QMD_WRAPPER_CAPTURE;',
+        'if (capture) {',
+        '  writeFileSync(capture, ["node", process.argv[1], ...process.argv.slice(2)].join("\\n") + "\\n");',
+        '}',
+        '',
+      ].join("\n"),
+    );
   }
   if (options.git) {
     mkdirSync(join(packageRoot, ".git"), { recursive: true });
@@ -264,6 +297,17 @@ describe("bin/qmd package wrapper", () => {
     expect(result.runtime).toBe("node");
     expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs")));
     expect(result.args).toEqual([realpathSync(join(packageRoot, "src", "cli", "qmd.ts")), "--version"]);
+  });
+
+  test("node child uses process.execPath, not a different PATH node (#577 leftover)", () => {
+    const { root, runtimeBin, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+
+    const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
+
+    expect(result.runtime).toBe("node");
+    expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
+    expect(result.args).toEqual(["--version"]);
   });
 
   test("explains how to build when dist is missing and source cannot run", () => {

@@ -2971,17 +2971,23 @@ describe("mcp stdio launcher", () => {
     try {
       await mkdir(join(tempPackage, "bin"), { recursive: true });
       await mkdir(join(tempPackage, "dist", "cli"), { recursive: true });
-      await writeFile(join(tempPackage, "dist", "cli", "qmd.js"), "// fixture\n");
+      await writeFile(join(tempPackage, "dist", "cli", "qmd.js"), [
+        'if (process.env.GGML_BACKEND_SILENT !== "1") {',
+        '  process.stdout.write("llama.cpp native log on stdout\\n");',
+        '}',
+        'process.stdout.write(\'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n\');',
+        '',
+      ].join("\n"));
       await mkdir(join(tempPackage, "fake-bin"), { recursive: true });
 
       const qmdBin = join(tempPackage, "bin", "qmd");
       await copyFile(join(projectRoot, "bin", "qmd"), qmdBin);
       await chmod(qmdBin, 0o755);
 
-      // Force the wrapper down the Node branch, then put our fake `node` first
-      // in PATH. The fake node behaves like the native llama/ggml layer: it
-      // writes a non-JSON stdout line unless qmd pre-seeded the documented
-      // quiet env vars before launching JS.
+      // Force the wrapper down the Node branch. The trampoline now execs
+      // process.execPath (not PATH `node`) so the dist fixture is the child
+      // that observes the quiet env. Fake PATH `node` remains only to satisfy
+      // `#!/usr/bin/env node` and the bun-test fallback (`bun bin/qmd`).
       await writeFile(join(tempPackage, "package-lock.json"), "{}\n");
       const fakeNode = join(tempPackage, "fake-bin", "node");
       await writeFile(fakeNode, `#!/bin/sh

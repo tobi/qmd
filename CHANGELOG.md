@@ -27,6 +27,14 @@
 
 ### Fixed
 
+- The `bin/qmd` trampoline now execs `process.execPath` instead of
+  re-resolving `node` from PATH. Native addons (`better-sqlite3`) are
+  compiled for the Node that installed qmd; a version manager (nvm, fnm,
+  mise) selecting a different major in the working directory used to spawn
+  that other binary and fail with `NODE_MODULE_VERSION` / `ERR_DLOPEN_FAILED`
+  (#577 leftover; #319). `bun bin/qmd` still resolves `node` from PATH so
+  Node-ABI addons are not loaded into bun.
+
 - `qmd update` / `qmd collection add` no longer swallow unreadable files
   silently (#460). `readFileSync` failures (ETIMEDOUT on APFS compressed
   files, EAGAIN, EACCES, …) still skip the file so the rest of the collection
