@@ -1,20 +1,33 @@
 /**
  * store-cjk-fts.test.ts — Regression tests for the CJK FTS migration fix.
  *
- * Covers rebuildFTSForCjkNormalization()'s streaming, batched, shadow-table
- * rebuild (src/store.ts). The previous implementation cleared documents_fts up
- * front, loaded every document body into memory via .all() inside a single
- * giant transaction, and left FTS empty on a mid-rebuild crash. The new
- * implementation:
- *   - streams source rows via .iterate() (never materializes all bodies),
- *   - builds a separate documents_fts_rebuild shadow table in batches,
+ * Covers rebuildFTSForCjkNormalization()'s batched, shadow-table rebuild
+ * (src/store.ts). The original implementation cleared documents_fts up front,
+ * loaded every document body into memory via a single unbounded .all() inside
+ * one giant transaction, and left FTS empty on a mid-rebuild crash.
+ *
+ * The row-scan strategy has since gone through two fixes for two distinct
+ * failure modes, both still enforced here:
+ *   - OOM (the original bug): never materialize every active document's body
+ *     into one JS array at once. First fixed via a streaming .iterate()
+ *     cursor; now enforced via bounded, keyset-paginated .all() batches
+ *     (`WHERE id > ? ORDER BY id LIMIT ?`) — each call materializes at most
+ *     one bounded batch, then the batch is discarded before the next SELECT.
+ *   - "database is busy" (a later regression): a better-sqlite3 .iterate()
+ *     cursor left open while a transaction begins on the same connection
+ *     raises "database is busy". Bounded LIMIT/OFFSET-style batches instead
+ *     fully finalize each SELECT before the insert transaction starts, so the
+ *     connection is never busy with two concurrent statements.
+ * Both fixes share the same shadow-table structure:
+ *   - builds a separate documents_fts_rebuild shadow table in bounded batches,
  *   - atomically swaps it in only after a complete pass,
  *   - drops a lingering shadow table from a prior crashed run on the next run.
  *
  * These tests exercise the migration through createStore()/openDatabase() on a
  * pre-seeded DB that omits the fts_cjk_normalized_version marker (forcing a
- * rebuild on open), plus a structural assertion that .iterate() — not .all() —
- * drives the body scan. They also cover a brand-new empty store and a legacy
+ * rebuild on open), plus a structural assertion that the body scan is bounded
+ * (LIMIT + keyset pagination) rather than a single unbounded .all() over every
+ * active document. They also cover a brand-new empty store and a legacy
  * fts5(name, body, content='documents') schema, which used to throw
  * `no such column: T.name` during rebuildFTSForCjkNormalization (#792).
  *
@@ -136,11 +149,11 @@ function activeDocCount(db: Database): number {
 }
 
 // =============================================================================
-// Test 1 — structural: rebuild streams via .iterate(), never .all()
+// Test 1 — structural: rebuild scans source rows in bounded, paginated batches
 // =============================================================================
 
-describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
-  test("body scan uses .iterate(), not .all()", () => {
+describe("rebuildFTSForCjkNormalization — bounded source scan", () => {
+  test("body scan is bounded (keyset LIMIT pagination), never one unbounded .all()", () => {
     const __filename = fileURLToPath(import.meta.url);
     const storeSrc = readFileSync(
       join(dirname(__filename), "..", "src", "store.ts"),
@@ -157,18 +170,24 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     const fnBodyRaw = storeSrc.slice(startIdx, endIdx);
 
     // Strip line + block comments so the assertions match real executed code,
-    // not the narrative comment that mentions the old `.all()` behavior.
+    // not narrative comments that mention old/alternate behavior.
     const fnBody = fnBodyRaw
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .split("\n")
       .map(line => line.replace(/\/\/.*$/, ""))
       .join("\n");
 
-    // The source-row scan must stream one row at a time.
-    expect(fnBody).toMatch(/\.iterate</);
-    // It must NOT pull the whole result set (every document body) into a JS
-    // array — that is the OOM regression this fix removes.
-    expect(fnBody).not.toMatch(/\.all\(/);
+    // The guarded invariant is "bounded memory", not a specific better-sqlite3
+    // API. Any .all() used for the source-body scan must be paired with a
+    // LIMIT and a keyset cursor (id > ?), so each call only ever materializes
+    // one bounded batch — never every active document's body at once (the
+    // original OOM bug) — and each SELECT fully finalizes before the insert
+    // transaction begins (the "database is busy" regression this replaced a
+    // streaming .iterate() cursor to fix, since holding a cursor open on the
+    // same connection while starting a transaction raises "busy").
+    expect(fnBody).toMatch(/LIMIT\s*\?/);
+    expect(fnBody).toMatch(/d\.id\s*>\s*\?/);
+    expect(fnBody).toMatch(/ORDER BY d\.id/);
     // Sanity: it builds into a shadow table and atomically swaps it in via
     // INSERT INTO … SELECT (not ALTER TABLE … RENAME, which triggers SQLite
     // 3.25+ re-validation of dependent trigger bodies).

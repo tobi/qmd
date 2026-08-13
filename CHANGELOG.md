@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- CJK FTS rebuild no longer raises "database is busy" when flushing insert
+  batches. The streaming `.iterate()` cursor stayed open across
+  `BEGIN` on the same connection; the scan now uses keyset-paginated
+  `LIMIT` batches so each SELECT finalizes before the insert transaction
+  starts (#797).
+
 - Quoted FTS phrases containing dotted tokens (e.g. `"1.0.21"`) now match the
   indexed document. The porter unicode61 tokenizer stores dotted strings as
   adjacent parts, but phrase sanitization stripped the dots into a single

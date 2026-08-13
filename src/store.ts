@@ -1001,24 +1001,25 @@ function rebuildFTSForCjkNormalization(db: Database): void {
       }
     });
 
-    // .iterate() pulls rows one at a time from SQLite rather than materializing
-    // the entire result set (every document body) into a JS array up front.
-    const iterator = db.prepare(`
+    // Pull bounded batches and finalize each SELECT before starting the insert
+    // transaction. Holding a better-sqlite3 iterator open while beginning a
+    // transaction on the same connection raises "database is busy".
+    const selectBatch = db.prepare(`
       SELECT d.id, d.collection, d.path, d.title, content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
       WHERE d.active = 1
-    `).iterate<FtsRow>();
+        AND d.id > ?
+      ORDER BY d.id
+      LIMIT ?
+    `);
 
-    for (const row of iterator) {
-      batch.push(row);
-      if (batch.length >= BATCH_SIZE) {
-        flushBatch();
-        batch = [];
-      }
-    }
-    if (batch.length > 0) {
+    let lastId = 0;
+    for (;;) {
+      batch = selectBatch.all(lastId, BATCH_SIZE) as FtsRow[];
+      if (batch.length === 0) break;
       flushBatch();
+      lastId = batch[batch.length - 1]!.id;
     }
 
     // Atomic publish: copy the completed shadow index into the live table and
