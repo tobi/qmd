@@ -17,7 +17,9 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  countOrphanedVectors,
   sanitizeFTS5Term,
+  splitGlobMask,
 } from "../src/store";
 
 // =============================================================================
@@ -90,6 +92,26 @@ describe("Path Utilities", () => {
 // =============================================================================
 // Handelize Tests
 // =============================================================================
+
+describe("countOrphanedVectors", () => {
+  test("returns 0 when content_vectors is missing", () => {
+    const db = {
+      prepare: () => { throw new Error("no such table: content_vectors"); },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(0);
+  });
+
+  test("returns the COUNT of hashes not referenced by an active document (#768)", () => {
+    const db = {
+      prepare: (sql: string) => {
+        expect(sql).toContain("content_vectors");
+        expect(sql).toContain("d.active = 1");
+        return { get: () => ({ c: 42 }) };
+      },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(42);
+  });
+});
 
 describe("cleanupOrphanedVectors", () => {
   test("returns 0 when vec table exists in schema but sqlite-vec is unavailable", () => {
@@ -285,5 +307,43 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
+  });
+});
+
+// =============================================================================
+// splitGlobMask (#557)
+// =============================================================================
+
+describe("splitGlobMask", () => {
+  test("splits comma-separated patterns into a union", () => {
+    expect(splitGlobMask("a.md,X - *.md")).toEqual(["a.md", "X - *.md"]);
+    expect(splitGlobMask("sources/**/*.md,CO - *.md")).toEqual([
+      "sources/**/*.md",
+      "CO - *.md",
+    ]);
+  });
+
+  test("leaves brace expansion intact", () => {
+    expect(splitGlobMask("{a.md,X - *.md}")).toEqual(["{a.md,X - *.md}"]);
+    expect(splitGlobMask("**/*.{md,txt}")).toEqual(["**/*.{md,txt}"]);
+  });
+
+  test("splits only top-level commas", () => {
+    expect(splitGlobMask("a.md,{b,c}.md")).toEqual(["a.md", "{b,c}.md"]);
+  });
+
+  test("does not split commas inside character classes", () => {
+    expect(splitGlobMask("file[a,b].md")).toEqual(["file[a,b].md"]);
+  });
+
+  test("trims whitespace and drops empty segments", () => {
+    expect(splitGlobMask(" a.md , *.txt ")).toEqual(["a.md", "*.txt"]);
+    expect(splitGlobMask("a.md,")).toEqual(["a.md"]);
+    expect(splitGlobMask("a.md,,b.md")).toEqual(["a.md", "b.md"]);
+  });
+
+  test("returns a single pattern unchanged", () => {
+    expect(splitGlobMask("**/*.md")).toEqual(["**/*.md"]);
+    expect(splitGlobMask("notes/*.md")).toEqual(["notes/*.md"]);
   });
 });

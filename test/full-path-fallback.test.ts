@@ -176,7 +176,7 @@ describe("--full-path fallback for unresolvable results", () => {
       { cwd: collectionDir, dbPath, configDir }
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toMatch(/#[a-f0-9]{6} qmd:\/\/stale\/beta\.md/);
+    expect(stdout).toMatch(/#[a-f0-9]{6},qmd:\/\/stale\/beta\.md/);
     expect(hasFullPathWarning(stderr)).toBe(true);
   });
 

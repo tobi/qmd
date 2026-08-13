@@ -56,7 +56,7 @@
     "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",
     "node-llama-cpp": "3.18.1",
@@ -88,7 +88,6 @@
       "esbuild",
       "node-llama-cpp",
       "tree-sitter-go",
-      "tree-sitter-javascript",
       "tree-sitter-python",
       "tree-sitter-rust",
       "tree-sitter-typescript"

@@ -9,6 +9,19 @@
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
+/**
+ * Pid/log filenames for the MCP HTTP daemon.
+ * The default index keeps `mcp.pid` / `mcp.log` for compatibility; named
+ * indexes are scoped so a named daemon can run alongside the default (#772).
+ */
+export function mcpDaemonStateFiles(indexName: string = "index"): { pidFile: string; logFile: string } {
+  const suffix = !indexName || indexName === "index" ? "" : `-${indexName}`;
+  return {
+    pidFile: `mcp${suffix}.pid`,
+    logFile: `mcp${suffix}.log`,
+  };
+}
+
 /** True if a process command line looks like a qmd CLI invocation. */
 export function looksLikeQmdMcpCommand(cmdline: string): boolean {
   const s = cmdline.trim();

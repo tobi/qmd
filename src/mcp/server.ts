@@ -4,19 +4,16 @@
  * Exposes QMD search and document retrieval as MCP tools and resources.
  * Documents are accessible via qmd:// URIs.
  *
- * Follows MCP spec 2025-06-18 for proper response types.
+ * Speaks MCP spec 2026-07-28 (stateless, no initialize handshake) and dual-speaks
+ * 2025-era clients via the official SDK entries (`serveStdio` / `createMcpHandler`).
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { WebStandardStreamableHTTPServerTransport }
-  from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { existsSync } from "fs";
 import {
@@ -102,8 +99,9 @@ function getPackageVersion(): string {
 
 /**
  * Build dynamic server instructions from actual index state.
- * Injected into the LLM's system prompt via MCP initialize response —
- * gives the LLM immediate context about what's searchable without a tool call.
+ * Injected into the LLM's system prompt via MCP initialize (2025-era) and
+ * server/discover (2026-07-28) — gives the LLM immediate context about what's
+ * searchable without a tool call.
  */
 async function buildInstructions(store: QMDStore): Promise<string> {
   const status = await store.getStatus();
@@ -174,7 +172,16 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
   const track = inflight?.track ?? (<T,>(fn: T): T => fn);
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
-    { instructions: await buildInstructions(store) },
+    {
+      instructions: await buildInstructions(store),
+      // tools/list is static for the process lifetime; resources/read stays
+      // uncacheable because the index can change under us.
+      cacheHints: {
+        "tools/list": { ttlMs: 60_000, cacheScope: "private" },
+        "server/discover": { ttlMs: 60_000, cacheScope: "private" },
+        "resources/read": { ttlMs: 0, cacheScope: "private" },
+      },
+    },
   );
 
   // Pre-fetch default collection names for search tools
@@ -305,7 +312,7 @@ Intent-aware lex (C++ performance, not sports):
 ]
 \`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
           "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
@@ -326,7 +333,7 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
-      },
+      }),
     },
     track(async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
@@ -399,12 +406,12 @@ Intent-aware lex (C++ performance, not sports):
       title: "Get Document",
       description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         file: z.string().describe("File path or docid from search results. Supports a line-range suffix: 'pages/meeting.md:100' starts at line 100; 'pages/meeting.md:100:40' (or '#abc123:100:40') reads 40 lines from line 100."),
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
         maxLines: z.number().optional().describe("Maximum number of lines to return"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
-      },
+      }),
     },
     track(async ({ file, fromLine, maxLines, lineNumbers }) => {
       // Support :line and :from:count suffixes in `file` (e.g. "foo.md:120" or
@@ -476,12 +483,12 @@ Intent-aware lex (C++ performance, not sports):
       title: "Multi-Get Documents",
       description: "Retrieve multiple documents by glob pattern (e.g., 'journals/2025-05*.md'), comma-separated list, or docids. Skips files larger than maxBytes.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         pattern: z.string().describe("Glob pattern, docid, or comma-separated list of file paths/docids"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
         maxBytes: z.number().optional().default(DEFAULT_MULTI_GET_MAX_BYTES).describe("Skip files larger than this (default: 65536 = 64KB)"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
-      },
+      }),
     },
     track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
       const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
@@ -549,7 +556,7 @@ Intent-aware lex (C++ performance, not sports):
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
     track(async () => {
       const status: StatusResult = await store.getStatus();
@@ -802,9 +809,10 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     ...(existsSync(configPath) ? { configPath } : {}),
   });
   const inflight = createInflightGate();
-  const server = await createMcpServer(store, inflight);
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
+  // (opening exchange pins the era). A hand-wired StdioServerTransport would
+  // stay 2025-only even on SDK 2.x.
+  const handle = serveStdio(() => createMcpServer(store, inflight));
 
   // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
   // and the server must exit instead of orphaning to PID 1 (#751). No
@@ -812,7 +820,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // instance, so passing the global disposeDefaultLlamaCpp would only risk
   // tearing down an unrelated instance in an embedded process.
   registerStdioEofShutdown({
-    closeServer: () => server.close(),
+    closeServer: () => handle.close(),
     waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
     closeStore: () => store.close(),
   });
@@ -829,10 +837,17 @@ export type HttpServerHandle = {
 };
 
 /**
- * Start MCP server over Streamable HTTP (JSON responses, no SSE).
+ * Start MCP server over Streamable HTTP (JSON responses by default).
  * Binds to `options.host` (default "localhost", overridable via the QMD_HOST
  * env var) — set "0.0.0.0" to accept connections from other hosts, e.g. a
  * container liveness probe. Returns a handle for shutdown and port discovery.
+ *
+ * HTTP is sessionless (MCP 2026-07-28): there is no `Mcp-Session-Id`, no
+ * initialize handshake, and no idle-session TTL. 2025-era clients are still
+ * served per-request via the SDK's stateless legacy fallback (initialize
+ * works as a standalone call; subsequent 2025 methods need a modern envelope
+ * or a stdio connection). The previous session reaper (#816) is gone because
+ * there are no sessions to reap.
  */
 export async function startMcpHttpServer(
   port: number,
@@ -851,30 +866,13 @@ export async function startMcpHttpServer(
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
 
-  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
-  // The store is shared — it's stateless SQLite, safe for concurrent access.
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
-
-  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
-      onsessioninitialized: (sessionId: string) => {
-        sessions.set(sessionId, transport);
-        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
-      },
-    });
-    const server = await createMcpServer(store);
-    await server.connect(transport);
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
-
-    return transport;
-  }
+  // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
+  // responses (matches the previous enableJsonResponse: true). Dual-speaks
+  // 2025-era traffic statelessly by default (`legacy: "stateless"`).
+  const mcpHandler = createMcpHandler(
+    () => createMcpServer(store),
+    { responseMode: "json" },
+  );
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -907,6 +905,7 @@ export async function startMcpHttpServer(
         const q = String(args.query).slice(0, 80);
         return `tools/call ${tool} "${q}"`;
       }
+      if (args?.file) return `tools/call ${tool} ${args.file}`;
       if (args?.path) return `tools/call ${tool} ${args.path}`;
       if (args?.pattern) return `tools/call ${tool} ${args.pattern}`;
       return `tools/call ${tool}`;
@@ -916,6 +915,17 @@ export async function startMcpHttpServer(
 
   function log(msg: string): void {
     if (!quiet) console.error(msg);
+  }
+
+  function nodeHeadersToWeb(nodeReq: IncomingMessage): Headers {
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(nodeReq.headers)) {
+      if (typeof v === "string") headers.set(k, v);
+      else if (Array.isArray(v)) {
+        for (const item of v) headers.append(k, item);
+      }
+    }
+    return headers;
   }
 
   // Helper to collect request body
@@ -995,87 +1005,36 @@ export async function startMcpHttpServer(
         return;
       }
 
-      if (pathname === "/mcp" && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
-        const body = JSON.parse(rawBody);
-        const label = describeRequest(body);
-        const url = `http://localhost:${port}${pathname}`;
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(nodeReq.headers)) {
-          if (typeof v === "string") headers[k] = v;
-        }
-
-        // Route to existing session or create new one on initialize
-        const sessionId = headers["mcp-session-id"];
-        let transport: WebStandardStreamableHTTPServerTransport;
-
-        if (sessionId) {
-          const existing = sessions.get(sessionId);
-          if (!existing) {
-            nodeRes.writeHead(404, { "Content-Type": "application/json" });
-            nodeRes.end(JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32001, message: "Session not found" },
-              id: body?.id ?? null,
-            }));
-            return;
-          }
-          transport = existing;
-        } else if (isInitializeRequest(body)) {
-          transport = await createSession();
-        } else {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: body?.id ?? null,
-          }));
-          return;
-        }
-
-        const request = new Request(url, { method: "POST", headers, body: rawBody });
-        const response = await transport.handleRequest(request, { parsedBody: body });
-
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
-        log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
-        return;
-      }
-
       if (pathname === "/mcp") {
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(nodeReq.headers)) {
-          if (typeof v === "string") headers[k] = v;
+        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD"
+          ? await collectBody(nodeReq)
+          : undefined;
+        let parsedBody: unknown;
+        if (rawBody) {
+          try {
+            parsedBody = JSON.parse(rawBody);
+          } catch {
+            parsedBody = undefined;
+          }
         }
+        const label = parsedBody && typeof parsedBody === "object" && parsedBody !== null
+          ? describeRequest(parsedBody as JsonRpcLikeBody)
+          : (nodeReq.method || "GET");
+        const hostHeader = typeof nodeReq.headers.host === "string" ? nodeReq.headers.host : `localhost:${port}`;
+        const url = `http://${hostHeader}${pathname}`;
+        const request = new Request(url, {
+          method: nodeReq.method || "GET",
+          headers: nodeHeadersToWeb(nodeReq),
+          ...(rawBody !== undefined ? { body: rawBody } : {}),
+        });
+        const response = await mcpHandler.fetch(
+          request,
+          parsedBody !== undefined ? { parsedBody } : undefined,
+        );
 
-        // GET/DELETE must have a valid session
-        const sessionId = headers["mcp-session-id"];
-        if (!sessionId) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: null,
-          }));
-          return;
-        }
-        const transport = sessions.get(sessionId);
-        if (!transport) {
-          nodeRes.writeHead(404, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32001, message: "Session not found" },
-            id: null,
-          }));
-          return;
-        }
-
-        const url = `http://localhost:${port}${pathname}`;
-        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
-        const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
-        const response = await transport.handleRequest(request);
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        log(`${ts()} ${nodeReq.method} /mcp ${label} (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -1100,10 +1059,7 @@ export async function startMcpHttpServer(
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    for (const transport of sessions.values()) {
-      await transport.close();
-    }
-    sessions.clear();
+    await mcpHandler.close();
     httpServer.close();
     await store.close();
   };

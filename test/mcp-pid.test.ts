@@ -3,7 +3,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { looksLikeQmdMcpCommand, isQmdMcpPid } from "../src/cli/mcp-pid.ts";
+import { looksLikeQmdMcpCommand, isQmdMcpPid, mcpDaemonStateFiles } from "../src/cli/mcp-pid.ts";
 
 describe("looksLikeQmdMcpCommand", () => {
   test("matches bare qmd and common CLI script paths", () => {
@@ -27,6 +27,21 @@ describe("looksLikeQmdMcpCommand", () => {
   test("does not match qmd as a substring of another token", () => {
     expect(looksLikeQmdMcpCommand("myqmdtool serve")).toBe(false);
     expect(looksLikeQmdMcpCommand("qmdfoo")).toBe(false);
+  });
+});
+
+describe("mcpDaemonStateFiles", () => {
+  test("default index keeps mcp.pid / mcp.log", () => {
+    expect(mcpDaemonStateFiles("index")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
+    expect(mcpDaemonStateFiles("")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
+    expect(mcpDaemonStateFiles()).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
+  });
+
+  test("named indexes get scoped pid/log files (#772)", () => {
+    expect(mcpDaemonStateFiles("hsm-public-repro")).toEqual({
+      pidFile: "mcp-hsm-public-repro.pid",
+      logFile: "mcp-hsm-public-repro.log",
+    });
   });
 });
 

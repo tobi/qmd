@@ -1,20 +1,35 @@
 /**
  * store-cjk-fts.test.ts — Regression tests for the CJK FTS migration fix.
  *
- * Covers rebuildFTSForCjkNormalization()'s streaming, batched, shadow-table
- * rebuild (src/store.ts). The previous implementation cleared documents_fts up
- * front, loaded every document body into memory via .all() inside a single
- * giant transaction, and left FTS empty on a mid-rebuild crash. The new
- * implementation:
- *   - streams source rows via .iterate() (never materializes all bodies),
- *   - builds a separate documents_fts_rebuild shadow table in batches,
+ * Covers rebuildFTSForCjkNormalization()'s batched, shadow-table rebuild
+ * (src/store.ts). The original implementation cleared documents_fts up front,
+ * loaded every document body into memory via a single unbounded .all() inside
+ * one giant transaction, and left FTS empty on a mid-rebuild crash.
+ *
+ * The row-scan strategy has since gone through two fixes for two distinct
+ * failure modes, both still enforced here:
+ *   - OOM (the original bug): never materialize every active document's body
+ *     into one JS array at once. First fixed via a streaming .iterate()
+ *     cursor; now enforced via bounded, keyset-paginated .all() batches
+ *     (`WHERE id > ? ORDER BY id LIMIT ?`) — each call materializes at most
+ *     one bounded batch, then the batch is discarded before the next SELECT.
+ *   - "database is busy" (a later regression): a better-sqlite3 .iterate()
+ *     cursor left open while a transaction begins on the same connection
+ *     raises "database is busy". Bounded LIMIT/OFFSET-style batches instead
+ *     fully finalize each SELECT before the insert transaction starts, so the
+ *     connection is never busy with two concurrent statements.
+ * Both fixes share the same shadow-table structure:
+ *   - builds a separate documents_fts_rebuild shadow table in bounded batches,
  *   - atomically swaps it in only after a complete pass,
  *   - drops a lingering shadow table from a prior crashed run on the next run.
  *
  * These tests exercise the migration through createStore()/openDatabase() on a
  * pre-seeded DB that omits the fts_cjk_normalized_version marker (forcing a
- * rebuild on open), plus a structural assertion that .iterate() — not .all() —
- * drives the body scan.
+ * rebuild on open), plus a structural assertion that the body scan is bounded
+ * (LIMIT + keyset pagination) rather than a single unbounded .all() over every
+ * active document. They also cover a brand-new empty store and a legacy
+ * fts5(name, body, content='documents') schema, which used to throw
+ * `no such column: T.name` during rebuildFTSForCjkNormalization (#792).
  *
  * Run with: bun test test/store-cjk-fts.test.ts
  *        or: pnpm test:node test/store-cjk-fts.test.ts
@@ -134,11 +149,11 @@ function activeDocCount(db: Database): number {
 }
 
 // =============================================================================
-// Test 1 — structural: rebuild streams via .iterate(), never .all()
+// Test 1 — structural: rebuild scans source rows in bounded, paginated batches
 // =============================================================================
 
-describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
-  test("body scan uses .iterate(), not .all()", () => {
+describe("rebuildFTSForCjkNormalization — bounded source scan", () => {
+  test("body scan is bounded (keyset LIMIT pagination), never one unbounded .all()", () => {
     const __filename = fileURLToPath(import.meta.url);
     const storeSrc = readFileSync(
       join(dirname(__filename), "..", "src", "store.ts"),
@@ -155,23 +170,37 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     const fnBodyRaw = storeSrc.slice(startIdx, endIdx);
 
     // Strip line + block comments so the assertions match real executed code,
-    // not the narrative comment that mentions the old `.all()` behavior.
+    // not narrative comments that mention old/alternate behavior.
     const fnBody = fnBodyRaw
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .split("\n")
       .map(line => line.replace(/\/\/.*$/, ""))
       .join("\n");
 
-    // The source-row scan must stream one row at a time.
-    expect(fnBody).toMatch(/\.iterate</);
-    // It must NOT pull the whole result set (every document body) into a JS
-    // array — that is the OOM regression this fix removes.
-    expect(fnBody).not.toMatch(/\.all\(/);
+    // The guarded invariant is "bounded memory", not a specific better-sqlite3
+    // API. Any .all() used for the source-body scan must be paired with a
+    // LIMIT and a keyset cursor (id > ?), so each call only ever materializes
+    // one bounded batch — never every active document's body at once (the
+    // original OOM bug) — and each SELECT fully finalizes before the insert
+    // transaction begins (the "database is busy" regression this replaced a
+    // streaming .iterate() cursor to fix, since holding a cursor open on the
+    // same connection while starting a transaction raises "busy").
+    expect(fnBody).toMatch(/LIMIT\s*\?/);
+    expect(fnBody).toMatch(/d\.id\s*>\s*\?/);
+    expect(fnBody).toMatch(/ORDER BY d\.id/);
     // Sanity: it builds into a shadow table and atomically swaps it in via
     // INSERT INTO … SELECT (not ALTER TABLE … RENAME, which triggers SQLite
     // 3.25+ re-validation of dependent trigger bodies).
     expect(fnBody).toContain("documents_fts_rebuild");
     expect(fnBody).toContain("INSERT INTO documents_fts");
+    // DELETE FROM documents_fts on leftover content-external FTS compiles as
+    // SELECT T.name FROM documents (#792). Repair must run inside this
+    // function *before* that DELETE (and before the version-stamp early
+    // return), not only in initializeDatabase.
+    const ensureIdx = fnBody.indexOf("ensureDocumentsFtsSchema");
+    const deleteIdx = fnBody.indexOf("DELETE FROM documents_fts");
+    expect(ensureIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(ensureIdx);
   });
 });
 
@@ -501,6 +530,203 @@ describe("rebuildFTSForCjkNormalization — Latin search regression guard", () =
       const both = store.searchFTS("keyword inverted", 10, "en");
       expect(both.length).toBe(1);
       expect(both[0]!.displayPath).toBe("en/keyword.md");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+
+// =============================================================================
+// Test 6 — legacy fts5(name, body, content='documents') must not crash open (#792)
+// =============================================================================
+
+describe("rebuildFTSForCjkNormalization — legacy external-content FTS schema (#792)", () => {
+  let dbPath: string;
+
+  beforeEach(async () => {
+    await setEmptyConfig();
+    dbPath = freshDbPath();
+  });
+
+  afterEach(async () => {
+    try {
+      await unlink(dbPath);
+    } catch {
+      // ignore
+    }
+  });
+
+  test("createStore on a brand-new empty file stamps the CJK version", async () => {
+    const store = createStore(dbPath);
+    try {
+      const ver = store.db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+      expect(ftsRowCount(store.db)).toBe(0);
+
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).toContain("title");
+      expect(sql).not.toMatch(/content\s*=/);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("opens a DB whose documents_fts still uses name/body + content='documents'", async () => {
+    {
+      const seed = openDatabase(dbPath);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS content (
+          hash TEXT PRIMARY KEY,
+          doc TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          collection TEXT NOT NULL,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          modified_at TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+          UNIQUE(collection, path)
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS store_config (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      `);
+      // The schema that produced `no such column: T.name` on CJK rebuild:
+      // FTS5 external-content maps column `name` onto documents.name.
+      seed.exec(`
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          name, body,
+          content='documents',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        )
+      `);
+      seed.exec(`
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+          INSERT INTO documents_fts(rowid, name, body)
+          SELECT new.id, new.path, content.doc
+          FROM content
+          WHERE content.hash = new.hash;
+        END
+      `);
+      seedDocument(seed, {
+        id: 1,
+        collection: "docs",
+        path: "readme.md",
+        title: "Project README",
+        body: "legacy fts canary token UNIQUE_KEYWORD_XYZ",
+      });
+      seed.close();
+    }
+
+    const store = createStore(dbPath);
+    try {
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).toContain("title");
+      expect(sql).not.toMatch(/content\s*=/);
+
+      const ver = store.db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+
+      const hits = store.searchFTS("UNIQUE_KEYWORD_XYZ", 10, "docs");
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.displayPath).toBe("docs/readme.md");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("repairs leftover name/body FTS even when the CJK version is already stamped", async () => {
+    {
+      const seed = openDatabase(dbPath);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS content (
+          hash TEXT PRIMARY KEY,
+          doc TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          collection TEXT NOT NULL,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          modified_at TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+          UNIQUE(collection, path)
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS store_config (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      `);
+      seed.exec(`
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          name, body,
+          content='documents',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        )
+      `);
+      seed.prepare(`
+        INSERT INTO store_config(key, value) VALUES ('fts_cjk_normalized_version', ?)
+      `).run(FTS_CJK_NORMALIZED_VERSION);
+      seedDocument(seed, {
+        id: 1,
+        collection: "docs",
+        path: "readme.md",
+        title: "Project README",
+        body: "stamped-legacy canary STAMPED_LEGACY_XYZ",
+      });
+      seed.close();
+    }
+
+    const store = createStore(dbPath);
+    try {
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).not.toMatch(/content\s*=/);
+
+      const cols = store.db.prepare(`PRAGMA table_info(documents_fts)`).all() as { name: string }[];
+      const names = cols.map(c => c.name);
+      expect(names).toContain("filepath");
+      expect(names).not.toContain("name");
+
+      const hits = store.searchFTS("STAMPED_LEGACY_XYZ", 10, "docs");
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.displayPath).toBe("docs/readme.md");
     } finally {
       store.close();
     }

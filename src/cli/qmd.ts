@@ -2,7 +2,8 @@ import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid } from "./mcp-pid.js";
+import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
@@ -23,7 +24,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocument,
-  findDocumentByDocid,
+  resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -54,13 +55,13 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
-  deleteLLMCache,
-  deleteInactiveDocuments,
-  cleanupOrphanedVectors,
-  vacuumDatabase,
+  countOrphanedVectors,
+  previewCleanup,
+  runCleanup,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
+  escapeLikePattern,
   hybridQuery,
   vectorSearchQuery,
   structuredSearch,
@@ -73,6 +74,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
+  splitGlobMask,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
@@ -137,11 +139,13 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      const llm = new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
-      }));
+      });
+      setDefaultLlamaCpp(llm);
+      store.llm = llm;
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -179,6 +183,18 @@ function getDbPath(): string {
 
 function getActiveIndexName(): string {
   return currentIndexName;
+}
+
+function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string } {
+  const cacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const { pidFile, logFile } = mcpDaemonStateFiles(getActiveIndexName());
+  return {
+    cacheDir,
+    pidPath: resolve(cacheDir, pidFile),
+    logPath: resolve(cacheDir, logFile),
+  };
 }
 
 function setIndexName(name: string | null): void {
@@ -467,6 +483,14 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
+/** Hint after `qmd update` when orphaned embedding chunks exceed this share of vectors (#768). */
+const ORPHAN_VECTOR_HINT_RATIO = 0.1;
+
+function formatOrphanedVectorHint(orphaned: number, total: number): string {
+  const pct = total > 0 ? Math.round((orphaned / total) * 100) : 0;
+  return `${orphaned} orphaned embedding chunks (${pct}% of vectors) — run 'qmd cleanup' to reclaim space`;
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -497,11 +521,8 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = process.env.XDG_CACHE_HOME
-    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-    : resolve(homedir(), ".cache", "qmd");
-  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
+  // MCP daemon status (check PID file liveness; scoped per --index)
+  const { pidPath: mcpPidPath } = mcpDaemonPaths();
   if (existsSync(mcpPidPath)) {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
     if (isQmdMcpPid(mcpPid)) {
@@ -513,9 +534,15 @@ async function showStatus(): Promise<void> {
   }
   console.log("");
 
+  const orphanedVectors = countOrphanedVectors(db);
+
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
   console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  if (orphanedVectors > 0) {
+    const pct = vectorCount.count > 0 ? Math.round((orphanedVectors / vectorCount.count) * 100) : 0;
+    console.log(`  ${c.yellow}Orphaned: ${orphanedVectors} embedding chunks (${pct}%)${c.reset} — run 'qmd cleanup'`);
+  }
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
@@ -736,6 +763,7 @@ async function updateCollections(): Promise<void> {
 
     progress.clear();
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
     }
@@ -744,11 +772,16 @@ async function updateCollections(): Promise<void> {
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
+  const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
+  const orphanedVectors = countOrphanedVectors(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+  if (vectorTotal > 0 && orphanedVectors / vectorTotal >= ORPHAN_VECTOR_HINT_RATIO) {
+    console.log(`\n${formatOrphanedVectorHint(orphanedVectors, vectorTotal)}`);
   }
 }
 
@@ -1108,66 +1141,17 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       : [pattern.trim()].filter(Boolean);
     files = [];
     for (const name of names) {
-      let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
-      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
-      const lookupName = docidMatch?.filepath ?? name;
-
-      // Handle virtual paths
-      if (isVirtualPath(lookupName)) {
-        const parsed = parseVirtualPath(lookupName);
-        if (parsed) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(parsed.collectionName, parsed.path) as typeof doc;
-        }
-      } else if (!docidMatch) {
-        // Try exact match on path
-        doc = db.prepare(`
-          SELECT
-            'qmd://' || d.collection || '/' || d.path as virtual_path,
-            LENGTH(content.doc) as body_length,
-            d.collection,
-            d.path
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path = ? AND d.active = 1
-          LIMIT 1
-        `).get(lookupName) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-
-        // Try suffix match
-        if (!doc) {
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.path LIKE ? AND d.active = 1
-            LIMIT 1
-          `).get(`%${lookupName}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-        }
-      }
-
-      if (doc) {
+      const resolved = resolveCommaListName(db, name);
+      if (resolved.ok) {
         files.push({
-          filepath: doc.virtual_path,
-          displayPath: doc.virtual_path,
-          bodyLength: doc.body_length,
-          collection: doc.collection,
-          path: doc.path
+          filepath: resolved.match.virtualPath,
+          displayPath: resolved.match.virtualPath,
+          bodyLength: resolved.match.bodyLength,
+          collection: resolved.match.collection,
+          path: resolved.match.path
         });
       } else {
-        console.error(`File not found: ${name}`);
+        console.error(resolved.error);
       }
     }
     if (isSingleDocid && files.length === 0) {
@@ -1316,9 +1300,12 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       console.log([docidVal ? `#${docidVal}` : "", identOf(r), r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
+    // Headerless CSV: docid,filepath[,context][,status] — docid is its own
+    // field (comma-separated), matching search --format files shape so naive
+    // comma-splitting stays usable (#760).
     for (const r of results) {
       const docidVal = docidOf(r);
-      const id = docidVal ? `#${docidVal} ` : "";
+      const id = docidVal ? `#${docidVal},` : "";
       const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
       const status = r.skipped ? "[SKIPPED]" : "";
       console.log(`${id}${identOf(r)}${ctx}${status ? `,${status}` : ""}`);
@@ -1498,10 +1485,10 @@ function listFiles(pathArg?: string): void {
       SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+      WHERE d.collection = ? AND d.path LIKE ? ESCAPE '#' AND d.active = 1
       ORDER BY d.path
     `;
-    params = [coll.name, `${pathPrefix}%`];
+    params = [coll.name, `${escapeLikePattern(pathPrefix)}%`];
   } else {
     // List all files in the collection
     query = `
@@ -1595,6 +1582,13 @@ function collectionList(): void {
   }
 
   closeDb();
+}
+
+/** Canonical --mask, with --glob as the alias OpenClaw and others already pass (#536). */
+function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): string {
+  const mask = typeof values.mask === "string" && values.mask.length > 0 ? values.mask : undefined;
+  const glob = typeof values.glob === "string" && values.glob.length > 0 ? values.glob : undefined;
+  return mask ?? glob ?? DEFAULT_GLOB;
 }
 
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
@@ -1707,7 +1701,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(globPattern, {
+  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
@@ -1729,7 +1723,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const skippedFiles: { file: string; code: string }[] = [];
   const seenPaths = new Set<string>();
+  // Literal paths of every file in this scan. Passed to the legacy-path
+  // migration so it never adopts a row that still belongs to a live file.
+  const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
 
   for (const relativeFile of files) {
@@ -1741,9 +1739,10 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+    } catch (err) {
+      // Skip files that can't be read (ETIMEDOUT, EAGAIN, EACCES, …) (#460)
       processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       progress.set((processed / total) * 100);
       continue;
     }
@@ -1758,7 +1757,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1814,6 +1813,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  reportSkippedReads(skippedFiles);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
@@ -1823,6 +1823,22 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   closeDb();
+}
+
+function fsErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+  }
+  return "ERROR";
+}
+
+function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
+  if (skippedFiles.length === 0) return;
+  for (const skipped of skippedFiles) {
+    console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
+  }
+  console.warn(`Skipped ${skippedFiles.length} unreadable file(s)`);
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
@@ -1905,86 +1921,98 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
-  if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-  }
-
-  // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-  if (hashesToEmbed === 0 && !force) {
-    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+  // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
+  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
+  if (!embedLock) {
+    console.log(EMBED_LOCK_BUSY_MESSAGE);
     closeDb();
     return;
   }
 
-  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
-  if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
-    const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
-    const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
-    console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
-  }
-  cursor.hide();
-  progress.indeterminate();
+  try {
+    if (force) {
+      console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    }
 
-  const startTime = Date.now();
+    // Check if there's work to do before starting
+    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
+    if (hashesToEmbed === 0 && !force) {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+      closeDb();
+      return;
+    }
 
-  const result = await generateEmbeddings(storeInstance, {
-    force,
-    model,
-    collection: batchOptions?.collection,
-    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
-    maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
-    maxDurationMs: batchOptions?.maxDurationMs,
-    onProgress: (info) => {
-      if (info.totalBytes === 0) return;
-      // Progress is measured by input bytes, not by chunks. The final chunk
-      // count is discovered lazily batch-by-batch, so displaying
-      // chunksEmbedded/totalChunks makes the percent look wrong when a few
-      // large documents remain. Show chunks as a count and label the byte
-      // percentage explicitly as input progress.
-      const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
-      progress.set(percent);
+    console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+    if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
+      const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
+      const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
+      console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+    }
+    cursor.hide();
+    progress.indeterminate();
 
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
-      const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
-      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
+    const startTime = Date.now();
 
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
-      const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
-      const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
-      const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
-      const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
+    const result = await generateEmbeddings(storeInstance, {
+      force,
+      model,
+      collection: batchOptions?.collection,
+      maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+      maxBatchBytes: batchOptions?.maxBatchBytes,
+      chunkStrategy: batchOptions?.chunkStrategy,
+      maxDurationMs: batchOptions?.maxDurationMs,
+      onProgress: (info) => {
+        if (info.totalBytes === 0) return;
+        // Progress is measured by input bytes, not by chunks. The final chunk
+        // count is discovered lazily batch-by-batch, so displaying
+        // chunksEmbedded/totalChunks makes the percent look wrong when a few
+        // large documents remain. Show chunks as a count and label the byte
+        // percentage explicitly as input progress.
+        const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
+        progress.set(percent);
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
-    },
-  });
+        const elapsed = (Date.now() - startTime) / 1000;
+        const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
+        const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
+        const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
 
-  progress.clear();
-  cursor.show();
+        const bar = renderProgressBar(percent);
+        const percentStr = percent.toFixed(0).padStart(3);
+        const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
+        const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
+        const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
+        const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
+        const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
-  const totalTimeSec = result.durationMs / 1000;
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
+      },
+    });
 
-  if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
-    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-  } else {
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
-    if (result.errors > 0) {
-      console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
-      for (const failure of (result.failures ?? []).slice(0, 8)) {
-        console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
-      }
-      if ((result.failures?.length ?? 0) > 8) {
-        console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+    progress.clear();
+    cursor.show();
+
+    const totalTimeSec = result.durationMs / 1000;
+
+    if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
+      console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+    } else {
+      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      if (result.errors > 0) {
+        console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+        for (const failure of (result.failures ?? []).slice(0, 8)) {
+          console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
+        }
+        if ((result.failures?.length ?? 0) > 8) {
+          console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+        }
       }
     }
-  }
 
-  closeDb();
+    closeDb();
+  } finally {
+    embedLock.release();
+  }
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -2426,14 +2454,11 @@ function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults
   return validated;
 }
 
-// Post-filter results to only include files from specified collections.
-function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
-  if (collectionNames.length <= 1) return results;
-  const prefixes = collectionNames.map(n => `qmd://${n}/`);
-  return results.filter(r => {
-    const path = r.filepath || r.file || '';
-    return prefixes.some(p => path.startsWith(p));
-  });
+// Pass 0/1/N collection names through to store search (search each, then merge).
+function collectionSearchFilter(names: string[]): string | string[] | undefined {
+  if (names.length === 0) return undefined;
+  if (names.length === 1) return names[0];
+  return names;
 }
 
 /**
@@ -2532,14 +2557,10 @@ function search(query: string, opts: OutputOptions): void {
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2583,13 +2604,12 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+      collection: collectionSearchFilter(collectionNames),
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2600,14 +2620,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       },
     });
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
 
     closeDb();
 
@@ -2634,7 +2646,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
@@ -2664,7 +2675,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
+        collections: collectionNames.length > 0 ? collectionNames : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2692,7 +2703,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     } else {
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
-        collection: singleCollection,
+        collection: collectionSearchFilter(collectionNames),
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2727,14 +2738,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
-      });
-    }
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
       });
     }
 
@@ -2801,6 +2804,7 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -2809,6 +2813,8 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
+      progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
+      "dry-run": { type: "boolean" },  // cleanup: report what would be removed
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -3345,7 +3351,8 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
+  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4197,9 +4204,15 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          const pwd = cli.args[1];
+          if (!pwd) {
+            console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
+            console.error("  Pass '.' to index the current directory.");
+            console.error("  --mask / --glob: glob (default **/*.md), brace group, or comma-separated list");
+            process.exit(1);
+          }
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const globPattern = collectionGlobFromCli(cli.values);
           const name = cli.values.name as string | undefined;
 
           if (!existsSync(resolvedPwd)) {
@@ -4322,7 +4335,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--mask|--glob GLOB]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
@@ -4332,6 +4345,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection add ~/notes --name notes --mask 'a.md,journals/*.md'");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);
@@ -4402,6 +4416,7 @@ if (isMain) {
       const results = await pullModels(models, {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,
+        cli: Boolean(cli.values.progress),
       });
       for (const result of results) {
         const size = formatBytes(result.sizeBytes);
@@ -4452,23 +4467,25 @@ if (isMain) {
       }
       const { runBenchmark } = await import("../bench/bench.js");
       const benchCollection = cli.opts.collection;
-      await runBenchmark(fixturePath, {
-        json: !!cli.values.json,
-        collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
-        dbPath: getDbPath(),
-        configPath: configExists() ? getConfigPath() : undefined,
-      });
+      try {
+        await runBenchmark(fixturePath, {
+          json: !!cli.values.json,
+          collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+          dbPath: getDbPath(),
+          configPath: configExists() ? getConfigPath() : undefined,
+        });
+      } catch (error) {
+        exitWithError(error);
+      }
       break;
     }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
 
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = process.env.XDG_CACHE_HOME
-        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
+      // Cache dir for PID/log files — scoped per --index so named daemons
+      // do not collide with the default index (#772).
+      const { cacheDir, pidPath, logPath } = mcpDaemonPaths();
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -4513,7 +4530,6 @@ if (isMain) {
           }
 
           mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
@@ -4524,6 +4540,12 @@ if (isMain) {
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
+            env: {
+              ...process.env,
+              // Explicit resolved DB path so the child does not depend on
+              // re-parsing --index (and cannot inherit a stale INDEX_PATH).
+              INDEX_PATH: getDbPath(),
+            },
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
@@ -4627,28 +4649,42 @@ if (isMain) {
 
     case "cleanup": {
       const db = getDb();
+      const dryRun = Boolean(cli.values["dry-run"]);
 
-      // 1. Clear llm_cache
-      const cacheCount = deleteLLMCache(db);
-      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
+      if (dryRun) {
+        const stats = previewCleanup(db);
+        console.log("Dry run — no changes made.\n");
+        console.log(`Would clear ${stats.cacheCount} cached API responses`);
+        if (stats.orphanedVectors > 0) {
+          console.log(`Would remove ${stats.orphanedVectors} orphaned embedding chunks`);
+        } else {
+          console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+        }
+        if (stats.inactiveDocs > 0) {
+          console.log(`Would remove ${stats.inactiveDocs} inactive document records`);
+        }
+        if (stats.orphanedContent > 0) {
+          console.log(`Would remove ${stats.orphanedContent} orphaned content hashes`);
+        }
+        console.log("Would compact FTS and vacuum the database");
+        closeDb();
+        break;
+      }
 
-      // 2. Remove orphaned vectors
-      const orphanedVecs = cleanupOrphanedVectors(db);
-      if (orphanedVecs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      const stats = runCleanup(db);
+      console.log(`${c.green}✓${c.reset} Cleared ${stats.cacheCount} cached API responses`);
+      if (stats.orphanedVectors > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedVectors} orphaned embedding chunks`);
       } else {
         console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
       }
-
-      // 3. Remove inactive documents
-      const inactiveDocs = deleteInactiveDocuments(db);
-      if (inactiveDocs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      if (stats.inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.inactiveDocs} inactive document records`);
       }
-
-      // 4. Vacuum to reclaim space
-      vacuumDatabase(db);
-      console.log(`${c.green}✓${c.reset} Database vacuumed`);
+      if (stats.orphanedContent > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedContent} orphaned content hashes`);
+      }
+      console.log(`${c.green}✓${c.reset} FTS compacted, database vacuumed`);
 
       closeDb();
       break;

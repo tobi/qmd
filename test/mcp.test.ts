@@ -8,8 +8,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
@@ -934,7 +932,7 @@ describe("MCP Server", () => {
 // =============================================================================
 
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { enableProductionMode } from "../src/store";
+import { _resetProductionModeForTesting } from "../src/store";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
@@ -1030,122 +1028,118 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // MCP protocol over HTTP
+  // MCP protocol over HTTP (2026-07-28, sessionless)
   // ---------------------------------------------------------------------------
 
-  /** Track session ID returned by initialize (MCP Streamable HTTP spec) */
-  let sessionId: string | null = null;
+  const MCP_VERSION = "2026-07-28";
+  const mcpMeta = {
+    "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+    "io.modelcontextprotocol/clientInfo": { name: "test-client", version: "1.0.0" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
 
-  /** Send a JSON-RPC message to /mcp and return the parsed response.
-   * MCP Streamable HTTP requires Accept header with both JSON and SSE. */
-  async function mcpRequest(body: object): Promise<{ status: number; json: any; contentType: string | null }> {
+  async function mcpRequest(
+    method: string,
+    params: Record<string, unknown> = {},
+    extraHeaders: Record<string, string> = {},
+    id = 1,
+  ): Promise<{ status: number; json: any; contentType: string | null; headers: Headers }> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "Accept": "application/json, text/event-stream",
+      "MCP-Protocol-Version": MCP_VERSION,
+      "Mcp-Method": method,
+      ...extraHeaders,
     };
-    if (sessionId) headers["mcp-session-id"] = sessionId;
-
     const res = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method,
+        params: { ...params, _meta: mcpMeta },
+      }),
     });
-
-    // Capture session ID from initialize responses
-    const sid = res.headers.get("mcp-session-id");
-    if (sid) sessionId = sid;
-
     const json = await res.json();
-    return { status: res.status, json, contentType: res.headers.get("content-type") };
+    return { status: res.status, json, contentType: res.headers.get("content-type"), headers: res.headers };
   }
 
-  test("POST /mcp initialize returns 200 JSON (not SSE)", async () => {
-    const { status, json, contentType } = await mcpRequest({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "test-client", version: "1.0.0" },
+  test("POST /mcp initialize still works for 2025-era clients (no session id)", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
       },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "test-client", version: "1.0.0" },
+        },
+      }),
     });
-    expect(status).toBe(200);
-    expect(contentType).toContain("application/json");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("mcp-session-id")).toBeNull();
+    const json = await res.json() as any;
     expect(json.jsonrpc).toBe("2.0");
     expect(json.id).toBe(1);
     expect(json.result.serverInfo.name).toBe("qmd");
   });
 
-  test("POST /mcp tools/list returns registered tools", async () => {
-    // Initialize first (required by MCP protocol)
-    await mcpRequest({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
-    });
-
-    const { status, json, contentType } = await mcpRequest({
-      jsonrpc: "2.0", id: 2, method: "tools/list", params: {},
-    });
+  test("POST /mcp tools/list returns registered tools without a session", async () => {
+    const { status, json, contentType, headers } = await mcpRequest("tools/list");
     expect(status).toBe(200);
     expect(contentType).toContain("application/json");
+    expect(headers.get("mcp-session-id")).toBeNull();
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toContain("query");
-    expect(toolNames).toContain("get");
-    expect(toolNames).toContain("status");
+    expect(toolNames).toEqual(["query", "get", "multi_get", "status"]);
   });
 
   test("POST /mcp tools/call query returns results", async () => {
-    // Initialize
-    await mcpRequest({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
-    });
-
-    const { status, json } = await mcpRequest({
-      jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
-    });
+    const { status, json } = await mcpRequest(
+      "tools/call",
+      { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      { "Mcp-Name": "query" },
+      3,
+    );
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
-    // Should have content array with text results
     expect(json.result.content.length).toBeGreaterThan(0);
     expect(json.result.content[0].type).toBe("text");
   });
 
   test("POST /mcp tools/call get returns document", async () => {
-    // Initialize
-    await mcpRequest({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
-    });
-
-    const { status, json } = await mcpRequest({
-      jsonrpc: "2.0", id: 4, method: "tools/call",
-      params: { name: "get", arguments: { path: "readme.md" } },
-    });
+    const { status, json } = await mcpRequest(
+      "tools/call",
+      { name: "get", arguments: { file: "readme.md" } },
+      { "Mcp-Name": "get" },
+      4,
+    );
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 
   test("POST /mcp tools/call query returns absolute source-file line numbers, not chunk-local", async () => {
-    await mcpRequest({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
-    });
-
-    const { status, json } = await mcpRequest({
-      jsonrpc: "2.0", id: 5, method: "tools/call",
-      params: {
+    const { status, json } = await mcpRequest(
+      "tools/call",
+      {
         name: "query",
         arguments: {
           searches: [{ type: "lex", query: "UNIQUE_KEYWORD_XYZ" }],
           rerank: false,
         },
       },
-    });
+      { "Mcp-Name": "query" },
+      5,
+    );
     expect(status).toBe(200);
     const results = json.result.structuredContent.results;
     expect(results.length).toBeGreaterThan(0);
@@ -1153,5 +1147,263 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(hit).toBeDefined();
     expect(hit.line).toBe(301);
     expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
+  });
+});
+
+
+// =============================================================================
+// HTTP Transport — CI-visible 2026-07-28 protocol (no models)
+// =============================================================================
+
+const MCP_2026 = "2026-07-28";
+const mcp2026Meta = {
+  "io.modelcontextprotocol/protocolVersion": MCP_2026,
+  "io.modelcontextprotocol/clientInfo": { name: "qmd-protocol-test", version: "1.0.0" },
+  "io.modelcontextprotocol/clientCapabilities": {},
+};
+
+describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
+  let handle: HttpServerHandle | undefined;
+  let baseUrl: string;
+  let dbPath: string;
+  let configDir: string | undefined;
+  const origIndexPath = process.env.INDEX_PATH;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  beforeAll(async () => {
+    dbPath = `/tmp/qmd-mcp-http-2026-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`;
+    const db = openDatabase(dbPath);
+    initTestDatabase(db);
+    seedTestData(db);
+    const testConfig: CollectionConfig = {
+      collections: {
+        docs: { path: "/test/docs", pattern: "**/*.md" },
+      },
+    };
+    syncConfigToDb(db, testConfig);
+    db.close();
+
+    const configPrefix = join(tmpdir(), `qmd-mcp-http-2026-config-${Date.now()}-`);
+    configDir = await mkdtemp(configPrefix);
+    await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
+
+    process.env.INDEX_PATH = dbPath;
+    process.env.QMD_CONFIG_DIR = configDir;
+    handle = await startMcpHttpServer(0, { quiet: true, dbPath });
+    baseUrl = `http://localhost:${handle.port}`;
+  });
+
+  afterAll(async () => {
+    if (handle) await handle.stop();
+    _resetProductionModeForTesting();
+    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+    else delete process.env.INDEX_PATH;
+    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+    else delete process.env.QMD_CONFIG_DIR;
+    try { unlinkSync(dbPath); } catch {}
+    if (configDir) {
+      try {
+        const files = await readdir(configDir);
+        for (const f of files) await unlink(join(configDir, f));
+        await rmdir(configDir);
+      } catch {}
+    }
+  });
+
+  async function postMcp(
+    body: object,
+    headers: Record<string, string>,
+  ): Promise<{ status: number; json: any; rawHeaders: Headers }> {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: await res.json(), rawHeaders: res.headers };
+  }
+
+  test("server/discover advertises 2026-07-28, tools, and identity", async () => {
+    const { status, json, rawHeaders } = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "server/discover",
+        params: { _meta: mcp2026Meta },
+      },
+      {
+        "MCP-Protocol-Version": MCP_2026,
+        "Mcp-Method": "server/discover",
+      },
+    );
+    expect(status).toBe(200);
+    expect(rawHeaders.get("mcp-session-id")).toBeNull();
+    expect(json.error).toBeUndefined();
+    expect(json.result.resultType).toBe("complete");
+    expect(json.result.ttlMs).toBe(60_000);
+    expect(json.result.cacheScope).toBe("private");
+    expect(json.result.supportedVersions).toEqual(expect.arrayContaining([MCP_2026]));
+    expect(json.result.capabilities?.tools).toBeDefined();
+    const serverInfo = json.result._meta?.["io.modelcontextprotocol/serverInfo"]
+      ?? json.result.serverInfo;
+    expect(serverInfo?.name).toBe("qmd");
+  });
+
+  test("tools/list is sessionless, deterministic, and carries cache hints", async () => {
+    const { status, json, rawHeaders } = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: { _meta: mcp2026Meta },
+      },
+      {
+        "MCP-Protocol-Version": MCP_2026,
+        "Mcp-Method": "tools/list",
+      },
+    );
+    expect(status).toBe(200);
+    expect(rawHeaders.get("mcp-session-id")).toBeNull();
+    expect(json.error).toBeUndefined();
+    expect(json.result.resultType).toBe("complete");
+    expect(json.result.ttlMs).toBe(60_000);
+    expect(json.result.cacheScope).toBe("private");
+    const toolNames = json.result.tools.map((t: { name: string }) => t.name);
+    expect(toolNames).toEqual(["query", "get", "multi_get", "status"]);
+    const serverInfo = json.result._meta?.["io.modelcontextprotocol/serverInfo"];
+    expect(serverInfo?.name).toBe("qmd");
+  });
+
+  test("POST without Mcp-Method is HeaderMismatch (-32020)", async () => {
+    const { status, json } = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/list",
+        params: { _meta: mcp2026Meta },
+      },
+      {
+        "MCP-Protocol-Version": MCP_2026,
+      },
+    );
+    expect(status).toBe(400);
+    expect(json.error?.code).toBe(-32020);
+  });
+
+  test("tools/call with mismatched Mcp-Name is HeaderMismatch (-32020)", async () => {
+    const { status, json } = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "status",
+          arguments: {},
+          _meta: mcp2026Meta,
+        },
+      },
+      {
+        "MCP-Protocol-Version": MCP_2026,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": "query",
+      },
+    );
+    expect(status).toBe(400);
+    expect(json.error?.code).toBe(-32020);
+  });
+
+  test("unsupported protocol version is UnsupportedProtocolVersionError (-32022)", async () => {
+    const { status, json } = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: 5,
+        method: "server/discover",
+        params: {
+          _meta: {
+            ...mcp2026Meta,
+            "io.modelcontextprotocol/protocolVersion": "1900-01-01",
+          },
+        },
+      },
+      {
+        "MCP-Protocol-Version": "1900-01-01",
+        "Mcp-Method": "server/discover",
+      },
+    );
+    expect(status).toBe(400);
+    expect(json.error?.code).toBe(-32022);
+    expect(json.error?.data?.supported).toEqual(expect.arrayContaining([MCP_2026]));
+  });
+
+  test("GET /mcp is 405 (no session GET stream)", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("mcp-session-id")).toBeNull();
+  });
+});
+
+
+// =============================================================================
+// HTTP Transport — CI-visible legacy FTS open (#792)
+// =============================================================================
+//
+// The suite above is skipIf(CI) because query tests load models. The original
+// #792 failure was in that suite's beforeAll: initTestDatabase still creates
+// fts5(name, body, content='documents'), then startMcpHttpServer -> createStore
+// -> rebuildFTSForCjkNormalization ran DELETE FROM documents_fts and threw
+// `no such column: T.name`. Keep this helper seed and assert open succeeds
+// even when CI=true.
+
+describe("MCP HTTP Transport — legacy FTS seed (#792)", () => {
+  test("startMcpHttpServer opens a DB seeded like the MCP helper (name/body + content='documents')", async () => {
+    const origIndexPath = process.env.INDEX_PATH;
+    const origConfigDir = process.env.QMD_CONFIG_DIR;
+    const dbPath = `/tmp/qmd-mcp-http-legacy-fts-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`;
+    let configDir: string | undefined;
+    let handle: HttpServerHandle | undefined;
+
+    try {
+      const db = openDatabase(dbPath);
+      initTestDatabase(db);
+      seedTestData(db);
+      const testConfig: CollectionConfig = {
+        collections: {
+          docs: { path: "/test/docs", pattern: "**/*.md" },
+        },
+      };
+      syncConfigToDb(db, testConfig);
+      db.close();
+
+      const configPrefix = join(tmpdir(), `qmd-mcp-http-legacy-config-${Date.now()}-`);
+      configDir = await mkdtemp(configPrefix);
+      await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
+
+      process.env.INDEX_PATH = dbPath;
+      process.env.QMD_CONFIG_DIR = configDir;
+
+      handle = await startMcpHttpServer(0, { quiet: true, dbPath });
+      const res = await fetch(`http://localhost:${handle.port}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { status?: string };
+      expect(body.status).toBe("ok");
+    } finally {
+      if (handle) await handle.stop();
+      _resetProductionModeForTesting();
+      if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+      else delete process.env.INDEX_PATH;
+      if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+      else delete process.env.QMD_CONFIG_DIR;
+      try { unlinkSync(dbPath); } catch {}
+      if (configDir) {
+        try {
+          const files = await readdir(configDir);
+          for (const f of files) await unlink(join(configDir, f));
+          await rmdir(configDir);
+        } catch {}
+      }
+    }
   });
 });

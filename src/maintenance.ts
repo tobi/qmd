@@ -13,6 +13,10 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   clearAllEmbeddings,
+  optimizeDocumentsFts,
+  previewCleanup,
+  runCleanup,
+  type CleanupStats,
 } from "./store.js";
 
 export class Maintenance {
@@ -50,5 +54,23 @@ export class Maintenance {
   /** Clear all vector embeddings (forces re-embedding) */
   clearEmbeddings(): void {
     clearAllEmbeddings(this.store.db);
+  }
+
+  /** Compact FTS5 so deleted rows leave documents_fts_data (#550). */
+  optimizeFts(): void {
+    optimizeDocumentsFts(this.store.db);
+  }
+
+  /** Preview what {@link run} would remove, without writing. */
+  preview(): CleanupStats {
+    return previewCleanup(this.store.db);
+  }
+
+  /**
+   * Full cleanup: cache, orphaned vectors, inactive docs, orphaned content,
+   * FTS optimize, vacuum. Same sequence as `qmd cleanup`.
+   */
+  run(): CleanupStats {
+    return runCleanup(this.store.db);
   }
 }

@@ -849,6 +849,7 @@ describe("update", () => {
     expect(result.updated).toBe(0);
     expect(result.unchanged).toBe(0);
     expect(result.removed).toBe(0);
+    expect(result.skipped).toBe(0);
     expect(typeof result.needsEmbedding).toBe("number");
 
     await store.close();

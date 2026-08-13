@@ -8,25 +8,166 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
   setNodeLlamaCppModuleForTest,
+  setLlamaDirWritableForTest,
+  canWriteLlamaDir,
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
+  computeGpuContextPoolSize,
+  estimateEmbedContextMB,
+  BASELINE_EMBED_CONTEXT_MB,
+  EMBED_POOL_RERANK_RESERVE_MB,
   resolveEmbedModel,
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  pullModels,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("canWriteLlamaDir", () => {
+  test("returns true when llama/ exists and is writable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "qmd-llama-rw-"));
+    mkdirSync(join(dir, "llama"));
+    try {
+      expect(canWriteLlamaDir(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns false when the package directory is missing", () => {
+    expect(canWriteLlamaDir("/tmp/qmd-no-such-llama-pkg")).toBe(false);
+  });
+
+  test("returns false when llama/ exists but is not writable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "qmd-llama-ro-"));
+    const llamaDir = join(dir, "llama");
+    mkdirSync(llamaDir, { mode: 0o555 });
+    chmodSync(llamaDir, 0o555);
+    try {
+      expect(canWriteLlamaDir(dir)).toBe(false);
+    } finally {
+      chmodSync(llamaDir, 0o755);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureLlama uses build:never when the llama dir is read-only", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    delete process.env.QMD_LLAMA_GPU;
+    delete process.env.QMD_FORCE_CPU;
+
+    const calls: Array<Record<string, unknown>> = [];
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options);
+        return { gpu: false, cpuMathCores: 4, dispose: async () => {} } as any;
+      }),
+    });
+    // After the module mock: that helper clears the writability override.
+    setLlamaDirWritableForTest(false);
+
+    try {
+      const llm = new LlamaCpp();
+      await (llm as any).ensureLlama();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]?.build).toBe("never");
+      expect(calls[0]?.skipDownload).toBe(true);
+    } finally {
+      setLlamaDirWritableForTest(undefined);
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+});
+
+
+describe("model download progress (#776)", () => {
+  test("pullModels hides node-llama-cpp CLI progress by default", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "qmd-pull-quiet-"));
+    const resolveModelFile = vi.fn(async () => join(cacheDir, "missing.gguf"));
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile,
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(),
+    });
+    try {
+      await pullModels(["local-model.gguf"], { cacheDir });
+      expect(resolveModelFile).toHaveBeenCalledWith(
+        "local-model.gguf",
+        { directory: cacheDir, cli: false },
+      );
+    } finally {
+      setNodeLlamaCppModuleForTest(null);
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pullModels shows CLI progress only when cli: true", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "qmd-pull-progress-"));
+    const resolveModelFile = vi.fn(async () => join(cacheDir, "missing.gguf"));
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile,
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(),
+    });
+    try {
+      await pullModels(["local-model.gguf"], { cacheDir, cli: true });
+      expect(resolveModelFile).toHaveBeenCalledWith(
+        "local-model.gguf",
+        { directory: cacheDir, cli: true },
+      );
+    } finally {
+      setNodeLlamaCppModuleForTest(null);
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  test("LlamaCpp.resolveModel also hides download progress", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "qmd-resolve-quiet-"));
+    const resolveModelFile = vi.fn(async () => join(cacheDir, "missing.gguf"));
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile,
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(),
+    });
+    try {
+      const llm = new LlamaCpp({ modelCacheDir: cacheDir });
+      await (llm as any).resolveModel("local-model.gguf");
+      expect(resolveModelFile).toHaveBeenCalledWith(
+        "local-model.gguf",
+        { directory: cacheDir, cli: false },
+      );
+    } finally {
+      setNodeLlamaCppModuleForTest(null);
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
@@ -371,6 +512,50 @@ describe("LLM context parallelism safety", () => {
   });
 });
 
+describe("embedding context VRAM pool (#799)", () => {
+  test("keeps the nomic/embeddinggemma baseline for small GGUFs so default embed throughput is unchanged", () => {
+    const gemmaBytes = 308 * 1024 * 1024;
+    expect(estimateEmbedContextMB({ modelBytes: gemmaBytes })).toBe(BASELINE_EMBED_CONTEXT_MB);
+    expect(estimateEmbedContextMB({ modelBytes: 137 * 1024 * 1024 })).toBe(BASELINE_EMBED_CONTEXT_MB);
+  });
+
+  test("scales Qwen3-Embedding-0.6B-class GGUFs to ~1190 MB per context", () => {
+    const qwenBytes = 640 * 1024 * 1024;
+    expect(estimateEmbedContextMB({ modelBytes: qwenBytes })).toBe(Math.round(640 * 1.85));
+    expect(estimateEmbedContextMB({ modelBytes: qwenBytes, contextSize: 1024 })).toBe(Math.round(640 * 1.85 * 0.5));
+  });
+
+  test("falls back to the baseline when the file size is unknown", () => {
+    expect(estimateEmbedContextMB({ modelBytes: 0 })).toBe(BASELINE_EMBED_CONTEXT_MB);
+    expect(estimateEmbedContextMB({ modelBytes: Number.NaN })).toBe(BASELINE_EMBED_CONTEXT_MB);
+  });
+
+  test("on 8 GB VRAM, a Qwen 0.6B pool is 1 context so the reranker still fits", () => {
+    const perContextMB = estimateEmbedContextMB({ modelBytes: 640 * 1024 * 1024 });
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(1);
+  });
+
+  test("on 8 GB VRAM, the default 150 MB estimate still allows the 8-context cap", () => {
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB: BASELINE_EMBED_CONTEXT_MB,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(8);
+  });
+
+  test("the old hardcoded 150 MB estimate would still open 8 Qwen contexts and OOM the reranker", () => {
+    expect(computeGpuContextPoolSize({
+      freeMB: 7500,
+      perContextMB: 150,
+      reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
+    })).toBe(8);
+  });
+});
+
 describe("LlamaCpp expand context size config", () => {
   const defaultExpandContextSize = 2048;
 
@@ -532,6 +717,85 @@ describe("LlamaCpp rerank deduping", () => {
     expect(scoreByFile.get("a.md")).toBe(0.9);
     expect(scoreByFile.get("b.md")).toBe(0.9);
     expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
+describe("LlamaCpp ensureRerankContexts error reporting", () => {
+  test("warns with the underlying error and does not retry identical options", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const createRankingContext = vi.fn().mockRejectedValue(
+        new Error("A context size of 40960 is too large for the available VRAM"),
+      );
+      llm.computeParallelism = vi.fn().mockResolvedValue(2);
+      llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+      llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+      const contexts = await llm.ensureRerankContexts();
+
+      expect(contexts).toEqual([]);
+      expect(createRankingContext).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("A context size of 40960 is too large for the available VRAM"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("keeps already-created contexts when a later createRankingContext fails", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx1 = { id: 1 };
+      let calls = 0;
+      const createRankingContext = vi.fn().mockImplementation(async () => {
+        calls++;
+        if (calls === 1) return ctx1;
+        throw new Error("out of VRAM");
+      });
+      llm.computeParallelism = vi.fn().mockResolvedValue(3);
+      llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+      llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+      const contexts = await llm.ensureRerankContexts();
+
+      expect(contexts).toEqual([ctx1]);
+      expect(createRankingContext).toHaveBeenCalledTimes(2);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("serializes concurrent cold-start callers so ranking contexts are created once", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const ctx = { id: 1 };
+    let inflight = 0;
+    let maxInflight = 0;
+    const createRankingContext = vi.fn().mockImplementation(async () => {
+      inflight++;
+      maxInflight = Math.max(maxInflight, inflight);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inflight--;
+      return ctx;
+    });
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({ createRankingContext });
+
+    const [a, b, c] = await Promise.all([
+      llm.ensureRerankContexts(),
+      llm.ensureRerankContexts(),
+      llm.ensureRerankContexts(),
+    ]);
+
+    expect(a).toEqual([ctx]);
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+    expect(createRankingContext).toHaveBeenCalledTimes(1);
+    expect(maxInflight).toBe(1);
   });
 });
 
