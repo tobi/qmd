@@ -797,57 +797,101 @@ function getUserVersion(db: Database): number {
 // Gate the work behind PRAGMA user_version and apply it inside one IMMEDIATE
 // transaction: the DROP+CREATE pair is atomic across connections, and a
 // double-checked read skips it once any process has stamped the version.
+function installFtsSyncTriggers(db: Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`
+    CREATE TRIGGER documents_ai AFTER INSERT ON documents
+    WHEN new.active = 1
+    BEGIN
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`
+    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id;
+    END
+  `);
+
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+  db.exec(`
+    CREATE TRIGGER documents_au AFTER UPDATE ON documents
+    BEGIN
+      -- Delete from FTS if no longer active
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+      -- Update FTS if still/newly active
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+}
+
 function applyFtsSyncTriggers(db: Database): void {
   if (getUserVersion(db) >= STORE_SCHEMA_VERSION) return;
   db.exec(`BEGIN IMMEDIATE`);
   try {
     if (getUserVersion(db) < STORE_SCHEMA_VERSION) {
-      db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
-      db.exec(`
-        CREATE TRIGGER documents_ai AFTER INSERT ON documents
-        WHEN new.active = 1
-        BEGIN
-          INSERT INTO documents_fts(rowid, filepath, title, body)
-          SELECT
-            new.id,
-            new.collection || '/' || new.path,
-            new.title,
-            (SELECT doc FROM content WHERE hash = new.hash)
-          WHERE new.active = 1;
-        END
-      `);
-
-      db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
-      db.exec(`
-        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-          DELETE FROM documents_fts WHERE rowid = old.id;
-        END
-      `);
-
-      db.exec(`DROP TRIGGER IF EXISTS documents_au`);
-      db.exec(`
-        CREATE TRIGGER documents_au AFTER UPDATE ON documents
-        BEGIN
-          -- Delete from FTS if no longer active
-          DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-          -- Update FTS if still/newly active
-          INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-          SELECT
-            new.id,
-            new.collection || '/' || new.path,
-            new.title,
-            (SELECT doc FROM content WHERE hash = new.hash)
-          WHERE new.active = 1;
-        END
-      `);
-
+      installFtsSyncTriggers(db);
       db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
     }
     db.exec(`COMMIT`);
   } catch (err) {
     db.exec(`ROLLBACK`);
     throw err;
+  }
+}
+
+/**
+ * True when documents_fts is the current standalone (filepath, title, body)
+ * table. Older schemas used fts5(name, body, content='documents'), and
+ * CREATE VIRTUAL TABLE IF NOT EXISTS will not replace them. A CJK rebuild
+ * then runs `DELETE FROM documents_fts`, which FTS5 compiles against the
+ * external content table as `SELECT T.name FROM documents AS T` — documents
+ * has no `name` column, so open throws `no such column: T.name` (#792).
+ */
+function documentsFtsSchemaIsCurrent(db: Database): boolean {
+  const row = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+  ).get() as { sql?: string } | undefined | null;
+  const sql = (row?.sql ?? "").toLowerCase().replace(/\s+/g, "");
+  return sql.includes("filepath") && sql.includes("title") && !sql.includes("content=");
+}
+
+function recreateDocumentsFts(db: Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+  db.exec(`DROP TABLE IF EXISTS documents_fts`);
+  db.exec(`
+    CREATE VIRTUAL TABLE documents_fts USING fts5(
+      filepath, title, body,
+      tokenize='porter unicode61'
+    )
+  `);
+  db.exec(`DELETE FROM store_config WHERE key = 'fts_cjk_normalized_version'`);
+}
+
+function ensureDocumentsFtsSchema(db: Database): void {
+  if (documentsFtsSchemaIsCurrent(db)) return;
+  recreateDocumentsFts(db);
+  // recreateDocumentsFts dropped the sync triggers. applyFtsSyncTriggers
+  // only reinstalls them when user_version is stale, so a DB that already
+  // has the current user_version would otherwise be left untriggered.
+  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) {
+    installFtsSyncTriggers(db);
   }
 }
 
@@ -1057,6 +1101,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  ensureDocumentsFtsSchema(db);
   applyFtsSyncTriggers(db);
 
   rebuildFTSForCjkNormalization(db);

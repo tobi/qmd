@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- Opening a store no longer throws `SQLiteError: no such column: T.name` when
+  `documents_fts` is still the legacy `fts5(name, body, content='documents')`
+  schema. `CREATE VIRTUAL TABLE IF NOT EXISTS` left that table in place, and
+  the CJK FTS rebuild's `DELETE FROM documents_fts` compiled against
+  `documents.name`, which does not exist (#792).
+
 - Rerank cache keys now include the resolved `models.rerank` URI, so swapping
   the configured reranker no longer serves the previous model's cached scores
   (#764).

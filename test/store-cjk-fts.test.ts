@@ -14,7 +14,9 @@
  * These tests exercise the migration through createStore()/openDatabase() on a
  * pre-seeded DB that omits the fts_cjk_normalized_version marker (forcing a
  * rebuild on open), plus a structural assertion that .iterate() — not .all() —
- * drives the body scan.
+ * drives the body scan. They also cover a brand-new empty store and a legacy
+ * fts5(name, body, content='documents') schema, which used to throw
+ * `no such column: T.name` during rebuildFTSForCjkNormalization (#792).
  *
  * Run with: bun test test/store-cjk-fts.test.ts
  *        or: pnpm test:node test/store-cjk-fts.test.ts
@@ -501,6 +503,130 @@ describe("rebuildFTSForCjkNormalization — Latin search regression guard", () =
       const both = store.searchFTS("keyword inverted", 10, "en");
       expect(both.length).toBe(1);
       expect(both[0]!.displayPath).toBe("en/keyword.md");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+
+// =============================================================================
+// Test 6 — legacy fts5(name, body, content='documents') must not crash open (#792)
+// =============================================================================
+
+describe("rebuildFTSForCjkNormalization — legacy external-content FTS schema (#792)", () => {
+  let dbPath: string;
+
+  beforeEach(async () => {
+    await setEmptyConfig();
+    dbPath = freshDbPath();
+  });
+
+  afterEach(async () => {
+    try {
+      await unlink(dbPath);
+    } catch {
+      // ignore
+    }
+  });
+
+  test("createStore on a brand-new empty file stamps the CJK version", async () => {
+    const store = createStore(dbPath);
+    try {
+      const ver = store.db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+      expect(ftsRowCount(store.db)).toBe(0);
+
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).toContain("title");
+      expect(sql).not.toMatch(/content\s*=/);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("opens a DB whose documents_fts still uses name/body + content='documents'", async () => {
+    {
+      const seed = openDatabase(dbPath);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS content (
+          hash TEXT PRIMARY KEY,
+          doc TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          collection TEXT NOT NULL,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          modified_at TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+          UNIQUE(collection, path)
+        )
+      `);
+      seed.exec(`
+        CREATE TABLE IF NOT EXISTS store_config (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      `);
+      // The schema that produced `no such column: T.name` on CJK rebuild:
+      // FTS5 external-content maps column `name` onto documents.name.
+      seed.exec(`
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          name, body,
+          content='documents',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        )
+      `);
+      seed.exec(`
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+          INSERT INTO documents_fts(rowid, name, body)
+          SELECT new.id, new.path, content.doc
+          FROM content
+          WHERE content.hash = new.hash;
+        END
+      `);
+      seedDocument(seed, {
+        id: 1,
+        collection: "docs",
+        path: "readme.md",
+        title: "Project README",
+        body: "legacy fts canary token UNIQUE_KEYWORD_XYZ",
+      });
+      seed.close();
+    }
+
+    const store = createStore(dbPath);
+    try {
+      const sqlRow = store.db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+      ).get() as { sql?: string } | undefined;
+      const sql = (sqlRow?.sql ?? "").toLowerCase();
+      expect(sql).toContain("filepath");
+      expect(sql).toContain("title");
+      expect(sql).not.toMatch(/content\s*=/);
+
+      const ver = store.db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+
+      const hits = store.searchFTS("UNIQUE_KEYWORD_XYZ", 10, "docs");
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.displayPath).toBe("docs/readme.md");
     } finally {
       store.close();
     }
