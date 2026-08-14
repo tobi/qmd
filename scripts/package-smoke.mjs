@@ -56,6 +56,10 @@ assertPath("dist/index.d.ts", "compiled type export");
 assertPath("dist/cli/qmd.js", "compiled CLI");
 
 run("compiled CLI under Node", process.execPath, ["dist/cli/qmd.js", "--help"], { quiet: true });
+run("bundled benchmark fixture", process.execPath, ["dist/cli/qmd.js", "bench", "--example"], {
+  quiet: true,
+  env: { ...process.env, QMD_SKILLS_DIR: join(root, "missing-skills-override") },
+});
 run("package wrapper", "sh", ["bin/qmd", "--help"], { quiet: true });
 
 if (process.env.QMD_SKIP_BUN_SMOKE === "1") {

@@ -232,20 +232,79 @@ beforeEach(async () => {
 });
 
 describe("CLI Help", () => {
-  test("shows help with --help flag", async () => {
+  test("shows a concise command directory with --help", async () => {
     const { stdout, exitCode } = await runQmd(["--help"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Usage:");
-    expect(stdout).toContain("qmd collection add");
-    expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("collection <command>");
+    expect(stdout).toContain("search <query>");
     expect(stdout).toContain("--no-gpu");
-    expect(stdout).toContain("qmd skill show/install");
+    expect(stdout).toContain("skill <command>");
+    expect(stdout).not.toContain("Query grammar:");
+    expect(stdout).not.toContain("--candidate-limit");
   });
 
   test("shows help with no arguments", async () => {
     const { stdout, exitCode } = await runQmd([]);
     expect(exitCode).toBe(1);
     expect(stdout).toContain("Usage:");
+  });
+
+  test("shows query-specific help and grammar", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["query", "--help"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Usage:\n  qmd query [options] <query>");
+    expect(stdout).toContain("--intent <text>");
+    expect(stdout).toContain("--candidate-limit <n>");
+    expect(stdout).toContain("Query grammar:");
+    expect(stdout).not.toContain("--max-bytes");
+  });
+
+  test("shows get-specific help including --from", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["get", "--help"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Usage:\n  qmd get <file>[:from[:count]] [options]");
+    expect(stdout).toContain("--from <line>");
+    expect(stdout).toContain("--no-line-numbers");
+    expect(stdout).not.toContain("Query grammar:");
+  });
+
+  test("shows embed-specific resource controls", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["embed", "-h"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Usage:\n  qmd embed [options]");
+    expect(stdout).toContain("--max-docs-per-batch <n>");
+    expect(stdout).toContain("--timeout <minutes>");
+    expect(stdout).not.toContain("--max-bytes");
+  });
+
+  test("shows nested collection add help", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", "--help"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Usage:\n  qmd collection add <path> [options]");
+    expect(stdout).toContain("--name <name>");
+    expect(stdout).toContain("--mask <glob>");
+    expect(stdout).not.toContain("remove <name>");
+  });
+
+  test("supports qmd help <command>", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["help", "search"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Usage:\n  qmd search [options] <query>");
+  });
+
+  test("prints the bundled benchmark fixture", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["bench", "--example"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    const fixture = JSON.parse(stdout);
+    expect(fixture.collection).toBe("eval-docs");
+    expect(fixture.queries.length).toBeGreaterThan(0);
   });
 });
 
@@ -367,7 +426,7 @@ describe("CLI Skill Commands", () => {
   test("shows skill help with -h", async () => {
     const { stdout, exitCode } = await runQmd(["skill", "-h"]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("Usage: qmd skill <show|install> [options]");
+    expect(stdout).toContain("Usage:\n  qmd skill <show|install> [options]");
     expect(stdout).toContain("install");
     expect(stdout).toContain("--global");
   });

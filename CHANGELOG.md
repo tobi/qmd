@@ -44,6 +44,14 @@
 
 ### Changed
 
+- CLI help is now contextual: top-level `qmd --help` is a concise command
+  directory, while `<command> --help` shows only that command's usage, options,
+  and examples. The query grammar appears only under `qmd query --help`, and
+  previously omitted flags such as `query --intent` and `get --from` are now
+  documented. `qmd help <command>` is also supported. `qmd bench --example`
+  prints a bundled fixture so installed users no longer need a source-checkout
+  path to discover the benchmark format (#716).
+
 - Dependencies: `node-llama-cpp` 3.18.1 → **3.20.0** (llama.cpp b8390 → b10361, 2026-08-11). Also safe patch/minors: `picomatch` 4.0.4 → 4.0.5, `web-tree-sitter` 0.26.8 → 0.26.12, `tsx` 4.21.0 → 4.23.12, `vitest` 3.2.4 → 3.2.7. No zod/vitest major; `@modelcontextprotocol/server` stays 2.0.0 (no 2.x patch). `flake.nix` FOD hashes are not updated here.
 - `generate` and query expansion now await `LlamaContextSequence.dispose()` before disposing the parent context. node-llama-cpp 3.20 made sequence dispose async; the library's context-onDispose path does not wait.
 

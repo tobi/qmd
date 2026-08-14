@@ -95,6 +95,8 @@ import {
   type OutputFormat,
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
+import { CLI_OPTIONS } from "./options.js";
+import { printHelp, resolveHelpTopic } from "./help.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -3017,68 +3019,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 function parseCLI() {
   const { values, positionals } = parseArgs({
     args: process.argv.slice(2), // Skip node and script path
-    options: {
-      // Global options
-      index: {
-        type: "string",
-      },
-      context: {
-        type: "string",
-      },
-      help: { type: "boolean", short: "h" },
-      version: { type: "boolean", short: "v" },
-      skill: { type: "boolean" },
-      global: { type: "boolean" },
-      yes: { type: "boolean" },
-      // Search options
-      n: { type: "string" },
-      "min-score": { type: "string" },
-      all: { type: "boolean" },
-      full: { type: "boolean" },
-      format: { type: "string" },          // preferred: --format cli|json|csv|md|xml|files
-      // Legacy boolean format aliases. Kept working for back-compat but
-      // omitted from the documented help; prefer `--format <kind>`.
-      csv: { type: "boolean" },
-      md: { type: "boolean" },
-      xml: { type: "boolean" },
-      files: { type: "boolean" },
-      json: { type: "boolean" },
-      explain: { type: "boolean" },
-      collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
-      // Collection options
-      name: { type: "string" },  // collection name
-      mask: { type: "string" },  // glob pattern
-      glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
-      // Embed options
-      force: { type: "boolean", short: "f" },
-      "max-docs-per-batch": { type: "string" },
-      "max-batch-mb": { type: "string" },
-      timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
-      // Update options
-      pull: { type: "boolean" },  // git pull before update
-      refresh: { type: "boolean" },
-      progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
-      "dry-run": { type: "boolean" },  // cleanup: report what would be removed
-      // Get options
-      l: { type: "string" },  // max lines
-      from: { type: "string" },  // start line
-      "max-bytes": { type: "string" },  // max bytes for multi-get
-      "line-numbers": { type: "boolean" },  // add line numbers to output (search; default on for get/multi-get)
-      "no-line-numbers": { type: "boolean" },  // disable line numbers for get/multi-get
-      "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
-      // Query options
-      "candidate-limit": { type: "string", short: "C" },
-      "no-rerank": { type: "boolean", default: false },
-      "no-gpu": { type: "boolean", default: false },
-      intent: { type: "string" },
-      // Chunking options
-      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
-      // MCP HTTP transport options
-      http: { type: "boolean" },
-      daemon: { type: "boolean" },
-      port: { type: "string" },
-      host: { type: "string" },
-    },
+    options: CLI_OPTIONS,
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
   });
@@ -3195,10 +3136,6 @@ type SkillInfo = {
 const SKILL_DIR = "skills";
 
 function findPackageRoot(): string | null {
-  if (process.env.QMD_SKILLS_DIR) {
-    return null;
-  }
-
   const start = dirname(fileURLToPath(import.meta.url));
   let current = start;
   while (true) {
@@ -3478,17 +3415,7 @@ function runSkillsCommand(args: string[], jsonMode: boolean, fullOption = false,
 }
 
 function showSkillsHelp(): void {
-  console.log("Usage: qmd skills <list|get|path> [options]");
-  console.log("");
-  console.log("Commands:");
-  console.log("  list                 List bundled runtime skills");
-  console.log("  get <name>           Print a bundled runtime skill");
-  console.log("  get <name> --full    Include references/templates/scripts");
-  console.log("  get --all            Print all bundled runtime skills");
-  console.log("  path [name]          Print runtime skill directory path(s)");
-  console.log("");
-  console.log("Options:");
-  console.log("  --json               Print structured JSON");
+  printHelp("skills");
 }
 
 function ensureClaudeSymlink(linkPath: string, targetDir: string, force: boolean): boolean {
@@ -3565,113 +3492,7 @@ async function installSkill(globalInstall: boolean, force: boolean, autoYes: boo
 }
 
 function showHelp(): void {
-  console.log("qmd — Quick Markdown Search");
-  console.log("");
-  console.log("Usage:");
-  console.log("  qmd <command> [options]");
-  console.log("");
-  console.log("Primary commands:");
-  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
-  console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
-  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
-  console.log("  qmd vsearch <query>           - Vector similarity only");
-  console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
-  console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
-  console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
-  console.log("  qmd skill show/install        - Show or install the QMD skill");
-  console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
-  console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
-  console.log("");
-  console.log("Collections & context:");
-  console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
-  console.log("  qmd context add/list/rm                      - Attach human-written summaries");
-  console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
-  console.log("");
-  console.log("Maintenance:");
-  console.log("  qmd init                      - Create a project-local .qmd index");
-  console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
-  console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
-  console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
-  console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
-  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
-  console.log("");
-  console.log("Query syntax (qmd query):");
-  console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
-  console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
-  console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
-  console.log("");
-  const grammar = [
-    `query          = expand_query | query_document ;`,
-    `expand_query   = text | explicit_expand ;`,
-    `explicit_expand= "expand:" text ;`,
-    `query_document = [ intent_line ] { typed_line } ;`,
-    `intent_line    = "intent:" text newline ;`,
-    `typed_line     = type ":" text newline ;`,
-    `type           = "lex" | "vec" | "hyde" ;`,
-    `text           = quoted_phrase | plain_text ;`,
-    `quoted_phrase  = '"' { character } '"' ;`,
-    `plain_text     = { character } ;`,
-    `newline        = "\\n" ;`,
-  ];
-  console.log("  Grammar:");
-  for (const line of grammar) {
-    console.log(`    ${line}`);
-  }
-  console.log("");
-  console.log("  Examples:");
-  console.log("    qmd query \"how does auth work\"                # single-line → implicit expand");
-  console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
-  console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
-  console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
-  console.log("");
-  console.log("  Constraints:");
-  console.log("    - Standalone expand queries cannot mix with typed lines.");
-  console.log("    - Query documents allow only lex:, vec:, or hyde: prefixes.");
-  console.log("    - Each typed line must be single-line text with balanced quotes.");
-  console.log("");
-  console.log("AI agents & integrations:");
-  console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
-  console.log("  - Run `qmd skills get qmd --full` for version-matched agent instructions.");
-  console.log("  - `qmd skill install` installs the QMD skill into ./.agents/skills/qmd.");
-  console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
-  console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
-  console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
-  console.log("");
-  console.log("Global options:");
-  console.log("  --index <name>             - Use a named index (default: index)");
-  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
-  console.log("");
-  console.log("Search options:");
-  console.log("  -n <num>                   - Max results (default 5, or 20 for --format files|json)");
-  console.log("  --all                      - Return all matches (pair with --min-score)");
-  console.log("  --min-score <num>          - Minimum similarity score");
-  console.log("  --full                     - Output full document instead of snippet");
-  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
-  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
-  console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
-  console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
-  console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
-  console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
-  console.log("                                Paths are ./-prefixed when under $PWD, absolute otherwise");
-  console.log("                                Results whose file is gone keep qmd:// + docid and warn on stderr");
-  console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
-  console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
-  console.log("  -c, --collection <name>    - Filter by one or more collections");
-  console.log("");
-  console.log("Embed/query options:");
-  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
-  console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("");
-  console.log("Multi-get options:");
-  console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 65536)");
-  console.log("  --format <kind>            - Same formats as search");
-  console.log("");
-  console.log(`Index: ${getDbPath()}`);
+  printHelp("root", { indexPath: getDbPath() });
 }
 
 function doctorCheck(label: string, ok: boolean, details: string): void {
@@ -4311,23 +4132,15 @@ if (isMain) {
     process.exit(0);
   }
 
-  if (cli.values.help && cli.command === "skill") {
-    console.log("Usage: qmd skill <show|install> [options]");
-    console.log("");
-    console.log("Commands:");
-    console.log("  show                 Print the QMD skill");
-    console.log("  install              Install QMD skill into ./.agents/skills/qmd");
-    console.log("");
-    console.log("Options:");
-    console.log("  --global             Install into ~/.agents/skills/qmd");
-    console.log("  --yes                Also create the .claude/skills/qmd symlink");
-    console.log("  -f, --force          Replace existing install or symlink");
-    process.exit(0);
-  }
-
-  if (!cli.command || cli.values.help) {
+  if (!cli.command) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  if (cli.values.help || cli.command === "help") {
+    const topic = resolveHelpTopic(cli.command, cli.args);
+    printHelp(topic, topic === "root" ? { indexPath: getDbPath() } : undefined);
+    process.exit(0);
   }
 
   switch (cli.command) {
@@ -4579,23 +4392,7 @@ if (isMain) {
 
         case "help":
         case undefined: {
-          console.log("Usage: qmd collection <command> [options]");
-          console.log("");
-          console.log("Commands:");
-          console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME] [--mask|--glob GLOB]  Add a collection");
-          console.log("  remove <name>             Remove a collection");
-          console.log("  rename <old> <new>        Rename a collection");
-          console.log("  show <name>               Show collection details");
-          console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
-          console.log("  include <name>            Include in default queries");
-          console.log("  exclude <name>            Exclude from default queries");
-          console.log("");
-          console.log("Examples:");
-          console.log("  qmd collection add ~/notes --name notes");
-          console.log("  qmd collection add ~/notes --name notes --mask 'a.md,journals/*.md'");
-          console.log("  qmd collection update-cmd brain 'git pull'");
-          console.log("  qmd collection exclude archive");
+          printHelp("collection");
           process.exit(0);
         }
 
@@ -4713,12 +4510,26 @@ if (isMain) {
       break;
 
     case "bench": {
+      if (cli.values.example) {
+        const packageRoot = findPackageRoot();
+        if (!packageRoot) {
+          exitWithError("Bundled benchmark example not found. Reinstall qmd and try again.");
+        }
+        const examplePath = resolve(packageRoot, "src", "bench", "fixtures", "example.json");
+        try {
+          process.stdout.write(readFileSync(examplePath, "utf-8"));
+        } catch {
+          exitWithError("Bundled benchmark example not found. Reinstall qmd and try again.");
+        }
+        break;
+      }
+
       const fixturePath = cli.args[0];
       if (!fixturePath) {
         console.error("Usage: qmd bench <fixture.json> [--json] [-c collection]");
         console.error("");
         console.error("Run search quality benchmarks against a fixture file.");
-        console.error("See src/bench/fixtures/example.json for the fixture format.");
+        console.error("Run 'qmd bench --example' to print an example fixture.");
         process.exit(1);
       }
       const { runBenchmark } = await import("../bench/bench.js");
@@ -4881,16 +4692,7 @@ if (isMain) {
 
         case "help":
         case undefined: {
-          console.log("Usage: qmd skill <show|install> [options]");
-          console.log("");
-          console.log("Commands:");
-          console.log("  show                 Print the QMD skill");
-          console.log("  install              Install QMD skill into ./.agents/skills/qmd");
-          console.log("");
-          console.log("Options:");
-          console.log("  --global             Install into ~/.agents/skills/qmd");
-          console.log("  --yes                Also create the .claude/skills/qmd symlink");
-          console.log("  -f, --force          Replace existing install or symlink");
+          printHelp("skill");
           process.exit(0);
         }
 
