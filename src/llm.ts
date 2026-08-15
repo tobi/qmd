@@ -764,9 +764,9 @@ async function disposeWithTimeout(resourceName: string, dispose: () => Promise<v
     if (result === "timeout") {
       process.stderr.write(`QMD Warning: timed out disposing ${resourceName}; continuing shutdown.\n`);
     }
-  } catch (error) {
+  } catch {
     process.stderr.write(
-      `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
+      `QMD Warning: failed to dispose ${resourceName}; continuing shutdown.\n`
     );
   }
 }
@@ -887,8 +887,8 @@ export class LlamaCpp implements LLM {
           this.touchActivity();
           return;
         }
-        this.unloadIdleResources().catch(err => {
-          console.error("Error unloading idle resources:", err);
+        this.unloadIdleResources().catch(() => {
+          console.error("Failed to unload idle resources.");
         });
       }, this.inactivityTimeoutMs);
       // Don't keep process alive just for this timer
@@ -1006,7 +1006,7 @@ export class LlamaCpp implements LLM {
       const loadCpuCompatibleLlama = async () => {
         try {
           return await loadLlama(false, false);
-        } catch (err) {
+        } catch {
           // Some platforms, notably Apple Silicon, ship a Metal prebuilt but no
           // CPU-only prebuilt. Do a fast no-build lookup for an actual CPU
           // binding first; if it does not exist, use the packaged auto/Metal
@@ -1014,7 +1014,7 @@ export class LlamaCpp implements LLM {
           if (!cpuForcedPrebuiltFallbackWarningShown) {
             cpuForcedPrebuiltFallbackWarningShown = true;
             process.stderr.write(
-              `QMD Warning: CPU-only llama.cpp prebuilt not available (${err instanceof Error ? err.message : String(err)}); using packaged backend with GPU offloading disabled.\n`
+              "QMD Warning: CPU-only llama.cpp prebuilt not available; using packaged backend with GPU offloading disabled.\n"
             );
           }
           return await loadLlama("auto", false);
@@ -1056,13 +1056,13 @@ export class LlamaCpp implements LLM {
               }
             }
           }
-        } catch (err) {
+        } catch {
           // GPU backend (e.g. Vulkan/CUDA on headless/driverless machines) can throw at init.
           // Fall back to CPU so qmd still works, and cache the failure to avoid repeated
           // expensive native build/probe attempts in this process.
           failedGpuInitModes.add(gpuMode);
           process.stderr.write(
-            `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
+            `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`}; falling back to CPU.\n`
           );
           llama = await loadCpuCompatibleLlama();
         }
@@ -1345,13 +1345,8 @@ export class LlamaCpp implements LLM {
           }));
         } catch (error) {
           if (this.rerankContexts.length === 0) {
-            // Surface the underlying failure (e.g. out of VRAM). A previous
-            // "retry without flash attention" path was dead: ranking contexts
-            // never accepted that option, so the retry repeated identical
-            // arguments and the real error was discarded.
-            const detail = error instanceof Error ? error.message : String(error);
             console.warn(
-              `Reranker unavailable — skipping reranking (${detail}). ` +
+              "Reranker unavailable — skipping reranking. " +
               "Use --no-rerank to silence this warning.",
             );
             return [];
@@ -1461,8 +1456,8 @@ export class LlamaCpp implements LLM {
         embedding: Array.from(embedding.vector),
         model: options.model ?? this.embedModelUri,
       };
-    } catch (error) {
-      console.error("Embedding error:", error);
+    } catch {
+      console.error("Embedding failed.");
       return null;
     }
   }
@@ -1495,8 +1490,8 @@ export class LlamaCpp implements LLM {
             const embedding = await context.getEmbeddingFor(safeText);
             this.touchActivity();
             embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-          } catch (err) {
-            console.error("Embedding error for text:", err);
+          } catch {
+            console.error("Embedding failed.");
             embeddings.push(null);
           }
         }
@@ -1522,8 +1517,8 @@ export class LlamaCpp implements LLM {
               const embedding = await ctx.getEmbeddingFor(safeText);
               this.touchActivity();
               results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-            } catch (err) {
-              console.error("Embedding error for text:", err);
+            } catch {
+              console.error("Embedding failed.");
               results.push(null);
             }
           }
@@ -1532,8 +1527,8 @@ export class LlamaCpp implements LLM {
       );
 
       return chunkResults.flat();
-    } catch (error) {
-      console.error("Batch embedding error:", error);
+    } catch {
+      console.error("Batch embedding failed.");
       return texts.map(() => null);
     }
   }
@@ -1685,8 +1680,8 @@ export class LlamaCpp implements LLM {
         { type: 'vec', text: query },
       ];
       return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
-    } catch (error) {
-      console.error("Structured query expansion failed:", error);
+    } catch {
+      console.error("Structured query expansion failed.");
       // Fallback to original query
       const fallback: Queryable[] = [{ type: 'vec', text: query }];
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });

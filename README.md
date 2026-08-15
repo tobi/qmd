@@ -149,10 +149,28 @@ The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
-The HTTP server exposes two endpoints:
+The HTTP server exposes these endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
-- `POST /query` (alias `/search`) — structured search without the MCP protocol
-- `GET /health` — liveness check with uptime
+- `POST /query` (alias `/search`) — compatible structured search without the MCP protocol
+- `GET /health` — liveness and daemon capability information
+- `POST /v1/search` — versioned search with typed semantic or lexical-degraded outcomes
+- `POST /v1/update` — schedule a coalesced collection update
+- `POST /v1/embed` — schedule an explicit embedding operation
+- `GET /v1/operations/:id` — inspect an update, embed, or collection setup operation
+- `GET /v1/collections` — list collection metadata
+- `POST /v1/collections/ensure` — schedule collection setup and optional context changes
+
+The HTTP daemon is the single owner of the QMD store and local models. Plain queries,
+vector or HyDE searches, and reranking use one bounded work queue. Only an explicit
+`lex` search with `rerank: false` bypasses that queue. Queue saturation, queue timeouts,
+or semantic errors return a lexical result with a `reason` when the lexical store is
+available. An empty degraded result is not authoritative. Automatic lexical degradation
+is limited to two concurrent searches. Excess
+work returns `status: "unavailable"` and `authoritativeEmpty: false`; callers should use
+their own keyword fallback. Collection updates, embedding, and collection setup are
+exclusive with all reads. Embedding is never started automatically by the daemon.
+Request logs contain only fixed route labels and duration. They omit request
+bodies, query text, collection paths, and raw errors.
 
 
 ##### Origin and Host validation

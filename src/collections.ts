@@ -209,7 +209,11 @@ export function loadConfig(): CollectionConfig {
 export function saveConfig(config: CollectionConfig): void {
   // SDK inline config mode: update in place, no file I/O
   if (configSource.type === 'inline') {
-    configSource.config = config;
+    const target = configSource.config;
+    if (target !== config) {
+      for (const key of Object.keys(target)) Reflect.deleteProperty(target, key);
+      Object.assign(target, config);
+    }
     return;
   }
 

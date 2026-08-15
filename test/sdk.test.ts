@@ -195,14 +195,19 @@ describe("collection management", () => {
     expect(removed).toBe(false);
   });
 
-  test("renameCollection renames a collection", async () => {
+  test("renameCollection renames metadata and indexed documents", async () => {
     await store.addCollection("old-name", { path: docsDir, pattern: "**/*.md" });
+    await store.update({ collections: ["old-name"] });
     const renamed = await store.renameCollection("old-name", "new-name");
 
     expect(renamed).toBe(true);
     const names = (await store.listCollections()).map(c => c.name);
     expect(names).toContain("new-name");
     expect(names).not.toContain("old-name");
+    const indexed = store.internal.db
+      .prepare(`SELECT DISTINCT collection FROM documents`)
+      .all() as Array<{ collection: string }>;
+    expect(indexed).toEqual([{ collection: "new-name" }]);
   });
 
   test("renameCollection returns false for non-existent source", async () => {
@@ -386,6 +391,40 @@ describe("inline config isolation", () => {
     await store.close();
   });
 
+  test("collection batches update and restore the caller's inline config", async () => {
+    const config: CollectionConfig = {
+      collections: {
+        docs: { path: docsDir, pattern: "*.md" },
+      },
+    };
+    const store = await createStore({ dbPath: freshDbPath(), config });
+
+    await store.applyCollectionMutations([
+      { kind: "upsert", name: "docs", path: notesDir },
+    ]);
+    expect(config.collections.docs).toEqual({
+      path: notesDir,
+      pattern: "*.md",
+    });
+
+    await expect(
+      store.applyCollectionMutations([
+        { kind: "upsert", name: "docs", path: docsDir },
+        {
+          kind: "context",
+          collection: "missing",
+          path: "/",
+          context: "Missing",
+        },
+      ]),
+    ).rejects.toThrow("collection context update failed");
+    expect(config.collections.docs).toEqual({
+      path: notesDir,
+      pattern: "*.md",
+    });
+    await store.close();
+  });
+
   test("two stores with different inline configs are independent", async () => {
     const store1 = await createStore({
       dbPath: freshDbPath(),
@@ -452,6 +491,82 @@ describe("YAML config file mode", () => {
     const parsed = YAML.parse(raw) as CollectionConfig;
     expect(parsed.collections).toHaveProperty("newcol");
     expect(parsed.collections.newcol!.path).toBe(docsDir);
+  });
+
+  test("partial collection updates preserve existing settings", async () => {
+    const configPath = join(testDir, `config-preserve-${Date.now()}.yml`);
+    writeFileSync(
+      configPath,
+      YAML.stringify({
+        collections: {
+          docs: {
+            path: docsDir,
+            pattern: "*.md",
+            ignore: ["drafts/**"],
+            includeByDefault: false,
+            update: "git pull --ff-only",
+            context: { "/": "Documentation" },
+          },
+        },
+      }),
+    );
+
+    const store = await createStore({ dbPath: freshDbPath(), configPath });
+    await store.addCollection("docs", { path: notesDir });
+    const row = store.internal.db
+      .prepare(
+        `
+      SELECT path, pattern, ignore_patterns, include_by_default, update_command, context
+      FROM store_collections WHERE name = 'docs'
+    `,
+      )
+      .get();
+    expect(row).toEqual({
+      path: notesDir,
+      pattern: "*.md",
+      ignore_patterns: JSON.stringify(["drafts/**"]),
+      include_by_default: 0,
+      update_command: "git pull --ff-only",
+      context: JSON.stringify({ "/": "Documentation" }),
+    });
+    await store.close();
+
+    const parsed = YAML.parse(
+      readFileSync(configPath, "utf-8"),
+    ) as CollectionConfig;
+    expect(parsed.collections.docs).toEqual({
+      path: notesDir,
+      pattern: "*.md",
+      ignore: ["drafts/**"],
+      includeByDefault: false,
+      update: "git pull --ff-only",
+      context: { "/": "Documentation" },
+    });
+  });
+
+  test("collection mutation batches roll back on failure", async () => {
+    const configPath = join(testDir, `config-rollback-${Date.now()}.yml`);
+    writeFileSync(configPath, YAML.stringify({ collections: {} }));
+    const store = await createStore({ dbPath: freshDbPath(), configPath });
+
+    await expect(
+      store.applyCollectionMutations([
+        { kind: "upsert", name: "notes", path: notesDir },
+        {
+          kind: "context",
+          collection: "missing",
+          path: "/",
+          context: "Missing",
+        },
+      ]),
+    ).rejects.toThrow("collection context update failed");
+    expect(await store.listCollections()).toEqual([]);
+    await store.close();
+
+    const parsed = YAML.parse(
+      readFileSync(configPath, "utf-8"),
+    ) as CollectionConfig;
+    expect(parsed.collections).toEqual({});
   });
 
   test("context persists to YAML file", async () => {

@@ -240,7 +240,7 @@ async function loadGrammar(language: SupportedLanguage): Promise<LanguageType | 
     grammarCache.delete(wasmKey);
     const message = formatGrammarLoadError(language, err);
     grammarLoadErrors.set(language, message);
-    console.warn(`[qmd] AST grammar unavailable for ${language}: ${message}`);
+    console.warn(`[qmd] AST grammar unavailable for ${language}.`);
     return null;
   }
 }
@@ -316,8 +316,8 @@ export async function getASTBreakPoints(
     parser.delete();
 
     return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
-  } catch (err) {
-    console.warn(`[qmd] AST parse failed for ${filepath}, falling back to regex: ${err instanceof Error ? err.message : err}`);
+  } catch {
+    console.warn("[qmd] AST parse failed; falling back to regex.");
     return [];
   }
 }

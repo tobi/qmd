@@ -71,9 +71,8 @@ import {
 import {
   setConfigSource,
   loadConfig,
-  addCollection as collectionsAddCollection,
+  saveConfig,
   removeCollection as collectionsRemoveCollection,
-  renameCollection as collectionsRenameCollection,
   addContext as collectionsAddContext,
   removeContext as collectionsRemoveContext,
   setGlobalContext as collectionsSetGlobalContext,
@@ -218,6 +217,17 @@ export interface StoreOptions {
   config?: CollectionConfig;
 }
 
+export type CollectionMutation =
+  | {
+      kind: "upsert";
+      name: string;
+      path: string;
+      pattern?: string;
+      ignore?: string[];
+    }
+  | { kind: "rename"; from: string; to: string }
+  | { kind: "context"; collection: string; path: string; context: string };
+
 /**
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
@@ -266,6 +276,9 @@ export interface QMDStore {
 
   /** Rename a collection */
   renameCollection(oldName: string, newName: string): Promise<boolean>;
+
+  /** Apply collection changes as one database transaction and one config write */
+  applyCollectionMutations(mutations: CollectionMutation[]): Promise<void>;
 
   /** List all collections with document stats */
   listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
@@ -445,10 +458,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Collection Management — write to SQLite + write-through to YAML/inline if configured
     addCollection: async (name, opts) => {
-      upsertStoreCollection(db, name, { path: opts.path, pattern: opts.pattern, ignore: opts.ignore });
-      if (hasYamlConfig || options.config) {
-        collectionsAddCollection(name, opts.path, opts.pattern);
-      }
+      await store.applyCollectionMutations([{ kind: "upsert", name, ...opts }]);
     },
     removeCollection: async (name) => {
       const result = deleteStoreCollection(db, name);
@@ -458,11 +468,117 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
-      if (hasYamlConfig || options.config) {
-        collectionsRenameCollection(oldName, newName);
+      if (!getStoreCollection(db, oldName)) return false;
+      await store.applyCollectionMutations([
+        { kind: "rename", from: oldName, to: newName },
+      ]);
+      return true;
+    },
+    applyCollectionMutations: async (mutations) => {
+      const writesConfig = hasYamlConfig || options.config !== undefined;
+      const previousConfig = writesConfig
+        ? structuredClone(loadConfig())
+        : undefined;
+      const nextConfig = previousConfig
+        ? structuredClone(previousConfig)
+        : undefined;
+      const apply = db.transaction(() => {
+        for (const mutation of mutations) {
+          if (mutation.kind === "rename") {
+            if (!renameStoreCollection(db, mutation.from, mutation.to)) {
+              throw new Error("collection rename failed");
+            }
+            if (nextConfig) {
+              const source = nextConfig.collections[mutation.from];
+              if (!source || nextConfig.collections[mutation.to]) {
+                throw new Error("collection rename failed");
+              }
+              nextConfig.collections[mutation.to] = source;
+              delete nextConfig.collections[mutation.from];
+            }
+            continue;
+          }
+
+          if (mutation.kind === "upsert") {
+            const current = getStoreCollection(db, mutation.name);
+            upsertStoreCollection(db, mutation.name, {
+              ...(current ?? {}),
+              path: mutation.path,
+              pattern: mutation.pattern ?? current?.pattern,
+              ...(mutation.ignore !== undefined
+                ? { ignore: mutation.ignore }
+                : {}),
+            });
+            if (nextConfig) {
+              const configured = nextConfig.collections[mutation.name];
+              nextConfig.collections[mutation.name] = {
+                ...configured,
+                path: mutation.path,
+                pattern:
+                  mutation.pattern ??
+                  configured?.pattern ??
+                  current?.pattern ??
+                  "**/*.md",
+                ...(mutation.ignore !== undefined
+                  ? { ignore: mutation.ignore }
+                  : {}),
+              };
+            }
+            continue;
+          }
+
+          if (!getStoreCollection(db, mutation.collection)) {
+            throw new Error("collection context update failed");
+          }
+          if (mutation.context.length === 0) {
+            removeStoreContext(db, mutation.collection, mutation.path);
+          } else if (
+            !updateStoreContext(
+              db,
+              mutation.collection,
+              mutation.path,
+              mutation.context,
+            )
+          ) {
+            throw new Error("collection context update failed");
+          }
+          if (nextConfig) {
+            const configured = nextConfig.collections[mutation.collection];
+            if (!configured) {
+              throw new Error("collection context update failed");
+            }
+            if (mutation.context.length === 0) {
+              if (configured.context) {
+                delete configured.context[mutation.path];
+                if (Object.keys(configured.context).length === 0) {
+                  delete configured.context;
+                }
+              }
+            } else {
+              configured.context = {
+                ...configured.context,
+                [mutation.path]: mutation.context,
+              };
+            }
+          }
+        }
+        if (nextConfig) {
+          saveConfig(nextConfig);
+        }
+      });
+
+      try {
+        apply();
+      } catch (error) {
+        if (previousConfig) {
+          try {
+            saveConfig(previousConfig);
+          } catch {
+            // Preserve the original mutation failure.
+          }
+        }
+        throw error;
       }
-      return result;
     },
     listCollections: async () => storeListCollections(db),
     getDefaultCollectionNames: async () => {

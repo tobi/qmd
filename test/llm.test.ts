@@ -369,7 +369,9 @@ describe("native llama stdout containment", () => {
       expect(stdoutSpy).not.toHaveBeenCalled();
       expect(stderrSpy).toHaveBeenCalledWith("cmake build spam\n", undefined, undefined);
       expect(calls).toEqual(["cuda", false, false]);
-      expect(String(stderrSpy.mock.calls.map(call => call[0]).join(""))).toContain("skipping previously failed GPU init");
+      const stderr = String(stderrSpy.mock.calls.map(call => call[0]).join(""));
+      expect(stderr).toContain("skipping previously failed GPU init");
+      expect(stderr).not.toContain("CUDA unavailable");
     } finally {
       stdoutSpy.mockRestore();
       stderrSpy.mockRestore();
@@ -721,7 +723,7 @@ describe("LlamaCpp rerank deduping", () => {
 });
 
 describe("LlamaCpp ensureRerankContexts error reporting", () => {
-  test("warns with the underlying error and does not retry identical options", async () => {
+  test("uses a safe warning and does not retry identical options", async () => {
     const llm = new LlamaCpp({}) as any;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -737,8 +739,9 @@ describe("LlamaCpp ensureRerankContexts error reporting", () => {
       expect(contexts).toEqual([]);
       expect(createRankingContext).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("A context size of 40960 is too large for the available VRAM"),
+        "Reranker unavailable — skipping reranking. Use --no-rerank to silence this warning.",
       );
+      expect(warn.mock.calls.flat().join(" ")).not.toContain("40960");
     } finally {
       warn.mockRestore();
     }

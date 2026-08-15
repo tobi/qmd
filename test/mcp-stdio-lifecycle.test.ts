@@ -112,7 +112,7 @@ describe("registerStdioEofShutdown", () => {
 
     expect(r.calls).toEqual(["idle-wait", "llm-dispose", "store-close"]);
     expect(r.warnings.join("")).toContain("server.close() failed during stdio shutdown");
-    expect(r.warnings.join("")).toContain("transport already gone");
+    expect(r.warnings.join("")).not.toContain("transport already gone");
     expect(r.exitCodes).toEqual([1]);
   });
 

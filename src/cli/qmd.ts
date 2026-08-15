@@ -4826,15 +4826,16 @@ if (isMain) {
           } catch { /* ignore */ }
         };
         process.on("exit", unlinkOwnPidfile);
-        const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
+          const { startMcpHttpServer } = await import("../mcp/server.js");
           await startMcpHttpServer(port, { dbPath: getDbPath(), host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
             process.exit(1);
           }
-          throw e;
+          console.error("QMD MCP server failed to start.");
+          process.exit(1);
         }
       } else {
         // Default: stdio transport

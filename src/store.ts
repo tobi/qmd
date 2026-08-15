@@ -1145,7 +1145,7 @@ function initializeDatabase(db: Database): void {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
     _sqliteVecUnavailableReason = getErrorMessage(err);
-    console.warn(_sqliteVecUnavailableReason);
+    console.warn("sqlite-vec extension is unavailable; vector search is disabled.");
   }
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -1336,14 +1336,19 @@ export function deleteStoreCollection(db: Database, name: string): boolean {
 }
 
 export function renameStoreCollection(db: Database, oldName: string, newName: string): boolean {
-  // Check target doesn't exist
-  const existing = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(newName) as { name: string } | null | undefined;
-  if (existing != null) {
-    throw new Error(`Collection '${newName}' already exists`);
-  }
+  const rename = db.transaction(() => {
+    const existing = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(newName) as { name: string } | null | undefined;
+    if (existing != null) {
+      throw new Error(`Collection '${newName}' already exists`);
+    }
 
-  const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
-  return result.changes > 0;
+    const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
+    if (result.changes > 0) {
+      db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+    }
+    return result.changes > 0;
+  });
+  return rename();
 }
 
 export function updateStoreContext(db: Database, collectionName: string, path: string, text: string): boolean {
@@ -3592,16 +3597,8 @@ export function removeCollection(db: Database, collectionName: string): { delete
   };
 }
 
-/**
- * Rename a collection.
- * Updates both YAML config and database documents table.
- */
+/** Rename a collection and its indexed documents. */
 export function renameCollection(db: Database, oldName: string, newName: string): void {
-  // Update all documents with the new collection name in database
-  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
-    .run(newName, oldName);
-
-  // Rename in store_collections
   renameStoreCollection(db, oldName, newName);
 }
 
