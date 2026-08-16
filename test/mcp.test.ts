@@ -17,6 +17,7 @@ import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
+import { initializeMetadataSchema } from "../src/metadata-store";
 
 // =============================================================================
 // Test Database Setup
@@ -124,6 +125,9 @@ function initTestDatabase(db: Database): void {
       value TEXT
     )
   `);
+
+  // Document metadata tables — searchFTS/searchVec join them for result metadata
+  initializeMetadataSchema(db);
 }
 
 function seedTestData(db: Database): void {

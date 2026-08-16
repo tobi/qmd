@@ -68,6 +68,20 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+} from "./metadata.js";
+import {
+  parseMetadataFilter,
+  MetadataFilterError,
+  type MetadataFilter,
+  type MetadataFilterGroup,
+  type MetadataFilterNegation,
+  type MetadataCondition,
+} from "./metadata-filter.js";
 import {
   setConfigSource,
   loadConfig,
@@ -108,6 +122,19 @@ export type {
   NamedCollection,
   ContextMap,
 };
+
+// Re-export metadata and metadata-filter types shared by every search surface
+export type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+  MetadataFilter,
+  MetadataFilterGroup,
+  MetadataFilterNegation,
+  MetadataCondition,
+};
+export { parseMetadataFilter, MetadataFilterError };
 
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
@@ -161,6 +188,8 @@ export interface SearchOptions {
   collection?: string;
   /** Filter to specific collections */
   collections?: string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
   /** Max results (default: 10) */
   limit?: number;
   /** Max candidates to rerank (default: 40) */
@@ -179,6 +208,8 @@ export interface SearchOptions {
 export interface LexSearchOptions {
   limit?: number;
   collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
@@ -187,6 +218,8 @@ export interface LexSearchOptions {
 export interface VectorSearchOptions {
   limit?: number;
   collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
@@ -410,6 +443,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
+          filter: opts.filter,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -423,6 +457,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
         collection: collections.length > 0 ? collections : undefined,
+        filter: opts.filter,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -432,8 +467,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.filter),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, opts?.filter),
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

@@ -22,9 +22,12 @@ import {
   addLineNumbers,
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  parseMetadataFilter,
   type QMDStore,
   type ExpandedQuery,
   type IndexStatus,
+  type DocumentMetadata,
+  type MetadataFilter,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
@@ -40,9 +43,23 @@ type SearchResultItem = {
   title: string;
   score: number;
   context: string | null;
+  metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
   line: number;   // Absolute line in source markdown
   snippet: string;
 };
+
+/**
+ * Validate an untrusted `filter` argument through the shared runtime
+ * validator. Returns the parse error message when invalid.
+ */
+function validateFilterArgument(filter: unknown): { filter?: MetadataFilter; error?: string } {
+  if (filter === undefined) return {};
+  try {
+    return { filter: parseMetadataFilter(filter) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 type StatusResult = {
   totalDocuments: number;
@@ -328,6 +345,15 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        filter: z.record(z.string(), z.unknown()).optional().describe(
+          "Metadata filter (recursive JSON AST). Every returned result satisfies it. " +
+          "Nodes are operator-discriminated: logical groups {operator:'and'|'or', operands:[...]}, " +
+          "negation {operator:'not', operand:{...}}, and conditions {key, operator, value} with " +
+          "operators eq/ne/gt/gte/lt/lte (comparison), in/nin/all (membership), exists (presence). " +
+          "Values are typed exactly (no coercion); missing keys do not match ne/nin. " +
+          "Example: {\"operator\":\"and\",\"operands\":[{\"key\":\"topics\",\"operator\":\"all\",\"value\":[\"typescript\"]}," +
+          "{\"key\":\"status\",\"operator\":\"ne\",\"value\":\"draft\"}]}"
+        ),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
@@ -336,7 +362,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -347,6 +373,14 @@ Intent-aware lex (C++ performance, not sports):
       if (query && searches && searches.length > 0) {
         return {
           content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
+          isError: true,
+        };
+      }
+
+      const filterValidation = validateFilterArgument(filter);
+      if (filterValidation.error) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${filterValidation.error}` }],
           isError: true,
         };
       }
@@ -363,6 +397,7 @@ Intent-aware lex (C++ performance, not sports):
       const results = await store.search({
         ...searchOptions,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        filter: filterValidation.filter,
         limit,
         minScore,
         candidateLimit,
@@ -385,6 +420,7 @@ Intent-aware lex (C++ performance, not sports):
           title: r.title,
           score: Math.round(r.score * 100) / 100,
           context: r.context,
+          ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
           line,
           snippet: addLineNumbers(snippet, line),
         };
@@ -998,12 +1034,30 @@ export async function startMcpHttpServer(
           query: String(s.query || ""),
         }));
 
+        // Optional metadata filter — must be an object and a valid filter AST
+        let restFilter: MetadataFilter | undefined;
+        if (params.filter !== undefined) {
+          if (typeof params.filter !== "object" || params.filter === null || Array.isArray(params.filter)) {
+            nodeRes.writeHead(400, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({ error: "Invalid field: filter (must be an object)" }));
+            return;
+          }
+          const filterValidation = validateFilterArgument(params.filter);
+          if (filterValidation.error) {
+            nodeRes.writeHead(400, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({ error: filterValidation.error }));
+            return;
+          }
+          restFilter = filterValidation.filter;
+        }
+
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
         const results = await store.search({
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          filter: restFilter,
           limit: typeof params.limit === "number" ? params.limit : 10,
           minScore: typeof params.minScore === "number" ? params.minScore : 0,
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
@@ -1024,6 +1078,7 @@ export async function startMcpHttpServer(
             title: r.title,
             score: Math.round(r.score * 100) / 100,
             context: r.context,
+            ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };
