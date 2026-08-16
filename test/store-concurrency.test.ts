@@ -2,9 +2,11 @@
  * store-concurrency.test.ts - concurrent schema-init safety
  *
  * Reproduces cross-process races in cold store initialization: WAL migration,
+ * FTS virtual-table CREATE (`table documents_fts already exists` on Bun/macOS),
  * FTS sync trigger rebuild, and CJK FTS normalization shadow-table rebuild.
  */
 import { describe, test, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -19,6 +21,9 @@ const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
 const WORKERS = isBunRuntime ? (process.platform === "darwin" ? 16 : 12) : 6;
+// A single unlucky schedule can miss the FTS CREATE race that Bun/macOS CI
+// hits. Two cold trials keep the test tight without blowing the 60s budget.
+const COLD_TRIALS = 2;
 
 type WorkerResult = { code: number | null; stderr: string };
 
@@ -41,8 +46,10 @@ async function openConcurrently(dbPath: string, n: number): Promise<WorkerResult
 
 function expectAllSucceeded(results: WorkerResult[]): void {
   const failed = results.filter(r => r.code !== 0);
+  const joined = failed.map(r => r.stderr.trim()).join("\n---\n");
   // On failure the joined worker stderr is surfaced by the assertion below.
-  expect(failed.map(r => r.stderr.trim()).join("\n---\n")).toBe("");
+  expect(joined).toBe("");
+  expect(joined).not.toMatch(/already exists/i);
   expect(failed).toHaveLength(0);
 }
 
@@ -79,15 +86,49 @@ function expectSchemaIntact(dbPath: string): void {
 }
 
 describe("concurrent store initialization", () => {
+  test("FTS table create is serialized (IF NOT EXISTS + BEGIN IMMEDIATE)", () => {
+    const storeSrc = readFileSync(join(projectRoot, "src", "store.ts"), "utf8");
+    const startIdx = storeSrc.indexOf("const DOCUMENTS_FTS_DDL");
+    const ensureIdx = storeSrc.indexOf("function ensureDocumentsFtsSchema(");
+    const endIdx = storeSrc.indexOf("function cjkRebuildVersion(", ensureIdx);
+    expect(startIdx).toBeGreaterThan(-1);
+    expect(ensureIdx).toBeGreaterThan(startIdx);
+    expect(endIdx).toBeGreaterThan(ensureIdx);
+
+    const createBody = storeSrc.slice(startIdx, ensureIdx)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map(line => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+    const ensureBody = storeSrc.slice(ensureIdx, endIdx)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map(line => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+
+    expect(createBody).toMatch(/CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts/);
+    expect(createBody).toContain("isAlreadyExistsError");
+    expect(ensureBody).toContain("BEGIN IMMEDIATE");
+    expect(ensureBody).toContain("createDocumentsFtsTable");
+    // initializeDatabase must not autocommit-create the FTS table outside the lock.
+    const initStart = storeSrc.indexOf("function initializeDatabase(");
+    const initEnd = storeSrc.indexOf("function rowToNamedCollection(", initStart);
+    const initBody = storeSrc.slice(initStart, initEnd);
+    expect(initBody).not.toMatch(/CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts/);
+    expect(initBody).toContain("ensureDocumentsFtsSchema");
+  });
+
   test("cold database: N processes initialize without colliding on FTS setup", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "qmd-store-concurrency-"));
-    const dbPath = join(dir, "index.sqlite");
-    try {
-      const results = await openConcurrently(dbPath, WORKERS);
-      expectAllSucceeded(results);
-      expectSchemaIntact(dbPath);
-    } finally {
-      await rm(dir, { recursive: true, force: true });
+    for (let trial = 0; trial < COLD_TRIALS; trial++) {
+      const dir = await mkdtemp(join(tmpdir(), "qmd-store-concurrency-"));
+      const dbPath = join(dir, "index.sqlite");
+      try {
+        const results = await openConcurrently(dbPath, WORKERS);
+        expectAllSucceeded(results);
+        expectSchemaIntact(dbPath);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     }
   }, 60_000);
 

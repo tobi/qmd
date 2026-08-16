@@ -1001,28 +1001,71 @@ function documentsFtsSchemaIsCurrent(db: Database): boolean {
   return names.has("filepath") && names.has("title") && names.has("body") && !names.has("name");
 }
 
+function isAlreadyExistsError(err: unknown): boolean {
+  return /already exists/i.test(getErrorMessage(err));
+}
+
+function documentsFtsExists(db: Database): boolean {
+  const row = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+  ).get() as { name?: string } | undefined | null;
+  return Boolean(row?.name);
+}
+
+// FTS5 CREATE VIRTUAL TABLE IF NOT EXISTS is not atomic across WAL connections.
+// Two first-open processes can both observe a missing table on their schema
+// snapshot; the loser then throws `table documents_fts already exists`
+// (Bun/macOS CI). IF NOT EXISTS still helps the uncontended path, and a
+// concurrent "already exists" is treated as success when the table is present.
+const DOCUMENTS_FTS_DDL = `
+  CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+    filepath, title, body,
+    tokenize='porter unicode61'
+  )
+`;
+
+function createDocumentsFtsTable(db: Database): void {
+  try {
+    db.exec(DOCUMENTS_FTS_DDL);
+  } catch (err) {
+    if (!isAlreadyExistsError(err) || !documentsFtsExists(db)) throw err;
+  }
+}
+
 function recreateDocumentsFts(db: Database): void {
   db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
   db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
   db.exec(`DROP TRIGGER IF EXISTS documents_au`);
   db.exec(`DROP TABLE IF EXISTS documents_fts`);
-  db.exec(`
-    CREATE VIRTUAL TABLE documents_fts USING fts5(
-      filepath, title, body,
-      tokenize='porter unicode61'
-    )
-  `);
+  createDocumentsFtsTable(db);
   db.exec(`DELETE FROM store_config WHERE key = 'fts_cjk_normalized_version'`);
 }
 
+// Missing-table create and legacy-schema repair share one IMMEDIATE
+// transaction with a double-checked read, matching applyFtsSyncTriggers:
+// the DROP+CREATE (or first CREATE) is atomic across connections, and
+// losers skip once any process has published the current table.
 function ensureDocumentsFtsSchema(db: Database): void {
   if (documentsFtsSchemaIsCurrent(db)) return;
-  recreateDocumentsFts(db);
-  // recreateDocumentsFts dropped the sync triggers. applyFtsSyncTriggers
-  // only reinstalls them when user_version is stale, so a DB that already
-  // has the current user_version would otherwise be left untriggered.
-  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) {
-    installFtsSyncTriggers(db);
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (!documentsFtsSchemaIsCurrent(db)) {
+      if (documentsFtsExists(db)) {
+        recreateDocumentsFts(db);
+        // recreateDocumentsFts dropped the sync triggers. applyFtsSyncTriggers
+        // only reinstalls them when user_version is stale, so a DB that already
+        // has the current user_version would otherwise be left untriggered.
+        if (getUserVersion(db) >= STORE_SCHEMA_VERSION) {
+          installFtsSyncTriggers(db);
+        }
+      } else {
+        createDocumentsFtsTable(db);
+      }
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
   }
 }
 
@@ -1230,14 +1273,9 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // FTS - index filepath (collection/path), title, and content
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      filepath, title, body,
-      tokenize='porter unicode61'
-    )
-  `);
-
+  // FTS - index filepath (collection/path), title, and content.
+  // Do not CREATE VIRTUAL TABLE here as an autocommit statement: FTS5
+  // IF NOT EXISTS races under WAL (see createDocumentsFtsTable).
   ensureDocumentsFtsSchema(db);
   applyFtsSyncTriggers(db);
 
