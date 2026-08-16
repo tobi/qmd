@@ -151,7 +151,7 @@ runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
-- `POST /query` (alias `/search`) — structured search without the MCP protocol
+- `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
 - `GET /health` — liveness check with uptime
 
 
@@ -187,6 +187,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 |------|-----------|------|-------|
 | `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. **Required.** First gets 2x weight. |
 | `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
+| `query` | `filter` | object | Metadata filter (recursive `operator`-discriminated JSON AST; see [Metadata Filtering](#metadata-filtering)) |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
@@ -292,6 +293,20 @@ const results3 = await store.search({
 
 // Skip reranking for faster results
 const fast = await store.search({ query: "auth", rerank: false })
+
+// Metadata filter — every returned result satisfies it (also available on
+// searchLex() and searchVector()); results expose indexed metadata via
+// r.metadata. See "Metadata Filtering" for the full grammar.
+const published = await store.search({
+  query: "authentication flow",
+  filter: {
+    operator: "and",
+    operands: [
+      { key: "topics", operator: "all", value: ["typescript"] },
+      { key: "status", operator: "ne", value: "draft" },
+    ],
+  },
+})
 ```
 
 For direct backend access:
@@ -860,6 +875,7 @@ and `deep-search` (→ `query`).
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)
+--filter <json>    # Metadata filter (recursive JSON AST; see Metadata Filtering)
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
 --no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
@@ -902,6 +918,72 @@ explicitly with `-c`.
 > **Note:** With multiple `-c` flags, results come from a global top-K pool and are
 > then filtered. If one collection dominates the rankings, matches from smaller
 > collections may not appear at the default limit — raise `-n` or use `--all`.
+
+### Metadata Filtering
+
+Documents can opt into typed metadata through a namespaced frontmatter block. A document without `qmd.metadata` behaves exactly as before, and the frontmatter stays ordinary searchable content (no chunking, embedding, or line-number changes):
+
+```markdown
+---
+qmd:
+  metadata:
+    topics:
+      - typescript
+      - programming
+    status: published
+    priority: 3
+    reviewed: true
+---
+
+# Document body starts here
+```
+
+Supported values are strings, numbers, booleans, and flat homogeneous arrays of one of those. Nested objects, nulls, empty arrays, and mixed-type arrays are rejected (the document still indexes; it is excluded from filtered search until corrected). Metadata keys are user-defined data — `tags`, `topics`, and `labels` are all ordinary keys with no special semantics.
+
+Every search surface (CLI, SDK, MCP, HTTP) accepts the same recursive filter, a JSON AST discriminated by `operator`:
+
+```sh
+# One condition
+qmd search "authentication" \
+  --filter '{"key":"status","operator":"eq","value":"published"}'
+
+# Composed conditions — works with search, vsearch, and query
+qmd query "dependency injection" --filter '{
+  "operator": "and",
+  "operands": [
+    { "key": "topics", "operator": "all", "value": ["typescript", "programming"] },
+    { "key": "status", "operator": "nin", "value": ["draft", "archived"] },
+    { "operator": "or", "operands": [
+      { "key": "priority", "operator": "gte", "value": 3 },
+      { "key": "reviewed", "operator": "eq", "value": true }
+    ] },
+    { "operator": "not", "operand": { "key": "audience", "operator": "eq", "value": "internal" } }
+  ]
+}'
+```
+
+| Node | Shape |
+|------|-------|
+| Logical group | `{ "operator": "and" \| "or", "operands": […] }` |
+| Negation | `{ "operator": "not", "operand": {…} }` |
+| Comparison | `{ "key", "operator": "eq" \| "ne" \| "gt" \| "gte" \| "lt" \| "lte", "value" }` |
+| Membership | `{ "key", "operator": "in" \| "nin" \| "all", "value": […] }` |
+| Presence | `{ "key", "operator": "exists", "value": true \| false }` |
+
+Semantics:
+
+- Matching is typed and exact — no string/number/boolean coercion, and a type mismatch never matches (including `ne` and `nin`).
+- Array-valued metadata is a set: a condition matches when any element satisfies it, `all` requires every filter value to be present.
+- Missing keys do not match `ne`/`nin`; combine with `{ "operator": "exists", "value": false }` in an `or` group to include them.
+- Multiple conditions require an explicit `and` group — there is no implicit AND, and no `$`-prefixed shorthand.
+
+Guarantees and limits:
+
+- Every returned result satisfies the filter, before RRF fusion and reranking.
+- Like collection filtering, highly selective filters are best-effort for top-K completeness: backends over-fetch and post-filter, so a very selective filter can return fewer than `limit` results.
+- Filtered search only considers documents whose metadata has been extracted (run `qmd update` after upgrading; `qmd status` shows the pending count).
+
+JSON output (`--format json`), the SDK, MCP structured results, and the HTTP endpoints include each result's indexed metadata.
 
 ### Output Format
 

@@ -199,6 +199,17 @@ qmd query "merchant support product reality" -c concepts -c sources -n 10
 
 Omit `-c` to search everything.
 
+## Filter by metadata
+
+Documents can carry typed metadata in a `qmd.metadata` frontmatter block (strings, numbers, booleans, or flat arrays). `search`, `vsearch`, and `query` accept `--filter` with a recursive JSON AST; every returned result satisfies it:
+
+```bash
+qmd search "authentication" --filter '{"key":"status","operator":"eq","value":"published"}'
+qmd query "dependency injection" --filter '{"operator":"and","operands":[{"key":"topics","operator":"all","value":["typescript"]},{"key":"status","operator":"nin","value":["draft","archived"]}]}'
+```
+
+Nodes are discriminated by `operator`: groups `and`/`or` take `operands`, `not` takes one `operand`, and conditions take `key` + `value` with operators `eq`/`ne`/`gt`/`gte`/`lt`/`lte` (comparison), `in`/`nin`/`all` (membership), or `exists` (presence). Matching is typed and exact; missing keys do not match `ne`/`nin` (add an `exists: false` branch in an `or` group to include them). The MCP `query` tool accepts the same AST as a `filter` object. JSON output includes each result's `metadata`.
+
 ## MCP Tool: `query`
 
 When using the MCP server, prefer structured searches:
