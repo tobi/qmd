@@ -87,6 +87,11 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
+import {
+  buildDoctorVectorSampleResult,
+  classifyDoctorVectorDistance,
+  type DoctorVectorSampleResult,
+} from "../doctor-vector-repro.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, withLLMSessionForLlm, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -3755,11 +3760,6 @@ function shortHashSeq(hashSeq: string): string {
   return `${hashSeq.slice(0, 12)}_${hashSeq.slice(idx + 1)}`;
 }
 
-type DoctorVectorSampleResult = {
-  ok: boolean;
-  details: string;
-};
-
 function decodeStoredEmbedding(bytes: Uint8Array): Float32Array {
   return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
 }
@@ -3983,12 +3983,12 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
 async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, llm: LlamaCpp, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
-    return { ok: true, details: "no active documents indexed" };
+    return { ok: true, details: "no active documents indexed", forceRebuild: false };
   }
 
   const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!vecTableExists) {
-    return { ok: false, details: "no vector table to test; please run qmd embed again" };
+    return { ok: false, details: "no vector table to test; please run qmd embed again", forceRebuild: true };
   }
 
   const samples = db.prepare(`
@@ -4003,11 +4003,12 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
 
   if (samples.length === 0) {
-    return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
+    return { ok: false, details: "no current embedded chunks to test; please run qmd embed again", forceRebuild: true };
   }
 
-  const threshold = 0.0001;
   const mismatches: string[] = [];
+  const remoteDrifts: string[] = [];
+  const remoteEmbedding = llm.isRemoteEmbed();
 
   await withLLMSessionForLlm(llm, async (session) => {
     for (const sample of samples) {
@@ -4033,23 +4034,16 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
       }
 
       const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
-      if (distance > threshold) {
+      const classification = classifyDoctorVectorDistance(distance, remoteEmbedding);
+      if (classification === "mismatch") {
         mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
+      } else if (classification === "remote-drift") {
+        remoteDrifts.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
       }
     }
   }, { maxDuration: 10 * 60 * 1000, name: "doctorEmbeddingVectorSample" });
 
-  if (mismatches.length > 0) {
-    return {
-      ok: false,
-      details: `${mismatches.length}/${samples.length} sampled chunks differ from stored vectors (${mismatches[0]}). Rebuild with \`qmd embed --force\``,
-    };
-  }
-
-  return {
-    ok: true,
-    details: `${samples.length} sampled ${samples.length === 1 ? "chunk" : "chunks"} reproduce stored vectors`,
-  };
+  return buildDoctorVectorSampleResult(samples.length, mismatches, remoteDrifts);
 }
 
 function hasLibraryInDirs(libraryBaseName: string, dirs: string[]): boolean {
@@ -4297,7 +4291,7 @@ async function showDoctor(): Promise<void> {
   try {
     const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint, llm);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
-    if (!vectorSample.ok) {
+    if (vectorSample.forceRebuild) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
     }
   } catch (error) {

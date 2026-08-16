@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Doctor: distinguish bounded remote-embedding batch-shape numerical drift from stale or corrupt vectors, while retaining strict local checks and fail-closed handling for material remote mismatches.
+
 ### Security
 
 - `qmd update` no longer runs a project-local `.qmd/index.yml`'s `update:`
