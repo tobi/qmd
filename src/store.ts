@@ -111,8 +111,29 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+export type EmbeddingFingerprintIdentity = string | {
+  provider: string;
+  model: string;
+  nativeDimensions: number;
+  dimensions: number;
+  reduction: string;
+  normalization: string;
+  formatVersion: string;
+  endpoint?: string;
+  apiKey?: string;
+};
+
+export function getEmbeddingFingerprint(identity: EmbeddingFingerprintIdentity = DEFAULT_EMBED_MODEL): string {
+  const model = typeof identity === "string" ? identity : identity.model;
   const significant = [
+    ...(typeof identity === "string" ? [] : [
+      `provider:${identity.provider}`,
+      `native_dimensions:${identity.nativeDimensions}`,
+      `output_dimensions:${identity.dimensions}`,
+      `reduction:${identity.reduction}`,
+      `normalization:${identity.normalization}`,
+      `format_version:${identity.formatVersion}`,
+    ]),
     `model:${model}`,
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
@@ -129,6 +150,17 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 function getLlm(store: Store): LlamaCpp {
   return store.llm ?? getDefaultLlamaCpp();
 }
+
+function getStoreEmbeddingIdentity(store: Store, model?: string): { model: string; fingerprint: string } {
+  const activeModel = model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
+  const llm = store.llm;
+  const identity = llm && typeof llm.isRemoteEmbed === "function" && llm.isRemoteEmbed() && activeModel === llm.embedModelName
+    ? llm.embeddingFingerprintIdentity
+    : activeModel;
+  return { model: activeModel, fingerprint: getEmbeddingFingerprint(identity) };
+}
+
+const activeRemoteEmbeddingDatabases = new WeakSet<object>();
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -1460,7 +1492,7 @@ export type Store = {
   ensureVecTable: (dimensions: number) => void;
 
   // Index health
-  getHashesNeedingEmbedding: (model?: string) => number;
+  getHashesNeedingEmbedding: (model?: string, collection?: string) => number;
   getIndexHealth: (model?: string) => IndexHealthInfo;
   getStatus: (model?: string) => IndexStatus;
 
@@ -1844,9 +1876,15 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(
+  db: Database,
+  collection?: string,
+  model: string = DEFAULT_EMBED_MODEL,
+  fingerprint: string = getEmbeddingFingerprint(model),
+  force: boolean = false,
+): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const pendingFilter = force ? `` : `AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)`;
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -1859,7 +1897,7 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
       WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${pendingFilter}
         ${collectionFilter}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
@@ -1927,24 +1965,68 @@ export async function generateEmbeddings(
 ): Promise<EmbedResult> {
   const db = store.db;
   const llm = getLlm(store);
-  const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const remoteEmbed = typeof llm.isRemoteEmbed === "function" && llm.isRemoteEmbed();
+  const activeModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+  if (remoteEmbed && options?.model && options.model !== activeModel) {
+    throw new Error("Remote embedding model override does not match the configured semantic identity");
+  }
+  const model = remoteEmbed ? activeModel : options?.model ?? activeModel;
+  const fingerprint = getEmbeddingFingerprint(remoteEmbed ? llm.embeddingFingerprintIdentity : model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+  const remoteFailClosed = remoteEmbed;
+  const remoteSavepoint = "qmd_remote_embedding_invocation";
+  let ownsRemoteInvocation = false;
+  const stagedRemoteEmbeddings: Array<{ chunk: ChunkItem; embedding: Float32Array }> = [];
+  let remoteDimensions: number | undefined;
 
-  if (options?.force) {
-    clearAllEmbeddings(db, options?.collection);
-  }
+  const commitRemoteEmbeddings = (): void => {
+    if (!remoteFailClosed) return;
+    db.exec(`SAVEPOINT ${remoteSavepoint}`);
+    try {
+      if (options?.force) clearAllEmbeddings(db, options.collection);
+      if (stagedRemoteEmbeddings.length > 0) {
+        if (!remoteDimensions) throw new Error("Remote embedding dimensions were not established");
+        store.ensureVecTable(remoteDimensions);
+        for (const { chunk, embedding } of stagedRemoteEmbeddings) {
+          insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, embedding, model, now, chunk.expectedTotalChunks, fingerprint);
+        }
+      }
+      db.exec(`RELEASE ${remoteSavepoint}`);
+    } catch (error) {
+      db.exec(`ROLLBACK TO ${remoteSavepoint}`);
+      db.exec(`RELEASE ${remoteSavepoint}`);
+      throw error;
+    }
+  };
 
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  try {
+    if (remoteFailClosed) {
+      if (activeRemoteEmbeddingDatabases.has(db)) {
+        throw new Error("A remote embedding invocation is already active for this database");
+      }
+      activeRemoteEmbeddingDatabases.add(db);
+      ownsRemoteInvocation = true;
+    }
 
-  if (docsToEmbed.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
-  }
-  const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
-  const totalDocs = docsToEmbed.length;
-  const startTime = Date.now();
+    if (options?.force && !remoteFailClosed) {
+      clearAllEmbeddings(db, options?.collection);
+    }
+
+    const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model, fingerprint, remoteFailClosed && !!options?.force);
+
+    if (docsToEmbed.length === 0) {
+      commitRemoteEmbeddings();
+      if (ownsRemoteInvocation) {
+        activeRemoteEmbeddingDatabases.delete(db);
+        ownsRemoteInvocation = false;
+      }
+      return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    }
+    const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+    const totalDocs = docsToEmbed.length;
+    const startTime = Date.now();
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const embedModelUri = model;
@@ -1994,7 +2076,9 @@ export async function generateEmbeddings(
           recordFailure(chunk, "embedding returned no vector");
           return false;
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        const embedding = new Float32Array(result.embedding);
+        if (remoteFailClosed) stagedRemoteEmbeddings.push({ chunk, embedding });
+        else insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, embedding, model, now, chunk.expectedTotalChunks, fingerprint);
         chunksEmbedded++;
         successesSinceRetry++;
         clearFailure(chunk);
@@ -2051,6 +2135,7 @@ export async function generateEmbeddings(
           doc.path,
           options?.chunkStrategy,
           session.signal,
+          llm,
         );
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -2084,7 +2169,8 @@ export async function generateEmbeddings(
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
-        store.ensureVecTable(firstResult.embedding.length);
+        if (remoteFailClosed) remoteDimensions = firstResult.embedding.length;
+        else store.ensureVecTable(firstResult.embedding.length);
         vectorTableInitialized = true;
       }
 
@@ -2119,7 +2205,9 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+              const vector = new Float32Array(embedding.embedding);
+              if (remoteFailClosed) stagedRemoteEmbeddings.push({ chunk, embedding: vector });
+              else insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, vector, model, now, chunk.expectedTotalChunks, fingerprint);
               chunksEmbedded++;
               successesSinceRetry++;
               clearFailure(chunk);
@@ -2161,7 +2249,7 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+      const removedPartialChunks = remoteFailClosed ? 0 : removeIncompleteEmbeddings(db, expectedChunksByHash, model);
       if (removedPartialChunks > 0) {
         chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
       }
@@ -2173,13 +2261,31 @@ export async function generateEmbeddings(
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
   }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
-  return {
-    docsProcessed: totalDocs,
-    chunksEmbedded: result.chunksEmbedded,
-    errors: result.errors,
-    failures: result.failures,
-    durationMs: Date.now() - startTime,
-  };
+    if (remoteFailClosed && result.errors > 0) {
+      throw new Error(`Remote embedding failed closed with ${result.errors} unresolved chunk error(s)`);
+    }
+
+    commitRemoteEmbeddings();
+
+    const output = {
+      docsProcessed: totalDocs,
+      chunksEmbedded: result.chunksEmbedded,
+      errors: result.errors,
+      failures: result.failures,
+      durationMs: Date.now() - startTime,
+    };
+    if (ownsRemoteInvocation) {
+      activeRemoteEmbeddingDatabases.delete(db);
+      ownsRemoteInvocation = false;
+    }
+    return output;
+  } catch (error) {
+    if (ownsRemoteInvocation) {
+      activeRemoteEmbeddingDatabases.delete(db);
+      ownsRemoteInvocation = false;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -2201,9 +2307,18 @@ export function createStore(dbPath?: string): Store {
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
-    getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
-    getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    getHashesNeedingEmbedding: (model?: string, collection?: string) => {
+      const identity = getStoreEmbeddingIdentity(store, model);
+      return getHashesNeedingEmbedding(db, collection, identity.model, identity.fingerprint);
+    },
+    getIndexHealth: (model?: string) => {
+      const identity = getStoreEmbeddingIdentity(store, model);
+      return getIndexHealth(db, identity.model, identity.fingerprint);
+    },
+    getStatus: (model?: string) => {
+      const identity = getStoreEmbeddingIdentity(store, model);
+      return getStatus(db, identity.model, identity.fingerprint);
+    },
 
     // Caching
     getCacheKey,
@@ -2479,9 +2594,13 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+export function getHashesNeedingEmbedding(
+  db: Database,
+  collection?: string,
+  model: string = DEFAULT_EMBED_MODEL,
+  fingerprint: string = getEmbeddingFingerprint(model),
+): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT COUNT(DISTINCT d.hash) as count
@@ -2549,7 +2668,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   const llm = getLlm(store);
 
   return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal, llm);
     const chunk = chunks[sample.seq];
     if (!chunk) {
       return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
@@ -2580,8 +2699,8 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   });
 }
 
-export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
+export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL, fingerprint: string = getEmbeddingFingerprint(model)): IndexHealthInfo {
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model, fingerprint);
   const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
 
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -3173,10 +3292,9 @@ export async function chunkDocumentByTokens(
   windowTokens: number = CHUNK_WINDOW_TOKENS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  llmOverride?: LlamaCpp,
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
-
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -3187,6 +3305,13 @@ export async function chunkDocumentByTokens(
   // Chunk in character space with conservative estimate
   // Use AST-aware chunking for the first pass when filepath/strategy provided
   let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+
+  const activeLlm = llmOverride ?? getDefaultLlamaCpp();
+  if (typeof activeLlm.isRemoteEmbed === "function" && activeLlm.isRemoteEmbed()) {
+    return charChunks.map(chunk => ({ text: chunk.text, pos: chunk.pos, tokens: Math.ceil(chunk.text.length / avgCharsPerToken) }));
+  }
+
+  const llm = typeof activeLlm.tokenize === "function" ? activeLlm : getDefaultLlamaCpp();
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
@@ -4491,7 +4616,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   const llm = llmOverride ?? getDefaultLlamaCpp();
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
-  const cacheModel = llm.rerankModelName ?? model;
+  const cacheModel = llm.rerankCacheIdentity ?? llm.rerankModelName ?? model;
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -4517,10 +4642,13 @@ export async function rerank(query: string, documents: { file: string; text: str
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+    // Cache by the returned document index. File paths are not unique here: one
+    // source file commonly contributes several candidate chunks.
     for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
+      if (!Number.isInteger(result.index) || result.index < 0 || result.index >= uncachedDocs.length) {
+        throw new Error("Reranker returned an invalid document index");
+      }
+      const chunk = uncachedDocs[result.index]!.text;
       const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
@@ -5119,7 +5247,7 @@ export function findDocuments(
 // Status
 // =============================================================================
 
-export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexStatus {
+export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL, fingerprint: string = getEmbeddingFingerprint(model)): IndexStatus {
   // DB is source of truth for collections — config provides supplementary metadata
   const dbCollections = db.prepare(`
     SELECT
@@ -5154,7 +5282,7 @@ export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): In
   });
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model, fingerprint);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   return {

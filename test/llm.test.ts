@@ -721,6 +721,17 @@ describe("LlamaCpp rerank deduping", () => {
 });
 
 describe("LlamaCpp ensureRerankContexts error reporting", () => {
+  test("unavailable-reranker fallback preserves each document index", async () => {
+    const llm = new LlamaCpp({}) as any;
+    llm.ensureRerankContexts = vi.fn().mockResolvedValue([]);
+    const result = await llm.rerank("query", [
+      { file: "a.md", text: "a" },
+      { file: "b.md", text: "b" },
+    ]);
+    expect(result.results.map((item: { index: number }) => item.index)).toEqual([0, 1]);
+    expect(result.results.map((item: { score: number }) => item.score)).toEqual([0.5, 0.5]);
+  });
+
   test("warns with the underlying error and does not retry identical options", async () => {
     const llm = new LlamaCpp({}) as any;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

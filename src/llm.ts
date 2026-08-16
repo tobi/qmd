@@ -78,6 +78,8 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 import { createRequire } from "node:module";
+import { OpenAIEmbeddingClient, RemoteEmbeddingProtocolError, resolveEmbeddingConfig, type EmbeddingConfig, type ResolvedEmbeddingConfig } from "./remote-embed.js";
+import { OpenAIRerankClient, getRerankCacheIdentity, resolveRerankConfig, type RerankConfig, type ResolvedRerankConfig } from "./remote-rerank.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -295,13 +297,13 @@ export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
 export type ModelResolutionConfig = {
-  embed?: string;
+  embed?: EmbeddingConfig;
   generate?: string;
-  rerank?: string;
+  rerank?: RerankConfig;
 };
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  return resolveEmbeddingConfig(config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL).model;
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {
@@ -309,14 +311,14 @@ export function resolveGenerateModel(config?: ModelResolutionConfig): string {
 }
 
 export function resolveRerankModel(config?: ModelResolutionConfig): string {
-  return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+  return resolveRerankConfig(config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL).model;
 }
 
-export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
+export function resolveModels(config?: ModelResolutionConfig): { embed: EmbeddingConfig; generate: string; rerank: RerankConfig } {
   return {
-    embed: resolveEmbedModel(config),
+    embed: config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL,
     generate: resolveGenerateModel(config),
-    rerank: resolveRerankModel(config),
+    rerank: config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL,
   };
 }
 
@@ -598,9 +600,9 @@ export interface LLM {
 // =============================================================================
 
 export type LlamaCppConfig = {
-  embedModel?: string;
+  embedModel?: EmbeddingConfig;
   generateModel?: string;
-  rerankModel?: string;
+  rerankModel?: RerankConfig;
   modelCacheDir?: string;
   /**
    * Context size used for query expansion generation contexts.
@@ -811,8 +813,12 @@ export class LlamaCpp implements LLM {
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
   private embedModelUri: string;
+  private readonly embedConfig: ResolvedEmbeddingConfig;
+  private remoteEmbedder: OpenAIEmbeddingClient | null = null;
   private generateModelUri: string;
   private rerankModelUri: string;
+  private readonly rerankConfig: ResolvedRerankConfig;
+  private remoteReranker: OpenAIRerankClient | null = null;
   private modelCacheDir: string;
   private expandContextSize: number;
 
@@ -844,9 +850,11 @@ export class LlamaCpp implements LLM {
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
 
-    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    this.embedConfig = resolveEmbeddingConfig(config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL);
+    this.embedModelUri = this.embedConfig.model;
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
-    this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
+    this.rerankConfig = resolveRerankConfig(config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL);
+    this.rerankModelUri = this.rerankConfig.model;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -857,12 +865,42 @@ export class LlamaCpp implements LLM {
     return this.embedModelUri;
   }
 
+  get embeddingFingerprintIdentity(): string | Exclude<ResolvedEmbeddingConfig, { kind: "local" }> {
+    return this.embedConfig.kind === "remote" ? this.embedConfig : this.embedModelUri;
+  }
+
+  isRemoteEmbed(): boolean { return this.embedConfig.kind === "remote"; }
+
+  private getRemoteEmbedder(): OpenAIEmbeddingClient {
+    if (this.embedConfig.kind !== "remote") throw new Error("remote embedding is not configured");
+    this.remoteEmbedder ??= new OpenAIEmbeddingClient({ ...this.embedConfig, provider: "openai" });
+    return this.remoteEmbedder;
+  }
+
+  private assertRemoteEmbeddingModel(model?: string): void {
+    if (model && model !== this.embedModelUri) {
+      throw new RemoteEmbeddingProtocolError("remote embedding model override does not match configured model identity");
+    }
+  }
+
   get generateModelName(): string {
     return this.generateModelUri;
   }
 
   get rerankModelName(): string {
     return this.rerankModelUri;
+  }
+
+  get rerankCacheIdentity(): string {
+    return getRerankCacheIdentity(this.rerankConfig);
+  }
+
+  isRemoteRerank(): boolean { return this.rerankConfig.kind === "remote"; }
+
+  private getRemoteReranker(): OpenAIRerankClient {
+    if (this.rerankConfig.kind !== "remote") throw new Error("remote reranking is not configured");
+    this.remoteReranker ??= new OpenAIRerankClient({ ...this.rerankConfig, provider: "openai" });
+    return this.remoteReranker;
   }
 
   /**
@@ -1443,6 +1481,11 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (this.isRemoteEmbed()) {
+      this.assertRemoteEmbeddingModel(options.model);
+      const embedding = await this.getRemoteEmbedder().embed(text);
+      return { embedding, model: options.model ?? this.embedModelUri };
+    }
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1472,6 +1515,11 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (this.isRemoteEmbed()) {
+      this.assertRemoteEmbeddingModel(options.model);
+      const embeddings = await this.getRemoteEmbedder().embedBatch(texts);
+      return embeddings.map(embedding => ({ embedding, model: options.model ?? this.embedModelUri }));
+    }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1707,6 +1755,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (this.rerankConfig.kind === "remote") return this.getRemoteReranker().rerank(query, documents);
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1714,7 +1763,7 @@ export class LlamaCpp implements LLM {
     const contexts = await this.ensureRerankContexts();
     if (contexts.length === 0) {
       return {
-        results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
+        results: documents.map((d, index) => ({ ...d, score: 0.5, index })),
         model: "fallback",
       };
     }

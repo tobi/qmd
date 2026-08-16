@@ -1306,6 +1306,62 @@ describe("Caching", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("rerank caches same-file chunks by returned index rather than ambiguous file path", async () => {
+    const store = await createTestStore();
+    const docs = [
+      { file: "same.md", text: "first chunk" },
+      { file: "same.md", text: "second chunk" },
+    ];
+    const rerankSpy = vi.fn(async () => ({
+      model: "remote-reranker",
+      results: [
+        { file: "same.md", index: 1, score: 0.9 },
+        { file: "same.md", index: 0, score: 0.1 },
+      ],
+    }));
+    store.llm = { rerank: rerankSpy, rerankModelName: "remote-reranker" } as any;
+
+    try {
+      expect(await store.rerank("query", docs)).toEqual([
+        { file: "same.md", score: 0.9 },
+        { file: "same.md", score: 0.1 },
+      ]);
+      expect(rerankSpy).toHaveBeenCalledTimes(1);
+      expect(await store.rerank("query", docs)).toEqual([
+        { file: "same.md", score: 0.9 },
+        { file: "same.md", score: 0.1 },
+      ]);
+      expect(rerankSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rerank cache identity separates remote backends with the same model name", async () => {
+    const store = await createTestStore();
+    const docs = [{ file: "doc.md", text: "same chunk" }];
+    const makeRemoteMock = (identity: string, score: number) => {
+      const spy = vi.fn(async () => ({
+        model: "same-model",
+        results: [{ file: "doc.md", index: 0, score }],
+      }));
+      return { spy, llm: { rerank: spy, rerankModelName: "same-model", rerankCacheIdentity: identity } };
+    };
+    const first = makeRemoteMock("remote:endpoint-a", 0.2);
+    const second = makeRemoteMock("remote:endpoint-b", 0.8);
+    store.llm = first.llm as any;
+
+    try {
+      expect((await store.rerank("query", docs))[0]!.score).toBe(0.2);
+      store.llm = second.llm as any;
+      expect((await store.rerank("query", docs))[0]!.score).toBe(0.8);
+      expect(first.spy).toHaveBeenCalledTimes(1);
+      expect(second.spy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 describe("Query expansion cache (#818)", () => {
@@ -4102,6 +4158,188 @@ describe("Embedding batching", () => {
       },
     };
   }
+
+  function remoteOutputVector(): number[] {
+    const embedding = Array(1024).fill(0);
+    embedding[0] = 0.1;
+    embedding[1] = 0.2;
+    embedding[2] = 0.3;
+    return embedding;
+  }
+
+  test("remote Qwen MRL output creates and stores only float[1024] vectors", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const native = Array(2560).fill(0);
+    native[0] = 3;
+    native[1] = 4;
+    native[1024] = 12;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const count = (JSON.parse(String(init?.body)).input as string[]).length;
+      return new Response(JSON.stringify({
+        model: "Qwen3-Embedding-4B-Q8_0.gguf",
+        data: Array.from({ length: count }, (_, index) => ({ index, embedding: native })),
+      }));
+    });
+    const getLlama = vi.fn();
+    const resolveModelFile = vi.fn();
+    llmModule.setNodeLlamaCppModuleForTest({
+      getLlama,
+      resolveModelFile,
+      LlamaChatSession: vi.fn() as any,
+      LlamaLogLevel: { error: 0 },
+    });
+    store.llm = new llmModule.LlamaCpp({
+      embedModel: {
+        provider: "openai",
+        endpoint: "http://127.0.0.1:8086/v1",
+        model: "Qwen3-Embedding-4B-Q8_0.gguf",
+        nativeDimensions: 2560,
+        dimensions: 1024,
+        reduction: "mrl-prefix",
+        normalization: "l2",
+        formatVersion: "qwen3-query-document-v1",
+      },
+    });
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await expect(generateEmbeddings(store)).resolves.toMatchObject({ errors: 0, chunksEmbedded: 1 });
+
+      const table = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vectors_vec'`).get() as { sql: string };
+      expect(table.sql).toContain("embedding float[1024]");
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM vectors_vec`).get()).toEqual({ count: 1 });
+      expect(fetchMock).toHaveBeenCalled();
+      expect(getLlama).not.toHaveBeenCalled();
+      expect(resolveModelFile).not.toHaveBeenCalled();
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rejects a concurrent remote embedding invocation on the same database", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    let releaseFirstBatch!: () => void;
+    let markFirstBatchStarted!: () => void;
+    const firstBatchStarted = new Promise<void>(resolve => { markFirstBatchStarted = resolve; });
+    const firstBatchGate = new Promise<void>(resolve => { releaseFirstBatch = resolve; });
+    let batchCalls = 0;
+    const identity = {
+      provider: "openai", model: "Qwen3-Embedding-4B-Q8_0.gguf",
+      nativeDimensions: 2560, dimensions: 1024, reduction: "mrl-prefix",
+      normalization: "l2", formatVersion: "qwen3-query-document-v1",
+    };
+    store.llm = {
+      embedModelName: identity.model,
+      embeddingFingerprintIdentity: identity,
+      isRemoteEmbed: () => true,
+      async embed() { return { embedding: remoteOutputVector(), model: identity.model }; },
+      async embedBatch(texts: string[]) {
+        batchCalls++;
+        if (batchCalls === 1) {
+          markFirstBatchStarted();
+          await firstBatchGate;
+        }
+        return texts.map(() => ({ embedding: remoteOutputVector(), model: identity.model }));
+      },
+    } as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      const first = generateEmbeddings(store);
+      await firstBatchStarted;
+      await expect(generateEmbeddings(store)).rejects.toThrow("already active");
+      releaseFirstBatch();
+      await expect(first).resolves.toMatchObject({ errors: 0 });
+    } finally {
+      releaseFirstBatch?.();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("remote embedding keeps its semantic fingerprint when the CLI passes the matching model explicitly", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const identity = {
+      provider: "openai",
+      model: "Qwen3-Embedding-4B-Q8_0.gguf",
+      nativeDimensions: 2560,
+      dimensions: 1024,
+      reduction: "mrl-prefix",
+      normalization: "l2",
+      formatVersion: "qwen3-query-document-v1",
+    };
+    store.llm = {
+      embedModelName: identity.model,
+      embeddingFingerprintIdentity: identity,
+      isRemoteEmbed: () => true,
+      async embed() { return { embedding: remoteOutputVector(), model: identity.model }; },
+      async embedBatch(texts: string[]) {
+        return texts.map(() => ({ embedding: remoteOutputVector(), model: identity.model }));
+      },
+    } as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      const result = await generateEmbeddings(store, { model: identity.model });
+      expect(result.errors).toBe(0);
+      expect(db.prepare(`SELECT DISTINCT embed_fingerprint FROM content_vectors`).all()).toEqual([
+        { embed_fingerprint: getEmbeddingFingerprint(identity) },
+      ]);
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+      expect(store.getStatus().needsEmbedding).toBe(0);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("remote embedding failure rolls back every vector written by the invocation", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    let batchCalls = 0;
+    const remoteLlm = {
+      embedModelName: "Qwen3-Embedding-4B-Q8_0.gguf",
+      embeddingFingerprintIdentity: {
+        provider: "openai",
+        model: "Qwen3-Embedding-4B-Q8_0.gguf",
+        nativeDimensions: 2560,
+        dimensions: 1024,
+        reduction: "mrl-prefix",
+        normalization: "l2",
+        formatVersion: "qwen3-query-document-v1",
+      },
+      isRemoteEmbed: () => true,
+      async embed() {
+        if (batchCalls > 0) throw new Error("remote embedding unavailable");
+        return { embedding: remoteOutputVector(), model: "Qwen3-Embedding-4B-Q8_0.gguf" };
+      },
+      async embedBatch(texts: string[]) {
+        batchCalls++;
+        if (batchCalls > 1) throw new Error("remote embedding unavailable");
+        db.prepare(`INSERT INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run("unrelated-write", "must-survive", new Date().toISOString());
+        return texts.map(() => ({ embedding: remoteOutputVector(), model: "Qwen3-Embedding-4B-Q8_0.gguf" }));
+      },
+    };
+    store.llm = remoteLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+
+      await expect(generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+      })).rejects.toThrow("Remote embedding failed closed");
+
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 0 });
+      const vectorTable = db.prepare(`SELECT name FROM sqlite_master WHERE name = 'vectors_vec'`).get();
+      expect(vectorTable).toBeUndefined();
+      expect(db.prepare(`SELECT result FROM llm_cache WHERE hash = ?`).get("unrelated-write")).toEqual({ result: "must-survive" });
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
     const store = await createTestStore();

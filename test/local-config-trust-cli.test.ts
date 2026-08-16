@@ -129,6 +129,128 @@ describe("qmd update with a checked-in collection path outside the project", () 
 });
 
 describe("qmd update with a checked-in custom model URI", () => {
+  test("malformed untrusted structured rerank config fails closed before trust fallback", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["update"]);
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(result.stdout).not.toContain("Indexed: 1 new");
+  }, 120_000);
+
+  test("trusted malformed structured rerank config also fails closed", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["update"], { QMD_TRUST_LOCAL_CONFIG: "1" });
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(result.stdout).not.toContain("Indexed: 1 new");
+  }, 120_000);
+
+  test("trust refuses malformed structured rerank config before recording approval", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["trust"]);
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(result.stdout).not.toContain("✓ Trusted");
+  }, 120_000);
+
+  test("pull refuses malformed structured rerank config before model downloads", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["pull"]);
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(result.stdout).not.toContain("Pulling");
+  }, 120_000);
+
+  test("never prints credentials embedded in a remote endpoint trust snapshot", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  embed:",
+      "    provider: openai",
+      "    endpoint: http://user:secret-token@127.0.0.1:8086/v1?api_key=query-secret",
+      "    model: Qwen3-Embedding-4B-Q8_0.gguf",
+      "    nativeDimensions: 2560",
+      "    dimensions: 1024",
+      "    reduction: mrl-prefix",
+      "    normalization: l2",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["update"]);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("secret-token");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("query-secret");
+  }, 120_000);
+
+  test("never prints credentials embedded in a remote rerank endpoint trust snapshot", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: http://user:rerank-secret@127.0.0.1:8088/v1?api_key=rerank-query-secret",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["update"]);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("rerank-secret");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("rerank-query-secret");
+  }, 120_000);
+
   test("does not treat the custom model as trusted, but still indexes the project", async () => {
     writeLocalConfig([
       "collections:",
