@@ -37,6 +37,11 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import {
+  initializeMetadataSchema,
+  syncDocumentMetadata,
+  countDocumentsPendingMetadata,
+} from "./metadata-store.js";
 
 // =============================================================================
 // Configuration
@@ -1252,6 +1257,10 @@ function initializeDatabase(db: Database): void {
 
   ensureContentVectorsStatusIndex(db);
 
+  // Document metadata — extraction state plus normalized value rows for
+  // metadata filtering. Keyed by document identity, not content hash.
+  initializeMetadataSchema(db);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -1551,7 +1560,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => number;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
@@ -1596,6 +1605,8 @@ export type ReindexResult = {
   orphanedCleaned: number;
   skipped: number;
   skippedFiles: ReindexSkippedFile[];
+  /** Documents whose qmd.metadata frontmatter failed extraction this pass. */
+  metadataErrors: number;
 };
 
 /**
@@ -1634,7 +1645,7 @@ export async function reindexCollection(
   });
 
   const total = files.length;
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: ReindexSkippedFile[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
@@ -1681,8 +1692,13 @@ export async function reindexCollection(
 
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
+    let documentId: number;
+    let contentChanged = true;
+
     if (existing) {
+      documentId = existing.id;
       if (existing.hash === hash) {
+        contentChanged = false;
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
           updated++;
@@ -1700,10 +1716,15 @@ export async function reindexCollection(
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
+
+    // Unchanged content still backfills missing or stale extraction state.
+    const extraction = syncDocumentMetadata(db, documentId, content, path,
+      contentChanged ? undefined : { onlyIfStale: true });
+    if (extraction?.error) metadataErrors++;
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1721,7 +1742,7 @@ export async function reindexCollection(
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
+  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
 }
 
 export type EmbedFailure = {
@@ -2510,6 +2531,8 @@ export type IndexStatus = {
   totalDocuments: number;
   needsEmbedding: number;
   hasVectorIndex: boolean;
+  /** Active documents without current, error-free metadata extraction. */
+  pendingMetadata: number;
   collections: CollectionInfo[];
 };
 
@@ -2932,6 +2955,7 @@ function rebuildDocumentFTS(db: Database, documentId: number): void {
 
 /**
  * Insert a new document into the documents table.
+ * Returns the document's id so callers can attach document-scoped state.
  */
 export function insertDocument(
   db: Database,
@@ -2941,7 +2965,7 @@ export function insertDocument(
   hash: string,
   createdAt: string,
   modifiedAt: string
-): void {
+): number {
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
@@ -2953,7 +2977,10 @@ export function insertDocument(
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
 
   const row = db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`).get(collectionName, path) as { id: number } | undefined;
-  if (row) rebuildDocumentFTS(db, row.id);
+  if (!row) throw new Error(`Document row missing after insert: ${collectionName}/${path}`);
+
+  rebuildDocumentFTS(db, row.id);
+  return row.id;
 }
 
 /**
@@ -5199,6 +5226,7 @@ export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): In
     totalDocuments: totalDocs,
     needsEmbedding,
     hasVectorIndex: hasVectors,
+    pendingMetadata: countDocumentsPendingMetadata(db),
     collections,
   };
 }
