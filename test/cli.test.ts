@@ -766,6 +766,132 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("qmd pull");
   }, 20000);
 
+  test("qmd doctor does not treat remote embedding as a missing local GGUF", async () => {
+    const env = await createIsolatedTestEnv("doctor-remote-embed");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections: {}",
+      "models:",
+      "  embed:",
+      "    provider: openai",
+      "    endpoint: http://127.0.0.1:8086/v1",
+      "    model: Qwen3-Embedding-4B-Q8_0.gguf",
+      "    nativeDimensions: 2560",
+      "    dimensions: 1024",
+      "    reduction: mrl-prefix",
+      "    normalization: l2",
+      "    formatVersion: qwen3-query-document-v1",
+      `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+      `  rerank: ${DEFAULT_RERANK_MODEL_URI}`,
+      "",
+    ].join("\n"));
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_DOCTOR_DEVICE_PROBE: "0" },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("embedding: Qwen3-Embedding-4B-Q8_0.gguf");
+    expect(stdout).not.toContain("[object Object]");
+    expect(stdout).toContain("current fingerprint 6618ed");
+  }, 20000);
+
+  test.each(["status", "doctor", "update", "embed"])(
+    "qmd %s rejects an incompatible remote embedding identity during preflight",
+    async (command) => {
+      const env = await createIsolatedTestEnv(`invalid-remote-embed-${command}`);
+      await writeFile(join(env.configDir, "index.yml"), [
+        "collections: {}",
+        "models:",
+        "  embed:",
+        "    provider: openai",
+        "    endpoint: http://127.0.0.1:8086/v1",
+        "    model: Qwen3-Embedding-4B-Q8_0.gguf",
+        "    nativeDimensions: 2560",
+        "    dimensions: 2560",
+        "    reduction: mrl-prefix",
+        "    normalization: l2",
+        `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+        `  rerank: ${DEFAULT_RERANK_MODEL_URI}`,
+        "",
+      ].join("\n"));
+
+      const result = await runQmd([command], { dbPath: env.dbPath, configDir: env.configDir });
+      expect(result.exitCode).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("dimensions must be exactly 1024");
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("[object Object]");
+    },
+    20000,
+  );
+
+  test("qmd doctor does not treat remote reranking as a missing local GGUF", async () => {
+    const env = await createIsolatedTestEnv("doctor-remote-rerank");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections: {}",
+      "models:",
+      `  embed: ${DEFAULT_EMBED_MODEL_URI}`,
+      `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: http://127.0.0.1:8088/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_DOCTOR_DEVICE_PROBE: "0" },
+    });
+
+    expect(exitCode, stdout).toBe(0);
+    expect(stdout).not.toContain("reranking: Qwen3-Reranker-0.6B-Q4_K_M.gguf");
+    expect(stdout).not.toContain("[object Object]");
+  }, 20000);
+
+  test("qmd status fails closed on malformed structured remote rerank config", async () => {
+    const env = await createIsolatedTestEnv("status-invalid-remote-rerank");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections: {}",
+      "models:",
+      `  embed: ${DEFAULT_EMBED_MODEL_URI}`,
+      `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["status"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("[object Object]");
+  }, 20000);
+
+  test("qmd doctor reports malformed remote rerank config without fallback", async () => {
+    const env = await createIsolatedTestEnv("doctor-invalid-remote-rerank");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections: {}",
+      "models:",
+      `  embed: ${DEFAULT_EMBED_MODEL_URI}`,
+      `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+      "  rerank:",
+      "    provider: openai",
+      "    endpoint: file:///tmp/v1",
+      "    model: Qwen3-Reranker-0.6B-Q4_K_M.gguf",
+      "",
+    ].join("\n"));
+
+    const result = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("QMD Doctor");
+    expect(result.stdout).toContain("model configuration");
+    expect(result.stdout).toContain("remote rerank endpoint must use HTTP or HTTPS");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("[object Object]");
+  }, 20000);
+
   test("qmd doctor identifies cached non-GGUF model files", async () => {
     const env = await createIsolatedTestEnv("doctor-invalid-model-cache");
     const model = "hf:example/custom-model/custom.gguf";
@@ -919,6 +1045,45 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("embedding fingerprints");
     expect(stdout).toContain("mixed named embedding fingerprints");
     expect(stdout).toContain("stale1");
+  }, 20000);
+
+  test("status treats remote semantic fingerprints as current", async () => {
+    const env = await createIsolatedTestEnv("status-remote-embed");
+    await writeFile(join(env.configDir, "index.yml"), [
+      "collections:",
+      "  docs:",
+      `    path: ${JSON.stringify(fixturesDir)}`,
+      '    pattern: "**/*.md"',
+      "models:",
+      "  embed:",
+      "    provider: openai",
+      "    endpoint: http://127.0.0.1:8086/v1",
+      "    model: Qwen3-Embedding-4B-Q8_0.gguf",
+      "    nativeDimensions: 2560",
+      "    dimensions: 1024",
+      "    reduction: mrl-prefix",
+      "    normalization: l2",
+      "    formatVersion: qwen3-query-document-v1",
+      `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+      `  rerank: ${DEFAULT_RERANK_MODEL_URI}`,
+      "",
+    ].join("\n"));
+    await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+
+    const db = openDatabase(env.dbPath);
+    const now = new Date().toISOString();
+    const hashes = db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
+    for (const { hash } of hashes) {
+      db.prepare(`
+        INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, 0, 0, 'Qwen3-Embedding-4B-Q8_0.gguf', '6618ed', 1, ?)
+      `).run(hash, now);
+    }
+    db.close();
+
+    const { stdout, exitCode } = await runQmd(["status"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("Pending:");
   }, 20000);
 
   test("shows index status", async () => {

@@ -9,6 +9,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
+import type { EmbeddingConfig } from "./remote-embed.js";
+import type { RerankConfig } from "./remote-rerank.js";
 
 // ============================================================================
 // Types
@@ -37,8 +39,8 @@ export interface Collection {
  * Model configuration for embedding, reranking, and generation
  */
 export interface ModelsConfig {
-  embed?: string;
-  rerank?: string;
+  embed?: EmbeddingConfig;
+  rerank?: RerankConfig;
   generate?: string;
 }
 

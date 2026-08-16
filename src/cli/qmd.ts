@@ -9,6 +9,7 @@ import { basename, dirname, join as pathJoin, relative as relativePath, resolve 
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
+import { createHash } from "node:crypto";
 import {
   getPwd,
   getRealPath,
@@ -86,7 +87,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, withLLMSessionForLlm, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -145,30 +146,55 @@ import {
 // =============================================================================
 
 let store: ReturnType<typeof createStore> | null = null;
+let doctorConfigLoadFailed = false;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
 
-function getStore(): ReturnType<typeof createStore> {
+function getStore(options: { allowInvalidYamlForDoctor?: boolean } = {}): ReturnType<typeof createStore> {
   if (!store) {
+    doctorConfigLoadFailed = false;
     store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB.
+    // loadConfig() handles an absent config; malformed structured remote model
+    // configuration must propagate so it cannot silently fall back to defaults.
+    let config: CollectionConfig;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
+      config = loadConfig();
+    } catch (error) {
+      if (!options.allowInvalidYamlForDoctor) throw error;
+      doctorConfigLoadFailed = true;
+      const defaults = resolveModels();
       const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
+        embedModel: defaults.embed,
+        generateModel: defaults.generate,
+        rerankModel: defaults.rerank,
       });
       setDefaultLlamaCpp(llm);
       store.llm = llm;
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      return store;
     }
+    const activeModels = ensureModelsConfiguredForCli();
+    syncConfigToDb(store.db, config);
+    // Validate configured structured models before trust gating. An untrusted
+    // malformed remote config must fail closed rather than being replaced by
+    // defaults before its endpoint/provider/model contract is checked.
+    const configuredLlm = new LlamaCpp({
+      embedModel: activeModels.embed,
+      generateModel: activeModels.generate,
+      rerankModel: activeModels.rerank,
+    });
+    // Untrusted project-local custom model URIs must not be loaded; status
+    // still displays the YAML values via resolveModelsForCli (#889).
+    const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
+    const llm = localConfigIsFullyTrusted()
+      ? configuredLlm
+      : new LlamaCpp({
+          embedModel: modelsForLlm.embed,
+          generateModel: modelsForLlm.generate,
+          rerankModel: modelsForLlm.rerank,
+        });
+    setDefaultLlamaCpp(llm);
+    store.llm = llm;
   }
   return store;
 }
@@ -350,8 +376,8 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
-  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
+function checkIndexHealth(storeInstance: ReturnType<typeof createStore>, model?: string): void {
+  const { needsEmbedding, totalDocs, daysStale } = storeInstance.getIndexHealth(model);
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -513,7 +539,8 @@ function formatOrphanedVectorHint(orphaned: number, total: number): string {
 
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
-  const db = getDb();
+  const storeInstance = getStore();
+  const db = storeInstance.db;
 
   // Collections are defined in YAML; no duplicate cleanup needed.
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -531,8 +558,7 @@ async function showStatus(): Promise<void> {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const statusEmbedModel = resolveEmbedModelForCli();
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, statusEmbedModel);
+  const needsEmbedding = storeInstance.getHashesNeedingEmbedding();
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -714,6 +740,16 @@ function builtinModels(): BuiltinModels {
   };
 }
 
+function safeRemoteEndpointTrustIdentity(endpoint: string): string {
+  const digest = createHash("sha256").update(endpoint).digest("hex").slice(0, 12);
+  try {
+    const url = new URL(endpoint);
+    return `${url.protocol}//${url.host || "invalid-host"}/[redacted]@sha256:${digest}`;
+  } catch {
+    return `[invalid-endpoint]@sha256:${digest}`;
+  }
+}
+
 /**
  * Gated surface of the active YAML: hooks, collection paths, models.
  * Read from the YAML rather than the synced SQLite copy so `qmd trust`
@@ -730,8 +766,16 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       path: col.path,
     })),
     models: {
-      embed: config.models?.embed,
-      rerank: config.models?.rerank,
+      embed: typeof config.models?.embed === "string"
+        ? config.models.embed
+        : config.models?.embed
+          ? `${config.models.embed.provider}:${safeRemoteEndpointTrustIdentity(config.models.embed.endpoint)}#${config.models.embed.model}`
+          : undefined,
+      rerank: typeof config.models?.rerank === "string"
+        ? config.models.rerank
+        : config.models?.rerank
+          ? `${config.models.rerank.provider}:${safeRemoteEndpointTrustIdentity(config.models.rerank.endpoint)}#${config.models.rerank.model}`
+          : undefined,
       generate: config.models?.generate,
     },
   };
@@ -879,6 +923,7 @@ function manageTrust(subcommand?: string): void {
     return;
   }
 
+  ensureModelsConfiguredForCli();
   const snapshot = collectSensitiveSnapshot();
   const gated = localConfigGated(configPath, snapshot);
   if (!hasGatedItems(gated)) {
@@ -992,7 +1037,7 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getStore().getHashesNeedingEmbedding();
   const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
   const orphanedVectors = countOrphanedVectors(db);
   closeDb();
@@ -2038,7 +2083,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getStore().getHashesNeedingEmbedding();
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -2111,30 +2156,32 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
   return minutes * 60 * 1000;
 }
 
-function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
-  try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
-  } catch {
-    return resolveModels();
+type ConfiguredModels = { embed: NonNullable<ModelsConfig["embed"]>; generate: string; rerank: NonNullable<ModelsConfig["rerank"]> };
+
+function ensureModelsConfiguredForCli(): ConfiguredModels {
+  const config = loadConfig();
+  const models = resolveModels(config.models);
+  // Validate every configured structured model before defaults are persisted,
+  // trust is recorded, or runtime trust gating can substitute local defaults.
+  resolveEmbedModel({ embed: models.embed });
+  resolveRerankModel({ rerank: models.rerank });
+  const current = config.models ?? {};
+  if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+    saveConfig({
+      ...config,
+      models: {
+        ...current,
+        embed: models.embed,
+        generate: models.generate,
+        rerank: models.rerank,
+      },
+    });
   }
+  return models;
 }
 
 export function resolveEmbedModelForCli(): string {
-  return ensureModelsConfiguredForCli().embed;
+  return resolveEmbedModel({ embed: ensureModelsConfiguredForCli().embed });
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2142,16 +2189,21 @@ export function resolveGenerateModelForCli(): string {
 }
 
 export function resolveRerankModelForCli(): string {
-  return ensureModelsConfiguredForCli().rerank;
+  return resolveRerankModel({ rerank: ensureModelsConfiguredForCli().rerank });
 }
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
-  return ensureModelsConfiguredForCli();
+  const models = ensureModelsConfiguredForCli();
+  return {
+    ...models,
+    embed: resolveEmbedModel({ embed: models.embed }),
+    rerank: resolveRerankModel({ rerank: models.rerank }),
+  };
 }
 
 /** Models that may actually be loaded. Falls back to defaults/env when a
  *  project-local config's custom URIs are not trusted (#889). */
-function resolveModelsForRuntime(): { embed: string; generate: string; rerank: string } {
+function resolveModelsForRuntime(): ConfiguredModels {
   const configured = ensureModelsConfiguredForCli();
   if (localConfigIsFullyTrusted()) return configured;
   return resolveModels();
@@ -2179,7 +2231,7 @@ async function vectorIndex(
     }
 
     // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
+    const hashesToEmbed = storeInstance.getHashesNeedingEmbedding(model, batchOptions?.collection);
     if (hashesToEmbed === 0 && !force) {
       console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
       closeDb();
@@ -2849,7 +2901,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
-  checkIndexHealth(store.db);
+  checkIndexHealth(store);
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
@@ -2891,7 +2943,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
-  checkIndexHealth(store.db);
+  checkIndexHealth(store);
 
   // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
   const parsed = parseStructuredQuery(query);
@@ -3859,9 +3911,9 @@ function checkEnvironmentOverrides(activeModels: { embed: string; generate: stri
 
 function checkModelDefaults(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
   const checks = [
-    { role: "embedding", key: "embed", active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
+    { role: "embedding", key: "embed", active: activeModels.embed, configured: typeof configModels.embed === "string" ? configModels.embed : configModels.embed?.model, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
     { role: "generation", key: "generate", active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
-    { role: "reranking", key: "rerank", active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
+    { role: "reranking", key: "rerank", active: activeModels.rerank, configured: typeof configModels.rerank === "string" ? configModels.rerank : configModels.rerank?.model, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
   ] as const;
 
   const notes: string[] = [];
@@ -3884,11 +3936,11 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
   doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
 }
 
-function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
+function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[], remoteEmbed: boolean = false, remoteRerank: boolean = false): void {
   const models = [
-    ["embedding", activeModels.embed],
+    ...(!remoteEmbed ? [["embedding", activeModels.embed] as const] : []),
     ["generation", activeModels.generate],
-    ["reranking", activeModels.rerank],
+    ...(!remoteRerank ? [["reranking", activeModels.rerank] as const] : []),
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
@@ -3928,7 +3980,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   }
 }
 
-async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, llm: LlamaCpp, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
     return { ok: true, details: "no active documents indexed" };
@@ -3957,10 +4009,10 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   const threshold = 0.0001;
   const mismatches: string[] = [];
 
-  await withLLMSession(async (session) => {
+  await withLLMSessionForLlm(llm, async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal, llm);
       const chunk = chunks[sample.seq];
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
@@ -4133,12 +4185,23 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
 }
 
 async function showDoctor(): Promise<void> {
-  const storeInstance = getStore();
+  const storeInstance = getStore({ allowInvalidYamlForDoctor: true });
   const db = storeInstance.db;
   const pkg = readPackageJson();
-  const activeModels = resolveModelsForCli();
+  const activeModels = doctorConfigLoadFailed
+    ? (() => {
+        const defaults = resolveModels();
+        return {
+          ...defaults,
+          embed: resolveEmbedModel({ embed: defaults.embed }),
+          rerank: resolveRerankModel({ rerank: defaults.rerank }),
+        };
+      })()
+    : resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const llm = storeInstance.llm ?? getDefaultLlamaCpp();
+  const remoteEmbed = llm.isRemoteEmbed();
+  const fingerprint = getEmbeddingFingerprint(remoteEmbed ? llm.embeddingFingerprintIdentity : embedModel);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
@@ -4166,12 +4229,14 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
+  checkModelCache(activeModels, nextSteps, remoteEmbed, llm.isRemoteRerank());
 
   await runDoctorDeviceChecks(nextSteps);
 
   try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    const adoption = remoteEmbed
+      ? { checked: false, adopted: 0, reason: "legacy fingerprint adoption is disabled for remote embedding identities" }
+      : await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
     if (adoption.checked || adoption.adopted > 0) {
       doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
     }
@@ -4180,7 +4245,7 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
+    const pending = getHashesNeedingEmbedding(db, undefined, embedModel, fingerprint);
     doctorCheck("embedding freshness", pending === 0, pending === 0 ? "all active documents match current fingerprint" : `${formatCount(pending)} active documents need embeddings. Next: \`qmd embed\``);
     if (pending > 0) {
       nextSteps.push(`Run \`qmd embed\` to generate ${formatCount(pending)} missing/stale document embeddings.`);
@@ -4230,7 +4295,7 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint, llm);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
@@ -4330,6 +4395,7 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  let commandCompletedSuccessfully = true;
   switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
@@ -4621,7 +4687,15 @@ if (isMain) {
       break;
 
     case "doctor":
-      await showDoctor();
+      try {
+        await showDoctor();
+      } catch (error) {
+        const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+        console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+        doctorCheck("model configuration", false, message);
+        commandCompletedSuccessfully = false;
+        process.exitCode = 1;
+      }
       break;
 
     case "update":
@@ -4645,7 +4719,8 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        const runtimeModels = resolveModelsForRuntime();
+        await vectorIndex(resolveEmbedModel({ embed: runtimeModels.embed }), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -4662,9 +4737,9 @@ if (isMain) {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const activeModels = resolveModelsForRuntime();
       const models = [
-        activeModels.embed,
+        ...(typeof activeModels.embed === "string" ? [activeModels.embed] : []),
         activeModels.generate,
-        activeModels.rerank,
+        ...(typeof activeModels.rerank === "string" ? [activeModels.rerank] : []),
       ];
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
@@ -4953,7 +5028,7 @@ if (isMain) {
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
+  if (cli.command !== "mcp" && commandCompletedSuccessfully) {
     await finishSuccessfulCliCommand({
       command: cli.command,
       format: cli.opts.format,
