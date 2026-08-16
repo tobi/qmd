@@ -86,6 +86,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
+import { syncDocumentMetadata, countDocumentsPendingMetadata } from "../metadata-store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -566,6 +567,10 @@ async function showStatus(): Promise<void> {
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
+  const pendingMetadata = countDocumentsPendingMetadata(db);
+  if (pendingMetadata > 0) {
+    console.log(`  ${c.yellow}Metadata: ${pendingMetadata} need extraction${c.reset} (run 'qmd update'; excluded from --filter searches)`);
+  }
   if (mostRecent.latest) {
     const lastUpdate = new Date(mostRecent.latest);
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
@@ -985,6 +990,7 @@ async function updateCollections(): Promise<void> {
     progress.clear();
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
     reportSkippedReads(result.skippedFiles);
+    reportMetadataErrors(result.metadataErrors);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
     }
@@ -1945,7 +1951,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: { file: string; code: string }[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
@@ -1988,8 +1994,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     // Check if document exists (also migrates legacy lowercase paths)
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
+    let documentId: number;
+    let contentChanged = true;
+
     if (existing) {
+      documentId = existing.id;
       if (existing.hash === hash) {
+        contentChanged = false;
         // Hash unchanged, but check if title needs updating
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
@@ -2010,10 +2021,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
+
+    // Unchanged content still backfills missing or stale extraction state.
+    const extraction = syncDocumentMetadata(db, documentId, content, path,
+      contentChanged ? undefined : { onlyIfStale: true });
+    if (extraction?.error) metadataErrors++;
 
     processed++;
     progress.set((processed / total) * 100);
@@ -2043,6 +2059,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
   reportSkippedReads(skippedFiles);
+  reportMetadataErrors(metadataErrors);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
@@ -2060,6 +2077,11 @@ function fsErrorCode(err: unknown): string {
     if (typeof code === "string" && code.length > 0) return code;
   }
   return "ERROR";
+}
+
+function reportMetadataErrors(metadataErrors: number): void {
+  if (metadataErrors === 0) return;
+  console.warn(`⚠ ${metadataErrors} file(s) have invalid qmd.metadata frontmatter and are excluded from filtered search`);
 }
 
 function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
