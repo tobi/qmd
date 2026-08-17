@@ -57,6 +57,7 @@ import {
   insertDocument,
   cleanupOrphanedVectors,
   generateEmbeddings,
+  maybeAdoptLegacyEmbeddingFingerprint,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -4084,10 +4085,19 @@ describe("Embedding batching", () => {
     const embedBatchCalls: string[][] = [];
     const embedCalls: { text: string; options?: { model?: string } }[] = [];
     const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
+    const tokenizeCalls: string[] = [];
     return {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
+      tokenizeCalls,
+      async tokenize(text: string) {
+        tokenizeCalls.push(text);
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length * 16);
+      },
       async embed(text: string, options?: { model?: string }) {
         embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
@@ -4102,6 +4112,82 @@ describe("Embedding batching", () => {
       },
     };
   }
+
+  test("generateEmbeddings tokenizes with the store-local LLM", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const globalTokenize = vi.fn(async () => {
+      throw new Error("global tokenizer must not run");
+    });
+
+    setDefaultLlamaCpp({
+      tokenize: globalTokenize,
+      detokenize: async () => "",
+    } as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "store-local-tokenizer",
+        body: "# Store-local tokenizer\n\nVerified model bytes own document tokenization.",
+      });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
+      expect(globalTokenize).not.toHaveBeenCalled();
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption tokenizes with the store-local LLM", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const globalTokenize = vi.fn(async () => {
+      throw new Error("global tokenizer must not run");
+    });
+    const model = "hf:test/store-local-fingerprint.gguf";
+    const body = "# Legacy fingerprint\n\nVerified model bytes own legacy tokenization.";
+    const hash = await hashContent(body);
+
+    setDefaultLlamaCpp({
+      tokenize: globalTokenize,
+      detokenize: async () => "",
+    } as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "store-local-fingerprint",
+        body,
+        hash,
+      });
+      store.ensureVecTable(3);
+      store.insertEmbedding(
+        hash,
+        0,
+        0,
+        new Float32Array([0.1, 0.2, 0.3]),
+        model,
+        new Date(0).toISOString(),
+        1,
+        "",
+      );
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
+
+      expect(result.checked).toBe(true);
+      expect(result.adopted).toBe(1);
+      expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
+      expect(globalTokenize).not.toHaveBeenCalled();
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
     const store = await createTestStore();
@@ -4138,6 +4224,7 @@ describe("Embedding batching", () => {
     // A slow embedder so the short session cap trips between document batches.
     const embedBatchCalls: string[][] = [];
     const slowLlm = {
+      ...createFakeTokenizer(),
       async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
       async embedBatch(texts: string[]) {
         embedBatchCalls.push([...texts]);
@@ -4258,6 +4345,7 @@ describe("Embedding batching", () => {
     const db = store.db;
     let embedCalls = 0;
     const fakeLlm = {
+      ...createFakeTokenizer(),
       async embed(_text: string, _options?: { model?: string }) {
         embedCalls++;
         return embedCalls === 1
@@ -4299,6 +4387,7 @@ describe("Embedding batching", () => {
     const store = await createTestStore();
     const db = store.db;
     const fakeLlm = {
+      ...createFakeTokenizer(),
       async embed(_text: string, _options?: { model?: string }) {
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },
@@ -4364,6 +4453,7 @@ describe("Embedding batching", () => {
     // so vectors_vec is created as float[3].
     const storeModel = "hf:store/embeddinggemma-300M.gguf";
     const storeLlm = {
+      ...createFakeTokenizer(),
       embedModelName: storeModel,
       async embed(_text: string, _options?: { model?: string }) {
         return { embedding: [0.1, 0.2, 0.3], model: storeModel };
