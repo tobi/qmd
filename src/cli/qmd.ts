@@ -3708,6 +3708,13 @@ type DoctorVectorSampleResult = {
   details: string;
 };
 
+type DoctorEmbeddingVectorSample = {
+  hash: string;
+  seq: number;
+  body: string;
+  path: string;
+};
+
 function decodeStoredEmbedding(bytes: Uint8Array): Float32Array {
   return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
 }
@@ -3928,6 +3935,41 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   }
 }
 
+export function selectDoctorEmbeddingVectorSamples(
+  db: Database,
+  model: string,
+  fingerprint: string,
+  sampleSize: number = 3,
+): DoctorEmbeddingVectorSample[] {
+  // Keep full document bodies out of SQLite's random sort. On large indexes,
+  // joining content before LIMIT can materialize the corpus in a temp B-tree.
+  return db.prepare(`
+    WITH sampled AS MATERIALIZED (
+      SELECT cv.hash, cv.seq
+      FROM content_vectors cv
+      WHERE cv.model = ?
+        AND cv.embed_fingerprint = ?
+        AND EXISTS (
+          SELECT 1
+          FROM documents d
+          WHERE d.hash = cv.hash AND d.active = 1
+        )
+      ORDER BY random()
+      LIMIT ?
+    )
+    SELECT sampled.hash,
+           sampled.seq,
+           c.doc AS body,
+           (
+             SELECT MIN(d.path)
+             FROM documents d
+             WHERE d.hash = sampled.hash AND d.active = 1
+           ) AS path
+    FROM sampled
+    JOIN content c ON c.hash = sampled.hash
+  `).all(model, fingerprint, sampleSize) as DoctorEmbeddingVectorSample[];
+}
+
 async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
@@ -3939,16 +3981,7 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     return { ok: false, details: "no vector table to test; please run qmd embed again" };
   }
 
-  const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ?
-    GROUP BY cv.hash, cv.seq, c.doc
-    ORDER BY random()
-    LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+  const samples = selectDoctorEmbeddingVectorSamples(db, model, fingerprint, sampleSize);
 
   if (samples.length === 0) {
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
