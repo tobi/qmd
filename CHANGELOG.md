@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `qmd doctor` now chooses embedding sample identifiers before joining full
+  document bodies. This prevents its random sample query from materializing
+  and sorting the indexed corpus, which could exhaust memory on large indexes.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
