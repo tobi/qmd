@@ -1060,7 +1060,13 @@ qmd cleanup
 Measure search quality across all four backends with `qmd bench` and a fixture file
 of queries with known-relevant documents.
 
-**From a git checkout**, an example fixture and its test corpus ship in the repo:
+Print the bundled example fixture to use as a starting point:
+
+```sh
+qmd bench --example > my-fixture.json
+```
+
+**From a git checkout**, its matching test corpus also ships in the repo:
 
 ```sh
 # One-time setup (indexes the repo's test corpus into its own collection)
@@ -1068,16 +1074,15 @@ qmd collection add test/eval-docs --name eval-docs
 qmd embed -c eval-docs
 
 # Run the benchmark (table output)
-qmd bench src/bench/fixtures/example.json
+qmd bench my-fixture.json
 
 # JSON output for programmatic analysis
-qmd bench src/bench/fixtures/example.json --json
+qmd bench my-fixture.json --json
 ```
 
-> The example fixture (`src/bench/fixtures/example.json`) and its test corpus
-> (`test/eval-docs/`) exist only in a git checkout — they are **not** part of the
-> published npm package. If you installed via `npm`/`npx`, write your own fixture
-> (see below) against a collection you have already indexed:
+> The test corpus (`test/eval-docs/`) exists only in a git checkout. If you
+> installed via `npm`/`npx`, adapt the output of `qmd bench --example` to a
+> collection you have already indexed:
 >
 > ```sh
 > qmd bench my-fixture.json -c my-collection

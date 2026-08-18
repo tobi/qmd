@@ -22,6 +22,7 @@
     "scripts/check-package-grammars.mjs",
     "scripts/package-smoke.mjs",
     "scripts/test-all.mjs",
+    "src/bench/fixtures/example.json",
     "LICENSE",
     "CHANGELOG.md"
   ],
