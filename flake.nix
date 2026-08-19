@@ -48,8 +48,9 @@
           aarch64-darwin = "sha256-9vvR3KLmBc+4bfyWEyyM8FHWg+DfiDzUlwqUlm3NFc8=";
 
           # Populate these on first build for additional hosts if/when needed.
+          # The nix-fod-hashes workflow computes and updates them automatically.
           aarch64-linux = pkgs.lib.fakeHash;
-          x86_64-darwin = pkgs.lib.fakeHash;
+          x86_64-darwin = "sha256-B8YZsB+JRkG98nhZ71yrULSiOFBfbYJJVHcQ/SSf3yU=";
         };
 
         nodeModules = pkgs.stdenvNoCC.mkDerivation {
@@ -155,6 +156,7 @@
         packages = {
           default = qmd;
           qmd = qmd;
+          qmd-node-modules = nodeModules;
         };
 
         apps.default = {
