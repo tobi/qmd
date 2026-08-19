@@ -8,6 +8,15 @@
 
 ### Fixed
 
+- Cap query expansion at 6 variants (2 per `lex`/`vec`/`hyde`), deduplicate
+  case-insensitively, and drop variants that only restate the original query.
+  One policy in the store covers both fresh model output and cache reads, so an
+  oversized record written before the cap can no longer replay a dump of
+  near-identical `hyde` lines as dozens of sequential vector lookups.
+- After a shutdown signal, hybrid, structured, and vector search now stop at the
+  next expansion / embed / vector / rerank boundary instead of starting another
+  sqlite-vec scan against the grace deadline. An aborted search rejects — it
+  never reports itself as an ordinary empty result.
 - Add one idempotent shutdown coordinator for CLI, stdio MCP, and HTTP MCP so
   first-signal/EOF/stop close admission, abort active LLM sessions, drain
   in-flight work, then dispose models before the store. The coordinator also
