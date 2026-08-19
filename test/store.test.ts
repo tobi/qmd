@@ -1342,7 +1342,7 @@ describe("Query expansion cache (#818)", () => {
       store.llm = {
         generateModelName: "fake-generate-model",
         expandQuery: async () => oversized,
-      } as unknown as typeof store.llm;
+      } as typeof store.llm;
 
       const out = await store.expandQuery("fresh question");
 

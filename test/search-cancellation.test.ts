@@ -75,7 +75,7 @@ function stubLlm(signal: AbortSignal | undefined, embedBatch: (texts: string[]) 
     generateModelName: "fake-generate-model",
     embedBatch,
     ...(signal ? { sessionAbortSignal: signal } : {}),
-  } as unknown as Store["llm"];
+  } as Store["llm"];
 }
 
 const embedOk = async (texts: string[]) =>
