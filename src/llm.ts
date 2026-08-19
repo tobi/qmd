@@ -1442,6 +1442,22 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
+  /**
+   * Ensure every configured model file is present in the local cache,
+   * downloading any that are missing. Models are NOT loaded into memory —
+   * lazy loading applies as before — so this is nearly free when the cache
+   * is already populated. Long-lived servers call this in the background at
+   * startup: without it, the first request that needs a missing GGUF pays
+   * for a multi-GB download synchronously inside the caller's request, which
+   * over MCP is an unexplained multi-minute hang.
+   */
+  async prefetchModels(): Promise<void> {
+    if (this._ciMode) return;
+    await this.resolveModel(this.embedModelUri);
+    await this.resolveModel(this.generateModelUri);
+    await this.resolveModel(this.rerankModelUri);
+  }
+
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();

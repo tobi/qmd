@@ -1084,6 +1084,22 @@ export async function startMcpHttpServer(
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
 
+  // Prefetch model files in the background once the server is accepting
+  // connections. A cold model cache otherwise turns the first vec/hyde or
+  // rerank request into a synchronous multi-GB download inside that client's
+  // call — over MCP that reads as the server silently hanging. Gated on an
+  // existing vector index so lex-only installs never fetch models they
+  // don't use; models still load into memory lazily on first use.
+  void (async () => {
+    try {
+      const status = await store.getStatus();
+      if (!status.hasVectorIndex) return;
+      await store.internal.llm?.prefetchModels();
+    } catch (err) {
+      log(`${ts()} Model prefetch failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
+
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
