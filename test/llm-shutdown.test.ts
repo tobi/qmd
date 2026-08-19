@@ -44,7 +44,7 @@ describe("LLM shutdown admission and abort", () => {
 
   test("an AbortError from embed is not converted into a null fallback", async () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       ensureEmbedContext: async () => {
         throw Object.assign(new Error("aborted"), { name: "AbortError" });
       },
@@ -54,7 +54,7 @@ describe("LLM shutdown admission and abort", () => {
 
   test("an AbortError from expandQuery is not converted into fallback query text", async () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       _ciMode: false,
       ensureLlama: async () => {
         throw Object.assign(new Error("aborted"), { name: "AbortError" });
@@ -65,7 +65,7 @@ describe("LLM shutdown admission and abort", () => {
 
   test("a non-shutdown expandQuery failure still falls back to the original query", async () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       _ciMode: false,
       ensureLlama: async () => ({ createGrammar: async () => { throw new Error("oom"); } }),
       ensureGenerateModel: async () => undefined,
@@ -101,7 +101,7 @@ describe("LLM shutdown admission and abort", () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
     const started = deferred();
     const gate = deferred();
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       embedContexts: [{
         dispose: async () => {
           started.resolve();
@@ -134,7 +134,7 @@ describe("LLM shutdown admission and abort", () => {
     const observed: string[] = [];
     let contextDisposed = false;
 
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       embedContexts: [{
         dispose: async () => {
           disposeStarted.resolve();
@@ -170,7 +170,7 @@ describe("LLM shutdown admission and abort", () => {
     const releaseDispose = deferred();
     let entered = false;
 
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       embedContexts: [{
         dispose: async () => {
           disposeStarted.resolve();
@@ -211,7 +211,7 @@ describe("LLM shutdown admission and abort", () => {
     const started = deferred();
     const gate = deferred();
     const calls: string[] = [];
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       ensureEmbedContext: async () => {
         started.resolve();
         await gate.promise;
@@ -266,7 +266,7 @@ describe("LLM phase shutdown", () => {
         }
       },
     });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       _ciMode: false,
       ensureLlama: async () => ({ createGrammar: async () => ({}) }),
       ensureGenerateModel: async () => undefined,
@@ -303,7 +303,7 @@ describe("LLM phase shutdown", () => {
     const started = deferred();
     const gate = deferred();
     const calls: string[] = [];
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       ensureEmbedContext: async () => ({
         getEmbeddingFor: async () => {
           started.resolve();
@@ -338,7 +338,7 @@ describe("LLM phase shutdown", () => {
       },
       dispose: async () => { calls.push("context"); },
     };
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       _ciMode: false,
       rerankContexts: [ctx],
       ensureRerankContexts: async () => [ctx],

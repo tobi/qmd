@@ -349,7 +349,7 @@ describe("runOwnedCliDispatch", () => {
     const started = deferred();
     const gate = deferred();
     const calls: string[] = [];
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       ensureEmbedContext: async () => ({
         getEmbeddingFor: async () => {
           started.resolve();

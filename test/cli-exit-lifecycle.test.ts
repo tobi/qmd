@@ -136,7 +136,7 @@ describe("CLI successful-exit lifecycle", () => {
   test("waits for an active instance-scoped session before native teardown", async () => {
     const calls: string[] = [];
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       llama: { dispose: async () => { calls.push("llama"); } },
     });
 
@@ -163,7 +163,7 @@ describe("CLI successful-exit lifecycle", () => {
   test("memoizes concurrent disposal and tears down native resources once", async () => {
     const calls: string[] = [];
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       llama: { dispose: async () => { calls.push("llama"); } },
     });
 
@@ -177,7 +177,7 @@ describe("CLI successful-exit lifecycle", () => {
   test("does not dispose parent models when child context disposal fails", async () => {
     const calls: string[] = [];
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       embedContexts: [{ dispose: async () => { calls.push("context"); throw new Error("context busy"); } }],
       embedModel: { dispose: async () => { calls.push("model"); } },
       llama: { dispose: async () => { calls.push("llama"); } },
@@ -192,7 +192,7 @@ describe("CLI successful-exit lifecycle", () => {
     let finishContext!: () => void;
     const contextGate = new Promise<void>((resolve) => { finishContext = resolve; });
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm as Record<string, unknown>, {
       embedContexts: [{
         dispose: async () => {
           calls.push("context-start");

@@ -202,7 +202,7 @@ describe("stdio MCP initialization vs EOF", () => {
       async getGlobalContext() { return undefined; },
       async getDefaultCollectionNames() { return []; },
       async close() { order.push("store-close"); },
-    } as unknown as QMDStore;
+    } as QMDStore;
 
     const stdin = new FakeStdin();
     stdin.readableEnded = true;
