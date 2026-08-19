@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
+import { applyDarwinRuntimeDefaults } from "../bin/launcher-env.js";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const fixtures: string[] = [];
@@ -63,6 +65,7 @@ function makePackage(root: string, packagePath: string, lockfiles: string[] = []
   const includeDist = options.dist ?? true;
   mkdirSync(join(packageRoot, "bin"), { recursive: true });
   copyFileSync(join(repoRoot, "bin", "qmd"), join(packageRoot, "bin", "qmd"));
+  copyFileSync(join(repoRoot, "bin", "launcher-env.js"), join(packageRoot, "bin", "launcher-env.js"));
   chmodSync(join(packageRoot, "bin", "qmd"), 0o755);
   if (includeDist) {
     mkdirSync(join(packageRoot, "dist", "cli"), { recursive: true });
@@ -123,6 +126,23 @@ function runWrapper(commandPath: string, runtimeBin: string, capturePath: string
   });
   const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split("\n");
   return { runtime, scriptPath, args };
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for process state");
+    await sleep(25);
+  }
 }
 
 afterEach(() => {
@@ -328,5 +348,245 @@ describe("bin/qmd package wrapper", () => {
     expect(result.stderr).toContain("bun install && bun run build");
     expect(result.stderr).toContain("npm install && npm run build");
     expect(result.stderr).toContain("qmd doctor");
+  });
+
+  test.skipIf(process.platform === "win32")("terminating the wrapper also terminates a running query child", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"]);
+    const childPidPath = join(root, "query-child.pid");
+    const bunPath = join(runtimeBin, "bun");
+    writeFileSync(
+      bunPath,
+      `#!/bin/sh
+printf '%s\n' "$$" > "$QMD_CHILD_PID"
+trap '' TERM INT HUP
+while :; do sleep 1; done
+`,
+    );
+    chmodSync(bunPath, 0o755);
+
+    const wrapper = spawn(join(packageRoot, "bin", "qmd"), [
+      "query",
+      "intent: find fixture result\nlex: existing indexed fixture",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        QMD_CHILD_PID: childPidPath,
+        QMD_SHUTDOWN_GRACE_MS: "200",
+      },
+      stdio: "ignore",
+    });
+
+    let childPid: number | undefined;
+    try {
+      await waitFor(() => existsSync(childPidPath));
+      childPid = Number(readFileSync(childPidPath, "utf8").trim());
+      expect(processExists(childPid)).toBe(true);
+
+      wrapper.kill("SIGTERM");
+      await waitFor(() => !processExists(childPid!));
+      await waitFor(() => wrapper.exitCode !== null || wrapper.signalCode !== null);
+
+      expect(processExists(childPid)).toBe(false);
+      expect(wrapper.exitCode ?? wrapper.signalCode).not.toBeNull();
+    } finally {
+      if (wrapper.exitCode === null && wrapper.signalCode === null) wrapper.kill("SIGKILL");
+      if (childPid !== undefined && processExists(childPid)) process.kill(childPid, "SIGKILL");
+    }
+  });
+});
+
+describe("bin/qmd shutdown supervisor", () => {
+  function writeChildFixture(packageRoot: string, source: string) {
+    writeFileSync(join(packageRoot, "dist", "cli", "qmd.js"), source);
+  }
+
+  test.skipIf(process.platform === "win32")("first SIGTERM waits for child cleanup and reports 143", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["package-lock.json"]);
+    const breadcrumb = join(root, "breadcrumb.txt");
+    const childPidPath = join(root, "child.pid");
+    writeChildFixture(packageRoot, `
+const { appendFileSync, writeFileSync } = require("node:fs");
+writeFileSync(process.env.QMD_CHILD_PID, String(process.pid));
+process.on("SIGTERM", () => {
+  appendFileSync(process.env.QMD_CHILD_BREADCRUMB, "cleanup-started\\n");
+  setTimeout(() => process.exit(143), 400);
+});
+setInterval(() => {}, 1 << 30);
+`);
+
+    const wrapper = spawn(join(packageRoot, "bin", "qmd"), ["query", "fixture"], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        QMD_CHILD_BREADCRUMB: breadcrumb,
+        QMD_CHILD_PID: childPidPath,
+        QMD_SHUTDOWN_GRACE_MS: "5000",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let childPid: number | undefined;
+    try {
+      await waitFor(() => existsSync(childPidPath));
+      childPid = Number(readFileSync(childPidPath, "utf8").trim());
+      wrapper.kill("SIGTERM");
+      await waitFor(() => existsSync(breadcrumb), 2000);
+      expect(processExists(childPid)).toBe(true);
+      await sleep(150);
+      expect(wrapper.exitCode).toBeNull();
+      expect(processExists(childPid)).toBe(true);
+      await waitFor(() => wrapper.exitCode !== null || wrapper.signalCode !== null, 3000);
+      expect(wrapper.exitCode).toBe(143);
+      expect(readFileSync(breadcrumb, "utf8")).toContain("cleanup-started");
+    } finally {
+      if (wrapper.exitCode === null && wrapper.signalCode === null) wrapper.kill("SIGKILL");
+      if (childPid !== undefined && processExists(childPid)) process.kill(childPid, "SIGKILL");
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("second SIGTERM SIGKILLs immediately and still reports 143", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["package-lock.json"]);
+    const breadcrumb = join(root, "breadcrumb.txt");
+    const childPidPath = join(root, "child.pid");
+    writeChildFixture(packageRoot, `
+const { appendFileSync, writeFileSync } = require("node:fs");
+writeFileSync(process.env.QMD_CHILD_PID, String(process.pid));
+process.on("SIGTERM", () => {
+  appendFileSync(process.env.QMD_CHILD_BREADCRUMB, "cleanup-started\\n");
+});
+setInterval(() => {}, 1 << 30);
+`);
+
+    const wrapper = spawn(join(packageRoot, "bin", "qmd"), ["query", "fixture"], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        QMD_CHILD_BREADCRUMB: breadcrumb,
+        QMD_CHILD_PID: childPidPath,
+        QMD_SHUTDOWN_GRACE_MS: "5000",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let childPid: number | undefined;
+    try {
+      await waitFor(() => existsSync(childPidPath));
+      childPid = Number(readFileSync(childPidPath, "utf8").trim());
+      wrapper.kill("SIGTERM");
+      await waitFor(() => existsSync(breadcrumb));
+      wrapper.kill("SIGTERM");
+      await waitFor(() => !processExists(childPid!), 2000);
+      await waitFor(() => wrapper.exitCode !== null || wrapper.signalCode !== null, 2000);
+      expect(wrapper.exitCode).toBe(143);
+      expect(processExists(childPid)).toBe(false);
+    } finally {
+      if (wrapper.exitCode === null && wrapper.signalCode === null) wrapper.kill("SIGKILL");
+      if (childPid !== undefined && processExists(childPid)) process.kill(childPid, "SIGKILL");
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("grace expiry SIGKILLs an ignoring child and reports 130", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["package-lock.json"]);
+    const childPidPath = join(root, "child.pid");
+    writeChildFixture(packageRoot, `
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.QMD_CHILD_PID, String(process.pid));
+process.on("SIGINT", () => {});
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1 << 30);
+`);
+
+    const wrapper = spawn(join(packageRoot, "bin", "qmd"), ["query", "fixture"], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        QMD_CHILD_PID: childPidPath,
+        QMD_SHUTDOWN_GRACE_MS: "200",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let childPid: number | undefined;
+    try {
+      await waitFor(() => existsSync(childPidPath));
+      childPid = Number(readFileSync(childPidPath, "utf8").trim());
+      wrapper.kill("SIGINT");
+      await waitFor(() => !processExists(childPid!), 2000);
+      await waitFor(() => wrapper.exitCode !== null || wrapper.signalCode !== null, 2000);
+      expect(wrapper.exitCode).toBe(130);
+      expect(processExists(childPid)).toBe(false);
+    } finally {
+      if (wrapper.exitCode === null && wrapper.signalCode === null) wrapper.kill("SIGKILL");
+      if (childPid !== undefined && processExists(childPid)) process.kill(childPid, "SIGKILL");
+    }
+  });
+});
+
+describe("bin/qmd Darwin model routing", () => {
+  test.each(["query", "mcp", "vsearch", "embed", "doctor"])("%s keeps automatic Metal enabled", (command) => {
+    const env: Record<string, string | undefined> = {};
+
+    applyDarwinRuntimeDefaults(command, env, "darwin");
+
+    expect(env.QMD_FORCE_CPU).toBeUndefined();
+    expect(env.QMD_METAL_KEEP_RESIDENCY).toBe("1");
+    expect(env.GGML_METAL_NO_RESIDENCY).toBeUndefined();
+  });
+
+  test("explicit GPU query and residency choices are preserved", () => {
+    const env = {
+      QMD_FORCE_CPU: "0",
+      QMD_LLAMA_GPU: "metal",
+      QMD_METAL_KEEP_RESIDENCY: "0",
+      GGML_METAL_NO_RESIDENCY: "1",
+    };
+
+    applyDarwinRuntimeDefaults("query", env, "darwin");
+
+    expect(env).toEqual({
+      QMD_FORCE_CPU: "0",
+      QMD_LLAMA_GPU: "metal",
+      QMD_METAL_KEEP_RESIDENCY: "0",
+      GGML_METAL_NO_RESIDENCY: "1",
+    });
+  });
+
+  test("QMD_LLAMA_GPU is preserved for query", () => {
+    const env: Record<string, string | undefined> = { QMD_LLAMA_GPU: "metal" };
+
+    applyDarwinRuntimeDefaults("query", env, "darwin");
+
+    expect(env.QMD_FORCE_CPU).toBeUndefined();
+    expect(env.QMD_METAL_KEEP_RESIDENCY).toBe("1");
+  });
+
+  test("an explicit GGML residency choice blocks the launcher default", () => {
+    const env: Record<string, string | undefined> = { GGML_METAL_NO_RESIDENCY: "1" };
+
+    applyDarwinRuntimeDefaults("vsearch", env, "darwin");
+
+    expect(env.GGML_METAL_NO_RESIDENCY).toBe("1");
+    expect(env.QMD_METAL_KEEP_RESIDENCY).toBeUndefined();
+  });
+
+  test.each(["search", "get", "status", "update"])("%s does not receive model defaults", (command) => {
+    const env: Record<string, string | undefined> = {};
+
+    applyDarwinRuntimeDefaults(command, env, "darwin");
+
+    expect(env).toEqual({});
+  });
+
+  test.each(["linux", "win32"])("%s remains unchanged", (platform) => {
+    const env: Record<string, string | undefined> = {};
+
+    applyDarwinRuntimeDefaults("query", env, platform);
+
+    expect(env).toEqual({});
   });
 });

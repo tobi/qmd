@@ -1,14 +1,14 @@
 import { describe, expect, test } from "vitest";
 import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
+import { LlamaCpp, isDarwinMetalMitigationActive, withLLMSessionForLlm } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
-  test("exits 0 after successful output when post-output LLM cleanup fails", async () => {
+  test("does not exit 0 after successful output when post-output LLM cleanup fails", async () => {
     const exitCodes: number[] = [];
     const stderr: string[] = [];
     const flushed: string[] = [];
 
-    await finishSuccessfulCliCommand({
+    await expect(finishSuccessfulCliCommand({
       command: "query",
       format: "json",
       cleanup: async () => {
@@ -19,10 +19,10 @@ describe("CLI successful-exit lifecycle", () => {
       },
       stdout: { write: (chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { flushed.push(String(chunk)); cb?.(); return true; } },
       stderr: { write: (chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { stderr.push(String(chunk)); cb?.(); return true; } },
-    });
+    })).rejects.toThrow("ggml_metal_device_free abort simulation");
 
-    expect(exitCodes).toEqual([0]);
-    expect(stderr.join("")).toContain("QMD Warning: cleanup after successful output failed");
+    expect(exitCodes).toEqual([]);
+    expect(stderr.join("")).toContain("QMD Error: shutdown after output failed");
     expect(flushed).toEqual([""]);
   });
 
@@ -51,7 +51,7 @@ describe("CLI successful-exit lifecycle", () => {
     // process.exit() skips `beforeExit`, which is what trips the libggml-metal
     // assertion (ggml-org/llama.cpp#22593) even with explicit dispose.
     const prevCode = process.exitCode;
-    process.exitCode = 1; // poison the state to verify we set it
+    process.exitCode = undefined;
     try {
       const calls: string[] = [];
       await finishSuccessfulCliCommand({
@@ -69,11 +69,10 @@ describe("CLI successful-exit lifecycle", () => {
     }
   });
 
-  test("darwin Metal mitigation reflects launcher-exported env on darwin", () => {
-    // The real mitigation lives in bin/qmd, which sets GGML_METAL_NO_RESIDENCY=1
-    // before Node loads the llama.cpp native binding. The JS-side predicate
-    // just reports whether that env was set (and not overridden by
-    // QMD_METAL_KEEP_RESIDENCY). On non-darwin the function returns false.
+  test("darwin Metal mitigation reflects an explicit legacy env on darwin", () => {
+    // This compatibility diagnostic reports an explicit legacy no-residency
+    // setting unless QMD_METAL_KEEP_RESIDENCY overrides it. The launcher no
+    // longer enables no-residency mode by default.
     const expected =
       process.platform === "darwin" &&
       process.env.QMD_METAL_KEEP_RESIDENCY !== "1" &&
@@ -124,5 +123,87 @@ describe("CLI successful-exit lifecycle", () => {
       "rerank-model",
       "llama",
     ]);
+  });
+
+  test("waits for an active instance-scoped session before native teardown", async () => {
+    const calls: string[] = [];
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      llama: { dispose: async () => { calls.push("llama"); } },
+    });
+
+    let markStarted!: () => void;
+    let releaseSession!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const activeSession = withLLMSessionForLlm(llm, async () => {
+      markStarted();
+      await gate;
+    });
+
+    await started;
+    const disposing = llm.dispose();
+    await Promise.resolve();
+    expect(calls).toEqual([]);
+
+    releaseSession();
+    await activeSession;
+    await disposing;
+    expect(calls).toEqual(["llama"]);
+  });
+
+  test("memoizes concurrent disposal and tears down native resources once", async () => {
+    const calls: string[] = [];
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      llama: { dispose: async () => { calls.push("llama"); } },
+    });
+
+    const first = llm.dispose();
+    const second = llm.dispose();
+    expect(first).toBe(second);
+    await Promise.all([first, second]);
+    expect(calls).toEqual(["llama"]);
+  });
+
+  test("does not dispose parent models when child context disposal fails", async () => {
+    const calls: string[] = [];
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      embedContexts: [{ dispose: async () => { calls.push("context"); throw new Error("context busy"); } }],
+      embedModel: { dispose: async () => { calls.push("model"); } },
+      llama: { dispose: async () => { calls.push("llama"); } },
+    });
+
+    await expect(llm.dispose()).rejects.toThrow("context busy");
+    expect(calls).toEqual(["context"]);
+  });
+
+  test("waits for slow child disposal instead of racing into its parent", async () => {
+    const calls: string[] = [];
+    let finishContext!: () => void;
+    const contextGate = new Promise<void>((resolve) => { finishContext = resolve; });
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      embedContexts: [{
+        dispose: async () => {
+          calls.push("context-start");
+          await contextGate;
+          calls.push("context-end");
+        },
+      }],
+      embedModel: { dispose: async () => { calls.push("model"); } },
+      llama: { dispose: async () => { calls.push("llama"); } },
+    });
+
+    const disposing = llm.dispose();
+    const deadline = Date.now() + 1000;
+    while (calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(calls).toEqual(["context-start"]);
+    finishContext();
+    await disposing;
+    expect(calls).toEqual(["context-start", "context-end", "model", "llama"]);
   });
 });

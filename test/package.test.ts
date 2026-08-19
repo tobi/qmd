@@ -84,7 +84,10 @@ describe("Nix flake package layout", () => {
 
   test("makeWrapper seeds the same pre-import env as bin/qmd (#723)", () => {
     const flake = readFileSync(new URL("flake.nix", root), "utf8");
-    const launcher = readFileSync(new URL("bin/qmd", root), "utf8");
+    const launcher = [
+      readFileSync(new URL("bin/qmd", root), "utf8"),
+      readFileSync(new URL("bin/launcher-env.js", root), "utf8"),
+    ].join("\n");
 
     // Nix installs skip bin/qmd and exec bun src/cli/qmd.ts. The wrapper must
     // still set these BEFORE the native binding loads, matching the launcher.

@@ -10,6 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import { boundQueryExpansions } from "./query-expansion.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -754,23 +755,6 @@ async function disposeSequenceThenContext(
   await context.dispose();
 }
 
-async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
-  const timeoutPromise = new Promise<"timeout">((resolve) => {
-    setTimeout(() => resolve("timeout"), timeoutMs).unref();
-  });
-
-  try {
-    const result = await Promise.race([dispose(), timeoutPromise]);
-    if (result === "timeout") {
-      process.stderr.write(`QMD Warning: timed out disposing ${resourceName}; continuing shutdown.\n`);
-    }
-  } catch (error) {
-    process.stderr.write(
-      `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
-    );
-  }
-}
-
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
     if (!Number.isInteger(configValue) || configValue <= 0) {
@@ -832,17 +816,16 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
-  // Track disposal state to prevent double-dispose
+  // Disposal is memoized so concurrent callers await the same native teardown.
   private disposed = false;
+  private disposePromise: Promise<void> | null = null;
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
-    // set GGML_METAL_NO_RESIDENCY=1 on darwin BEFORE the native binding loads,
-    // which prevents the libggml-metal static destructor assertion at process
-    // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
-    // See isDarwinMetalMitigationActive() for the runtime check exposed to
-    // diagnostics. No constructor-time guard installation is needed.
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) applies Darwin residency
+    // defaults before the native binding loads. Model-backed commands retain
+    // automatic Metal selection with residency sets enabled.
+    // No constructor-time environment mutation is late enough to be reliable.
 
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
@@ -879,10 +862,8 @@ export class LlamaCpp implements LLM {
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
+        // The manager is shared per LlamaCpp instance, including MCP stores.
+        if (!canUnloadLlamaCpp(this)) {
           // Active sessions/operations - reschedule timer
           this.touchActivity();
           return;
@@ -914,6 +895,9 @@ export class LlamaCpp implements LLM {
     if (this.disposed) {
       return;
     }
+
+    const didUnload = await getSessionManagerForLlm(this).runWhenIdle(async () => {
+      if (this.disposed) return false;
 
     // Clear timer
     if (this.inactivityTimer) {
@@ -954,6 +938,9 @@ export class LlamaCpp implements LLM {
     }
 
     // Note: We keep llama instance alive - it's lightweight
+      return true;
+    });
+    if (!didUnload && !this.disposed) this.touchActivity();
   }
 
   /**
@@ -986,6 +973,10 @@ export class LlamaCpp implements LLM {
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
+      const keepMetalResidency =
+        process.platform === "darwin" &&
+        gpuMode !== false &&
+        process.env.QMD_METAL_KEEP_RESIDENCY === "1";
       // Skip source build when install dir is read-only (e.g. NixOS store).
       const canBuild = allowBuild && canWriteLlamaDir();
 
@@ -1002,6 +993,13 @@ export class LlamaCpp implements LLM {
           gpu,
           progressLogs: false,
           skipDownload: !sourceBuildAllowed,
+          ...(keepMetalResidency
+            ? {
+                experimental: {
+                  metalSkipDisablingResidencySets: true,
+                },
+              }
+            : {}),
         }));
       const loadCpuCompatibleLlama = async () => {
         try {
@@ -1046,11 +1044,11 @@ export class LlamaCpp implements LLM {
               try {
                 const gpuLlama = await loadLlama(candidate, false, "never");
                 if (gpuLlama.gpu !== false) {
-                  await disposeWithTimeout("CPU llama runtime", () => llama.dispose());
+                  await llama.dispose();
                   llama = gpuLlama;
                   break;
                 }
-                await disposeWithTimeout(`${candidate} probe runtime`, () => gpuLlama.dispose());
+                await gpuLlama.dispose();
               } catch {
                 failedGpuInitModes.add(candidate);
               }
@@ -1379,7 +1377,7 @@ export class LlamaCpp implements LLM {
    * Tokenize text using the embedding model's tokenizer
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
-  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+  private async tokenizeUntracked(text: string): Promise<readonly LlamaToken[]> {
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1387,23 +1385,31 @@ export class LlamaCpp implements LLM {
     return this.embedModel.tokenize(text);
   }
 
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    return this.withTrackedOperation("tokenize", () => this.tokenizeUntracked(text));
+  }
+
   /**
    * Count tokens in text using the embedding model's tokenizer
    */
   async countTokens(text: string): Promise<number> {
-    const tokens = await this.tokenize(text);
-    return tokens.length;
+    return this.withTrackedOperation("countTokens", async () => {
+      const tokens = await this.tokenizeUntracked(text);
+      return tokens.length;
+    });
   }
 
   /**
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
-    await this.ensureEmbedContext();
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.detokenize(tokens);
+    return this.withTrackedOperation("detokenize", async () => {
+      await this.ensureEmbedContext();
+      if (!this.embedModel) {
+        throw new Error("Embed model not loaded");
+      }
+      return this.embedModel.detokenize(tokens);
+    });
   }
 
   // ==========================================================================
@@ -1443,28 +1449,31 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    return this.withTrackedOperation("embed", async () => {
+      // Ping activity at start to keep models alive during this operation
+      this.touchActivity();
 
-    try {
-      const context = await this.ensureEmbedContext();
+      try {
+        const context = await this.ensureEmbedContext();
 
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+        // Guard: truncate text that exceeds model context window to prevent GGML crash
+        const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+        if (truncated) {
+          console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+        }
+
+        const embedding = await context.getEmbeddingFor(safeText);
+
+        return {
+          embedding: Array.from(embedding.vector),
+          model: options.model ?? this.embedModelUri,
+        };
+      } catch (error) {
+        if (this.shouldPropagateShutdown(error)) throw error;
+        console.error("Embedding error:", error);
+        return null;
       }
-
-      const embedding = await context.getEmbeddingFor(safeText);
-
-      return {
-        embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
-      };
-    } catch (error) {
-      console.error("Embedding error:", error);
-      return null;
-    }
+    });
   }
 
   /**
@@ -1472,6 +1481,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    return this.withTrackedOperation("embedBatch", async () => {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1496,6 +1506,7 @@ export class LlamaCpp implements LLM {
             this.touchActivity();
             embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
+            if (this.shouldPropagateShutdown(err)) throw err;
             console.error("Embedding error for text:", err);
             embeddings.push(null);
           }
@@ -1523,6 +1534,7 @@ export class LlamaCpp implements LLM {
               this.touchActivity();
               results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
             } catch (err) {
+              if (this.shouldPropagateShutdown(err)) throw err;
               console.error("Embedding error for text:", err);
               results.push(null);
             }
@@ -1533,12 +1545,15 @@ export class LlamaCpp implements LLM {
 
       return chunkResults.flat();
     } catch (error) {
+      if (this.shouldPropagateShutdown(error)) throw error;
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
     }
+    });
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    return this.withTrackedOperation("generate", async () => {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1560,6 +1575,7 @@ export class LlamaCpp implements LLM {
     let result = "";
     try {
       await session.prompt(prompt, {
+        signal: getSessionManagerForLlm(this).signal,
         maxTokens,
         temperature,
         topK: 20,
@@ -1578,6 +1594,7 @@ export class LlamaCpp implements LLM {
       // Sequence dispose is async as of node-llama-cpp 3.20; await it before the parent context.
       await disposeSequenceThenContext(sequence, context);
     }
+    });
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
@@ -1600,6 +1617,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    return this.withTrackedOperation("expandQuery", async () => {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1644,6 +1662,7 @@ export class LlamaCpp implements LLM {
       // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
+        signal: getSessionManagerForLlm(this).signal,
         grammar,
         maxTokens: 600,
         temperature: 0.7,
@@ -1675,9 +1694,11 @@ export class LlamaCpp implements LLM {
         return { type: type as QueryType, text };
       }).filter((q): q is Queryable => q !== null);
 
-      // Filter out lex entries if not requested
+      // Filter out lex entries if not requested, then apply the shared
+      // dedup/cap so a repeated-hyde dump cannot fan out into dozens of lookups.
       const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
+      const bounded = boundQueryExpansions(filtered, q => q.text);
+      if (bounded.length > 0) return bounded;
 
       const fallback: Queryable[] = [
         { type: 'hyde', text: `Information about ${query}` },
@@ -1686,6 +1707,7 @@ export class LlamaCpp implements LLM {
       ];
       return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
     } catch (error) {
+      if (this.shouldPropagateShutdown(error)) throw error;
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
       const fallback: Queryable[] = [{ type: 'vec', text: query }];
@@ -1694,6 +1716,7 @@ export class LlamaCpp implements LLM {
     } finally {
       if (genContext) await disposeSequenceThenContext(sequence, genContext);
     }
+    });
   }
 
   // Qwen3 reranker chat template overhead (system prompt, tags, separators).
@@ -1707,6 +1730,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    return this.withTrackedOperation("rerank", async () => {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1801,6 +1825,7 @@ export class LlamaCpp implements LLM {
       results,
       model: this.rerankModelUri,
     };
+    });
   }
 
   /**
@@ -1814,6 +1839,7 @@ export class LlamaCpp implements LLM {
     vram?: { total: number; used: number; free: number };
     cpuCores: number;
   }> {
+    return this.withTrackedOperation("getDeviceInfo", async () => {
     const llama = await this.ensureLlama(options.allowBuild ?? true);
     const cpuForced = this.isCpuOffloadForced();
     const gpuDevices = cpuForced ? [] : await llama.getGpuDeviceNames();
@@ -1831,14 +1857,66 @@ export class LlamaCpp implements LLM {
       vram,
       cpuCores: llama.cpuMathCores,
     };
+    });
   }
 
-  async dispose(): Promise<void> {
-    // Prevent double-dispose
-    if (this.disposed) {
-      return;
+  closeSessionAdmission(): void {
+    getSessionManagerForLlm(this).closeAdmission();
+  }
+
+  requestSessionAbort(reason: Error): void {
+    getSessionManagerForLlm(this).requestAbort(reason);
+  }
+
+  /** Abort signal flipped by `requestSessionAbort()` / shutdown. */
+  get sessionAbortSignal(): AbortSignal {
+    return getSessionManagerForLlm(this).signal;
+  }
+
+  waitForSessionIdle(): Promise<void> {
+    return getSessionManagerForLlm(this).waitForIdle();
+  }
+
+  private assertAcceptingWork(): void {
+    const manager = getSessionManagerForLlm(this);
+    if (this.disposed || manager.admissionClosed) {
+      throw new SessionReleasedError("LlamaCpp is shutting down");
     }
+  }
+
+  private shouldPropagateShutdown(error: unknown): boolean {
+    if (error instanceof SessionReleasedError) return true;
+    if (error instanceof Error && error.name === "AbortError") return true;
+    if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "AbortError") {
+      return true;
+    }
+    const manager = getSessionManagerForLlm(this);
+    return this.disposed || manager.admissionClosed || manager.signal.aborted;
+  }
+
+  private async withTrackedOperation<T>(_name: string, fn: () => Promise<T>): Promise<T> {
+    this.assertAcceptingWork();
+    const manager = getSessionManagerForLlm(this);
+    manager.operationStart();
+    try {
+      return await fn();
+    } finally {
+      manager.operationEnd();
+    }
+  }
+
+  dispose(): Promise<void> {
+    if (!this.disposePromise) {
+      this.disposePromise = this.disposeImpl();
+    }
+    return this.disposePromise;
+  }
+
+  private async disposeImpl(): Promise<void> {
     this.disposed = true;
+    const sessionManager = getSessionManagerForLlm(this);
+    sessionManager.closeAdmission();
+    sessionManager.requestAbort(new Error("LlamaCpp is being disposed"));
 
     // Clear inactivity timer
     if (this.inactivityTimer) {
@@ -1846,36 +1924,38 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Explicitly dispose in dependency order: contexts first, then models, then llama.
-    // Relying only on llama.dispose() leaves Metal resource sets alive until process
-    // finalization on Apple Silicon, where ggml_metal_device_free can abort after
-    // otherwise-successful CLI output (#368).
+    // Never tear down a context, model, or runtime beneath active native work.
+    await sessionManager.waitForMaintenance();
+    await sessionManager.waitForIdle();
+
+    // Dispose strictly in dependency order. A failed child tier aborts teardown;
+    // continuing into its parent can leave live Metal resources at device exit.
     for (const ctx of this.embedContexts) {
-      await disposeWithTimeout("embedding context", () => ctx.dispose());
+      await ctx.dispose();
     }
     this.embedContexts = [];
 
     for (const ctx of this.rerankContexts) {
-      await disposeWithTimeout("rerank context", () => ctx.dispose());
+      await ctx.dispose();
     }
     this.rerankContexts = [];
 
     if (this.embedModel) {
-      await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
+      await this.embedModel.dispose();
       this.embedModel = null;
       this.embedModelPath = null;
     }
     if (this.generateModel) {
-      await disposeWithTimeout("generation model", () => this.generateModel!.dispose());
+      await this.generateModel.dispose();
       this.generateModel = null;
     }
     if (this.rerankModel) {
-      await disposeWithTimeout("rerank model", () => this.rerankModel!.dispose());
+      await this.rerankModel.dispose();
       this.rerankModel = null;
     }
 
     if (this.llama) {
-      await disposeWithTimeout("llama runtime", () => this.llama!.dispose());
+      await this.llama.dispose();
       this.llama = null;
     }
 
@@ -1901,9 +1981,23 @@ class LLMSessionManager {
   private llm: LlamaCpp;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
+  private _admissionClosed = false;
+  private maintenanceCount = 0;
+  private idleWaiters = new Set<() => void>();
+  private maintenanceWaiters = new Set<() => void>();
+  private acquireWaiters = new Set<() => void>();
+  private readonly shutdownController = new AbortController();
 
   constructor(llm: LlamaCpp) {
     this.llm = llm;
+  }
+
+  get signal(): AbortSignal {
+    return this.shutdownController.signal;
+  }
+
+  get admissionClosed(): boolean {
+    return this._admissionClosed;
   }
 
   get activeSessionCount(): number {
@@ -1916,18 +2010,43 @@ class LLMSessionManager {
 
   /**
    * Returns true only when both session count and in-flight operations are 0.
-   * Used by LlamaCpp to determine if idle unload is safe.
+   * Used by LlamaCpp to determine if idle unload is safe. Maintenance is a
+   * separate barrier so runWhenIdle can hold it while canUnload() is still true.
    */
   canUnload(): boolean {
     return this._activeSessionCount === 0 && this._inFlightOperations === 0;
   }
 
+  private isQuiescent(): boolean {
+    return this.canUnload() && this.maintenanceCount === 0;
+  }
+
   acquire(): void {
+    if (this._admissionClosed) {
+      throw new SessionReleasedError("LLM is shutting down");
+    }
+    if (this.maintenanceCount > 0) {
+      throw new SessionReleasedError("LLM is temporarily unavailable");
+    }
     this._activeSessionCount++;
+  }
+
+  async acquireAsync(): Promise<void> {
+    while (true) {
+      if (this._admissionClosed) {
+        throw new SessionReleasedError("LLM is shutting down");
+      }
+      if (this.maintenanceCount === 0) {
+        this._activeSessionCount++;
+        return;
+      }
+      await new Promise<void>((resolve) => this.acquireWaiters.add(resolve));
+    }
   }
 
   release(): void {
     this._activeSessionCount = Math.max(0, this._activeSessionCount - 1);
+    this.notifyIdle();
   }
 
   operationStart(): void {
@@ -1936,6 +2055,67 @@ class LLMSessionManager {
 
   operationEnd(): void {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
+    this.notifyIdle();
+  }
+
+  closeAdmission(): void {
+    this._admissionClosed = true;
+    this.notifyIdle();
+    this.wakeAcquireWaiters();
+  }
+
+  requestAbort(reason: Error): void {
+    if (!this.shutdownController.signal.aborted) {
+      this.shutdownController.abort(reason);
+    }
+  }
+
+  waitForIdle(): Promise<void> {
+    if (this.isQuiescent()) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.add(resolve));
+  }
+
+  waitForMaintenance(): Promise<void> {
+    if (this.maintenanceCount === 0) return Promise.resolve();
+    return new Promise((resolve) => this.maintenanceWaiters.add(resolve));
+  }
+
+  beginMaintenance(): () => void {
+    this.maintenanceCount++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.maintenanceCount = Math.max(0, this.maintenanceCount - 1);
+      if (this.maintenanceCount === 0) {
+        for (const resolve of this.maintenanceWaiters) resolve();
+        this.maintenanceWaiters.clear();
+        this.wakeAcquireWaiters();
+        this.notifyIdle();
+      }
+    };
+  }
+
+  async runWhenIdle<T>(fn: () => Promise<T>): Promise<T | undefined> {
+    if (this._admissionClosed || !this.canUnload()) return undefined;
+    const release = this.beginMaintenance();
+    try {
+      if (this._admissionClosed || !this.canUnload()) return undefined;
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private wakeAcquireWaiters(): void {
+    for (const resolve of this.acquireWaiters) resolve();
+    this.acquireWaiters.clear();
+  }
+
+  private notifyIdle(): void {
+    if (!this.isQuiescent()) return;
+    for (const resolve of this.idleWaiters) resolve();
+    this.idleWaiters.clear();
   }
 
   getLlamaCpp(): LlamaCpp {
@@ -1960,24 +2140,20 @@ export class SessionReleasedError extends Error {
 class LLMSession implements ILLMSession {
   private manager: LLMSessionManager;
   private released = false;
+  private acquired = false;
   private abortController: AbortController;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
   private name: string;
+  private readonly abortListenerCleanups: Array<() => void> = [];
 
   constructor(manager: LLMSessionManager, options: LLMSessionOptions = {}) {
     this.manager = manager;
     this.name = options.name || "unnamed";
     this.abortController = new AbortController();
 
-    // Link external abort signal if provided
+    this.linkAbortSignal(manager.signal);
     if (options.signal) {
-      if (options.signal.aborted) {
-        this.abortController.abort(options.signal.reason);
-      } else {
-        options.signal.addEventListener("abort", () => {
-          this.abortController.abort(options.signal!.reason);
-        }, { once: true });
-      }
+      this.linkAbortSignal(options.signal);
     }
 
     // Set up max duration timer
@@ -1988,9 +2164,27 @@ class LLMSession implements ILLMSession {
       }, maxDuration);
       this.maxDurationTimer.unref(); // Don't keep process alive
     }
+  }
 
-    // Acquire session lease
-    this.manager.acquire();
+  private linkAbortSignal(signal: AbortSignal): void {
+    const abort = () => {
+      if (!this.abortController.signal.aborted) {
+        this.abortController.abort(signal.reason);
+      }
+    };
+
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+
+    signal.addEventListener("abort", abort, { once: true });
+    this.abortListenerCleanups.push(() => signal.removeEventListener("abort", abort));
+  }
+
+  async activate(): Promise<void> {
+    await this.manager.acquireAsync();
+    this.acquired = true;
   }
 
   get isValid(): boolean {
@@ -2014,8 +2208,12 @@ class LLMSession implements ILLMSession {
       this.maxDurationTimer = null;
     }
 
-    this.abortController.abort(new Error("Session released"));
-    this.manager.release();
+    for (const cleanup of this.abortListenerCleanups.splice(0)) cleanup();
+
+    if (!this.abortController.signal.aborted) {
+      this.abortController.abort(new Error("Session released"));
+    }
+    if (this.acquired) this.manager.release();
   }
 
   /**
@@ -2064,18 +2262,22 @@ class LLMSession implements ILLMSession {
   }
 }
 
-// Session manager for the default LlamaCpp instance
-let defaultSessionManager: LLMSessionManager | null = null;
+const sessionManagers = new WeakMap<LlamaCpp, LLMSessionManager>();
+
+function getSessionManagerForLlm(llm: LlamaCpp): LLMSessionManager {
+  let manager = sessionManagers.get(llm);
+  if (!manager) {
+    manager = new LLMSessionManager(llm);
+    sessionManagers.set(llm, manager);
+  }
+  return manager;
+}
 
 /**
  * Get the session manager for the default LlamaCpp instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
-    defaultSessionManager = new LLMSessionManager(llm);
-  }
-  return defaultSessionManager;
+  return getSessionManagerForLlm(getDefaultLlamaCpp());
 }
 
 /**
@@ -2100,6 +2302,7 @@ export async function withLLMSession<T>(
   const session = new LLMSession(manager, options);
 
   try {
+    await session.activate();
     return await fn(session);
   } finally {
     session.release();
@@ -2115,10 +2318,11 @@ export async function withLLMSessionForLlm<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
+  const manager = getSessionManagerForLlm(llm);
   const session = new LLMSession(manager, options);
 
   try {
+    await session.activate();
     return await fn(session);
   } finally {
     session.release();
@@ -2130,46 +2334,35 @@ export async function withLLMSessionForLlm<T>(
  * Used internally by LlamaCpp idle timer.
  */
 export function canUnloadLLM(): boolean {
-  if (!defaultSessionManager) return true;
-  return defaultSessionManager.canUnload();
+  if (!defaultLlamaCpp) return true;
+  return canUnloadLlamaCpp(defaultLlamaCpp);
+}
+
+function canUnloadLlamaCpp(llm: LlamaCpp): boolean {
+  return sessionManagers.get(llm)?.canUnload() ?? true;
 }
 
 // =============================================================================
 // Darwin Metal exit-crash mitigation
 // =============================================================================
 //
-// libggml-metal on macOS keeps allocated model memory wired via "residency
-// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
-// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
-// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
-// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
-// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
-// stderr after the user-visible output. See ggml-org/llama.cpp#22593.
+// Older llama.cpp Metal builds could leave a freed buffer's residency set in
+// the device registry and then assert `[rsets->data count] == 0` at teardown
+// (ggml-org/llama.cpp#22593). The packaged b10361 backend removes that registry
+// entry, but it still requires QMD to drain active work and dispose strictly in
+// context → model → runtime order.
 //
-// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
-// prevent it: the static destructor runs after every JS-reachable cleanup,
-// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
-// does NOT skip C++ static destructors — verified in
-// node/src/api/environment.cc).
+// Disabling residency sets via `GGML_METAL_NO_RESIDENCY=1` avoids that teardown
+// assertion, but crashes model operations on affected Apple Silicon runtimes.
+// The launcher now keeps residency sets enabled and relies on orderly cleanup.
+// The predicate below remains as a compatibility diagnostic for an explicit
+// legacy environment setting.
 //
-// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
-// which we set from `bin/qmd` before Node loads the native binding. For QMD's
-// short-lived CLI workflow this has no measurable cost (subsequent calls
-// don't reuse the warm mapping). The functions below report whether that
-// mitigation is in effect — kept here, in the module that depends on the
-// underlying resource, so doctor can answer "is the protection active?"
-// without reaching into env handling directly.
-//
-// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
-// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
-// env var is accepted as a no-op alias for back-compat; it had no effect on
-// Node prior to this fix.
+// `QMD_METAL_KEEP_RESIDENCY=1` is translated to node-llama-cpp's
+// `experimental.metalSkipDisablingResidencySets` option when Metal is active.
 
 /**
- * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
- *   true  → residency sets disabled, process exit completes silently
- *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
- *           in which case the libggml-metal teardown assertion may fire
+ * Whether the legacy Darwin no-residency mitigation is active in this process.
  */
 export function isDarwinMetalMitigationActive(): boolean {
   if (process.platform !== "darwin") return false;

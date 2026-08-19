@@ -12,6 +12,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyDarwinRuntimeDefaults } from "./launcher-env.js";
 
 // Resolve symlinks so global installs (npm link / npm install -g) can find
 // the actual package directory instead of the global bin directory.
@@ -30,26 +31,11 @@ if (process.argv[2] === "mcp") {
   process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
 }
 
-// libggml-metal on macOS uses "residency sets" to keep allocated model memory
-// resident across inference requests (180-second keep_alive timer). The
-// process-static device destructor that runs during libc exit() asserts the
-// residency set is empty (ggml-org/llama.cpp#22593); the keep_alive hasn't
-// expired by exit, so the assertion fails and ggml_abort dumps a multi-kB
-// stack trace to stderr even when the user-visible results were already
-// emitted correctly. No JS-side dispose can prevent it because the static
-// destructor runs in __cxa_finalize_ranges, after every JS-reachable cleanup.
-//
-// For QMD's short-lived CLI workflow, residency sets provide no observable
-// performance benefit (subsequent requests don't reuse the warm mapping —
-// measured: identical wall time with and without on M3 Pro), so disable them
-// by default on darwin. The env var must be set BEFORE the native llama.cpp
-// binding loads, which is why it lives here in the launcher rather than in
-// the JS entry point. Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you
-// run long-lived qmd processes (the MCP daemon may benefit on hot reload)
-// or are triaging an upstream Metal teardown fix.
-if (process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1") {
-  process.env.GGML_METAL_NO_RESIDENCY = process.env.GGML_METAL_NO_RESIDENCY || "1";
-}
+// These defaults must be applied before the child imports node-llama-cpp.
+// On Darwin, model-backed commands retain automatic Metal selection. Residency
+// sets stay enabled because disabling them crashes the affected Apple Silicon
+// runtime. Explicit operator choices win.
+applyDarwinRuntimeDefaults(process.argv[2], process.env, process.platform);
 
 function hasBun() {
   try {
@@ -177,15 +163,83 @@ const child = spawn(runner, args, {
   shell: needsShell,
 });
 
+// The launcher is the authoritative supervisor for first-signal drain,
+// second-signal SIGKILL, and the final deadline. The child coordinator owns
+// graceful teardown; this wrapper must not self-signal or ask the child to
+// dispose after the deadline.
+const forwardedSignals = process.platform === "win32"
+  ? ["SIGINT", "SIGTERM"]
+  : ["SIGHUP", "SIGINT", "SIGTERM"];
+const signalExitCode = new Map([
+  ["SIGHUP", 129],
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]);
+const parsedGrace = Number(process.env.QMD_SHUTDOWN_GRACE_MS);
+const shutdownGraceMs = Number.isFinite(parsedGrace) && parsedGrace >= 0 ? parsedGrace : 30_000;
+let firstSignal = null;
+let forceKillTimer = null;
+let forced = false;
+const signalHandlers = new Map();
+
+function childIsRunning() {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function stopChild(signal) {
+  if (!childIsRunning()) return;
+
+  // Only signals received by the supervisor count toward force escalation.
+  // Duplicate delivery to the child is handled idempotently by the child.
+  if (firstSignal !== null) {
+    forced = true;
+    child.kill("SIGKILL");
+    return;
+  }
+
+  firstSignal = signal;
+  child.kill(signal);
+  forceKillTimer = setTimeout(() => {
+    if (childIsRunning()) {
+      forced = true;
+      child.kill("SIGKILL");
+    }
+  }, shutdownGraceMs);
+}
+
+for (const signal of forwardedSignals) {
+  const handler = () => stopChild(signal);
+  signalHandlers.set(signal, handler);
+  process.on(signal, handler);
+}
+
+function removeSignalForwarding() {
+  if (forceKillTimer !== null) clearTimeout(forceKillTimer);
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+}
+
 child.on("exit", (code, signal) => {
+  removeSignalForwarding();
+  if (firstSignal !== null) {
+    if (forced) {
+      process.stderr.write("qmd: child exceeded shutdown grace; forced termination\n");
+    }
+    process.exitCode = signalExitCode.get(firstSignal) ?? 1;
+    return;
+  }
   if (signal) {
-    process.kill(process.pid, signal);
+    process.exitCode =
+      signalExitCode.get(signal) ??
+      (signal === "SIGKILL" ? 137 : 1);
   } else {
-    process.exit(code ?? 0);
+    process.exitCode = code ?? 0;
   }
 });
 
 child.on("error", (err) => {
+  removeSignalForwarding();
   const name = useSourceMode ? sourceRunner : runnerName;
   console.error(`qmd: failed to launch ${name}: ${err.message}`);
   process.exit(1);

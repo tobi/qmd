@@ -6,6 +6,17 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- Add one idempotent shutdown coordinator for CLI, stdio MCP, and HTTP MCP so
+  first-signal/EOF/stop close admission, abort active LLM sessions, drain
+  in-flight work, then dispose models before the store. The wrapper and
+  `qmd mcp stop` own the deadline and second-signal `SIGKILL`; JavaScript no
+  longer `process.exit()`s or continues disposal under active native work.
+- Restore automatic Metal selection for Darwin `query` and `mcp` after the
+  native lifecycle gate passed; keep residency sets enabled on affected Apple
+  Silicon runtimes and preserve explicit GPU, CPU, and residency overrides.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
@@ -393,7 +404,6 @@
   dropped the column entirely — which also disagreed with the empty-result
   header, always printed with `docid`. Column positions are now stable across
   runs and formats.
-
 ## [2.6.3] - 2026-06-24
 
 ### Added

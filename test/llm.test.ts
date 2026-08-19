@@ -100,6 +100,52 @@ describe("canWriteLlamaDir", () => {
       else process.env.QMD_FORCE_CPU = prevForceCpu;
     }
   });
+
+  test("requests native Metal residency sets when the Darwin launcher opts in", async () => {
+    const previous = {
+      gpu: process.env.QMD_LLAMA_GPU,
+      forceCpu: process.env.QMD_FORCE_CPU,
+      keepResidency: process.env.QMD_METAL_KEEP_RESIDENCY,
+    };
+    process.env.QMD_LLAMA_GPU = "metal";
+    process.env.QMD_FORCE_CPU = "0";
+    process.env.QMD_METAL_KEEP_RESIDENCY = "1";
+
+    const calls: Array<Record<string, unknown>> = [];
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options);
+        return { gpu: "metal", cpuMathCores: 4, dispose: async () => {} } as any;
+      }),
+    });
+    setLlamaDirWritableForTest(false);
+
+    try {
+      const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+      await (llm as any).ensureLlama();
+      expect(calls).toHaveLength(1);
+      if (process.platform === "darwin") {
+        expect(calls[0]?.experimental).toEqual({
+          metalSkipDisablingResidencySets: true,
+        });
+      } else {
+        expect(calls[0]?.experimental).toBeUndefined();
+      }
+      await llm.dispose();
+    } finally {
+      setLlamaDirWritableForTest(undefined);
+      setNodeLlamaCppModuleForTest(null);
+      if (previous.gpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = previous.gpu;
+      if (previous.forceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = previous.forceCpu;
+      if (previous.keepResidency === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
+      else process.env.QMD_METAL_KEEP_RESIDENCY = previous.keepResidency;
+    }
+  });
 });
 
 
