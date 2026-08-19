@@ -1,0 +1,365 @@
+{
+  "description": "wiki-bench v0: retrieval over Tobi Lütke public-appearances wiki. Ground truth from meta/registry.json + page YAML frontmatter only (no LLM judge). Collection rooted at wiki/ so paths are concepts|sources|entities/*.md.",
+  "version": 1,
+  "collection": "wiki-bench",
+  "queries": [
+    {
+      "id": "src-kp41",
+      "query": "Knowledge Project Episode 41 Trust Battery",
+      "type": "exact",
+      "description": "Exact show + episode title → source page (registry title)",
+      "expected_files": ["sources/2018-knowledge-project.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-hibt",
+      "query": "How I Built This Guy Raz Shopify",
+      "type": "exact",
+      "description": "Show + host → 2019 NPR biography source",
+      "expected_files": ["sources/2019-how-i-built-this.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-kara",
+      "query": "Kara Swisher Startupfest 2016 Rise of Shopify",
+      "type": "exact",
+      "description": "Host + event + year → source",
+      "expected_files": ["sources/2016-kara-swisher.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-mos",
+      "query": "Masters of Scale Reid Hoffman be a platform",
+      "type": "exact",
+      "description": "Show + host → 2020 Masters of Scale source",
+      "expected_files": ["sources/2020-masters-of-scale-reid-hoffman.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-motley-2017",
+      "query": "Motley Fool Tom Gardner 2017 trust battery",
+      "type": "exact",
+      "description": "Show + host + year → source that first names trust battery",
+      "expected_files": ["sources/2017-motley-fool-tom-gardner.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-leo",
+      "query": "Leo Laporte Call for Help Liquid 2006",
+      "type": "exact",
+      "description": "Early TV interview → source",
+      "expected_files": ["sources/2006-leo-laporte.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-mixergy",
+      "query": "Mixergy Andrew Warner Shopify profitable",
+      "type": "exact",
+      "description": "Show + host → 2010 Mixergy source",
+      "expected_files": ["sources/2010-mixergy.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-twist",
+      "query": "This Week in Startups Jason Calacanis Ottawa",
+      "type": "exact",
+      "description": "Show + host → 2013 TWiST source",
+      "expected_files": ["sources/2013-this-week-in-startups.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-balaji",
+      "query": "Network State Balaji country-sized economy",
+      "type": "exact",
+      "description": "Show + host + phrase → 2023 source",
+      "expected_files": ["sources/2023-network-state-balaji.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "src-iltb173",
+      "query": "Invest Like the Best 173 Patrick O'Shaughnessy",
+      "type": "exact",
+      "description": "Show + episode number → source",
+      "expected_files": ["sources/2020-invest-like-the-best-173.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-trust-battery",
+      "query": "trust battery",
+      "type": "exact",
+      "description": "Concept title exact match",
+      "expected_files": ["concepts/trust-battery.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-arming-rebels",
+      "query": "arming the rebels",
+      "type": "exact",
+      "description": "Concept title exact match",
+      "expected_files": ["concepts/arming-the-rebels.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-antifragility",
+      "query": "antifragility Taleb",
+      "type": "exact",
+      "description": "Concept + author cue from tldr",
+      "expected_files": ["concepts/antifragility.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-liquid",
+      "query": "Liquid template language Shopify",
+      "type": "exact",
+      "description": "Concept title + tldr keywords",
+      "expected_files": ["concepts/liquid.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-tobi-test",
+      "query": "Tobi test",
+      "type": "exact",
+      "description": "Concept title exact match",
+      "expected_files": ["concepts/tobi-test.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-pendulum",
+      "query": "pendulum model management",
+      "type": "exact",
+      "description": "Concept title + domain word",
+      "expected_files": ["concepts/pendulum-model.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-hundred-year",
+      "query": "hundred year vision",
+      "type": "exact",
+      "description": "Concept title exact match",
+      "expected_files": ["concepts/hundred-year-vision.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-apprenticeship",
+      "query": "apprenticeship German craft",
+      "type": "exact",
+      "description": "Concept + tldr keywords",
+      "expected_files": ["concepts/apprenticeship.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-autonomy",
+      "query": "autonomy NUMMI rip cord",
+      "type": "exact",
+      "description": "Concept + distinctive exhibit from page body/frontmatter framing",
+      "expected_files": ["concepts/autonomy.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "concept-platform-shift",
+      "query": "AI as platform shift",
+      "type": "exact",
+      "description": "Concept title phrasing",
+      "expected_files": ["concepts/ai-as-platform-shift.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "sem-trust-paraphrase",
+      "query": "interpersonal trust that charges with follow-through and buys autonomy",
+      "type": "semantic",
+      "description": "Paraphrase of trust-battery tldr (no title words)",
+      "expected_files": ["concepts/trust-battery.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "sem-rebels-paraphrase",
+      "query": "give independent merchants platform tools to compete with Amazon",
+      "type": "semantic",
+      "description": "Paraphrase of arming-the-rebels tldr",
+      "expected_files": ["concepts/arming-the-rebels.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "sem-tobi-test-paraphrase",
+      "query": "randomly turning off production services to train for failure",
+      "type": "semantic",
+      "description": "Paraphrase of tobi-test definition (chaos drill)",
+      "expected_files": ["concepts/tobi-test.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "sem-calm-progress",
+      "query": "counter-philosophy to hype and calm progress at scale",
+      "type": "semantic",
+      "description": "Paraphrase tied to calm-progress / KP 152 framing",
+      "expected_files": ["concepts/calm-progress.md"],
+      "expected_in_top_k": 3
+    },
+    {
+      "id": "cit-trust-battery-intro",
+      "query": "which interview first named the trust battery metaphor",
+      "type": "topical",
+      "description": "Citation grounding: concept frontmatter sources include 2017 Motley Fool (first naming) and 2018 KP",
+      "expected_files": [
+        "sources/2017-motley-fool-tom-gardner.md",
+        "sources/2018-knowledge-project.md"
+      ],
+      "expected_in_top_k": 2
+    },
+    {
+      "id": "cit-liquid-debut",
+      "query": "interview where Liquid template engine was first demoed",
+      "type": "topical",
+      "description": "Citation: liquid frontmatter sources → 2006 Leo Laporte",
+      "expected_files": ["sources/2006-leo-laporte.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-tobi-test-named",
+      "query": "podcast episode where the Tobi test chaos drill was named",
+      "type": "topical",
+      "description": "Citation: tobi-test frontmatter → 2018 Knowledge Project",
+      "expected_files": ["sources/2018-knowledge-project.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-apprenticeship",
+      "query": "appearance discussing Siemens apprenticeship and German craft education",
+      "type": "topical",
+      "description": "Citation: apprenticeship frontmatter → How I Built This",
+      "expected_files": ["sources/2019-how-i-built-this.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-arming-rebels",
+      "query": "podcast where Tobi said Shopify arms the rebels against Amazon",
+      "type": "topical",
+      "description": "Citation: arming-the-rebels frontmatter → Escape Velocity",
+      "expected_files": ["sources/2019-escape-velocity-dan-martell.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-autonomy-nummi",
+      "query": "talk where Tobi told the NUMMI Toyota autonomy rip cord story",
+      "type": "topical",
+      "description": "Citation: autonomy frontmatter → Business of Software 2011",
+      "expected_files": ["sources/2011-business-of-software.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-calm-progress",
+      "query": "2022 Farnam Street return interview about calm progress",
+      "type": "topical",
+      "description": "Citation: calm-progress frontmatter → KP 152",
+      "expected_files": ["sources/2022-knowledge-project-152.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-country-economy",
+      "query": "conversation with Balaji about Shopify as a country-sized economy",
+      "type": "topical",
+      "description": "Citation: country-sized-economy frontmatter → Network State",
+      "expected_files": ["sources/2023-network-state-balaji.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-pendulum",
+      "query": "Motley Fool interview introducing the pendulum management metaphor",
+      "type": "topical",
+      "description": "Citation: pendulum-model frontmatter → 2017 Motley Fool",
+      "expected_files": ["sources/2017-motley-fool-tom-gardner.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "cit-antifragile",
+      "query": "appearances discussing Taleb antifragile and thriving on change",
+      "type": "topical",
+      "description": "Citation: antifragility frontmatter sources",
+      "expected_files": [
+        "sources/2017-motley-fool-tom-gardner.md",
+        "sources/2016-kara-swisher.md"
+      ],
+      "expected_in_top_k": 2
+    },
+    {
+      "id": "alias-guy-raz",
+      "query": "Guy Raz",
+      "type": "alias",
+      "description": "Person entity by common name",
+      "expected_files": ["entities/p-guy-raz.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-shane-parrish",
+      "query": "Shane Parrish",
+      "type": "alias",
+      "description": "Person entity by common name",
+      "expected_files": ["entities/p-shane-parrish.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-hibt-show",
+      "query": "How I Built This",
+      "type": "alias",
+      "description": "Show entity title",
+      "expected_files": ["entities/s-how-i-built-this.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-knowledge-project",
+      "query": "The Knowledge Project Farnam Street",
+      "type": "alias",
+      "description": "Show entity + alternate name",
+      "expected_files": ["entities/s-the-knowledge-project.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-kara",
+      "query": "Kara Swisher",
+      "type": "alias",
+      "description": "Person entity",
+      "expected_files": ["entities/p-kara-swisher.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-reid",
+      "query": "Reid Hoffman",
+      "type": "alias",
+      "description": "Person entity",
+      "expected_files": ["entities/p-reid-hoffman.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-amazon",
+      "query": "Amazon aggregator",
+      "type": "alias",
+      "description": "Org entity + tldr cue",
+      "expected_files": ["entities/o-amazon.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-calacanis",
+      "query": "Jason Calacanis",
+      "type": "alias",
+      "description": "Person entity",
+      "expected_files": ["entities/p-jason-calacanis.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-shopify",
+      "query": "Shopify",
+      "type": "alias",
+      "description": "Primary org entity",
+      "expected_files": ["entities/shopify.md"],
+      "expected_in_top_k": 1
+    },
+    {
+      "id": "alias-ferriss",
+      "query": "Tim Ferriss",
+      "type": "alias",
+      "description": "Person entity",
+      "expected_files": ["entities/p-tim-ferriss.md"],
+      "expected_in_top_k": 1
+    }
+  ]
+}
