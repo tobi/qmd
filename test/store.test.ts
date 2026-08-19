@@ -4126,6 +4126,9 @@ describe("Embedding batching", () => {
       expect(fakeLlm.embedBatchCalls).toHaveLength(3);
       expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
       expect(result.docsProcessed).toBe(3);
+      expect(result.docsCompleted).toBe(3);
+      expect(result.remainingDocs).toBe(0);
+      expect(result.sessionExpired).toBe(false);
       expect(result.chunksEmbedded).toBe(3);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
     } finally {
@@ -4166,6 +4169,10 @@ describe("Embedding batching", () => {
       expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
       expect(embedBatchCalls.length).toBeLessThan(3);
       expect(result.chunksEmbedded).toBeLessThan(3);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.docsCompleted + result.remainingDocs).toBe(3);
+      expect(result.remainingDocs).toBeGreaterThan(0);
+      expect(result.sessionExpired).toBe(true);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);

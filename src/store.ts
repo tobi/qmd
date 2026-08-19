@@ -1743,7 +1743,18 @@ export type EmbedProgress = {
 };
 
 export type EmbedResult = {
+  /**
+   * Number of pending documents selected at run start. Kept for backward
+   * compatibility; use {@link EmbedResult.docsCompleted} for the number of
+   * documents actually completed before the run ended.
+   */
   docsProcessed: number;
+  /** Number of documents whose chunks were fully embedded before the run ended. */
+  docsCompleted: number;
+  /** Number of selected documents that remain pending (docsProcessed - docsCompleted). */
+  remainingDocs: number;
+  /** True when the run stopped because the session duration cap was reached. */
+  sessionExpired: boolean;
   chunksEmbedded: number;
   /** Active failed chunks that did not recover after retries. */
   errors: number;
@@ -1978,11 +1989,12 @@ export async function generateEmbeddings(
   const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
 
   if (docsToEmbed.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    return { docsProcessed: 0, docsCompleted: 0, remainingDocs: 0, sessionExpired: false, chunksEmbedded: 0, errors: 0, durationMs: 0 };
   }
   const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
+  let docsCompleted = 0;
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const embedModelUri = model;
@@ -2204,15 +2216,25 @@ export async function generateEmbeddings(
         chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
       }
 
+      const countChunksStmt = db.prepare(`SELECT COUNT(*) as count FROM content_vectors WHERE hash = ? AND model = ?`);
+      for (const [hash, expectedChunks] of expectedChunksByHash) {
+        if (expectedChunks === 0) continue;
+        const row = countChunksStmt.get(hash, model) as { count: number };
+        if (row.count === expectedChunks) docsCompleted++;
+      }
+
       bytesProcessed += batchBytes;
       options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
     }
 
-    return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
+    return { chunksEmbedded, errors: activeErrorCount(), failures: failureList(), sessionExpired: !session.isValid };
   }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
+    docsCompleted,
+    remainingDocs: totalDocs - docsCompleted,
+    sessionExpired: result.sessionExpired,
     chunksEmbedded: result.chunksEmbedded,
     errors: result.errors,
     failures: result.failures,

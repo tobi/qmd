@@ -2241,7 +2241,11 @@ async function vectorIndex(
       console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
       console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsCompleted}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      if (result.remainingDocs > 0) {
+        const stopReason = result.sessionExpired ? "session expired at the duration cap" : "run stopped early";
+        console.log(`${c.yellow}⚠ ${formatCount(result.remainingDocs)} documents remaining (${stopReason}) — re-run \`qmd embed\` to continue${c.reset}`);
+      }
       if (result.errors > 0) {
         console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
         for (const failure of (result.failures ?? []).slice(0, 8)) {
