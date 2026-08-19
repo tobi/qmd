@@ -3,10 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Pin x86_64-darwin to the last stable branch that supports it.
+    # nixpkgs-unstable dropped x86_64-darwin in 26.11; nixpkgs-26.05-darwin
+    # is the last stable branch with x86_64-darwin support (security fixes
+    # until end of 2026). See references/flake-templates/darwin-legacy-pin.md
+    # in the nixify skill for rationale.
+    nixpkgs-darwin-legacy.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-darwin-legacy, flake-utils }:
     {
       homeModules.default = { config, lib, pkgs, ... }:
         with lib;
@@ -32,7 +38,10 @@
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs =
+          if system == "x86_64-darwin"
+          then nixpkgs-darwin-legacy.legacyPackages.${system}
+          else nixpkgs.legacyPackages.${system};
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
         version = packageJson.version;
 
@@ -49,6 +58,8 @@
 
           # Populate these on first build for additional hosts if/when needed.
           # The nix-fod-hashes workflow computes and updates them automatically.
+          # If GitHub Actions decommissions macos-26-intel, the self-prune job
+          # in nix.yml swaps x86_64-darwin to pkgs.lib.fakeHash automatically.
           aarch64-linux = pkgs.lib.fakeHash;
           x86_64-darwin = "sha256-B8YZsB+JRkG98nhZ71yrULSiOFBfbYJJVHcQ/SSf3yU=";
         };

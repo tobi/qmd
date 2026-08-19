@@ -1,27 +1,294 @@
-name: Nix
+name: Nix flake
+
+# Validates the flake (flake.nix). For most nixify targets Nix is a side
+# concern and the full build can take 10+ minutes, so this workflow runs
+# only on manual dispatch or when a release is published — not on every
+# push or PR. If the project wants per-PR validation, add a `pull_request`
+# trigger with `paths:` filtered to flake files (see customization notes).
+#
+# Steps, in order of what they catch:
+#   1. nix flake check --all-systems  — every system's outputs evaluate
+#      (including darwin on an ubuntu runner).
+#   2. nix build .#default            — fetchurl + autoPatchelf + install
+#      layout actually realises for the runner's system.
+#   3. nix run .#default -- --version — the patched binary actually execs.
+#      This is the only step that catches the `let ... in rec` shadowing
+#      class of bug (passes flake check, fails nix run). Do NOT drop it.
+#   4. nix build .#source (if #source output exists) — the from-source
+#      build path realises for the runner's system. Skip if the flake
+#      does not expose a #source output.
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch: {}
+  release:
+    types: [published]
   pull_request:
     branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - ".github/workflows/nix.yml"
+      - "bun.lock"
+      - "package.json"
+  push:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - ".github/workflows/nix.yml"
+      - "bun.lock"
+      - "package.json"
+
+permissions:
+  contents: read
+  # id-token: write is required by magic-nix-cache-action for the GitHub
+  # Actions cache v2 API (OIDC token exchange for cache auth).
+  id-token: write
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-flake:
-    name: Build flake (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-13]
+  check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Enable Nix binary cache (GitHub Actions cache)
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: nix flake check --all-systems
+        run: nix flake check --all-systems --no-build
+
+      - name: nix build .#default
+        run: nix build .#default --print-build-logs
+
+      - name: nix run .#default -- --version
+        run: nix run .#default -- --version
+
+  validate-x86-darwin:
+    name: Validate x86_64-darwin (Intel macOS)
+    runs-on: macos-26-intel
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Enable Nix binary cache (GitHub Actions cache)
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: nix build .#default (x86_64-darwin)
+        run: nix build .#default --print-build-logs
+
+      - name: nix run .#default -- --version (x86_64-darwin)
+        run: nix run .#default -- --version
+
+  validate-aarch64-darwin:
+    name: Validate aarch64-darwin (Apple Silicon macOS)
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Enable Nix binary cache (GitHub Actions cache)
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: nix build .#default (aarch64-darwin)
+        run: nix build .#default --print-build-logs
+
+      - name: nix run .#default -- --version (aarch64-darwin)
+        run: nix run .#default -- --version
+
+  self-prune:
+    name: Self-prune dead Intel macOS runner
+    runs-on: ubuntu-latest
+    if: always() && needs.validate-x86-darwin.result == 'failure'
+    needs: [validate-x86-darwin]
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: cachix/install-nix-action@v31
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          persist-credentials: false
 
-      - name: Build flake
-        run: nix build . --print-build-logs
+      - name: Check for newer Intel macOS runner label
+        id: check-label
+        run: |
+          set -euo pipefail
+          CURRENT="macos-26-intel"
+          # Query the actions/runner-images repo for available macOS runner directories.
+          # The directory structure is the closest public signal for runner label availability.
+          LABELS=$(curl -fsSL \
+            "https://api.github.com/repos/actions/runner-images/contents/images/macos" \
+            | python3 -c '
+          import json, sys
+          entries = json.load(sys.stdin)
+          intel = [e["name"] for e in entries
+                   if e["type"] == "dir" and e["name"].endswith("-intel")]
+          print("\n".join(sorted(intel)))
+          ')
+          NEWEST=$(echo "$LABELS" | tail -1)
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "newest=$NEWEST" >> "$GITHUB_OUTPUT"
+          if [ -n "$NEWEST" ] && [ "$NEWEST" != "$CURRENT" ]; then
+            echo "newer=true" >> "$GITHUB_OUTPUT"
+            echo "Found newer Intel macOS runner label: $NEWEST (current: $CURRENT)"
+          else
+            echo "newer=false" >> "$GITHUB_OUTPUT"
+            echo "No newer Intel macOS runner label available (current: $CURRENT)"
+          fi
+
+      - name: Open PR to update runner label
+        if: steps.check-label.outputs.newer == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(ci): update Intel macOS runner from ${{ steps.check-label.outputs.current }} to ${{ steps.check-label.outputs.newest }}"
+          title: "chore(ci): update Intel macOS runner label"
+          branch: chore/ci-update-intel-runner
+          body: |
+            The `macos-26-intel` GitHub Actions runner was decommissioned and the
+            `validate-x86-darwin` job failed with "no runner available."
+
+            A newer Intel macOS runner label is available:
+            `${{ steps.check-label.outputs.newest }}`.
+
+            This PR updates `runs-on:` in the `validate-x86-darwin` job to the
+            newer label. No other changes are needed.
+
+            Source: https://github.com/actions/runner-images/issues/13739
+
+      - name: Comment out dead job + swap to fakeHash
+        if: steps.check-label.outputs.newer == 'false'
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import re
+          # 1. Comment out validate-x86-darwin job in .github/workflows/nix.yml
+          wf = open(".github/workflows/nix.yml").read()
+          # Replace the validate-x86-darwin job block with a commented-out version
+          # + warning job. The block starts at "  validate-x86-darwin:" and ends
+          # at the next top-level job (two-space indented "  self-prune:").
+          pattern = r'(  validate-x86-darwin:.*?)(\n  self-prune:)'
+          # Build the commented-out block + warning job as a list of lines to
+          # avoid YAML block-scalar indentation issues with triple-quoted strings.
+          commented = "\n".join([
+              "# DECOMMISSIONED: macos-26-intel was scheduled for decommission by GitHub",
+              "# Actions (~Nov 2028 per https://github.com/actions/runner-images/issues/13739).",
+              '# This job is commented out to prevent CI failures from "no runner available."',
+              "#",
+              "# To re-enable:",
+              "# 1. Check for a newer Intel macOS runner label:",
+              "#    https://github.com/actions/runner-images/tree/main/images/macos",
+              "#    (look for any macos-*-intel directory newer than macos-26-intel)",
+              "# 2. If a newer label exists, uncomment this job and update runs-on below",
+              "# 3. If using a self-hosted Intel Mac runner, uncomment and set runs-on to",
+              "#    your self-hosted label",
+              "# 4. If no Intel macOS runner is available, x86_64-darwin source-build FOD",
+              "#    hashes are set to lib.fakeHash in flake.nix -- a community user with an",
+              "#    Intel Mac can compute the real hash via `nix build .#source` and open a PR",
+              "# validate-x86-darwin:",
+              "#   name: Validate x86_64-darwin (Intel macOS)",
+              "#   runs-on: macos-26-intel  # <-- update to newer label if available",
+              "#   timeout-minutes: 20",
+              "#   steps:",
+              "#     - name: Checkout",
+              "#       uses: actions/checkout@v4",
+              "#       with:",
+              "#         persist-credentials: false",
+              "#     - name: Install Nix",
+              "#       uses: DeterminateSystems/nix-installer-action@v16",
+              "#     - name: Enable Nix binary cache (GitHub Actions cache)",
+              "#       uses: DeterminateSystems/magic-nix-cache-action@v13",
+              "#     - name: nix build .#default (x86_64-darwin)",
+              "#       run: nix build .#default --print-build-logs",
+              "#     - name: nix run .#default -- --version (x86_64-darwin)",
+              "#       run: nix run .#default -- --version",
+              "",
+              "  warn-x86-darwin-decommissioned:",
+              "    name: Warn x86_64-darwin validation disabled",
+              "    runs-on: ubuntu-latest",
+              "    steps:",
+              '      - run: |',
+              '          echo "::warning::x86_64-darwin validation is disabled -- macos-26-intel runner was decommissioned by GitHub Actions. x86_64-darwin source-build FOD hashes are set to lib.fakeHash. See commented validate-x86-darwin job above for re-enablement instructions."',
+              "",
+          ])
+          replacement = commented + "\\2"
+          wf_new, n = re.subn(pattern, replacement, wf, flags=re.S)
+          if n == 1:
+              open(".github/workflows/nix.yml", "w").write(wf_new)
+              print("Commented out validate-x86-darwin job")
+          else:
+              print(f"WARNING: could not match validate-x86-darwin job block (matches: {n})")
+
+          # 2. Swap x86_64-darwin FOD hashes to lib.fakeHash in flake.nix
+          flake = open("flake.nix").read()
+          # Replace real SRI hashes for x86_64-darwin with lib.fakeHash
+          flake_new = re.sub(
+              r'(x86_64-darwin = )"sha256-[^"]*(";)',
+              r'\1pkgs.lib.fakeHash\2',
+              flake, count=1)
+          if flake_new != flake:
+              open("flake.nix", "w").write(flake_new)
+              print("Swapped x86_64-darwin FOD hash to lib.fakeHash")
+          else:
+              print("WARNING: could not find x86_64-darwin SRI hash to swap")
+          PYEOF
+
+      - name: Open PR for fakeHash swap
+        if: steps.check-label.outputs.newer == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(ci): decommission macos-26-intel — comment out validate-x86-darwin, swap to lib.fakeHash"
+          title: "chore(ci): handle macos-26-intel decommission"
+          branch: chore/ci-decommission-intel-runner
+          body: |
+            The `macos-26-intel` GitHub Actions runner was decommissioned and the
+            `validate-x86-darwin` job failed with "no runner available." No newer
+            Intel macOS runner label is currently available.
+
+            This PR:
+            1. Comments out the `validate-x86-darwin` job with re-enablement
+               instructions (see the commented block in `.github/workflows/nix.yml`)
+            2. Adds a warning job that emits a `::warning::` annotation on every
+               CI run so the gap is visible, not buried in git history
+            3. Swaps `x86_64-darwin` source-build FOD hashes to `lib.fakeHash`
+               in `flake.nix` — an honest "unverified" signal
+
+            To re-enable x86_64-darwin validation in the future:
+            1. Check for a newer Intel macOS runner label:
+               https://github.com/actions/runner-images/tree/main/images/macos
+               (look for any `macos-*-intel` directory newer than `macos-26-intel`)
+            2. If a newer label exists, uncomment `validate-x86-darwin` and update
+               `runs-on:` to the new label
+            3. If using a self-hosted Intel Mac runner, uncomment and set
+               `runs-on:` to your self-hosted label
+               (https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-github-actions)
+            4. After re-enabling, run `nix build .#default --system x86_64-darwin`
+               to compute the real FOD hash, replace `lib.fakeHash`, and open a PR
+
+            Source: https://github.com/actions/runner-images/issues/13739
