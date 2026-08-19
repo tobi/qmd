@@ -6,6 +6,40 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- Add one idempotent shutdown coordinator for CLI, stdio MCP, and HTTP MCP so
+  first-signal/EOF/stop close admission, abort active LLM sessions, drain
+  in-flight work, then dispose models before the store. The coordinator also
+  owns a single grace deadline (`QMD_SHUTDOWN_GRACE_MS`, default 30s) for every
+  trigger kind, so a shutdown that hangs terminates even when nothing is
+  supervising the process — a Nix wrapper, `node dist/cli/qmd.js`, or the
+  detached `--daemon`. Teardown that fails or blows the deadline self-`SIGKILL`s
+  rather than `process.exit()`ing, which would still run the ggml static
+  destructors and cannot preempt an event loop blocked inside llama.cpp.
+- `bin/qmd` now marks its child with `QMD_SUPERVISED=1`, the whole wrapper
+  protocol. A supervised child leaves second-signal escalation to the wrapper
+  (one terminal Ctrl-C reaches both members of the foreground process group, so
+  the forwarded copy used to kill a healthy drain); an unsupervised child
+  hard-stops on the second signal itself. `qmd mcp --http --daemon` removes the
+  bit when it spawns, because whatever launched it is not its supervisor.
+- Metal residency sets now follow one predicate in `src/llm.ts` that every
+  `getLlama()` attempt uses, instead of a default split between `bin/qmd` and
+  `flake.nix` that `qmd bench`, dev runs, and Nix installs never reached. The
+  default is node-llama-cpp's own (residency disabled): an A/B on Apple M1 Pro /
+  macOS 14.7.6 with node-llama-cpp 3.20.0 could not reproduce a crash in either
+  state across 48 embedding/generation runs. `QMD_METAL_KEEP_RESIDENCY=1` opts
+  back into native residency sets, and an explicitly set `GGML_METAL_NO_RESIDENCY`
+  always wins. GPU selection is unchanged — `auto` was already `auto`.
+- A direct LLM operation (embedding, reranking, tokenizing) could start while
+  idle-timeout maintenance was disposing the very contexts it was about to use.
+  Operations now wait on the same maintenance barrier as session acquisition,
+  and re-check for shutdown after waking.
+- An `update:` hook that exits non-zero now propagates that exact code and
+  prints one failure line. `process.exit()` is a throwing shim during owned CLI
+  dispatch, so exiting from inside the hook's spawn `try` was caught as a spawn
+  failure and downgraded to exit 1 with a second message.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
@@ -393,7 +427,6 @@
   dropped the column entirely — which also disagreed with the empty-result
   header, always printed with `docid`. Column positions are now stable across
   runs and formats.
-
 ## [2.6.3] - 2026-06-24
 
 ### Added

@@ -2,7 +2,7 @@ import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { isQmdMcpPid, mcpDaemonStateFiles, stopQmdMcpProcess } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -86,7 +86,17 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, SessionReleasedError, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, describeMetalResidencyPolicy } from "../llm.js";
+import {
+  createAdmissionLease,
+  createShutdownCoordinator,
+  createShutdownHandoff,
+  createShutdownHold,
+  formatShutdownError,
+  hardStopProcess,
+  type AdmissionLease,
+  type ShutdownTrigger,
+} from "../shutdown.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -190,7 +200,18 @@ function resyncConfig(): void {
   }
 }
 
+let storeCloseObserver: (() => void) | undefined;
+
+export function setStoreCloseObserverForTest(observer?: () => void): void {
+  storeCloseObserver = observer;
+}
+
+export function resetCliStoreForTest(): void {
+  store = null;
+}
+
 function closeDb(): void {
+  storeCloseObserver?.();
   if (store) {
     store.close();
     store = null;
@@ -277,22 +298,17 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
 /**
  * Finish a successful CLI command after output has been flushed.
  *
- * We deliberately do NOT call `process.exit(0)`. `process.exit()` skips
- * Node's `beforeExit` event, and node-llama-cpp registers a `beforeExit` hook
- * that auto-disposes its native handles. On darwin, without that hook firing,
- * libggml-metal's static `ggml_metal_device` destructor asserts on a
- * non-empty residency-set collection during `__cxa_finalize_ranges` and
- * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
- * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
- * direct `process.exit(0)` path still trips the assertion — letting the
- * event loop drain naturally is what actually clears the rsets.
+ * We deliberately do NOT call `process.exit(0)`. Immediate `process.exit()`
+ * skips remaining JS ownership and can tear down native parents while a
+ * model operation is still live. Packaged llama.cpp b10361 removes the old
+ * Metal residency-set registry entry, but QMD still has to drain active work
+ * and dispose contexts → models → runtime before the store and before the
+ * process ends naturally.
  *
- * So: set `process.exitCode = 0` and return. The main module finishes, the
- * event loop drains, `beforeExit` fires, native resources tear down in
- * order, and the process exits cleanly. The `GGML_METAL_NO_RESIDENCY=1` env
- * var that `bin/qmd` exports is a defense-in-depth safety net for paths
- * that still call `process.exit()` after loading the native binding
- * (signal handlers, error paths, `bun test`).
+ * So: set `process.exitCode` and return. The main module finishes, the event
+ * loop drains, `beforeExit` can still run, and native resources tear down in
+ * the coordinator's order. Native Metal has passed the lifecycle gate; CPU
+ * remains an explicit operator choice, not a launcher default.
  *
  * If the caller passes an explicit `exit` for testability, we honor it —
  * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
@@ -307,22 +323,166 @@ export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCom
     await (options.cleanup ?? disposeDefaultLlamaCpp)();
   } catch (error) {
     stderr.write(
-      `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
+      `QMD Error: shutdown after output failed (${error instanceof Error ? error.message : String(error)}).\n`
     );
+    throw error;
   }
   await flushWritable(stderr);
 
+  const code = typeof process.exitCode === "number" ? process.exitCode : 0;
   if (options.exit) {
-    options.exit(0);
+    options.exit(code);
     return;
   }
 
-  process.exitCode = 0;
+  if (process.exitCode === undefined) process.exitCode = 0;
 }
 
-// Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
+type ActiveShutdown = (trigger: ShutdownTrigger) => Promise<void>;
+
+let activeShutdown: ActiveShutdown | undefined;
+let cliCommandLease: AdmissionLease | undefined;
+
+export function createCliShutdownCoordinator(options: {
+  waitForInflight?: () => Promise<void>;
+  closeAdmission?: () => void;
+  requestAbort?: (reason: Error) => void;
+  waitForLlmIdle?: () => Promise<void>;
+  disposeLlm?: () => Promise<void>;
+  closeStore?: () => void | Promise<void>;
+  holdOpen?: () => () => void;
+  hardStop?: (error: unknown) => never;
+  schedule?: (fn: () => void, ms: number) => { clear(): void };
+  setExitCode?: (code: number) => void;
+  logError?: (error: unknown) => void;
+} = {}) {
+  return createShutdownCoordinator({
+    closeAdmission() {
+      cliCommandLease?.closeAdmission();
+      store?.llm?.closeSessionAdmission();
+      options.closeAdmission?.();
+    },
+    stopServing() {
+      // No listener for ordinary one-shot CLI.
+    },
+    requestAbort(reason) {
+      store?.llm?.requestSessionAbort(reason);
+      options.requestAbort?.(reason);
+    },
+    waitForInflight() {
+      return options.waitForInflight?.() ?? cliCommandLease?.waitForIdle() ?? Promise.resolve();
+    },
+    waitForLlmIdle() {
+      return options.waitForLlmIdle?.() ?? store?.llm?.waitForSessionIdle() ?? Promise.resolve();
+    },
+    disposeLlm: () => options.disposeLlm?.() ?? disposeDefaultLlamaCpp(),
+    closeStore() {
+      if (options.closeStore) return options.closeStore();
+      const closing = store;
+      store = null;
+      return closing?.close();
+    },
+    setExitCode: options.setExitCode ?? ((code) => {
+      const prior = typeof process.exitCode === "number" ? process.exitCode : undefined;
+      if (code !== 0 || prior === undefined || prior === 0) {
+        process.exitCode = code;
+      }
+    }),
+    logError: options.logError ?? ((error) => {
+      try {
+        process.stderr.write(`QMD shutdown failed: ${formatShutdownError(error)}\n`);
+      } catch {}
+    }),
+    holdOpen: options.holdOpen ?? createShutdownHold,
+    ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
+  });
+}
+
+/**
+ * `bin/qmd` sets this on its child. A supervised child must not escalate on a
+ * duplicate signal: one terminal Ctrl-C is delivered to every member of the
+ * foreground process group and the wrapper then forwards it again, so the
+ * child would see two signals for one keypress. The wrapper owns the second
+ * Ctrl-C and the outer deadline; an unsupervised child owns both itself.
+ */
+export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.QMD_SUPERVISED === "1";
+}
+
+export function installMainSignalHandlers(
+  fallback: ActiveShutdown,
+  options: {
+    supervised?: boolean;
+    hardStop?: (error: unknown) => never;
+  } = {},
+): () => void {
+  const supervised = options.supervised ?? isSupervisedChild();
+  const hardStop = options.hardStop ?? hardStopProcess;
+  let signalCount = 0;
+
+  const trigger = (
+    signal: "SIGINT" | "SIGTERM",
+    exitCode: 130 | 143,
+  ) => {
+    cursor.show();
+    progress.clear();
+
+    signalCount += 1;
+    if (signalCount > 1 && !supervised) {
+      hardStop(new Error(`Second ${signal} during shutdown`));
+      return;
+    }
+
+    const shutdown = activeShutdown ?? fallback;
+    void shutdown({ kind: "signal", signal, exitCode }).catch((error) => {
+      try {
+        process.stderr.write(`QMD shutdown failed: ${formatShutdownError(error)}\n`);
+      } catch {}
+    });
+  };
+
+  const onInt = () => trigger("SIGINT", 130);
+  const onTerm = () => trigger("SIGTERM", 143);
+
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+
+  return () => {
+    process.off("SIGINT", onInt);
+    process.off("SIGTERM", onTerm);
+  };
+}
+
+export function handleProcessSignalForTest(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  const exitCode = signal === "SIGINT" ? 130 : 143;
+  const shutdown = activeShutdown;
+  if (!shutdown) {
+    return Promise.reject(new Error("CLI signal handler is not installed"));
+  }
+  cursor.show();
+  progress.clear();
+  return shutdown({ kind: "signal", signal, exitCode });
+}
+
+export function setActiveShutdownForTest(shutdown: ActiveShutdown | undefined): void {
+  activeShutdown = shutdown;
+}
+
+export async function attachForegroundMcpShutdown(options: {
+  start: () => Promise<{ shutdown: (trigger?: ShutdownTrigger) => Promise<void> }>;
+}): Promise<void> {
+  const handoff = createShutdownHandoff();
+  activeShutdown = handoff.shutdown;
+  try {
+    const handle = await options.start();
+    await handoff.attach(handle.shutdown);
+    activeShutdown = handle.shutdown;
+  } catch (error) {
+    handoff.fail(error);
+    throw error;
+  }
+}
 
 // Terminal progress bar using OSC 9;4 escape sequence (TTY only)
 const isTTY = process.stderr.isTTY;
@@ -934,13 +1094,20 @@ async function updateCollections(): Promise<void> {
     }
     if (yamlCol?.update && hooksAllowed) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      // Only spawn/IO failures belong in the try. `process.exit()` is replaced
+      // by a throwing shim during owned CLI dispatch, so exiting inside the
+      // try would be caught here and downgraded to exit 1 plus a second
+      // failure line.
+      let hookOutput: string;
+      let hookErrorOutput: string;
+      let hookExitCode: number;
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
           cwd: col.pwd,
           stdio: ["ignore", "pipe", "pipe"],
         });
 
-        const [output, errorOutput, exitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
+        [hookOutput, hookErrorOutput, hookExitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
           let out = "";
           let err = "";
           proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
@@ -948,21 +1115,21 @@ async function updateCollections(): Promise<void> {
           proc.on("error", reject);
           proc.on("close", (code) => resolve([out, err, code ?? 1]));
         });
-
-        if (output.trim()) {
-          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-        if (errorOutput.trim()) {
-          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-
-        if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
-          process.exit(exitCode);
-        }
       } catch (err) {
         console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
         process.exit(1);
+      }
+
+      if (hookOutput.trim()) {
+        console.log(hookOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+      }
+      if (hookErrorOutput.trim()) {
+        console.log(hookErrorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+      }
+
+      if (hookExitCode !== 0) {
+        console.log(`${c.yellow}✗ Update command failed with exit code ${hookExitCode}${c.reset}`);
+        process.exit(hookExitCode);
       }
     }
 
@@ -2197,7 +2364,7 @@ async function vectorIndex(
 
     const startTime = Date.now();
 
-    const result = await generateEmbeddings(storeInstance, {
+    const result = await generateEmbeddingsFn(storeInstance, {
       force,
       model,
       collection: batchOptions?.collection,
@@ -2252,11 +2419,16 @@ async function vectorIndex(
         }
       }
     }
-
-    closeDb();
   } finally {
     embedLock.release();
   }
+}
+
+export { vectorIndex };
+
+let generateEmbeddingsFn = generateEmbeddings;
+export function setGenerateEmbeddingsForTest(fn?: typeof generateEmbeddings): void {
+  generateEmbeddingsFn = fn ?? generateEmbeddings;
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -2860,8 +3032,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       },
     });
 
-    closeDb();
-
     if (results.length === 0) {
       printEmptySearchResults(opts.format);
       return;
@@ -2979,8 +3149,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         },
       });
     }
-
-    closeDb();
 
     if (results.length === 0) {
       printEmptySearchResults(opts.format);
@@ -3803,8 +3971,9 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
-  add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
-  add("GGML_METAL_NO_RESIDENCY", "set automatically by the launcher on darwin to disable Metal residency sets (avoids ggml-org/llama.cpp#22593); override via QMD_METAL_KEEP_RESIDENCY=1");
+  add("QMD_METAL_KEEP_RESIDENCY", "set to 1 to keep libggml-metal residency sets enabled on darwin; default follows node-llama-cpp, which disables them");
+  add("GGML_METAL_NO_RESIDENCY", "read directly by node-llama-cpp; when set to any value QMD defers to it and applies no residency policy of its own");
+  add("QMD_SUPERVISED", "set by bin/qmd on its child; tells the child that the launcher owns second-signal escalation and the outer deadline");
   add("NO_COLOR", "disables colored terminal output");
   add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
   add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
@@ -4085,27 +4254,11 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
         nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
       }
 
-      // Surface the darwin residency-set mitigation. libggml-metal's
-      // process-static device dtor asserts on un-expired residency sets
-      // during libc exit() (ggml-org/llama.cpp#22593), producing a giant
-      // stderr backtrace after correct output. The bin/qmd launcher exports
-      // GGML_METAL_NO_RESIDENCY=1 on darwin to skip the assertion entirely.
-      // No measurable perf cost on short-lived CLI calls.
+      // Informational only: both residency states run correctly on the
+      // supported Metal backend, so this reports the effective policy from
+      // the same predicate llm.ts uses rather than failing a check.
       if (device.gpu === "metal" && process.platform === "darwin") {
-        if (isDarwinMetalMitigationActive()) {
-          doctorCheck(
-            "darwin metal residency",
-            true,
-            "GGML_METAL_NO_RESIDENCY=1 set by launcher; clean process exit (avoids ggml-org/llama.cpp#22593). Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you run long-lived qmd processes."
-          );
-        } else {
-          doctorCheck(
-            "darwin metal residency",
-            false,
-            "residency sets active (QMD_METAL_KEEP_RESIDENCY=1 or launcher bypassed); llama-using commands may dump a libggml-metal backtrace at exit (ggml-org/llama.cpp#22593) even when output succeeded."
-          );
-          nextSteps.push("Unset `QMD_METAL_KEEP_RESIDENCY` so the launcher can disable Metal residency sets; without this, query/vsearch/embed dump a stack trace at exit even on success.");
-        }
+        doctorCheck("darwin metal residency", true, describeMetalResidencyPolicy());
       }
     } else {
       const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
@@ -4243,18 +4396,88 @@ async function showDoctor(): Promise<void> {
       console.log(`  - ${step}`);
     }
   }
-
-  closeDb();
 }
 
 function printDoctorHint(): void {
   console.error("If qmd still behaves unexpectedly, run 'qmd doctor' for diagnostics.");
 }
 
+export class CliExit extends Error {
+  readonly code: number;
+  constructor(code: number, message = "") {
+    super(message);
+    this.name = "CliExit";
+    this.code = code;
+  }
+}
+
+export function isShutdownCancellation(error: unknown): boolean {
+  if (error instanceof SessionReleasedError && /shutting down/i.test(error.message)) return true;
+  if (error instanceof Error && /Shutdown requested by/.test(error.message)) return true;
+  if (error instanceof Error && error.name === "AbortError" && /Shutdown requested/.test(String(error.message))) {
+    return true;
+  }
+  return false;
+}
+
 function exitWithError(error: unknown, code = 1): never {
+  if (isShutdownCancellation(error)) {
+    throw new CliExit(code);
+  }
   console.error(error instanceof Error ? error.message : String(error));
   printDoctorHint();
-  process.exit(code);
+  throw new CliExit(code, error instanceof Error ? error.message : String(error));
+}
+
+export async function runOwnedCliDispatch(options: {
+  run: () => void | Promise<void>;
+  keepAlive?: () => boolean;
+  shutdown: (trigger: ShutdownTrigger) => Promise<void>;
+  lease?: AdmissionLease;
+}): Promise<void> {
+  const lease = options.lease ?? createAdmissionLease();
+  const previousLease = cliCommandLease;
+  cliCommandLease = lease;
+  const release = lease.enter();
+  let exitCode: number | undefined;
+  let keepAlive = false;
+  const originalExit = process.exit;
+  process.exit = ((code?: number) => {
+    throw new CliExit(typeof code === "number" ? code : 0);
+  }) as typeof process.exit;
+
+  try {
+    await options.run();
+    keepAlive = options.keepAlive?.() ?? false;
+  } catch (error) {
+    if (error instanceof CliExit) {
+      exitCode = error.code;
+      if (error.message && error.code !== 0 && !isShutdownCancellation(error)) {
+        // Message already printed by the caller in most branches.
+      }
+    } else if (isShutdownCancellation(error)) {
+      exitCode = undefined;
+    } else {
+      console.error(error instanceof Error ? error.message : String(error));
+      printDoctorHint();
+      exitCode = 1;
+    }
+  } finally {
+    process.exit = originalExit;
+    release();
+    cliCommandLease = previousLease;
+  }
+
+  if (keepAlive && (exitCode === undefined || exitCode === 0)) {
+    return;
+  }
+
+  await options.shutdown({ kind: "complete", exitCode: 0 });
+
+  const current = typeof process.exitCode === "number" ? process.exitCode : undefined;
+  if (current !== 130 && current !== 143 && exitCode !== undefined) {
+    process.exitCode = exitCode;
+  }
 }
 
 type PackageJson = {
@@ -4325,6 +4548,15 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  const cliShutdown = createCliShutdownCoordinator();
+  activeShutdown = (trigger) => cliShutdown.shutdown(trigger);
+  installMainSignalHandlers(activeShutdown);
+  let mcpKeepAlive = false;
+
+  await runOwnedCliDispatch({
+    shutdown: (trigger) => cliShutdown.shutdown(trigger),
+    keepAlive: () => mcpKeepAlive,
+    run: async () => {
   switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
@@ -4751,12 +4983,16 @@ if (isMain) {
           process.exit(0);
         }
         try {
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
+          const outcome = await stopQmdMcpProcess(pid);
           try { unlinkSync(pidPath); } catch { /* ignore */ }
-          console.log("Cleaned up stale PID file (server was not running).");
+          console.log(
+            outcome === "forced"
+              ? `Stopped QMD MCP server with SIGKILL after shutdown deadline (PID ${pid}).`
+              : `Stopped QMD MCP server (PID ${pid}).`,
+          );
+        } catch (error) {
+          console.error(error instanceof Error ? error.message : String(error));
+          process.exit(1);
         }
         process.exit(0);
       }
@@ -4788,15 +5024,19 @@ if (isMain) {
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
+          const daemonEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            // Explicit resolved DB path so the child does not depend on
+            // re-parsing --index (and cannot inherit a stale INDEX_PATH).
+            INDEX_PATH: getDbPath(),
+          };
+          // The daemon is detached: whatever launched this command is not its
+          // supervisor, so it must own its own second-signal escalation.
+          delete daemonEnv.QMD_SUPERVISED;
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
-            env: {
-              ...process.env,
-              // Explicit resolved DB path so the child does not depend on
-              // re-parsing --index (and cannot inherit a stale INDEX_PATH).
-              INDEX_PATH: getDbPath(),
-            },
+            env: daemonEnv,
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
@@ -4807,12 +5047,9 @@ if (isMain) {
           process.exit(0);
         }
 
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
-        process.removeAllListeners("SIGTERM");
-        process.removeAllListeners("SIGINT");
-        // Best-effort: if this process owns the daemon pidfile, unlink on exit
-        // (covers SIGTERM/SIGINT via startMcpHttpServer's process.exit).
+        // Best-effort: if this process owns the daemon pidfile, unlink on exit.
+        // After SIGKILL the stop command also removes the file — but only once
+        // the process identity is confirmed gone.
         const unlinkOwnPidfile = () => {
           try {
             if (!existsSync(pidPath)) return;
@@ -4821,9 +5058,14 @@ if (isMain) {
           } catch { /* ignore */ }
         };
         process.on("exit", unlinkOwnPidfile);
-        const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          await attachForegroundMcpShutdown({
+            start: async () => {
+              const { startMcpHttpServer } = await import("../mcp/server.js");
+              return startMcpHttpServer(port, { dbPath: getDbPath(), host });
+            },
+          });
+          mcpKeepAlive = true;
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -4833,8 +5075,13 @@ if (isMain) {
         }
       } else {
         // Default: stdio transport
-        const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await attachForegroundMcpShutdown({
+          start: async () => {
+            const { startMcpServer } = await import("../mcp/server.js");
+            return startMcpServer({ dbPath: getDbPath() });
+          },
+        });
+        mcpKeepAlive = true;
       }
       break;
     }
@@ -4947,12 +5194,7 @@ if (isMain) {
       printDoctorHint();
       process.exit(1);
   }
-
-  if (cli.command !== "mcp") {
-    await finishSuccessfulCliCommand({
-      command: cli.command,
-      format: cli.opts.format,
-    });
-  }
+    },
+  });
 
 } // end if (main module)

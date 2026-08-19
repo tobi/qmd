@@ -84,3 +84,59 @@ export function isQmdMcpPid(pid: number): boolean {
   if (!cmdline) return false;
   return looksLikeQmdMcpCommand(cmdline);
 }
+
+export type StopQmdMcpOutcome = "graceful" | "forced" | "already-gone";
+
+export async function stopQmdMcpProcess(
+  pid: number,
+  options: {
+    gracefulMs?: number;
+    killWaitMs?: number;
+    isOwnedPid?: (pid: number) => boolean;
+    kill?: (pid: number, signal: NodeJS.Signals) => void;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+  } = {},
+): Promise<StopQmdMcpOutcome> {
+  const isOwnedPid = options.isOwnedPid ?? isQmdMcpPid;
+  const kill = options.kill ?? ((target, signal) => { process.kill(target, signal); });
+  const sleep =
+    options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = options.now ?? Date.now;
+
+  const isGoneError = (error: unknown): boolean =>
+    typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH";
+
+  const tryKill = (signal: NodeJS.Signals): "sent" | "gone" => {
+    try {
+      kill(pid, signal);
+      return "sent";
+    } catch (error) {
+      if (isGoneError(error)) return "gone";
+      throw error;
+    }
+  };
+
+  if (!isOwnedPid(pid)) return "already-gone";
+
+  if (tryKill("SIGTERM") === "gone") return "already-gone";
+
+  const gracefulDeadline = now() + (options.gracefulMs ?? 30_000);
+  while (now() < gracefulDeadline) {
+    if (!isOwnedPid(pid)) return "graceful";
+    await sleep(50);
+  }
+
+  // Recheck identity immediately before escalation. Never SIGKILL a reused PID.
+  if (!isOwnedPid(pid)) return "graceful";
+
+  if (tryKill("SIGKILL") === "gone") return "forced";
+
+  const killDeadline = now() + (options.killWaitMs ?? 5_000);
+  while (now() < killDeadline) {
+    if (!isOwnedPid(pid)) return "forced";
+    await sleep(25);
+  }
+
+  throw new Error(`QMD MCP process ${pid} survived SIGKILL`);
+}

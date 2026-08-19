@@ -5,17 +5,6 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-// Mirror bin/qmd's darwin Metal residency mitigation for test subprocesses.
-// libggml-metal asserts on a non-empty residency set during its static
-// destructor (ggml-org/llama.cpp#22593, fix open as #22595) and dumps a
-// multi-kB backtrace at process exit even when tests pass. The env var must
-// be set BEFORE the subprocess starts because libggml-metal reads it via
-// libc getenv at module-load time. Opt out with QMD_METAL_KEEP_RESIDENCY=1.
-const darwinMetalEnv =
-  process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1"
-    ? { GGML_METAL_NO_RESIDENCY: "1" }
-    : {};
-
 function run(label, command, args, options = {}) {
   console.log(`==> ${label}`);
   const { env: extraEnv, ...spawnOptions } = options;
@@ -23,7 +12,7 @@ function run(label, command, args, options = {}) {
     cwd: root,
     stdio: "inherit",
     shell: process.platform === "win32",
-    env: { ...process.env, ...darwinMetalEnv, ...(extraEnv ?? {}) },
+    env: { ...process.env, ...(extraEnv ?? {}) },
     ...spawnOptions,
   });
   if (result.status !== 0) {

@@ -1042,6 +1042,34 @@ describe("CLI Search Command", () => {
   });
 });
 
+describe("CLI Structured Query Command", () => {
+  beforeEach(async () => {
+    await runQmd(["collection", "add", "."]);
+  });
+
+  test("returns an indexed fixture result without terminating its supervisor", async () => {
+    const query = [
+      "intent: find the existing meeting fixture",
+      "lex: technical debt prioritization",
+    ].join("\n");
+
+    const { stdout, exitCode } = await runQmd([
+      "query",
+      query,
+      "--no-rerank",
+      "-n",
+      "2",
+      "--format",
+      "json",
+    ]);
+
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(stdout);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].file).toContain("notes/meeting.md");
+  });
+});
+
 describe("CLI Get Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files

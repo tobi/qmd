@@ -15,217 +15,143 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { registerStdioEofShutdown, createInflightGate } from "../src/mcp/server";
+import { registerStdioEofShutdown, createInflightGate, ServerShuttingDownError, startMcpServer } from "../src/mcp/server";
+import { LlamaCpp } from "../src/llm.ts";
+import type { QMDStore } from "../src/index.ts";
+import { createShutdownCoordinator } from "../src/shutdown.ts";
+import type { ShutdownTrigger } from "../src/shutdown.ts";
 
 class FakeStdin extends EventEmitter {
   readableEnded = false;
   destroyed = false;
 }
 
-type Recorded = {
-  stdin: FakeStdin;
-  calls: string[];
-  exitCodes: number[];
-  warnings: string[];
-  shutdown: () => Promise<void>;
-};
-
-function register(overrides: {
-  closeServer?: () => Promise<void>;
-  disposeLlm?: () => Promise<void>;
-  closeStore?: () => void | Promise<void>;
-  waitForIdle?: (timeoutMs: number) => Promise<boolean>;
-  idleTimeoutMs?: number;
-  getExitCode?: () => number | undefined;
-  stderrWrite?: (chunk: string) => unknown;
-  stdin?: FakeStdin;
-} = {}): Recorded {
-  const stdin = overrides.stdin ?? new FakeStdin();
-  const calls: string[] = [];
-  const exitCodes: number[] = [];
-  const warnings: string[] = [];
-
-  const shutdown = registerStdioEofShutdown({
-    stdin,
-    closeServer: overrides.closeServer ?? (async () => { calls.push("server-close"); }),
-    disposeLlm: overrides.disposeLlm ?? (async () => { calls.push("llm-dispose"); }),
-    closeStore: overrides.closeStore ?? (() => { calls.push("store-close"); }),
-    waitForIdle: overrides.waitForIdle ?? (async () => { calls.push("idle-wait"); return true; }),
-    idleTimeoutMs: overrides.idleTimeoutMs,
-    setExitCode: (code) => { exitCodes.push(code); },
-    getExitCode: overrides.getExitCode ?? (() => undefined),
-    stderr: { write: overrides.stderrWrite ?? ((chunk: string) => { warnings.push(chunk); return true; }) },
-  });
-
-  return { stdin, calls, exitCodes, warnings, shutdown };
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
 }
 
 describe("registerStdioEofShutdown", () => {
-  test("stdin 'end' tears down in order: server, llm, store, then exitCode 0", async () => {
-    const r = register();
-
-    r.stdin.emit("end");
-    await r.shutdown(); // same shared promise as the event-triggered run
-
-    expect(r.calls).toEqual(["server-close", "idle-wait", "llm-dispose", "store-close"]);
-    expect(r.exitCodes).toEqual([0]);
-    expect(r.warnings.join("")).toContain("Shutting down (stdin closed)");
-    expect(r.warnings.filter((w) => w.startsWith("QMD Warning"))).toEqual([]);
-  });
-
-  test("stdin 'close' triggers the same teardown", async () => {
-    const r = register();
-
-    r.stdin.emit("close");
-    await r.shutdown();
-
-    expect(r.calls).toEqual(["server-close", "idle-wait", "llm-dispose", "store-close"]);
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("is idempotent: 'end' + 'close' + manual calls share one run", async () => {
-    const r = register();
-
-    r.stdin.emit("end");
-    r.stdin.emit("close");
-    const first = r.shutdown();
-    const second = r.shutdown();
-    expect(first).toBe(second);
-    await first;
-
-    expect(r.calls).toEqual(["server-close", "idle-wait", "llm-dispose", "store-close"]);
-    expect(r.exitCodes).toEqual([0]);
-    // Listeners are removed during shutdown, so late events cannot re-enter.
-    r.stdin.emit("end");
-    r.stdin.emit("close");
-    await r.shutdown();
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("a failing step is logged, later steps still run, exit code is 1", async () => {
-    const r = register({
-      closeServer: async () => { throw new Error("transport already gone"); },
-    });
-
-    r.stdin.emit("end");
-    await r.shutdown();
-
-    expect(r.calls).toEqual(["idle-wait", "llm-dispose", "store-close"]);
-    expect(r.warnings.join("")).toContain("server.close() failed during stdio shutdown");
-    expect(r.warnings.join("")).toContain("transport already gone");
-    expect(r.exitCodes).toEqual([1]);
-  });
-
-  test("every step failing still finishes the chain instead of throwing", async () => {
-    const r = register({
-      closeServer: async () => { throw new Error("boom-server"); },
-      disposeLlm: async () => { throw new Error("boom-llm"); },
-      closeStore: () => { throw new Error("boom-store"); },
-    });
-
-    r.stdin.emit("end");
-    await expect(r.shutdown()).resolves.toBeUndefined();
-
-    expect(r.warnings.filter((w) => w.startsWith("QMD Warning"))).toHaveLength(3);
-    expect(r.exitCodes).toEqual([1]);
-  });
-
-  test("stdin that already ended before registration still shuts down", async () => {
+  test("stdin 'end' and 'close' share one coordinator trigger", async () => {
+    const triggers: ShutdownTrigger[] = [];
+    const started = deferred();
+    const gate = deferred();
     const stdin = new FakeStdin();
-    stdin.readableEnded = true;
-
-    const r = register({ stdin });
-    await r.shutdown();
-
-    expect(r.calls).toEqual(["server-close", "idle-wait", "llm-dispose", "store-close"]);
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("stdin destroyed before registration still shuts down", async () => {
-    const stdin = new FakeStdin();
-    stdin.destroyed = true;
-
-    const r = register({ stdin });
-    await r.shutdown();
-
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("a drain deadline miss is logged but does not fail the shutdown", async () => {
-    const r = register({
-      waitForIdle: async () => false,
-    });
-
-    r.stdin.emit("end");
-    await r.shutdown();
-
-    expect(r.warnings.join("")).toContain("in-flight request did not settle");
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("a successful shutdown preserves an earlier nonzero exit code", async () => {
-    const r = register({ getExitCode: () => 1 });
-
-    r.stdin.emit("end");
-    await r.shutdown();
-
-    // No setExitCode(0) call — the earlier failure status stays visible.
-    expect(r.exitCodes).toEqual([]);
-  });
-
-  test("a failing shutdown still sets exit code 1 over an earlier 0", async () => {
-    const r = register({
-      getExitCode: () => 0,
-      closeStore: () => { throw new Error("boom-store"); },
-    });
-
-    r.stdin.emit("end");
-    await r.shutdown();
-
-    expect(r.exitCodes).toEqual([1]);
-  });
-
-  test("a throwing stderr cannot break the teardown chain", async () => {
-    const r = register({
-      stderrWrite: () => { throw new Error("EPIPE"); },
-    });
-
-    r.stdin.emit("end");
-    await expect(r.shutdown()).resolves.toBeUndefined();
-
-    expect(r.calls).toEqual(["server-close", "idle-wait", "llm-dispose", "store-close"]);
-    expect(r.exitCodes).toEqual([0]);
-  });
-
-  test("skips the llm-dispose step when disposeLlm is omitted (store owns it)", async () => {
-    const stdin = new FakeStdin();
-    const calls: string[] = [];
-    const exitCodes: number[] = [];
-
-    // Mirror how startMcpServer wires it: no disposeLlm — store.close() disposes
-    // the store's own LlamaCpp, so there must be no extra global disposal step.
+    const warnings: string[] = [];
     const shutdown = registerStdioEofShutdown({
       stdin,
-      closeServer: async () => { calls.push("server-close"); },
-      waitForIdle: async () => { calls.push("idle-wait"); return true; },
-      closeStore: () => { calls.push("store-close"); },
-      setExitCode: (code) => { exitCodes.push(code); },
-      getExitCode: () => undefined,
-      stderr: { write: () => true },
+      shutdown: async (trigger) => {
+        triggers.push(trigger);
+        started.resolve();
+        await gate.promise;
+      },
+      stderr: { write: (chunk) => { warnings.push(chunk); return true; } },
     });
 
     stdin.emit("end");
-    await shutdown();
+    stdin.emit("close");
+    const first = shutdown();
+    const second = shutdown();
+    expect(first).toBe(second);
+    await started.promise;
+    expect(triggers).toEqual([{ kind: "stdin-eof", exitCode: 0 }]);
+    expect(warnings.join("")).toContain("Shutting down (stdin closed)");
+    gate.resolve();
+    await first;
+  });
 
-    expect(calls).toEqual(["server-close", "idle-wait", "store-close"]);
-    expect(exitCodes).toEqual([0]);
+  test("stdin that already ended before registration still shuts down", async () => {
+    const calls: string[] = [];
+    const stdin = new FakeStdin();
+    stdin.readableEnded = true;
+    const shutdown = registerStdioEofShutdown({
+      stdin,
+      shutdown: async () => { calls.push("shutdown"); },
+      stderr: { write: () => true },
+    });
+    await shutdown();
+    expect(calls).toEqual(["shutdown"]);
+  });
+
+  test("a throwing stderr cannot break the trigger", async () => {
+    const stdin = new FakeStdin();
+    const shutdown = registerStdioEofShutdown({
+      stdin,
+      shutdown: async () => undefined,
+      stderr: { write: () => { throw new Error("EPIPE"); } },
+    });
+    stdin.emit("end");
+    await expect(shutdown()).resolves.toBeUndefined();
+  });
+});
+
+describe("stdio EOF with active work", () => {
+  test("does not dispose LLM or store until the tracked handler releases", async () => {
+    const inflight = createInflightGate();
+    const calls: string[] = [];
+    const handlerGate = deferred();
+    const handlerStarted = deferred();
+    const handler = inflight.track(async () => {
+      handlerStarted.resolve();
+      await handlerGate.promise;
+    });
+    const running = handler();
+    await handlerStarted.promise;
+
+    const coordinator = createShutdownCoordinator({
+      closeAdmission() {
+        inflight.closeAdmission();
+        calls.push("close-admission");
+      },
+      stopServing() { calls.push("stop-serving"); },
+      requestAbort() { calls.push("request-abort"); },
+      waitForInflight: () => inflight.waitForIdle(),
+      waitForLlmIdle: async () => { calls.push("llm-idle"); },
+      async disposeLlm() { calls.push("llm-dispose"); },
+      closeStore() { calls.push("store-close"); },
+      setExitCode(code) { calls.push(`exit:${code}`); },
+      logError() { calls.push("log-error"); },
+    });
+
+    const stdin = new FakeStdin();
+    const shutdown = registerStdioEofShutdown({
+      stdin,
+      shutdown: coordinator.shutdown,
+      stderr: { write: () => true },
+    });
+    stdin.emit("end");
+    const shutting = shutdown();
+    await Promise.resolve();
+    expect(calls).toContain("close-admission");
+    expect(calls).not.toContain("llm-dispose");
+    expect(calls).not.toContain("store-close");
+
+    handlerGate.resolve();
+    await running;
+    await shutting;
+    expect(calls).toEqual([
+      "close-admission",
+      "stop-serving",
+      "request-abort",
+      "llm-idle",
+      "llm-dispose",
+      "store-close",
+      "exit:0",
+    ]);
+  });
+
+  test("a new request after EOF is rejected", async () => {
+    const inflight = createInflightGate();
+    inflight.closeAdmission();
+    await expect(inflight.run(async () => "nope")).rejects.toBeInstanceOf(ServerShuttingDownError);
   });
 });
 
 describe("createInflightGate", () => {
   test("waitForIdle resolves immediately when nothing is tracked", async () => {
     const gate = createInflightGate();
-    await expect(gate.waitForIdle(1000)).resolves.toBe(true);
+    await expect(gate.waitForIdle()).resolves.toBeUndefined();
   });
 
   test("waitForIdle waits for a tracked handler to settle", async () => {
@@ -234,24 +160,11 @@ describe("createInflightGate", () => {
     const handler = gate.track(() => new Promise<void>((resolve) => { release = resolve; }));
 
     const running = handler();
-    const idle = gate.waitForIdle(5000);
+    const idle = gate.waitForIdle();
 
     release();
     await running;
-    await expect(idle).resolves.toBe(true);
-  });
-
-  test("waitForIdle reports a missed deadline without throwing", async () => {
-    const gate = createInflightGate();
-    let release!: () => void;
-    const handler = gate.track(() => new Promise<void>((resolve) => { release = resolve; }));
-
-    const running = handler();
-    await expect(gate.waitForIdle(20)).resolves.toBe(false);
-
-    release();
-    await running;
-    await expect(gate.waitForIdle(20)).resolves.toBe(true);
+    await expect(idle).resolves.toBeUndefined();
   });
 
   test("a rejecting handler still releases the gate and keeps rejecting", async () => {
@@ -259,8 +172,52 @@ describe("createInflightGate", () => {
     const handler = gate.track(async () => { throw new Error("handler failed"); });
 
     await expect(handler()).rejects.toThrow("handler failed");
-    await expect(gate.waitForIdle(1000)).resolves.toBe(true);
+    await expect(gate.waitForIdle()).resolves.toBeUndefined();
   });
+
+  test("closed admission rejects new work without incrementing the count", async () => {
+    const gate = createInflightGate();
+    gate.closeAdmission();
+    await expect(gate.run(async () => 1)).rejects.toBeInstanceOf(ServerShuttingDownError);
+    expect(gate.getActiveCount()).toBe(0);
+  });
+});
+
+describe("stdio MCP initialization vs EOF", () => {
+  test("store initialization finishes before an already-ended stdin can dispose it", async () => {
+    const order: string[] = [];
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const origDispose = llm.dispose.bind(llm);
+    llm.dispose = async () => {
+      order.push("llm-dispose");
+      return origDispose();
+    };
+    const store = {
+      internal: { llm, close() {} },
+      dbPath: ":memory:",
+      async getStatus() {
+        order.push("init-status");
+        return { totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: false, collections: [] };
+      },
+      async getGlobalContext() { return undefined; },
+      async getDefaultCollectionNames() { return []; },
+      async close() { order.push("store-close"); },
+    } as QMDStore;
+
+    const stdin = new FakeStdin();
+    stdin.readableEnded = true;
+    const handle = await startMcpServer({
+      store,
+      stdin,
+      createTransport: () => ({ close: async () => { order.push("transport-close"); } }),
+      hardStop: (() => { order.push("hard-stop"); throw new Error("hard stop"); }) as never,
+    });
+    await handle.shutdown();
+
+    expect(order[0]).toBe("init-status");
+    expect(order.indexOf("init-status")).toBeLessThan(order.indexOf("store-close"));
+  });
+
 });
 
 describe("qmd mcp stdio process lifecycle", () => {

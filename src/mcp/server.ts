@@ -28,6 +28,14 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { LlamaCpp } from "../llm.js";
+import {
+  applyProcessExitCode,
+  createShutdownCoordinator,
+  createShutdownHold,
+  formatShutdownError,
+  type ShutdownTrigger,
+} from "../shutdown.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -590,60 +598,76 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  store?: QMDStore;
+  stdin?: StdioShutdownStdin;
+  shutdownGraceMs?: number;
+  hardStop?: (error: unknown) => never;
+  schedule?: (fn: () => void, ms: number) => { clear(): void };
+  createTransport?: (server: McpServer) => { close(): void | Promise<void> };
+  /**
+   * When `store` is provided, the caller retains store/LLM ownership even if
+   * startup fails. When omitted, the server creates the store and must dispose
+   * it (LLM then DB) before rethrowing a startup failure.
+   */
 };
 
+export class ServerShuttingDownError extends Error {
+  constructor() {
+    super("QMD server is shutting down");
+    this.name = "ServerShuttingDownError";
+  }
+}
+
 /**
- * Counts running request handlers so shutdown can wait for them to settle
- * before tearing down their llm/store dependencies. The SDK aborts in-flight
- * request controllers on close, but qmd's handlers finish their current
- * store/llm work rather than observing the signal mid-operation.
+ * Admission gate for in-flight request handlers. Closing admission rejects
+ * new work; waitForIdle has no timeout — the supervisor owns the deadline.
  */
 export type InflightGate = {
-  /** Wraps a handler so the gate counts it while it runs. */
+  closeAdmission(): void;
+  run<T>(fn: () => T | Promise<T>): Promise<T>;
   track<T extends (...args: never[]) => unknown>(fn: T): T;
-  /** Resolves once no tracked handler runs, or after timeoutMs. Returns whether idle was reached. */
-  waitForIdle(timeoutMs: number): Promise<boolean>;
+  waitForIdle(): Promise<void>;
+  getActiveCount(): number;
 };
 
 export function createInflightGate(): InflightGate {
-  // `active` is a running-handler counter, not a closed admission barrier.
-  // The barrier comes from the caller's ordering: registerStdioEofShutdown
-  // runs closeServer() (which stops the transport from dispatching new
-  // requests) BEFORE waitForIdle(), so by the time we wait, the only handlers
-  // that can still be running are ones already dispatched — there is no source
-  // of late admissions to guard against under the stdio transport.
+  let admissionClosed = false;
   let active = 0;
   const waiters: Array<() => void> = [];
+
+  const leave = () => {
+    active -= 1;
+    if (active === 0) {
+      while (waiters.length > 0) waiters.shift()!();
+    }
+  };
+
+  const run = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+    if (admissionClosed) throw new ServerShuttingDownError();
+
+    // Single-threaded JS: no await between the closed check and increment.
+    active += 1;
+    try {
+      return await fn();
+    } finally {
+      leave();
+    }
+  };
+
   return {
-    track(fn) {
-      const wrapped = async (...args: never[]) => {
-        active += 1;
-        try {
-          return await fn(...args);
-        } finally {
-          active -= 1;
-          if (active === 0) {
-            while (waiters.length > 0) waiters.shift()!();
-          }
-        }
-      };
-      return wrapped as typeof fn;
+    closeAdmission() {
+      admissionClosed = true;
     },
-    waitForIdle(timeoutMs: number): Promise<boolean> {
-      if (active === 0) return Promise.resolve(true);
-      return new Promise((resolve) => {
-        const onIdle = () => {
-          clearTimeout(timer);
-          resolve(true);
-        };
-        const timer = setTimeout(() => {
-          const i = waiters.indexOf(onIdle);
-          if (i >= 0) waiters.splice(i, 1);
-          resolve(false);
-        }, timeoutMs);
-        timer.unref?.();
-        waiters.push(onIdle);
-      });
+    run,
+    track(fn) {
+      return ((...args: never[]) => run(() => fn(...args))) as typeof fn;
+    },
+    waitForIdle() {
+      if (active === 0) return Promise.resolve();
+      return new Promise<void>((resolve) => waiters.push(resolve));
+    },
+    getActiveCount() {
+      return active;
     },
   };
 }
@@ -657,174 +681,159 @@ export type StdioShutdownStdin = {
 };
 
 export type StdioShutdownOptions = {
-  /** Closes the MCP server and its transport. */
-  closeServer: () => Promise<void>;
-  /** Closes the SQLite store (owns disposing the per-store llama.cpp instance). */
-  closeStore: () => void | Promise<void>;
-  /**
-   * Optional extra llama.cpp teardown, run before closeStore. The MCP store
-   * disposes its own per-store LlamaCpp inside closeStore, so this is left
-   * unset there; it exists for callers that own a separate instance. If
-   * omitted, the step is skipped (do NOT default it to the global
-   * disposeDefaultLlamaCpp — that would tear down an unrelated instance in an
-   * embedded process).
-   */
-  disposeLlm?: () => Promise<void>;
-  /** Waits for in-flight handlers to settle (see InflightGate.waitForIdle). */
-  waitForIdle?: (timeoutMs: number) => Promise<boolean>;
-  /** Deadline for the in-flight wait. Defaults to 5000 ms. */
-  idleTimeoutMs?: number;
-  /** Defaults to process.stdin. */
   stdin?: StdioShutdownStdin;
-  /** Defaults to assigning process.exitCode. */
-  setExitCode?: (code: number) => void;
-  /** Defaults to reading process.exitCode. */
-  getExitCode?: () => number | undefined;
-  /** Defaults to process.stderr. */
+  shutdown: (trigger: ShutdownTrigger) => Promise<void>;
   stderr?: { write(chunk: string): unknown; on?(event: "error", listener: (err: unknown) => void): unknown };
 };
 
 /**
- * Shut the stdio MCP server down when stdin reaches EOF (#751).
- *
- * The SDK's StdioServerTransport subscribes to stdin "data"/"error" only and
- * never notices "end"/"close". When the parent MCP client dies, nothing tears
- * the process down: the warm llama.cpp model's native handles keep the event
- * loop alive, so the server reparents to PID 1, leaks RAM, and keeps the
- * SQLite index open. stdin EOF means the client is gone, so this treats it as
- * a disconnect: no new requests are accepted and nobody is left to read a
- * response — but handlers that are already running get a bounded window to
- * settle (waitForIdle) before their llm/store dependencies are torn down.
- *
- * Teardown order matters. Close the transport first so no further requests
- * are dispatched, wait for in-flight handlers, then close the store last —
- * which disposes the store's own llama.cpp instance and then the database, so
- * the dispose path cannot hit an already-closed DB. (disposeLlm is an optional
- * extra step for callers that own a separate instance; the MCP store does
- * not.) Failures are logged best-effort (the parent's death may have closed
- * stderr too) and do not stop the remaining steps. The function sets process.exitCode
- * instead of calling process.exit() so `beforeExit` still fires and
- * node-llama-cpp's auto-dispose runs before libc's static destructors —
- * process.exit() during native-addon unload has caused exit-time crashes
- * before (#59, #129; same rationale as finishSuccessfulCliCommand in the CLI).
- *
- * Returns the idempotent shutdown function: every invocation (manual, "end",
- * "close", or already-ended stdin) shares one promise, and the promise never
- * rejects.
+ * Thin adapter: stdin EOF becomes a coordinator trigger. Teardown order and
+ * failure policy live in the shared shutdown coordinator — this function
+ * must not continue disposal after a missed idle deadline.
  */
 export function registerStdioEofShutdown(options: StdioShutdownOptions): () => Promise<void> {
   const stdin = options.stdin ?? process.stdin;
-  const stderr = options.stderr ?? process.stderr;
-  const setExitCode = options.setExitCode ?? ((code: number) => { process.exitCode = code; });
-  const getExitCode = options.getExitCode ?? (() => (typeof process.exitCode === "number" ? process.exitCode : undefined));
-  let shutdownPromise: Promise<void> | null = null;
+  const stderr = options.stderr;
+  let triggered: Promise<void> | undefined;
 
-  // If the parent died, its stderr pipe may be gone: writes can throw
-  // synchronously or emit an async stream error. Logging must never take the
-  // teardown down with it.
-  stderr.on?.("error", () => {});
+  stderr?.on?.("error", () => {});
   const safeWrite = (chunk: string): void => {
     try {
-      stderr.write(chunk);
+      stderr?.write(chunk);
     } catch {
       // stderr went away with the parent
     }
   };
 
-  const performShutdown = async (): Promise<void> => {
+  const shutdown = () =>
+    (triggered ??= options.shutdown({
+      kind: "stdin-eof",
+      exitCode: 0,
+    }));
+
+  const onEof = () => {
     try {
-      stdin.off("end", onStdinEof);
-      stdin.off("close", onStdinEof);
+      stdin.off("end", onEof);
+      stdin.off("close", onEof);
     } catch {
       // an exotic stdin may throw on off(); shutdown continues regardless
     }
-
-    // Same stderr breadcrumb style as the HTTP transport's SIGTERM/SIGINT
-    // handlers; also gives tests an observable signal that the EOF path ran.
     safeWrite("Shutting down (stdin closed)...\n");
-
-    let failed = false;
-    const step = async (name: string, run: () => void | Promise<void>): Promise<void> => {
-      try {
-        await run();
-      } catch (error) {
-        failed = true;
-        safeWrite(
-          `QMD Warning: ${name} failed during stdio shutdown (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
-        );
-      }
-    };
-
-    await step("server.close()", options.closeServer);
-    if (options.waitForIdle) {
-      await step("in-flight drain", async () => {
-        const idle = await options.waitForIdle!(options.idleTimeoutMs ?? 5000);
-        if (!idle) {
-          safeWrite("QMD Warning: in-flight request did not settle before the shutdown deadline; continuing shutdown.\n");
-        }
-      });
-    }
-    if (options.disposeLlm) {
-      await step("llama disposal", options.disposeLlm);
-    }
-    await step("store.close()", options.closeStore);
-
-    try {
-      const prior = getExitCode();
-      if (failed) {
-        setExitCode(1);
-      } else if (prior === undefined || prior === 0) {
-        setExitCode(0);
-      }
-      // else: keep an earlier nonzero status instead of masking it
-    } catch {
-      // injected setExitCode/getExitCode must not break the shutdown promise
-    }
+    void shutdown().catch(() => {});
   };
 
-  const shutdown = (): Promise<void> => (shutdownPromise ??= performShutdown());
-  const onStdinEof = (): void => { void shutdown().catch(() => {}); };
+  stdin.once("end", onEof);
+  stdin.once("close", onEof);
 
-  stdin.once("end", onStdinEof);
-  stdin.once("close", onStdinEof);
-
-  // The parent can die between spawn and listener registration; check the
-  // stream flags after subscribing so an already-ended stdin still shuts down.
-  if (stdin.readableEnded || stdin.destroyed) {
-    onStdinEof();
-  }
+  if (stdin.readableEnded || stdin.destroyed) onEof();
 
   return shutdown;
 }
 
-export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
+export type StdioMcpHandle = {
+  shutdown(trigger?: ShutdownTrigger): Promise<void>;
+};
+
+function resolveServerLlm(store: QMDStore): LlamaCpp {
+  const existing = store.internal.llm;
+  if (existing) return existing;
+  const llm = new LlamaCpp();
+  store.internal.llm = llm;
+  return llm;
+}
+
+function logShutdownError(error: unknown): void {
+  try {
+    process.stderr.write(`QMD shutdown failed: ${formatShutdownError(error)}\n`);
+  } catch {
+    // stderr may already be gone
+  }
+}
+
+async function cleanupOwnedMcpStartup(options: {
+  ownsStore: boolean;
+  store?: QMDStore;
+  llm?: LlamaCpp;
+  closeTransport?: () => void | Promise<void>;
+}): Promise<void> {
+  try { await options.closeTransport?.(); } catch { /* best-effort */ }
+  if (!options.ownsStore) return;
+  try { await options.llm?.dispose(); } catch { /* best-effort */ }
+  try { await options.store?.close(); } catch { /* best-effort */ }
+}
+
+export async function startMcpServer(options: McpStartupOptions = {}): Promise<StdioMcpHandle> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
   // at the top level flipped the global production flag and broke test
   // isolation for downstream suites that expect the default (development)
   // database path behaviour.
   enableProductionMode();
+  const ownsStore = !options.store;
   const configPath = getConfigPath();
-  const store = await createStore({
+  let store: QMDStore | undefined;
+  let llm: LlamaCpp | undefined;
+  let transport: { close(): void | Promise<void> } | undefined;
+  try {
+  store = options.store ?? await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
+  llm = resolveServerLlm(store);
   const inflight = createInflightGate();
+  // Finish store-touching initialization before EOF can dispose ownership.
+  // serveStdio's factory otherwise calls createMcpServer() (buildInstructions /
+  // getDefaultCollectionNames) after shutdown registration, which would look idle.
+  const mcpServer = await createMcpServer(store, inflight);
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
   // stay 2025-only even on SDK 2.x.
-  const handle = serveStdio(() => createMcpServer(store, inflight));
+  transport = options.createTransport?.(mcpServer) ?? serveStdio(async () => mcpServer);
 
-  // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
-  // and the server must exit instead of orphaning to PID 1 (#751). No
-  // disposeLlm here — store.close() disposes this store's own LlamaCpp
-  // instance, so passing the global disposeDefaultLlamaCpp would only risk
-  // tearing down an unrelated instance in an embedded process.
-  registerStdioEofShutdown({
-    closeServer: () => handle.close(),
-    waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
-    closeStore: () => store.close(),
+  const startedStore = store;
+  const startedLlm = llm;
+  const startedTransport = transport;
+  const coordinator = createShutdownCoordinator({
+    closeAdmission() {
+      inflight.closeAdmission();
+      startedLlm.closeSessionAdmission();
+    },
+    stopServing: () => startedTransport.close(),
+    requestAbort: (reason) => startedLlm.requestSessionAbort(reason),
+    waitForInflight: () => inflight.waitForIdle(),
+    waitForLlmIdle: () => startedLlm.waitForSessionIdle(),
+    disposeLlm: () => startedLlm.dispose(),
+    closeStore: () => startedStore.close(),
+    setExitCode: applyProcessExitCode,
+    logError: logShutdownError,
+    holdOpen: createShutdownHold,
+    ...(options.shutdownGraceMs !== undefined ? { graceMs: options.shutdownGraceMs } : {}),
+    ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
   });
+
+  // Stdio EOF is not observed by bin/qmd, so the deadline must be owned by the
+  // coordinator. It arms one watchdog for every trigger kind, so there is no
+  // separate EOF-only or MCP-only hard-stop path here.
+  registerStdioEofShutdown({
+    stdin: options.stdin,
+    shutdown: (trigger) => coordinator.shutdown(trigger),
+    stderr: process.stderr,
+  });
+
+  return {
+    shutdown: (trigger: ShutdownTrigger = { kind: "complete", exitCode: 0 }) =>
+      coordinator.shutdown(trigger),
+  };
+  } catch (error) {
+    await cleanupOwnedMcpStartup({
+      ownsStore,
+      store,
+      llm,
+      closeTransport: transport ? () => transport!.close() : undefined,
+    });
+    throw error;
+  }
 }
 
 // =============================================================================
@@ -835,6 +844,8 @@ export type HttpServerHandle = {
   httpServer: import("http").Server;
   port: number;
   stop: () => Promise<void>;
+  shutdown: (trigger?: ShutdownTrigger) => Promise<void>;
+  inflight: InflightGate;
 };
 
 /**
@@ -852,26 +863,43 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: ({
+    quiet?: boolean;
+    host?: string;
+    allowedOrigins?: string[];
+    allowedHosts?: string[];
+    setExitCode?: (code: number) => void;
+    holdOpen?: () => () => void;
+    listen?: (server: import("http").Server, port: number, host: string) => Promise<void>;
+  } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
   // callers that only import this module for its exports (e.g. tests).
   enableProductionMode();
+  const ownsStore = !options.store;
   const configPath = getConfigPath();
-  const store = await createStore({
+  let store: QMDStore | undefined;
+  let llm: LlamaCpp | undefined;
+  let httpServer: import("http").Server | undefined;
+  try {
+  store = options.store ?? await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
+  llm = resolveServerLlm(store);
+  const ownedStore = store;
+  const inflight = createInflightGate();
 
   // Pre-fetch default collection names for REST endpoint
-  const defaultCollectionNames = await store.getDefaultCollectionNames();
+  const defaultCollectionNames = await ownedStore.getDefaultCollectionNames();
 
   // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
   // responses (matches the previous enableJsonResponse: true). Dual-speaks
   // 2025-era traffic statelessly by default (`legacy: "stateless"`).
+  // No inner inflight gate — HTTP counts each /mcp or REST request once.
   const mcpHandler = createMcpHandler(
-    () => createMcpServer(store),
+    () => createMcpServer(ownedStore),
     { responseMode: "json" },
   );
 
@@ -943,7 +971,7 @@ export async function startMcpHttpServer(
     ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
   });
 
-  const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
+  httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
     const reqStart = Date.now();
     const pathname = (nodeReq.url || "/").split("?")[0];
 
@@ -981,6 +1009,7 @@ export async function startMcpHttpServer(
       // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
+        return await inflight.run(async () => {
         const rawBody = await collectBody(nodeReq);
         const params = JSON.parse(rawBody) as Record<string, unknown>;
 
@@ -1001,7 +1030,7 @@ export async function startMcpHttpServer(
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
-        const results = await store.search({
+        const results = await ownedStore.search({
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: typeof params.limit === "number" ? params.limit : 10,
@@ -1033,6 +1062,7 @@ export async function startMcpHttpServer(
         nodeRes.end(JSON.stringify({ results: formatted }));
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
+        });
       }
 
       if (pathname === "/mcp") {
@@ -1057,9 +1087,11 @@ export async function startMcpHttpServer(
           headers: nodeHeadersToWeb(nodeReq),
           ...(rawBody !== undefined ? { body: rawBody } : {}),
         });
-        const response = await mcpHandler.fetch(
-          request,
-          parsedBody !== undefined ? { parsedBody } : undefined,
+        const response = await inflight.run(async () =>
+          mcpHandler.fetch(
+            request,
+            parsedBody !== undefined ? { parsedBody } : undefined,
+          ),
         );
 
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
@@ -1071,38 +1103,69 @@ export async function startMcpHttpServer(
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
+      if (err instanceof ServerShuttingDownError) {
+        nodeRes.writeHead(503, {
+          "Content-Type": "application/json",
+          "Retry-After": "1",
+          "Connection": "close",
+        });
+        nodeRes.end(JSON.stringify({ error: "QMD server is shutting down" }));
+        return;
+      }
       console.error("HTTP handler error:", err);
       nodeRes.writeHead(500);
       nodeRes.end("Internal Server Error");
     }
   });
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.on("error", reject);
-    httpServer.listen(port, host, () => resolve());
+  const ownedHttp = httpServer!;
+  if (options.listen) {
+    await options.listen(ownedHttp, port, host);
+  } else {
+    await new Promise<void>((resolve, reject) => {
+      ownedHttp.on("error", reject);
+      ownedHttp.listen(port, host, () => resolve());
+    });
+  }
+
+  const actualPort = (ownedHttp.address() as import("net").AddressInfo).port;
+
+  let httpClosePromise: Promise<void> | undefined;
+  const closeHttpServer = (): Promise<void> =>
+    (httpClosePromise ??= new Promise<void>((resolve, reject) => {
+      ownedHttp.close((error?: Error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    }));
+
+  const coordinator = createShutdownCoordinator({
+    closeAdmission() {
+      inflight.closeAdmission();
+      llm!.closeSessionAdmission();
+    },
+    stopServing: async () => {
+      await Promise.all([
+        mcpHandler.close(),
+        closeHttpServer(),
+      ]);
+    },
+    requestAbort: (reason) => llm!.requestSessionAbort(reason),
+    waitForInflight: () => inflight.waitForIdle(),
+    waitForLlmIdle: () => llm!.waitForSessionIdle(),
+    disposeLlm: () => llm!.dispose(),
+    closeStore: () => store!.close(),
+    setExitCode: options.setExitCode ?? applyProcessExitCode,
+    logError: logShutdownError,
+    holdOpen: options.holdOpen ?? createShutdownHold,
+    ...(options.shutdownGraceMs !== undefined ? { graceMs: options.shutdownGraceMs } : {}),
+    ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
   });
 
-  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
-
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    await mcpHandler.close();
-    httpServer.close();
-    await store.close();
-  };
-
-  process.on("SIGTERM", async () => {
-    console.error("Shutting down (SIGTERM)...");
-    await stop();
-    process.exit(0);
-  });
-  process.on("SIGINT", async () => {
-    console.error("Shutting down (SIGINT)...");
-    await stop();
-    process.exit(0);
-  });
+  const shutdown = (trigger: ShutdownTrigger = { kind: "complete", exitCode: 0 }) =>
+    coordinator.shutdown(trigger);
+  const stop = () => shutdown({ kind: "complete", exitCode: 0 });
 
   log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   if (originGuard.disabled) {
@@ -1110,7 +1173,20 @@ export async function startMcpHttpServer(
   } else if (!originGuard.enforceHost) {
     log(`Warning: bound to ${host} with no QMD_ALLOWED_HOSTS — Host validation is off and the index is readable by anyone who can reach this port.`);
   }
-  return { httpServer, port: actualPort, stop };
+  return { httpServer: ownedHttp, port: actualPort, stop, shutdown, inflight };
+  } catch (error) {
+    await cleanupOwnedMcpStartup({
+      ownsStore,
+      store,
+      llm,
+      closeTransport: httpServer
+        ? () => new Promise<void>((resolve) => {
+            httpServer!.close(() => resolve());
+          })
+        : undefined,
+    });
+    throw error;
+  }
 }
 
 // Run if this is the main module
