@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp, isDarwinMetalMitigationActive, withLLMSessionForLlm } from "../src/llm.ts";
+import { LlamaCpp, describeMetalResidencyPolicy, shouldKeepMetalResidencySets, withLLMSessionForLlm } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
   test("does not exit 0 after successful output when post-output LLM cleanup fails", async () => {
@@ -69,30 +69,38 @@ describe("CLI successful-exit lifecycle", () => {
     }
   });
 
-  test("darwin Metal mitigation reflects an explicit legacy env on darwin", () => {
-    // This compatibility diagnostic reports an explicit legacy no-residency
-    // setting unless QMD_METAL_KEEP_RESIDENCY overrides it. The launcher no
-    // longer enables no-residency mode by default.
-    const expected =
-      process.platform === "darwin" &&
-      process.env.QMD_METAL_KEEP_RESIDENCY !== "1" &&
-      process.env.GGML_METAL_NO_RESIDENCY === "1";
-    expect(isDarwinMetalMitigationActive()).toBe(expected);
+  test("residency predicate: default, opt-in, opt-out, and explicit GGML env", () => {
+    const darwin = { platform: "darwin" as const, gpuMode: "auto" as const };
+
+    // Default: follow node-llama-cpp, which disables residency sets.
+    expect(shouldKeepMetalResidencySets({ ...darwin, env: {} })).toBe(false);
+    // Explicit opt-in.
+    expect(shouldKeepMetalResidencySets({ ...darwin, env: { QMD_METAL_KEEP_RESIDENCY: "1" } })).toBe(true);
+    // Explicit opt-out.
+    expect(shouldKeepMetalResidencySets({ ...darwin, env: { QMD_METAL_KEEP_RESIDENCY: "0" } })).toBe(false);
+
+    // Any set GGML_METAL_NO_RESIDENCY wins: node-llama-cpp reads the variable
+    // directly, so QMD must not force the skip flag on top of it.
+    for (const value of ["1", "0", ""]) {
+      expect(shouldKeepMetalResidencySets({ ...darwin, env: { GGML_METAL_NO_RESIDENCY: value } })).toBe(false);
+      expect(shouldKeepMetalResidencySets({
+        ...darwin,
+        env: { GGML_METAL_NO_RESIDENCY: value, QMD_METAL_KEEP_RESIDENCY: "1" },
+      })).toBe(false);
+    }
+
+    // Not a Darwin/Metal concern otherwise.
+    expect(shouldKeepMetalResidencySets({ platform: "linux", gpuMode: "auto", env: { QMD_METAL_KEEP_RESIDENCY: "1" } })).toBe(false);
+    expect(shouldKeepMetalResidencySets({ ...darwin, gpuMode: false, env: { QMD_METAL_KEEP_RESIDENCY: "1" } })).toBe(false);
   });
 
-  test("QMD_METAL_KEEP_RESIDENCY=1 disables the mitigation even when GGML_METAL_NO_RESIDENCY is set", () => {
-    const prevKeep = process.env.QMD_METAL_KEEP_RESIDENCY;
-    const prevNoRes = process.env.GGML_METAL_NO_RESIDENCY;
-    try {
-      process.env.QMD_METAL_KEEP_RESIDENCY = "1";
-      process.env.GGML_METAL_NO_RESIDENCY = "1";
-      expect(isDarwinMetalMitigationActive()).toBe(false);
-    } finally {
-      if (prevKeep === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
-      else process.env.QMD_METAL_KEEP_RESIDENCY = prevKeep;
-      if (prevNoRes === undefined) delete process.env.GGML_METAL_NO_RESIDENCY;
-      else process.env.GGML_METAL_NO_RESIDENCY = prevNoRes;
-    }
+  test("doctor description reports the effective residency state", () => {
+    const darwin = { platform: "darwin" as const, gpuMode: "auto" as const };
+    expect(describeMetalResidencyPolicy({ ...darwin, env: {} })).toContain("node-llama-cpp default");
+    expect(describeMetalResidencyPolicy({ ...darwin, env: { QMD_METAL_KEEP_RESIDENCY: "1" } }))
+      .toContain("QMD_METAL_KEEP_RESIDENCY=1");
+    expect(describeMetalResidencyPolicy({ ...darwin, env: { GGML_METAL_NO_RESIDENCY: "1" } }))
+      .toContain("GGML_METAL_NO_RESIDENCY=1");
   });
 
   test("disposes Llama resources in dependency order before CLI exit", async () => {

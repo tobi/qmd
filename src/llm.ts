@@ -10,7 +10,6 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
-import { boundQueryExpansions } from "./query-expansion.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -822,10 +821,9 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) applies Darwin residency
-    // defaults before the native binding loads. Model-backed commands retain
-    // automatic Metal selection with residency sets enabled.
-    // No constructor-time environment mutation is late enough to be reliable.
+    // Metal residency is not decided here. No constructor-time environment
+    // mutation is late enough to be reliable, so the decision is made by
+    // shouldKeepMetalResidencySets() and passed to every getLlama() call.
 
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
@@ -973,10 +971,9 @@ export class LlamaCpp implements LLM {
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
-      const keepMetalResidency =
-        process.platform === "darwin" &&
-        gpuMode !== false &&
-        process.env.QMD_METAL_KEEP_RESIDENCY === "1";
+      // One predicate decides residency for every getLlama attempt below,
+      // including the CPU-compatible fallback and the auto-mode GPU probes.
+      const keepMetalResidency = shouldKeepMetalResidencySets({ gpuMode });
       // Skip source build when install dir is read-only (e.g. NixOS store).
       const canBuild = allowBuild && canWriteLlamaDir();
 
@@ -1694,11 +1691,9 @@ export class LlamaCpp implements LLM {
         return { type: type as QueryType, text };
       }).filter((q): q is Queryable => q !== null);
 
-      // Filter out lex entries if not requested, then apply the shared
-      // dedup/cap so a repeated-hyde dump cannot fan out into dozens of lookups.
+      // Filter out lex entries if not requested
       const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      const bounded = boundQueryExpansions(filtered, q => q.text);
-      if (bounded.length > 0) return bounded;
+      if (filtered.length > 0) return filtered;
 
       const fallback: Queryable[] = [
         { type: 'hyde', text: `Information about ${query}` },
@@ -1897,6 +1892,14 @@ export class LlamaCpp implements LLM {
   private async withTrackedOperation<T>(_name: string, fn: () => Promise<T>): Promise<T> {
     this.assertAcceptingWork();
     const manager = getSessionManagerForLlm(this);
+    // Idle maintenance (runWhenIdle) may be disposing embedding/rerank
+    // contexts right now. Direct operations do not go through session
+    // acquisition, so they must wait on the same barrier before taking a
+    // lease — otherwise the operation runs against a context being freed.
+    await manager.waitForMaintenanceSlot();
+    // Waking does not imply the runtime is still usable: the waiters are also
+    // woken when admission closes.
+    this.assertAcceptingWork();
     manager.operationStart();
     try {
       return await fn();
@@ -1985,7 +1988,7 @@ class LLMSessionManager {
   private maintenanceCount = 0;
   private idleWaiters = new Set<() => void>();
   private maintenanceWaiters = new Set<() => void>();
-  private acquireWaiters = new Set<() => void>();
+  private maintenanceGateWaiters = new Set<() => void>();
   private readonly shutdownController = new AbortController();
 
   constructor(llm: LlamaCpp) {
@@ -2021,16 +2024,6 @@ class LLMSessionManager {
     return this.canUnload() && this.maintenanceCount === 0;
   }
 
-  acquire(): void {
-    if (this._admissionClosed) {
-      throw new SessionReleasedError("LLM is shutting down");
-    }
-    if (this.maintenanceCount > 0) {
-      throw new SessionReleasedError("LLM is temporarily unavailable");
-    }
-    this._activeSessionCount++;
-  }
-
   async acquireAsync(): Promise<void> {
     while (true) {
       if (this._admissionClosed) {
@@ -2040,7 +2033,18 @@ class LLMSessionManager {
         this._activeSessionCount++;
         return;
       }
-      await new Promise<void>((resolve) => this.acquireWaiters.add(resolve));
+      await new Promise<void>((resolve) => this.maintenanceGateWaiters.add(resolve));
+    }
+  }
+
+  /**
+   * Wait until idle maintenance is not holding the native contexts. Returns
+   * early once admission closes so a shutdown cannot be blocked by this wait;
+   * the caller re-checks shutdown state before starting work.
+   */
+  async waitForMaintenanceSlot(): Promise<void> {
+    while (this.maintenanceCount > 0 && !this._admissionClosed) {
+      await new Promise<void>((resolve) => this.maintenanceGateWaiters.add(resolve));
     }
   }
 
@@ -2061,7 +2065,7 @@ class LLMSessionManager {
   closeAdmission(): void {
     this._admissionClosed = true;
     this.notifyIdle();
-    this.wakeAcquireWaiters();
+    this.wakeMaintenanceGateWaiters();
   }
 
   requestAbort(reason: Error): void {
@@ -2090,7 +2094,7 @@ class LLMSessionManager {
       if (this.maintenanceCount === 0) {
         for (const resolve of this.maintenanceWaiters) resolve();
         this.maintenanceWaiters.clear();
-        this.wakeAcquireWaiters();
+        this.wakeMaintenanceGateWaiters();
         this.notifyIdle();
       }
     };
@@ -2107,9 +2111,9 @@ class LLMSessionManager {
     }
   }
 
-  private wakeAcquireWaiters(): void {
-    for (const resolve of this.acquireWaiters) resolve();
-    this.acquireWaiters.clear();
+  private wakeMaintenanceGateWaiters(): void {
+    for (const resolve of this.maintenanceGateWaiters) resolve();
+    this.maintenanceGateWaiters.clear();
   }
 
   private notifyIdle(): void {
@@ -2343,48 +2347,65 @@ function canUnloadLlamaCpp(llm: LlamaCpp): boolean {
 }
 
 // =============================================================================
-// Darwin Metal exit-crash mitigation
+// Darwin Metal residency sets
 // =============================================================================
 //
 // Older llama.cpp Metal builds could leave a freed buffer's residency set in
 // the device registry and then assert `[rsets->data count] == 0` at teardown
 // (ggml-org/llama.cpp#22593). The packaged b10361 backend removes that registry
-// entry, but it still requires QMD to drain active work and dispose strictly in
-// context → model → runtime order.
+// entry; QMD additionally drains active work and disposes strictly in
+// context -> model -> runtime order.
 //
-// Disabling residency sets via `GGML_METAL_NO_RESIDENCY=1` avoids that teardown
-// assertion, but crashes model operations on affected Apple Silicon runtimes.
-// The launcher now keeps residency sets enabled and relies on orderly cleanup.
-// The predicate below remains as a compatibility diagnostic for an explicit
-// legacy environment setting.
+// node-llama-cpp 3.20 disables residency sets by default on macOS + Metal: it
+// sets `GGML_METAL_NO_RESIDENCY=1` around `loadBackends()` unless the operator
+// already set that variable or `experimental.metalSkipDisablingResidencySets`
+// is true. Keeping residency sets wires model memory, which upstream documents
+// as degrading system performance and post-dispose memory accounting.
 //
-// `QMD_METAL_KEEP_RESIDENCY=1` is translated to node-llama-cpp's
-// `experimental.metalSkipDisablingResidencySets` option when Metal is active.
+// A real-model A/B on the affected Apple Silicon machine (M1 Pro, macOS 14.7.6,
+// node-llama-cpp 3.20.0) found no crash and no failed model operation in either
+// residency state, with and without ordered disposal. QMD therefore keeps
+// upstream's default and only opts in when explicitly asked.
 
 /**
- * Whether the legacy Darwin no-residency mitigation is active in this process.
+ * Whether QMD asks node-llama-cpp to keep Metal residency sets enabled.
+ *
+ * - `GGML_METAL_NO_RESIDENCY` set to any value: defer to the operator, never
+ *   force the skip flag (node-llama-cpp honours the variable directly).
+ * - `QMD_METAL_KEEP_RESIDENCY=1`: keep residency sets.
+ * - anything else, including `QMD_METAL_KEEP_RESIDENCY=0` and unset: use
+ *   node-llama-cpp's default, which disables them.
  */
-export function isDarwinMetalMitigationActive(): boolean {
-  if (process.platform !== "darwin") return false;
-  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
-  return process.env.GGML_METAL_NO_RESIDENCY === "1";
+export function shouldKeepMetalResidencySets(options: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  gpuMode?: LlamaGpuMode;
+} = {}): boolean {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const gpuMode = options.gpuMode ?? resolveLlamaGpuMode();
+  if (platform !== "darwin") return false;
+  if (gpuMode === false) return false;
+  if (env.GGML_METAL_NO_RESIDENCY !== undefined) return false;
+  return env.QMD_METAL_KEEP_RESIDENCY === "1";
 }
 
 /**
- * Compatibility shim: previous releases installed a `process.on('exit')` hook
- * that tried to skip the C++ static destructor by calling `process.reallyExit`.
- * That mechanism didn't work on Node (Environment::Exit still calls libc
- * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
- * Kept as a no-op for code paths that still call it; safe to remove once no
- * production launcher predates the residency-set fix.
+ * Human-readable description of the effective residency state, for `qmd doctor`.
  */
-export function installDarwinExitGuard(): void {
-  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
-}
-
-/** @deprecated Replaced by isDarwinMetalMitigationActive. */
-export function isDarwinExitGuardInstalled(): boolean {
-  return isDarwinMetalMitigationActive();
+export function describeMetalResidencyPolicy(options: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  gpuMode?: LlamaGpuMode;
+} = {}): string {
+  const env = options.env ?? process.env;
+  if (shouldKeepMetalResidencySets(options)) {
+    return "residency sets kept enabled by QMD_METAL_KEEP_RESIDENCY=1";
+  }
+  if (env.GGML_METAL_NO_RESIDENCY !== undefined) {
+    return `residency sets follow GGML_METAL_NO_RESIDENCY=${env.GGML_METAL_NO_RESIDENCY}`;
+  }
+  return "residency sets disabled (node-llama-cpp default)";
 }
 
 // =============================================================================
@@ -2393,11 +2414,7 @@ export function isDarwinExitGuardInstalled(): boolean {
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
-/**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
- */
+/** Get the default LlamaCpp instance (creates one if needed). */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
@@ -2405,14 +2422,8 @@ export function getDefaultLlamaCpp(): LlamaCpp {
   return defaultLlamaCpp;
 }
 
-/**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
- * non-null instance also ensures the darwin exit guard is installed — keeps
- * the invariant intact for test doubles that didn't go through the real
- * constructor.
- */
+/** Set a custom default LlamaCpp instance (useful for testing). */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 

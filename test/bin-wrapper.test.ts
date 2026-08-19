@@ -5,7 +5,6 @@ import { dirname, join, relative } from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { applyDarwinRuntimeDefaults } from "../bin/launcher-env.js";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const fixtures: string[] = [];
@@ -65,7 +64,6 @@ function makePackage(root: string, packagePath: string, lockfiles: string[] = []
   const includeDist = options.dist ?? true;
   mkdirSync(join(packageRoot, "bin"), { recursive: true });
   copyFileSync(join(repoRoot, "bin", "qmd"), join(packageRoot, "bin", "qmd"));
-  copyFileSync(join(repoRoot, "bin", "launcher-env.js"), join(packageRoot, "bin", "launcher-env.js"));
   chmodSync(join(packageRoot, "bin", "qmd"), 0o755);
   if (includeDist) {
     mkdirSync(join(packageRoot, "dist", "cli"), { recursive: true });
@@ -527,66 +525,41 @@ setInterval(() => {}, 1 << 30);
   });
 });
 
-describe("bin/qmd Darwin model routing", () => {
-  test.each(["query", "mcp", "vsearch", "embed", "doctor"])("%s keeps automatic Metal enabled", (command) => {
-    const env: Record<string, string | undefined> = {};
+describe("bin/qmd supervision marker", () => {
+  test.skipIf(process.platform === "win32")("marks the child QMD_SUPERVISED=1 and leaves Metal env alone", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["package-lock.json"]);
+    const envDump = join(root, "child-env.json");
+    writeFileSync(join(packageRoot, "dist", "cli", "qmd.js"), `
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.QMD_CHILD_ENV, JSON.stringify({
+  supervised: process.env.QMD_SUPERVISED ?? null,
+  keep: process.env.QMD_METAL_KEEP_RESIDENCY ?? null,
+  noResidency: process.env.GGML_METAL_NO_RESIDENCY ?? null,
+}));
+`);
 
-    applyDarwinRuntimeDefaults(command, env, "darwin");
-
-    expect(env.QMD_FORCE_CPU).toBeUndefined();
-    expect(env.QMD_METAL_KEEP_RESIDENCY).toBe("1");
-    expect(env.GGML_METAL_NO_RESIDENCY).toBeUndefined();
-  });
-
-  test("explicit GPU query and residency choices are preserved", () => {
-    const env = {
-      QMD_FORCE_CPU: "0",
-      QMD_LLAMA_GPU: "metal",
-      QMD_METAL_KEEP_RESIDENCY: "0",
-      GGML_METAL_NO_RESIDENCY: "1",
-    };
-
-    applyDarwinRuntimeDefaults("query", env, "darwin");
-
-    expect(env).toEqual({
-      QMD_FORCE_CPU: "0",
-      QMD_LLAMA_GPU: "metal",
-      QMD_METAL_KEEP_RESIDENCY: "0",
-      GGML_METAL_NO_RESIDENCY: "1",
+    const wrapper = spawn(join(packageRoot, "bin", "qmd"), ["query", "fixture"], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        QMD_CHILD_ENV: envDump,
+        QMD_METAL_KEEP_RESIDENCY: undefined,
+        GGML_METAL_NO_RESIDENCY: undefined,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
     });
-  });
 
-  test("QMD_LLAMA_GPU is preserved for query", () => {
-    const env: Record<string, string | undefined> = { QMD_LLAMA_GPU: "metal" };
-
-    applyDarwinRuntimeDefaults("query", env, "darwin");
-
-    expect(env.QMD_FORCE_CPU).toBeUndefined();
-    expect(env.QMD_METAL_KEEP_RESIDENCY).toBe("1");
-  });
-
-  test("an explicit GGML residency choice blocks the launcher default", () => {
-    const env: Record<string, string | undefined> = { GGML_METAL_NO_RESIDENCY: "1" };
-
-    applyDarwinRuntimeDefaults("vsearch", env, "darwin");
-
-    expect(env.GGML_METAL_NO_RESIDENCY).toBe("1");
-    expect(env.QMD_METAL_KEEP_RESIDENCY).toBeUndefined();
-  });
-
-  test.each(["search", "get", "status", "update"])("%s does not receive model defaults", (command) => {
-    const env: Record<string, string | undefined> = {};
-
-    applyDarwinRuntimeDefaults(command, env, "darwin");
-
-    expect(env).toEqual({});
-  });
-
-  test.each(["linux", "win32"])("%s remains unchanged", (platform) => {
-    const env: Record<string, string | undefined> = {};
-
-    applyDarwinRuntimeDefaults("query", env, platform);
-
-    expect(env).toEqual({});
+    try {
+      await waitFor(() => existsSync(envDump), 3000);
+      await waitFor(() => wrapper.exitCode !== null || wrapper.signalCode !== null, 3000);
+      expect(JSON.parse(readFileSync(envDump, "utf8"))).toEqual({
+        supervised: "1",
+        keep: null,
+        noResidency: null,
+      });
+    } finally {
+      if (wrapper.exitCode === null && wrapper.signalCode === null) wrapper.kill("SIGKILL");
+    }
   });
 });

@@ -31,7 +31,6 @@ import { enableProductionMode } from "../store.js";
 import { LlamaCpp } from "../llm.js";
 import {
   applyProcessExitCode,
-  createEofWatchdog,
   createShutdownCoordinator,
   createShutdownHold,
   formatShutdownError,
@@ -601,8 +600,9 @@ export type McpStartupOptions = {
   dbPath?: string;
   store?: QMDStore;
   stdin?: StdioShutdownStdin;
-  eofGraceMs?: number;
-  eofHardStop?: (error: unknown) => void;
+  shutdownGraceMs?: number;
+  hardStop?: (error: unknown) => never;
+  schedule?: (fn: () => void, ms: number) => { clear(): void };
   createTransport?: (server: McpServer) => { close(): void | Promise<void> };
   /**
    * When `store` is provided, the caller retains store/LLM ownership even if
@@ -807,25 +807,17 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<S
     setExitCode: applyProcessExitCode,
     logError: logShutdownError,
     holdOpen: createShutdownHold,
+    ...(options.shutdownGraceMs !== undefined ? { graceMs: options.shutdownGraceMs } : {}),
+    ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
   });
 
-  const eofWatchdog = createEofWatchdog({
-    graceMs: options.eofGraceMs,
-    hardStop: options.eofHardStop,
-  });
-
+  // Stdio EOF is not observed by bin/qmd, so the deadline must be owned by the
+  // coordinator. It arms one watchdog for every trigger kind, so there is no
+  // separate EOF-only or MCP-only hard-stop path here.
   registerStdioEofShutdown({
     stdin: options.stdin,
-    shutdown: async (trigger) => {
-      if (trigger.kind === "stdin-eof") eofWatchdog.arm();
-      try {
-        await coordinator.shutdown(trigger);
-        eofWatchdog.disarm();
-      } catch (error) {
-        // Leave the watchdog armed: a failed drain must not continue disposal.
-        throw error;
-      }
-    },
+    shutdown: (trigger) => coordinator.shutdown(trigger),
     stderr: process.stderr,
   });
 
@@ -878,7 +870,6 @@ export async function startMcpHttpServer(
     allowedHosts?: string[];
     setExitCode?: (code: number) => void;
     holdOpen?: () => () => void;
-    hardStop?: (error: unknown) => never;
     listen?: (server: import("http").Server, port: number, host: string) => Promise<void>;
   } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
@@ -1167,7 +1158,9 @@ export async function startMcpHttpServer(
     setExitCode: options.setExitCode ?? applyProcessExitCode,
     logError: logShutdownError,
     holdOpen: options.holdOpen ?? createShutdownHold,
+    ...(options.shutdownGraceMs !== undefined ? { graceMs: options.shutdownGraceMs } : {}),
     ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
   });
 
   const shutdown = (trigger: ShutdownTrigger = { kind: "complete", exitCode: 0 }) =>

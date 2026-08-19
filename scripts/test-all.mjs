@@ -5,16 +5,6 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-// Mirror bin/qmd's safe Darwin residency default for test subprocesses. This
-// must be set before a subprocess imports node-llama-cpp. Preserve either
-// explicit operator choice so tests can still exercise both modes.
-const darwinMetalEnv =
-  process.platform === "darwin"
-    && process.env.QMD_METAL_KEEP_RESIDENCY === undefined
-    && process.env.GGML_METAL_NO_RESIDENCY === undefined
-    ? { QMD_METAL_KEEP_RESIDENCY: "1" }
-    : {};
-
 function run(label, command, args, options = {}) {
   console.log(`==> ${label}`);
   const { env: extraEnv, ...spawnOptions } = options;
@@ -22,7 +12,7 @@ function run(label, command, args, options = {}) {
     cwd: root,
     stdio: "inherit",
     shell: process.platform === "win32",
-    env: { ...process.env, ...darwinMetalEnv, ...(extraEnv ?? {}) },
+    env: { ...process.env, ...(extraEnv ?? {}) },
     ...spawnOptions,
   });
   if (result.status !== 0) {

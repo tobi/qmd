@@ -86,13 +86,14 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, SessionReleasedError, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, SessionReleasedError, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, describeMetalResidencyPolicy } from "../llm.js";
 import {
   createAdmissionLease,
   createShutdownCoordinator,
   createShutdownHandoff,
   createShutdownHold,
   formatShutdownError,
+  hardStopProcess,
   type AdmissionLease,
   type ShutdownTrigger,
 } from "../shutdown.js";
@@ -351,6 +352,7 @@ export function createCliShutdownCoordinator(options: {
   closeStore?: () => void | Promise<void>;
   holdOpen?: () => () => void;
   hardStop?: (error: unknown) => never;
+  schedule?: (fn: () => void, ms: number) => { clear(): void };
   setExitCode?: (code: number) => void;
   logError?: (error: unknown) => void;
 } = {}) {
@@ -392,27 +394,45 @@ export function createCliShutdownCoordinator(options: {
       } catch {}
     }),
     holdOpen: options.holdOpen ?? createShutdownHold,
-    hardStop: options.hardStop ?? ((error): never => {
-      try {
-        process.stderr.write(
-          "QMD fatal: shutdown ownership could not be completed; terminating without native teardown.\n",
-        );
-      } catch {}
-      process.kill(process.pid, "SIGKILL");
-      throw error;
-    }),
+    ...(options.hardStop ? { hardStop: options.hardStop } : {}),
+    ...(options.schedule ? { schedule: options.schedule } : {}),
   });
+}
+
+/**
+ * `bin/qmd` sets this on its child. A supervised child must not escalate on a
+ * duplicate signal: one terminal Ctrl-C is delivered to every member of the
+ * foreground process group and the wrapper then forwards it again, so the
+ * child would see two signals for one keypress. The wrapper owns the second
+ * Ctrl-C and the outer deadline; an unsupervised child owns both itself.
+ */
+export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.QMD_SUPERVISED === "1";
 }
 
 export function installMainSignalHandlers(
   fallback: ActiveShutdown,
+  options: {
+    supervised?: boolean;
+    hardStop?: (error: unknown) => never;
+  } = {},
 ): () => void {
+  const supervised = options.supervised ?? isSupervisedChild();
+  const hardStop = options.hardStop ?? hardStopProcess;
+  let signalCount = 0;
+
   const trigger = (
     signal: "SIGINT" | "SIGTERM",
     exitCode: 130 | 143,
   ) => {
     cursor.show();
     progress.clear();
+
+    signalCount += 1;
+    if (signalCount > 1 && !supervised) {
+      hardStop(new Error(`Second ${signal} during shutdown`));
+      return;
+    }
 
     const shutdown = activeShutdown ?? fallback;
     void shutdown({ kind: "signal", signal, exitCode }).catch((error) => {
@@ -1074,13 +1094,20 @@ async function updateCollections(): Promise<void> {
     }
     if (yamlCol?.update && hooksAllowed) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      // Only spawn/IO failures belong in the try. `process.exit()` is replaced
+      // by a throwing shim during owned CLI dispatch, so exiting inside the
+      // try would be caught here and downgraded to exit 1 plus a second
+      // failure line.
+      let hookOutput: string;
+      let hookErrorOutput: string;
+      let hookExitCode: number;
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
           cwd: col.pwd,
           stdio: ["ignore", "pipe", "pipe"],
         });
 
-        const [output, errorOutput, exitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
+        [hookOutput, hookErrorOutput, hookExitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
           let out = "";
           let err = "";
           proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
@@ -1088,21 +1115,21 @@ async function updateCollections(): Promise<void> {
           proc.on("error", reject);
           proc.on("close", (code) => resolve([out, err, code ?? 1]));
         });
-
-        if (output.trim()) {
-          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-        if (errorOutput.trim()) {
-          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-
-        if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
-          process.exit(exitCode);
-        }
       } catch (err) {
         console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
         process.exit(1);
+      }
+
+      if (hookOutput.trim()) {
+        console.log(hookOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+      }
+      if (hookErrorOutput.trim()) {
+        console.log(hookErrorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+      }
+
+      if (hookExitCode !== 0) {
+        console.log(`${c.yellow}✗ Update command failed with exit code ${hookExitCode}${c.reset}`);
+        process.exit(hookExitCode);
       }
     }
 
@@ -3944,8 +3971,9 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
-  add("QMD_METAL_KEEP_RESIDENCY", "keeps libggml-metal residency sets enabled on darwin; this is the launcher default for model-backed commands on affected Apple Silicon runtimes");
-  add("GGML_METAL_NO_RESIDENCY", "explicitly disables Metal residency sets; preserved by the launcher but unsafe on affected Apple Silicon runtimes");
+  add("QMD_METAL_KEEP_RESIDENCY", "set to 1 to keep libggml-metal residency sets enabled on darwin; default follows node-llama-cpp, which disables them");
+  add("GGML_METAL_NO_RESIDENCY", "read directly by node-llama-cpp; when set to any value QMD defers to it and applies no residency policy of its own");
+  add("QMD_SUPERVISED", "set by bin/qmd on its child; tells the child that the launcher owns second-signal escalation and the outer deadline");
   add("NO_COLOR", "disables colored terminal output");
   add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
   add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
@@ -4226,25 +4254,11 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
         nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
       }
 
-      // Surface the Darwin residency policy. Disabling residency sets avoids
-      // one upstream teardown assertion, but crashes model operations on some
-      // Apple Silicon runtimes. The launcher therefore keeps them enabled and
-      // relies on orderly node-llama-cpp cleanup instead.
+      // Informational only: both residency states run correctly on the
+      // supported Metal backend, so this reports the effective policy from
+      // the same predicate llm.ts uses rather than failing a check.
       if (device.gpu === "metal" && process.platform === "darwin") {
-        if (isDarwinMetalMitigationActive()) {
-          doctorCheck(
-            "darwin metal residency",
-            false,
-            "residency sets explicitly disabled by GGML_METAL_NO_RESIDENCY=1; this can crash model operations on affected Apple Silicon runtimes."
-          );
-          nextSteps.push("Unset `GGML_METAL_NO_RESIDENCY` or set `QMD_METAL_KEEP_RESIDENCY=1`, then rerun `qmd doctor`.");
-        } else {
-          doctorCheck(
-            "darwin metal residency",
-            true,
-            "residency sets enabled; launcher-safe default for model-backed commands on affected Apple Silicon runtimes."
-          );
-        }
+        doctorCheck("darwin metal residency", true, describeMetalResidencyPolicy());
       }
     } else {
       const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
@@ -5010,15 +5024,19 @@ if (isMain) {
           const spawnArgs = selfPath.endsWith(".ts")
             ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
+          const daemonEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            // Explicit resolved DB path so the child does not depend on
+            // re-parsing --index (and cannot inherit a stale INDEX_PATH).
+            INDEX_PATH: getDbPath(),
+          };
+          // The daemon is detached: whatever launched this command is not its
+          // supervisor, so it must own its own second-signal escalation.
+          delete daemonEnv.QMD_SUPERVISED;
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
-            env: {
-              ...process.env,
-              // Explicit resolved DB path so the child does not depend on
-              // re-parsing --index (and cannot inherit a stale INDEX_PATH).
-              INDEX_PATH: getDbPath(),
-            },
+            env: daemonEnv,
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd

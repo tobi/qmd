@@ -12,7 +12,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyDarwinRuntimeDefaults } from "./launcher-env.js";
 
 // Resolve symlinks so global installs (npm link / npm install -g) can find
 // the actual package directory instead of the global bin directory.
@@ -30,12 +29,6 @@ if (process.argv[2] === "mcp") {
   process.env.GGML_LOG_LEVEL = process.env.GGML_LOG_LEVEL || "error";
   process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
 }
-
-// These defaults must be applied before the child imports node-llama-cpp.
-// On Darwin, model-backed commands retain automatic Metal selection. Residency
-// sets stay enabled because disabling them crashes the affected Apple Silicon
-// runtime. Explicit operator choices win.
-applyDarwinRuntimeDefaults(process.argv[2], process.env, process.platform);
 
 function hasBun() {
   try {
@@ -158,9 +151,16 @@ const runner = selected === "node" && typeof process.versions.bun !== "string"
 const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
 const needsShell = (runner === "bun") && process.platform === "win32";
 
+// Mark the child as supervised. This is the entire wrapper protocol: it tells
+// the child that this process owns the second-signal escalation and the outer
+// deadline, so the child must not hard-stop itself on a duplicate signal. One
+// terminal Ctrl-C reaches both members of the foreground process group, and
+// the wrapper forwards it again — without this bit the child would read the
+// wrapper's forward as the user's second Ctrl-C and kill a healthy drain.
 const child = spawn(runner, args, {
   stdio: "inherit",
   shell: needsShell,
+  env: { ...process.env, QMD_SUPERVISED: "1" },
 });
 
 // The launcher is the authoritative supervisor for first-signal drain,

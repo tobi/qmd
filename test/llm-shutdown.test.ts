@@ -127,6 +127,77 @@ describe("LLM shutdown admission and abort", () => {
     expect(sessionBegan).toBe(true);
   });
 
+  test("a direct operation cannot enter while idle maintenance is disposing contexts", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const disposeStarted = deferred();
+    const releaseDispose = deferred();
+    const observed: string[] = [];
+    let contextDisposed = false;
+
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      embedContexts: [{
+        dispose: async () => {
+          disposeStarted.resolve();
+          await releaseDispose.promise;
+          contextDisposed = true;
+        },
+      }],
+      // Stands in for any direct embed/rerank/expandQuery body: it must never
+      // run while the unload is mid-dispose.
+      tokenizeUntracked: async () => {
+        observed.push(contextDisposed ? "after-dispose" : "during-dispose");
+        return [1, 2, 3];
+      },
+    });
+
+    const unloading = llm.unloadIdleResources();
+    await disposeStarted.promise;
+
+    const operation = llm.tokenize("direct call");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(observed).toEqual([]);
+
+    releaseDispose.resolve();
+    await unloading;
+    await operation;
+    expect(observed).toEqual(["after-dispose"]);
+  });
+
+  test("a direct operation waiting on maintenance rejects when shutdown closes admission", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const disposeStarted = deferred();
+    const releaseDispose = deferred();
+    let entered = false;
+
+    Object.assign(llm as unknown as Record<string, unknown>, {
+      embedContexts: [{
+        dispose: async () => {
+          disposeStarted.resolve();
+          await releaseDispose.promise;
+        },
+      }],
+      tokenizeUntracked: async () => {
+        entered = true;
+        return [1];
+      },
+    });
+
+    const unloading = llm.unloadIdleResources();
+    await disposeStarted.promise;
+
+    const operation = llm.tokenize("direct call");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    llm.closeSessionAdmission();
+    await expect(operation).rejects.toThrow(SessionReleasedError);
+    expect(entered).toBe(false);
+
+    releaseDispose.resolve();
+    await unloading;
+  });
+
   test("concurrent dispose() still returns the same promise", async () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
     const first = llm.dispose();

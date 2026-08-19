@@ -3,8 +3,13 @@
  *
  * One memoized shutdown promise owns admission close, cooperative abort,
  * request/LLM drain, LLM disposal, and store closure. A missed deadline is
- * not another teardown branch: the external supervisor must SIGKILL instead
- * of disposing parents under active native work.
+ * not another teardown branch: the coordinator hard-stops instead of disposing
+ * parents under active native work.
+ *
+ * The grace watchdog lives here, not in a launcher, because `bin/qmd` is only
+ * one of the ways QMD starts. Nix wrappers, `node dist/cli/qmd.js`,
+ * `bun src/cli/qmd.ts` and the detached HTTP daemon have no supervising
+ * parent, so every trigger kind arms the same deadline.
  */
 
 export type ShutdownTrigger =
@@ -39,13 +44,21 @@ export type ShutdownHooks = {
   logError(error: unknown): void;
 
   /**
-   * Must not return in production. For supervised children this can be
-   * omitted on the normal path; the supervisor owns the deadline.
+   * Must not return in production. Defaults to self-SIGKILL: once teardown has
+   * failed or blown its deadline, the process cannot dispose native parents
+   * safely, and a JS-level exit path may never run if the event loop is stuck
+   * inside llama.cpp.
    */
   hardStop?(error: unknown): never;
 
   /** Keeps Node alive while shutdown is pending, even if all other handles disappear. */
   holdOpen?(): () => void;
+
+  /** Deadline for the whole teardown. Defaults to `QMD_SHUTDOWN_GRACE_MS`. */
+  graceMs?: number;
+
+  /** Timer injection point for tests. */
+  schedule?(fn: () => void, ms: number): { clear(): void };
 };
 
 export type ShutdownCoordinator = {
@@ -187,53 +200,34 @@ export function resolveShutdownGraceMs(env = process.env.QMD_SHUTDOWN_GRACE_MS, 
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-export type EofWatchdog = {
-  arm(): void;
-  disarm(): void;
-};
-
 /**
- * Stdio EOF is not observed by bin/qmd, so the child must own a hard-stop
- * deadline. The watchdog only kills the process; it never continues parent
- * disposal. A JS timer cannot fire if the event loop is blocked in native code.
+ * Terminate without further native teardown.
+ *
+ * Reaching this point means either a teardown stage failed or the grace
+ * deadline expired, so disposing parents beneath possibly-live native work is
+ * exactly what must not happen. `process.exit()` would still run libc `exit()`
+ * and the ggml static destructors, and it cannot preempt a blocked event loop,
+ * so self-SIGKILL is the only reliable stop.
  */
-export function createEofWatchdog(options: {
-  graceMs?: number;
-  hardStop?: (error: unknown) => void;
-  schedule?: (fn: () => void, ms: number) => { clear(): void };
-} = {}): EofWatchdog {
-  const graceMs = options.graceMs ?? resolveShutdownGraceMs();
-  const hardStop = options.hardStop ?? ((error: unknown) => {
-    try {
-      process.stderr.write("qmd: stdio shutdown exceeded grace; forcing exit\n");
-    } catch {}
-    process.kill(process.pid, "SIGKILL");
-    throw error instanceof Error ? error : new Error(String(error));
-  });
-  const schedule = options.schedule ?? ((fn, ms) => {
-    const timer = setTimeout(fn, ms);
-    return { clear: () => clearTimeout(timer) };
-  });
-  let handle: { clear(): void } | undefined;
-
-  return {
-    arm() {
-      if (handle) return;
-      handle = schedule(() => {
-        hardStop(new Error("stdio EOF shutdown exceeded grace"));
-      }, graceMs);
-    },
-    disarm() {
-      handle?.clear();
-      handle = undefined;
-    },
-  };
+export function hardStopProcess(error: unknown): never {
+  try {
+    process.stderr.write(`QMD fatal: ${formatShutdownError(error)}; terminating without native teardown.\n`);
+  } catch {}
+  process.kill(process.pid, "SIGKILL");
+  throw error instanceof Error ? error : new Error(String(error));
 }
 
 export function createShutdownCoordinator(hooks: ShutdownHooks): ShutdownCoordinator {
   let shutdownPromise: Promise<void> | undefined;
   let requestedExitCode = 0;
   const abortController = new AbortController();
+  const hardStop = hooks.hardStop ?? hardStopProcess;
+  const graceMs = hooks.graceMs ?? resolveShutdownGraceMs();
+  const schedule = hooks.schedule ?? ((fn: () => void, ms: number) => {
+    const timer = setTimeout(fn, ms);
+    return { clear: () => clearTimeout(timer) };
+  });
+  let watchdog: { clear(): void } | undefined;
 
   const shutdown = (trigger: ShutdownTrigger): Promise<void> => {
     // A signal upgrades an EOF/success shutdown. Repeated signals do not
@@ -246,6 +240,14 @@ export function createShutdownCoordinator(hooks: ShutdownHooks): ShutdownCoordin
 
     shutdownPromise = (async () => {
       let releaseHold: (() => void) | undefined;
+      // Armed for every trigger kind, disarmed only after a clean teardown.
+      // hardStop never returns, so the throw is deliberately not caught: a
+      // caught hard stop would hand control back to the event loop and let
+      // teardown carry on past the deadline, which is exactly the failure the
+      // deadline exists to prevent.
+      watchdog = schedule(() => {
+        hardStop(new Error(`Shutdown exceeded ${graceMs}ms grace`));
+      }, graceMs);
       try {
         releaseHold = hooks.holdOpen?.();
 
@@ -285,6 +287,8 @@ export function createShutdownCoordinator(hooks: ShutdownHooks): ShutdownCoordin
 
         // 8. Natural exit.
         hooks.setExitCode(requestedExitCode);
+        watchdog?.clear();
+        watchdog = undefined;
         releaseHold?.();
       } catch (error) {
         try {
@@ -293,11 +297,10 @@ export function createShutdownCoordinator(hooks: ShutdownHooks): ShutdownCoordin
           // logging must not hide the original failure
         }
 
-        // Do not release the hold and do not continue to lower tiers.
-        // A known failure can hard-stop immediately; a hung wait is killed
-        // by the external supervisor's deadline.
-        if (hooks.hardStop) hooks.hardStop(error);
-        throw error;
+        // Do not release the hold, do not disarm the watchdog, and do not
+        // continue to lower tiers. A known failure hard-stops immediately;
+        // a hung wait is killed when the watchdog fires.
+        hardStop(error);
       }
     })();
 

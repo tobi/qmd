@@ -1,8 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
-  createEofWatchdog,
   createShutdownCoordinator,
   createShutdownHandoff,
+  hardStopProcess,
   type ShutdownHooks,
   type ShutdownTrigger,
 } from "../src/shutdown.ts";
@@ -58,6 +58,13 @@ function createHooks(overrides: Partial<ShutdownHooks> = {}) {
       calls.push("hard-stop");
       hardStops.push(error);
       throw error instanceof Error ? error : new Error(String(error));
+    },
+    // Several tests below deliberately leave a shutdown hung forever. Without
+    // an inert scheduler they would arm real 30s watchdogs that later fire
+    // during unrelated tests. The watchdog's own behaviour is covered by
+    // "shutdown grace watchdog", which injects its own schedule.
+    schedule() {
+      return { clear() {} };
     },
     ...overrides,
   };
@@ -307,33 +314,105 @@ describe("createShutdownHandoff", () => {
   });
 });
 
-describe("createEofWatchdog", () => {
-  test("hard-stops after grace and never continues disposal", async () => {
-    const stops: string[] = [];
-    let fire!: () => void;
-    const watchdog = createEofWatchdog({
-      graceMs: 10,
-      hardStop() { stops.push("hard-stop"); },
-      schedule(fn) {
-        fire = fn;
-        return { clear() { stops.push("cleared"); } };
-      },
-    });
-    watchdog.arm();
-    fire();
-    expect(stops).toEqual(["hard-stop"]);
+describe("shutdown grace watchdog", () => {
+  const hooks = (overrides: Partial<Parameters<typeof createShutdownCoordinator>[0]> = {}) => ({
+    closeAdmission() {},
+    stopServing() {},
+    requestAbort() {},
+    waitForInflight: async () => {},
+    waitForLlmIdle: async () => {},
+    disposeLlm: async () => {},
+    closeStore() {},
+    setExitCode() {},
+    logError() {},
+    ...overrides,
   });
 
-  test("successful shutdown disarms the timer", () => {
-    const stops: string[] = [];
-    const watchdog = createEofWatchdog({
-      hardStop() { stops.push("hard-stop"); },
+  test("arms one watchdog for every trigger kind", async () => {
+    for (const trigger of [
+      { kind: "complete", exitCode: 0 },
+      { kind: "stdin-eof", exitCode: 0 },
+      { kind: "signal", signal: "SIGINT", exitCode: 130 },
+    ] as const) {
+      const armed: number[] = [];
+      const coordinator = createShutdownCoordinator(hooks({
+        graceMs: 250,
+        hardStop: (() => { throw new Error("unused"); }) as never,
+        schedule(_fn, ms) {
+          armed.push(ms);
+          return { clear() {} };
+        },
+      }));
+      await coordinator.shutdown(trigger);
+      expect(armed).toEqual([250]);
+    }
+  });
+
+  test("successful teardown disarms the watchdog and never hard-stops", async () => {
+    const events: string[] = [];
+    const coordinator = createShutdownCoordinator(hooks({
+      hardStop: (() => { events.push("hard-stop"); throw new Error("x"); }) as never,
       schedule(_fn) {
-        return { clear() { stops.push("cleared"); } };
+        events.push("armed");
+        return { clear() { events.push("cleared"); } };
       },
-    });
-    watchdog.arm();
-    watchdog.disarm();
-    expect(stops).toEqual(["cleared"]);
+    }));
+    await coordinator.shutdown({ kind: "complete", exitCode: 0 });
+    expect(events).toEqual(["armed", "cleared"]);
+  });
+
+  // The hardStop hook is contractually never-returning, so the coordinator must
+  // not catch it. The harness models that faithfully: the injected hard stop
+  // throws out of the timer callback, and the drain it interrupted stays hung
+  // (a resolvable drain would mean there was no deadline to miss).
+  test("grace expiry throws out of the timer and no lower tier can follow", async () => {
+    const events: string[] = [];
+    let fire!: () => void;
+    const coordinator = createShutdownCoordinator(hooks({
+      waitForInflight: () => new Promise<void>(() => {}),
+      waitForLlmIdle: async () => { events.push("wait-llm-idle"); },
+      disposeLlm: async () => { events.push("dispose-llm"); },
+      closeStore() { events.push("close-store"); },
+      setExitCode() { events.push("set-exit-code"); },
+      graceMs: 5,
+      hardStop: ((error: unknown) => {
+        events.push("hard-stop");
+        throw error instanceof Error ? error : new Error(String(error));
+      }) as never,
+      schedule(fn) {
+        fire = fn;
+        return { clear() { events.push("cleared"); } };
+      },
+    }));
+
+    void coordinator.shutdown({ kind: "stdin-eof", exitCode: 0 });
+    await Promise.resolve();
+
+    // Terminal: the throw reaches the scheduler, it is not swallowed into a
+    // return that would hand control back to the event loop.
+    expect(() => fire()).toThrow(/Shutdown exceeded 5ms grace/);
+
+    // Nothing resumes teardown afterwards, and the watchdog is never disarmed.
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual(["hard-stop"]);
+  });
+
+  test("hardStopProcess reports the reason before terminating", () => {
+    const written: string[] = [];
+    const originalWrite = process.stderr.write;
+    const originalKill = process.kill;
+    const killed: Array<[number, string | number | undefined]> = [];
+    // @ts-expect-error test double
+    process.stderr.write = (chunk: string) => { written.push(String(chunk)); return true; };
+    // @ts-expect-error test double
+    process.kill = (pid: number, signal?: string | number) => { killed.push([pid, signal]); return true; };
+    try {
+      expect(() => hardStopProcess(new Error("drain stuck"))).toThrow("drain stuck");
+    } finally {
+      process.stderr.write = originalWrite;
+      process.kill = originalKill;
+    }
+    expect(written.join("")).toContain("drain stuck");
+    expect(killed).toEqual([[process.pid, "SIGKILL"]]);
   });
 });

@@ -3044,7 +3044,6 @@ describe("mcp stdio launcher", () => {
 
       const qmdBin = join(tempPackage, "bin", "qmd");
       await copyFile(join(projectRoot, "bin", "qmd"), qmdBin);
-      await copyFile(join(projectRoot, "bin", "launcher-env.js"), join(tempPackage, "bin", "launcher-env.js"));
       await chmod(qmdBin, 0o755);
 
       // Force the wrapper down the Node branch. The trampoline now execs

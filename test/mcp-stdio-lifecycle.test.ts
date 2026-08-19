@@ -210,7 +210,7 @@ describe("stdio MCP initialization vs EOF", () => {
       store,
       stdin,
       createTransport: () => ({ close: async () => { order.push("transport-close"); } }),
-      eofHardStop: () => { order.push("eof-hard-stop"); },
+      hardStop: (() => { order.push("hard-stop"); throw new Error("hard stop"); }) as never,
     });
     await handle.shutdown();
 
@@ -218,23 +218,6 @@ describe("stdio MCP initialization vs EOF", () => {
     expect(order.indexOf("init-status")).toBeLessThan(order.indexOf("store-close"));
   });
 
-  test("EOF watchdog hard-stops instead of disposing under a hung drain", async () => {
-    const stops: string[] = [];
-    let fire!: () => void;
-    const { createEofWatchdog } = await import("../src/shutdown.ts");
-    const watchdog = createEofWatchdog({
-      graceMs: 1,
-      hardStop() { stops.push("hard-stop"); },
-      schedule(fn) {
-        fire = fn;
-        return { clear() { stops.push("cleared"); } };
-      },
-    });
-    watchdog.arm();
-    fire();
-    expect(stops).toEqual(["hard-stop"]);
-    expect(stops).not.toContain("dispose");
-  });
 });
 
 describe("qmd mcp stdio process lifecycle", () => {

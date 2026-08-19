@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = new URL("..", import.meta.url);
@@ -84,10 +84,7 @@ describe("Nix flake package layout", () => {
 
   test("makeWrapper seeds the same pre-import env as bin/qmd (#723)", () => {
     const flake = readFileSync(new URL("flake.nix", root), "utf8");
-    const launcher = [
-      readFileSync(new URL("bin/qmd", root), "utf8"),
-      readFileSync(new URL("bin/launcher-env.js", root), "utf8"),
-    ].join("\n");
+    const launcher = readFileSync(new URL("bin/qmd", root), "utf8");
 
     // Nix installs skip bin/qmd and exec bun src/cli/qmd.ts. The wrapper must
     // still set these BEFORE the native binding loads, matching the launcher.
@@ -95,8 +92,6 @@ describe("Nix flake package layout", () => {
       "LLAMA_LOG_LEVEL",
       "GGML_LOG_LEVEL",
       "GGML_BACKEND_SILENT",
-      "GGML_METAL_NO_RESIDENCY",
-      "QMD_METAL_KEEP_RESIDENCY",
     ]) {
       expect(launcher, `bin/qmd should set ${env}`).toContain(env);
       expect(flake, `flake.nix wrapper should set ${env}`).toContain(env);
@@ -104,10 +99,28 @@ describe("Nix flake package layout", () => {
 
     expect(flake).toContain('--run');
     expect(flake).toContain('$1" = mcp');
-    expect(flake).toContain('$(uname -s)" = Darwin');
     expect(flake).toContain('LLAMA_LOG_LEVEL:-error');
     expect(flake).toContain('GGML_LOG_LEVEL:-error');
     expect(flake).toContain('GGML_BACKEND_SILENT:-1');
-    expect(flake).toContain('GGML_METAL_NO_RESIDENCY:-1');
+  });
+
+  test("neither launcher carries a QMD Metal residency default", () => {
+    const flake = readFileSync(new URL("flake.nix", root), "utf8");
+    const launcher = readFileSync(new URL("bin/qmd", root), "utf8");
+
+    // Residency is decided once, in src/llm.ts, on the getLlama call. A
+    // launcher-side default was unreachable for `qmd bench`, global-flag
+    // invocations, dev runs and Nix, and it drifted between the two launchers.
+    for (const [name, source] of [["bin/qmd", launcher], ["flake.nix", flake]] as const) {
+      expect(source, `${name} must not set QMD_METAL_KEEP_RESIDENCY`).not.toContain("QMD_METAL_KEEP_RESIDENCY");
+      expect(source, `${name} must not set GGML_METAL_NO_RESIDENCY`).not.toContain("GGML_METAL_NO_RESIDENCY");
+    }
+    expect(existsSync(new URL("bin/launcher-env.js", root))).toBe(false);
+  });
+
+  test("bin/qmd marks its child supervised with exactly one bit", () => {
+    const launcher = readFileSync(new URL("bin/qmd", root), "utf8");
+    expect(launcher).toContain('QMD_SUPERVISED: "1"');
+    expect(launcher.match(/QMD_SUPERVISED/g)?.length).toBe(1);
   });
 });
