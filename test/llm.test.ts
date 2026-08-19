@@ -100,6 +100,102 @@ describe("canWriteLlamaDir", () => {
       else process.env.QMD_FORCE_CPU = prevForceCpu;
     }
   });
+
+  test("requests native Metal residency sets only when explicitly opted in", async () => {
+    const previous = {
+      gpu: process.env.QMD_LLAMA_GPU,
+      forceCpu: process.env.QMD_FORCE_CPU,
+      keepResidency: process.env.QMD_METAL_KEEP_RESIDENCY,
+    };
+    process.env.QMD_LLAMA_GPU = "metal";
+    process.env.QMD_FORCE_CPU = "0";
+    process.env.QMD_METAL_KEEP_RESIDENCY = "1";
+
+    const calls: Array<Record<string, unknown>> = [];
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options);
+        return { gpu: "metal", cpuMathCores: 4, dispose: async () => {} } as any;
+      }),
+    });
+    setLlamaDirWritableForTest(false);
+
+    try {
+      const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+      await (llm as any).ensureLlama();
+      expect(calls).toHaveLength(1);
+      if (process.platform === "darwin") {
+        expect(calls[0]?.experimental).toEqual({
+          metalSkipDisablingResidencySets: true,
+        });
+      } else {
+        expect(calls[0]?.experimental).toBeUndefined();
+      }
+      await llm.dispose();
+    } finally {
+      setLlamaDirWritableForTest(undefined);
+      setNodeLlamaCppModuleForTest(null);
+      if (previous.gpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = previous.gpu;
+      if (previous.forceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = previous.forceCpu;
+      if (previous.keepResidency === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
+      else process.env.QMD_METAL_KEEP_RESIDENCY = previous.keepResidency;
+    }
+  });
+
+  test.each([
+    ["default (no residency env)", {}, false],
+    ["QMD_METAL_KEEP_RESIDENCY=0", { QMD_METAL_KEEP_RESIDENCY: "0" }, false],
+    ["QMD_METAL_KEEP_RESIDENCY=1", { QMD_METAL_KEEP_RESIDENCY: "1" }, true],
+    ["GGML_METAL_NO_RESIDENCY=1", { GGML_METAL_NO_RESIDENCY: "1" }, false],
+    ["GGML_METAL_NO_RESIDENCY=0", { GGML_METAL_NO_RESIDENCY: "0" }, false],
+    ["both set", { GGML_METAL_NO_RESIDENCY: "1", QMD_METAL_KEEP_RESIDENCY: "1" }, false],
+  ] as const)("every getLlama attempt carries the residency decision: %s", async (_label, envPatch, expectSkipFlag) => {
+    const keys = ["QMD_LLAMA_GPU", "QMD_FORCE_CPU", "QMD_METAL_KEEP_RESIDENCY", "GGML_METAL_NO_RESIDENCY"] as const;
+    const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    for (const key of keys) delete process.env[key];
+    process.env.QMD_FORCE_CPU = "0";
+    Object.assign(process.env, envPatch);
+
+    const calls: Array<Record<string, unknown>> = [];
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      // First attempt reports CPU so auto-mode runs its extra no-build GPU
+      // probes; every one of those attempts must carry the same decision.
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options);
+        return { gpu: calls.length === 1 ? false : "metal", cpuMathCores: 4, dispose: async () => {} } as any;
+      }),
+      getLlamaGpuTypes: vi.fn(async () => ["metal"]),
+    } as any);
+    setLlamaDirWritableForTest(false);
+
+    try {
+      const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+      await (llm as any).ensureLlama();
+      expect(calls.length).toBeGreaterThan(1);
+      const wantExperimental = process.platform === "darwin" && expectSkipFlag;
+      for (const call of calls) {
+        expect(call.experimental).toEqual(
+          wantExperimental ? { metalSkipDisablingResidencySets: true } : undefined,
+        );
+      }
+      await llm.dispose();
+    } finally {
+      setLlamaDirWritableForTest(undefined);
+      setNodeLlamaCppModuleForTest(null);
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
 });
 
 

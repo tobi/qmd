@@ -31,6 +31,7 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import { sanitizeQueryExpansions } from "./query-expansion.js";
 import type {
   NamedCollection,
   Collection,
@@ -4488,11 +4489,20 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
       const parsed = JSON.parse(cached) as unknown;
       if (!Array.isArray(parsed)) return [];
       const rows = parsed as Array<Record<string, unknown>>;
-      // Migrate old cache format: { type, text } → { type, query }
-      if (rows.length > 0 && typeof rows[0]?.query === "string") {
-        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.query) }));
-      } else if (rows.length > 0 && typeof rows[0]?.text === "string") {
-        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.text) }));
+      // Migrate old cache format: { type, text } → { type, query }, then run
+      // the same policy the fresh path uses. A record written before the cap
+      // existed would otherwise replay its full fan-out on every warm repeat.
+      const field = typeof rows[0]?.query === "string" ? "query"
+        : typeof rows[0]?.text === "string" ? "text"
+        : null;
+      if (field) {
+        return sanitizeQueryExpansions(
+          rows
+            .filter((r) => typeof r[field] === "string")
+            .map((r) => ({ type: r.type as ExpandedQuery["type"], query: r[field] as string })),
+          (q) => q.query,
+          query,
+        );
       }
     } catch {
       // Old cache format (pre-typed, newline-separated text) — re-expand
@@ -4503,11 +4513,14 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query);
 
-  // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
-  // Filter out entries that duplicate the original query text.
-  const expanded: ExpandedQuery[] = results
-    .filter(r => r.text !== query)
-    .map(r => ({ type: r.type, query: r.text }));
+  // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts
+  // internals), then apply the one expansion policy — the same call cache
+  // reads make — before anything fans out into searches.
+  const expanded: ExpandedQuery[] = sanitizeQueryExpansions(
+    results.map(r => ({ type: r.type, query: r.text })),
+    (q) => q.query,
+    query,
+  );
 
   if (expanded.length > 0) {
     setCachedResult(db, cacheKey, JSON.stringify(expanded));
@@ -5398,6 +5411,8 @@ export interface HybridQueryOptions {
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Cooperative cancellation; the LLM session shutdown signal always applies too. */
+  signal?: AbortSignal;
 }
 
 export interface HybridQueryResult {
@@ -5434,6 +5449,37 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+/** A cancellation source: an LLM exposing PR 1's session abort signal. */
+type SearchAbortSource = { readonly sessionAbortSignal?: AbortSignal } | null | undefined;
+
+function abortReasonError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error(reason === undefined ? "The operation was aborted" : String(reason));
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * Cooperative cancellation check for the search pipeline.
+ *
+ * Sources are additive so a still-live caller signal cannot mask a shutdown
+ * abort: the first aborted signal among (caller, resolved LLM, store LLM)
+ * throws its own reason. Aborting rejects — it never degrades into an empty
+ * successful result, which would look to the caller like "nothing matched".
+ *
+ * Never instantiates a default LlamaCpp just to read a signal; callers that
+ * already resolved one via getLlm() pass it in.
+ */
+function throwIfSearchAborted(store: Store, signal?: AbortSignal, llm?: SearchAbortSource): void {
+  const seen = new Set<AbortSignal>();
+  for (const candidate of [signal, llm?.sessionAbortSignal, store.llm?.sessionAbortSignal]) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (candidate.aborted) throw abortReasonError(candidate);
+  }
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -5460,6 +5506,9 @@ export async function hybridQuery(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+  const signal = options?.signal;
+
+  throwIfSearchAborted(store, signal);
 
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
@@ -5488,6 +5537,7 @@ export async function hybridQuery(
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
+  throwIfSearchAborted(store, signal);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -5522,6 +5572,11 @@ export async function hybridQuery(
     }
   }
 
+  // Resolved only inside the vector branch below, so an FTS-only store never
+  // instantiates the default LLM just to read a cancellation signal — but once
+  // resolved, later phases keep observing that instance's shutdown signal.
+  let vectorLlm: SearchAbortSource;
+
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
   if (hasVectors) {
     const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
@@ -5535,15 +5590,19 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
+    vectorLlm = llm;
     const embedModel = llm.embedModelName;
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
+    throwIfSearchAborted(store, signal, llm);
     const embeddings = await llm.embedBatch(textsToEmbed);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
+    throwIfSearchAborted(store, signal, llm);
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
+      throwIfSearchAborted(store, signal, llm);
       const embedding = embeddings[i]?.embedding;
       if (!embedding) continue;
 
@@ -5578,6 +5637,10 @@ export async function hybridQuery(
       store.invalidateExpansionCache(query);
     }
   }
+
+  // Retrieval is done. Reject here rather than let an empty candidate set
+  // report an aborted search as a successful "nothing matched".
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
   // expansion-derived lists stay at 1x independent of insertion order.
@@ -5614,6 +5677,11 @@ export async function hybridQuery(
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
+
+  // Last boundary before reranking / the RRF-only return: an aborted search
+  // must reject here rather than enter another native model phase or present
+  // partial hits as a complete result.
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -5678,6 +5746,9 @@ export async function hybridQuery(
   const rerankStart = Date.now();
   const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
+  // Reranking can abort and still resolve with scores. Reject rather than
+  // blend and return them as a complete result set.
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
@@ -5749,6 +5820,8 @@ export interface VectorSearchOptions {
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
+  /** Cooperative cancellation; the LLM session shutdown signal always applies too. */
+  signal?: AbortSignal;
 }
 
 export interface VectorSearchResult {
@@ -5785,17 +5858,27 @@ export async function vectorSearchQuery(
   ).get();
   if (!hasVectors) return [];
 
+  // Resolve the effective LLM up front: every remaining step embeds through
+  // it, and on a store with no attached llm that is the default instance —
+  // whose shutdown signal must stop this fan-out just the same.
+  const signal = options?.signal;
+  const llm = getLlm(store);
+  throwIfSearchAborted(store, signal, llm);
+
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
   const allExpanded = await store.expandQuery(query);
+  throwIfSearchAborted(store, signal, llm);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
+  const embedModel = llm.embedModelName;
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
+    // searchVec embeds before it scans, so this guards both native phases.
+    throwIfSearchAborted(store, signal, llm);
     const vecResults = await store.searchVec(q, embedModel, limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -5812,6 +5895,10 @@ export async function vectorSearchQuery(
       }
     }
   }
+
+  // The final lookup can abort while still returning a hit. Reject rather than
+  // hand back the partial map as a complete result set.
+  throwIfSearchAborted(store, signal, llm);
 
   return Array.from(allResults.values())
     .sort((a, b) => b.score - a.score)
@@ -5839,6 +5926,8 @@ export interface StructuredSearchOptions {
   skipRerank?: boolean;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Cooperative cancellation; the LLM session shutdown signal always applies too. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -5871,6 +5960,9 @@ export async function structuredSearch(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+  const signal = options?.signal;
+
+  throwIfSearchAborted(store, signal);
 
   const collections = options?.collections;
 
@@ -5926,6 +6018,10 @@ export async function structuredSearch(
     }
   }
 
+  // Resolved only when there is vector work to do, so an FTS-only store never
+  // instantiates the default LLM just to read a cancellation signal.
+  let vectorLlm: SearchAbortSource;
+
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
     const vecSearches = searches.filter(
@@ -5934,18 +6030,23 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
+      vectorLlm = llm;
       const embedModel = llm.embedModelName;
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
+      throwIfSearchAborted(store, signal, llm);
       const embeddings = await llm.embedBatch(textsToEmbed);
       hooks?.onEmbedDone?.(Date.now() - embedStart);
+      throwIfSearchAborted(store, signal, llm);
 
       for (let i = 0; i < vecSearches.length; i++) {
+        throwIfSearchAborted(store, signal, llm);
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
         for (const coll of collectionList) {
+          throwIfSearchAborted(store, signal, llm);
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, embedModel, 20, coll,
             undefined, embedding
@@ -5966,6 +6067,10 @@ export async function structuredSearch(
       }
     }
   }
+
+  // Retrieval is done. Reject here rather than let an empty result set report
+  // an aborted search as a successful "nothing matched".
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   if (rankedLists.length === 0) return [];
 
@@ -6008,6 +6113,11 @@ export async function structuredSearch(
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
+
+  // Last boundary before reranking / the RRF-only return: an aborted search
+  // must reject here rather than enter another native model phase or present
+  // partial hits as a complete result.
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -6072,6 +6182,9 @@ export async function structuredSearch(
   const rerankStart2 = Date.now();
   const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
+  // Reranking can abort and still resolve with scores. Reject rather than
+  // blend and return them as a complete result set.
+  throwIfSearchAborted(store, signal, vectorLlm);
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {

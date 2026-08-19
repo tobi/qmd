@@ -1326,6 +1326,102 @@ describe("Query expansion cache (#818)", () => {
     }
   });
 
+  test("expandQuery bounds a fresh expansion and caches only the bounded list", async () => {
+    const store = await createTestStore();
+    try {
+      const oversized = [
+        ...Array.from({ length: 20 }, () => ({ type: "hyde", text: "Repeated Hyde Document" })),
+        { type: "vec", text: "  Fresh Question " },
+        { type: "lex", text: "alpha" },
+        { type: "lex", text: "bravo" },
+        { type: "lex", text: "charlie" },
+        { type: "vec", text: "semantic one" },
+        { type: "vec", text: "semantic two" },
+        { type: "hyde", text: "Another Hyde Document" },
+      ];
+      store.llm = {
+        generateModelName: "fake-generate-model",
+        expandQuery: async () => oversized,
+      } as typeof store.llm;
+
+      const out = await store.expandQuery("fresh question");
+
+      // "  Fresh Question " normalizes to the original query and is dropped
+      // before the caps, so it never costs a slot.
+      expect(out).toEqual([
+        { type: "hyde", query: "Repeated Hyde Document" },
+        { type: "lex", query: "alpha" },
+        { type: "lex", query: "bravo" },
+        { type: "vec", query: "semantic one" },
+        { type: "vec", query: "semantic two" },
+        { type: "hyde", query: "Another Hyde Document" },
+      ]);
+
+      const cached = store.getCachedResult(
+        getCacheKey("expandQuery", { query: "fresh question", model: "fake-generate-model" }),
+      );
+      expect(JSON.parse(cached!)).toEqual(out);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("expandQuery sanitizes an oversized cached expansion on read", async () => {
+    const store = await createTestStore();
+    try {
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const oversized = [
+        ...Array.from({ length: 26 }, () => ({ type: "hyde", query: "Repeated Hyde Document" })),
+        { type: "lex", query: "alpha" },
+        { type: "lex", query: "bravo" },
+        { type: "lex", query: "charlie" },
+        { type: "vec", query: "semantic one" },
+        { type: "vec", query: "semantic two" },
+        { type: "vec", query: "semantic three" },
+        { type: "hyde", query: "Another Hyde Document" },
+      ];
+      store.setCachedResult(
+        getCacheKey("expandQuery", { query: "cached question", model }),
+        JSON.stringify(oversized),
+      );
+
+      // A record written before the cap existed must not replay its fan-out.
+      const out = await store.expandQuery("cached question");
+      expect(out).toEqual([
+        { type: "hyde", query: "Repeated Hyde Document" },
+        { type: "lex", query: "alpha" },
+        { type: "lex", query: "bravo" },
+        { type: "vec", query: "semantic one" },
+        { type: "vec", query: "semantic two" },
+        { type: "hyde", query: "Another Hyde Document" },
+      ]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("expandQuery drops cached restatements of the original query", async () => {
+    const store = await createTestStore();
+    try {
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      store.setCachedResult(
+        getCacheKey("expandQuery", { query: "cached question", model }),
+        JSON.stringify([
+          { type: "vec", query: "  Cached   QUESTION " },
+          { type: "vec", query: "A" },
+          { type: "vec", query: "B" },
+        ]),
+      );
+
+      expect(await store.expandQuery("cached question")).toEqual([
+        { type: "vec", query: "A" },
+        { type: "vec", query: "B" },
+      ]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery drops a cached expansion whose sub-queries contributed nothing", async () => {
     const store = await createTestStore();
     try {
