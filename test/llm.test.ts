@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -34,9 +34,82 @@ import {
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
+  inspectGgufFile,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("inspectGgufFile", () => {
+  let dir: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "qmd-gguf-inspect-"));
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("missing file", () => {
+    const result = inspectGgufFile(join(dir, "does-not-exist.gguf"));
+    expect(result.exists).toBe(false);
+    expect(result.valid).toBe(false);
+    expect(result.kind).toBe("missing");
+  });
+
+  test("valid GGUF header", () => {
+    const filePath = join(dir, "valid.gguf");
+    const header = Buffer.alloc(16);
+    header.write("GGUF", 0, "ascii");
+    writeFileSync(filePath, header);
+
+    const result = inspectGgufFile(filePath);
+    expect(result.exists).toBe(true);
+    expect(result.valid).toBe(true);
+    expect(result.kind).toBe("gguf");
+    expect(result.magic).toBe("GGUF");
+  });
+
+  test("HTML error page is reported as html, not invalid", () => {
+    const filePath = join(dir, "html.gguf");
+    writeFileSync(filePath, "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>");
+
+    const result = inspectGgufFile(filePath);
+    expect(result.exists).toBe(true);
+    expect(result.valid).toBe(false);
+    expect(result.kind).toBe("html");
+  });
+
+  test("wrong magic bytes are reported as invalid (content was actually read)", () => {
+    const filePath = join(dir, "wrong-magic.gguf");
+    writeFileSync(filePath, Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]));
+
+    const result = inspectGgufFile(filePath);
+    expect(result.exists).toBe(true);
+    expect(result.valid).toBe(false);
+    expect(result.kind).toBe("invalid");
+    expect(result.magic).toBeDefined();
+  });
+
+  // A read/stat failure (fd exhaustion, a concurrent loader, a volume that
+  // briefly went away) must not be reported as "invalid": that kind means the
+  // content was read and confirmed bad, which is what drives validateGgufFile
+  // to delete the file. Opening a directory as if it were a file is a
+  // portable, privilege-free way to make open/read fail after stat has already
+  // succeeded, which is the shape of the real failure.
+  test("unreadable path (read fails after stat succeeds) is reported as unreadable, not invalid", () => {
+    const dirAsFile = join(dir, "actually-a-directory.gguf");
+    mkdirSync(dirAsFile);
+
+    const result = inspectGgufFile(dirAsFile);
+    expect(result.exists).toBe(true);
+    expect(result.valid).toBe(false);
+    expect(result.kind).toBe("unreadable");
+    // Nothing was read, so it must not claim to know the header.
+    expect(result.magic).toBeUndefined();
+    expect(result.details).toContain("cannot read model file");
+  });
+});
 
 describe("canWriteLlamaDir", () => {
   test("returns true when llama/ exists and is writable", () => {
