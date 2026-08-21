@@ -164,6 +164,34 @@ async function buildInstructions(store: QMDStore): Promise<string> {
 }
 
 /**
+ * Cache built instructions per store. The HTTP transport builds a fresh
+ * McpServer per request (sessionless MCP 2026-07-28), and buildInstructions()
+ * runs a full index-status aggregation, so rebuilding it per request puts that
+ * scan in front of every call. Concurrent builds share one in-flight promise,
+ * and entries expire after a short TTL so index updates from other processes
+ * still surface without a server restart.
+ */
+const INSTRUCTIONS_CACHE_TTL_MS = 60_000;
+const instructionsCache = new WeakMap<QMDStore, { promise: Promise<string>; builtAt: number }>();
+
+function getInstructions(store: QMDStore): Promise<string> {
+  const cached = instructionsCache.get(store);
+  if (cached && Date.now() - cached.builtAt < INSTRUCTIONS_CACHE_TTL_MS) {
+    return cached.promise;
+  }
+  const promise = buildInstructions(store);
+  instructionsCache.set(store, { promise, builtAt: Date.now() });
+  // Drop failed builds so the next initialize retries instead of replaying
+  // the cached rejection for the rest of the TTL window.
+  promise.catch(() => {
+    if (instructionsCache.get(store)?.promise === promise) {
+      instructionsCache.delete(store);
+    }
+  });
+  return promise;
+}
+
+/**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
@@ -174,7 +202,7 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     {
-      instructions: await buildInstructions(store),
+      instructions: await getInstructions(store),
       // tools/list is static for the process lifetime; resources/read stays
       // uncacheable because the index can change under us.
       cacheHints: {

@@ -1092,6 +1092,55 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.serverInfo.name).toBe("qmd");
   });
 
+  test("POST /mcp initialize serves cached instructions across requests", async () => {
+    // The legacy initialize path answers either JSON or a single SSE frame
+    // depending on how the transport negotiates; read both the same way.
+    const legacyInitialize = async (id: number) => {
+      const res = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "test-client", version: "1.0.0" },
+          },
+        }),
+      });
+      const text = await res.text();
+      const data = text.includes("data:")
+        ? text.split("\n").find(line => line.startsWith("data:"))!.slice(5).trim()
+        : text;
+      return JSON.parse(data) as any;
+    };
+
+    const first = await legacyInitialize(10);
+    const firstInstructions = first.result.instructions;
+    expect(typeof firstInstructions).toBe("string");
+    expect(firstInstructions.length).toBeGreaterThan(0);
+
+    // Change the index under the server. HTTP builds a fresh McpServer per
+    // request, so without the cache the next initialize rebuilds the
+    // instructions and reports the new document count; with it, the same
+    // string is served until the TTL lapses.
+    const db = openDatabase(httpTestDbPath);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run("hash-instr-cache", "# Cache probe\nbody", now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run("instructions-cache-probe.md", "Cache Probe", "hash-instr-cache", now, now);
+    db.close();
+
+    const second = await legacyInitialize(11);
+    expect(second.result.instructions).toBe(firstInstructions);
+  });
+
   test("POST /mcp tools/list returns registered tools without a session", async () => {
     const { status, json, contentType, headers } = await mcpRequest("tools/list");
     expect(status).toBe(200);
