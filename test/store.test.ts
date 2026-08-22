@@ -3744,6 +3744,44 @@ describe("Vector Search collection filter", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS finds a scoped doc the global candidate window does not contain", async () => {
+    const store = await createTestStore();
+    const large = await createTestCollection({ name: "large-fts", pwd: "/test/large-fts" });
+    const small = await createTestCollection({ name: "small-fts", pwd: "/test/small-fts" });
+
+    // 40 short noise docs carrying the term in the title (bm25 title weight
+    // 4.0), so every one of them outranks the target globally.
+    for (let i = 0; i < 40; i++) {
+      await insertTestDocument(store.db, large, {
+        name: `noise-${i}`,
+        title: `zebra zebra ${i}`,
+        body: `# Noise ${i}\n\nzebra zebra zebra, noise document ${i}.`,
+        displayPath: `noise-${i}.md`,
+      });
+    }
+
+    // One long target doc that mentions the term once, dead last globally.
+    await insertTestDocument(store.db, small, {
+      name: "target",
+      title: "Target",
+      body: `# Target\n\n${"filler prose without the search term. ".repeat(40)}zebra.`,
+      displayPath: "target.md",
+    });
+
+    // Unscoped, the target is nowhere near the top of the ranking.
+    const global = store.searchFTS("zebra", 2);
+    expect(global).toHaveLength(2);
+    expect(global.every(r => r.collectionName === large)).toBe(true);
+
+    // Scoped, it is the only answer. Taking a global top-(limit * 10) and
+    // filtering afterwards returned nothing here: all 20 candidates were
+    // large-fts documents.
+    const scoped = store.searchFTS("zebra", 2, small);
+    expect(scoped.map(r => r.displayPath)).toEqual([`${small}/target.md`]);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
