@@ -74,6 +74,7 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
   }
 }
 
+import { execSync } from "child_process";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -633,6 +634,9 @@ const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
+type AppleMetalWorkaroundEnv = Partial<Record<"GGML_METAL_NO_RESIDENCY" | "GGML_METAL_TENSOR_DISABLE", string>>;
+const DISABLE_ENV_VALUES = ["false", "off", "none", "disable", "disabled", "0"];
+
 type ParallelismOptions = {
   gpu: string | false;
   platform?: NodeJS.Platform;
@@ -731,16 +735,14 @@ export function resolveLlamaGpuMode(
   if (forceCpu && !["false", "off", "none", "disable", "disabled", "0"].includes(forceCpu)) {
     return false;
   }
-
   const normalized = envValue?.trim().toLowerCase() ?? "";
   if (!normalized) return "auto";
-  if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
+  if (DISABLE_ENV_VALUES.includes(normalized)) return false;
   if (normalized === "metal" || normalized === "vulkan" || normalized === "cuda") return normalized;
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
   return "auto";
 }
-
 
 /** node-llama-cpp 3.20 made LlamaContextSequence.dispose() async (llama.cpp b10361).
  * Context.onDispose fires sequence.dispose() without awaiting, so dispose the
@@ -768,6 +770,75 @@ async function disposeWithTimeout(resourceName: string, dispose: () => Promise<v
     process.stderr.write(
       `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
     );
+  }
+}
+
+export function resolveAppleMetalWorkarounds(envValue = process.env.QMD_APPLE_METAL_WORKAROUNDS): boolean {
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  if (!normalized) return true;
+  if (DISABLE_ENV_VALUES.includes(normalized)) return false;
+  return true;
+}
+
+function readAppleCpuBrand(): string | null {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return null;
+
+  try {
+    const output = execSync("sysctl -n machdep.cpu.brand_string", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+export function getAppleMetalWorkaroundEnv(opts: {
+  platform?: NodeJS.Platform;
+  arch?: string;
+  env?: NodeJS.ProcessEnv;
+  cpuBrand?: string | null;
+  enabled?: boolean;
+} = {}): AppleMetalWorkaroundEnv {
+  const {
+    platform = process.platform,
+    arch = process.arch,
+    env = process.env,
+    cpuBrand = readAppleCpuBrand(),
+    enabled = resolveAppleMetalWorkarounds(),
+  } = opts;
+
+  if (!enabled || platform !== "darwin" || arch !== "arm64") {
+    return {};
+  }
+
+  const patch: AppleMetalWorkaroundEnv = {};
+
+  // Apple Silicon currently hits ggml Metal cleanup assertions on process exit
+  // when residency sets remain active. Disabling residency sets trades a small
+  // optimization for predictable process shutdown.
+  if (env.GGML_METAL_NO_RESIDENCY == null) {
+    patch.GGML_METAL_NO_RESIDENCY = "1";
+  }
+
+  // M5/A19-class Metal 4 devices can fail the tensor API shader probe before
+  // node-llama-cpp falls back to the embedded library. Pre-disable the probe.
+  const normalizedBrand = (cpuBrand ?? "").toUpperCase();
+  if (
+    /(M5|M6|A19|A20)/.test(normalizedBrand) &&
+    env.GGML_METAL_TENSOR_DISABLE == null
+  ) {
+    patch.GGML_METAL_TENSOR_DISABLE = "1";
+  }
+
+  return patch;
+}
+
+function applyAppleMetalWorkaroundEnv(): void {
+  const patch = getAppleMetalWorkaroundEnv();
+  for (const [key, value] of Object.entries(patch)) {
+    process.env[key] = value;
   }
 }
 
@@ -985,6 +1056,7 @@ export class LlamaCpp implements LLM {
 
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
+      applyAppleMetalWorkaroundEnv();
       const gpuMode = resolveLlamaGpuMode();
       // Skip source build when install dir is read-only (e.g. NixOS store).
       const canBuild = allowBuild && canWriteLlamaDir();
