@@ -11,7 +11,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Resolve symlinks so global installs (npm link / npm install -g) can find
 // the actual package directory instead of the global bin directory.
@@ -160,33 +160,47 @@ if (existsSync(resolve(pkgDir, "package-lock.json"))) {
 }
 
 const selected = useSourceMode ? sourceRunner : (runnerName === "node" ? "node" : "bun");
-// Pin Node to the binary that launched this trampoline. Native addons
-// (better-sqlite3) are compiled for that install's ABI; spawning PATH
-// `node` picks up nvm/fnm/mise shims in the project directory and fails
-// with NODE_MODULE_VERSION / ERR_DLOPEN_FAILED (leftover from #577; #319).
-// If the trampoline itself is running under bun (`bun bin/qmd`), keep
-// PATH `node` so we don't load Node-ABI addons into bun.
-const runner = selected === "node" && typeof process.versions.bun !== "string"
-  ? process.execPath
-  : selected;
-const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
-const needsShell = (runner === "bun") && process.platform === "win32";
+const launchedByBun = typeof process.versions.bun === "string";
+const runtimeAlreadySelected = !useSourceMode
+  && ((selected === "node" && !launchedByBun) || (selected === "bun" && launchedByBun));
 
-const child = spawn(runner, args, {
-  stdio: "inherit",
-  shell: needsShell,
-});
+// Published packages can reach this launcher under the runtime selected by
+// their lockfile. Starting that same runtime again adds an avoidable process
+// startup to matching-runtime CLI calls. Align argv with the compiled entry
+// point and import it in place; the CLI's main-module guard then behaves
+// exactly as in a direct run.
+if (runtimeAlreadySelected) {
+  process.argv.splice(1, 1, jsEntry);
+  await import(pathToFileURL(jsEntry).href);
+} else {
+  const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
+  // Pin Node to the binary that launched this trampoline. Native addons
+  // (better-sqlite3) are compiled for that install's ABI; spawning PATH
+  // `node` picks up nvm/fnm/mise shims in the project directory and fails
+  // with NODE_MODULE_VERSION / ERR_DLOPEN_FAILED (leftover from #577; #319).
+  // If the trampoline itself is running under bun (`bun bin/qmd`), keep
+  // PATH `node` so we don't load Node-ABI addons into bun.
+  const runner = selected === "node" && !launchedByBun
+    ? process.execPath
+    : selected;
+  const needsShell = (runner === "bun") && process.platform === "win32";
 
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-  } else {
-    process.exit(code ?? 0);
-  }
-});
+  const child = spawn(runner, args, {
+    stdio: "inherit",
+    shell: needsShell,
+  });
 
-child.on("error", (err) => {
-  const name = useSourceMode ? sourceRunner : runnerName;
-  console.error(`qmd: failed to launch ${name}: ${err.message}`);
-  process.exit(1);
-});
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+    } else {
+      process.exit(code ?? 0);
+    }
+  });
+
+  child.on("error", (err) => {
+    const name = useSourceMode ? sourceRunner : runnerName;
+    console.error(`qmd: failed to launch ${name}: ${err.message}`);
+    process.exit(1);
+  });
+}

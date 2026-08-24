@@ -6,6 +6,11 @@
 
 - Added Oxlint lint fence.
 
+### Changed
+
+- Avoid a redundant runtime process on packaged CLI calls where the launcher is
+  already running under its selected Node or Bun runtime.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
