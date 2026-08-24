@@ -7,7 +7,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync, utimesSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -17,6 +17,7 @@ import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qm
 import { openDatabase } from "../src/db.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
+import { readProcessIdentity } from "../src/cli/mcp-pid.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -59,6 +60,7 @@ async function runQmd(
       ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
 
   const stdoutPromise = new Promise<string>((resolve, reject) => {
@@ -2525,6 +2527,12 @@ describe("mcp http daemon", () => {
     return join(daemonCacheDir, "qmd", "mcp.pid");
   }
 
+  function readDaemonPid(path = pidPath()): number {
+    const identity = readProcessIdentity(path);
+    if (!identity) throw new Error(`Invalid daemon identity file: ${path}`);
+    return identity.pid;
+  }
+
   /** Run qmd with test-isolated env (cache, db, config) */
   async function runDaemonQmd(
     args: string[],
@@ -2552,6 +2560,7 @@ describe("mcp http daemon", () => {
         ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
     if (proc.pid) spawnedPids.push(proc.pid);
     return proc;
@@ -2595,7 +2604,7 @@ describe("mcp http daemon", () => {
     try {
       const pf = pidPath();
       if (existsSync(pf)) {
-        const pid = parseInt(readFileSync(pf, "utf-8").trim());
+        const pid = readDaemonPid(pf);
         try { process.kill(pid, "SIGTERM"); } catch {}
         unlinkSync(pf);
       }
@@ -2744,7 +2753,7 @@ describe("mcp http daemon", () => {
     expect(existsSync(namedPidPath)).toBe(true);
     expect(existsSync(defaultPidPath)).toBe(false);
 
-    const pid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+    const pid = readDaemonPid(namedPidPath);
     spawnedPids.push(pid);
 
     try {
@@ -2792,7 +2801,7 @@ describe("mcp http daemon", () => {
     ]);
     expect(defaultCode).toBe(0);
     expect(existsSync(pidPath())).toBe(true);
-    const defaultPid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    const defaultPid = readDaemonPid();
     spawnedPids.push(defaultPid);
 
     const { stdout, stderr, exitCode: namedCode } = await runDaemonQmd([
@@ -2805,7 +2814,7 @@ describe("mcp http daemon", () => {
       expect(stdout).toContain(`http://localhost:${portNamed}/mcp`);
       expect(existsSync(namedPidPath)).toBe(true);
 
-      const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+      const namedPid = readDaemonPid(namedPidPath);
       spawnedPids.push(namedPid);
       expect(namedPid).not.toBe(defaultPid);
 
@@ -2815,7 +2824,7 @@ describe("mcp http daemon", () => {
       try { process.kill(defaultPid, "SIGTERM"); } catch {}
       try {
         if (existsSync(namedPidPath)) {
-          const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+          const namedPid = readDaemonPid(namedPidPath);
           try { process.kill(namedPid, "SIGTERM"); } catch {}
         }
       } catch {}
@@ -2831,16 +2840,16 @@ describe("mcp http daemon", () => {
 
   test("--daemon writes PID file and starts server", async () => {
     const port = randomPort();
-    const { stdout, exitCode } = await runDaemonQmd([
+    const { stdout, stderr, exitCode } = await runDaemonQmd([
       "mcp", "--http", "--daemon", "--port", String(port),
     ]);
-    expect(exitCode).toBe(0);
+    expect(exitCode, stderr).toBe(0);
     expect(stdout).toContain(`http://localhost:${port}/mcp`);
 
     // PID file should exist
     expect(existsSync(pidPath())).toBe(true);
 
-    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    const pid = readDaemonPid();
     spawnedPids.push(pid);
 
     // Server should be reachable
@@ -2856,12 +2865,12 @@ describe("mcp http daemon", () => {
   test("stop kills daemon and removes PID file", async () => {
     const port = randomPort();
     // Start daemon
-    const { exitCode: startCode } = await runDaemonQmd([
+    const { stderr: startErr, exitCode: startCode } = await runDaemonQmd([
       "mcp", "--http", "--daemon", "--port", String(port),
     ]);
-    expect(startCode).toBe(0);
+    expect(startCode, startErr).toBe(0);
 
-    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    const pid = readDaemonPid();
     spawnedPids.push(pid);
 
     await waitForServer(port);
@@ -2894,12 +2903,12 @@ describe("mcp http daemon", () => {
   test("--daemon rejects if already running", async () => {
     const port = randomPort();
     // Start first daemon
-    const { exitCode: firstCode } = await runDaemonQmd([
+    const { stderr: firstErr, exitCode: firstCode } = await runDaemonQmd([
       "mcp", "--http", "--daemon", "--port", String(port),
     ]);
-    expect(firstCode).toBe(0);
+    expect(firstCode, firstErr).toBe(0);
 
-    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    const pid = readDaemonPid();
     spawnedPids.push(pid);
 
     await waitForServer(port);
@@ -2917,6 +2926,29 @@ describe("mcp http daemon", () => {
     try { unlinkSync(pidPath()); } catch {}
   });
 
+  test("--daemon does not publish state when the HTTP port cannot bind", async () => {
+    const port = randomPort();
+    // Keep both processes on the same address family. Bun and Node can resolve
+    // `localhost` differently across POSIX hosts, which otherwise permits one
+    // listener on ::1 and the other on 127.0.0.1 at the same numeric port.
+    const bindHost = "127.0.0.1";
+    const blocker = spawnHttpServer(port, { args: ["--host", bindHost] });
+    try {
+      expect(await waitForServer(port)).toBe(true);
+
+      const { stderr, exitCode } = await runDaemonQmd([
+        "mcp", "--http", "--daemon", "--port", String(port), "--host", bindHost,
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain(`Port ${port} already in use`);
+      expect(existsSync(pidPath())).toBe(false);
+    } finally {
+      const closed = new Promise(resolve => blocker.once("close", resolve));
+      blocker.kill("SIGTERM");
+      await closed;
+    }
+  });
+
   test("--daemon cleans stale PID file and starts fresh", async () => {
     // Write a stale PID file
     writeFileSync(pidPath(), "999999999");
@@ -2928,7 +2960,7 @@ describe("mcp http daemon", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain(`http://localhost:${port}/mcp`);
 
-    const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    const pid = readDaemonPid();
     spawnedPids.push(pid);
     expect(pid).not.toBe(999999999);
 
@@ -2940,18 +2972,34 @@ describe("mcp http daemon", () => {
     try { unlinkSync(pidPath()); } catch {}
   });
 
-  test("stop does not SIGTERM a live non-qmd PID from a recycled pidfile (#806)", async () => {
-    // Stand-in for a recycled PID owner (must not be killed)
-    const decoy = spawn("sleep", ["1000000"], { stdio: "ignore" });
+  test("stop reclaims an unchanged old invalid PID file", async () => {
+    writeFileSync(pidPath(), "");
+    const old = new Date(Date.now() - 31_000);
+    utimesSync(pidPath(), old, old);
+
+    const { stdout, exitCode } = await runDaemonQmd(["mcp", "stop"]);
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Cleaned up stale invalid PID file");
+    expect(existsSync(pidPath())).toBe(false);
+  });
+
+  test("stop leaves a live legacy pidfile untouched (#806)", async () => {
+    // A pre-upgrade numeric pidfile cannot safely identify the process owner.
+    const decoy = spawn(process.execPath, ["-e", "setTimeout(() => {}, 1_000_000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
     expect(decoy.pid).toBeTruthy();
     spawnedPids.push(decoy.pid!);
     writeFileSync(pidPath(), String(decoy.pid));
 
     try {
-      const { stdout, exitCode } = await runDaemonQmd(["mcp", "stop"]);
-      expect(exitCode).toBe(0);
-      expect(stdout).toContain("stale");
-      expect(existsSync(pidPath())).toBe(false);
+      const { stderr, exitCode } = await runDaemonQmd(["mcp", "stop"]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("Cannot verify");
+      expect(stderr).toContain(pidPath().replace(/\\/g, "/"));
+      expect(existsSync(pidPath())).toBe(true);
 
       // Decoy must still be alive
       expect(() => process.kill(decoy.pid!, 0)).not.toThrow();
@@ -2961,33 +3009,27 @@ describe("mcp http daemon", () => {
     }
   });
 
-  test("--daemon treats live non-qmd pidfile PID as stale and starts (#806)", async () => {
-    const decoy = spawn("sleep", ["1000000"], { stdio: "ignore" });
+  test("--daemon refuses to replace a live legacy pidfile (#806)", async () => {
+    const decoy = spawn(process.execPath, ["-e", "setTimeout(() => {}, 1_000_000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
     expect(decoy.pid).toBeTruthy();
     spawnedPids.push(decoy.pid!);
     writeFileSync(pidPath(), String(decoy.pid));
 
     const port = randomPort();
     try {
-      const { stdout, stderr, exitCode } = await runDaemonQmd([
+      const { stderr, exitCode } = await runDaemonQmd([
         "mcp", "--http", "--daemon", "--port", String(port),
       ]);
-      expect(exitCode).toBe(0);
-      expect(stderr).not.toContain("Already running");
-      expect(stdout).toContain(`http://localhost:${port}/mcp`);
-
-      const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
-      spawnedPids.push(pid);
-      expect(pid).not.toBe(decoy.pid);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("Cannot verify");
+      expect(stderr).toContain(pidPath().replace(/\\/g, "/"));
+      expect(readFileSync(pidPath(), "utf-8").trim()).toBe(String(decoy.pid));
 
       // Decoy must still be alive
       expect(() => process.kill(decoy.pid!, 0)).not.toThrow();
-
-      const ready = await waitForServer(port);
-      expect(ready).toBe(true);
-      process.kill(pid, "SIGTERM");
-      await sleep(500);
-      try { unlinkSync(pidPath()); } catch {}
     } finally {
       decoy.kill("SIGTERM");
       await new Promise<void>((resolve) => decoy.once("close", () => resolve()));

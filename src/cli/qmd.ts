@@ -2,9 +2,17 @@ import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
-import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
-import { fileURLToPath } from "url";
+import {
+  createProcessRecord,
+  mcpDaemonStateFiles,
+  processRecordPid,
+  processRecordStatus,
+  readProcessRecord,
+  sameProcessRecord,
+  serializeProcessRecord,
+} from "./mcp-pid.js";
+import { embedLockBusyMessage, embedLockPathForDb, tryAcquireEmbedLock } from "./embed-lock.js";
+import { fileURLToPath, pathToFileURL } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
@@ -199,6 +207,22 @@ function closeDb(): void {
 
 function getDbPath(): string {
   return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
+}
+
+function reclaimStableInvalidProcessState(path: string, graceMs = 30_000): boolean {
+  try {
+    const before = statSync(path);
+    if (Date.now() - before.mtimeMs < graceMs) return false;
+    const record = readProcessRecord(path);
+    const after = statSync(path);
+    if (record.kind !== "invalid" || before.mtimeMs !== after.mtimeMs || before.size !== after.size) {
+      return false;
+    }
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function getActiveIndexName(): string {
@@ -544,11 +568,18 @@ async function showStatus(): Promise<void> {
   // MCP daemon status (check PID file liveness; scoped per --index)
   const { pidPath: mcpPidPath } = mcpDaemonPaths();
   if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    if (isQmdMcpPid(mcpPid)) {
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+    const record = readProcessRecord(mcpPidPath);
+    const status = processRecordStatus(record, "mcp-http");
+    const recordedPid = processRecordPid(record);
+    if (status === "live") {
+      console.log(`MCP:   ${c.green}running${c.reset} (PID ${recordedPid})`);
+    } else if (status === "unknown") {
+      const pidDetail = recordedPid === null ? "" : ` (PID ${recordedPid})`;
+      console.log(`MCP:   ${c.yellow}identity unavailable${c.reset}${pidDetail}; state: ${mcpPidPath}`);
     } else {
-      try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
+      try {
+        if (sameProcessRecord(record, readProcessRecord(mcpPidPath))) unlinkSync(mcpPidPath);
+      } catch { /* ignore */ }
       // Stale / recycled PID file cleaned up silently
     }
   }
@@ -2168,7 +2199,7 @@ async function vectorIndex(
   // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
   if (!embedLock) {
-    console.log(EMBED_LOCK_BUSY_MESSAGE);
+    console.log(embedLockBusyMessage(embedLockPathForDb(getDbPath())));
     closeDb();
     return;
   }
@@ -4744,19 +4775,68 @@ if (isMain) {
           console.log("Not running (no PID file).");
           process.exit(0);
         }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        if (!isQmdMcpPid(pid)) {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
+        const record = readProcessRecord(pidPath);
+        if (record.kind === "invalid" && reclaimStableInvalidProcessState(pidPath)) {
+          console.log("Cleaned up stale invalid PID file (server was not running).");
+          process.exit(0);
+        }
+        const recordStatus = processRecordStatus(record, "mcp-http");
+        const recordedPid = processRecordPid(record);
+        if (recordStatus === "dead") {
+          try {
+            if (sameProcessRecord(record, readProcessRecord(pidPath))) unlinkSync(pidPath);
+          } catch { /* ignore */ }
           console.log("Cleaned up stale PID file (server was not running).");
           process.exit(0);
         }
-        try {
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
+        if (recordStatus === "unknown") {
+          const pidDetail = recordedPid === null ? "" : ` for PID ${recordedPid}`;
+          console.error(`Cannot verify QMD MCP process identity${pidDetail} from ${pidPath}; leaving it untouched.`);
+          console.error("After independently confirming that process is not QMD, remove the state file manually.");
+          process.exit(1);
+        }
+        // Recheck immediately before signalling to narrow the PID-reuse window.
+        const recheckRecord = readProcessRecord(pidPath);
+        if (!sameProcessRecord(record, recheckRecord)) {
+          console.error(`QMD MCP state changed while stopping PID ${recordedPid}; leaving it untouched.`);
+          process.exit(1);
+        }
+        const recheckStatus = processRecordStatus(recheckRecord, "mcp-http");
+        if (recheckStatus === "unknown") {
+          console.error(`QMD MCP process identity for PID ${recordedPid} became unavailable; leaving ${pidPath} untouched.`);
+          process.exit(1);
+        }
+        if (recheckStatus === "dead") {
+          try {
+            if (sameProcessRecord(recheckRecord, readProcessRecord(pidPath))) unlinkSync(pidPath);
+          } catch { /* ignore */ }
           console.log("Cleaned up stale PID file (server was not running).");
+          process.exit(0);
+        }
+        const targetPid = processRecordPid(recheckRecord);
+        if (targetPid === null) {
+          console.error(`QMD MCP state in ${pidPath} has no valid PID; leaving it untouched.`);
+          process.exit(1);
+        }
+        try {
+          process.kill(targetPid, "SIGTERM");
+          const finalRecord = readProcessRecord(pidPath);
+          if (sameProcessRecord(recheckRecord, finalRecord)) unlinkSync(pidPath);
+          console.log(`Stopped QMD MCP server (PID ${targetPid}).`);
+        } catch (error: unknown) {
+          const code = typeof error === "object" && error !== null && "code" in error
+            ? (error as NodeJS.ErrnoException).code
+            : undefined;
+          if (code === "ESRCH") {
+            const finalRecord = readProcessRecord(pidPath);
+            if (sameProcessRecord(recheckRecord, finalRecord)) {
+              try { unlinkSync(pidPath); } catch { /* ignore */ }
+            }
+            console.log("Cleaned up stale PID file (server was not running).");
+            process.exit(0);
+          }
+          console.error(`Failed to stop QMD MCP server (PID ${targetPid}); leaving ${pidPath} intact.`);
+          process.exit(1);
         }
         process.exit(0);
       }
@@ -4771,13 +4851,31 @@ if (isMain) {
         if (cli.values.daemon) {
           // Guard: check if already running (identity-checked — recycled PIDs are stale)
           if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (isQmdMcpPid(existingPid)) {
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
+            const existing = readProcessRecord(pidPath);
+            if (existing.kind === "invalid" && reclaimStableInvalidProcessState(pidPath)) {
+              // Continue with a clean state file after a stable crash remnant.
+            } else {
+              const existingStatus = processRecordStatus(existing, "mcp-http");
+              const existingPid = processRecordPid(existing);
+              if (existingStatus === "live") {
+                console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
+                process.exit(1);
+              }
+              if (existingStatus === "unknown") {
+                const pidDetail = existingPid === null ? "" : ` for PID ${existingPid}`;
+                console.error(`Cannot verify existing QMD MCP process identity${pidDetail} from ${pidPath}; refusing to replace it.`);
+                console.error("After independently confirming that process is not QMD, remove the state file manually.");
+                process.exit(1);
+              }
+              // Stale or recycled PID file — remove and continue
+              try {
+                if (sameProcessRecord(existing, readProcessRecord(pidPath))) unlinkSync(pidPath);
+              } catch { /* ignore */ }
+              if (existsSync(pidPath)) {
+                console.error(`QMD MCP state changed while starting; refusing to replace ${pidPath}.`);
+                process.exit(1);
+              }
             }
-            // Stale or recycled PID file — remove and continue
-            try { unlinkSync(pidPath); } catch { /* ignore */ }
           }
 
           mkdirSync(cacheDir, { recursive: true });
@@ -4786,23 +4884,59 @@ if (isMain) {
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+            ? isBun
+              ? [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+              : ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href, selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
+            windowsHide: true,
             env: {
               ...process.env,
               // Explicit resolved DB path so the child does not depend on
               // re-parsing --index (and cannot inherit a stale INDEX_PATH).
               INDEX_PATH: getDbPath(),
+              QMD_MCP_DAEMON_STATE_PATH: pidPath,
             },
           });
+          if (!child.pid) {
+            closeSync(logFd);
+            console.error("QMD MCP daemon did not report a process ID.");
+            process.exit(1);
+          }
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
 
-          writeFileSync(pidPath, String(child.pid));
+          // The child writes its own start token. Wait for that handshake so
+          // the parent never publishes a PID it could not identify exactly.
+          const startupDeadline = Date.now() + 30_000;
+          let startedRecord = readProcessRecord(pidPath);
+          while (processRecordPid(startedRecord) !== child.pid
+            && child.exitCode === null
+            && child.signalCode === null
+            && Date.now() < startupDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            startedRecord = readProcessRecord(pidPath);
+          }
+          if (processRecordPid(startedRecord) !== child.pid
+            || (startedRecord.kind === "identity" && startedRecord.identity.role !== "mcp-http")) {
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+            let detail = "";
+            try { detail = `: ${readFileSync(logPath, "utf-8").trim().slice(-1000)}`; } catch { /* ignore */ }
+            const reason = child.exitCode !== null
+              ? `exited before publishing process identity (code ${child.exitCode})`
+              : child.signalCode !== null
+                ? `exited before publishing process identity (signal ${child.signalCode})`
+                : "did not publish process identity within 30 seconds";
+            console.error(`QMD MCP daemon ${reason}${detail}`);
+            process.exit(1);
+          }
+
           console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
+          if (startedRecord.kind === "legacy") {
+            console.log("Warning: process start identity was unavailable; lifecycle state is fail-closed.");
+          }
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -4811,25 +4945,38 @@ if (isMain) {
         // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
-        // Best-effort: if this process owns the daemon pidfile, unlink on exit
+        const daemonStatePath = process.env.QMD_MCP_DAEMON_STATE_PATH;
+        let publishedRecord: ReturnType<typeof createProcessRecord> | null = null;
+        // Best-effort: if this process owns the daemon state file, unlink on exit
         // (covers SIGTERM/SIGINT via startMcpHttpServer's process.exit).
         const unlinkOwnPidfile = () => {
           try {
-            if (!existsSync(pidPath)) return;
-            const written = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (written === process.pid) unlinkSync(pidPath);
+            if (!daemonStatePath || !publishedRecord || !existsSync(daemonStatePath)) return;
+            if (sameProcessRecord(publishedRecord, readProcessRecord(daemonStatePath))) unlinkSync(daemonStatePath);
           } catch { /* ignore */ }
         };
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          const handle = await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          if (daemonStatePath) {
+            try {
+              const record = createProcessRecord("mcp-http", { port: handle.port });
+              writeFileSync(daemonStatePath, serializeProcessRecord(record), { flag: "wx", flush: true });
+              publishedRecord = record;
+            } catch (error) {
+              await handle.stop();
+              throw error;
+            }
+          }
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
             process.exit(1);
           }
-          throw e;
+          const message = e instanceof Error ? e.message : String(e);
+          console.error(`Failed to start QMD MCP server: ${message}`);
+          process.exit(1);
         }
       } else {
         // Default: stdio transport

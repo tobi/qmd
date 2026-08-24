@@ -3,7 +3,7 @@
  */
 import { describe, test, expect } from "vitest";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, writeFileSync, unlinkSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,9 @@ import {
   tryAcquireEmbedLock,
   isLiveEmbedLockHolder,
   EMBED_LOCK_BUSY_MESSAGE,
+  embedLockBusyMessage,
 } from "../src/cli/embed-lock.ts";
+import { createProcessIdentity, parseProcessIdentity, parseProcessRecord } from "../src/cli/mcp-pid.ts";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
@@ -22,20 +24,28 @@ const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined
 
 describe("embedLockPathForDb", () => {
   test("places .qmd-embed.lock next to the index database", () => {
-    expect(embedLockPathForDb("/tmp/qmd-cache/index.sqlite")).toBe("/tmp/qmd-cache/.qmd-embed.lock");
-    expect(embedLockPathForDb("/var/lib/qmd/custom.sqlite")).toBe("/var/lib/qmd/.qmd-embed.lock");
+    const firstDb = join(tmpdir(), "qmd-cache", "index.sqlite");
+    const secondDb = join(tmpdir(), "qmd-other", "custom.sqlite");
+    expect(embedLockPathForDb(firstDb)).toBe(join(tmpdir(), "qmd-cache", ".qmd-embed.lock"));
+    expect(embedLockPathForDb(secondDb)).toBe(join(tmpdir(), "qmd-other", ".qmd-embed.lock"));
   });
 });
 
 describe("isLiveEmbedLockHolder", () => {
   test("treats the current process as a live holder", () => {
-    expect(isLiveEmbedLockHolder(process.pid)).toBe(true);
+    expect(isLiveEmbedLockHolder({ kind: "identity", identity: createProcessIdentity("embed") })).toBe(true);
+    expect(isLiveEmbedLockHolder(parseProcessRecord(String(process.pid)))).toBe(true);
   });
 
-  test("rejects invalid and dead PIDs", () => {
-    expect(isLiveEmbedLockHolder(0)).toBe(false);
-    expect(isLiveEmbedLockHolder(-1)).toBe(false);
-    expect(isLiveEmbedLockHolder(999999999)).toBe(false);
+  test("fails closed for malformed state and rejects recycled process identity", () => {
+    expect(isLiveEmbedLockHolder({ kind: "invalid" })).toBe(true);
+    expect(isLiveEmbedLockHolder({
+      kind: "identity",
+      identity: {
+        ...createProcessIdentity("embed"),
+        startToken: "recycled-process-token",
+      },
+    })).toBe(false);
   });
 });
 
@@ -47,7 +57,7 @@ describe("tryAcquireEmbedLock", () => {
       const first = tryAcquireEmbedLock(lockPath);
       expect(first).not.toBeNull();
       expect(existsSync(lockPath)).toBe(true);
-      expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
+      expect(parseProcessIdentity(await readFile(lockPath, "utf-8"))?.pid).toBe(process.pid);
 
       // Same process still holds the lock — second caller must skip.
       expect(tryAcquireEmbedLock(lockPath)).toBeNull();
@@ -70,13 +80,15 @@ describe("tryAcquireEmbedLock", () => {
     const holderTs = join(thisDir, "_helpers", "embed-lock-holder.ts");
     const holdMs = 1000;
 
-    // Include a bare `qmd` argv token so isQmdMcpPid(child) is true.
     const args = isBunRuntime
       ? [holderTs, lockPath, String(holdMs), "qmd", "embed"]
       : [tsxCli, holderTs, lockPath, String(holdMs), "qmd", "embed"];
 
     try {
-      const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(process.execPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
@@ -119,9 +131,25 @@ describe("tryAcquireEmbedLock", () => {
       writeFileSync(lockPath, "999999999\n");
       const handle = tryAcquireEmbedLock(lockPath);
       expect(handle).not.toBeNull();
-      expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
+      expect(parseProcessIdentity(await readFile(lockPath, "utf-8"))?.pid).toBe(process.pid);
       handle!.release();
       expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a fresh corrupt lock, then reclaims it after the grace period", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-invalid-"));
+    const lockPath = join(dir, ".qmd-embed.lock");
+    try {
+      writeFileSync(lockPath, "");
+      expect(tryAcquireEmbedLock(lockPath)).toBeNull();
+      const old = new Date(Date.now() - 31_000);
+      utimesSync(lockPath, old, old);
+      const handle = tryAcquireEmbedLock(lockPath);
+      expect(handle).not.toBeNull();
+      handle!.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -152,5 +180,12 @@ describe("tryAcquireEmbedLock", () => {
 describe("EMBED_LOCK_BUSY_MESSAGE", () => {
   test("matches the issue-requested skip message", () => {
     expect(EMBED_LOCK_BUSY_MESSAGE).toBe("Another embed process is already running. Skipping.");
+  });
+
+  test("includes the lock path and corrupt-state recovery guidance", () => {
+    const path = join(tmpdir(), ".qmd-embed.lock");
+    const message = embedLockBusyMessage(path);
+    expect(message).toContain(path);
+    expect(message).toContain("wait 30 seconds and retry");
   });
 });
