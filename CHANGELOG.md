@@ -6,6 +6,13 @@
 
 - Added Oxlint lint fence.
 
+- Remote embedding, reranking, and query expansion via OpenAI-compatible API
+  (vLLM, Ollama, OpenAI, etc.). Set `QMD_EMBED_API_URL` / `QMD_EMBED_API_MODEL`
+  (and optionally `QMD_RERANK_API_*` / `QMD_EXPAND_API_*`) env vars or add
+  the equivalent keys to `models:` in `index.yml`. Local generation and
+  tokenization are preserved via a hybrid routing layer. Includes circuit
+  breakers, dimension validation, and batch splitting.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

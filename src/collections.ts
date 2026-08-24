@@ -40,6 +40,18 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  /** Remote embedding API base URL (e.g. http://gpu-host:8000/v1) */
+  embed_api_url?: string;
+  /** Remote embedding model name (e.g. BAAI/bge-m3) */
+  embed_api_model?: string;
+  /** Bearer token for remote embedding API */
+  embed_api_key?: string;
+  /** Remote rerank API base URL (defaults to embed_api_url) */
+  rerank_api_url?: string;
+  /** Remote rerank model name */
+  rerank_api_model?: string;
+  /** Bearer token for remote rerank API */
+  rerank_api_key?: string;
 }
 
 /**

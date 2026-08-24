@@ -86,7 +86,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -159,12 +161,21 @@ function getStore(): ReturnType<typeof createStore> {
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
+      const localLlm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
         rerankModel: modelsForLlm.rerank,
       });
-      setDefaultLlamaCpp(llm);
+
+      // Environment variables always take precedence. Project-local remote
+      // endpoints are loaded only after the same trust gate as custom models.
+      const remoteConfig = localConfigIsFullyTrusted()
+        ? remoteConfigFromEnv(config.models)
+        : remoteConfigFromEnv();
+      const llm = remoteConfig
+        ? new HybridLLM(new RemoteLLM(remoteConfig), localLlm)
+        : localLlm;
+      setDefaultLLM(llm);
       store.llm = llm;
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -666,7 +677,6 @@ async function showStatus(): Promise<void> {
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
-
 
   // Tips section
   const tips: string[] = [];
@@ -2164,6 +2174,10 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // Use the actual configured backend model (which may be remote) for the
+  // embedding fingerprint and pending-work check.
+  model = storeInstance.llm?.embedModelName ?? getDefaultLLM().embedModelName;
 
   // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
@@ -4066,7 +4080,12 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const defaultLlm = getDefaultLLM();
+    if (!(defaultLlm instanceof LlamaCpp)) {
+      doctorCheck("device probe", false, "unavailable for the configured remote/hybrid LLM backend");
+      return;
+    }
+    const device = await defaultLlm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
