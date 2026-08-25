@@ -86,7 +86,27 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  setDefaultLlamaCpp,
+  setDefaultLLM,
+  LlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_MODEL_CACHE_DIR,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveRerankModel,
+  resolveModels,
+  inspectGgufFile,
+  isDarwinMetalMitigationActive,
+} from "../llm.js";
+import { RemoteQMD } from "../remote-qmd.js";
+import { startServer } from "../serve.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -156,16 +176,22 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      // Constructing a local LlamaCpp would defeat QMD_REMOTE_URL by reloading
+      // models the daemon already holds, allocating VRAM the user explicitly
+      // delegated to `qmd serve`. Leaving store.llm unset routes the store
+      // layer through getDefaultLLM's remote client.
+      if (!process.env.QMD_REMOTE_URL) {
+        // Untrusted project-local custom model URIs must not be loaded; status
+        // still displays the YAML values via resolveModelsForCli (#889).
+        const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
+        const llm = new LlamaCpp({
+          embedModel: modelsForLlm.embed,
+          generateModel: modelsForLlm.generate,
+          rerankModel: modelsForLlm.rerank,
+        });
+        setDefaultLlamaCpp(llm);
+        store.llm = llm;
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -3073,6 +3099,12 @@ function parseCLI() {
       daemon: { type: "boolean" },
       port: { type: "string" },
       host: { type: "string" },
+      // Remote model server options
+      "remote-url": { type: "string" },  // URL of a qmd serve instance (e.g. http://host:7832)
+      bind: { type: "string" },    // Bind address for qmd serve (default: 0.0.0.0)
+      backend: { type: "string" }, // Backend for qmd serve: "local" or "ollama"
+      "backend-url": { type: "string" }, // URL of Ollama-compatible server
+      "rkllama-url": { type: "string" }, // Deprecated alias for --backend-url
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3593,6 +3625,13 @@ function showHelp(): void {
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
+  console.log("");
+  console.log("Model server (shared models over network):");
+  console.log("  qmd serve [--port 7832] [--bind 0.0.0.0]  - Start model server (local backend)");
+  console.log("  qmd serve --backend ollama                - Use Ollama-compatible server");
+  console.log("  qmd serve --backend ollama --backend-url http://host:11434");
+  console.log("  qmd query --remote-url http://host:7832 <q>  - Use remote models instead of local");
+  console.log("  QMD_REMOTE_URL=http://host:7832 qmd query <q> - Same via env var");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4325,6 +4364,16 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  // Configure remote model server if --remote-url is set or QMD_REMOTE_URL env var
+  const remoteUrl = (cli.values["remote-url"] as string) || process.env.QMD_REMOTE_URL;
+  if (remoteUrl && cli.command !== "serve") {
+    // Reflect --remote-url into the environment so downstream lookups (e.g.
+    // getStore's local-LlamaCpp guard, getDefaultLLM's auto-detect fallback)
+    // share one source of truth regardless of which entry point they came in.
+    process.env.QMD_REMOTE_URL = remoteUrl;
+    setDefaultLLM(new RemoteQMD({ serverUrl: remoteUrl }));
+  }
+
   switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
@@ -4728,6 +4777,26 @@ if (isMain) {
       } catch (error) {
         exitWithError(error);
       }
+      break;
+    }
+
+    case "serve": {
+      // Remove top-level cursor handlers so shutdown handlers work
+      process.removeAllListeners("SIGTERM");
+      process.removeAllListeners("SIGINT");
+      const servePort = Number(cli.values.port) || 7832;
+      const serveBind = (cli.values.bind as string) || "0.0.0.0";
+      const serveBackend = ((cli.values.backend as string) || process.env.QMD_SERVE_BACKEND || "local") as "local" | "ollama";
+      const backendUrl = (cli.values["backend-url"] as string) || (cli.values["rkllama-url"] as string) || process.env.RKLLAMA_URL || "http://localhost:11434";
+      await startServer({
+        port: servePort,
+        bind: serveBind,
+        backend: serveBackend,
+        backendUrl: serveBackend === "ollama" ? backendUrl : undefined,
+        config: {
+          embedModel: process.env.QMD_EMBED_MODEL || undefined,
+        },
+      });
       break;
     }
 
