@@ -222,11 +222,16 @@ function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string 
 
 function setIndexName(name: string | null): void {
   let normalizedName = name;
-  // Normalize relative paths to prevent malformed database paths
-  if (name && name.includes('/')) {
-    const absolutePath = pathResolve(process.cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  // Normalize relative paths to prevent malformed database paths. Windows
+  // absolute paths (C:\..., \\server\share) are already absolute -- skip
+  // pathResolve() for those and sanitize `:` and `\` alongside `/`.
+  if (name) {
+    const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\/.test(name);
+    if (isWindowsAbsolute || /[\\/]/.test(name)) {
+      const absolutePath = isWindowsAbsolute ? name : pathResolve(process.cwd(), name);
+      // Replace path separators with underscores to create a valid filename
+      normalizedName = absolutePath.replace(/[:\\/]+/g, '_').replace(/^_+/, '');
+    }
   }
   currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
