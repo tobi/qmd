@@ -1018,7 +1018,14 @@ export async function startMcpHttpServer(
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody) as Record<string, unknown>;
+        let params: Record<string, unknown>;
+        try {
+          params = JSON.parse(rawBody) as Record<string, unknown>;
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
 
         // Validate required fields
         if (!params.searches || !Array.isArray(params.searches)) {

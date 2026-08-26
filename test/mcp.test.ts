@@ -1031,6 +1031,17 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(res.status).toBe(404);
   });
 
+  test("POST /query with malformed JSON body returns 400, not a 500", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{not valid json",
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Invalid JSON body");
+  });
+
   // ---------------------------------------------------------------------------
   // MCP protocol over HTTP (2026-07-28, sessionless)
   // ---------------------------------------------------------------------------
