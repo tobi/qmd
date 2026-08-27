@@ -5,6 +5,9 @@
 ### Added
 
 - Added Oxlint lint fence.
+- Added a GPU acceleration guide (`docs/GPU.md`) covering backend selection,
+  building a GPU-enabled `node-llama-cpp` binary, and enabling the Apple GPU on
+  Linux (Asahi) via Vulkan, linked from the README.
 
 ## [2.8.3] - 2026-08-16
 
