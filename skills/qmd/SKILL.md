@@ -289,6 +289,11 @@ Query types:
 - `vec` — vector semantic search. Best for natural-language concepts.
 - `hyde` — vector search using a hypothetical answer/document passage.
 
+When querying indexed code, pass `"chunkStrategy": "auto"` so candidate
+selection and reranking use AST-aware function, class, type, and import
+boundaries. The default is `regex`; Markdown and unsupported file types are
+unchanged by `auto`.
+
 ## Query craft
 
 Good QMD searches mix three things:

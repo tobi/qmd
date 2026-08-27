@@ -1188,12 +1188,22 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
     const toolNames = json.result.tools.map((t: any) => t.name);
     expect(toolNames).toEqual(["query", "get", "multi_get", "status", "metadata"]);
+    const queryTool = json.result.tools.find((t: any) => t.name === "query");
+    expect(queryTool).toBeDefined();
+    expect(queryTool.inputSchema.properties.chunkStrategy.enum).toEqual(["auto", "regex"]);
   });
 
   test("POST /mcp tools/call query returns results", async () => {
     const { status, json } = await mcpRequest(
       "tools/call",
-      { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      {
+        name: "query",
+        arguments: {
+          searches: [{ type: "lex", query: "readme" }],
+          rerank: false,
+          chunkStrategy: "auto",
+        },
+      },
       { "Mcp-Name": "query" },
       3,
     );
