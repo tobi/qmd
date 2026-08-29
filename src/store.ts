@@ -4191,6 +4191,28 @@ function annVecScan(
   `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 }
 
+/**
+ * Fetch document bodies for a set of content hashes, keyed by hash.
+ *
+ * Called *after* results are deduped and truncated to `limit`, so body text is
+ * materialised once per surviving document rather than once per matching
+ * chunk. Chunked with the same IN-list budget as `exactVecScanByHashSeq` to
+ * stay under SQLITE_MAX_VARIABLE_NUMBER.
+ */
+function fetchContentBodies(db: Database, hashes: string[]): Map<string, string> {
+  const bodies = new Map<string, string>();
+  const unique = [...new Set(hashes)];
+  for (let i = 0; i < unique.length; i += VEC_HASH_SEQ_IN_CHUNK) {
+    const chunk = unique.slice(i, i + VEC_HASH_SEQ_IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT hash, doc FROM content WHERE hash IN (${placeholders})
+    `).all(...chunk) as { hash: string; doc: string }[];
+    for (const row of rows) bodies.set(row.hash, row.doc);
+  }
+  return bodies;
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
@@ -4259,8 +4281,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body
+      d.title
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
@@ -4275,7 +4296,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string;
   }[]);
 
   // Combine with distances and dedupe by filepath
@@ -4288,11 +4309,23 @@ export async function searchVec(db: Database, query: string, model: string, limi
     }
   }
 
-  return Array.from(seen.values())
+  const winners = Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
-    .slice(0, limit)
+    .slice(0, limit);
+
+  // Hydrate bodies only for the rows we are about to return. Selecting
+  // content.doc in the query above joins one-row-per-document content to
+  // one-row-per-chunk content_vectors, so every matching chunk carries a full
+  // copy of its document body — for book-sized documents that is hundreds of
+  // multi-megabyte strings materialised before `limit` is ever applied, which
+  // exhausts the V8 heap. The `JOIN content` is deliberately kept above so row
+  // filtering is unchanged; only the string materialisation moves here.
+  const bodyMap = fetchContentBodies(db, winners.map(({ row }) => row.hash));
+
+  return winners
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      const body = bodyMap.get(row.hash) ?? "";
       return {
         filepath: row.filepath,
         displayPath: row.display_path,
@@ -4301,8 +4334,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
-        bodyLength: row.body.length,
-        body: row.body,
+        // `JOIN content` above guarantees a row exists; "" is defensive only.
+        bodyLength: body.length,
+        body,
         context: getContextForFile(db, row.filepath),
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,

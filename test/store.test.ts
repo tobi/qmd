@@ -8,7 +8,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
-import type { Database } from "../src/db.js";
+import type { Database, SQLiteValue } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3745,6 +3745,167 @@ describe("Vector Search collection filter", () => {
     await cleanupTestDb(store);
   });
 });
+
+// =============================================================================
+// Vector Search body hydration (no LLM — uses precomputed embeddings)
+// =============================================================================
+
+/**
+ * Count how many times one of `bodies` crosses the SQLite -> JS boundary while
+ * `fn` runs.
+ *
+ * This is the quantity that exhausted the heap: the fan-out bug selected
+ * `content.doc` in a query joining one-row-per-document `content` to
+ * one-row-per-chunk `content_vectors`, so the number of full body copies scaled
+ * with chunks-per-document instead of with `limit`. Counting the copies
+ * directly — rather than asserting on SQL text — keeps the test meaningful if
+ * the query is later rewritten.
+ */
+async function countBodyReads<T>(
+  db: Database,
+  bodies: readonly string[],
+  fn: () => Promise<T>,
+): Promise<{ reads: number; result: T }> {
+  const known = new Set(bodies);
+  const originalPrepare = db.prepare.bind(db);
+  let reads = 0;
+
+  db.prepare = (sql: string) => {
+    const stmt = originalPrepare(sql);
+    const originalAll = stmt.all.bind(stmt);
+    stmt.all = ((...params: SQLiteValue[]) => {
+      const rows = originalAll(...params) as unknown[];
+      for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        for (const value of Object.values(row)) {
+          if (typeof value === "string" && known.has(value)) reads++;
+        }
+      }
+      return rows;
+    }) as typeof stmt.all;
+    return stmt;
+  };
+
+  try {
+    const result = await fn();
+    return { reads, result };
+  } finally {
+    db.prepare = originalPrepare;
+  }
+}
+
+/** Insert one document whose body is covered by `chunks` embedded chunks. */
+async function seedChunkedDoc(
+  store: Store,
+  collection: string,
+  opts: { hash: string; name: string; body: string; chunks: number; dims: number },
+): Promise<void> {
+  const now = new Date().toISOString();
+  await insertTestDocument(store.db, collection, {
+    name: opts.name,
+    hash: opts.hash,
+    body: opts.body,
+    displayPath: `${opts.name}.md`,
+  });
+
+  const insertChunk = store.db.prepare(
+    `INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`,
+  );
+  const insertVector = store.db.prepare(
+    `INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`,
+  );
+  for (let seq = 0; seq < opts.chunks; seq++) {
+    const embedding = new Float32Array(opts.dims);
+    embedding[0] = 1;
+    // Spread chunks slightly so they are distinct, near-but-not-equal vectors.
+    embedding[1] = seq / opts.chunks;
+    insertChunk.run(opts.hash, seq, seq * 100, now);
+    insertVector.run(`${opts.hash}_${seq}`, embedding);
+  }
+}
+
+describe("Vector Search body hydration", () => {
+  const dims = 8;
+  const queryEmbedding = Array(dims).fill(0).map((_, i) => (i === 0 ? 1 : 0));
+
+  test("hydrates a body once per document, not once per matching chunk", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "books", pwd: "/test/books" });
+    store.ensureVecTable(dims);
+
+    const body = "Chunked book body. ".repeat(200);
+    await seedChunkedDoc(store, collection, {
+      hash: "bookhash1", name: "book", body, chunks: 300, dims,
+    });
+
+    const { reads, result } = await countBodyReads(store.db, [body], () =>
+      store.searchVec("ignored — embedding precomputed", "test-model", 5, collection, undefined, queryEmbedding),
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.body).toBe(body);
+    expect(result[0]!.bodyLength).toBe(body.length);
+    // Exactly one: more is the fan-out regression (the over-fetch made this 15),
+    // zero would mean the body never loaded at all.
+    expect(reads).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("a high limit (--all) does not fan body text out across chunks", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "books", pwd: "/test/books" });
+    store.ensureVecTable(dims);
+
+    const body = "Chunked book body. ".repeat(200);
+    await seedChunkedDoc(store, collection, {
+      hash: "bookhash1", name: "book", body, chunks: 300, dims,
+    });
+
+    // `qmd vsearch --all` maps to limit 100000, which previously pulled a full
+    // body copy for every one of the document's chunks before dedupe ran.
+    const { reads, result } = await countBodyReads(store.db, [body], () =>
+      store.searchVec("ignored — embedding precomputed", "test-model", 100_000, collection, undefined, queryEmbedding),
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.body).toBe(body);
+    // Must not scale with the document's chunk count (was 300).
+    expect(reads).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("hydrates the matching body for each returned document", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "books", pwd: "/test/books" });
+    store.ensureVecTable(dims);
+
+    const bodyA = "Body of the first book. ".repeat(50);
+    const bodyB = "Body of the second book. ".repeat(50);
+    await seedChunkedDoc(store, collection, {
+      hash: "bookhasha", name: "book-a", body: bodyA, chunks: 4, dims,
+    });
+    await seedChunkedDoc(store, collection, {
+      hash: "bookhashb", name: "book-b", body: bodyB, chunks: 4, dims,
+    });
+
+    const { reads, result } = await countBodyReads(store.db, [bodyA, bodyB], () =>
+      store.searchVec("ignored — embedding precomputed", "test-model", 10, collection, undefined, queryEmbedding),
+    );
+
+    // Bodies are now fetched by hash in a second pass — guard against a result
+    // being paired with another document's body.
+    expect(result).toHaveLength(2);
+    const bodyByPath = new Map(result.map((r) => [r.displayPath, r.body]));
+    expect(bodyByPath.get(`${collection}/book-a.md`)).toBe(bodyA);
+    expect(bodyByPath.get(`${collection}/book-b.md`)).toBe(bodyB);
+    expect(reads).toBe(2);  // one per surviving document, not per chunk
+
+    await cleanupTestDb(store);
+  });
+});
+
 
 // =============================================================================
 // LlamaCpp Integration Tests (using real local models)

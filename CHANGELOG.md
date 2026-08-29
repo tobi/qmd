@@ -6,6 +6,23 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- `qmd vsearch` and `qmd query` no longer exhaust the V8 heap on collections
+  holding book-length documents. `searchVec` selected `content.doc` in the
+  query that joins one-row-per-document `content` to one-row-per-chunk
+  `content_vectors`, so every matching chunk carried a full copy of its
+  document's body, and all of them were materialised before dedupe and `limit`
+  were applied. A 300-chunk match on an 8 MB document built roughly 2.4 GB of
+  strings — more where the text is outside Latin-1 and V8 stores two bytes per
+  character, which is routine in scientific prose. `vsearch --all` (limit
+  100000) and `query` (several expanded queries, each over-fetching candidates)
+  therefore died with `Reached heap limit Allocation failed` on indexes as small
+  as a single file. Bodies are now fetched by hash in a second pass, after
+  results are deduped and truncated, so memory scales with `-n` instead of with
+  the number of matching chunks. The `content` join is kept, so which rows match
+  is unchanged, and search output is byte-identical.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
