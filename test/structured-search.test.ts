@@ -10,6 +10,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -316,6 +317,22 @@ describe("structuredSearch", () => {
     // These may return empty results but should not throw
     await expect(structuredSearch(store, [{ type: "lex", query: "test" }])).resolves.toBeDefined();
     // vec and hyde require embeddings, so just test lex
+  });
+
+  test("returns identical content at multiple paths only once", async () => {
+    const body = "rainstormqmdduplicateproof belongs to one content object";
+    const hash = createHash("sha256").update(body).digest("hex");
+    const now = new Date().toISOString();
+    store.insertContent(hash, body, now);
+    store.insertDocument("docs", "one.md", "One", hash, now, now);
+    store.insertDocument("docs", "two.md", "Two", hash, now, now);
+
+    const results = await structuredSearch(store, [
+      { type: "lex", query: "rainstormqmdduplicateproof" }
+    ], { skipRerank: true, limit: 5 });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.docid).toBe(hash.slice(0, 6));
   });
 
   test("respects limit option", async () => {
