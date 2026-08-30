@@ -5413,6 +5413,16 @@ export interface HybridQueryResult {
   explain?: HybridQueryExplain;
 }
 
+function dedupeByContent<T extends { docid: string; file: string }>(results: T[]): T[] {
+  const seen = new Set<string>();
+  return results.filter(result => {
+    const key = result.docid || result.file;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export type RankedListMeta = {
   source: "fts" | "vec";
   queryType: "original" | "lex" | "vec" | "hyde";
@@ -5445,7 +5455,7 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 5. chunkDocument() + keyword-best-chunk selection
  * 6. rerank on chunks (NOT full bodies — O(tokens) trap)
  * 7. Position-aware score blending (RRF rank × reranker score)
- * 8. Dedup by file, filter by minScore, slice to limit
+ * 8. Dedup by content, filter by minScore, slice to limit
  */
 export async function hybridQuery(
   store: Store,
@@ -5617,8 +5627,7 @@ export async function hybridQuery(
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
-    const seenFiles = new Set<string>();
-    return candidates
+    return dedupeByContent(candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -5655,12 +5664,7 @@ export async function hybridQuery(
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
         };
-      })
-      .filter(r => {
-        if (seenFiles.has(r.file)) return false;
-        seenFiles.add(r.file);
-        return true;
-      })
+      }))
       .filter(r => r.score >= minScore)
       .slice(0, limit);
   }
@@ -5731,14 +5735,8 @@ export async function hybridQuery(
     };
   }).sort((a, b) => b.score - a.score);
 
-  // Step 8: Dedup by file (safety net — prevents duplicate output)
-  const seenFiles = new Set<string>();
-  return blended
-    .filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
-    })
+  // Step 8: Dedup by content (safety net — prevents duplicate output)
+  return dedupeByContent(blended)
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }
@@ -6011,8 +6009,7 @@ export async function structuredSearch(
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
-    const seenFiles = new Set<string>();
-    return candidates
+    return dedupeByContent(candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -6049,12 +6046,7 @@ export async function structuredSearch(
           docid: docidMap.get(cand.file) || "",
           ...(explainData ? { explain: explainData } : {}),
         };
-      })
-      .filter(r => {
-        if (seenFiles.has(r.file)) return false;
-        seenFiles.add(r.file);
-        return true;
-      })
+      }))
       .filter(r => r.score >= minScore)
       .slice(0, limit);
   }
@@ -6124,14 +6116,8 @@ export async function structuredSearch(
     };
   }).sort((a, b) => b.score - a.score);
 
-  // Step 7: Dedup by file
-  const seenFiles = new Set<string>();
-  return blended
-    .filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
-    })
+  // Step 7: Dedup by content
+  return dedupeByContent(blended)
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }
