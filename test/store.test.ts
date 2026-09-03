@@ -3608,11 +3608,9 @@ describe("Vector Search collection filter", () => {
     const queryEmbedding = Array(dims).fill(0);
     queryEmbedding[0] = 1;
 
-    // 250 nearer neighbours in the large collection. With limit=3:
-    //   - old global k=limit*3=9 never sees `small`
-    //   - a plain multiplier (limit*30=90) still misses it
-    //   - sqlite-vec also caps k at 4096, so multipliers cannot fix tiny
-    //     collections in huge indexes. Collection-scoped exact scan does.
+    // 250 nearer neighbours in the large collection. With limit=3 the
+    // unscoped top-k (k=9) never reaches `small`; the scoped KNN pre-filters
+    // on the collection before selecting k, so `small` is found regardless.
     for (let i = 0; i < 250; i++) {
       const hash = `largehash${String(i).padStart(3, "0")}`;
       await insertTestDocument(store.db, large, {
@@ -3634,7 +3632,7 @@ describe("Vector Search collection filter", () => {
       body: "Target document in the small collection",
       displayPath: "target.md",
     });
-    // Farther than the noise vectors — only found via collection-scoped scan.
+    // Farther than the noise vectors; only a scoped KNN reaches it.
     const targetEmbedding = new Float32Array(dims);
     targetEmbedding[0] = 0.6;
     targetEmbedding[1] = 0.8;
@@ -3741,6 +3739,343 @@ describe("Vector Search collection filter", () => {
     );
     expect(union.map(r => r.collectionName).sort()).toEqual([knowledge, notes].sort());
     expect(union.every((r) => r.collectionName !== large)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  const DIMS = 8;
+  const query: number[] = Array(DIMS).fill(0);
+  query[0] = 1;
+
+  function vector(x: number, y: number): Float32Array {
+    const embedding = new Float32Array(DIMS);
+    embedding[0] = x;
+    embedding[1] = y;
+    return embedding;
+  }
+
+  /** Chunk `seq` of `hash` sits at pos seq * 100. */
+  function insertChunkVectors(store: Store, hash: string, chunks: readonly Float32Array[]): void {
+    const now = new Date().toISOString();
+    const insertChunk = store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`);
+    const insertVec = store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+    store.db.transaction(() => {
+      chunks.forEach((embedding, seq) => {
+        insertChunk.run(hash, seq, seq * 100, now);
+        insertVec.run(`${hash}_${seq}`, embedding);
+      });
+    })();
+  }
+
+  async function insertVecDoc(store: Store, collection: string, hash: string, chunks: readonly Float32Array[]): Promise<void> {
+    await insertTestDocument(store.db, collection, { name: hash, hash, body: `Document ${hash}`, displayPath: `${hash}.md` });
+    insertChunkVectors(store, hash, chunks);
+  }
+
+  /** Documents orthogonal to the query; they keep a scoped collection below the global-scan share so the pre-filter runs. */
+  async function insertFillerDocs(store: Store, collection: string, prefix: string, count: number): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      await insertVecDoc(store, collection, `${prefix}${String(i).padStart(2, "0")}`, [vector(0, 1)]);
+    }
+  }
+
+  test("searchVec scoped to two of three collections returns exactly those two", async () => {
+    const store = await createTestStore();
+    const first = await createTestCollection({ name: "first", pwd: "/test/first" });
+    const second = await createTestCollection({ name: "second", pwd: "/test/second" });
+    const third = await createTestCollection({ name: "third", pwd: "/test/third" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, first, "firsthash", [vector(1, 0)]);
+    await insertVecDoc(store, second, "secondhash", [vector(0.9, 0.44)]);
+    await insertVecDoc(store, third, "thirdhash", [vector(0.8, 0.6)]);
+    await insertFillerDocs(store, second, "secondfill", 4);
+
+    const results = await store.searchVec("ignored", "test-model", 3, [first, third], undefined, query);
+    expect(results.map((r) => r.collectionName).sort()).toEqual([first, third].sort());
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec returns a hash shared with an out-of-scope collection once, named for the scoped collection", async () => {
+    const store = await createTestStore();
+    const included = await createTestCollection({ name: "included", pwd: "/test/included" });
+    const excluded = await createTestCollection({ name: "excluded", pwd: "/test/excluded" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, excluded, "sharedhash", [vector(1, 0)]);
+    await insertFillerDocs(store, excluded, "excludedfill", 3);
+    await insertTestDocument(store.db, included, { name: "copy", hash: "sharedhash", body: "Document sharedhash", displayPath: "copy.md" });
+
+    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.collectionName).toBe(included);
+    expect(results[0]!.displayPath).toBe(`${included}/copy.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec ignores a hash whose only in-scope row is inactive", async () => {
+    const store = await createTestStore();
+    const included = await createTestCollection({ name: "included", pwd: "/test/included" });
+    const excluded = await createTestCollection({ name: "excluded", pwd: "/test/excluded" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, excluded, "sharedhash", [vector(1, 0)]);
+    await insertTestDocument(store.db, included, { name: "stale", hash: "sharedhash", body: "Document sharedhash", displayPath: "stale.md", active: 0 });
+
+    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    expect(results).toEqual([]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec returns a document once when its hash has an active and an inactive row in scope", async () => {
+    const store = await createTestStore();
+    const included = await createTestCollection({ name: "included", pwd: "/test/included" });
+    const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, included, "duphash", [vector(1, 0)]);
+    await insertFillerDocs(store, outside, "outsidefill", 3);
+    await insertTestDocument(store.db, included, { name: "stale", hash: "duphash", body: "Document duphash", displayPath: "stale.md", active: 0 });
+
+    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.displayPath).toBe(`${included}/duphash.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec returns empty for a scoped collection that has documents but no vectors", async () => {
+    const store = await createTestStore();
+    const embedded = await createTestCollection({ name: "embedded", pwd: "/test/embedded" });
+    const bare = await createTestCollection({ name: "bare", pwd: "/test/bare" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, embedded, "embeddedhash", [vector(1, 0)]);
+    await insertFillerDocs(store, embedded, "embeddedfill", 2);
+    await insertTestDocument(store.db, bare, { name: "plain", body: "Not embedded", displayPath: "plain.md" });
+
+    const results = await store.searchVec("ignored", "test-model", 3, bare, undefined, query);
+    expect(results).toEqual([]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec returns empty for a collection name that no document carries", async () => {
+    const store = await createTestStore();
+    const embedded = await createTestCollection({ name: "embedded", pwd: "/test/embedded" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, embedded, "embeddedhash", [vector(1, 0)]);
+
+    const results = await store.searchVec("ignored", "test-model", 3, "never-indexed", undefined, query);
+    expect(results).toEqual([]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec accepts a scoped limit above sqlite-vec's k cap", async () => {
+    const store = await createTestStore();
+    const embedded = await createTestCollection({ name: "embedded", pwd: "/test/embedded" });
+    const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, embedded, "nearhash", [vector(1, 0)]);
+    await insertVecDoc(store, embedded, "farhash", [vector(0.6, 0.8)]);
+    await insertFillerDocs(store, outside, "outsidefill", 4);
+
+    const results = await store.searchVec("ignored", "test-model", 2000, embedded, undefined, query);
+    expect(results.map((r) => r.hash)).toEqual(["nearhash", "farhash"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec treats an empty collection list like no scope", async () => {
+    const store = await createTestStore();
+    const first = await createTestCollection({ name: "first", pwd: "/test/first" });
+    const second = await createTestCollection({ name: "second", pwd: "/test/second" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, first, "firsthash", [vector(1, 0)]);
+    await insertVecDoc(store, second, "secondhash", [vector(0.6, 0.8)]);
+
+    const unscoped = await store.searchVec("ignored", "test-model", 3, undefined, undefined, query);
+    const emptyScope = await store.searchVec("ignored", "test-model", 3, [], undefined, query);
+    expect(unscoped.map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
+    expect(emptyScope).toEqual(unscoped);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec collapses a scoped over-fetch to one row per file at its best chunk", async () => {
+    const store = await createTestStore();
+    const alpha = await createTestCollection({ name: "alpha", pwd: "/test/alpha" });
+    const beta = await createTestCollection({ name: "beta", pwd: "/test/beta" });
+    const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
+    store.ensureVecTable(DIMS);
+    await insertFillerDocs(store, outside, "outsidefill", 30);
+    const near = vector(1, 0);
+    const far = vector(0.6, 0.8);
+    for (let i = 0; i < 3; i++) {
+      await insertVecDoc(store, alpha, `long${i}`, Array.from({ length: 10 }, () => near));
+    }
+    for (let i = 0; i < 20; i++) {
+      await insertVecDoc(store, i % 2 === 0 ? alpha : beta, `short${String(i).padStart(2, "0")}`, [far]);
+    }
+
+    const results = await store.searchVec("ignored", "test-model", 10, [alpha, beta], undefined, query);
+    expect(results).toHaveLength(10);
+    expect(results.slice(0, 3).map((r) => r.hash).sort()).toEqual(["long0", "long1", "long2"]);
+    expect(new Set(results.map((r) => r.filepath)).size).toBe(results.length);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec rows carry the vec source, a cosine score, and the best chunk position", async () => {
+    const store = await createTestStore();
+    const embedded = await createTestCollection({ name: "embedded", pwd: "/test/embedded" });
+    const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, embedded, "twochunks", [vector(0, 1), vector(0.6, 0.8)]);
+    await insertFillerDocs(store, outside, "outsidefill", 3);
+
+    const results = await store.searchVec("ignored", "test-model", 3, embedded, undefined, query);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.source).toBe("vec");
+    expect(results[0]!.chunkPos).toBe(100);
+    expect(results[0]!.score).toBeCloseTo(0.6, 5);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec keeps a scope of 20k+ chunks reachable behind nearer out-of-scope vectors", async () => {
+    const store = await createTestStore();
+    const big = await createTestCollection({ name: "big", pwd: "/test/big" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+    store.ensureVecTable(DIMS);
+    const far = vector(0.6, 0.8);
+    await insertVecDoc(store, big, "bighash", Array.from({ length: 20_001 }, () => far));
+    for (let i = 0; i < 100; i++) {
+      await insertVecDoc(store, other, `otherhash${String(i).padStart(3, "0")}`, [vector(1, 0)]);
+    }
+
+    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.collectionName).toBe(big);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec union keeps a sibling collection reachable behind a long in-scope document", async () => {
+    const store = await createTestStore();
+    const small = await createTestCollection({ name: "small", pwd: "/test/small" });
+    const large = await createTestCollection({ name: "large", pwd: "/test/large" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, large, "longhash", Array.from({ length: 12 }, () => vector(1, 0)));
+    await insertVecDoc(store, small, "smallhash", [vector(0.6, 0.8)]);
+    const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
+    await insertFillerDocs(store, outside, "outsidefill", 4);
+
+    const results = await store.searchVec("ignored", "test-model", 3, [small, large], undefined, query);
+    expect(results.map((r) => r.collectionName).sort()).toEqual([large, small].sort());
+    expect(results.some((r) => r.hash === "smallhash")).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec scoped to a collection still answers when one chunk row has no vector", async () => {
+    const store = await createTestStore();
+    const partial = await createTestCollection({ name: "partial", pwd: "/test/partial" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, partial, "wholehash0", [vector(1, 0)]);
+    await insertVecDoc(store, partial, "wholehash1", [vector(0.9, 0.44)]);
+    await insertVecDoc(store, partial, "ghosthash", [vector(0.8, 0.6)]);
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+    await insertFillerDocs(store, other, "otherfill", 4);
+    store.db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run("ghosthash_0");
+
+    const scoped = await store.searchVec("ignored", "test-model", 5, partial, undefined, query);
+    const unscoped = await store.searchVec("ignored", "test-model", 5, undefined, undefined, query);
+    expect(scoped.map((r) => r.hash)).toEqual(["wholehash0", "wholehash1"]);
+    expect(unscoped.filter((r) => r.collectionName === partial).map((r) => r.hash)).toEqual(["wholehash0", "wholehash1"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec scoped to a collection that holds most of the index returns its nearest documents", async () => {
+    const store = await createTestStore();
+    const big = await createTestCollection({ name: "big", pwd: "/test/big" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+    store.ensureVecTable(DIMS);
+    for (let i = 0; i < 30; i++) {
+      await insertVecDoc(store, big, `bighash${String(i).padStart(2, "0")}`, [vector(1, 0.02 + i * 0.01)]);
+    }
+    for (let i = 0; i < 12; i++) {
+      await insertVecDoc(store, other, `otherhash${String(i).padStart(2, "0")}`, [vector(1, 0)]);
+    }
+
+    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    expect(results.map((r) => r.hash)).toEqual(["bighash00", "bighash01", "bighash02"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec scoped to a majority collection is not starved by nearer vectors outside it", async () => {
+    const store = await createTestStore();
+    const big = await createTestCollection({ name: "big", pwd: "/test/big" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+    store.ensureVecTable(DIMS);
+    for (let i = 0; i < 100; i++) {
+      await insertVecDoc(store, big, `bighash${String(i).padStart(3, "0")}`, [vector(0.6, 0.8)]);
+    }
+    for (let i = 0; i < 80; i++) {
+      await insertVecDoc(store, other, `otherhash${String(i).padStart(3, "0")}`, [vector(1, 0)]);
+    }
+
+    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    expect(results).toHaveLength(3);
+    expect(results.every((r) => r.collectionName === big)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec scoped to a majority collection larger than the over-fetch returns its nearest documents", async () => {
+    const store = await createTestStore();
+    const big = await createTestCollection({ name: "big", pwd: "/test/big" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+    store.ensureVecTable(DIMS);
+    for (let i = 0; i < 300; i++) {
+      await insertVecDoc(store, big, `bighash${String(i).padStart(3, "0")}`, [vector(1, 0.02 + i * 0.001)]);
+    }
+    for (let i = 0; i < 20; i++) {
+      await insertVecDoc(store, other, `otherhash${String(i).padStart(2, "0")}`, [vector(1, 0)]);
+    }
+
+    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    expect(results.map((r) => r.hash)).toEqual(["bighash000", "bighash001", "bighash002"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec reads a majority scope from the global scan and a minority scope through the pre-filter", async () => {
+    const store = await createTestStore();
+    const major = await createTestCollection({ name: "major", pwd: "/test/major" });
+    const minor = await createTestCollection({ name: "minor", pwd: "/test/minor" });
+    store.ensureVecTable(DIMS);
+    for (let i = 0; i < 6; i++) {
+      await insertVecDoc(store, major, `majorhash${i}`, [vector(1, 0.01 * i)]);
+    }
+    for (let i = 0; i < 3; i++) {
+      await insertVecDoc(store, minor, `minorhash${i}`, [vector(0.6, 0.8)]);
+    }
+    const prepare = vi.spyOn(store.db, "prepare");
+    const knnStatements = () => prepare.mock.calls.map((call) => String(call[0])).filter((sql) => sql.includes("MATCH"));
+    try {
+      await store.searchVec("ignored", "test-model", 3, major, undefined, query);
+      expect(knnStatements()).toHaveLength(1);
+      expect(knnStatements()[0]).not.toContain("vectors_vec_rowids");
+
+      prepare.mockClear();
+      await store.searchVec("ignored", "test-model", 3, minor, undefined, query);
+      expect(knnStatements()).toHaveLength(1);
+      expect(knnStatements()[0]).toContain("vectors_vec_rowids");
+    } finally {
+      prepare.mockRestore();
+    }
 
     await cleanupTestDb(store);
   });

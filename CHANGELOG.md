@@ -6,6 +6,23 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- Collection-scoped vector search runs one sqlite-vec KNN statement with the
+  requested collections as an IN pre-filter on the vector key, replacing a
+  chunked exact scan that walked the whole `vectors_vec` table once per 400
+  keys, once more per collection in the scope. On a 793k-vector index,
+  `vsearch -c <collection>` drops from 33s to 7s and a default-scope search
+  over 13 collections from 152s to 7.5s. Single-collection results are
+  unchanged; a multi-collection scope ranks from one pool that holds each
+  collection's three-per-result chunk budget, so its tail can include
+  higher-scoring files that a per-collection merge left out. A scope above
+  20k vectors is no longer served by a capped global top-k with a
+  post-filter, so it is no longer starved by nearer vectors outside the
+  scope; a scope that holds most of the index is answered from the global
+  scan with a verified over-fetch and falls back to the pre-filter when that
+  scan does not yield enough in-scope rows (#775, #791, #803).
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

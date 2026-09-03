@@ -899,9 +899,11 @@ With no `-c` flag, all default-included collections are searched. Collections
 marked excluded (`qmd collection exclude <name>`) are skipped unless named
 explicitly with `-c`.
 
-> **Note:** With multiple `-c` flags, results come from a global top-K pool and are
-> then filtered. If one collection dominates the rankings, matches from smaller
-> collections may not appear at the default limit — raise `-n` or use `--all`.
+> **Note:** With multiple `-c` flags, vector search runs one nearest-neighbour
+> query over the union of the named collections, keeping three candidate
+> chunks per requested result for each named collection before collapsing to
+> one row per file. When a few long documents own the nearest chunks, fewer
+> files than `-n` can come back; raise `-n` or use `--all`.
 
 ### Output Format
 
