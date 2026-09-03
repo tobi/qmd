@@ -880,18 +880,15 @@ function containsCjk(text: string): boolean {
 }
 
 function sanitizeFTS5Phrase(phrase: string): string {
-  // Dotted tokens (1.0.21, 2026.4.10) are indexed as adjacent parts by the
-  // porter unicode61 tokenizer. Stripping the dots would produce "1021",
-  // which never matches — split them into phrase terms instead (#757).
+  // A quoted phrase is matched against tokens the porter unicode61 tokenizer
+  // produced, and that tokenizer splits document text on every separator.
+  // Deleting the separators here instead would collapse "1.0.21" to "1021" and
+  // "PIO-1384" to "pio1384", tokens no document holds, so the query returns
+  // nothing with no error (#757 for dots, #916 for the rest). Split on the same
+  // separators the tokenizer does and emit the parts as adjacent phrase terms.
   return normalizeCjkForFTS(phrase)
     .split(/\s+/)
-    .flatMap(t => {
-      if (isDottedToken(t)) {
-        return t.split('.').map(p => sanitizeFTS5Term(p)).filter(p => p);
-      }
-      const sanitized = sanitizeFTS5Term(t);
-      return sanitized ? [sanitized] : [];
-    })
+    .flatMap(t => splitFTS5CompoundTerm(t))
     .join(' ');
 }
 
@@ -3831,41 +3828,30 @@ export function sanitizeFTS5Term(term: string): string {
 }
 
 /**
- * Check if a token is a hyphenated compound word (e.g., multi-agent, DEC-0054, gpt-4).
- * Returns true if the token contains internal hyphens between word/digit characters.
+ * A run of characters the FTS tokenizer treats as a separator.
+ *
+ * `documents_fts` is tokenized with `porter unicode61`, which starts a new
+ * token at every character that is not a letter or a digit. Underscore is one
+ * of those, but it is deliberately kept here rather than split on: FTS5 applies
+ * the same tokenizer to a quoted phrase, so leaving `apply_secrets` intact lets
+ * it split symmetrically into `apply secrets` on both sides, and that is the
+ * behaviour #305 shipped. The apostrophe is kept for the same reason.
  */
-function isHyphenatedToken(token: string): boolean {
-  return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
-}
+const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
 
 /**
- * Sanitize a hyphenated term into an FTS5 phrase by splitting on hyphens
- * and sanitizing each part. Returns the parts joined by spaces for use
- * inside FTS5 quotes: "multi agent" matches "multi-agent" in porter tokenizer.
+ * Split one query term the way the tokenizer split the document text, and
+ * sanitize each part.
+ *
+ * `PIO-1384` becomes ["pio", "1384"], `src/lib/i18n.ts` becomes
+ * ["src", "lib", "i18n", "ts"], and a term with no separator in it comes back
+ * as a single part. Callers join the parts into an FTS5 phrase, which is what
+ * makes the parts have to be adjacent in the document rather than merely all
+ * present. Parts that sanitize to nothing are dropped, so a term that is all
+ * punctuation yields an empty list and the caller skips it.
  */
-function sanitizeHyphenatedTerm(term: string): string {
-  return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
-}
-
-/**
- * Check if a token is a dotted version/version-like string (e.g., 2026.4.10, 3.14.0).
- * Returns true if splitting on dots yields at least 2 non-empty parts consisting of
- * word/digit characters only. This avoids incorrectly splitting tokens with leading/
- * trailing dots. Version strings like "2026.4.10" split into ["2026","4","10"] (3 parts).
- */
-function isDottedToken(token: string): boolean {
-  const parts = token.split('.');
-  return parts.length >= 2 && parts.every(p => p.length > 0 && /^[\p{L}\p{N}_]+$/u.test(p));
-}
-
-/**
- * Sanitize a dotted term into individual FTS5 tokens joined with AND.
- * e.g. "2026.4.10" → '"2026"* AND "4"* AND "10"*'
- * The AND ensures all parts must appear, matching how the porter tokenizer
- * indexes dotted strings.
- */
-function sanitizeDottedTerm(term: string): string {
-  return term.split('.').map(t => sanitizeFTS5Term(t)).filter(t => t).map(t => `"${t}"*`).join(' AND ');
+function splitFTS5CompoundTerm(term: string): string[] {
+  return term.split(FTS5_SEPARATOR_RUN).map(p => sanitizeFTS5Term(p)).filter(p => p);
 }
 
 /**
@@ -3874,7 +3860,8 @@ function sanitizeDottedTerm(term: string): string {
  * Supports:
  * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
  * - Negation: -term or -"phrase" → uses FTS5 NOT operator
- * - Hyphenated tokens: multi-agent, DEC-0054, gpt-4 → treated as phrases
+ * - Terms holding a separator: multi-agent, DEC-0054, gpt-4, 2026.4.10,
+ *   src/lib/i18n.ts, @tobilu/qmd → treated as phrases over their parts
  * - Plain terms: term → "term"* (prefix match)
  *
  * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
@@ -3891,6 +3878,8 @@ function sanitizeDottedTerm(term: string): string {
  *   multi-agent memory      → "multi agent" AND "memory"*
  *   DEC-0054               → "dec 0054"
  *   -multi-agent            → NOT "multi agent"
+ *   "DEC-0054"              → "dec 0054"
+ *   src/lib/i18n.ts         → "src lib i18n ts"
  */
 function buildFTS5Query(query: string): string | null {
   const positive: string[] = [];
@@ -3932,37 +3921,7 @@ function buildFTS5Query(query: string): string | null {
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
       const term = s.slice(start, i);
 
-      // Handle hyphenated tokens: multi-agent, DEC-0054, gpt-4
-      // These get split into phrase queries so FTS5 porter tokenizer matches them.
-      if (isHyphenatedToken(term)) {
-        const sanitized = sanitizeHyphenatedTerm(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // Phrase match (no prefix)
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      } else if (isDottedToken(term)) {
-        // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
-        // The porter tokenizer splits on dots, so the index has individual tokens.
-        // We AND all parts together so the query matches documents containing all parts.
-        const sanitized = sanitizeDottedTerm(term);
-        if (sanitized) {
-          // sanitizeDottedTerm already wraps each part in quotes with prefix match
-          if (negated) {
-            // Wrap multi-token AND expression in parens for NOT negation
-            negative.push(`(${sanitized})`);
-          } else {
-            // Flatten individual AND'd terms into the positive list so they combine
-            // correctly with other terms (avoids double-wrapping in outer AND).
-            for (const part of sanitized.split(' AND ')) {
-              positive.push(part.trim());
-            }
-          }
-        }
-      } else if (containsCjk(term)) {
+      if (containsCjk(term)) {
         const sanitized = sanitizeFTS5Phrase(term);
         if (sanitized) {
           const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
@@ -3973,9 +3932,16 @@ function buildFTS5Query(query: string): string | null {
           }
         }
       } else {
-        const sanitized = sanitizeFTS5Term(term);
-        if (sanitized) {
-          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+        // Any separator inside the term (multi-agent, DEC-0054, 2026.4.10,
+        // src/lib/i18n.ts, @tobilu/qmd) split it at index time too, so the term
+        // has to be matched as the phrase those parts form. A term with no
+        // separator is one part and keeps its prefix match, which is what makes
+        // a plain word still match longer words that start with it.
+        const parts = splitFTS5CompoundTerm(term);
+        if (parts.length > 0) {
+          const ftsTerm = parts.length > 1
+            ? `"${parts.join(' ')}"`   // Phrase match (no prefix)
+            : `"${parts[0]}"*`;        // Prefix match
           if (negated) {
             negative.push(ftsTerm);
           } else {
