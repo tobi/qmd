@@ -17,6 +17,7 @@
   "files": [
     "bin/",
     "dist/",
+    "assets/",
     "skills/",
     "scripts/build.mjs",
     "scripts/check-package-grammars.mjs",

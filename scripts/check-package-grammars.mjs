@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -11,6 +12,12 @@ const grammars = [
   "tree-sitter-rust/tree-sitter-rust.wasm",
 ];
 
+// Grammars whose npm package ships no .wasm; built with `tree-sitter build
+// --wasm` and bundled in assets/grammars/ instead.
+const bundledGrammars = [
+  "../assets/grammars/tree-sitter-swift.wasm",
+];
+
 let ok = true;
 for (const grammar of grammars) {
   try {
@@ -20,6 +27,16 @@ for (const grammar of grammars) {
     ok = false;
     console.error(`missing ${grammar}`);
     console.error(err instanceof Error ? err.message : String(err));
+  }
+}
+
+for (const grammar of bundledGrammars) {
+  const resolved = new URL(grammar, import.meta.url);
+  if (existsSync(resolved)) {
+    console.log(`ok ${grammar} -> ${resolved.pathname}`);
+  } else {
+    ok = false;
+    console.error(`missing bundled ${grammar}`);
   }
 }
 

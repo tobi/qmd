@@ -46,6 +46,10 @@ describe("detectLanguage", () => {
     expect(detectLanguage("src/auth.rs")).toBe("rust");
   });
 
+  test("recognizes Swift extension", () => {
+    expect(detectLanguage("Sources/App/AuthService.swift")).toBe("swift");
+  });
+
   test("returns null for markdown", () => {
     expect(detectLanguage("docs/README.md")).toBeNull();
   });
@@ -285,6 +289,81 @@ fn hash_password(password: &str) -> String {
     expect(structPoint?.score).toBe(100);
     expect(implPoint?.score).toBe(100);
     expect(traitPoint?.score).toBe(100);
+  });
+});
+
+describe("getASTBreakPoints - Swift", () => {
+  const SWIFT_SAMPLE = `import Foundation
+
+protocol Authenticatable {
+    func validate() -> Bool
+}
+
+class AuthService {
+    let db: Database
+
+    init(db: Database) {
+        self.db = db
+    }
+
+    func authenticate(user: User) -> Bool {
+        return true
+    }
+}
+
+struct Credentials {
+    let username: String
+    let password: String
+}
+
+enum Role {
+    case admin
+    case user
+}
+
+extension AuthService: Authenticatable {
+    func validate() -> Bool {
+        return true
+    }
+}
+
+typealias UserID = String
+
+func hashPassword(_ password: String) -> String {
+    return password
+}
+`;
+
+  test("produces break points for class, protocol, function, init, typealias, and import", async () => {
+    const points = await getASTBreakPoints(SWIFT_SAMPLE, "AuthService.swift");
+    const types = points.map(p => p.type);
+
+    expect(types.some(t => t.includes("import"))).toBe(true);
+    // class_declaration covers class, struct, enum, and extension
+    expect(types.some(t => t.includes("class"))).toBe(true);
+    expect(types.some(t => t.includes("iface"))).toBe(true);  // protocol_declaration
+    expect(types.some(t => t.includes("func"))).toBe(true);
+    expect(types.some(t => t.includes("method"))).toBe(true); // init_declaration
+    expect(types.some(t => t.includes("type"))).toBe(true);   // typealias_declaration
+  });
+
+  test("struct, enum, and extension all surface as class_declaration break points", async () => {
+    const points = await getASTBreakPoints(SWIFT_SAMPLE, "AuthService.swift");
+    const classPoints = points.filter(p => p.type === "ast:class");
+
+    // class AuthService + struct Credentials + enum Role + extension AuthService
+    expect(classPoints.length).toBe(4);
+  });
+
+  test("class and protocol score 100, functions score 90", async () => {
+    const points = await getASTBreakPoints(SWIFT_SAMPLE, "AuthService.swift");
+    const classPoint = points.find(p => p.type === "ast:class");
+    const ifacePoint = points.find(p => p.type === "ast:iface");
+    const funcPoint = points.find(p => p.type === "ast:func");
+
+    expect(classPoint?.score).toBe(100);
+    expect(ifacePoint?.score).toBe(100);
+    expect(funcPoint?.score).toBe(90);
   });
 });
 

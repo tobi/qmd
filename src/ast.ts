@@ -20,6 +20,7 @@
 
 import { createRequire } from "node:module";
 import { extname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
@@ -31,7 +32,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "swift";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +46,7 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".swift": "swift",
 };
 
 /**
@@ -63,18 +65,25 @@ export function detectLanguage(filepath: string): SupportedLanguage | null {
 /**
  * Maps language to the npm package and wasm filename for the grammar.
  */
-const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; version: string }> = {
+const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; version: string; bundled?: boolean }> = {
   typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
   tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm",        version: "0.23.2" },
   javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.23.4" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.23.4" },
   rust:       { pkg: "tree-sitter-rust",       wasm: "tree-sitter-rust.wasm",       version: "0.24.0" },
+  // tree-sitter-swift's npm package ships no .wasm, so the grammar is built
+  // with `tree-sitter build --wasm` and bundled in assets/grammars/.
+  swift:      { pkg: "tree-sitter-swift",      wasm: "tree-sitter-swift.wasm",      version: "0.7.1", bundled: true },
 };
 
 export function formatGrammarLoadError(language: SupportedLanguage, err: unknown): string {
   const grammar = GRAMMAR_MAP[language];
   const detail = err instanceof Error ? err.message : String(err);
+  if (grammar.bundled) {
+    return `bundled assets/grammars/${grammar.wasm} failed to load (${detail}); falling back to regex chunking. ` +
+      `Reinstall @tobilu/qmd to restore the bundled grammar.`;
+  }
   return `${grammar.pkg}/${grammar.wasm} failed to load (${detail}); falling back to regex chunking. ` +
     `Repair a broken global install with: bun add ${grammar.pkg}@${grammar.version}`;
 }
@@ -148,6 +157,18 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  // Swift (alex-pinkus/tree-sitter-swift): class_declaration covers class,
+  // struct, enum, actor, and extension via its declaration_kind field.
+  swift: `
+    (class_declaration) @class
+    (protocol_declaration) @iface
+    (function_declaration) @func
+    (protocol_function_declaration) @method
+    (init_declaration) @method
+    (deinit_declaration) @method
+    (typealias_declaration) @type
+    (import_declaration) @import
+  `,
 };
 
 /**
@@ -213,7 +234,10 @@ async function ensureInit(): Promise<void> {
  * Uses createRequire to resolve from installed dependency packages.
  */
 function resolveGrammarPath(language: SupportedLanguage): string {
-  const { pkg, wasm } = GRAMMAR_MAP[language];
+  const { pkg, wasm, bundled } = GRAMMAR_MAP[language];
+  if (bundled) {
+    return fileURLToPath(new URL(`../assets/grammars/${wasm}`, import.meta.url));
+  }
   const require = createRequire(import.meta.url);
   return require.resolve(`${pkg}/${wasm}`);
 }

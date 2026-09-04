@@ -5,6 +5,9 @@
 ### Added
 
 - Added Oxlint lint fence.
+- AST-aware chunking for Swift (`.swift`) via alex-pinkus/tree-sitter-swift.
+  The grammar's npm package ships no `.wasm`, so the built grammar is bundled
+  in `assets/grammars/` and resolved via `import.meta.url`.
 
 ## [2.8.3] - 2026-08-16
 
