@@ -6,6 +6,18 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- `qmd embed` no longer skips itself forever behind a wedged predecessor. The
+  embed lock now records when it was taken and the session cap its holder
+  promised (`--timeout`, default 30 min); a holder still alive past twice that
+  cap (24 h if it declared no cap) is evicted with a warning naming its PID.
+  Previously a process stuck inside a native node-llama-cpp call kept its PID,
+  so the PID-liveness check kept the lock alive indefinitely and every later
+  run printed "Another embed process is already running" — the session cap is
+  a JS timer and cannot fire while the event loop is blocked (#735). Bare-PID
+  lockfiles from earlier versions are still understood, aged by mtime.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
