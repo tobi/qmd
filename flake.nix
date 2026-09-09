@@ -148,6 +148,7 @@
             homepage = "https://github.com/tobi/qmd";
             license = licenses.mit;
             platforms = platforms.unix;
+            mainProgram = "qmd";
           };
         };
       in
