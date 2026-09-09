@@ -365,7 +365,13 @@ const GGUF_MAGIC = Buffer.from("GGUF");
 export type GgufFileInspection = {
   exists: boolean;
   valid: boolean;
-  kind: "missing" | "gguf" | "html" | "invalid";
+  /**
+   * "html" and "invalid" mean the header was read and is confirmed bad.
+   * "unreadable" means the read itself failed, so nothing is known about the
+   * content. The two stay distinct because only the first justifies deleting
+   * the file.
+   */
+  kind: "missing" | "gguf" | "html" | "invalid" | "unreadable";
   sizeBytes?: number;
   magic?: string;
   details: string;
@@ -435,10 +441,13 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
       details: `not valid GGUF (expected magic "GGUF", got "${magic}", ${formatModelFileSize(sizeBytes)})`,
     };
   } catch (error) {
+    // stat/open/read threw, so the header was never seen. Reporting this as
+    // "invalid" would claim a verdict no read supports, and `magic` stays
+    // undefined for the same reason.
     return {
       exists: true,
       valid: false,
-      kind: "invalid",
+      kind: "unreadable",
       sizeBytes,
       details: `cannot read model file: ${error instanceof Error ? error.message : String(error)}`,
     };
@@ -454,10 +463,27 @@ function validateGgufFile(filePath: string, modelUri: string): void {
   const inspection = inspectGgufFile(filePath);
   if (!inspection.exists || inspection.valid) return; // let downstream handle missing files
 
-  // Remove the bad file so the next attempt re-downloads
+  // A read that failed says nothing about the bytes on disk. Deleting here
+  // throws away a file that is usually fine (fd exhaustion, a concurrent
+  // loader, a volume that briefly went away) and re-downloading it can cost
+  // gigabytes, so surface the real error and leave the file alone.
+  if (inspection.kind === "unreadable") {
+    throw new Error(
+      `Model file could not be read, so it could not be validated (${inspection.details}).\n` +
+      `Model: ${modelUri}\n` +
+      `Path:  ${filePath}\n\n` +
+      `The file has been left in place. If this repeats, check open file limits, ` +
+      `permissions, and whether the volume holding the model cache is still mounted.`
+    );
+  }
+
+  // Confirmed bad content: remove it so the next attempt re-downloads.
+  let removed = true;
   try {
     unlinkSync(filePath);
-  } catch { /* best effort */ }
+  } catch {
+    removed = false;
+  }
 
   if (inspection.kind === "html") {
     throw new Error(
@@ -477,7 +503,9 @@ function validateGgufFile(filePath: string, modelUri: string): void {
     `Model file is not valid GGUF (expected magic "GGUF", got "${inspection.magic ?? "unknown"}", file is ${formatModelFileSize(inspection.sizeBytes ?? 0)}).\n` +
     `Model: ${modelUri}\n` +
     `Path:  ${filePath}\n\n` +
-    `The file has been removed. Run the command again to re-download.`
+    (removed
+      ? `The file has been removed. Run the command again to re-download.`
+      : `The file could NOT be removed. Delete it manually, then run the command again.`)
   );
 }
 
