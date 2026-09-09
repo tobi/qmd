@@ -7,6 +7,18 @@
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
+### Fixed
+
+- `qmd embed` no longer skips itself forever behind a wedged predecessor. The
+  embed lock now records when it was taken and the session cap its holder
+  promised (`--timeout`, default 30 min); a holder still alive past twice that
+  cap (24 h if it declared no cap) is evicted with a warning naming its PID.
+  Previously a process stuck inside a native node-llama-cpp call kept its PID,
+  so the PID-liveness check kept the lock alive indefinitely and every later
+  run printed "Another embed process is already running" — the session cap is
+  a JS timer and cannot fire while the event loop is blocked (#735). Bare-PID
+  lockfiles from earlier versions are still understood, aged by mtime.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

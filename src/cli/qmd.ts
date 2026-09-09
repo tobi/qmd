@@ -3,7 +3,7 @@ import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
-import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
+import { embedLockPathForDb, tryAcquireEmbedLock, embedLockReclaimedMessage, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
@@ -72,6 +72,7 @@ import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
+  DEFAULT_EMBED_MAX_DURATION_MS,
   DEFAULT_RERANK_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
@@ -2189,12 +2190,19 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
-  // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
-  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
+  // Exclusive process lock — concurrent embeds race on vectors_vec (#825).
+  // The lock records this run's session cap so a later run can evict us if we
+  // wedge in a native call and outlive it (#735).
+  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()), {
+    maxDurationMs: batchOptions?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS,
+  });
   if (!embedLock) {
     console.log(EMBED_LOCK_BUSY_MESSAGE);
     closeDb();
     return;
+  }
+  if (embedLock.reclaimedFrom) {
+    console.error(`${c.yellow}${embedLockReclaimedMessage(embedLock.reclaimedFrom)}${c.reset}`);
   }
 
   try {
