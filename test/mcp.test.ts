@@ -1031,15 +1031,22 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(res.status).toBe(404);
   });
 
-  test("POST /query with malformed JSON body returns 400, not a 500", async () => {
-    const res = await fetch(`${baseUrl}/query`, {
+  test("POST /query rejects malformed and non-object JSON with 400", async () => {
+    const malformed = await fetch(`${baseUrl}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{not valid json",
     });
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toBe("Invalid JSON body");
+    expect(malformed.status).toBe(400);
+    expect((await malformed.json()).error).toBe("Invalid JSON body");
+
+    const nonObject = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "null",
+    });
+    expect(nonObject.status).toBe(400);
+    expect((await nonObject.json()).error).toBe("JSON body must be an object");
   });
 
   // ---------------------------------------------------------------------------
