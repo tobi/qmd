@@ -9,6 +9,10 @@
 ### Fixed
 
 - Fixed idle LLM resource disposal racing active operations on per-store LLM instances (HTTP MCP daemon): `LlamaCpp` now tracks in-flight operations per instance, the inactivity timer refuses to unload while any operation runs, `unloadIdleResources()` waits for operations to drain, and new operations wait for an unload to finish. Prevents `DisposedError` and the native `llama_free` use-after-free crash during long embedding/rerank requests (#947, #935, #938).
+- `tokenize`/`countTokens`/`detokenize` now go through the same in-flight tracking as other model-backed operations, so a chunked index/add can no longer race an idle unload (#948 review).
+- `dispose()` drains in-flight operations (bounded) and joins any running idle unload before freeing resources, so shutdown with live requests no longer frees contexts under active operations (#948 review).
+- Idle unload now detaches contexts and models before disposing and swallows/logs per-resource dispose failures, so a failed dispose can no longer leave freed objects cached for later operations (#948 review).
+- Bounded the unload drain wait (30s) so a wedged native call skips the unload with a warning instead of hanging the daemon, and stopped unref-ing the drain timer so the process cannot exit mid-unload (#948 review).
 
 ## [2.8.3] - 2026-08-16
 

@@ -630,6 +630,8 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+// How long disposal paths wait for in-flight LLM operations before giving up.
+const OP_DRAIN_TIMEOUT_MS = 30_000;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
@@ -911,12 +913,6 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Unload idle resources but keep the instance alive for future use.
-   *
-   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
-   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
-   */
-  /**
    * Run an LLM operation with instance-local in-flight tracking (#947).
    *
    * Blocks new operations while an idle unload is disposing contexts, and
@@ -927,6 +923,14 @@ export class LlamaCpp implements LLM {
   private async runOperation<T>(fn: () => Promise<T>): Promise<T> {
     while (this._idleUnload) {
       await this._idleUnload.catch(() => {});
+      // dispose() may have started while we were waiting on the unload;
+      // don't resume onto resources it may have freed.
+      if (this.disposed) {
+        throw new Error("LLM instance is disposed");
+      }
+    }
+    if (this.disposed) {
+      throw new Error("LLM instance is disposed");
     }
     this._activeOperations++;
     this.touchActivity();
@@ -962,10 +966,17 @@ export class LlamaCpp implements LLM {
    * blocked at runOperation while this runs.
    */
   private async performUnloadIdleResources(): Promise<void> {
+    // Bounded drain: a wedged native call must not hang the daemon (#947).
+    const deadline = Date.now() + OP_DRAIN_TIMEOUT_MS;
     while (!this.disposed && this._activeOperations > 0) {
+      if (Date.now() > deadline) {
+        process.stderr.write("QMD Warning: timed out waiting for in-flight LLM operations; skipping idle unload.\n");
+        return;
+      }
+      // Referenced (not unref'd): an unref'd timer here can let the process
+      // exit successfully mid-drain, abandoning the unload.
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, 100);
-        t.unref();
+        setTimeout(resolve, 100);
       });
     }
     if (this.disposed) {
@@ -978,30 +989,39 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Dispose contexts first
-    for (const ctx of this.embedContexts) {
-      await ctx.dispose();
-    }
+    // Detach before disposing so a failed dispose cannot leave freed
+    // objects cached for later operations (#948 review). disposeWithTimeout
+    // logs and swallows per-resource errors so one failure can't poison the
+    // instance or abort the rest of the unload.
+    const embedContexts = this.embedContexts;
     this.embedContexts = [];
-    for (const ctx of this.rerankContexts) {
-      await ctx.dispose();
-    }
+    const rerankContexts = this.rerankContexts;
     this.rerankContexts = [];
+    for (const ctx of embedContexts) {
+      await disposeWithTimeout("embedding context", () => ctx.dispose());
+    }
+    for (const ctx of rerankContexts) {
+      await disposeWithTimeout("rerank context", () => ctx.dispose());
+    }
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
-      if (this.embedModel) {
-        await this.embedModel.dispose();
-        this.embedModel = null;
-        this.embedModelPath = null;
+      // Detach first, dispose after — same rationale as contexts above.
+      const embedModel = this.embedModel;
+      const generateModel = this.generateModel;
+      const rerankModel = this.rerankModel;
+      this.embedModel = null;
+      this.embedModelPath = null;
+      this.generateModel = null;
+      this.rerankModel = null;
+      if (embedModel) {
+        await disposeWithTimeout("embedding model", () => embedModel.dispose());
       }
-      if (this.generateModel) {
-        await this.generateModel.dispose();
-        this.generateModel = null;
+      if (generateModel) {
+        await disposeWithTimeout("generation model", () => generateModel.dispose());
       }
-      if (this.rerankModel) {
-        await this.rerankModel.dispose();
-        this.rerankModel = null;
+      if (rerankModel) {
+        await disposeWithTimeout("rerank model", () => rerankModel.dispose());
       }
       // Reset load promises so models can be reloaded later
       this.embedModelLoadPromise = null;
@@ -1437,11 +1457,15 @@ export class LlamaCpp implements LLM {
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
-    await this.ensureEmbedContext();  // Ensure model is loaded
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.tokenize(text);
+    // runOperation: tokenize touches the embed model/context and must not
+    // race an idle unload (#948 review).
+    return this.runOperation(async () => {
+      await this.ensureEmbedContext(); // Ensure model is loaded
+      if (!this.embedModel) {
+        throw new Error("Embed model not loaded");
+      }
+      return this.embedModel.tokenize(text);
+    });
   }
 
   /**
@@ -1456,11 +1480,13 @@ export class LlamaCpp implements LLM {
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
-    await this.ensureEmbedContext();
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.detokenize(tokens);
+    return this.runOperation(async () => {
+      await this.ensureEmbedContext();
+      if (!this.embedModel) {
+        throw new Error("Embed model not loaded");
+      }
+      return this.embedModel.detokenize(tokens);
+    });
   }
 
   // ==========================================================================
@@ -1896,7 +1922,25 @@ export class LlamaCpp implements LLM {
     if (this.disposed) {
       return;
     }
+    // Mark disposed first so runOperation rejects new/queued operations,
+    // then drain in-flight ones before freeing anything (#948 review).
     this.disposed = true;
+
+    // Bounded drain of in-flight operations.
+    const deadline = Date.now() + OP_DRAIN_TIMEOUT_MS;
+    while (this._activeOperations > 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 100);
+      });
+    }
+    if (this._activeOperations > 0) {
+      process.stderr.write("QMD Warning: LLM operations still in flight at dispose; proceeding.\n");
+    }
+    // Join any in-progress idle unload so we never dispose concurrently with
+    // it (it bails without disposing once it sees this.disposed).
+    while (this._idleUnload) {
+      await this._idleUnload.catch(() => {});
+    }
 
     // Clear inactivity timer
     if (this.inactivityTimer) {

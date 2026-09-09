@@ -1468,6 +1468,8 @@ describe("idle unload vs active operations (#947)", () => {
       releaseEmbedding = resolve;
     });
     let holdNextEmbedding = false;
+    // When set, the next created context's dispose() rejects (failure-path test).
+    let failNextContextDispose = false;
 
     const getEmbeddingFor = vi.fn(async (text: string) => {
       if (holdNextEmbedding) await embeddingGate;
@@ -1478,6 +1480,10 @@ describe("idle unload vs active operations (#947)", () => {
       return {
         getEmbeddingFor,
         dispose: vi.fn(async () => {
+          if (failNextContextDispose) {
+            failNextContextDispose = false;
+            throw new Error(`simulated dispose failure for context ${id}`);
+          }
           disposedContexts.push(id);
         }),
       };
@@ -1514,6 +1520,9 @@ describe("idle unload vs active operations (#947)", () => {
       createEmbeddingContext,
       holdNext: () => {
         holdNextEmbedding = true;
+      },
+      failNextDispose: () => {
+        failNextContextDispose = true;
       },
       release: () => {
         releaseEmbedding?.();
@@ -1579,6 +1588,88 @@ describe("idle unload vs active operations (#947)", () => {
       await second;
       expect(mock.disposedContexts.length).toBeGreaterThan(0);
       expect(mock.getEmbeddingFor).toHaveBeenCalledTimes(2);
+      expect(mock.createEmbeddingContext.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await llm.dispose();
+      mock.restore();
+    }
+  });
+
+  test("tokenize is blocked behind an in-flight unload and runs after it", async () => {
+    const mock = makeMockedLlm(0); // timer disabled; drive unload directly
+    const { llm } = mock;
+    try {
+      // Load the embed context so the unload has something to dispose.
+      await llm.embed("warmup");
+
+      mock.holdNext();
+      const op = llm.embed("held while tokenize arrives");
+      await new Promise((r) => setTimeout(r, 20));
+
+      const unload = llm.unloadIdleResources();
+      // tokenize must wait for the unload instead of touching the embed
+      // model/context while it is being disposed.
+      let tokensResolved = false;
+      const tokens = llm.tokenize("hello").then((r) => {
+        tokensResolved = true;
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      expect(tokensResolved).toBe(false); // still blocked behind the held op + unload
+
+      mock.release();
+      await op;
+      await unload;
+      expect(await tokens).toEqual(["h", "e", "l", "l", "o"]);
+      // Fresh context was created for the post-unload tokenize.
+      expect(mock.createEmbeddingContext.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(await llm.countTokens("hello")).toBe(5);
+    } finally {
+      await llm.dispose();
+      mock.restore();
+    }
+  });
+
+  test("dispose waits for an in-flight operation before freeing contexts", async () => {
+    const mock = makeMockedLlm(0);
+    const { llm } = mock;
+    try {
+      mock.holdNext();
+      const op = llm.embed("held across dispose");
+      await new Promise((r) => setTimeout(r, 20));
+
+      const disposing = llm.dispose();
+      await new Promise((r) => setTimeout(r, 200));
+      // Op still in flight: nothing has been freed yet.
+      expect(mock.disposedContexts).toEqual([]);
+
+      mock.release();
+      await op;
+      await disposing;
+      // The op completed first, then dispose freed the context.
+      expect(mock.disposedContexts.length).toBeGreaterThan(0);
+      // New operations after dispose are rejected, not run against freed state.
+      await expect(llm.embed("after dispose")).rejects.toThrow("disposed");
+    } finally {
+      await llm.dispose();
+      mock.restore();
+    }
+  });
+
+  test("a failed context dispose does not leave freed contexts cached", async () => {
+    const mock = makeMockedLlm(0);
+    const { llm } = mock;
+    try {
+      const warm = await llm.embed("warmup");
+      expect(warm).not.toBeNull();
+
+      mock.failNextDispose();
+      // The dispose rejects, but the context must be detached from the cache
+      // either way — the instance stays usable.
+      await llm.unloadIdleResources();
+
+      const again = await llm.embed("after failed unload");
+      expect(again).not.toBeNull();
       expect(mock.createEmbeddingContext.mock.calls.length).toBeGreaterThanOrEqual(2);
     } finally {
       await llm.dispose();
