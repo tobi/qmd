@@ -17,6 +17,7 @@ import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
+import { initializeMetadataSchema } from "../src/metadata-store";
 
 // =============================================================================
 // Test Database Setup
@@ -124,6 +125,9 @@ function initTestDatabase(db: Database): void {
       value TEXT
     )
   `);
+
+  // Document metadata tables — searchFTS/searchVec join them for result metadata
+  initializeMetadataSchema(db);
 }
 
 function seedTestData(db: Database): void {
@@ -1084,9 +1088,19 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       }),
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("application/json");
+    const contentType = res.headers.get("content-type") ?? "";
+    expect(contentType).toMatch(/application\/json|text\/event-stream/);
     expect(res.headers.get("mcp-session-id")).toBeNull();
-    const json = await res.json() as any;
+
+    // Streamable HTTP permits either a direct JSON response or one SSE
+    // message when the client advertises both. The MCP SDK currently chooses
+    // SSE for legacy initialize even when responseMode is "json".
+    const responseText = await res.text();
+    const payload = contentType.includes("text/event-stream")
+      ? responseText.split(/\r?\n/).find(line => line.startsWith("data: "))?.slice(6)
+      : responseText;
+    expect(payload).toBeDefined();
+    const json = JSON.parse(payload!) as any;
     expect(json.jsonrpc).toBe("2.0");
     expect(json.id).toBe(1);
     expect(json.result.serverInfo.name).toBe("qmd");

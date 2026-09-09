@@ -37,6 +37,15 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
+import {
+  initializeMetadataSchema,
+  syncDocumentMetadata,
+  countDocumentsPendingMetadata,
+  getMetadataByFilepath,
+  parseMetadataJson,
+} from "./metadata-store.js";
 
 // =============================================================================
 // Configuration
@@ -1252,6 +1261,10 @@ function initializeDatabase(db: Database): void {
 
   ensureContentVectorsStatusIndex(db);
 
+  // Document metadata — extraction state plus normalized value rows for
+  // metadata filtering. Keyed by document identity, not content hash.
+  initializeMetadataSchema(db);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -1530,8 +1543,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -1551,7 +1564,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => number;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
@@ -1596,6 +1609,8 @@ export type ReindexResult = {
   orphanedCleaned: number;
   skipped: number;
   skippedFiles: ReindexSkippedFile[];
+  /** Documents whose qmd.metadata frontmatter failed extraction this pass. */
+  metadataErrors: number;
 };
 
 /**
@@ -1634,7 +1649,7 @@ export async function reindexCollection(
   });
 
   const total = files.length;
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: ReindexSkippedFile[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
@@ -1681,8 +1696,13 @@ export async function reindexCollection(
 
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
+    let documentId: number;
+    let contentChanged = true;
+
     if (existing) {
+      documentId = existing.id;
       if (existing.hash === hash) {
+        contentChanged = false;
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
           updated++;
@@ -1700,10 +1720,15 @@ export async function reindexCollection(
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
+
+    // Unchanged content still backfills missing or stale extraction state.
+    const extraction = syncDocumentMetadata(db, documentId, content, path,
+      contentChanged ? undefined : { onlyIfStale: true });
+    if (extraction?.error) metadataErrors++;
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1721,7 +1746,7 @@ export async function reindexCollection(
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
+  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
 }
 
 export type EmbedFailure = {
@@ -2271,8 +2296,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store)),
+    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -2416,6 +2441,7 @@ export function handelize(path: string): string {
  * Search result extends DocumentResult with score and source info
  */
 export type SearchResult = DocumentResult & {
+  metadata: DocumentMetadata;
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
@@ -2510,6 +2536,8 @@ export type IndexStatus = {
   totalDocuments: number;
   needsEmbedding: number;
   hasVectorIndex: boolean;
+  /** Active documents without current, error-free metadata extraction. */
+  pendingMetadata: number;
   collections: CollectionInfo[];
 };
 
@@ -2939,6 +2967,7 @@ function rebuildDocumentFTS(db: Database, documentId: number): void {
 
 /**
  * Insert a new document into the documents table.
+ * Returns the document's id so callers can attach document-scoped state.
  */
 export function insertDocument(
   db: Database,
@@ -2948,7 +2977,7 @@ export function insertDocument(
   hash: string,
   createdAt: string,
   modifiedAt: string
-): void {
+): number {
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
@@ -2960,7 +2989,10 @@ export function insertDocument(
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
 
   const row = db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`).get(collectionName, path) as { id: number } | undefined;
-  if (row) rebuildDocumentFTS(db, row.id);
+  if (!row) throw new Error(`Document row missing after insert: ${collectionName}/${path}`);
+
+  rebuildDocumentFTS(db, row.id);
+  return row.id;
 }
 
 /**
@@ -4050,12 +4082,12 @@ function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): Sear
     .slice(0, limit);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   // Search each requested collection before merging/truncating so a large
   // unrelated collection cannot occupy global top-k and starve the rest (#775).
   if (names && names.length > 1) {
-    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name)), limit);
+    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name, filter)), limit);
   }
   const collectionFilter = names?.[0];
 
@@ -4069,10 +4101,12 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // query into a 17-second query on large collections.
   const params: (string | number)[] = [ftsQuery];
 
-  // When filtering by collection, fetch extra candidates from the FTS index
-  // since some will be filtered out. Without a collection filter we can
-  // fetch exactly the requested limit.
-  const ftsLimit = collectionFilter ? limit * 10 : limit;
+  // When filtering by collection or metadata, fetch extra candidates from the
+  // FTS index since some will be filtered out. Without a filter we can fetch
+  // exactly the requested limit. Selective filters remain best-effort: an
+  // eligible document outside this candidate window is missed (same
+  // completeness contract as collection filtering).
+  const ftsLimit = (collectionFilter || filter) ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -4088,10 +4122,12 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
-      fm.bm25_score
+      fm.bm25_score,
+      dm.metadata_json
     FROM fts_matches fm
     JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
+    LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE d.active = 1
   `;
 
@@ -4100,11 +4136,19 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(String(collectionFilter));
   }
 
+  if (filter) {
+    // Only documents with current, error-free extraction can match — an
+    // unprocessed document must not accidentally satisfy `exists: false`.
+    const compiledFilter = compileMetadataFilter(filter, "d");
+    sql += ` AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiledFilter.sql}`;
+    params.push(...compiledFilter.params);
+  }
+
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -4123,6 +4167,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
+      metadata: parseMetadataJson(row.metadata_json),
       score,
       source: "fts" as const,
     };
@@ -4137,12 +4182,13 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 const SQLITE_VEC_MAX_K = 4096;
 
 /**
- * Max collection-scoped vectors for an exact cosine scan. Above this we fall
+ * Max filter-eligible vectors for an exact cosine scan. Above this we fall
  * back to global ANN with a capped over-fetch. Exact scan avoids the
- * post-filter starvation of small collections (#791, #803); ANN remains for
- * very large collections where a full scan would be expensive.
+ * post-filter starvation of small eligible sets — originally small
+ * collections (#791, #803), now also selective metadata filters; ANN remains
+ * for very large eligible sets where a full scan would be expensive.
  */
-const COLLECTION_VEC_EXACT_SCAN_MAX = 20_000;
+const FILTERED_VEC_EXACT_SCAN_MAX = 20_000;
 
 const VEC_HASH_SEQ_IN_CHUNK = 400;
 
@@ -4191,7 +4237,7 @@ function annVecScan(
   `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -4201,7 +4247,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const names = scopedCollectionNames(collectionName);
   if (names && names.length > 1) {
     const lists = await Promise.all(
-      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm)),
+      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
     );
     return mergeSearchResultsByScore(lists, limit);
   }
@@ -4214,30 +4260,49 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed).
   //
-  // Collection filter cannot be pushed into MATCH (sqlite-vec has no join-safe
-  // predicate here). Global ANN + post-filter starves small collections: they
-  // never enter the top-k (#791, #803). Multiplier over-fetch alone is not
-  // enough either — sqlite-vec caps k at 4096. For a collection filter we
-  // therefore exact-scan that collection's vectors when the set is small
+  // Collection and metadata filters cannot be pushed into MATCH (sqlite-vec
+  // has no join-safe predicate here). Global ANN + post-filter starves small
+  // eligible sets: they never enter the top-k (#791, #803). Multiplier
+  // over-fetch alone is not enough either — sqlite-vec caps k at 4096. For a
+  // filter we therefore exact-scan the eligible vectors when the set is small
   // enough, and only then fall back to capped ANN + post-filter.
   let vecResults: { hash_seq: string; distance: number }[];
 
-  if (collectionFilter) {
-    const collectionHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(`
-        SELECT cv.hash || '_' || cv.seq AS hash_seq
-        FROM content_vectors cv
-        JOIN documents d ON d.hash = cv.hash AND d.active = 1
-        WHERE d.collection = ?
-      `).all(collectionFilter) as { hash_seq: string }[],
+  if (collectionFilter || filter) {
+    let eligibleSql = `
+      SELECT DISTINCT cv.hash || '_' || cv.seq AS hash_seq
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    `;
+    const eligibleConditions: string[] = [];
+    const eligibleParams: (string | number)[] = [];
+
+    if (collectionFilter) {
+      eligibleConditions.push(`d.collection = ?`);
+      eligibleParams.push(collectionFilter);
+    }
+
+    if (filter) {
+      const compiledFilter = compileMetadataFilter(filter, "d");
+      eligibleSql += ` JOIN document_metadata dm ON dm.document_id = d.id`;
+      eligibleConditions.push(`dm.extraction_version = ${METADATA_EXTRACTION_VERSION}`);
+      eligibleConditions.push(`dm.extraction_error IS NULL`);
+      eligibleConditions.push(compiledFilter.sql);
+      eligibleParams.push(...compiledFilter.params);
+    }
+
+    eligibleSql += ` WHERE ${eligibleConditions.join(" AND ")}`;
+
+    const eligibleHashSeqs = withLazyContentVectorMigration(db, () =>
+      db.prepare(eligibleSql).all(...eligibleParams) as { hash_seq: string }[],
     ).map((r) => r.hash_seq);
 
-    if (collectionHashSeqs.length === 0) return [];
+    if (eligibleHashSeqs.length === 0) return [];
 
-    if (collectionHashSeqs.length <= COLLECTION_VEC_EXACT_SCAN_MAX) {
-      vecResults = exactVecScanByHashSeq(db, embedding, collectionHashSeqs, limit);
+    if (eligibleHashSeqs.length <= FILTERED_VEC_EXACT_SCAN_MAX) {
+      vecResults = exactVecScanByHashSeq(db, embedding, eligibleHashSeqs, limit);
     } else {
-      // Large collection: ANN with over-fetch, hard-capped at sqlite-vec's max k.
+      // Large eligible set: ANN with over-fetch, hard-capped at sqlite-vec's max k.
       vecResults = annVecScan(db, embedding, Math.max(limit * 30, limit * 3));
     }
   } else {
@@ -4260,22 +4325,32 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body
+      content.doc as body,
+      dm.metadata_json
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
+    LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: (string | number)[] = [...hashSeqs];
 
   if (collectionFilter) {
     docSql += ` AND d.collection = ?`;
     params.push(collectionFilter);
   }
 
+  if (filter) {
+    // Re-apply the filter on the document join: vectors are content-scoped,
+    // so one hash can belong to both matching and non-matching documents.
+    const compiledFilter = compileMetadataFilter(filter, "d");
+    docSql += ` AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiledFilter.sql}`;
+    params.push(...compiledFilter.params);
+  }
+
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; body: string; metadata_json: string | null;
   }[]);
 
   // Combine with distances and dedupe by filepath
@@ -4304,6 +4379,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
+        metadata: parseMetadataJson(row.metadata_json),
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
@@ -5206,6 +5282,7 @@ export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): In
     totalDocuments: totalDocs,
     needsEmbedding,
     hasVectorIndex: hasVectors,
+    pendingMetadata: countDocumentsPendingMetadata(db),
     collections,
   };
 }
@@ -5390,6 +5467,7 @@ export interface SearchHooks {
 
 export interface HybridQueryOptions {
   collection?: string | readonly string[];
+  filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -5410,7 +5488,21 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  metadata: DocumentMetadata; // indexed qmd.metadata for the document
   explain?: HybridQueryExplain;
+}
+
+/**
+ * Attach canonical metadata to final search results with one batch query.
+ * Runs after RRF/reranking so metadata is never duplicated through the
+ * intermediate ranked lists.
+ */
+function attachResultMetadata<T extends { file: string }>(
+  db: Database,
+  results: T[],
+): (T & { metadata: DocumentMetadata })[] {
+  const metadataByFilepath = getMetadataByFilepath(db, results.map(r => r.file));
+  return results.map(r => ({ ...r, metadata: metadataByFilepath.get(r.file) ?? {} }));
 }
 
 export type RankedListMeta = {
@@ -5456,6 +5548,7 @@ export async function hybridQuery(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
+  const filter = options?.filter;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -5472,8 +5565,10 @@ export async function hybridQuery(
   // When intent is provided, disable strong-signal bypass — the obvious BM25
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
-  // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  // Pass collection and metadata filter directly into FTS query (filter at
+  // SQL level, not post-hoc) — the strong-signal decision must be based only
+  // on eligible documents.
+  const initialFts = store.searchFTS(query, 20, collection, filter);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -5510,7 +5605,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection, filter);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -5549,7 +5644,7 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding
+        undefined, embedding, filter
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -5618,7 +5713,7 @@ export async function hybridQuery(
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
     const seenFiles = new Set<string>();
-    return candidates
+    const rrfResults = candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -5663,6 +5758,7 @@ export async function hybridQuery(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
+    return attachResultMetadata(store.db, rrfResults);
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -5733,7 +5829,7 @@ export async function hybridQuery(
 
   // Step 8: Dedup by file (safety net — prevents duplicate output)
   const seenFiles = new Set<string>();
-  return blended
+  const finalResults = blended
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -5741,10 +5837,12 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+  return attachResultMetadata(store.db, finalResults);
 }
 
 export interface VectorSearchOptions {
   collection?: string | readonly string[];
+  filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5759,6 +5857,7 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  metadata: DocumentMetadata;
 }
 
 /**
@@ -5778,6 +5877,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const filter = options?.filter;
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -5796,7 +5896,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, filter);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -5808,6 +5908,7 @@ export async function vectorSearchQuery(
           score: r.score,
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
+          metadata: r.metadata,
         });
       }
     }
@@ -5829,6 +5930,7 @@ export async function vectorSearchQuery(
  */
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
+  filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -5873,6 +5975,7 @@ export async function structuredSearch(
   const hooks = options?.hooks;
 
   const collections = options?.collections;
+  const filter = options?.filter;
 
   if (searches.length === 0) return [];
 
@@ -5909,7 +6012,7 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, filter);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
@@ -5948,7 +6051,7 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, embedModel, 20, coll,
-            undefined, embedding
+            undefined, embedding, filter
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -6012,7 +6115,7 @@ export async function structuredSearch(
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
     const seenFiles = new Set<string>();
-    return candidates
+    const rrfResults = candidates
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
@@ -6057,6 +6160,7 @@ export async function structuredSearch(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
+    return attachResultMetadata(store.db, rrfResults);
   }
 
   // Step 5: Rerank chunks
@@ -6126,7 +6230,7 @@ export async function structuredSearch(
 
   // Step 7: Dedup by file
   const seenFiles = new Set<string>();
-  return blended
+  const finalResults = blended
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -6134,4 +6238,5 @@ export async function structuredSearch(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+  return attachResultMetadata(store.db, finalResults);
 }
