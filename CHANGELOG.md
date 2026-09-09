@@ -7,6 +7,14 @@
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
+### Fixed
+
+- Fixed idle LLM resource disposal racing active operations on per-store LLM instances (HTTP MCP daemon): `LlamaCpp` now tracks in-flight operations per instance, the inactivity timer refuses to unload while any operation runs, `unloadIdleResources()` waits for operations to drain, and new operations wait for an unload to finish. Prevents `DisposedError` and the native `llama_free` use-after-free crash during long embedding/rerank requests (#947, #935, #938).
+- `tokenize`/`countTokens`/`detokenize` now go through the same in-flight tracking as other model-backed operations, so a chunked index/add can no longer race an idle unload (#948 review).
+- `dispose()` drains in-flight operations (bounded) and joins any running idle unload before freeing resources, so shutdown with live requests no longer frees contexts under active operations (#948 review).
+- Idle unload now detaches contexts and models before disposing and swallows/logs per-resource dispose failures, so a failed dispose can no longer leave freed objects cached for later operations (#948 review).
+- Bounded the unload drain wait (30s) so a wedged native call skips the unload with a warning instead of hanging the daemon, and stopped unref-ing the drain timer so the process cannot exit mid-unload (#948 review).
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
