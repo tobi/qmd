@@ -832,6 +832,13 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
+  // In-flight operation refcount and idle-unload coordination (#947).
+  // Instance-local so per-store LLMs (HTTP MCP) get the same protection as
+  // the CLI singleton — the global canUnloadLLM() never saw them, so the
+  // idle timer disposed contexts underneath live embedding/rerank work.
+  private _activeOperations = 0;
+  private _idleUnload: Promise<void> | null = null;
+
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
@@ -879,10 +886,10 @@ export class LlamaCpp implements LLM {
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
+        // Never dispose while an operation on THIS instance is in flight (#947).
+        // canUnloadLLM covers sessions on the default singleton; the local
+        // refcount covers every instance, including per-store HTTP LLMs.
+        if (this._activeOperations > 0 || !canUnloadLLM()) {
           // Active sessions/operations - reschedule timer
           this.touchActivity();
           return;
@@ -909,8 +916,58 @@ export class LlamaCpp implements LLM {
    * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
    * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
    */
+  /**
+   * Run an LLM operation with instance-local in-flight tracking (#947).
+   *
+   * Blocks new operations while an idle unload is disposing contexts, and
+   * keeps the idle timer from unloading while the operation runs. All public
+   * model-backed methods (embed, embedBatch, generate, expandQuery, rerank,
+   * tokenize) must go through this.
+   */
+  private async runOperation<T>(fn: () => Promise<T>): Promise<T> {
+    while (this._idleUnload) {
+      await this._idleUnload.catch(() => {});
+    }
+    this._activeOperations++;
+    this.touchActivity();
+    try {
+      return await fn();
+    } finally {
+      this._activeOperations = Math.max(0, this._activeOperations - 1);
+    }
+  }
+
   async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
+    if (this.disposed) {
+      return;
+    }
+    if (this._idleUnload) {
+      return this._idleUnload;
+    }
+    this._idleUnload = this.performUnloadIdleResources();
+    try {
+      await this._idleUnload;
+    } finally {
+      this._idleUnload = null;
+    }
+  }
+
+  /**
+   * Unload idle resources but keep the instance alive for future use.
+   *
+   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
+   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
+   *
+   * Waits for in-flight operations to drain first (#947); new operations are
+   * blocked at runOperation while this runs.
+   */
+  private async performUnloadIdleResources(): Promise<void> {
+    while (!this.disposed && this._activeOperations > 0) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 100);
+        t.unref();
+      });
+    }
     if (this.disposed) {
       return;
     }
@@ -1443,28 +1500,29 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
+    // runOperation tracks in-flight work so the idle timer cannot dispose
+    // contexts underneath this call (#947).
+    return this.runOperation(async () => {
+      try {
+        const context = await this.ensureEmbedContext();
 
-    try {
-      const context = await this.ensureEmbedContext();
+        // Guard: truncate text that exceeds model context window to prevent GGML crash
+        const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+        if (truncated) {
+          console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+        }
 
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+        const embedding = await context.getEmbeddingFor(safeText);
+
+        return {
+          embedding: Array.from(embedding.vector),
+          model: options.model ?? this.embedModelUri,
+        };
+      } catch (error) {
+        console.error("Embedding error:", error);
+        return null;
       }
-
-      const embedding = await context.getEmbeddingFor(safeText);
-
-      return {
-        embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
-      };
-    } catch (error) {
-      console.error("Embedding error:", error);
-      return null;
-    }
+    });
   }
 
   /**
@@ -1473,111 +1531,111 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
 
     if (texts.length === 0) return [];
 
-    try {
-      const contexts = await this.ensureEmbedContexts();
-      const n = contexts.length;
+    return this.runOperation(async () => {
+      try {
+        const contexts = await this.ensureEmbedContexts();
+        const n = contexts.length;
 
-      if (n === 1) {
-        // Single context: sequential (no point splitting)
-        const context = contexts[0]!;
-        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
-        for (const text of texts) {
-          try {
-            const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-            if (truncated) {
-              console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
-            }
-            const embedding = await context.getEmbeddingFor(safeText);
-            this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-          } catch (err) {
-            console.error("Embedding error for text:", err);
-            embeddings.push(null);
-          }
-        }
-        return embeddings;
-      }
-
-      // Multiple contexts: split texts across contexts for parallel evaluation
-      const chunkSize = Math.ceil(texts.length / n);
-      const chunks = Array.from({ length: n }, (_, i) =>
-        texts.slice(i * chunkSize, (i + 1) * chunkSize)
-      );
-
-      const chunkResults = await Promise.all(
-        chunks.map(async (chunk, i) => {
-          const ctx = contexts[i]!;
-          const results: (EmbeddingResult | null)[] = [];
-          for (const text of chunk) {
+        if (n === 1) {
+          // Single context: sequential (no point splitting)
+          const context = contexts[0]!;
+          const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
+          for (const text of texts) {
             try {
               const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
               if (truncated) {
                 console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
-              const embedding = await ctx.getEmbeddingFor(safeText);
+              const embedding = await context.getEmbeddingFor(safeText);
               this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+              embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
             } catch (err) {
               console.error("Embedding error for text:", err);
-              results.push(null);
+              embeddings.push(null);
             }
           }
-          return results;
-        })
-      );
+          return embeddings;
+        }
 
-      return chunkResults.flat();
-    } catch (error) {
-      console.error("Batch embedding error:", error);
-      return texts.map(() => null);
-    }
+        // Multiple contexts: split texts across contexts for parallel evaluation
+        const chunkSize = Math.ceil(texts.length / n);
+        const chunks = Array.from({ length: n }, (_, i) =>
+          texts.slice(i * chunkSize, (i + 1) * chunkSize)
+        );
+
+        const chunkResults = await Promise.all(
+          chunks.map(async (chunk, i) => {
+            const ctx = contexts[i]!;
+            const results: (EmbeddingResult | null)[] = [];
+            for (const text of chunk) {
+              try {
+                const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+                if (truncated) {
+                  console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
+                }
+                const embedding = await ctx.getEmbeddingFor(safeText);
+                this.touchActivity();
+                results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
+              } catch (err) {
+                console.error("Embedding error for text:", err);
+                results.push(null);
+              }
+            }
+            return results;
+          })
+        );
+
+        return chunkResults.flat();
+        } catch (error) {
+          console.error("Batch embedding error:", error);
+          return texts.map(() => null);
+        }
+    });
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
 
-    // Ensure model is loaded
-    await this.ensureGenerateModel();
+    return this.runOperation(async () => {
+      // Ensure model is loaded
+      await this.ensureGenerateModel();
 
-    // Create fresh context -> sequence -> session for each call
-    const context = await this.generateModel!.createContext();
-    const sequence = context.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+      // Create fresh context -> sequence -> session for each call
+      const context = await this.generateModel!.createContext();
+      const sequence = context.getSequence();
+      const { LlamaChatSession } = await loadNodeLlamaCpp();
+      const session = new LlamaChatSession({ contextSequence: sequence });
 
-    const maxTokens = options.maxTokens ?? 150;
-    // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
-    // DO NOT use greedy decoding (temp=0) - causes repetition loops
-    const temperature = options.temperature ?? 0.7;
+      const maxTokens = options.maxTokens ?? 150;
+      // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
+      // DO NOT use greedy decoding (temp=0) - causes repetition loops
+      const temperature = options.temperature ?? 0.7;
 
-    let result = "";
-    try {
-      await session.prompt(prompt, {
-        maxTokens,
-        temperature,
-        topK: 20,
-        topP: 0.8,
-        onTextChunk: (text: string) => {
-          result += text;
-        },
-      });
+      let result = "";
+      try {
+        await session.prompt(prompt, {
+          maxTokens,
+          temperature,
+          topK: 20,
+          topP: 0.8,
+          onTextChunk: (text: string) => {
+            result += text;
+          },
+        });
 
-      return {
-        text: result,
-        model: this.generateModelUri,
-        done: true,
-      };
-    } finally {
-      // Sequence dispose is async as of node-llama-cpp 3.20; await it before the parent context.
-      await disposeSequenceThenContext(sequence, context);
-    }
+        return {
+          text: result,
+          model: this.generateModelUri,
+          done: true,
+        };
+      } finally {
+        // Sequence dispose is async as of node-llama-cpp 3.20; await it before the parent context.
+        await disposeSequenceThenContext(sequence, context);
+      }
+    });
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
@@ -1601,99 +1659,99 @@ export class LlamaCpp implements LLM {
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
 
-    const llama = await this.ensureLlama();
-    await this.ensureGenerateModel();
+    return this.runOperation(async () => {
+      const llama = await this.ensureLlama();
+      await this.ensureGenerateModel();
 
-    const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
+      const includeLexical = options.includeLexical ?? true;
+      const context = options.context;
 
-    // The expansion prompt consumes ONLY the query text. Caller intent is
-    // free-form meta-language that the expansion model reproduced verbatim as
-    // lex/vec sub-queries — degenerate terms that match nothing. Intent still
-    // shapes retrieval where it belongs: the reranker query prefix and
-    // keyword-based chunk/snippet selection.
-    const prompt = `/no_think Expand this search query: ${query}`;
+      // The expansion prompt consumes ONLY the query text. Caller intent is
+      // free-form meta-language that the expansion model reproduced verbatim as
+      // lex/vec sub-queries — degenerate terms that match nothing. Intent still
+      // shapes retrieval where it belongs: the reranker query prefix and
+      // keyword-based chunk/snippet selection.
+      const prompt = `/no_think Expand this search query: ${query}`;
 
-    // Set up inside the try so any failure (grammar creation, context
-    // allocation/VRAM, session prompt) falls back to the original query
-    // instead of propagating and failing the caller's operation.
-    let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
-    let sequence: { dispose: () => void | Promise<void> } | undefined;
-    try {
-      const grammar = await llama.createGrammar({
-        grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-      });
+      // Set up inside the try so any failure (grammar creation, context
+      // allocation/VRAM, session prompt) falls back to the original query
+      // instead of propagating and failing the caller's operation.
+      let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
+      let sequence: { dispose: () => void | Promise<void> } | undefined;
+      try {
+        const grammar = await llama.createGrammar({
+          grammar: `
+          root ::= line+
+          line ::= type ": " content "\\n"
+          type ::= "lex" | "vec" | "hyde"
+          content ::= [^\\n]+
+        `
+        });
 
-      // Create a bounded context for expansion to prevent large default VRAM allocations.
-      genContext = await this.generateModel!.createContext({
-        contextSize: this.expandContextSize,
-      });
-      sequence = genContext.getSequence();
-      const { LlamaChatSession } = await loadNodeLlamaCpp();
-      const session = new LlamaChatSession({ contextSequence: sequence });
+        // Create a bounded context for expansion to prevent large default VRAM allocations.
+        genContext = await this.generateModel!.createContext({
+          contextSize: this.expandContextSize,
+        });
+        sequence = genContext.getSequence();
+        const { LlamaChatSession } = await loadNodeLlamaCpp();
+        const session = new LlamaChatSession({ contextSequence: sequence });
 
-      // Qwen3 recommended settings for non-thinking mode:
-      // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
-      // DO NOT use greedy decoding (temp=0) - causes infinite loops
-      const result = await session.prompt(prompt, {
-        grammar,
-        maxTokens: 600,
-        temperature: 0.7,
-        topK: 20,
-        topP: 0.8,
-        repeatPenalty: {
-          lastTokens: 64,
-          presencePenalty: 0.5,
-        },
-      });
+        // Qwen3 recommended settings for non-thinking mode:
+        // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
+        // DO NOT use greedy decoding (temp=0) - causes infinite loops
+        const result = await session.prompt(prompt, {
+          grammar,
+          maxTokens: 600,
+          temperature: 0.7,
+          topK: 20,
+          topP: 0.8,
+          repeatPenalty: {
+            lastTokens: 64,
+            presencePenalty: 0.5,
+          },
+        });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+        const lines = result.trim().split("\n");
+        const queryLower = query.toLowerCase();
+        const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
 
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
+        const hasQueryTerm = (text: string): boolean => {
+          const lower = text.toLowerCase();
+          if (queryTerms.length === 0) return true;
+          return queryTerms.some(term => lower.includes(term));
+        };
 
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
+        const queryables: Queryable[] = lines.map(line => {
+          const colonIdx = line.indexOf(":");
+          if (colonIdx === -1) return null;
+          const type = line.slice(0, colonIdx).trim();
+          if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+          const text = line.slice(colonIdx + 1).trim();
+          if (!hasQueryTerm(text)) return null;
+          return { type: type as QueryType, text };
+        }).filter((q): q is Queryable => q !== null);
 
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
+        // Filter out lex entries if not requested
+        const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+        if (filtered.length > 0) return filtered;
 
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
-    } catch (error) {
-      console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
-    } finally {
-      if (genContext) await disposeSequenceThenContext(sequence, genContext);
-    }
+        const fallback: Queryable[] = [
+          { type: 'hyde', text: `Information about ${query}` },
+          { type: 'lex', text: query },
+          { type: 'vec', text: query },
+        ];
+        return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      } catch (error) {
+        console.error("Structured query expansion failed:", error);
+        // Fallback to original query
+        const fallback: Queryable[] = [{ type: 'vec', text: query }];
+        if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+        return fallback;
+      } finally {
+        if (genContext) await disposeSequenceThenContext(sequence, genContext);
+      }
+    });
   }
 
   // Qwen3 reranker chat template overhead (system prompt, tags, separators).
@@ -1708,99 +1766,99 @@ export class LlamaCpp implements LLM {
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
 
-    const contexts = await this.ensureRerankContexts();
-    if (contexts.length === 0) {
+    return this.runOperation(async () => {
+      const contexts = await this.ensureRerankContexts();
+      if (contexts.length === 0) {
+        return {
+          results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
+          model: "fallback",
+        };
+      }
+      const model = await this.ensureRerankModel();
+
+      // Truncate documents that would exceed the rerank context size.
+      // Budget = contextSize - template overhead - query tokens
+      const queryTokens = model.tokenize(query).length;
+      const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+      const truncationCache = new Map<string, string>();
+
+      const truncatedDocs = documents.map((doc) => {
+        const cached = truncationCache.get(doc.text);
+        if (cached !== undefined) {
+          return cached === doc.text ? doc : { ...doc, text: cached };
+        }
+
+        const tokens = model.tokenize(doc.text);
+        const truncatedText = tokens.length <= maxDocTokens
+          ? doc.text
+          : model.detokenize(tokens.slice(0, maxDocTokens));
+        truncationCache.set(doc.text, truncatedText);
+
+        if (truncatedText === doc.text) return doc;
+        return { ...doc, text: truncatedText };
+      });
+
+      // Deduplicate identical effective texts before scoring.
+      // This avoids redundant work for repeated chunks and fixes collisions where
+      // multiple docs map to the same chunk text.
+      const textToDocs = new Map<string, { file: string; index: number }[]>();
+      truncatedDocs.forEach((doc, index) => {
+        const existing = textToDocs.get(doc.text);
+        if (existing) {
+          existing.push({ file: doc.file, index });
+        } else {
+          textToDocs.set(doc.text, [{ file: doc.file, index }]);
+        }
+      });
+
+      // Extract just the text for ranking
+      const texts = Array.from(textToDocs.keys());
+
+      // Split documents across contexts for parallel evaluation.
+      // Each context has its own sequence with a lock, so parallelism comes
+      // from multiple contexts evaluating different chunks simultaneously.
+      const activeContextCount = Math.max(
+        1,
+        Math.min(
+          contexts.length,
+          Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+        )
+      );
+      const activeContexts = contexts.slice(0, activeContextCount);
+      const chunkSize = Math.ceil(texts.length / activeContexts.length);
+      const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
+        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+      ).filter(chunk => chunk.length > 0);
+
+      const allScores = await Promise.all(
+        chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
+      );
+
+      // Reassemble scores in original order and sort
+      const flatScores = allScores.flat();
+      const ranked = texts
+        .map((text, i) => ({ document: text, score: flatScores[i]! }))
+        .sort((a, b) => b.score - a.score);
+
+      // Map back to our result format.
+      const results: RerankDocumentResult[] = [];
+      for (const item of ranked) {
+        const docInfos = textToDocs.get(item.document) ?? [];
+        for (const docInfo of docInfos) {
+          results.push({
+            file: docInfo.file,
+            score: item.score,
+            index: docInfo.index,
+          });
+        }
+      }
+
       return {
-        results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
-        model: "fallback",
+        results,
+        model: this.rerankModelUri,
       };
-    }
-    const model = await this.ensureRerankModel();
-
-    // Truncate documents that would exceed the rerank context size.
-    // Budget = contextSize - template overhead - query tokens
-    const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
-    const truncationCache = new Map<string, string>();
-
-    const truncatedDocs = documents.map((doc) => {
-      const cached = truncationCache.get(doc.text);
-      if (cached !== undefined) {
-        return cached === doc.text ? doc : { ...doc, text: cached };
-      }
-
-      const tokens = model.tokenize(doc.text);
-      const truncatedText = tokens.length <= maxDocTokens
-        ? doc.text
-        : model.detokenize(tokens.slice(0, maxDocTokens));
-      truncationCache.set(doc.text, truncatedText);
-
-      if (truncatedText === doc.text) return doc;
-      return { ...doc, text: truncatedText };
     });
-
-    // Deduplicate identical effective texts before scoring.
-    // This avoids redundant work for repeated chunks and fixes collisions where
-    // multiple docs map to the same chunk text.
-    const textToDocs = new Map<string, { file: string; index: number }[]>();
-    truncatedDocs.forEach((doc, index) => {
-      const existing = textToDocs.get(doc.text);
-      if (existing) {
-        existing.push({ file: doc.file, index });
-      } else {
-        textToDocs.set(doc.text, [{ file: doc.file, index }]);
-      }
-    });
-
-    // Extract just the text for ranking
-    const texts = Array.from(textToDocs.keys());
-
-    // Split documents across contexts for parallel evaluation.
-    // Each context has its own sequence with a lock, so parallelism comes
-    // from multiple contexts evaluating different chunks simultaneously.
-    const activeContextCount = Math.max(
-      1,
-      Math.min(
-        contexts.length,
-        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
-      )
-    );
-    const activeContexts = contexts.slice(0, activeContextCount);
-    const chunkSize = Math.ceil(texts.length / activeContexts.length);
-    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
-      texts.slice(i * chunkSize, (i + 1) * chunkSize)
-    ).filter(chunk => chunk.length > 0);
-
-    const allScores = await Promise.all(
-      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
-    );
-
-    // Reassemble scores in original order and sort
-    const flatScores = allScores.flat();
-    const ranked = texts
-      .map((text, i) => ({ document: text, score: flatScores[i]! }))
-      .sort((a, b) => b.score - a.score);
-
-    // Map back to our result format.
-    const results: RerankDocumentResult[] = [];
-    for (const item of ranked) {
-      const docInfos = textToDocs.get(item.document) ?? [];
-      for (const docInfo of docInfos) {
-        results.push({
-          file: docInfo.file,
-          score: item.score,
-          index: docInfo.index,
-        });
-      }
-    }
-
-    return {
-      results,
-      model: this.rerankModelUri,
-    };
   }
 
   /**

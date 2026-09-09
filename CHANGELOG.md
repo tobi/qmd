@@ -6,6 +6,10 @@
 
 - Added Oxlint lint fence.
 
+### Fixed
+
+- Fixed idle LLM resource disposal racing active operations on per-store LLM instances (HTTP MCP daemon): `LlamaCpp` now tracks in-flight operations per instance, the inactivity timer refuses to unload while any operation runs, `unloadIdleResources()` waits for operations to drain, and new operations wait for an unload to finish. Prevents `DisposedError` and the native `llama_free` use-after-free crash during long embedding/rerank requests (#947, #935, #938).
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
