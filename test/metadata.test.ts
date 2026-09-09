@@ -73,6 +73,19 @@ describe("extractDocumentMetadata", () => {
     expect(extraction.metadata["topics"]).toEqual(["b", "a", "c"]);
   });
 
+  test("treats prototype-shaped metadata keys as ordinary data", () => {
+    const extraction = extractDocumentMetadata(
+      buildDoc("qmd:\n  metadata:\n    __proto__: inherited\n    constructor: built\n"),
+      "doc.md",
+    );
+    expect(Object.keys(extraction.metadata)).toEqual(["__proto__", "constructor"]);
+    expect(extraction.metadata["__proto__"]).toBe("inherited");
+    expect(extraction.metadata["constructor"]).toBe("built");
+    expect(JSON.stringify(extraction.metadata)).toBe(
+      '{"__proto__":"inherited","constructor":"built"}',
+    );
+  });
+
   test("tolerates BOM, CRLF, and '...' closing marker", () => {
     const bomDoc = "\uFEFF---\nqmd:\n  metadata:\n    status: ok\n---\nBody\n";
     expect(extractDocumentMetadata(bomDoc, "doc.md").metadata).toEqual({ status: "ok" });

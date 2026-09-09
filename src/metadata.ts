@@ -173,12 +173,15 @@ function normalizeMetadata(rawMetadata: Record<string, unknown>): DocumentMetada
     throw new Error(`metadata has ${keys.length} keys (max ${METADATA_LIMITS.maxKeys})`);
   }
 
-  const metadata: DocumentMetadata = {};
+  const entries: [string, MetadataValue][] = [];
   for (const key of keys) {
     validateMetadataKey(key);
-    metadata[key] = normalizeMetadataValue(key, rawMetadata[key]);
+    entries.push([key, normalizeMetadataValue(key, rawMetadata[key])]);
   }
-  return metadata;
+  // Object.fromEntries defines "__proto__" as ordinary data instead of
+  // invoking Object.prototype's legacy setter. Metadata keys are unrestricted
+  // user data, so prototype-shaped names must round-trip like every other key.
+  return Object.fromEntries(entries);
 }
 
 function validateMetadataKey(key: string): void {
@@ -236,13 +239,18 @@ function normalizeMetadataArray(key: string, rawValues: unknown[]): MetadataScal
     return normalizeMetadataScalar(key, rawValue);
   });
 
-  const elementType = typeof scalars[0];
-  if (scalars.some(scalar => typeof scalar !== elementType)) {
-    throw new Error(`metadata key "${key}": mixed-type arrays are not supported`);
+  // Narrow each homogeneous case explicitly so the public array union remains
+  // precise without discarding type evidence through chained assertions.
+  if (scalars.every((scalar): scalar is string => typeof scalar === "string")) {
+    return Array.from(new Set(scalars));
   }
-
-  // De-duplicate while preserving first-seen order.
-  return Array.from(new Set(scalars)) as unknown as MetadataScalarArray;
+  if (scalars.every((scalar): scalar is number => typeof scalar === "number")) {
+    return Array.from(new Set(scalars));
+  }
+  if (scalars.every((scalar): scalar is boolean => typeof scalar === "boolean")) {
+    return Array.from(new Set(scalars));
+  }
+  throw new Error(`metadata key "${key}": mixed-type arrays are not supported`);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

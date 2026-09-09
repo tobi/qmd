@@ -438,12 +438,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collections ?? []),
       ];
       const skipRerank = opts.rerank === false;
+      // The SDK is also a JavaScript boundary: TypeScript declarations do not
+      // protect plain-JS callers or deserialized input. Apply the same bounded,
+      // strict validation used by CLI, MCP, and HTTP before compiling SQL.
+      const filter = opts.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
 
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
-          filter: opts.filter,
+          filter,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -457,7 +461,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
         collection: collections.length > 0 ? collections : undefined,
-        filter: opts.filter,
+        filter,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -467,8 +471,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.filter),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, opts?.filter),
+    searchLex: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
+    },
+    searchVector: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+    },
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

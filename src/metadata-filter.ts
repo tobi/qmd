@@ -226,13 +226,18 @@ function parseMembershipValues(value: unknown, operator: string, path: string): 
 
   const scalars = value.map((element, index) => parseScalarValue(element, `${path}.value[${index}]`));
 
-  const elementType = typeof scalars[0];
-  if (scalars.some(scalar => typeof scalar !== elementType)) {
-    throw new MetadataFilterError(`${path}.value`, `'${operator}' requires a homogeneous array of one scalar type`);
+  // Narrow each homogeneous case explicitly so the public array union remains
+  // precise without discarding type evidence through chained assertions.
+  if (scalars.every((scalar): scalar is string => typeof scalar === "string")) {
+    return Array.from(new Set(scalars));
   }
-
-  // Canonicalize: de-duplicate while preserving first-seen order.
-  return Array.from(new Set(scalars)) as unknown as MetadataScalarArray;
+  if (scalars.every((scalar): scalar is number => typeof scalar === "number")) {
+    return Array.from(new Set(scalars));
+  }
+  if (scalars.every((scalar): scalar is boolean => typeof scalar === "boolean")) {
+    return Array.from(new Set(scalars));
+  }
+  throw new MetadataFilterError(`${path}.value`, `'${operator}' requires a homogeneous array of one scalar type`);
 }
 
 function parseScalarValue(value: unknown, path: string): MetadataScalar {

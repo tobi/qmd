@@ -88,6 +88,12 @@ describe("SDK metadata filter", () => {
     const status = await store.getStatus();
     expect(status.pendingMetadata).toBe(0);
   });
+
+  test("validates filters at the SDK runtime boundary", async () => {
+    await expect(store.searchLex("sdk keyword", {
+      filter: { operator: "and", operands: [] },
+    })).rejects.toThrow(/non-empty 'operands'/);
+  });
 });
 
 // =============================================================================
@@ -142,7 +148,9 @@ describe("MCP and HTTP metadata filter", () => {
     await rm(configDir, { recursive: true, force: true });
   });
 
-  async function postJson(path: string, body: object): Promise<{ status: number; json: any }> {
+  type HttpRequestBody = Record<string, unknown>;
+
+  async function postJson(path: string, body: HttpRequestBody): Promise<{ status: number; json: any }> {
     const res = await fetch(`${baseUrl}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
