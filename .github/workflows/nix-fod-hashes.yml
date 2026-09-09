@@ -1,0 +1,213 @@
+name: Update Nix FOD hashes
+
+# Computes per-platform FOD (fixed-output derivation) hashes for
+# qmd-node-modules by building on a 4-platform matrix, then opens a PR
+# with the updated hashes.
+#
+# This addresses the maintenance burden Toby identified in PR #55:
+#   "can you add a workflow to update the hashes on release tags?"
+# and implements the approach Mic92 suggested:
+#   "build matrix over the 4 architectures + collector job that updates
+#    the hashes file."
+#
+# The qmd-node-modules FOD runs `bun install --frozen-lockfile` to produce
+# a node_modules store path. Because bun.lock carries platform-gated
+# optional dependencies (@esbuild/darwin-arm64, @esbuild/linux-x64, etc.),
+# the installed tree differs per system — a single outputHash cannot be
+# shared across all four platforms. This workflow computes each platform's
+# hash by building the FOD on a runner matching that platform.
+#
+# Triggers:
+# - On bun.lock / package.json / flake.nix changes (catches dependency bumps)
+# - Daily schedule (catches nixpkgs-unstable drift that changes the FOD output)
+# - Manual dispatch (for one-off updates, e.g. after adding a new platform)
+
+on:
+  push:
+    paths:
+      - bun.lock
+      - package.json
+      - flake.nix
+      - .github/workflows/nix-fod-hashes.yml
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  # id-token: write is required by magic-nix-cache-action for the GitHub
+  # Actions cache v2 API (OIDC token exchange for cache auth).
+  id-token: write
+
+concurrency:
+  group: nix-fod-hashes
+  cancel-in-progress: true
+
+jobs:
+  compute-hash:
+    name: Compute FOD hash (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: x86_64-darwin
+            runner: macos-26-intel
+          - system: aarch64-darwin
+            runner: macos-26
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Compute FOD hash for ${{ matrix.system }}
+        env:
+          TARGET_SYSTEM: ${{ matrix.system }}
+        run: |
+          set -euo pipefail
+
+          # Temporarily set this platform's hash to fakeHash so the FOD
+          # build fails with a hash mismatch error revealing the correct hash.
+          python3 <<'PYEOF'
+          import re, os, sys
+          system = os.environ["TARGET_SYSTEM"]
+          src = open("flake.nix").read()
+          # Match: <system> = "sha256-...";  OR  <system> = pkgs.lib.fakeHash;
+          pattern = r'^(\s*' + re.escape(system) + r' = )(?:\"sha256-[^\"]*\"|pkgs\.lib\.fakeHash);'
+          new_src, n = re.subn(
+              pattern,
+              lambda m: m.group(1) + "pkgs.lib.fakeHash;",
+              src,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if n != 1:
+              print(f"ERROR: could not find hash entry for {system} in flake.nix", file=sys.stderr)
+              sys.exit(1)
+          open("flake.nix", "w").write(new_src)
+          print(f"Set {system} hash to fakeHash for build")
+          PYEOF
+
+          # Build the FOD — it will fail with a hash mismatch showing the
+          # correct hash in the "got:" line.
+          nix build .#qmd-node-modules --no-link 2>&1 | tee build.log || true
+
+          # Extract the correct SRI hash from the mismatch error.
+          HASH=$(grep 'got:' build.log | sed 's/.*got: *//' | tr -d ' ' | head -1)
+
+          if [ -z "$HASH" ]; then
+            echo "ERROR: no hash mismatch found — the FOD build may have failed"
+            echo "for reasons other than a hash mismatch. See build.log above." >&2
+            exit 1
+          fi
+
+          if ! echo "$HASH" | grep -q '^sha256-'; then
+            echo "ERROR: extracted hash does not look like an SRI hash: $HASH" >&2
+            exit 1
+          fi
+
+          echo "Computed FOD hash for ${TARGET_SYSTEM}: ${HASH}"
+          echo "$HASH" > "fod-hash-${TARGET_SYSTEM}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fod-hash-${{ matrix.system }}
+          path: fod-hash-${{ matrix.system }}.txt
+
+  update-flake:
+    name: Update flake.nix with computed hashes
+    needs: compute-hash
+    runs-on: ubuntu-latest
+    if: github.repository == 'tobi/qmd'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download all hash artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: hashes
+          pattern: fod-hash-*
+
+      - name: Update flake.nix with new hashes
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import os, re, glob, sys
+
+          src = open("flake.nix").read()
+          changed = False
+
+          for system in ["x86_64-linux", "aarch64-linux", "x86_64-darwin", "aarch64-darwin"]:
+              artifact_dir = f"hashes/fod-hash-{system}"
+              if not os.path.isdir(artifact_dir):
+                  print(f"WARNING: no artifact for {system}, skipping")
+                  continue
+              files = os.listdir(artifact_dir)
+              if not files:
+                  print(f"WARNING: empty artifact for {system}, skipping")
+                  continue
+              new_hash = open(os.path.join(artifact_dir, files[0])).read().strip()
+              if not new_hash.startswith("sha256-"):
+                  print(f"WARNING: invalid hash for {system}: {new_hash}")
+                  continue
+
+              # Match: <system> = "sha256-...";  OR  <system> = pkgs.lib.fakeHash;
+              pattern = r'^(\s*' + re.escape(system) + r' = )(?:\"sha256-[^\"]*\"|pkgs\.lib\.fakeHash);'
+              match = re.search(pattern, src, re.MULTILINE)
+              if not match:
+                  print(f"WARNING: could not find hash entry for {system} in flake.nix")
+                  continue
+              old_line = match.group(0)
+              new_line = match.group(1) + f'"{new_hash}";'
+              if old_line != new_line:
+                  src = src.replace(old_line, new_line, 1)
+                  changed = True
+                  print(f"Updated {system} -> {new_hash}")
+              else:
+                  print(f"{system} already current: {new_hash}")
+
+          if changed:
+              open("flake.nix", "w").write(src)
+              print("\nflake.nix updated with new FOD hashes")
+          else:
+              print("\nAll hashes current — no PR needed")
+              open(".no-changes", "w").write("")
+          PYEOF
+
+      - name: Open PR
+        if: hashFiles('.no-changes') == ''
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(nix): update qmd-node-modules FOD hashes"
+          title: "chore(nix): update qmd-node-modules FOD hashes"
+          branch: chore/nix-fod-hashes
+          body: |
+            Auto-generated by the `Update Nix FOD hashes` workflow.
+
+            Computes per-platform FOD (fixed-output derivation) hashes for
+            `qmd-node-modules` by building on a 4-platform matrix
+            (x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin)
+            and updates `flake.nix` with the results.
+
+            This addresses the maintenance burden Toby identified in #55
+            and implements the approach Mic92 suggested: a build matrix
+            over the 4 architectures with a collector job that updates
+            the hashes file.
+
+            Note: PRs opened by `GITHUB_TOKEN` do not trigger downstream
+            workflow runs (e.g. CI), so this PR will show no checks.
+            Review the diff before merging — it should be hash value
+            changes in `nodeModulesHashes` with no other modifications.
