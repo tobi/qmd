@@ -14,6 +14,32 @@
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
 
+### Changed
+
+- MCP daemon and embed-lock files now use structured process identity. A
+  pre-upgrade numeric file is acted on only when the live process command line
+  verifies the expected QMD role; otherwise it is left untouched.
+
+### Fixed
+
+- MCP daemon state and embed locks now bind a PID to its process start time
+  and role, preventing recycled or unrelated PIDs from being treated as their
+  owner. This also restores daemon and embedding-lock lifecycle checks on
+  native Windows.
+- Embed locks are published exclusively from a flushed temporary file. Fresh
+  malformed locks fail closed; unchanged malformed locks are reclaimed after
+  a 30-second grace period with a path-specific recovery message.
+- Legacy numeric state is recognized only when the live process command line
+  matches the expected QMD role, preserving safe upgrades on POSIX systems.
+- Source-checkout MCP daemons now pass the TSX loader as a file URL, allowing
+  detached daemon launches from Windows drive-letter paths.
+- Bun source-checkout daemons now launch TypeScript directly instead of
+  receiving Node's TSX loader flags.
+- Windows start identity now uses the CIM process creation timestamp, including
+  for protected system processes where `Process.StartTime` is inaccessible.
+- If a process-start token cannot be obtained, daemon and embed state falls
+  back to a legacy PID record that remains fail-closed while the PID is live.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
