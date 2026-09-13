@@ -145,7 +145,7 @@ qmd mcp stop                      # stop via PID file
 qmd status                        # shows "MCP: running (PID ...)" when active
 ```
 
-The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
+The server serves both loopbacks (`127.0.0.1` and `::1`) by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
