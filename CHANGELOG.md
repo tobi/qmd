@@ -14,6 +14,18 @@
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
 
+### Changed
+
+- `qmd cleanup` repacks the vector table when fewer than 90% of its chunk
+  reads hold live rows. vec0 fills the first free slot of its newest chunk
+  and reclaims a chunk only once it is empty, so re-embeds and orphan removal
+  leave holes in older chunks that every brute-force scan still reads; a
+  794k-vector index at 36% occupancy scanned twice as slowly as a packed copy
+  of the same rows. The repack moves the live rows of each mostly-empty chunk
+  to the tail, one chunk per short transaction, so it never holds the write
+  lock for long and an interrupted run leaves a consistent table. The cleanup
+  output and `qmd cleanup --dry-run` report the chunk counts.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

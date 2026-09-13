@@ -1133,7 +1133,7 @@ qmd multi-get "docs/*.md" --max-bytes 20480
 # Output multi-get as JSON for agent processing
 qmd multi-get "docs/*.md" --json
 
-# Clean up cache and orphaned data
+# Drop caches and orphans; repack the vector table when it has holes
 qmd cleanup
 ```
 

@@ -59,6 +59,7 @@ import {
   countOrphanedVectors,
   previewCleanup,
   runCleanup,
+  type VectorTableLayout,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
@@ -2703,6 +2704,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
   warnUnresolvedFullPaths(unresolvedCount, filtered.length);
 }
 
+function describeVectorLayout(layout: VectorTableLayout): string {
+  return `${layout.chunks} chunks for ${layout.neededChunks} needed, ${Math.round(layout.occupancy * 100)}% useful`;
+}
+
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
@@ -4995,12 +5000,19 @@ if (isMain) {
         if (stats.orphanedContent > 0) {
           console.log(`Would remove ${stats.orphanedContent} orphaned content hashes`);
         }
+        if (stats.vectorLayout) {
+          console.log(stats.vectorsRepacked
+            ? `Would repack the vector table (${describeVectorLayout(stats.vectorLayout)})`
+            : `${c.dim}Vector table is packed (${describeVectorLayout(stats.vectorLayout)})${c.reset}`);
+        }
         console.log("Would compact FTS and vacuum the database");
         closeDb();
         break;
       }
 
-      const stats = runCleanup(db);
+      const stats = runCleanup(db, {
+        onVectorRepack: (layout) => console.log(`Repacking the vector table (${describeVectorLayout(layout)})...`),
+      });
       console.log(`${c.green}✓${c.reset} Cleared ${stats.cacheCount} cached API responses`);
       if (stats.orphanedVectors > 0) {
         console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedVectors} orphaned embedding chunks`);
@@ -5012,6 +5024,11 @@ if (isMain) {
       }
       if (stats.orphanedContent > 0) {
         console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedContent} orphaned content hashes`);
+      }
+      if (stats.vectorLayout) {
+        console.log(stats.vectorsRepacked
+          ? `${c.green}✓${c.reset} Repacked the vector table (${describeVectorLayout(stats.vectorLayout)})`
+          : `${c.dim}Vector table is packed (${describeVectorLayout(stats.vectorLayout)})${c.reset}`);
       }
       console.log(`${c.green}✓${c.reset} FTS compacted, database vacuumed`);
 
