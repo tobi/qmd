@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- The default HTTP MCP server now listens on both IPv4 and IPv6 loopback addresses.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

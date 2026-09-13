@@ -868,6 +868,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
 // =============================================================================
 
 export type HttpServerHandle = {
+  /** First bound listener; close() closes every listener. */
   httpServer: import("http").Server;
   port: number;
   stop: () => Promise<void>;
@@ -875,9 +876,10 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses by default).
- * Binds to `options.host` (default "localhost", overridable via the QMD_HOST
- * env var) — set "0.0.0.0" to accept connections from other hosts, e.g. a
- * container liveness probe. Returns a handle for shutdown and port discovery.
+ * Serves both loopbacks (127.0.0.1 and ::1) for the default "localhost" host.
+ * Override via `options.host` or QMD_HOST — set "0.0.0.0" to accept connections
+ * from other hosts, e.g. a container liveness probe. Returns a handle for
+ * shutdown and port discovery.
  *
  * HTTP is sessionless (MCP 2026-07-28): there is no `Mcp-Session-Id`, no
  * initialize handshake, and no idle-session TTL. 2025-era clients are still
@@ -979,7 +981,7 @@ export async function startMcpHttpServer(
     ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
   });
 
-  const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
+  const requestHandler = async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
     const reqStart = Date.now();
     const pathname = (nodeReq.url || "/").split("?")[0];
 
@@ -1143,21 +1145,61 @@ export async function startMcpHttpServer(
       nodeRes.writeHead(500);
       nodeRes.end("Internal Server Error");
     }
-  });
+  };
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.on("error", reject);
-    httpServer.listen(port, host, () => resolve());
-  });
+  const httpServers: import("http").Server[] = [];
+  let actualPort = port;
+  try {
+    let unavailableError: unknown;
+    // Bind IPv4 first, then IPv6 on the same port, including for port 0.
+    for (const bindHost of host === "localhost" ? ["127.0.0.1", "::1"] : [host]) {
+      const server = createServer(requestHandler);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(actualPort, bindHost, () => {
+            server.removeListener("error", reject);
+            resolve();
+          });
+        });
+        httpServers.push(server);
+        actualPort = (server.address() as import("net").AddressInfo).port;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (host !== "localhost" || (code !== "EADDRNOTAVAIL" && code !== "EAFNOSUPPORT")) throw error;
+        unavailableError = error;
+      }
+    }
+    if (httpServers.length === 0) throw unavailableError;
+  } catch (error) {
+    await Promise.all(httpServers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+    await mcpHandler.close();
+    await store.close();
+    throw error;
+  }
 
-  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
+  const httpServer = httpServers[0]!;
+  if (httpServers.length > 1) {
+    const closeListeners = httpServers.map(server => server.close.bind(server));
+    httpServer.close = (callback) => {
+      let remaining = closeListeners.length;
+      let closeError: Error | undefined;
+      for (const close of closeListeners) {
+        close(error => {
+          closeError ??= error;
+          if (--remaining === 0) callback?.(closeError);
+        });
+      }
+      return httpServer;
+    };
+  }
 
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     await mcpHandler.close();
-    httpServer.close();
+    await new Promise<void>(resolve => httpServer.close(() => resolve()));
     await store.close();
   };
 

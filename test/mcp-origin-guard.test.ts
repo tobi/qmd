@@ -112,6 +112,14 @@ describe("checkRequestOrigin", () => {
     }
   });
 
+  test("allows every loopback Host and Origin combination", () => {
+    for (const host of ["127.0.0.1:12345", "[::1]:12345", "localhost:12345"]) {
+      for (const origin of ["http://127.0.0.1:12345", "http://[::1]:12345", "http://localhost:12345"]) {
+        expect(checkRequestOrigin({ host, origin }, guard).ok).toBe(true);
+      }
+    }
+  });
+
   test("rejects a foreign Origin", () => {
     const verdict = checkRequestOrigin({ origin: "https://evil.example", host: "localhost:8181" }, guard);
     expect(verdict.ok).toBe(false);
