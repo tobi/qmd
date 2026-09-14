@@ -1628,6 +1628,46 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS scope is exact when an out-of-scope collection fills the candidate window (#922)", async () => {
+    const store = await createTestStore();
+    const noise = await createTestCollection({ name: "noise", pwd: "/test/noise" });
+    const target = await createTestCollection({ name: "target", pwd: "/test/target" });
+    const other = await createTestCollection({ name: "other", pwd: "/test/other" });
+
+    // limit=5 made the old scoped window limit*10 = 50: exactly as many
+    // stronger out-of-scope hits as fit in it.
+    for (let i = 0; i < 50; i++) {
+      await insertTestDocument(store.db, noise, {
+        name: `noise-${i}`,
+        title: "alpha alpha",
+        body: `Noise ${i}: alpha alpha alpha.`,
+        displayPath: `noise-${i}.md`,
+      });
+    }
+    await insertTestDocument(store.db, target, {
+      name: "t",
+      title: "Target",
+      body: `${"Unrelated prose. ".repeat(40)}One weaker mention of alpha.`,
+      displayPath: "t.md",
+    });
+    await insertTestDocument(store.db, other, {
+      name: "o",
+      title: "Other",
+      body: "Nothing relevant here.",
+      displayPath: "o.md",
+    });
+
+    expect(store.searchFTS("alpha", 5).every(r => r.collectionName === noise)).toBe(true);
+
+    const single = store.searchFTS("alpha", 5, target);
+    expect(single.map(r => r.displayPath)).toEqual([`${target}/t.md`]);
+
+    const multi = store.searchFTS("alpha", 5, [target, other]);
+    expect(multi.map(r => r.displayPath)).toEqual([`${target}/t.md`]);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS finds CJK documents by exact and mixed queries", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

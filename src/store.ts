@@ -4097,20 +4097,21 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // query into a 17-second query on large collections.
   const params: (string | number)[] = [ftsQuery];
 
-  // When filtering by collection or metadata, fetch extra candidates from the
-  // FTS index since some will be filtered out. Without a filter we can fetch
-  // exactly the requested limit. Selective filters remain best-effort: an
-  // eligible document outside this candidate window is missed (same
-  // completeness contract as collection filtering).
-  const ftsLimit = (collectionFilter || filter) ? limit * 10 : limit;
+  // Unscoped, the MATCH is the whole answer: LIMIT inside the CTE lets FTS5
+  // stop at the requested count. Scoped by collection or metadata, the filter
+  // must see the COMPLETE match set — any inner LIMIT (the old `limit * 10`)
+  // returns false-empty results whenever stronger out-of-scope matches fill
+  // the window (#922). MATERIALIZED keeps the planner from flattening the CTE
+  // and folding the filter back into the MATCH. The set is corpus-bounded:
+  // at most one row per matching document.
+  const scoped = Boolean(collectionFilter || filter);
 
   let sql = `
-    WITH fts_matches AS (
+    WITH fts_matches AS ${scoped ? "MATERIALIZED " : ""}(
       SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
       FROM documents_fts
       WHERE documents_fts MATCH ?
-      ORDER BY bm25_score ASC
-      LIMIT ${ftsLimit}
+      ${scoped ? "" : `ORDER BY bm25_score ASC LIMIT ${limit}`}
     )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
