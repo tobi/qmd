@@ -764,7 +764,8 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role, or `openai:<model id>` for a remote server (see [Remote models](#remote-models-openai-compatible)). |
+| `models.openai_base_url` / `.openai_api_key` / `.openai_generate_params` | top-level | Endpoint, bearer token and extra chat-completion fields for `openai:` models. |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
@@ -1232,6 +1233,8 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| `QMD_OPENAI_BASE_URL` | unset | Endpoint for `openai:` models when `models.openai_base_url` is not set (see [Remote models](#remote-models-openai-compatible)) |
+| `QMD_OPENAI_API_KEY` | unset | Bearer token for that endpoint; takes precedence over `models.openai_api_key` |
 
 ## How It Works
 
@@ -1359,6 +1362,33 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 Override them per-role without touching source via the `models:` block in
 `index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
 `QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
+
+### Remote models (OpenAI-compatible)
+
+On a machine without a usable GPU, or with an embedding/rerank server already
+running, point all three roles at an OpenAI-compatible endpoint instead of
+local GGUF files. The model URI prefix picks the backend, the way `hf:` does:
+
+```yaml
+models:
+  embed: openai:text-embedding-3-small     # POST {base_url}/embeddings
+  rerank: openai:rerank-2.5-lite           # POST {base_url}/rerank  (Jina/Voyage/Cohere/llama-server shape)
+  generate: openai:gpt-4.1-mini            # POST {base_url}/chat/completions, for query expansion
+  openai_base_url: http://127.0.0.1:8080/v1
+  openai_api_key: sk-…                     # or QMD_OPENAI_API_KEY, which wins
+  openai_generate_params:                  # optional, merged into every chat request
+    reasoning_effort: none                 # a reasoning model otherwise thinks through the whole budget
+```
+
+All three roles must be `openai:` or all local; one backend per index.
+`QMD_OPENAI_BASE_URL` stands in for `openai_base_url`. With a remote backend
+`qmd pull` has nothing to download, `qmd doctor` probes the endpoint
+(`GET /models`) instead of the GPU, and embedding text is sent as-is (no
+EmbeddingGemma prefix). Vectors are stored under the `openai:` URI, so
+switching backends is a model change like any other: `qmd embed -f`. A
+project-local `.qmd/index.yml` that sets `openai:` models or the endpoint is
+gated by `qmd trust` like any custom model, because it decides where your
+documents are sent.
 
 ### EmbeddingGemma Prompt Format
 

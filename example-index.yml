@@ -27,6 +27,15 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 #   embed: "hf:<user>/<repo>/<file>.gguf"
 #   rerank: "hf:<user>/<repo>/<file>.gguf"
 #   generate: "hf:<user>/<repo>/<file>.gguf"
+#
+# Or serve all three from an OpenAI-compatible endpoint (see "Remote models"
+# in the README): `openai:<model id>` URIs plus the endpoint.
+# models:
+#   embed: "openai:text-embedding-3-small"
+#   rerank: "openai:rerank-2.5-lite"
+#   generate: "openai:gpt-4.1-mini"
+#   openai_base_url: "http://127.0.0.1:8080/v1"
+#   openai_api_key: "…"            # or the QMD_OPENAI_API_KEY env var
 
 # ─── Collections ─────────────────────────────────────────────────────────────
 collections:

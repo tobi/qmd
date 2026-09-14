@@ -89,7 +89,7 @@ import {
 import { syncDocumentMetadata, countDocumentsPendingMetadata } from "../metadata-store.js";
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, type MetadataFilter } from "../metadata-filter.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, OpenAiLLM, createLlm, isOpenAiModelUri, resolveOpenAiBaseUrl, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, type LlmConfig } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -159,14 +159,10 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
+      // Untrusted project-local custom model URIs (and the endpoint they
+      // would send documents to) must not be used; status still displays the
+      // YAML values via resolveModelsForCli (#889).
+      const llm = createLlm(llmConfigForRuntime(activeModels, config));
       setDefaultLlamaCpp(llm);
       store.llm = llm;
     } catch {
@@ -174,6 +170,19 @@ function getStore(): ReturnType<typeof createStore> {
     }
   }
   return store;
+}
+
+/** Backend config the running process may use: the active models plus the
+ *  endpoint settings, unless the project-local config is untrusted, in which
+ *  case only the built-in/env defaults. */
+function llmConfigForRuntime(activeModels: { embed: string; generate: string; rerank: string }, config: CollectionConfig): LlmConfig {
+  if (!localConfigIsFullyTrusted()) return resolveModels();
+  return {
+    ...activeModels,
+    openaiBaseUrl: config.models?.openai_base_url,
+    openaiApiKey: config.models?.openai_api_key,
+    openaiGenerateParams: config.models?.openai_generate_params,
+  };
 }
 
 function getDb(): Database {
@@ -677,6 +686,9 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    if (isOpenAiModelUri(activeModels.embed)) {
+      console.log(`  Endpoint:    ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "(not configured)"}`);
+    }
   }
 
 
@@ -745,6 +757,7 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       embed: config.models?.embed,
       rerank: config.models?.rerank,
       generate: config.models?.generate,
+      openai_base_url: config.models?.openai_base_url,
     },
   };
 }
@@ -3869,6 +3882,10 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
+  add("QMD_OPENAI_BASE_URL", "endpoint for openai: models when models.openai_base_url is unset");
+  if (process.env.QMD_OPENAI_API_KEY?.trim()) {
+    overrides.push({ name: "QMD_OPENAI_API_KEY", value: "(set)", consequence: "bearer token for the OpenAI-compatible endpoint; overrides models.openai_api_key" });
+  }
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
@@ -4124,6 +4141,22 @@ function linuxCudaRuntimeDiagnostic(): string | null {
   return `NVIDIA driver libraries are visible, but CUDA user-space libraries are missing from loader paths (${missing.join(", ")})`;
 }
 
+async function runDoctorRemoteChecks(nextSteps: string[]): Promise<void> {
+  const llm = getDefaultLlamaCpp();
+  if (!(llm instanceof OpenAiLLM)) {
+    doctorCheck("remote endpoint", false, "openai: models configured but the backend is not OpenAiLLM (untrusted project-local config?). Next: `qmd trust`");
+    return;
+  }
+  try {
+    const models = await llm.listModels();
+    doctorCheck("remote endpoint", true, `${llm.endpoint} answers; ${models.length} models listed`);
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("remote endpoint", false, `${llm.endpoint}: ${message}. Next: check models.openai_base_url / QMD_OPENAI_BASE_URL and the API key`);
+    nextSteps.push("The OpenAI-compatible endpoint did not answer; embedding and query need it. Check the URL, the key and that the server is running.");
+  }
+}
+
 async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   const mode = configuredGpuModeLabel();
   doctorCheck("device mode", true, mode);
@@ -4141,7 +4174,9 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const llm = getDefaultLlamaCpp();
+    if (!(llm instanceof LlamaCpp)) throw new Error("default backend is not node-llama-cpp");
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
@@ -4236,9 +4271,13 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
-
-  await runDoctorDeviceChecks(nextSteps);
+  // Remote models have no cache and no device; the endpoint is what can fail.
+  if (isOpenAiModelUri(embedModel)) {
+    await runDoctorRemoteChecks(nextSteps);
+  } else {
+    checkModelCache(activeModels, nextSteps);
+    await runDoctorDeviceChecks(nextSteps);
+  }
 
   try {
     const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
@@ -4736,6 +4775,10 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
+      if (models.some(isOpenAiModelUri)) {
+        console.log(`Models are served by ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "the OpenAI-compatible endpoint"}; nothing to download.`);
+        break;
+      }
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,

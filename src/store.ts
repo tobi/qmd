@@ -20,7 +20,6 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -30,6 +29,7 @@ import {
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
+  type LLM,
 } from "./llm.js";
 import type {
   NamedCollection,
@@ -132,10 +132,10 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * Get the LLM instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
@@ -1502,8 +1502,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1979,7 +1979,7 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
- * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ * Uses the store's LLM instance if set, otherwise the global singleton.
  */
 export async function generateEmbeddings(
   store: Store,
@@ -2006,7 +2006,7 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's LLM or global singleton, wrapped in a session
   const embedModelUri = model;
 
   // Create a session manager for this llm instance
@@ -3249,9 +3249,12 @@ function stripUnpairedSurrogates(text: string): string {
  *
  * When filepath and chunkStrategy are provided, uses AST-aware break points
  * for supported code files.
+ *
+ * A backend without a tokenizer (remote models) keeps the character-space
+ * chunks as they are, with token counts estimated at the same ratio.
  */
 async function chunkDocumentByTokensWithLlm(
-  llm: LlamaCpp,
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -3271,6 +3274,13 @@ async function chunkDocumentByTokensWithLlm(
   // Use AST-aware chunking for the first pass when filepath/strategy provided
   let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
 
+  if (!llm.tokenize || !llm.detokenize) {
+    return charChunks
+      .map(chunk => ({ text: stripUnpairedSurrogates(chunk.text), pos: chunk.pos, tokens: Math.ceil(chunk.text.length / avgCharsPerToken) }))
+      .filter(chunk => chunk.text.length > 0);
+  }
+  const { tokenize, detokenize } = llm;
+
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
   const clampOverlapChars = (value: number, maxChars: number): number => {
@@ -3281,7 +3291,7 @@ async function chunkDocumentByTokensWithLlm(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
+    const tokens = await tokenize.call(llm, text);
     if (tokens.length <= maxTokens || text.length <= 1) {
       // Safety net: text.length <= 1 can only legitimately be a single
       // BMP character (a well-formed astral character needs 2 code units),
@@ -3326,7 +3336,7 @@ async function chunkDocumentByTokensWithLlm(
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
       // multiple tokens — truncating the token list can land mid-character.
-      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+      const truncatedText = stripUnpairedSurrogates(await detokenize.call(llm, fallbackTokens));
       if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
@@ -4233,7 +4243,7 @@ function annVecScan(
   `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -4387,7 +4397,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -4547,7 +4557,7 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
@@ -4572,7 +4582,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  // Note: backends use their configured model, the model parameter is ignored
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -4602,7 +4612,7 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
@@ -4629,7 +4639,7 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents with the backend
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });

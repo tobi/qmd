@@ -8,7 +8,8 @@
  * - `update:` — a shell command run by `qmd update` (#886)
  * - `collections.*.path` — any directory the process can read (#889)
  * - `models.embed` / `models.rerank` / `models.generate` — any `hf:` repo or
- *   local GGUF path (#889)
+ *   local GGUF path (#889), or an `openai:` model whose
+ *   `models.openai_base_url` receives every indexed document
  *
  * Global `~/.config/qmd` is never gated. In-project collection paths and the
  * built-in default model URIs are also allowed without approval: those are
@@ -35,12 +36,13 @@ export type CollectionPath = {
   path: string;
 };
 
-export type ModelSlot = "embed" | "rerank" | "generate";
+export type ModelSlot = "embed" | "rerank" | "generate" | "openai_base_url";
 
 export type ModelsSnapshot = {
   embed?: string;
   rerank?: string;
   generate?: string;
+  openai_base_url?: string;
 };
 
 export type SensitiveSnapshot = {
@@ -55,7 +57,7 @@ export type GatedItems = {
   models: Array<{ slot: ModelSlot; uri: string }>;
 };
 
-export type BuiltinModels = Required<ModelsSnapshot>;
+export type BuiltinModels = Required<Omit<ModelsSnapshot, "openai_base_url">>;
 
 export type TrustRecord = {
   /** Digest of the gated set that was approved. */
@@ -143,6 +145,9 @@ export function gatedModels(
     if (uri === builtins[slot]) continue;
     out.push({ slot, uri });
   }
+  // Part of the digest so that swapping the endpoint under approved
+  // `openai:` models re-arms the gate: it decides where documents are sent.
+  if (models.openai_base_url) out.push({ slot: "openai_base_url", uri: models.openai_base_url });
   return out;
 }
 

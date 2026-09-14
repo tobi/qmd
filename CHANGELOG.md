@@ -4,6 +4,16 @@
 
 ### Added
 
+- OpenAI-compatible remote models. `models.embed`/`.rerank`/`.generate` accept
+  `openai:<model id>` URIs served by `models.openai_base_url` (or
+  `QMD_OPENAI_BASE_URL`) with an optional `openai_api_key` /
+  `QMD_OPENAI_API_KEY`, for machines without a usable GPU or with a model
+  server already running. Embeddings (`/embeddings`, batched), reranking
+  (`/rerank`), generation and query expansion (`/chat/completions`) all go to
+  the endpoint; `qmd pull` becomes a no-op and `qmd doctor` probes the
+  endpoint instead of the GPU. `hf:` URIs keep running locally and remain the
+  default. The store, sessions and SDK are now typed against the `LLM`
+  interface, so a backend without a tokenizer chunks by character estimate.
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 

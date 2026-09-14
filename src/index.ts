@@ -66,7 +66,7 @@ import {
   type ChunkStrategy,
 } from "./store.js";
 import {
-  LlamaCpp,
+  createLlm,
 } from "./llm.js";
 import type {
   DocumentMetadata,
@@ -412,12 +412,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
+  // Create a per-store LLM instance. LlamaCpp lazy-loads models on first use
+  // and auto-unloads after 5 min inactivity to free VRAM; OpenAiLLM holds nothing.
+  const llm = createLlm({
+    embed: config?.models?.embed,
+    generate: config?.models?.generate,
+    rerank: config?.models?.rerank,
+    openaiBaseUrl: config?.models?.openai_base_url,
+    openaiApiKey: config?.models?.openai_api_key,
+    openaiGenerateParams: config?.models?.openai_generate_params,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
