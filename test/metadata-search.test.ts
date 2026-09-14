@@ -77,6 +77,24 @@ describe("searchFTS with metadata filter", () => {
     expect(filtered[0]!.metadata).toEqual({ status: "published" });
   });
 
+  test("finds a matching document ranked below the unfiltered candidate window", async () => {
+    // limit=5 made the old filtered window 50; every noise doc outranks the target.
+    for (let i = 0; i < 50; i++) {
+      await insertDoc("notes", `noise-${i}.md`, `# N${i}\n\nalpha alpha alpha`, { status: "draft" });
+    }
+    await insertDoc(
+      "notes",
+      "target.md",
+      `# Target\n\n${"Unrelated prose. ".repeat(40)}One weaker mention of alpha.`,
+      { status: "published" },
+    );
+
+    const filtered = searchFTS(store.db, "alpha", 5, undefined, {
+      key: "status", operator: "eq", value: "published",
+    });
+    expect(filtered.map(r => r.displayPath)).toEqual(["notes/target.md"]);
+  });
+
   test("excludes pending, stale, and errored documents from filtered search", async () => {
     const { documentId: erroredId } = await insertDoc("notes", "errored.md", "# One\n\ncommon term");
     await insertDoc("notes", "pending.md", "# Two\n\ncommon term");

@@ -9,6 +9,14 @@
 
 ### Fixed
 
+- Collection- and metadata-scoped BM25 search (`qmd search -c`, the lex leg of
+  `qmd query`, MCP, SDK `searchLex`) no longer returns false-empty or
+  incomplete results when stronger matches outside the scope fill the old
+  `limit * 10` candidate window (#922). The scope is now applied to the full
+  FTS5 match set, materialized once, so `search -c <collection>` is exact for
+  common terms; unscoped search keeps its early-terminating plan. Builds on
+  the approach in #918.
+
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
