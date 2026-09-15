@@ -547,6 +547,117 @@ describe("native llama stdout containment", () => {
   });
 });
 
+describe("LlamaCpp.ensureEmbedContexts GPU->CPU fallback", () => {
+  function fakeModel(createEmbeddingContext: ReturnType<typeof vi.fn>) {
+    return { createEmbeddingContext, dispose: vi.fn(async () => {}) };
+  }
+
+  test("reloads the embedding model on CPU and retries after a GPU context allocation failure", async () => {
+    const cpuContext = { dispose: vi.fn(async () => {}) };
+    const gpuModel = fakeModel(vi.fn().mockRejectedValue(new Error("vkAllocateMemory: out of device memory")));
+    const cpuModel = fakeModel(vi.fn().mockResolvedValue(cpuContext));
+
+    const llm = new LlamaCpp({}) as any;
+    llm.ensureLlama = vi.fn().mockResolvedValue({ gpu: "vulkan", cpuMathCores: 8 });
+    llm.isCpuOffloadForced = vi.fn().mockReturnValue(false);
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureEmbedModel = vi.fn(async (forceCpu?: boolean) => (forceCpu ? cpuModel : gpuModel));
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const contexts = await llm.ensureEmbedContexts();
+
+      expect(contexts).toEqual([cpuContext]);
+      expect(gpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+      expect(cpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+      expect(gpuModel.dispose).toHaveBeenCalledTimes(1);
+      expect(llm.ensureEmbedModel).toHaveBeenNthCalledWith(1, false);
+      expect(llm.ensureEmbedModel).toHaveBeenNthCalledWith(2, true);
+
+      const stderr = String(stderrSpy.mock.calls.map(call => call[0]).join(""));
+      expect(stderr).toContain("GPU embedding context init failed");
+      expect(stderr).toContain("reloading embedding model on CPU");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("throws if the CPU retry also fails, without looping forever", async () => {
+    const gpuModel = fakeModel(vi.fn().mockRejectedValue(new Error("gpu oom")));
+    const cpuModel = fakeModel(vi.fn().mockRejectedValue(new Error("cpu oom too")));
+
+    const llm = new LlamaCpp({}) as any;
+    llm.ensureLlama = vi.fn().mockResolvedValue({ gpu: "vulkan", cpuMathCores: 8 });
+    llm.isCpuOffloadForced = vi.fn().mockReturnValue(false);
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureEmbedModel = vi.fn(async (forceCpu?: boolean) => (forceCpu ? cpuModel : gpuModel));
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      await expect(llm.ensureEmbedContexts()).rejects.toThrow("Failed to create any embedding context");
+      expect(llm.ensureEmbedModel).toHaveBeenCalledTimes(2);
+      expect(gpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+      expect(cpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("does not retry when GPU offload is already forced (QMD_FORCE_CPU)", async () => {
+    const cpuOnlyModel = fakeModel(vi.fn().mockRejectedValue(new Error("cpu-only failure")));
+
+    const llm = new LlamaCpp({}) as any;
+    llm.ensureLlama = vi.fn().mockResolvedValue({ gpu: false, cpuMathCores: 8 });
+    llm.isCpuOffloadForced = vi.fn().mockReturnValue(true);
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureEmbedModel = vi.fn(async () => cpuOnlyModel);
+
+    await expect(llm.ensureEmbedContexts()).rejects.toThrow("Failed to create any embedding context");
+    expect(llm.ensureEmbedModel).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not repeat the GPU attempt on a later call once the fallback has latched", async () => {
+    const cpuContext1 = { dispose: vi.fn(async () => {}) };
+    const cpuContext2 = { dispose: vi.fn(async () => {}) };
+    const gpuModel = fakeModel(vi.fn().mockRejectedValue(new Error("gpu oom")));
+    const cpuModel = fakeModel(vi.fn()
+      .mockResolvedValueOnce(cpuContext1)
+      .mockResolvedValueOnce(cpuContext2));
+
+    const llm = new LlamaCpp({}) as any;
+    llm.ensureLlama = vi.fn().mockResolvedValue({ gpu: "vulkan", cpuMathCores: 8 });
+    llm.isCpuOffloadForced = vi.fn().mockReturnValue(false);
+    llm.computeParallelism = vi.fn().mockResolvedValue(1);
+    llm.threadsPerContext = vi.fn().mockResolvedValue(0);
+    llm.ensureEmbedModel = vi.fn(async (forceCpu?: boolean) => (forceCpu ? cpuModel : gpuModel));
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const first = await llm.ensureEmbedContexts();
+      expect(first).toEqual([cpuContext1]);
+      expect(gpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+
+      // Simulate the contexts being unloaded (e.g. inactivity timeout) so a
+      // later call re-enters context creation.
+      llm.embedContexts = [];
+
+      const second = await llm.ensureEmbedContexts();
+      expect(second).toEqual([cpuContext2]);
+      // The GPU model is never retried once the fallback has latched: only
+      // one more ensureEmbedModel call (forceCpu=true, no failed GPU attempt
+      // in between), not the two it took the first time.
+      expect(gpuModel.createEmbeddingContext).toHaveBeenCalledTimes(1);
+      expect(llm.ensureEmbedModel).toHaveBeenCalledTimes(3);
+      expect(llm.ensureEmbedModel).toHaveBeenNthCalledWith(3, true);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
 describe("LLM context parallelism safety", () => {
   test("defaults Windows CUDA to one context to avoid ggml-cuda.cu:98 crashes", () => {
     expect(resolveSafeParallelism({
