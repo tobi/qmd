@@ -49,6 +49,14 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- `ensureEmbedContexts` now falls back to CPU when a GPU embedding context
+  fails to allocate (e.g. another process is holding the VRAM), instead of
+  throwing `Failed to create any embedding context` outright. This mirrors
+  `ensureLlama`'s existing GPU-backend-init fallback one layer deeper: the
+  backend and model load can both succeed while the actual context
+  allocation still fails on a contended GPU. The fallback reloads the
+  embedding model with `gpuLayers: 0` and retries once, then latches so
+  later calls in the same process skip straight to CPU (#957).
 
 ### Changed
 
