@@ -4250,7 +4250,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      substr(content.doc, 1, 262144) as body,
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4455,7 +4455,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      substr(content.doc, 1, 262144) as body,
       dm.metadata_json
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
