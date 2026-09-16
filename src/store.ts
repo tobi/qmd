@@ -1639,11 +1639,14 @@ type FileSyncStateRow = {
 
 function getFileSyncStateMap(db: Database, collectionName: string): Map<string, FileSyncStateRow> {
   try {
-    const rows = db.prepare(
+    const stmt = db.prepare(
       `SELECT relative_path, mtime_ms, size, content_hash, document_id FROM file_sync_state WHERE collection = ?`
-    ).all(collectionName) as FileSyncStateRow[];
+    );
     const map = new Map<string, FileSyncStateRow>();
-    for (const r of rows) map.set(r.relative_path, r);
+    // Large-result query: use iterate() to stream rows instead of .all() materializing at once
+    for (const r of stmt.iterate(collectionName) as IterableIterator<FileSyncStateRow>) {
+      map.set(r.relative_path, r);
+    }
     return map;
   } catch {
     // Table may not exist yet on legacy DBs — initializeDatabase creates it on next open,
@@ -2058,7 +2061,15 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
+    const results: PendingEmbeddingDoc[] = [];
+    const iter = collection
+      ? stmt.iterate(model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint);
+    for (const row of iter as IterableIterator<PendingEmbeddingDoc>) {
+      results.push(row);
+    }
+    return results;
   });
 }
 
@@ -2097,12 +2108,17 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   if (batch.length === 0) return [];
 
   const placeholders = batch.map(() => "?").join(",");
-  const rows = db.prepare(`
+  // Bounded: batch size max 64 (maxDocsPerBatch), so IN list max 64 hashes.
+  // Use iterate() to stream rows instead of materializing all at once, nicer for large batches.
+  const stmt = db.prepare(`
     SELECT hash, doc as body
     FROM content
     WHERE hash IN (${placeholders})
-  `).all(...batch.map(doc => doc.hash)) as { hash: string; body: string }[];
-  const bodyByHash = new Map(rows.map(row => [row.hash, row.body]));
+  `);
+  const bodyByHash = new Map<string, string>();
+  for (const row of stmt.iterate(...batch.map(doc => doc.hash)) as IterableIterator<{ hash: string; body: string }>) {
+    bodyByHash.set(row.hash, row.body);
+  }
 
   return batch.map((doc) => ({
     ...doc,
@@ -3271,10 +3287,15 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
  * Get all active document paths for a collection.
  */
 export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
-  const rows = db.prepare(`
+  const stmt = db.prepare(`
     SELECT path FROM documents WHERE collection = ? AND active = 1
-  `).all(collectionName) as { path: string }[];
-  return rows.map(r => r.path);
+  `);
+  // Large-result query (up to 5k per collection): use iterate() to bound heap
+  const paths: string[] = [];
+  for (const r of stmt.iterate(collectionName) as IterableIterator<{ path: string }>) {
+    paths.push(r.path);
+  }
+  return paths;
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -3584,22 +3605,26 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT d.path
     FROM documents d
     WHERE d.active = 1
-  `).all() as { path: string }[];
+  `);
+  // Large-result query (all active docs, up to 9k): iterate to bound heap
   const queryLower = query.toLowerCase();
-  const scored = allFiles
-    .map(f => ({ path: f.path, dist: levenshtein(f.path.toLowerCase(), queryLower) }))
-    .filter(f => f.dist <= maxDistance)
+  const scored: { path: string; dist: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ path: string }>) {
+    const dist = levenshtein(f.path.toLowerCase(), queryLower);
+    if (dist <= maxDistance) scored.push({ path: f.path, dist });
+  }
+  return scored
     .sort((a, b) => a.dist - b.dist)
-    .slice(0, limit);
-  return scored.map(f => f.path);
+    .slice(0, limit)
+    .map(f => f.path);
 }
 
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT
       'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
@@ -3608,16 +3633,20 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
-
+  `);
+  // Large-result query: iterate to bound heap (all active docs)
   const isMatch = picomatch(pattern);
-  return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
-    .map(f => ({
-      filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
-      bodyLength: f.body_length
-    }));
+  const results: { filepath: string; displayPath: string; bodyLength: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ virtual_path: string; body_length: number; path: string; collection: string }>) {
+    if (isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path)) {
+      results.push({
+        filepath: f.virtual_path,
+        displayPath: f.path,
+        bodyLength: f.body_length,
+      });
+    }
+  }
+  return results;
 }
 
 // =============================================================================
@@ -4423,9 +4452,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
     eligibleSql += ` WHERE ${eligibleConditions.join(" AND ")}`;
 
-    const eligibleHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(eligibleSql).all(...eligibleParams) as { hash_seq: string }[],
-    ).map((r) => r.hash_seq);
+    const eligibleHashSeqs: string[] = withLazyContentVectorMigration(db, () => {
+      const stmt = db.prepare(eligibleSql);
+      // Large-result query (up to 20k): use iterate() to bound heap, early exit if over max
+      const seqs: string[] = [];
+      for (const r of stmt.iterate(...eligibleParams) as IterableIterator<{ hash_seq: string }>) {
+        seqs.push(r.hash_seq);
+        if (seqs.length > FILTERED_VEC_EXACT_SCAN_MAX) break;
+      }
+      return seqs;
+    });
 
     if (eligibleHashSeqs.length === 0) return [];
 
@@ -4536,8 +4572,9 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
   const fingerprint = getEmbeddingFingerprint(model);
-  return withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+    SELECT d.hash, substr(c.doc, 1, 262144) as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
@@ -4549,7 +4586,14 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
     WHERE d.active = 1
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
+  `);
+    // Large-result query (up to 9k): use iterate() to stream, bound heap
+    const results: { hash: string; body: string; path: string }[] = [];
+    for (const row of stmt.iterate(model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
+      results.push(row);
+    }
+    return results;
+  });
 }
 
 /**
