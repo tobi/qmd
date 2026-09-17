@@ -101,6 +101,12 @@ export function splitGlobMask(mask: string): string[] {
 }
 
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
+
+
+// Rerank hydration: fetch each winner's ranked chunk text by char position,
+// not the full document body.
+export const HYDRATION_CHUNKS_PER_DOC = 3;
+export const HYDRATION_CHUNK_CHARS = 3600; // == CHUNK_SIZE_CHARS
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
@@ -2602,8 +2608,9 @@ export type RankedResult = {
   file: string;
   displayPath: string;
   title: string;
-  body: string;
+  body?: string; // optional, kept for backward compatibility but not used in RRF; prefer chunk-only
   score: number;
+  chunkPos?: number; // winning chunk offset from vector search; absent for FTS-only hits
 };
 
 export type RRFContributionTrace = {
@@ -5696,6 +5703,40 @@ export type RankedListMeta = {
  * so a lex expansion inserted before original vector search cannot steal the
  * original vector boost.
  */
+/**
+ * Fetch the winning chunk texts for RRF-winning files by char position.
+ *
+ * Each winning file contributes only its ranked 3600-char chunk, sliced
+ * from the stored document with substr(doc, pos+1, len), instead of
+ * copying the whole document into JS. Copying full bodies of large
+ * documents is what caused the 4.2GB heap failure; per-winner slices
+ * keep a 40-winner query under ~500KB.
+ *
+ * FTS winners carry no position, so they fall back to the document head
+ * slice via pos 0. Callers pass chunkPos from SearchResult when available.
+ */
+export function fetchWinnerChunks(
+  db: Database,
+  winners: { file: string; chunkPos?: number }[],
+  chunkChars: number = HYDRATION_CHUNK_CHARS,
+): Map<string, string> {
+  const texts = new Map<string, string>();
+  for (const w of winners) {
+    const fp = w.file.startsWith('qmd://') ? w.file.slice(6) : w.file;
+    const pos = Math.max(0, w.chunkPos ?? 0);
+    try {
+      const row = db.prepare(
+        `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
+      ).get(pos + 1, chunkChars, fp) as { text: string } | undefined
+        ?? db.prepare(
+          `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
+        ).get(pos + 1, chunkChars, w.file) as { text: string } | undefined;
+      if (row?.text) texts.set(w.file, row.text);
+    } catch {}
+  }
+  return texts;
+}
+
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
@@ -5784,7 +5825,7 @@ export async function hybridQuery(
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, score: r.score, chunkPos: r.chunkPos,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
@@ -5824,7 +5865,7 @@ export async function hybridQuery(
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, score: r.score, chunkPos: r.chunkPos,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -5857,16 +5898,27 @@ export async function hybridQuery(
 
   if (candidates.length === 0) return [];
 
-  // Step 5: Chunk documents, pick best chunk per doc for reranking.
-  // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
+  // Step 5: Fetch only each winner's ranked chunk text for reranking.
+  // The slice at the winner's chunkPos is already the chunk to score,
+  // so wrap it directly instead of re-chunking a full document body.
+  const candidateBodies = fetchWinnerChunks(
+    store.db,
+    candidates.map(c => ({ file: c.file, chunkPos: c.chunkPos })),
+  );
+
+  // Step 5b: Pick each file's best chunk by keyword overlap.
+  // With a single fetched slice per file the best chunk is that slice;
+  // its keyword overlap still decides the rerank text below.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
-  const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
-    if (chunks.length === 0) continue;
+    // The fetched slice is already the winner's ranked chunk: score it
+    // directly instead of re-chunking a full document body to find it.
+    const slice = candidateBodies.get(cand.file) || "";
+    if (!slice) continue;
+    const chunks = [{ text: slice, pos: (cand as { chunkPos?: number }).chunkPos ?? 0 }];
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
@@ -5891,14 +5943,14 @@ export async function hybridQuery(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidateBodies.get(cand.file) || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -5916,7 +5968,7 @@ export async function hybridQuery(
           file: cand.file,
           displayPath: cand.displayPath,
           title: cand.title,
-          body: cand.body,
+          body: (cand.body ?? candidateBodies.get(cand.file) ?? "") as string,
           bestChunk,
           bestChunkPos,
           score: rrfScore,
@@ -5952,7 +6004,7 @@ export async function hybridQuery(
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: (candidateBodies.get(c.file) || "") as string,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5972,8 +6024,8 @@ export async function hybridQuery(
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
@@ -5991,7 +6043,7 @@ export async function hybridQuery(
       file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: candidate?.body || "",
+      body: (candidate?.body || candidateBodies.get(r.file) || "") as string,
       bestChunk,
       bestChunkPos,
       score: blendedScore,
@@ -6264,11 +6316,20 @@ export async function structuredSearch(
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-  const ssChunkStrategy = options?.chunkStrategy;
+
+  // Chunk-level hydration: reuse the helper so pre-expanded search also
+  // fetches only each winner's ranked chunk instead of full bodies.
+  const ssCandidateBodies = fetchWinnerChunks(
+    store.db,
+    candidates.map(c => ({ file: c.file, chunkPos: (c as { chunkPos?: number }).chunkPos })),
+  );
 
   for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
-    if (chunks.length === 0) continue;
+    // The fetched slice is already this winner's ranked chunk; score it
+    // directly instead of re-chunking a full document body.
+    const slice = ssCandidateBodies.get(cand.file) || "";
+    if (!slice) continue;
+    const chunks = [{ text: slice, pos: (cand as { chunkPos?: number }).chunkPos ?? 0 }];
 
     // Pick chunk with most keyword overlap
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
@@ -6293,14 +6354,14 @@ export async function structuredSearch(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || (cand as any).body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -6318,7 +6379,7 @@ export async function structuredSearch(
           file: cand.file,
           displayPath: cand.displayPath,
           title: cand.title,
-          body: cand.body,
+          body: (cand.body ?? (cand as any).body ?? "") as string,
           bestChunk,
           bestChunkPos,
           score: rrfScore,
@@ -6353,7 +6414,7 @@ export async function structuredSearch(
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: (ssCandidateBodies.get(c.file) || "") as string,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -6373,8 +6434,8 @@ export async function structuredSearch(
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
@@ -6392,7 +6453,7 @@ export async function structuredSearch(
       file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: candidate?.body || "",
+      body: (candidate?.body || ssCandidateBodies.get(r.file) || "") as string,
       bestChunk,
       bestChunkPos,
       score: blendedScore,
