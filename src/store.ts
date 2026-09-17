@@ -4526,20 +4526,57 @@ export async function searchVec(db: Database, query: string, model: string, limi
     display_path: string; title: string; body: string; metadata_json: string | null;
   }[]);
 
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  // Score each file from its top 3 non-overlapping chunks. Neighboring
+  // chunks share 15% overlap, so the same file fragment is not
+  // double-counted when two adjacent chunks both match. Combining the
+  // top chunks approximates reranking the whole file at chunk cost.
+  const seen = new Map<string, { row: typeof docRows[0]; entries: { distance: number; seq: number; pos: number }[]; bestDist: number }>();
   for (const row of docRows) {
     const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const seq = parseInt(row.hash_seq.split('_').pop() || '0', 10);
     const existing = seen.get(row.filepath);
-    if (!existing || distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: distance });
+    if (!existing) {
+      seen.set(row.filepath, { row, entries: [{ distance, seq, pos: row.pos }], bestDist: distance });
+    } else {
+      existing.entries.push({ distance, seq, pos: row.pos });
+      if (distance < existing.bestDist) {
+        existing.bestDist = distance;
+        existing.row = row;
+      }
     }
   }
 
   return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
+    .map(v => {
+      // Walk chunks best-first and keep a chunk unless it overlaps one
+      // already kept; at most 3 are kept per file.
+      const sorted = [...v.entries].sort((a, b) => a.distance - b.distance);
+      const picked: typeof sorted = [];
+      for (const cand of sorted) {
+        if (picked.length >= 3) break;
+        // Skip a chunk that overlaps a kept one: neighboring sequence
+        // numbers whose positions are within one chunk length.
+        let overlap = false;
+        for (const p of picked) {
+          if (Math.abs(cand.seq - p.seq) <= 1 && Math.abs(cand.pos - p.pos) < CHUNK_SIZE_CHARS) {
+            overlap = true;
+            break;
+          }
+        }
+        if (!overlap) picked.push(cand);
+      }
+      const ds = picked.map(e => e.distance);
+      const d0 = ds[0] ?? 1;
+      const s0 = 1 - d0;
+      const s1 = ds[1] !== undefined ? 1 - ds[1]! : 0;
+      const s2 = ds[2] !== undefined ? 1 - ds[2]! : 0;
+      const aggScore = s0 + 0.25 * s1 + 0.1 * s2;
+      const aggDist = 1 - Math.min(1, aggScore);
+      return { row: v.row, aggDist: aggDist };
+    })
+    .sort((a, b) => a.aggDist - b.aggDist)
     .slice(0, limit)
-    .map(({ row, bestDist }) => {
+    .map(({ row, aggDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
@@ -4553,7 +4590,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         body: row.body,
         context: getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - aggDist,  // Cosine similarity = 1 - aggregated distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
