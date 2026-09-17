@@ -3136,7 +3136,7 @@ function parseCLI() {
       "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
       // Query options
       "candidate-limit": { type: "string", short: "C" },
-      "no-rerank": { type: "boolean", default: false },
+      "no-rerank": { type: "boolean", default: true },
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options

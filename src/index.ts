@@ -182,7 +182,7 @@ export interface SearchOptions {
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
-  /** Rerank results using LLM (default: true) */
+  /** Rerank results using LLM (default: false, RRF order is returned as-is) */
   rerank?: boolean;
   /** Filter to a specific collection */
   collection?: string;
@@ -437,7 +437,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collection ? [opts.collection] : []),
         ...(opts.collections ?? []),
       ];
-      const skipRerank = opts.rerank === false;
+      const skipRerank = opts.rerank !== true;
       // The SDK is also a JavaScript boundary: TypeScript declarations do not
       // protect plain-JS callers or deserialized input. Apply the same bounded,
       // strict validation used by CLI, MCP, and HTTP before compiling SQL.

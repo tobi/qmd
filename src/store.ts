@@ -429,8 +429,13 @@ export function chunkDocumentWithBreakPoints(
 
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
-export const STRONG_SIGNAL_MIN_SCORE = 0.85;
-export const STRONG_SIGNAL_MIN_GAP = 0.15;
+export const STRONG_SIGNAL_MIN_SCORE = 0.70;
+export const STRONG_SIGNAL_MIN_GAP = 0.08;
+// Skip the rerank step when the top result already leads the runner-up by
+// a wide margin: chunk vectors and fused ranking agree, so reranking
+// rarely changes the order.
+export const RERANK_SKIP_MIN_SCORE = 0.70;
+export const RERANK_SKIP_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
@@ -5826,15 +5831,20 @@ export async function hybridQuery(
   const hasStrongSignal = !intent && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
+  // Fast path: when the top keyword (FTS) score clears 0.70, the keyword
+  // ranking is trusted on its own and vector expansion is skipped.
+  const hasDecentFts = initialFts.length > 0 && topScore >= 0.70;
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
+
+  const shouldExpand = !hasStrongSignal && !hasDecentFts;
 
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = hasStrongSignal
-    ? []
-    : await store.expandQuery(query);
+  const expanded = shouldExpand
+    ? await store.expandQuery(query)
+    : [];
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -5870,8 +5880,8 @@ export async function hybridQuery(
   }
 
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
-  if (hasVectors) {
-    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
+  if (hasVectors && !hasDecentFts) {
+    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = hasStrongSignal ? [] : [
       { text: query, queryType: "original" },
     ];
     for (const q of expanded) {

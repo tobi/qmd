@@ -357,8 +357,8 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        rerank: z.boolean().optional().default(false).describe(
+          "Rerank results using LLM (default: false). Set to true for higher precision on CPU-only machines."
         ),
       }),
     },
