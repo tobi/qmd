@@ -38,6 +38,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { computeCentroid, computeCentroidFromFloat32, type CentroidConfig, DEFAULT_CENTROID_CONFIG } from "./centroid.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -5699,6 +5700,12 @@ export interface HybridQueryOptions {
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio pseudo-relevance feedback) — thematic grouping without LLM */
+  expandCentroid?: boolean;
+  centroidK?: number; // top-k RRF results to form centroid (default 3)
+  centroidWeight?: number; // RRF weight for centroid list (default 1.0)
+  centroidVectorTopK?: number; // vector top-k for centroid search (default 20)
+  centroidConfig?: CentroidConfig; // full config override
 }
 
 export interface HybridQueryResult {
@@ -5880,7 +5887,8 @@ export async function hybridQuery(
   }
 
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
-  if (hasVectors && !hasDecentFts) {
+    const shouldDoVectorSearch = hasVectors && !hasDecentFts && !(hasStrongSignal && !options?.expandCentroid && !options?.centroidConfig?.enabled);
+  if (shouldDoVectorSearch) {
     const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = hasStrongSignal ? [] : [
       { text: query, queryType: "original" },
     ];
@@ -5938,9 +5946,151 @@ export async function hybridQuery(
 
   // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
   // expansion-derived lists stay at 1x independent of insertion order.
-  const weights = getHybridRrfWeights(rankedListMeta);
-  const fused = reciprocalRankFusion(rankedLists, weights);
-  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  let weights = getHybridRrfWeights(rankedListMeta);
+  let fused = reciprocalRankFusion(rankedLists, weights);
+  let rrfTraceByFile: Map<string, any> | null = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  // Step 4b: Centroid expansion (Rocchio pseudo-relevance feedback).
+  // When enabled, the top-ranked files vote on the query's theme: embed
+  // their winning chunks, average into a centroid vector, and search it
+  // for files the keyword ranking missed.
+  const centroidCfg = options?.centroidConfig ?? DEFAULT_CENTROID_CONFIG;
+  const centroidK = options?.centroidK ?? centroidCfg.topKForCentroid;
+  const centroidWeight = options?.centroidWeight ?? centroidCfg.weight;
+  const centroidVectorTopK = options?.centroidVectorTopK ?? centroidCfg.vectorTopK;
+  const lowRecall = fused.length <= 6 || topScore < 0.35;
+  const shouldCentroid = (options?.expandCentroid ?? (centroidCfg.enabled || lowRecall)) && hasVectors && fused.length > 0;
+
+  if (shouldCentroid) {
+    const centroidStart = Date.now();
+    const topK = Math.min(Math.max(1, centroidK), fused.length);
+    const topCandidates = fused.slice(0, topK);
+
+    // Fetch each top file's winning chunk text to seed the centroid.
+    const fileBodyMap = fetchWinnerChunks(
+      store.db,
+      topCandidates.map(c => ({ file: c.file, chunkPos: c.chunkPos })),
+    );
+
+    // The seeds are the winning chunk texts of the top-ranked files.
+    const seedChunks: string[] = [];
+    const seedFiles: string[] = [];
+
+    for (const c of topCandidates) {
+      // Each fetched slice is already that file's winning chunk text.
+      const bestChunk = fileBodyMap.get(c.file) || "";
+      if (bestChunk.trim()) {
+        seedChunks.push(bestChunk);
+        seedFiles.push(c.file);
+      }
+    }
+
+    if (seedChunks.length > 0) {
+      let centroidVec: Float32Array | null = null;
+
+      // Stored-vector path: reuse the chunk embeddings already stored in
+      // the vector index instead of re-embedding, avoiding a model load.
+      try {
+        const modelName = DEFAULT_EMBED_MODEL;
+        const fingerprint = getEmbeddingFingerprint(modelName);
+        const storedEmbeddings: Float32Array[] = [];
+
+        for (let i = 0; i < seedFiles.length; i++) {
+          const file = seedFiles[i]!;
+          const docRow = store.db.prepare(
+            `SELECT hash FROM documents WHERE collection || '/' || path = ? AND active = 1 LIMIT 1`
+          ).get(file.startsWith('qmd://') ? file.slice(6) : file) as { hash: string } | undefined
+            || store.db.prepare(
+              `SELECT d.hash FROM documents d WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active=1 LIMIT 1`
+            ).get(file) as { hash: string } | undefined;
+
+          if (!docRow) continue;
+
+          // Use the first chunk's stored embedding as this file's vote.
+          const cvRows = store.db.prepare(
+            `SELECT seq FROM content_vectors WHERE hash = ? AND model = ? AND embed_fingerprint = ? ORDER BY seq LIMIT 5`
+          ).all(docRow.hash, modelName, fingerprint) as { seq: number }[];
+
+          for (const cv of cvRows.slice(0, 1)) { // first chunk per file votes in the centroid
+            const vecRow = store.db.prepare(
+              `SELECT embedding FROM vectors_vec WHERE hash_seq = ? LIMIT 1`
+            ).get(`${docRow.hash}_${cv.seq}`) as { embedding: Float32Array } | undefined;
+            if (vecRow?.embedding) {
+              // Stored embeddings arrive as Float32Array or raw blob bytes.
+              let emb: Float32Array;
+              if (vecRow.embedding instanceof Float32Array) emb = vecRow.embedding as Float32Array;
+              else if ((vecRow.embedding as any) instanceof Uint8Array || (typeof Buffer !== 'undefined' && (globalThis as any).Buffer?.isBuffer?.(vecRow.embedding))) {
+                // Raw bytes from the vector index: reinterpret as float32 values.
+                const buf = vecRow.embedding as any;
+                emb = buf instanceof Float32Array ? buf : new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength/4);
+              } else {
+                continue;
+              }
+              if (emb.length > 0) storedEmbeddings.push(emb);
+            }
+          }
+        }
+
+        if (storedEmbeddings.length === seedChunks.length && storedEmbeddings.length > 0) {
+          // All seeds were already embedded: average them directly.
+          centroidVec = computeCentroidFromFloat32(storedEmbeddings);
+        }
+      } catch {
+        // Stored embeddings were missing or mismatched; fall through to re-embed.
+      }
+
+      // Fallback: embed the seed chunks now (a few ms on CPU for 3 chunks).
+      if (!centroidVec) {
+        try {
+          const llmForCentroid = getLlm(store);
+          const embedModel = llmForCentroid.embedModelName;
+          const formatted = seedChunks.map(t => formatDocForEmbedding(t, undefined, embedModel));
+          const embResults = await llmForCentroid.embedBatch(formatted);
+          const validEmbs: number[][] = [];
+          for (const r of embResults) if (r?.embedding) validEmbs.push(r.embedding);
+          if (validEmbs.length > 0) {
+            centroidVec = computeCentroid(validEmbs);
+          }
+        } catch {
+          // Embedding failed; return the keyword ranking unchanged.
+        }
+      }
+
+      // Search the centroid vector for files near the top-ranked theme.
+      const centroidVecSearchStart = Date.now();
+      if (centroidVec) {
+        try {
+          const centroidResults = await store.searchVec(
+            "__centroid__",
+            (getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL),
+            centroidVectorTopK,
+            collection,
+            undefined,
+            Array.from(centroidVec),
+            filter
+          );
+          if (centroidResults.length > 0) {
+            for (const r of centroidResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(centroidResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+            rankedListMeta.push({ source: "vec", queryType: "vec", query: "__centroid_expansion__" });
+            // Fuse again with the centroid list included, at its own weight.
+            weights = getHybridRrfWeights(rankedListMeta);
+            // Give the centroid list its configured weight rather than the default.
+            weights[weights.length - 1] = centroidWeight;
+            fused = reciprocalRankFusion(rankedLists, weights);
+            if (explain) {
+              rrfTraceByFile = buildRrfTrace(rankedLists, weights, rankedListMeta);
+            }
+          }
+        } catch {
+          // Centroid search failed; keep the keyword-fused ranking.
+        }
+      }
+    }
+  }
+
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -6214,6 +6364,12 @@ export interface StructuredSearchOptions {
   skipRerank?: boolean;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio) */
+  expandCentroid?: boolean;
+  centroidK?: number;
+  centroidWeight?: number;
+  centroidVectorTopK?: number;
+  centroidConfig?: CentroidConfig;
 }
 
 /**
