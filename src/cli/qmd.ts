@@ -811,7 +811,7 @@ async function watchCollections(autoEmbed: boolean): Promise<void> {
               const needsEmbedding = getHashesNeedingEmbedding(db);
               if (needsEmbedding > 0) {
                 console.log(`  Embedding ${needsEmbedding} new hash(es)...`);
-                await vectorIndex(DEFAULT_EMBED_MODEL_URI, false, {});
+                await vectorIndex(DEFAULT_EMBED_MODEL, false, {});
                 console.log(`  ${c.green}✓${c.reset} Embeddings updated`);
               }
             } else {
