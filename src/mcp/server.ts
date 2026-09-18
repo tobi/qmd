@@ -12,8 +12,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
+import { Writable } from "node:stream";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { existsSync } from "fs";
 import {
@@ -833,6 +834,73 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
   return shutdown;
 }
 
+type StdoutChunk = string | Uint8Array;
+type NativeWriteCallback = (error?: Error | null) => void;
+
+/** Minimal stdout surface consumed by StdoutWriteGuard, injectable for tests. */
+export type StdoutWriteGuardTarget = {
+  write: NodeJS.WriteStream["write"];
+  on(event: "error", listener: (error: Error) => void): unknown;
+  on(event: "drain", listener: () => void): unknown;
+  off(event: "error", listener: (error: Error) => void): unknown;
+  off(event: "drain", listener: () => void): unknown;
+};
+
+/**
+ * A Writable that always writes through the real stdout's write function,
+ * captured once at construction time, regardless of later reassignments to
+ * `process.stdout.write`.
+ *
+ * `withNativeStdoutRedirectedToStderr` (llm.ts) reassigns it process-wide
+ * while a model loads, which would otherwise reroute a concurrent request's
+ * JSON-RPC response to stderr.
+ */
+class StdoutWriteGuard extends Writable {
+  private readonly nativeWrite: NodeJS.WriteStream["write"];
+  private readonly stdout: StdoutWriteGuardTarget;
+  private readonly onStdoutError: (error: Error) => void;
+  private readonly onStdoutDrain: () => void;
+
+  constructor(stdout: StdoutWriteGuardTarget) {
+    super();
+    this.nativeWrite = stdout.write.bind(stdout);
+    this.stdout = stdout;
+    // Trap: `this.emit("error", ...)` throws when nothing is listening
+    // (Writable's default). That window exists between construction and the
+    // transport's start() attaching its handler, and after its close()
+    // removes it — so only forward when a listener is actually attached.
+    this.onStdoutError = (error: Error) => {
+      if (this.listenerCount("error") > 0) this.emit("error", error);
+    };
+    this.onStdoutDrain = () => this.emit("drain");
+    stdout.on("error", this.onStdoutError);
+    stdout.on("drain", this.onStdoutDrain);
+  }
+
+  override write(
+    chunk: StdoutChunk,
+    encodingOrCallback?: BufferEncoding | NativeWriteCallback,
+    callback?: NativeWriteCallback,
+  ): boolean {
+    if (typeof encodingOrCallback === "function") {
+      return this.nativeWrite(chunk, encodingOrCallback);
+    }
+    return this.nativeWrite(chunk, encodingOrCallback, callback);
+  }
+
+  // Don't leak our listeners onto the real stdout after this guard is gone.
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.stdout.off("error", this.onStdoutError);
+    this.stdout.off("drain", this.onStdoutDrain);
+    callback(error);
+  }
+}
+
+/** See {@link StdoutWriteGuard}. */
+export function createStdoutWriteGuard(stdout: StdoutWriteGuardTarget = process.stdout): Writable {
+  return new StdoutWriteGuard(stdout);
+}
+
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
@@ -847,9 +915,13 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   });
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
-  // (opening exchange pins the era). A hand-wired StdioServerTransport would
-  // stay 2025-only even on SDK 2.x.
-  const handle = serveStdio(() => createMcpServer(store, inflight));
+  // (opening exchange pins the era) as long as it still owns era negotiation,
+  // so we still pass it a StdioServerTransport rather than hand-wiring one
+  // outside serveStdio, which would stay 2025-only even on SDK 2.x. Its
+  // stdout is createStdoutWriteGuard() rather than process.stdout directly —
+  // see that function's JSDoc for why.
+  const transport = new StdioServerTransport(process.stdin, createStdoutWriteGuard());
+  const handle = serveStdio(() => createMcpServer(store, inflight), { transport });
 
   // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
   // and the server must exit instead of orphaning to PID 1 (#751). No
