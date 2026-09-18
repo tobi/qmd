@@ -13,6 +13,9 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- Lex queries typed in decomposed Unicode (NFD), such as `impôt` spelled
+  `o` + U+0302, match again. The separator split treated the combining mark as
+  a separator and searched for `"impo t"`, which returned nothing (#966).
 
 ## [2.8.3] - 2026-08-16
 
