@@ -5841,7 +5841,6 @@ export interface VectorSearchOptions {
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
-  intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -5859,13 +5858,37 @@ export interface VectorSearchResult {
 /**
  * Vector-only semantic search with query expansion.
  *
- * Pipeline:
+ * Accepts either a plain string query (auto-expanded) or a
+ * pre-expanded list of typed sub-queries. The structured branch only embeds
+ * vec:/hyde: entries — callers are expected to have rejected lex:/intent:
+ * at the entry point (the CLI exits non-zero when these appear in a vsearch
+ * query). The internal `expandQuery()` step is skipped entirely in the
+ * structured branch; only the caller's vec/hyde entries are embedded
+ * (caller-controlled, no LLM in the loop).
+ *
+ * Pipeline (string query):
  * 1. expandQuery() → typed variants, filter to vec/hyde only (lex irrelevant here)
  * 2. searchVec() for original + vec/hyde variants (sequential — node-llama-cpp embed limitation)
  * 3. Dedup by filepath (keep max score)
  * 4. Sort by score descending, filter by minScore, slice to limit
+ *
+ * Pipeline (structured query):
+ * 1. searchVec() for each vec/hyde entry sequentially
+ * 2. Dedup by filepath (keep max score)
+ * 3. Sort by score descending, filter by minScore, slice to limit
  */
 export async function vectorSearchQuery(
+  store: Store,
+  query: string | ExpandedQuery[],
+  options?: VectorSearchOptions
+): Promise<VectorSearchResult[]> {
+  if (Array.isArray(query)) {
+    return vectorStructuredSearch(store, query, options);
+  }
+  return vectorAutoExpandSearch(store, query, options);
+}
+
+async function vectorAutoExpandSearch(
   store: Store,
   query: string,
   options?: VectorSearchOptions
@@ -5874,7 +5897,6 @@ export async function vectorSearchQuery(
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
   const filter = options?.filter;
-  const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -5887,9 +5909,62 @@ export async function vectorSearchQuery(
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
-  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
+  return runVectorSearches(store, [query, ...vecExpanded.map(q => q.query)], {
+    limit,
+    minScore,
+    collection,
+    filter,
+    hooks: options?.hooks,
+  });
+}
+
+async function vectorStructuredSearch(
+  store: Store,
+  queries: ExpandedQuery[],
+  options?: VectorSearchOptions,
+): Promise<VectorSearchResult[]> {
+  const limit = options?.limit ?? 10;
+  const minScore = options?.minScore ?? 0.3;
+  const collection = options?.collection;
+  const filter = options?.filter;
+
+  const hasVectors = !!store.db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+  ).get();
+  if (!hasVectors) return [];
+
+  // Defensive filter — callers may pass mixed types; only vec/hyde get embedded.
+  const vecQueries = queries.filter(q => q.type === 'vec' || q.type === 'hyde');
+  if (vecQueries.length === 0) return [];
+
+  // Empty (original="", expanded=[], elapsedMs=0) signals "no expansion ran" to hook consumers.
+  options?.hooks?.onExpand?.("", [], 0);
+
+  return runVectorSearches(
+    store,
+    vecQueries.map(q => q.query),
+    { limit, minScore, collection, filter, hooks: options?.hooks },
+  );
+}
+
+/**
+ * Embed + searchVec each text sequentially, dedup by filepath keeping the
+ * highest score, sort desc, filter by minScore, slice to limit. Shared by
+ * the auto-expand and structured branches.
+ */
+async function runVectorSearches(
+  store: Store,
+  queryTexts: string[],
+  opts: {
+    limit: number;
+    minScore?: number;
+    collection?: string | readonly string[];
+    filter?: MetadataFilter;
+    hooks?: Pick<SearchHooks, 'onExpand'>;
+  },
+): Promise<VectorSearchResult[]> {
+  const { limit, minScore = 0.3, collection, filter } = opts;
   const embedModel = getLlm(store).embedModelName;
-  const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
     const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, filter);
