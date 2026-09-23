@@ -873,7 +873,7 @@ const FTS_CJK_NORMALIZED_VERSION = "1";
 
 // Bump when any FTS sync trigger body in applyFtsSyncTriggers changes, so the
 // new definition is reapplied to existing databases on next open.
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 2;
 
 /**
  * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
@@ -923,7 +923,7 @@ function installFtsSyncTriggers(db: Database): void {
     CREATE TRIGGER documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
         new.collection || '/' || new.path,
