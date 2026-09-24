@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,14 +29,15 @@ describe("scripts/build.mjs Windows execPath spaces (#681)", () => {
     fixtures.push(root);
     const spacedDir = join(root, "Program Files", "nodejs");
     mkdirSync(spacedDir, { recursive: true });
-    const spacedBin = join(spacedDir, "node");
+    const spacedBin = join(spacedDir, process.platform === "win32" ? "node.exe" : "node");
     // Stand-in for C:\\Program Files\\nodejs\\node.exe: a real executable
     // whose path contains a space. We own this file so chmod is allowed.
-    writeFileSync(
-      spacedBin,
-      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
-    );
-    chmodSync(spacedBin, 0o755);
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, spacedBin);
+    } else {
+      writeFileSync(spacedBin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+      chmodSync(spacedBin, 0o755);
+    }
 
     const result = spawnSync(spacedBin, ["-e", "process.stdout.write('ok')"], {
       encoding: "utf8",

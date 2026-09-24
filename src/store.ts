@@ -810,11 +810,8 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
-    if (absolutePath.startsWith(coll.path + '/') || absolutePath === coll.path) {
-      // Extract relative path
-      const relativePath = absolutePath.startsWith(coll.path + '/')
-        ? absolutePath.slice(coll.path.length + 1)
-        : '';
+    const relativePath = getRelativePathFromPrefix(absolutePath, coll.path);
+    if (relativePath !== null) {
 
       // Verify this document exists in the database
       const doc = db.prepare(`
@@ -3565,12 +3562,10 @@ export function getContextForFile(db: Database, filepath: string): string | null
       // Skip collections with missing paths
       if (!coll || !coll.path) continue;
 
-      if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
+      const matchedPath = getRelativePathFromPrefix(filepath, coll.path);
+      if (matchedPath !== null) {
         collectionName = coll.name;
-        // Extract relative path
-        relativePath = filepath.startsWith(coll.path + '/')
-          ? filepath.slice(coll.path.length + 1)
-          : '';
+        relativePath = matchedPath;
         break;
       }
     }
@@ -4805,13 +4800,14 @@ function getIgnoredLookupMatch(db: Database, query: string): DocumentExcludedByI
     if (!coll.ignore || coll.ignore.length === 0) continue;
 
     const candidates: string[] = [];
+    const relativePath = parsedVirtual ? null : getRelativePathFromPrefix(normalizedQuery, coll.path);
 
     if (parsedVirtual) {
       if (parsedVirtual.collectionName !== coll.name) continue;
       candidates.push(parsedVirtual.path);
-    } else if (normalizedQuery.startsWith(coll.path + '/')) {
-      candidates.push(normalizedQuery.slice(coll.path.length + 1));
-    } else if (!normalizedQuery.startsWith('/')) {
+    } else if (relativePath) {
+      candidates.push(relativePath);
+    } else if (!isAbsolutePath(normalizedQuery)) {
       const collectionPrefix = `${coll.name}/`;
       if (normalizedQuery.startsWith(collectionPrefix)) {
         candidates.push(normalizedQuery.slice(collectionPrefix.length));
@@ -4909,12 +4905,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
     for (const coll of collections) {
       let relativePath: string | null = null;
 
-      // If filepath is absolute and starts with collection path, extract relative part
-      if (filepath.startsWith(coll.path + '/')) {
-        relativePath = filepath.slice(coll.path.length + 1);
-      }
-      // Otherwise treat filepath as relative to collection
-      else if (!filepath.startsWith('/')) {
+      // Match paths regardless of whether Windows or POSIX separators were stored.
+      relativePath = getRelativePathFromPrefix(filepath, coll.path);
+      if (relativePath === null && !isAbsolutePath(filepath)) {
         relativePath = filepath;
       }
 
@@ -4980,8 +4973,8 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   if (!row) {
     const collections = getStoreCollections(db);
     for (const coll of collections) {
-      if (filepath.startsWith(coll.path + '/')) {
-        const relativePath = filepath.slice(coll.path.length + 1);
+      const relativePath = getRelativePathFromPrefix(filepath, coll.path);
+      if (relativePath) {
         row = db.prepare(`
           SELECT content.doc as body
           FROM documents d

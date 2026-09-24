@@ -2883,7 +2883,7 @@ describe("Reindex Collection", () => {
       expect(result.indexed).toBeGreaterThanOrEqual(1);
 
       store.db.prepare(`DELETE FROM documents`).run();
-      const abs = await reindexCollection(store, collectionPath, join(parent, "outside.md"), "docs");
+      const abs = await reindexCollection(store, collectionPath, join(parent, "outside.md").replace(/\\/g, "/"), "docs");
       expect(abs.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
       const absBodies = store.db.prepare(`
         SELECT content.doc as body FROM documents d

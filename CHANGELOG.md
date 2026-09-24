@@ -9,6 +9,12 @@
 
 ### Fixed
 
+- Windows collection names, document lookup, context paths, and `--full-path`
+  output now handle native drive paths and separators. Bun on Windows releases
+  prepared SQLite statements when the index closes, and the MCP shutdown
+  deadline remains active until pending work settles. Packaging and tests use
+  platform-appropriate path, executable, and permission checks.
+
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

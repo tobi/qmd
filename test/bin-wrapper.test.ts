@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -27,6 +27,12 @@ function makeTempFixture() {
   const capturePath = join(root, "capture.txt");
   const runtimeBin = join(root, "runtime-bin");
   mkdirSync(runtimeBin, { recursive: true });
+
+  if (process.platform === "win32") {
+    writeFileSync(join(runtimeBin, "node.cmd"), '@echo off\r\necho qmd launcher must not re-resolve node from PATH 1>&2\r\nexit /b 42\r\n');
+    writeFileSync(join(runtimeBin, "bun.cmd"), '@echo off\r\nif "%~1"=="--version" exit /b 0\r\n> "%QMD_WRAPPER_CAPTURE%" echo bun\r\n:next\r\nif "%~1"=="" exit /b 0\r\n>> "%QMD_WRAPPER_CAPTURE%" echo %~1\r\nshift\r\ngoto next\r\n');
+    return { root, capturePath, runtimeBin };
+  }
 
   for (const runtime of ["node", "bun"]) {
     const runtimePath = join(runtimeBin, runtime);
@@ -112,16 +118,16 @@ function symlinkRelative(target: string, linkPath: string) {
 
 function runWrapper(commandPath: string, runtimeBin: string, capturePath: string, env: Record<string, string> = {}) {
   rmSync(capturePath, { force: true });
-  execFileSync(commandPath, ["--version"], {
+  execFileSync(process.platform === "win32" ? REAL_NODE : commandPath, process.platform === "win32" ? [commandPath, "--version"] : ["--version"], {
     env: {
       ...process.env,
       ...env,
-      PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+      PATH: `${runtimeBin}${delimiter}${process.env.PATH ?? ""}`,
       QMD_WRAPPER_CAPTURE: capturePath,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split("\n");
+  const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split(/\r?\n/);
   return { runtime, scriptPath, args };
 }
 
@@ -314,10 +320,11 @@ describe("bin/qmd package wrapper", () => {
     const { root, runtimeBin } = makeTempFixture();
     const packageRoot = makePackage(root, "qmd", [], { dist: false });
 
-    const result = spawnSync(join(packageRoot, "bin", "qmd"), ["--version"], {
+    const commandPath = join(packageRoot, "bin", "qmd");
+    const result = spawnSync(process.platform === "win32" ? REAL_NODE : commandPath, process.platform === "win32" ? [commandPath, "--version"] : ["--version"], {
       env: {
         ...process.env,
-        PATH: `${runtimeBin}:${process.env.PATH ?? ""}`,
+        PATH: `${runtimeBin}${delimiter}${process.env.PATH ?? ""}`,
       },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

@@ -3,7 +3,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -41,7 +41,7 @@ describe("Path Utilities", () => {
   });
 
   test("resolve handles relative paths", () => {
-    const pwd = process.env.PWD || process.cwd();
+    const pwd = (process.env.PWD || process.cwd()).replace(/\\/g, "/");
     expect(resolve("foo")).toBe(`${pwd}/foo`);
     expect(resolve("foo", "bar")).toBe(`${pwd}/foo/bar`);
   });
@@ -87,9 +87,7 @@ describe("Path Utilities", () => {
   });
 
   test("getRealPath resolves symlinks", () => {
-    const result = getRealPath("/tmp");
-    expect(result).toBeTruthy();
-    expect(result === "/tmp" || result === "/private/tmp").toBe(true);
+    expect(getRealPath(tmpdir())).toBe(realpathSync(tmpdir()));
   });
 
   test("isPathInsideDir accepts descendants and rejects escapes", () => {

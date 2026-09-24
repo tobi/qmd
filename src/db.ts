@@ -115,6 +115,26 @@ function enableWal(db: Database, budgetMs: number): void {
  */
 export function openDatabase(path: string): Database {
   const db = new _Database(path) as Database;
+  if (isBun && process.platform === "win32") {
+    // Bun 1.3 leaves prepared statements holding the file open after close().
+    // Windows then cannot remove or replace the index until they are finalized.
+    const prepare = db.prepare.bind(db);
+    const close = db.close.bind(db);
+    const statements = new Set<WeakRef<Statement>>();
+    const registry = new FinalizationRegistry<WeakRef<Statement>>(ref => statements.delete(ref));
+    db.prepare = (sql) => {
+      const statement = prepare(sql);
+      const ref = new WeakRef(statement);
+      statements.add(ref);
+      registry.register(statement, ref);
+      return statement;
+    };
+    db.close = () => {
+      for (const ref of statements) ref.deref()?.finalize?.();
+      statements.clear();
+      close();
+    };
+  }
   const raw = process.env.QMD_SQLITE_BUSY_TIMEOUT;
   const parsed = raw !== undefined && raw !== "" ? Number(raw) : Number.NaN;
   const busyTimeoutMs = Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 120_000;
@@ -137,6 +157,7 @@ export interface Database {
 }
 
 export interface Statement {
+  finalize?(): void;
   run(...params: SQLiteValue[]): { changes: number; lastInsertRowid: number | bigint };
   get<T = unknown>(...params: SQLiteValue[]): T | undefined;
   all<T = unknown>(...params: SQLiteValue[]): T[];
