@@ -45,7 +45,7 @@ for (const entry of pkg.files ?? []) {
 for (const [name, binPath] of Object.entries(pkg.bin ?? {})) {
   const full = assertPath(binPath, `bin ${name}`);
   const mode = statSync(full).mode;
-  if ((mode & 0o111) === 0) {
+  if (process.platform !== "win32" && (mode & 0o111) === 0) {
     console.error(`Package smoke failed: bin ${name} is not executable (${binPath})`);
     process.exit(1);
   }
@@ -56,7 +56,7 @@ assertPath("dist/index.d.ts", "compiled type export");
 assertPath("dist/cli/qmd.js", "compiled CLI");
 
 run("compiled CLI under Node", process.execPath, ["dist/cli/qmd.js", "--help"], { quiet: true });
-run("package wrapper", "sh", ["bin/qmd", "--help"], { quiet: true });
+run("package wrapper", process.platform === "win32" ? process.execPath : "sh", ["bin/qmd", "--help"], { quiet: true });
 
 if (process.env.QMD_SKIP_BUN_SMOKE === "1") {
   console.log("==> compiled CLI under Bun (skipped by QMD_SKIP_BUN_SMOKE=1)");

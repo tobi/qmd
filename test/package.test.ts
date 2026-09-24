@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("..", import.meta.url);
 const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
@@ -63,7 +64,7 @@ describe("package grammar distribution", () => {
     // The skill must teach structured, self-authored queries near the top.
     expect(firstSixtyLines).toContain("Default to structured");
 
-    const scriptPath = join(root.pathname, "scripts", "check-package-grammars.mjs");
+    const scriptPath = join(fileURLToPath(root), "scripts", "check-package-grammars.mjs");
     const script = readFileSync(scriptPath, "utf8");
     expect(script).toContain("tree-sitter-typescript/tree-sitter-typescript.wasm");
     expect(script).toContain("tree-sitter-typescript/tree-sitter-tsx.wasm");

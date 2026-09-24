@@ -7,7 +7,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import {
   decideHookGate,
@@ -241,7 +241,7 @@ describe("isCollectionPathInsideProject", () => {
     process.env.HOME = "/home/me";
     try {
       expect(isCollectionPathInsideProject(configPath, "~/secrets")).toBe(false);
-      expect(resolveConfigCollectionPath("~/secrets", configPath)).toBe("/home/me/secrets");
+      expect(resolveConfigCollectionPath("~/secrets", configPath)).toBe(resolve(process.env.HOME!, "secrets"));
     } finally {
       if (origHome === undefined) delete process.env.HOME;
       else process.env.HOME = origHome;

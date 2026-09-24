@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest"
 import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
-import { join, dirname } from "path";
+import { join, dirname, isAbsolute, delimiter } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
@@ -23,6 +23,7 @@ let testDir: string;
 let testDbPath: string;
 let testConfigDir: string;
 let fixturesDir: string;
+let unrelatedDir: string;
 let testCounter = 0; // Unique counter for each test run
 
 // Get the directory where this test file lives
@@ -106,9 +107,11 @@ beforeAll(async () => {
   testDbPath = join(testDir, "test.sqlite");
   testConfigDir = join(testDir, "config");
   fixturesDir = join(testDir, "fixtures");
+  unrelatedDir = join(testDir, "unrelated");
 
   await mkdir(testConfigDir, { recursive: true });
   await mkdir(fixturesDir, { recursive: true });
+  await mkdir(unrelatedDir, { recursive: true });
   await mkdir(join(fixturesDir, "notes"), { recursive: true });
   await mkdir(join(fixturesDir, "docs"), { recursive: true });
 
@@ -384,7 +387,7 @@ describe("CLI Skill Commands", () => {
     expect(installed).toContain("# QMD - Query Markdown Documents");
     expect(installed).toContain("!`qmd skill show`");
     expect(existsSync(join(projectDir, ".claude", "skills", "qmd"))).toBe(false);
-    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
+    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir.replace(/\\/g, "/")}`);
     expect(stdout).toContain("Tip: create a Claude symlink manually");
   });
 
@@ -403,8 +406,8 @@ describe("CLI Skill Commands", () => {
     expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
     expect(lstatSync(claudeLink).isSymbolicLink()).toBe(true);
     expect(readFileSync(join(claudeLink, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
-    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir}`);
-    expect(stdout).toContain(`✓ Linked Claude skill at ${claudeLink}`);
+    expect(stdout).toContain(`✓ Installed QMD skill to ${skillDir.replace(/\\/g, "/")}`);
+    expect(stdout).toContain(`✓ Linked Claude skill at ${claudeLink.replace(/\\/g, "/")}`);
   });
 
   test("skips Claude qmd symlink when .claude/skills already points to .agents/skills", async () => {
@@ -421,7 +424,7 @@ describe("CLI Skill Commands", () => {
     const skillDir = join(fakeHome, ".agents", "skills", "qmd");
     expect(lstatSync(skillDir).isSymbolicLink()).toBe(false);
     expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toContain("!`qmd skill show`");
-    expect(stdout).toContain(`✓ Claude already sees the skill via ${join(fakeHome, ".claude", "skills")}`);
+    expect(stdout).toContain(`✓ Claude already sees the skill via ${join(fakeHome, ".claude", "skills").replace(/\\/g, "/")}`);
   });
 
   test("refuses to overwrite an existing install without --force", async () => {
@@ -1233,13 +1236,13 @@ describe("CLI Multi-Get Command", () => {
   test("--full-path --json uses absolute path when files are outside $PWD", async () => {
     const { stdout, exitCode } = await runQmd(
       ["multi-get", "notes/*.md", "--json", "--full-path"],
-      { dbPath: localDbPath, cwd: "/" }
+      { dbPath: localDbPath, cwd: unrelatedDir }
     );
     expect(exitCode).toBe(0);
     const parsed = JSON.parse(stdout);
     expect(parsed.length).toBeGreaterThan(0);
     for (const entry of parsed) {
-      expect(entry.file.startsWith("/")).toBe(true);
+      expect(isAbsolute(entry.file)).toBe(true);
       expect(entry.file).not.toMatch(/^\.\//);
       expect(entry.docid).toBeUndefined();
     }
@@ -1672,7 +1675,7 @@ describe("CLI ls Command", () => {
     await writeFile(join(absoluteDir, "root.md"), "# Absolute collection\n");
     await writeFile(
       join(env.configDir, "index.yml"),
-      `collections:\n  "${absoluteDir}":\n    path: "${absoluteDir}"\n    pattern: "**/*.md"\n`
+      `collections:\n  ${JSON.stringify(absoluteDir)}:\n    path: ${JSON.stringify(absoluteDir)}\n    pattern: "**/*.md"\n`
     );
 
     const update = await runQmd(["update"], {
@@ -1702,7 +1705,7 @@ describe("CLI ls Command", () => {
     await writeFile(join(childDataDir, "child.md"), "# Child collection\n");
     await writeFile(
       join(env.configDir, "index.yml"),
-      `collections:\n  "${parentCollectionName}":\n    path: "${parentDataDir}"\n    pattern: "**/*.md"\n  "${childCollectionName}":\n    path: "${childDataDir}"\n    pattern: "**/*.md"\n`
+      `collections:\n  ${JSON.stringify(parentCollectionName)}:\n    path: ${JSON.stringify(parentDataDir)}\n    pattern: "**/*.md"\n  ${JSON.stringify(childCollectionName)}:\n    path: ${JSON.stringify(childDataDir)}\n    pattern: "**/*.md"\n`
     );
 
     const update = await runQmd(["update"], {
@@ -2082,10 +2085,10 @@ describe("search output formats", () => {
   });
 
   test("search --full-path --json swaps qmd:// for absolute realpath when cwd is unrelated", async () => {
-    // Use "/" as cwd so the fixtures path (under tmpdir) is NOT a subpath of $PWD.
+    // Use a sibling directory so the fixtures are outside $PWD on every OS.
     const { stdout, exitCode } = await runQmd(
       ["search", "test", "--full-path", "--json", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: unrelatedDir }
     );
     expect(exitCode).toBe(0);
     const results = JSON.parse(stdout);
@@ -2093,7 +2096,8 @@ describe("search output formats", () => {
     const result = results[0];
     expect(result.file).not.toMatch(/^qmd:\/\//);
     // Must be an absolute path ending in .md.
-    expect(result.file).toMatch(/^\/.+\.md$/);
+    expect(isAbsolute(result.file)).toBe(true);
+    expect(result.file).toMatch(/\.md$/);
     // --full-path: the on-disk path replaces the docid as the identifier.
     expect(result.docid).toBeUndefined();
   });
@@ -2118,14 +2122,14 @@ describe("search output formats", () => {
   test("search --full-path default CLI format shows on-disk path and drops the docid", async () => {
     const { stdout, exitCode } = await runQmd(
       ["search", "test", "--full-path", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: unrelatedDir }
     );
     expect(exitCode).toBe(0);
     // eslint-disable-next-line no-control-regex
     const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
     const plain = stripAnsi(stdout);
     expect(plain).not.toMatch(/qmd:\/\//);
-    expect(plain).toMatch(/^\/.+\.md/m);
+    expect(plain).toMatch(/^([A-Za-z]:[\\/]|\/).+\.md/m);
     // No `#docid` suffix when --full-path is set.
     expect(plain).not.toMatch(/#[a-f0-9]{6}\s*$/m);
   });
@@ -2133,12 +2137,12 @@ describe("search output formats", () => {
   test("search --full-path --md uses on-disk path in heading and drops the docid", async () => {
     const { stdout, exitCode } = await runQmd(
       ["search", "test", "--full-path", "--md", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: unrelatedDir }
     );
     expect(exitCode).toBe(0);
     expect(stdout).not.toMatch(/qmd:\/\//);
     expect(stdout).not.toMatch(/\*\*docid:\*\*/);
-    expect(stdout).toMatch(/\*\*file:\*\* `\/.+\.md`/);
+    expect(stdout).toMatch(/\*\*file:\*\* `([A-Za-z]:[\\/]|\/).+\.md`/);
   });
 
   test("search --format json matches the legacy --json behavior", async () => {
@@ -2358,11 +2362,12 @@ describe("get command path normalization", () => {
   test("get --full-path shows absolute path when file is outside $PWD", async () => {
     const { stdout, exitCode } = await runQmd(
       ["get", `${collName}/test1.md`, "--full-path"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
+      { dbPath: localDbPath, configDir: localConfigDir, cwd: unrelatedDir }
     );
     expect(exitCode).toBe(0);
     // Absolute realpath (allow macOS /var → /private/var).
-    expect(stdout).toMatch(/^\/.+\/test1\.md$/m);
+    expect(isAbsolute(stdout.split(/\r?\n/)[0]!)).toBe(true);
+    expect(stdout.split(/\r?\n/)[0]).toMatch(/test1\.md$/);
     expect(stdout).not.toMatch(/^\.\//m);
     expect(stdout).not.toContain("qmd://");
     expect(stdout).not.toMatch(/#[a-f0-9]{6}/);
@@ -3036,11 +3041,11 @@ fi
 `);
       await chmod(fakeNode, 0o755);
 
-      const proc = spawn(qmdBin, ["mcp"], {
+      const proc = spawn(process.platform === "win32" ? process.execPath : qmdBin, process.platform === "win32" ? [qmdBin, "mcp"] : ["mcp"], {
         cwd: tempPackage,
         env: {
           ...process.env,
-          PATH: `${join(tempPackage, "fake-bin")}:${process.env.PATH}`,
+          PATH: `${join(tempPackage, "fake-bin")}${delimiter}${process.env.PATH}`,
           LLAMA_LOG_LEVEL: "",
           GGML_LOG_LEVEL: "",
           GGML_BACKEND_SILENT: "",

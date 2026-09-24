@@ -522,7 +522,7 @@ describe("Path fidelity — migration from handalized index", () => {
     const store = createStore(dbPath);
     const now = new Date().toISOString();
     // Write and sync a config that points at the collection so `qmd update` knows where it is
-    const migrationYaml = `collections:\n  crazytest:\n    path: "${collectionDir}"\n    mask: "**/*.md"\n`;
+    const migrationYaml = YAML.stringify({ collections: { crazytest: { path: collectionDir, mask: "**/*.md" } } });
     await writeFile(join(configDir, "index.yml"), migrationYaml);
     const config = YAML.parse(migrationYaml) as CollectionConfig;
     syncConfigToDb(store.db, config);

@@ -173,7 +173,7 @@ describe("rebuildFTSForCjkNormalization — bounded source scan", () => {
     // not narrative comments that mention old/alternate behavior.
     const fnBody = fnBodyRaw
       .replace(/\/\*[\s\S]*?\*\//g, "")
-      .split("\n")
+      .split(/\r?\n/)
       .map(line => line.replace(/\/\/.*$/, ""))
       .join("\n");
 

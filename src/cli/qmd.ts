@@ -13,6 +13,9 @@ import {
   getPwd,
   getRealPath,
   isPathInsideDir,
+  isAbsolutePath,
+  getRelativePathFromPrefix,
+  normalizePathSeparators,
   homedir,
   resolve,
   enableProductionMode,
@@ -1030,28 +1033,21 @@ function detectCollectionFromPath(db: Database, fsPath: string): { collectionNam
   const allCollections = yamlListCollections();
 
   // Find longest matching path
-  let bestMatch: { name: string; path: string } | null = null;
+  let bestMatch: { name: string; path: string; relativePath: string } | null = null;
   for (const coll of allCollections) {
-    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
+    const relativePath = getRelativePathFromPrefix(realPath, coll.path);
+    if (relativePath !== null) {
       if (!bestMatch || coll.path.length > bestMatch.path.length) {
-        bestMatch = { name: coll.name, path: coll.path };
+        bestMatch = { name: coll.name, path: coll.path, relativePath };
       }
     }
   }
 
   if (!bestMatch) return null;
 
-  // Calculate relative path
-  let relativePath = realPath;
-  if (relativePath.startsWith(bestMatch.path + '/')) {
-    relativePath = relativePath.slice(bestMatch.path.length + 1);
-  } else if (relativePath === bestMatch.path) {
-    relativePath = '';
-  }
-
   return {
     collectionName: bestMatch.name,
-    relativePath
+    relativePath: bestMatch.relativePath
   };
 }
 
@@ -1074,7 +1070,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('qmd://')) {
+  } else if (!isAbsolutePath(fsPath) && !fsPath.startsWith('qmd://')) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -1192,7 +1188,7 @@ function contextRemove(pathArg: string): void {
     fsPath = getPwd();
   } else if (fsPath.startsWith('~/')) {
     fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/')) {
+  } else if (!isAbsolutePath(fsPath)) {
     fsPath = resolve(getPwd(), fsPath);
   }
 
@@ -1229,11 +1225,9 @@ function renderFullPath(absolutePath: string, cwd: string = process.cwd()): stri
   let real: string;
   try { real = realpathSync(absolutePath); } catch { real = absolutePath; }
   const cwdReal = (() => { try { return realpathSync(cwd); } catch { return cwd; } })();
-  if (real === cwdReal) return "./";
-  if (real.startsWith(cwdReal + "/")) {
-    const rel = relativePath(cwdReal, real);
-    if (rel && !rel.startsWith("..")) return `./${rel}`;
-  }
+  const rel = relativePath(cwdReal, real);
+  if (!rel) return "./";
+  if (!isAbsolutePath(rel) && !/^\.\.(?:[\\/]|$)/.test(rel)) return `./${normalizePathSeparators(rel)}`;
   return real;
 }
 
@@ -1827,11 +1821,7 @@ function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): stri
 
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
   // If name not provided, generate from pwd basename
-  let collName = name;
-  if (!collName) {
-    const parts = pwd.split('/').filter(Boolean);
-    collName = parts[parts.length - 1] || 'root';
-  }
+  const collName = name || basename(normalizePathSeparators(pwd)) || 'root';
 
   // Check if collection with this name already exists in YAML
   const existing = getCollectionFromYaml(collName);

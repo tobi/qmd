@@ -126,7 +126,7 @@ describe("canWriteLlamaDir", () => {
     expect(canWriteLlamaDir("/tmp/qmd-no-such-llama-pkg")).toBe(false);
   });
 
-  test("returns false when llama/ exists but is not writable", () => {
+  (process.platform === "win32" ? test.skip : test)("returns false when llama/ exists but is not writable", () => {
     const dir = mkdtempSync(join(tmpdir(), "qmd-llama-ro-"));
     const llamaDir = join(dir, "llama");
     mkdirSync(llamaDir, { mode: 0o555 });

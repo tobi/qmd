@@ -677,7 +677,6 @@ export function createInflightGate(): InflightGate {
           if (i >= 0) waiters.splice(i, 1);
           resolve(false);
         }, timeoutMs);
-        timer.unref?.();
         waiters.push(onIdle);
       });
     },
