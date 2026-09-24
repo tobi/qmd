@@ -11,6 +11,9 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { openDatabase } from "../src/db.ts";
+import { DEFAULT_EMBED_MODEL_URI } from "../src/llm.ts";
+import { getEmbeddingFingerprint } from "../src/store.ts";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
@@ -145,6 +148,35 @@ describe("qmd update with a checked-in custom model URI", () => {
     expect(result.stdout).toContain("hf:evil/embed/x.gguf");
     expect(result.stdout).toContain("Indexed: 1 new");
     expect(result.exitCode).toBe(0);
+  }, 120_000);
+
+  test("counts pending embeddings against the model embed would actually use", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  embed: hf:evil/embed/x.gguf",
+      "",
+    ].join("\n"));
+    const first = await runQmd(["update"]);
+    expect(first.stdout).toContain("Indexed: 1 new");
+    expect(first.stdout).toContain("1 unique hashes need vectors");
+
+    // The untrusted custom model is never loaded, so embed writes vectors under
+    // the default model. Once those exist, update must not report the doc as pending.
+    const db = openDatabase(join(projectDir, ".qmd", "index.sqlite"));
+    const doc = db.prepare(`SELECT hash FROM documents WHERE active = 1 LIMIT 1`).get() as { hash: string };
+    db.prepare(`
+      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, ?, 1, ?)
+    `).run(doc.hash, DEFAULT_EMBED_MODEL_URI, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL_URI), new Date().toISOString());
+    db.close();
+
+    const second = await runQmd(["update"]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).not.toContain("need vectors");
   }, 120_000);
 
   test("`qmd trust` records the custom model", async () => {
