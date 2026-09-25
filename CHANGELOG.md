@@ -9,6 +9,11 @@
 
 ### Fixed
 
+- `qmd embed` on WSL2 with CUDA no longer aborts intermittently in
+  `cuMemAddressReserve` (`ggml-cuda.cu:106`, out of memory). WSL reports
+  `linux` but its CUDA runs on the Windows driver, so the Windows CUDA
+  one-context default from #519 now applies there too.
+  `QMD_EMBED_PARALLELISM` still overrides it.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

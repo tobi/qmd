@@ -558,9 +558,21 @@ describe("LLM context parallelism safety", () => {
   });
 
   test("keeps non-Windows and non-CUDA backends on computed parallelism", () => {
-    expect(resolveSafeParallelism({ gpu: "cuda", platform: "linux", computed: 8 })).toBe(8);
+    expect(resolveSafeParallelism({ gpu: "cuda", platform: "linux", wsl: false, computed: 8 })).toBe(8);
     expect(resolveSafeParallelism({ gpu: "vulkan", platform: "win32", computed: 8 })).toBe(8);
     expect(resolveSafeParallelism({ gpu: false, platform: "win32", computed: 4 })).toBe(4);
+  });
+
+  test("defaults WSL CUDA to one context: it runs on the Windows driver", () => {
+    expect(resolveSafeParallelism({ gpu: "cuda", platform: "linux", wsl: true, computed: 8 })).toBe(1);
+    expect(resolveSafeParallelism({ gpu: "vulkan", platform: "linux", wsl: true, computed: 8 })).toBe(8);
+    expect(resolveSafeParallelism({
+      gpu: "cuda",
+      platform: "linux",
+      wsl: true,
+      computed: 8,
+      envValue: "4",
+    })).toBe(4);
   });
 
   test("QMD_EMBED_PARALLELISM overrides the Windows CUDA safety default", () => {
