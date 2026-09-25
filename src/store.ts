@@ -28,6 +28,7 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  isWSL,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -494,14 +495,6 @@ export function isAbsolutePath(path: string): boolean {
  */
 export function normalizePathSeparators(path: string): string {
   return path.replace(/\\/g, '/');
-}
-
-/**
- * Detect if running inside WSL (Windows Subsystem for Linux).
- * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths.
- */
-function isWSL(): boolean {
-  return !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 }
 
 /**
