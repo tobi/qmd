@@ -12,7 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
-import type { Database } from "./db.js";
+import type { Database, SQLiteValue } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -4178,59 +4178,156 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 const SQLITE_VEC_MAX_K = 4096;
 
 /**
- * Max filter-eligible vectors for an exact cosine scan. Above this we fall
- * back to global ANN with a capped over-fetch. Exact scan avoids the
- * post-filter starvation of small eligible sets — originally small
- * collections (#791, #803), now also selective metadata filters; ANN remains
- * for very large eligible sets where a full scan would be expensive.
+ * A scope holding at least this share of the active documents is answered
+ * from the global KNN. vec0 resolves every key of an IN pre-filter one by one,
+ * so for a scope of hundreds of thousands of keys the pre-filter costs more
+ * than the scan itself, while the global top rows post-filtered to such a
+ * scope are its exact nearest chunks whenever enough of them come back.
  */
-const FILTERED_VEC_EXACT_SCAN_MAX = 20_000;
-
-const VEC_HASH_SEQ_IN_CHUNK = 400;
+const GLOBAL_SCAN_MIN_SHARE = 0.5;
 
 /**
- * Exact cosine-distance scan over a known set of hash_seq keys.
- * Uses vec_distance_cosine with chunked IN lists (no JOIN with vectors_vec).
+ * Floor for the global over-fetch of a majority scope. A query whose nearest
+ * chunks sit in the out-of-scope minority would otherwise come back short and
+ * pay the pre-filtered scan on top of the global one; a hundred-odd rows cost
+ * the scan little and make that rare.
  */
-function exactVecScanByHashSeq(
-  db: Database,
-  embedding: number[],
-  hashSeqs: string[],
-  limit: number,
-): { hash_seq: string; distance: number }[] {
-  if (hashSeqs.length === 0 || limit <= 0) return [];
+const GLOBAL_SCAN_MIN_OVERFETCH = 128;
 
-  const queryVec = new Float32Array(embedding);
-  // Over-fetch a bit so multi-chunk docs can still yield `limit` unique files.
-  const fetchLimit = Math.max(limit * 3, limit);
-  const scored: { hash_seq: string; distance: number }[] = [];
-
-  for (let i = 0; i < hashSeqs.length; i += VEC_HASH_SEQ_IN_CHUNK) {
-    const chunk = hashSeqs.slice(i, i + VEC_HASH_SEQ_IN_CHUNK);
-    const placeholders = chunk.map(() => "?").join(",");
-    const rows = db.prepare(`
-      SELECT hash_seq, vec_distance_cosine(embedding, ?) AS distance
-      FROM vectors_vec
-      WHERE hash_seq IN (${placeholders})
-    `).all(queryVec, ...chunk) as { hash_seq: string; distance: number }[];
-    scored.push(...rows);
-  }
-
-  scored.sort((a, b) => a.distance - b.distance);
-  return scored.slice(0, fetchLimit);
+interface VecMatch {
+  hash_seq: string;
+  distance: number;
 }
 
-function annVecScan(
+interface HashSeqRow {
+  hash_seq: string;
+}
+
+interface DocumentShareRow {
+  scoped: number;
+  total: number;
+}
+
+/** What a vector search is restricted to: collection names, a metadata filter, or both. */
+interface VecScope {
+  collectionNames?: readonly string[];
+  filter?: MetadataFilter;
+}
+
+/**
+ * SQL conditions and parameters that restrict `documents d` to the scope.
+ * With a metadata filter the caller joins `document_metadata dm`, and only
+ * documents whose metadata extraction is current and error-free qualify.
+ */
+function scopeConditions(scope: VecScope): { sql: string[]; params: SQLiteValue[] } {
+  const sql: string[] = [];
+  const params: SQLiteValue[] = [];
+  if (scope.collectionNames) {
+    sql.push(`d.collection IN (${scope.collectionNames.map(() => "?").join(",")})`);
+    params.push(...scope.collectionNames);
+  }
+  if (scope.filter) {
+    const compiled = compileMetadataFilter(scope.filter, "d");
+    sql.push(`dm.extraction_version = ${METADATA_EXTRACTION_VERSION}`, `dm.extraction_error IS NULL`, compiled.sql);
+    params.push(...compiled.params);
+  }
+  return { sql, params };
+}
+
+function metadataJoin(scope: VecScope): string {
+  return scope.filter ? `JOIN document_metadata dm ON dm.document_id = d.id` : "";
+}
+
+/**
+ * Exact top-k cosine scan over vectors_vec; vec0 brute-forces its candidate
+ * set. With a scope the candidates are pre-filtered through an IN list on
+ * hash_seq, so k is selected within the scope and a small collection or a
+ * selective metadata filter is never crowded out by the rest of the index
+ * (#775, #791, #803). vec0 returns no rows for a KNN whose IN list names a key
+ * it does not hold (sqlite-vec 0.1.9, pinned), so the list is drawn from the
+ * `vectors_vec_rowids` shadow table where vec0 keeps its keys: a
+ * content_vectors row without a vector narrows the scope instead of emptying
+ * it. The subselect never touches the vectors_vec virtual table itself, since
+ * a JOIN with it hangs (https://github.com/tobi/qmd/pull/23), and vec0 accepts
+ * one IN on its key.
+ */
+function knnVecScan(
   db: Database,
   embedding: number[],
   k: number,
-): { hash_seq: string; distance: number }[] {
+  scope?: VecScope,
+): VecMatch[] {
   const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
-  return db.prepare(`
+  const params: SQLiteValue[] = [new Float32Array(embedding), vecK];
+  let sql = `
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
+  `;
+  if (scope) {
+    const conditions = scopeConditions(scope);
+    sql += `
+      AND hash_seq IN (
+        SELECT r.id
+        FROM content_vectors cv
+        JOIN documents d ON d.hash = cv.hash AND d.active = 1
+        ${metadataJoin(scope)}
+        JOIN vectors_vec_rowids r ON r.id = cv.hash || '_' || cv.seq
+        WHERE ${conditions.sql.join(" AND ")}
+      )
+    `;
+    params.push(...conditions.params);
+  }
+  return withLazyContentVectorMigration(db, () => db.prepare(sql).all(...params) as VecMatch[]);
+}
+
+function activeDocumentShare(db: Database, scope: VecScope): number {
+  const conditions = scopeConditions(scope);
+  const row = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM documents d ${metadataJoin(scope)} WHERE d.active = 1 AND ${conditions.sql.join(" AND ")}) AS scoped,
+      (SELECT COUNT(*) FROM documents WHERE active = 1) AS total
+  `).get(...conditions.params) as DocumentShareRow;
+  return row.total === 0 ? 0 : row.scoped / row.total;
+}
+
+/** The matches whose chunk belongs to an active document in the scope, in the given order. */
+function keepInScope(db: Database, matches: VecMatch[], scope: VecScope): VecMatch[] {
+  if (matches.length === 0) return matches;
+  const hashes = Array.from(new Set(matches.map((m) => m.hash_seq.slice(0, m.hash_seq.lastIndexOf("_")))));
+  const conditions = scopeConditions(scope);
+  const rows = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT cv.hash || '_' || cv.seq AS hash_seq
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    ${metadataJoin(scope)}
+    WHERE cv.hash IN (${hashes.map(() => "?").join(",")})
+      AND ${conditions.sql.join(" AND ")}
+  `).all(...hashes, ...conditions.params) as HashSeqRow[]);
+  const inScope = new Set(rows.map((r) => r.hash_seq));
+  return matches.filter((m) => inScope.has(m.hash_seq));
+}
+
+/**
+ * Top-k chunks of a scope. A scope that holds most of the index is read from
+ * the global KNN with an over-fetch and post-filtered: the in-scope rows of a
+ * global top-k' are the exact in-scope top-m, so when m reaches k they equal
+ * the pre-filtered answer at the cost of one plain scan; a global pass that
+ * returned fewer rows than requested has exhausted the index, so its in-scope
+ * rows are complete as well. A smaller scope, a k whose over-fetch would not
+ * fit under the vec0 cap, or a global pass that filled its over-fetch without
+ * yielding k in-scope rows, runs the pre-filtered KNN.
+ */
+function scopedVecMatches(db: Database, embedding: number[], k: number, scope: VecScope): VecMatch[] {
+  const share = activeDocumentShare(db, scope);
+  const scaledK = share > 0 ? Math.ceil(k / share) * 4 : Infinity;
+  if (share >= GLOBAL_SCAN_MIN_SHARE && scaledK <= SQLITE_VEC_MAX_K) {
+    const overFetch = Math.min(SQLITE_VEC_MAX_K, Math.max(GLOBAL_SCAN_MIN_OVERFETCH, scaledK));
+    const global = knnVecScan(db, embedding, overFetch);
+    const inScope = keepInScope(db, global, scope);
+    if (inScope.length >= k || global.length < overFetch) return inScope.slice(0, k);
+  }
+  return knnVecScan(db, embedding, k, scope);
 }
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
@@ -4241,13 +4338,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   const names = scopedCollectionNames(collectionName);
-  if (names && names.length > 1) {
-    const lists = await Promise.all(
-      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
-    );
-    return mergeSearchResultsByScore(lists, limit);
-  }
-  const collectionFilter = names?.[0];
+  const scope: VecScope | undefined = names || filter ? { collectionNames: names, filter } : undefined;
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4256,55 +4347,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed).
   //
-  // Collection and metadata filters cannot be pushed into MATCH (sqlite-vec
-  // has no join-safe predicate here). Global ANN + post-filter starves small
-  // eligible sets: they never enter the top-k (#791, #803). Multiplier
-  // over-fetch alone is not enough either — sqlite-vec caps k at 4096. For a
-  // filter we therefore exact-scan the eligible vectors when the set is small
-  // enough, and only then fall back to capped ANN + post-filter.
-  let vecResults: { hash_seq: string; distance: number }[];
-
-  if (collectionFilter || filter) {
-    let eligibleSql = `
-      SELECT DISTINCT cv.hash || '_' || cv.seq AS hash_seq
-      FROM content_vectors cv
-      JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    `;
-    const eligibleConditions: string[] = [];
-    const eligibleParams: (string | number)[] = [];
-
-    if (collectionFilter) {
-      eligibleConditions.push(`d.collection = ?`);
-      eligibleParams.push(collectionFilter);
-    }
-
-    if (filter) {
-      const compiledFilter = compileMetadataFilter(filter, "d");
-      eligibleSql += ` JOIN document_metadata dm ON dm.document_id = d.id`;
-      eligibleConditions.push(`dm.extraction_version = ${METADATA_EXTRACTION_VERSION}`);
-      eligibleConditions.push(`dm.extraction_error IS NULL`);
-      eligibleConditions.push(compiledFilter.sql);
-      eligibleParams.push(...compiledFilter.params);
-    }
-
-    eligibleSql += ` WHERE ${eligibleConditions.join(" AND ")}`;
-
-    const eligibleHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(eligibleSql).all(...eligibleParams) as { hash_seq: string }[],
-    ).map((r) => r.hash_seq);
-
-    if (eligibleHashSeqs.length === 0) return [];
-
-    if (eligibleHashSeqs.length <= FILTERED_VEC_EXACT_SCAN_MAX) {
-      vecResults = exactVecScanByHashSeq(db, embedding, eligibleHashSeqs, limit);
-    } else {
-      // Large eligible set: ANN with over-fetch, hard-capped at sqlite-vec's max k.
-      vecResults = annVecScan(db, embedding, Math.max(limit * 30, limit * 3));
-    }
-  } else {
-    vecResults = annVecScan(db, embedding, limit * 3);
-  }
-
+  // A scope is an IN pre-filter inside the KNN statement, or the global KNN
+  // post-filtered when the scope holds most of the index (see
+  // scopedVecMatches); sqlite-vec caps k at 4096, so a wide over-fetch alone
+  // could not stand in for the pre-filter. Each collection in scope keeps the
+  // three-per-result chunk budget of a single scope, pooled into one k, so a
+  // long document in one collection cannot own the union's pool.
+  const k = limit * 3 * (names?.length ?? 1);
+  const vecResults = scope ? scopedVecMatches(db, embedding, k, scope) : knnVecScan(db, embedding, k);
   if (vecResults.length === 0) return [];
 
   // Step 2: Get chunk info and document data
@@ -4329,19 +4379,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
     LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: (string | number)[] = [...hashSeqs];
+  const params: SQLiteValue[] = [...hashSeqs];
 
-  if (collectionFilter) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionFilter);
-  }
-
-  if (filter) {
-    // Re-apply the filter on the document join: vectors are content-scoped,
-    // so one hash can belong to both matching and non-matching documents.
-    const compiledFilter = compileMetadataFilter(filter, "d");
-    docSql += ` AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiledFilter.sql}`;
-    params.push(...compiledFilter.params);
+  // Re-apply the scope on the document join: vectors are content-scoped, so
+  // one hash can belong to documents in and out of the scope.
+  if (scope) {
+    const conditions = scopeConditions(scope);
+    docSql += ` AND ${conditions.sql.join(" AND ")}`;
+    params.push(...conditions.params);
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {

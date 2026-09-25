@@ -1,9 +1,10 @@
 /**
  * Unit tests for multi-collection CLI filter input (#191, #775).
  *
- * Collection scoping is applied in searchFTS/searchVec (search each collection,
- * then merge). These tests cover CLI parseArgs / input normalization only.
- * Starvation regressions live in store.test.ts.
+ * Collection scoping is applied in searchFTS (search each collection, then
+ * merge) and searchVec (one KNN pre-filtered to the requested set). These
+ * tests cover CLI parseArgs / input normalization only. Starvation
+ * regressions live in store.test.ts.
  */
 
 import { describe, test, expect } from "vitest";
