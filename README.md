@@ -1213,13 +1213,15 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 ### Schema
 
 ```sql
-collections     -- Indexed directories with name and glob patterns
-path_contexts   -- Context descriptions by virtual path (qmd://...)
-documents       -- Markdown content with metadata and docid (6-char hash)
-documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
-vectors_vec     -- sqlite-vec vector index (hash_seq key)
-llm_cache       -- Cached LLM responses (query expansion, rerank scores)
+collections            -- Indexed directories with name and glob patterns
+path_contexts          -- Context descriptions by virtual path (qmd://...)
+documents              -- Markdown content with metadata and docid (6-char hash)
+documents_fts          -- FTS5 full-text index
+content_vectors        -- Embedding chunks (hash, seq, pos, 900 tokens each)
+vector_collection_ids  -- Integer id per collection name (the vector partition key)
+vector_rows            -- Vector rowid to (hash, seq, collection_id)
+vectors_by_collection  -- sqlite-vec vector index, one row per chunk and collection
+llm_cache              -- Cached LLM responses (query expansion, rerank scores)
 ```
 
 ## Environment Variables

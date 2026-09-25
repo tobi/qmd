@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { openDatabase } from "../src/db.js";
+import { VEC_TABLE, hasVectorIndex } from "../src/vec-layout.js";
 import type { Database } from "../src/db.js";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
@@ -166,12 +167,8 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     db = store.db;
 
     // Check if embeddings already exist (from previous test run)
-    const vecTable = db.prepare(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-    ).get();
-
-    if (vecTable) {
-      const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
+    if (hasVectorIndex(db)) {
+      const count = db.prepare(`SELECT COUNT(*) as cnt FROM ${VEC_TABLE}`).get() as { cnt: number };
       if (count.cnt > 0) {
         hasEmbeddings = true;
         return;
@@ -277,11 +274,8 @@ describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
     store = createStore();
     db = store.db;
     // Check if vectors exist
-    const vecTable = db.prepare(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-    ).get();
-    if (vecTable) {
-      const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
+    if (hasVectorIndex(db)) {
+      const count = db.prepare(`SELECT COUNT(*) as cnt FROM ${VEC_TABLE}`).get() as { cnt: number };
       hasVectors = count.cnt > 0;
     }
   });
