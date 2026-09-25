@@ -5,6 +5,11 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- `qmd embed` on WSL2 with CUDA no longer aborts intermittently in
+  `cuMemAddressReserve` (`ggml-cuda.cu:106`, out of memory). WSL reports
+  `linux` but its CUDA runs on the Windows driver, so the Windows CUDA
+  one-context default from #519 now applies there too.
+  `QMD_EMBED_PARALLELISM` still overrides it.
 
 ## [2.9.0] - 2026-11-17
 
