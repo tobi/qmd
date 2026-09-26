@@ -2588,16 +2588,39 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
     return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
   }
 
-  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ''
-    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
-    ORDER BY cv.hash, cv.seq
-    LIMIT 1
-  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+  // Pick the sample through indexes, then read one body by rowid; a join that
+  // carries c.doc costs one body copy per legacy chunk × active path. Both
+  // EXISTS filters depend only on hash, so this is still the lowest (hash, seq).
+  // One read transaction keeps the pick and the load on the same snapshot.
+  const sample = withLazyContentVectorMigration(db, () => {
+    const pickSample = db.prepare(`
+      SELECT cv.rowid AS rid
+      FROM content_vectors cv
+      WHERE cv.model = ? AND cv.embed_fingerprint = ''
+        AND cv.hash = (
+          SELECT l.hash
+          FROM content_vectors l
+          WHERE l.model = ? AND l.embed_fingerprint = ''
+            AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = l.hash AND d.active = 1)
+            AND EXISTS (SELECT 1 FROM content c WHERE c.hash = l.hash)
+          ORDER BY l.hash
+          LIMIT 1
+        )
+      ORDER BY cv.seq
+      LIMIT 1
+    `);
+    const loadSample = db.prepare(`
+      SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body,
+        (SELECT MIN(d.path) FROM documents d WHERE d.hash = cv.hash AND d.active = 1) AS path
+      FROM content_vectors cv
+      JOIN content c ON c.hash = cv.hash
+      WHERE cv.rowid = ?
+    `);
+    return db.transaction(() => {
+      const pick = pickSample.get(model, model) as { rid: number } | null | undefined;
+      return pick ? loadSample.get(pick.rid) : undefined;
+    })() as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | null | undefined;
+  });
 
   if (!sample) {
     return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };

@@ -13,6 +13,13 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- `qmd doctor` no longer stalls or fills the temp directory on large indexes
+  when checking legacy (empty-fingerprint) embeddings. The adoption sample
+  query joined `content` and grouped by the document body, so SQLite
+  materialized the full body once per legacy chunk and per active path before
+  `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
+  (#978). It now picks the sample row through indexes and loads only that
+  row's body; the sampled chunk is unchanged. #994 (thanks @mjaverto)
 
 ## [2.8.3] - 2026-08-16
 
