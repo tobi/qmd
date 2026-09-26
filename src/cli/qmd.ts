@@ -768,6 +768,20 @@ function localConfigIsFullyTrusted(): boolean {
   return isTrusted(configPath, localConfigDigest(configPath, snapshot));
 }
 
+/**
+ * Model override for commands that open their own SDK store (mcp, bench).
+ * Untrusted custom models fall back to env or built-in defaults, as in
+ * getStore(). The notice goes to stderr because stdio MCP owns stdout.
+ */
+function modelsForSdkStore(): ModelsConfig | undefined {
+  if (localConfigIsFullyTrusted()) return undefined;
+  const configPath = getConfigPath();
+  if (localConfigGated(configPath, collectSensitiveSnapshot()).models.length > 0) {
+    console.error(`Ignoring custom models in untrusted ${configPath}. Approve them with 'qmd trust'.`);
+  }
+  return resolveModels();
+}
+
 /** Record the active config's current gated set as approved. */
 function trustCurrentConfig(): void {
   const configPath = getConfigPath();
@@ -4802,6 +4816,7 @@ if (isMain) {
           collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
           dbPath: getDbPath(),
           configPath: configExists() ? getConfigPath() : undefined,
+          models: modelsForSdkStore(),
         });
       } catch (error) {
         exitWithError(error);
@@ -4839,6 +4854,7 @@ if (isMain) {
         process.exit(0);
       }
 
+      const models = modelsForSdkStore();
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
         // --host overrides the default localhost bind; QMD_HOST env is the
@@ -4901,7 +4917,7 @@ if (isMain) {
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host, models });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -4912,7 +4928,7 @@ if (isMain) {
       } else {
         // Default: stdio transport
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await startMcpServer({ dbPath: getDbPath(), models });
       }
       break;
     }

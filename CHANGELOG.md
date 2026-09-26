@@ -7,6 +7,14 @@
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
+### Security
+
+- `qmd mcp` (stdio and `--http`) and `qmd bench` now honor the project-local
+  model trust gate from 2.8.3. Before, starting the MCP server in a cloned
+  repository loaded or downloaded any custom model its `.qmd/index.yml` named,
+  with no prompt. They now use your env or built-in models until `qmd trust`,
+  and say so on stderr. (#997)
+
 ### Fixed
 
 - Embedding generation and legacy fingerprint adoption now tokenize documents

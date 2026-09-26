@@ -29,7 +29,7 @@ import {
   type DocumentMetadata,
   type MetadataFilter,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, type ModelsConfig } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
@@ -626,6 +626,7 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  models?: ModelsConfig;
 };
 
 /**
@@ -844,6 +845,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
+    models: options.models,
   });
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
@@ -898,6 +900,7 @@ export async function startMcpHttpServer(
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
+    models: options.models,
   });
 
   // Pre-fetch default collection names for REST endpoint
