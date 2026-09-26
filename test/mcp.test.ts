@@ -1380,6 +1380,27 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     expect(res.status).toBe(405);
     expect(res.headers.get("mcp-session-id")).toBeNull();
   });
+
+  // REST, not MCP protocol, but it lives here because this suite runs under CI
+  // and every case is rejected before a search (or a model) runs.
+  test("POST /query rejects invalid searches with 400", async () => {
+    const cases = [
+      { searches: [null], error: "Invalid field: searches" },
+      { searches: [{ type: "bogus", query: "x" }], error: "Invalid field: searches" },
+      { searches: [], error: "Invalid field: searches" },
+      { searches: [{ type: "lex", query: '"unterminated' }], error: "unmatched double quote" },
+      { searches: [{ type: "vec", query: "line one\nline two" }], error: "single-line" },
+    ];
+    for (const { searches, error } of cases) {
+      const res = await fetch(`${baseUrl}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain(error);
+    }
+  });
 });
 
 

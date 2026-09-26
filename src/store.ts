@@ -5940,6 +5940,22 @@ export interface StructuredSearchOptions {
 }
 
 /**
+ * Check typed sub-queries for syntax the backends reject, so callers can
+ * refuse bad input before searching. Returns the first error, or null.
+ */
+export function validateStructuredSearches(searches: ExpandedQuery[]): string | null {
+  for (const search of searches) {
+    const location = search.line ? `Line ${search.line}` : 'Structured search';
+    if (/[\r\n]/.test(search.query)) {
+      return `${location} (${search.type}): queries must be single-line. Remove newline characters.`;
+    }
+    const error = search.type === 'lex' ? validateLexQuery(search.query) : validateSemanticQuery(search.query);
+    if (error) return `${location} (${search.type}): ${error}`;
+  }
+  return null;
+}
+
+/**
  * Structured search: execute pre-expanded queries without LLM query expansion.
  *
  * Designed for LLM callers (MCP/HTTP) that generate their own query expansions.
@@ -5975,24 +5991,8 @@ export async function structuredSearch(
 
   if (searches.length === 0) return [];
 
-  // Validate queries before executing
-  for (const search of searches) {
-    const location = search.line ? `Line ${search.line}` : 'Structured search';
-    if (/[\r\n]/.test(search.query)) {
-      throw new Error(`${location} (${search.type}): queries must be single-line. Remove newline characters.`);
-    }
-    if (search.type === 'lex') {
-      const error = validateLexQuery(search.query);
-      if (error) {
-        throw new Error(`${location} (lex): ${error}`);
-      }
-    } else if (search.type === 'vec' || search.type === 'hyde') {
-      const error = validateSemanticQuery(search.query);
-      if (error) {
-        throw new Error(`${location} (${search.type}): ${error}`);
-      }
-    }
-  }
+  const validationError = validateStructuredSearches(searches);
+  if (validationError) throw new Error(validationError);
 
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];

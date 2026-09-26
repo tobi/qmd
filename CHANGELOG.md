@@ -13,6 +13,12 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- HTTP `POST /query` and `/search` now answer malformed `searches` with a 400
+  and a message naming the problem. A `null` entry, an unmatched quote in a
+  `lex` query, or a newline in a `vec` query used to return a bare 500, and an
+  unknown `type` used to return empty results. Like the MCP `query` tool, the
+  endpoint now takes 1 to 10 searches, so `searches: []` is a 400 instead of
+  an empty 200. (#998)
 
 ## [2.8.3] - 2026-08-16
 

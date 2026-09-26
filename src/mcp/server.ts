@@ -30,7 +30,7 @@ import {
   type MetadataFilter,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, validateStructuredSearches } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -60,6 +60,18 @@ function validateFilterArgument(filter: unknown): { filter?: MetadataFilter; err
     return { error: err instanceof Error ? err.message : String(err) };
   }
 }
+
+/** One typed sub-query, shared by the MCP `query` tool and REST `POST /query`. */
+const subSearchSchema = z.object({
+  type: z.enum(['lex', 'vec', 'hyde']).describe(
+    "lex = BM25 keywords (supports \"phrase\" and -negation); " +
+    "vec = semantic question; hyde = hypothetical answer passage"
+  ),
+  query: z.string().describe(
+    "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
+    "For vec: natural language question. For hyde: 50-100 word answer passage."
+  ),
+});
 
 type StatusResult = {
   totalDocuments: number;
@@ -253,17 +265,6 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
   // ---------------------------------------------------------------------------
   // Tool: query (Primary search tool)
   // ---------------------------------------------------------------------------
-
-  const subSearchSchema = z.object({
-    type: z.enum(['lex', 'vec', 'hyde']).describe(
-      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
-      "vec = semantic question; hyde = hypothetical answer passage"
-    ),
-    query: z.string().describe(
-      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
-      "For vec: natural language question. For hyde: 50-100 word answer passage."
-    ),
-  });
 
   server.registerTool(
     "query",
@@ -926,10 +927,6 @@ export async function startMcpHttpServer(
       arguments?: Record<string, unknown>;
     };
   };
-  type RestSearchInput = {
-    type?: unknown;
-    query?: unknown;
-  };
 
   /** Extract a human-readable label from a JSON-RPC body */
   function describeRequest(body: JsonRpcLikeBody): string {
@@ -1033,19 +1030,23 @@ export async function startMcpHttpServer(
         }
         const params = parsedParams as Record<string, unknown>;
 
-        // Validate required fields
-        if (!params.searches || !Array.isArray(params.searches)) {
+        // Same limits as the MCP `query` tool; an empty list would search nothing.
+        const parsedSearches = z.array(subSearchSchema).min(1).max(10).safeParse(params.searches);
+        if (!parsedSearches.success) {
+          const issues = parsedSearches.error.issues
+            .map((issue) => `${["searches", ...issue.path].join(".")} (${issue.message})`)
+            .join("; ");
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          nodeRes.end(JSON.stringify({ error: `Invalid field: ${issues}` }));
           return;
         }
-
-        // Map to internal format
-        const searches = params.searches as RestSearchInput[];
-        const queries: ExpandedQuery[] = searches.map((s) => ({
-          type: s.type as 'lex' | 'vec' | 'hyde',
-          query: String(s.query || ""),
-        }));
+        const queries: ExpandedQuery[] = parsedSearches.data;
+        const queryError = validateStructuredSearches(queries);
+        if (queryError) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: queryError }));
+          return;
+        }
 
         // Optional metadata filter — must be an object and a valid filter AST
         let restFilter: MetadataFilter | undefined;
@@ -1079,12 +1080,12 @@ export async function startMcpHttpServer(
         });
 
         // Use first lex or vec query for snippet extraction
-        const primaryQuery = searches.find((s) => s.type === 'lex')?.query
-          || searches.find((s) => s.type === 'vec')?.query
-          || searches[0]?.query || "";
+        const primaryQuery = queries.find((s) => s.type === 'lex')?.query
+          || queries.find((s) => s.type === 'vec')?.query
+          || queries[0]?.query || "";
 
         const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
+          const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
           return {
             docid: `#${r.docid}`,
             file: `qmd://${encodeQmdPath(r.displayPath)}`,
@@ -1099,7 +1100,7 @@ export async function startMcpHttpServer(
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        log(`${ts()} POST /query ${queries.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 
