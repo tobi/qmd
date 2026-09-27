@@ -111,6 +111,7 @@ import {
   setConfigIndexName,
   loadConfig,
   saveConfig,
+  saveModelsConfig,
   setConfigSource,
   findLocalConfigPath,
   getLocalDbPath,
@@ -2146,15 +2147,7 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
     const models = resolveModels(config.models);
     const current = config.models ?? {};
     if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
+      saveModelsConfig(models);
     }
     return models;
   } catch {
