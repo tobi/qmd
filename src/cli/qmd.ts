@@ -133,6 +133,7 @@ import {
   setConfigIndexName,
   loadConfig,
   saveConfig,
+  saveModelsConfig,
   setConfigSource,
   findLocalConfigPath,
   getLocalDbPath,
@@ -2413,15 +2414,7 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   if (isJevModel(models.rerank)) new JevReranker(models.rerank, current.rerankOptions);
   else if (current.rerankOptions !== undefined) throw new Error("rerankOptions requires a typesafe: rerank model");
   if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-    saveConfig({
-      ...config,
-      models: {
-        ...current,
-        embed: models.embed,
-        generate: models.generate,
-        rerank: models.rerank,
-      },
-    });
+    saveModelsConfig(models);
   }
   return models;
 }
