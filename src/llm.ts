@@ -1240,6 +1240,11 @@ export class LlamaCpp implements LLM {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+            // node-llama-cpp defaults batchSize to min(contextSize, 512) and
+            // splits longer inputs across decodes. Non-causal models such as
+            // EmbeddingGemma pool only the last batch, so 511+ token inputs
+            // came back as garbage (#897).
+            batchSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {

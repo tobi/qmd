@@ -57,7 +57,6 @@ import {
   insertDocument,
   cleanupOrphanedVectors,
   generateEmbeddings,
-  maybeAdoptLegacyEmbeddingFingerprint,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -4137,52 +4136,6 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store);
 
       expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
-      expect(globalTokenize).not.toHaveBeenCalled();
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("legacy fingerprint adoption tokenizes with the store-local LLM", async () => {
-    const store = await createTestStore();
-    const fakeLlm = createFakeEmbedLlm();
-    const globalTokenize = vi.fn(async () => {
-      throw new Error("global tokenizer must not run");
-    });
-    const model = "hf:test/store-local-fingerprint.gguf";
-    const body = "# Legacy fingerprint\n\nVerified model bytes own legacy tokenization.";
-    const hash = await hashContent(body);
-
-    setDefaultLlamaCpp({
-      tokenize: globalTokenize,
-      detokenize: async () => "",
-    } as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(store.db, "docs", {
-        name: "store-local-fingerprint",
-        body,
-        hash,
-      });
-      store.ensureVecTable(3);
-      store.insertEmbedding(
-        hash,
-        0,
-        0,
-        new Float32Array([0.1, 0.2, 0.3]),
-        model,
-        new Date(0).toISOString(),
-        1,
-        "",
-      );
-
-      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
-
-      expect(result.checked).toBe(true);
-      expect(result.adopted).toBe(1);
       expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
       expect(globalTokenize).not.toHaveBeenCalled();
     } finally {

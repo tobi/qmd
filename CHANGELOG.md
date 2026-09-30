@@ -9,9 +9,18 @@
 
 ### Fixed
 
-- Embedding generation and legacy fingerprint adoption now tokenize documents
+- Chunks of 511 tokens or more no longer embed to garbage (#897). The embedding
+  context used node-llama-cpp's default 512-token batch, so longer inputs were
+  split and EmbeddingGemma pooled only the last batch: every 511-token input
+  produced the same vector. The context now processes the whole input in one
+  batch. The embedding fingerprint changes, so `qmd update` and `qmd status`
+  report existing documents as pending and the next `qmd embed` replaces their
+  vectors; search keeps using the old ones until then. `qmd doctor` no longer
+  stamps legacy vectors as current based on one matching sample: they also
+  remain pending until re-embedded.
+- Embedding generation now tokenizes documents
   with the store-selected embedding model instead of the global default. This
-  keeps chunk boundaries aligned with the model that creates and verifies the
+  keeps chunk boundaries aligned with the model that creates the
   stored vectors without initializing an unrelated provider.
 
 ## [2.8.3] - 2026-08-16

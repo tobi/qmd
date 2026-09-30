@@ -15,7 +15,8 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
-import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, LlamaCpp, formatDocForEmbedding } from "../src/llm.ts";
+import { createStore, hashContent } from "../src/store.ts";
 import { setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
@@ -899,6 +900,33 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("disables real LLM operations");
     expect(stdout).toContain("changes Hugging Face download endpoint");
   }, 20000);
+
+  test.skipIf(!!process.env.CI)("qmd doctor leaves legacy embeddings pending even when a short sample matches", async () => {
+    const env = await createIsolatedTestEnv("doctor-legacy-embeddings");
+    const store = createStore(env.dbPath);
+    const llm = new LlamaCpp({ embedModel: DEFAULT_EMBED_MODEL_URI });
+    const body = "# Legacy document\n\nA short sample cannot verify longer embeddings.";
+    const hash = await hashContent(body);
+    const now = new Date().toISOString();
+    try {
+      const result = await llm.embed(formatDocForEmbedding(body, "Legacy document", DEFAULT_EMBED_MODEL_URI));
+      if (!result) throw new Error("Failed to create the legacy embedding fixture");
+      store.insertContent(hash, body, now);
+      store.insertDocument("docs", "legacy.md", "Legacy document", hash, now, now);
+      store.ensureVecTable(result.embedding.length);
+      store.insertEmbedding(hash, 0, 0, new Float32Array(result.embedding), DEFAULT_EMBED_MODEL_URI, now, 1, "");
+      await llm.dispose();
+
+      const { exitCode } = await runQmd(["doctor"], env);
+      expect(exitCode).toBe(0);
+      expect(store.getHashesNeedingEmbedding(DEFAULT_EMBED_MODEL_URI)).toBe(1);
+      const row = store.db.prepare("SELECT embed_fingerprint FROM content_vectors WHERE hash = ?").get<{ embed_fingerprint: string }>(hash);
+      expect(row?.embed_fingerprint).toBe("");
+    } finally {
+      store.close();
+      await llm.dispose();
+    }
+  }, 60000);
 
   test("qmd doctor flags mixed embedding fingerprints", async () => {
     const db = openDatabase(testDbPath);

@@ -127,6 +127,10 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    // Vectors written before the embedding context processed the whole
+    // sequence in one batch are wrong for inputs of 511+ tokens (#897).
+    // Bumping the fingerprint makes `qmd embed` replace them.
+    `embed_batch:whole_sequence`,
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
 }
@@ -2570,88 +2574,6 @@ export type IndexHealthInfo = {
   totalDocs: number;
   daysStale: number | null;
 };
-
-export type LegacyFingerprintAdoptionResult = {
-  checked: boolean;
-  adopted: number;
-  reason: string;
-};
-
-export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
-  const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
-  const legacyCount = withLazyContentVectorMigration(db, () => {
-    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
-    return row.count;
-  });
-  if (legacyCount === 0) {
-    return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
-  }
-
-  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ''
-    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
-    ORDER BY cv.hash, cv.seq
-    LIMIT 1
-  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
-
-  if (!sample) {
-    return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
-  }
-
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) {
-    return { checked: false, adopted: 0, reason: "vectors_vec table is missing" };
-  }
-
-  const expectedHashSeq = `${sample.hash}_${sample.seq}`;
-  const title = extractTitle(sample.body, sample.path);
-  const llm = getLlm(store);
-
-  return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokensWithLlm(
-      llm,
-      sample.body,
-      undefined,
-      undefined,
-      undefined,
-      sample.path,
-      undefined,
-      session.signal,
-    );
-    const chunk = chunks[sample.seq];
-    if (!chunk) {
-      return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
-    }
-
-    const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
-    if (!result) {
-      return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
-    }
-
-    const nearest = db.prepare(`
-      SELECT hash_seq, distance
-      FROM vectors_vec
-      WHERE embedding MATCH ? AND k = 1
-    `).get(new Float32Array(result.embedding)) as { hash_seq: string; distance: number } | undefined;
-
-    if (!nearest) {
-      return { checked: true, adopted: 0, reason: "legacy sample vector not found" };
-    }
-
-    const threshold = 0.0001;
-    if (nearest.hash_seq !== expectedHashSeq || nearest.distance > threshold) {
-      return { checked: true, adopted: 0, reason: `legacy sample differs from current fingerprint (nearest ${nearest.hash_seq}, distance ${nearest.distance.toFixed(6)})` };
-    }
-
-    const update = withLazyContentVectorMigration(db, () => db.prepare(`UPDATE content_vectors SET embed_fingerprint = ? WHERE model = ? AND embed_fingerprint = ''`).run(fingerprint, model));
-    return { checked: true, adopted: update.changes, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}` };
-  });
-}
 
 export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);

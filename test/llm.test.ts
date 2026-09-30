@@ -535,6 +535,8 @@ describe("native llama stdout containment", () => {
       expect(getLlama).toHaveBeenCalledWith(expect.objectContaining({ gpu: false, build: "never" }));
       expect(loadModel).toHaveBeenCalledWith(expect.objectContaining({ gpuLayers: 0 }));
       expect(getEmbeddingFor).toHaveBeenCalledWith("hello world");
+      // #897: the whole input must fit one batch, or non-causal models pool only the tail.
+      expect(createEmbeddingContext).toHaveBeenCalledWith(expect.objectContaining({ contextSize: 2048, batchSize: 2048 }));
     } finally {
       await llm.dispose();
       stderrSpy.mockRestore();
