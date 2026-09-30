@@ -89,6 +89,7 @@ import {
 import { syncDocumentMetadata, countDocumentsPendingMetadata } from "../metadata-store.js";
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, type MetadataFilter } from "../metadata-filter.js";
+import { isJevModel } from "../jev.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -3962,6 +3963,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (isJevModel(model)) continue; // remote model, nothing to download
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4735,7 +4737,7 @@ if (isMain) {
         activeModels.embed,
         activeModels.generate,
         activeModels.rerank,
-      ];
+      ].filter(model => !isJevModel(model));
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,
