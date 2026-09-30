@@ -78,6 +78,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 import { createRequire } from "node:module";
+import { isJevModel, jevRerank } from "./jev.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -1736,6 +1737,9 @@ export class LlamaCpp implements LLM {
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    if (isJevModel(this.rerankModelUri)) {
+      return jevRerank(this.rerankModelUri, query, documents, process.env.TYPESAFE_API_KEY);
+    }
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 

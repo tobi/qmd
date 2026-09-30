@@ -1374,6 +1374,17 @@ Override them per-role without touching source via the `models:` block in
 
 Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
 
+### Remote reranking with TypeSafe Jev (optional)
+
+Set the rerank model to `typesafe:<model>` to score candidates with [TypeSafe Jev](https://typesafe.ai) instead of the local reranker. Indexing, embeddings, and query expansion stay local; only the candidate chunks and the query are sent to the API.
+
+```sh
+export TYPESAFE_API_KEY=...
+QMD_RERANK_MODEL=typesafe:jev-latest qmd query "how do we handle retries"
+```
+
+If your `index.yml` has a `models:` block (`qmd init` writes one), set `rerank: "typesafe:jev-latest"` there instead: config takes precedence over `QMD_RERANK_MODEL`. Each chunk is scored independently (P(relevant)), so results are cached per model exactly like the local reranker.
+
 ### Qwen3 (Query Expansion)
 
 Used for generating query variations via `LlamaChatSession`.
