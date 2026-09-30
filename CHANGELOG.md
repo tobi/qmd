@@ -17,7 +17,7 @@
   process it spawns and SIGKILLs it if it is still running 5 seconds later.
   Previously the launcher died on SIGTERM while the child, possibly blocked in
   native llama.cpp code, was orphaned and kept running — so `timeout 60 qmd
-  query ...` could leave a process spinning at full CPU holding GPU memory.
+  query ...` could leave a process spinning at full CPU holding GPU memory. (#1029)
 
 ## [2.8.3] - 2026-08-16
 
