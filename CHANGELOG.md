@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- Document `bodyLength` now counts UTF-8 bytes, as documented, instead of
+  characters or UTF-16 code units. `multi-get` / `multi_get` compared that
+  value against `maxBytes`, so non-ASCII documents could exceed the limit by
+  up to 4x (an 80 KB file of umlauts passed the 64 KB default).
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

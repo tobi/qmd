@@ -58,6 +58,7 @@ import {
   cleanupOrphanedVectors,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
+  resolveCommaListName,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -2346,6 +2347,76 @@ describe("Document Retrieval", () => {
       if (docs[0]!.skipped) {
         expect((docs[0] as { skipped: true; skipReason: string }).skipReason).toContain("too large");
       }
+
+      await cleanupTestDb(store);
+    });
+
+    test.each([false, true])("findDocuments limits non-ASCII files by UTF-8 bytes (includeBody=%s)", async (includeBody) => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+      // 40,007 characters but 80,007 UTF-8 bytes: over the 64KB default.
+      const body = "# Test\n" + "\u00e4".repeat(40000);
+      const bytes = Buffer.byteLength(body, "utf-8");
+      await insertTestDocument(store.db, collectionName, {
+        name: "unicode",
+        filepath: "/path/unicode.md",
+        displayPath: "unicode.md",
+        body,
+      });
+
+      const { docs, errors } = store.findDocuments("unicode.md", { includeBody });
+      expect(errors).toEqual([]);
+      expect(docs).toHaveLength(1);
+      expect(docs[0]).toMatchObject({ skipped: true, skipReason: "File too large (78KB > 64KB)" });
+
+      const below = store.findDocuments("unicode.md", { includeBody, maxBytes: bytes - 1 });
+      expect(below.docs[0]!.skipped).toBe(true);
+
+      const atLimit = store.findDocuments("unicode.md", { includeBody, maxBytes: bytes });
+      expect(atLimit.docs[0]).toMatchObject({ skipped: false, doc: { bodyLength: bytes } });
+
+      await cleanupTestDb(store);
+    });
+
+    test("bodyLength is UTF-8 bytes on every lookup path", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+      // 1-, 2-, 3- and 4-byte characters: code points, UTF-16 units and bytes all differ.
+      const body = "# Bytes\n\nzebrafish A\u00e4\u4e2d\u{1F600}";
+      const bytes = Buffer.byteLength(body, "utf-8");
+      expect(bytes).not.toBe(body.length);
+      const hash = await hashContent(body);
+      await insertTestDocument(store.db, collectionName, {
+        name: "bytes",
+        hash,
+        body,
+        displayPath: "bytes.md",
+      });
+
+      expect(store.matchFilesByGlob("**/bytes.md")[0]!.bodyLength).toBe(bytes);
+
+      const comma = resolveCommaListName(store.db, "bytes.md");
+      expect(comma.ok && comma.match.bodyLength).toBe(bytes);
+
+      const single = store.findDocument("bytes.md");
+      expect("error" in single ? single.error : single.bodyLength).toBe(bytes);
+
+      const multi = store.findDocuments("bytes.md");
+      expect(multi.docs[0]).toMatchObject({ skipped: false, doc: { bodyLength: bytes } });
+
+      const fts = store.searchFTS("zebrafish", 10);
+      expect(fts[0]!.bodyLength).toBe(bytes);
+
+      const dims = 8;
+      store.ensureVecTable(dims);
+      const embedding = new Float32Array(dims);
+      embedding[0] = 1;
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+      const queryEmbedding = Array(dims).fill(0);
+      queryEmbedding[0] = 1;
+      const vec = await store.searchVec("ignored - embedding precomputed", "test-model", 3, undefined, undefined, queryEmbedding);
+      expect(vec[0]!.bodyLength).toBe(bytes);
 
       await cleanupTestDb(store);
     });
