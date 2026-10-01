@@ -503,11 +503,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
-      if (hasYamlConfig || options.config) {
-        collectionsRenameCollection(oldName, newName);
-      }
-      return result;
+      // Keep indexed identities unchanged if config write-through fails.
+      const rename = db.transaction(() => {
+        const result = renameStoreCollection(db, oldName, newName);
+        if (hasYamlConfig || options.config) {
+          collectionsRenameCollection(oldName, newName);
+        }
+        return result;
+      });
+      return rename();
     },
     listCollections: async () => storeListCollections(db),
     getDefaultCollectionNames: async () => {

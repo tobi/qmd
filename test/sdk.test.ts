@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
@@ -195,14 +195,34 @@ describe("collection management", () => {
     expect(removed).toBe(false);
   });
 
-  test("renameCollection renames a collection", async () => {
-    await store.addCollection("old-name", { path: docsDir, pattern: "**/*.md" });
-    const renamed = await store.renameCollection("old-name", "new-name");
+  test("renameCollection moves indexed documents to the new name", async () => {
+    const renameDir = await mkdtemp(join(testDir, "rename-"));
+    await writeFile(join(renameDir, "auth.md"), "---\nqmd:\n  metadata:\n    status: approved\n---\n# Authentication\n\nAuthentication uses JWT tokens for session management.\n");
+    await writeFile(join(renameDir, "cjk.md"), "# 报文处理\n\n手工发报支持 pacs.008 报文。\n");
+    await store.addCollection("original", { path: renameDir, pattern: "**/*.md" });
+    await store.update();
+    const before = await store.get("qmd://original/auth.md");
+    if ("error" in before) throw new Error(`auth.md was not indexed: ${before.error}`);
+
+    const renamed = await store.renameCollection("original", "renamed");
 
     expect(renamed).toBe(true);
-    const names = (await store.listCollections()).map(c => c.name);
-    expect(names).toContain("new-name");
-    expect(names).not.toContain("old-name");
+    const collections = await store.listCollections();
+    expect(collections.map(c => [c.name, c.active_count])).toEqual([["renamed", 2]]);
+    expect(await store.get("qmd://original/auth.md")).toMatchObject({ error: "not_found" });
+    expect(await store.get("qmd://renamed/auth.md")).toMatchObject({ collectionName: "renamed", hash: before.hash });
+
+    const lexical = await store.searchLex("JWT", { collection: "renamed" });
+    expect(lexical.map(r => r.filepath)).toEqual(["qmd://renamed/auth.md"]);
+    // CJK text is searchable only through its per-character FTS normalization.
+    const cjk = await store.searchLex("报文处理", { collection: "renamed" });
+    expect(cjk.map(r => r.filepath)).toEqual(["qmd://renamed/cjk.md"]);
+    // Frontmatter metadata is keyed by document id, so it survives only if the rows move in place.
+    const approved = await store.searchLex("JWT", {
+      collection: "renamed",
+      filter: { key: "status", operator: "eq", value: "approved" },
+    });
+    expect(approved.map(r => r.filepath)).toEqual(["qmd://renamed/auth.md"]);
   });
 
   test("renameCollection returns false for non-existent source", async () => {
@@ -210,11 +230,16 @@ describe("collection management", () => {
     expect(renamed).toBe(false);
   });
 
-  test("renameCollection throws if target exists", async () => {
+  test("renameCollection throws if target exists and leaves both collections intact", async () => {
     await store.addCollection("a", { path: docsDir, pattern: "**/*.md" });
     await store.addCollection("b", { path: notesDir, pattern: "**/*.md" });
+    await store.update();
 
     await expect(store.renameCollection("a", "b")).rejects.toThrow("already exists");
+
+    const collections = await store.listCollections();
+    expect(collections.map(c => [c.name, c.active_count])).toEqual([["a", 3], ["b", 3]]);
+    expect(await store.get("qmd://a/auth.md")).toMatchObject({ collectionName: "a", title: "Authentication" });
   });
 
   test("listCollections returns empty array for empty config", async () => {
@@ -452,6 +477,56 @@ describe("YAML config file mode", () => {
     const parsed = YAML.parse(raw) as CollectionConfig;
     expect(parsed.collections).toHaveProperty("newcol");
     expect(parsed.collections.newcol!.path).toBe(docsDir);
+  });
+
+  // POSIX write permissions do not restrict root and are not portable to Windows.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("renameCollection preserves indexed documents when YAML writing fails", async () => {
+    const configPath = join(testDir, "rename-write-failure.yml");
+    const dbPath = freshDbPath();
+    const config: CollectionConfig = {
+      collections: { original: { path: docsDir, pattern: "**/*.md" } },
+    };
+    const yaml = YAML.stringify(config);
+    await writeFile(configPath, yaml);
+    let store = await createStore({ dbPath, configPath });
+
+    const expectOriginalCollection = async () => {
+      expect(await store.get("qmd://original/auth.md")).toMatchObject({
+        collectionName: "original", title: "Authentication",
+      });
+      expect(await store.get("qmd://renamed/auth.md")).toMatchObject({ error: "not_found" });
+      expect((await store.searchLex("JWT", { collection: "original" })).map(r => r.filepath))
+        .toEqual(["qmd://original/auth.md"]);
+      expect((await store.listCollections()).map(c => [c.name, c.active_count]))
+        .toEqual([["original", 3]]);
+    };
+
+    try {
+      await store.update();
+      await expectOriginalCollection();
+      await chmod(configPath, 0o444);
+
+      await expect(store.renameCollection("original", "renamed")).rejects.toThrow("EACCES");
+      expect(readFileSync(configPath, "utf-8")).toBe(yaml);
+      await expectOriginalCollection();
+
+      await chmod(configPath, 0o644);
+      await store.close();
+      store = await createStore({ dbPath, configPath });
+      await expectOriginalCollection();
+
+      await store.close();
+      // A changed config forces a resync instead of reusing the stored config hash.
+      await writeFile(configPath, YAML.stringify({ ...config, global_context: "Reload config" }));
+      store = await createStore({ dbPath, configPath });
+      await expectOriginalCollection();
+
+      expect(await store.renameCollection("original", "renamed")).toBe(true);
+      expect(await store.get("qmd://renamed/auth.md")).toMatchObject({ collectionName: "renamed" });
+    } finally {
+      await chmod(configPath, 0o644);
+      await store.close();
+    }
   });
 
   test("context persists to YAML file", async () => {

@@ -1390,8 +1390,22 @@ export function renameStoreCollection(db: Database, oldName: string, newName: st
     throw new Error(`Collection '${newName}' already exists`);
   }
 
-  const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
-  return result.changes > 0;
+  // Indexed documents carry the collection name in their identity and FTS
+  // filepath, so they move with the collection row in one transaction.
+  // documents_au rewrites each moved FTS row from the raw content, dropping
+  // the CJK normalization, so the moved rows are rebuilt afterwards.
+  const rename = db.transaction(() => {
+    const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
+    if (result.changes === 0) return false;
+
+    const moved = db.prepare(`SELECT id FROM documents WHERE collection = ?`).all<{ id: number }>(oldName);
+    db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+    for (const { id } of moved) {
+      rebuildDocumentFTS(db, id);
+    }
+    return true;
+  });
+  return rename();
 }
 
 export function updateStoreContext(db: Database, collectionName: string, path: string, text: string): boolean {
