@@ -17,6 +17,7 @@ import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qm
 import { openDatabase } from "../src/db.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
+import { getEmbeddingFingerprint } from "../src/store.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -1297,6 +1298,35 @@ ${token}
 
     const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
     expect(after.exitCode).toBe(1);
+  });
+
+  test("update counts pending embeddings against the configured embed model", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-embed-model");
+    const collectionDir = join(testDir, "update-embed-model-docs");
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "embedded.md"), "# Embedded\nAlready has vectors.\n");
+
+    const customEmbed = "hf:custom/update-embed-model.gguf";
+    const env = { QMD_EMBED_MODEL: customEmbed };
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "embed-model-check"],
+      { dbPath, configDir, env }
+    );
+    expect(add.exitCode).toBe(0);
+
+    // Vectors exist only under the configured (non-default) model.
+    const db = openDatabase(dbPath);
+    const doc = db.prepare(`SELECT hash FROM documents WHERE active = 1 LIMIT 1`).get() as { hash: string };
+    db.prepare(`
+      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, ?, 1, ?)
+    `).run(doc.hash, customEmbed, getEmbeddingFingerprint(customEmbed), new Date().toISOString());
+    db.close();
+
+    const update = await runQmd(["update"], { dbPath, configDir, env });
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).not.toContain("need vectors");
   });
 });
 
