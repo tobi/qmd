@@ -10,6 +10,9 @@
 
 ### Fixed
 
+- `qmd update --pull` now fails with guidance to configure a per-collection
+  update command instead of silently re-indexing without pulling. The help text
+  no longer advertises the no-op flag.
 - Filtered vector search binds candidate IDs as one JSON list, so a parser-valid metadata filter cannot exhaust Node's SQL variable limit during document lookup. Applies to both exact scans and the capped global fallback.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
