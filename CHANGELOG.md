@@ -15,6 +15,11 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- The SDK's `removeCollection()` now deletes the collection's indexed
+  documents, not only its configuration. Before, search and `get()` kept
+  returning documents from a removed collection. Content that another
+  collection still uses is kept. If writing the configuration fails, the
+  collection and its indexed documents are preserved.
 
 ## [2.8.3] - 2026-08-16
 

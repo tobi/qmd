@@ -3701,18 +3701,17 @@ export function removeCollection(db: Database, collectionName: string): { delete
   // Delete documents from database
   const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
+  // Clean up orphaned content hashes. Content still referenced by another
+  // collection's inactive documents stays, since deleting it would cascade
+  // into those documents.
+  const cleanedHashes = cleanupOrphanedContent(db);
 
   // Remove from store_collections
   deleteStoreCollection(db, collectionName);
 
   return {
     deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
+    cleanedHashes,
   };
 }
 
