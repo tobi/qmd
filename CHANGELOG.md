@@ -15,6 +15,9 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- Filling in default model URIs now updates only the `models` block of the
+  parsed config, so comments and quoting in a committed `.qmd/index.yml`
+  survive (#899).
 
 ## [2.8.3] - 2026-08-16
 

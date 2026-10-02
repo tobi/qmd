@@ -6,11 +6,11 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
+import { getConfigPath, loadConfig, saveModelsConfig, setConfigIndexName, setConfigSource } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -101,6 +101,54 @@ describe("getConfigDir via getConfigPath", () => {
       await writeFile(join(dir, "index.yml"), "");
       expect(loadConfig()).toEqual({ collections: {} });
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("saveModelsConfig keeps comments and quoting in an existing file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-models-config-"));
+    const configPath = join(dir, "index.yml");
+    try {
+      await writeFile(configPath, [
+        "# Load-bearing comment",
+        'global_context: "demo project"',
+        "collections:",
+        "  docs:",
+        "    path: ./docs  # relative to .qmd",
+        '    pattern: "**/*.md"',
+        "",
+      ].join("\n"));
+      setConfigSource({ configPath });
+
+      saveModelsConfig({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+
+      const written = await readFile(configPath, "utf-8");
+      expect(written).toContain("# Load-bearing comment\n");
+      expect(written).toContain('global_context: "demo project"');
+      expect(written).toContain("# relative to .qmd");
+      expect(loadConfig().models).toEqual({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+    } finally {
+      setConfigSource();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["an existing models block", "models:\n  # pinned for reproducible embeddings\n  embed: hf:mine\n", "# pinned for reproducible embeddings"],
+    ["a bare models key", "models:\n  # embed: hf:later\n", "# embed: hf:later"],
+  ])("saveModelsConfig fills in %s", async (_name, models, kept) => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-models-config-"));
+    const configPath = join(dir, "index.yml");
+    try {
+      await writeFile(configPath, `collections: {}\n${models}`);
+      setConfigSource({ configPath });
+
+      saveModelsConfig({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+
+      expect(await readFile(configPath, "utf-8")).toContain(kept);
+      expect(loadConfig().models).toEqual({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+    } finally {
+      setConfigSource();
       await rm(dir, { recursive: true, force: true });
     }
   });
