@@ -5,7 +5,8 @@
  * Uses mocked Ollama responses and a test database.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { InMemoryServerEventBus } from "@modelcontextprotocol/server";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
@@ -1379,6 +1380,108 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("mcp-session-id")).toBeNull();
+  });
+
+  // subscriptions/listen is always answered with an open-ended SSE stream,
+  // even with responseMode: "json". The HTTP adapter must stream it: buffering
+  // the body withholds the headers and every event until the stream ends, which
+  // it never does, so clients stall and subscriptions pile up (#1035).
+  function openListen(signal: AbortSignal): Promise<Response> {
+    return fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_2026,
+        "Mcp-Method": "subscriptions/listen",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "subscriptions/listen",
+        params: { _meta: mcp2026Meta, notifications: { toolsListChanged: true } },
+      }),
+    });
+  }
+
+  async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms waiting for ${what}`)), ms);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function readFirstSseEvent(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<any> {
+    const decoder = new TextDecoder();
+    let text = "";
+    while (!text.includes("\n\n")) {
+      const { done, value } = await withTimeout(reader.read(), 5000, "the first SSE event");
+      if (done) throw new Error(`stream ended before the first event: ${JSON.stringify(text)}`);
+      text += decoder.decode(value, { stream: true });
+    }
+    const data = text.split("\n").find((line) => line.startsWith("data: "));
+    if (!data) throw new Error(`first SSE event has no data line: ${JSON.stringify(text)}`);
+    return JSON.parse(data.slice("data: ".length));
+  }
+
+  test("subscriptions/listen streams headers and the ack without ending the response (#1035)", async () => {
+    const client = new AbortController();
+    try {
+      const res = await withTimeout(openListen(client.signal), 5000, "subscriptions/listen response headers");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+      const reader = res.body!.getReader();
+      const ack = await readFirstSseEvent(reader);
+      expect(ack.method).toBe("notifications/subscriptions/acknowledged");
+
+      // The subscription stays open: nothing more arrives and the body does not end.
+      const next = reader.read();
+      const stillOpen = await Promise.race([
+        next.then(() => false, () => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 250)),
+      ]);
+      expect(stillOpen).toBe(true);
+    } finally {
+      client.abort();
+    }
+  });
+
+  test("client disconnect releases the subscriptions/listen subscription (#1035)", async () => {
+    // Observe the SDK's change-event bus, which every open listen stream subscribes to.
+    const originalSubscribe = InMemoryServerEventBus.prototype.subscribe;
+    let bus: InMemoryServerEventBus | undefined;
+    const spy = vi.spyOn(InMemoryServerEventBus.prototype, "subscribe").mockImplementation(
+      function (this: InMemoryServerEventBus, listener) {
+        bus = this;
+        return originalSubscribe.call(this, listener);
+      },
+    );
+    const client = new AbortController();
+    try {
+      const res = await withTimeout(openListen(client.signal), 5000, "subscriptions/listen response headers");
+      await readFirstSseEvent(res.body!.getReader());
+      expect(bus).toBeDefined();
+      const openListeners = bus!.listenerCount;
+      expect(openListeners).toBeGreaterThan(0);
+
+      client.abort();
+
+      const deadline = Date.now() + 5000;
+      while (bus!.listenerCount >= openListeners && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(bus!.listenerCount).toBe(openListeners - 1);
+    } finally {
+      client.abort();
+      spy.mockRestore();
+    }
   });
 });
 

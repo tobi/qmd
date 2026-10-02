@@ -9,6 +9,8 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
@@ -1114,6 +1116,32 @@ export async function startMcpHttpServer(
     return Buffer.concat(chunks).toString();
   }
 
+  /**
+   * Copy a fetch Response onto the Node response. Server-sent event streams
+   * are piped through as they arrive: subscriptions/listen answers with an
+   * open-ended text/event-stream, and buffering it would hold back the headers
+   * and every event until the stream ends, which it never does (#1035). If the
+   * client goes away, pipeline() destroys the source, cancelling the web
+   * stream. Finite JSON bodies keep the buffered write.
+   */
+  async function writeWebResponse(response: Response, nodeRes: ServerResponse): Promise<void> {
+    nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.body || !contentType.toLowerCase().startsWith("text/event-stream")) {
+      nodeRes.end(Buffer.from(await response.arrayBuffer()));
+      return;
+    }
+    nodeRes.flushHeaders();
+    try {
+      await pipeline(Readable.fromWeb(response.body), nodeRes);
+    } catch (err) {
+      // A client disconnecting mid-stream is how an SSE exchange normally ends.
+      if ((err as NodeJS.ErrnoException).code !== "ERR_STREAM_PREMATURE_CLOSE") {
+        console.error("MCP response stream error:", err);
+      }
+    }
+  }
+
   const host = options.host ?? process.env.QMD_HOST ?? "localhost";
   const originGuard = resolveOriginGuard({
     host,
@@ -1359,9 +1387,20 @@ export async function startMcpHttpServer(
           : (nodeReq.method || "GET");
         const hostHeader = typeof nodeReq.headers.host === "string" ? nodeReq.headers.host : `localhost:${port}`;
         const url = `http://${hostHeader}${pathname}`;
+        // Abort the web Request when the client disconnects before the
+        // response is complete, so the SDK tears down that request's work
+        // (including a listen subscription). Streamed responses can outlive
+        // this handler, so the request is logged when the response closes.
+        const clientGone = new AbortController();
+        nodeRes.once("close", () => {
+          const aborted = !nodeRes.writableFinished;
+          if (aborted) clientGone.abort();
+          log(`${ts()} ${nodeReq.method} /mcp ${label} (${Date.now() - reqStart}ms${aborted ? ", client closed" : ""})`);
+        });
         const request = new Request(url, {
           method: nodeReq.method || "GET",
           headers: nodeHeadersToWeb(nodeReq),
+          signal: clientGone.signal,
           ...(rawBody !== undefined ? { body: rawBody } : {}),
         });
         const response = await mcpHandler.fetch(
@@ -1369,9 +1408,7 @@ export async function startMcpHttpServer(
           parsedBody !== undefined ? { parsedBody } : undefined,
         );
 
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
-        log(`${ts()} ${nodeReq.method} /mcp ${label} (${Date.now() - reqStart}ms)`);
+        await writeWebResponse(response, nodeRes);
         return;
       }
 
@@ -1379,6 +1416,10 @@ export async function startMcpHttpServer(
       nodeRes.end("Not Found");
     } catch (err) {
       console.error("HTTP handler error:", err);
+      if (nodeRes.headersSent) {
+        nodeRes.destroy();
+        return;
+      }
       nodeRes.writeHead(500);
       nodeRes.end("Internal Server Error");
     }
