@@ -10,6 +10,13 @@
 
 ### Fixed
 
+- The HTTP MCP server now streams `subscriptions/listen` responses instead of
+  buffering them (#1035). The listen stream never ends, so the buffered write
+  withheld its headers and acknowledgement indefinitely: clients waited for
+  their own timeout (about 25 s in Claude Code) before listing tools, and every
+  abandoned listen request stayed subscribed until the server exited. A client
+  disconnect now cancels the stream and aborts the request, and request log
+  lines are written when the response closes.
 - Filtered vector search binds candidate IDs as one JSON list, so a parser-valid metadata filter cannot exhaust Node's SQL variable limit during document lookup. Applies to both exact scans and the capped global fallback.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
