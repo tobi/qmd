@@ -9,12 +9,16 @@
  * Run with: bun test structured-search.test.ts
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createStore,
+  hashContent,
+  insertContent,
+  insertDocument,
+  searchFTS,
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
@@ -345,6 +349,40 @@ describe("structuredSearch", () => {
       { type: "lex", query: "\"unfinished phrase", line: 2 }
     ])).rejects.toThrow(/unmatched double quote/);
   });
+
+  test("ranks over the union of named collections, not by the order they are named", async () => {
+    const now = new Date().toISOString();
+    const add = async (collection: string, path: string, body: string) => {
+      const hash = await hashContent(body);
+      insertContent(store.db, hash, body, now);
+      insertDocument(store.db, collection, path, path, hash, now, now);
+    };
+    const filler = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(40);
+    await add("alpha", "alpha/weak.md", `${filler} zanzibarquartz ${filler}`);
+    await add("beta", "beta/strong.md", "zanzibarquartz zanzibarquartz zanzibarquartz notes");
+
+    const searches: ExpandedQuery[] = [{ type: "lex", query: "zanzibarquartz" }];
+    const unscoped = await structuredSearch(store, searches, { skipRerank: true });
+    expect(unscoped[0]?.displayPath).toContain("strong.md");
+
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      const results = await structuredSearch(store, searches, { collections, skipRerank: true });
+      expect(results.map(r => r.displayPath)).toEqual(unscoped.map(r => r.displayPath));
+    }
+  });
+
+  test("an exact tie between collections goes the same way whichever is named first", async () => {
+    const now = new Date().toISOString();
+    const body = "quillmarrow notes";
+    const hash = await hashContent(body);
+    insertContent(store.db, hash, body, now);
+    insertDocument(store.db, "alpha", "same.md", "same.md", hash, now, now);
+    insertDocument(store.db, "beta", "same.md", "same.md", hash, now, now);
+
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      expect(searchFTS(store.db, "quillmarrow", 1, collections).map(r => r.filepath)).toEqual(["qmd://alpha/same.md"]);
+    }
+  });
 });
 
 // =============================================================================
@@ -590,5 +628,85 @@ describe("buildFTS5Query (lex parser)", () => {
 
   test("plain negation still works (not confused with hyphen)", () => {
     expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
+  });
+});
+
+// =============================================================================
+// structuredSearch collection scope
+// =============================================================================
+
+describe("structuredSearch collection scope", () => {
+  let testDir: string;
+  let store: Store;
+  const origConfigDir = process.env.QMD_CONFIG_DIR;
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), "qmd-structured-scope-"));
+    process.env.QMD_CONFIG_DIR = await mkdtemp(join(testDir, "config-"));
+    store = createStore(join(testDir, "index.sqlite"));
+  });
+
+  afterEach(async () => {
+    store.close();
+    if (origConfigDir === undefined) delete process.env.QMD_CONFIG_DIR;
+    else process.env.QMD_CONFIG_DIR = origConfigDir;
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  function addDocument(collection: string, path: string, body: string): void {
+    const now = new Date().toISOString();
+    const hash = `hash-${collection}-${path}`;
+    store.insertContent(hash, body, now);
+    store.insertDocument(collection, path, path, hash, now, now);
+  }
+
+  test("a vec leg over several collections runs one vector search over the whole list", async () => {
+    store.ensureVecTable(3);
+    store.llm = {
+      embedModelName: "scope-embed-model",
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 0, 0], model: "scope-embed-model" })),
+    } as any;
+    const searchVec = vi.fn(async () => []);
+    store.searchVec = searchVec as any;
+
+    await structuredSearch(store, [{ type: "vec", query: "x" }], { collections: ["alpha", "beta"], skipRerank: true });
+
+    expect(searchVec).toHaveBeenCalledTimes(1);
+    expect(searchVec.mock.calls[0]![3]).toEqual(["alpha", "beta"]);
+  });
+
+  test("a vec leg ranks the same whichever order the collections are named in", async () => {
+    const embedModel = "scope-embed-model";
+    store.ensureVecTable(3);
+    store.llm = {
+      embedModelName: embedModel,
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 0, 0], model: embedModel })),
+    } as any;
+    const now = new Date().toISOString();
+    const vectors: [string, string, number[]][] = [
+      ["alpha", "far.md", [0, 1, 0]],
+      ["beta", "near.md", [1, 0, 0]],
+      ["alpha", "mid.md", [0.8, 0.6, 0]],
+    ];
+    for (const [collection, path, vector] of vectors) {
+      addDocument(collection, path, `# ${path}\n\nbody`);
+      store.insertEmbedding(`hash-${collection}-${path}`, 0, 0, new Float32Array(vector), embedModel, now);
+    }
+
+    const searches: ExpandedQuery[] = [{ type: "vec", query: "x" }];
+    const unscoped = await structuredSearch(store, searches, { skipRerank: true });
+    expect(unscoped.map(r => r.displayPath)).toEqual(["beta/near.md", "alpha/mid.md", "alpha/far.md"]);
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      const scoped = await structuredSearch(store, searches, { collections, skipRerank: true });
+      expect(scoped.map(r => r.displayPath)).toEqual(unscoped.map(r => r.displayPath));
+    }
+  });
+
+  test("an empty collection list searches every collection", async () => {
+    addDocument("alpha", "a.md", "# A\n\nquokkascope in alpha");
+    addDocument("beta", "b.md", "# B\n\nquokkascope in beta");
+
+    const results = await structuredSearch(store, [{ type: "lex", query: "quokkascope" }], { collections: [], skipRerank: true });
+    expect(results.map(r => r.displayPath).sort()).toEqual(["alpha/a.md", "beta/b.md"]);
   });
 });

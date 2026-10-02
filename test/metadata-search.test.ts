@@ -77,6 +77,24 @@ describe("searchFTS with metadata filter", () => {
     expect(filtered[0]!.metadata).toEqual({ status: "published" });
   });
 
+  test("finds a matching document ranked below the unfiltered candidate window", async () => {
+    // limit=5 made the old filtered window 50; every noise doc outranks the target.
+    for (let i = 0; i < 50; i++) {
+      await insertDoc("notes", `noise-${i}.md`, `# N${i}\n\nalpha alpha alpha`, { status: "draft" });
+    }
+    await insertDoc(
+      "notes",
+      "target.md",
+      `# Target\n\n${"Unrelated prose. ".repeat(40)}One weaker mention of alpha.`,
+      { status: "published" },
+    );
+
+    const filtered = searchFTS(store.db, "alpha", 5, undefined, {
+      field: "status", operator: "eq", value: "published",
+    });
+    expect(filtered.map(r => r.displayPath)).toEqual(["notes/target.md"]);
+  });
+
   test("excludes pending, stale, and errored documents from filtered search", async () => {
     const { documentId: erroredId } = await insertDoc("notes", "errored.md", "# One\n\ncommon term");
     await insertDoc("notes", "pending.md", "# Two\n\ncommon term");
@@ -299,5 +317,35 @@ describe("structuredSearch with metadata filter", () => {
     const byPath = new Map(results.map(r => [r.displayPath, r.metadata]));
     expect(byPath.get("notes/a.md")).toEqual({ topics: ["x"] });
     expect(byPath.get("notes/b.md")).toEqual({});
+  });
+});
+
+describe("searchFTS with a collection scope and a metadata filter together", () => {
+  const published: MetadataFilter = { field: "status", operator: "eq", value: "published" };
+
+  test("returns the in-scope document the filter admits, past both the window and a stronger draft", async () => {
+    // Every noise document outranks both small-collection documents globally,
+    // and the draft outranks the target inside the small collection.
+    for (let i = 0; i < 50; i++) {
+      await insertDoc("large", `noise-${i}.md`, `# N${i}\n\nalpha alpha alpha`, { status: "published" });
+    }
+    await insertDoc("small", "draft.md", "# Draft\n\nalpha alpha", { status: "draft" });
+    await insertDoc(
+      "small",
+      "target.md",
+      `# Target\n\n${"Unrelated prose. ".repeat(40)}One weaker mention of alpha.`,
+      { status: "published" },
+    );
+
+    const results = searchFTS(store.db, "alpha", 1, "small", published);
+    expect(results.map(r => r.displayPath)).toEqual(["small/target.md"]);
+  });
+
+  test("keeps the 256 KiB body cap on the scoped path", async () => {
+    await insertDoc("small", "long.md", `# Long\n\nalpha ${"z".repeat(300 * 1024)}`, { status: "published" });
+
+    const results = searchFTS(store.db, "alpha", 5, "small", published);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.body!.length).toBe(262_144);
   });
 });
