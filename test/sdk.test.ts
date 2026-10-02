@@ -952,6 +952,42 @@ describe("update", () => {
 
     await store.close();
   });
+
+  test("update keeps cached query expansions (#1010)", async () => {
+    const collectionDir = join(testDir, "cache-preservation");
+    await mkdir(collectionDir, { recursive: true });
+    const notePath = join(collectionDir, "note.md");
+    await writeFile(notePath, "# Note\n\nOriginal wording.\n");
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: collectionDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    await store.update();
+
+    // No model may run in tests, so seed the entry an earlier query would have written.
+    // Under CI=true a cache miss throws instead of loading the expansion model.
+    const query = "release checklist";
+    const expansion = [{ type: "lex", query: "release steps" }];
+    const cacheKey = store.internal.getCacheKey("expandQuery", { query, model: store.internal.llm?.generateModelName });
+    store.internal.setCachedResult(cacheKey, JSON.stringify(expansion));
+    expect(await store.expandQuery(query)).toEqual(expansion);
+
+    const unchanged = await store.update();
+    expect(unchanged.unchanged).toBe(1);
+    expect(await store.expandQuery(query)).toEqual(expansion);
+
+    await writeFile(notePath, "# Note\n\nRevised wording.\n");
+    const changed = await store.update();
+    expect(changed.updated).toBe(1);
+    expect(await store.searchLex("revised")).toHaveLength(1);
+    expect(await store.expandQuery(query)).toEqual(expansion);
+
+    await store.close();
+  });
 });
 
 describe("embed", () => {

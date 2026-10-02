@@ -15,6 +15,7 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
+import { createStore } from "../src/store.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
@@ -1419,7 +1420,7 @@ describe("orphaned embedding vectors (#768)", () => {
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
-    // `qmd update` clears llm_cache; re-seed so dry-run has something to report.
+    // Re-seed so the cache count does not depend on earlier tests.
     seedOrphans({ live: 0, orphaned: 0, cache: 2, inactive: 0 });
     const { stdout, exitCode } = await runQmd(["cleanup", "--dry-run"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1439,6 +1440,46 @@ describe("orphaned embedding vectors (#768)", () => {
     expect(vectors).toBe(4);
     expect(cache).toBe(2);
     expect(inactive).toBe(1);
+  });
+});
+
+describe("cached model responses (#1010)", () => {
+  test("collection add and update keep cached responses; cleanup clears them", async () => {
+    const env = await createIsolatedTestEnv("model-cache");
+    const qmdEnv = { dbPath: env.dbPath, configDir: env.configDir };
+    const docsDir = join(testDir, "model-cache-docs");
+    await mkdir(docsDir, { recursive: true });
+    const notePath = join(docsDir, "note.md");
+    await writeFile(notePath, "# Note\n\nOriginal wording.\n");
+
+    // Stands in for an expansion an earlier `qmd query` wrote; no model may run in tests.
+    const seedStore = createStore(env.dbPath);
+    const cacheKey = seedStore.getCacheKey("expandQuery", { query: "release checklist", model: DEFAULT_GENERATE_MODEL_URI });
+    const cachedExpansion = JSON.stringify([{ type: "lex", query: "release steps" }]);
+    seedStore.setCachedResult(cacheKey, cachedExpansion);
+    seedStore.close();
+
+    function readCachedExpansion(): string | null {
+      const store = createStore(env.dbPath);
+      const result = store.getCachedResult(cacheKey);
+      store.close();
+      return result;
+    }
+
+    const added = await runQmd(["collection", "add", docsDir, "--name", "notes"], qmdEnv);
+    expect(added.exitCode).toBe(0);
+    expect(readCachedExpansion()).toBe(cachedExpansion);
+
+    await writeFile(notePath, "# Note\n\nRevised wording.\n");
+    const updated = await runQmd(["update"], qmdEnv);
+    expect(updated.exitCode).toBe(0);
+    expect(updated.stdout).toContain("1 updated");
+    expect(readCachedExpansion()).toBe(cachedExpansion);
+
+    const cleaned = await runQmd(["cleanup"], qmdEnv);
+    expect(cleaned.exitCode).toBe(0);
+    expect(cleaned.stdout).toContain("Cleared 1 cached API responses");
+    expect(readCachedExpansion()).toBeNull();
   });
 });
 

@@ -36,7 +36,6 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocumentByTokens,
-  clearCache,
   getCacheKey,
   getCachedResult,
   setCachedResult,
@@ -926,9 +925,6 @@ async function updateCollections(): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
-
-  // Clear Ollama cache on update
-  clearCache(db);
 
   const collections = listCollections(db);
 
@@ -2085,9 +2081,6 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
-
-  // Clear Ollama cache on index
-  clearCache(db);
 
   // Collection name must be provided (from YAML)
   if (!collectionName) {

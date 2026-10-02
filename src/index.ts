@@ -604,8 +604,6 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
 
-      internal.clearCache();
-
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
       for (const col of filtered) {

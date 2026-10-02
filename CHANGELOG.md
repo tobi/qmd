@@ -15,6 +15,11 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- `qmd update`, `qmd collection add`, and the SDK's `update()` no longer erase
+  cached query expansions and reranking scores. Those entries are keyed by the
+  query, model, and passage text, so a refresh never makes them wrong, and
+  wiping them made the next `qmd query` rerun the models. `qmd cleanup` still
+  clears the cache. (#1010)
 
 ## [2.8.3] - 2026-08-16
 
