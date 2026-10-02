@@ -4523,6 +4523,101 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("vectorSearchQuery skips expansion when called with pre-expanded vec/hyde queries", async () => {
+    const store = await createTestStore();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    // If the structured branch works, this MUST NOT be called — caller
+    // already provided the typed queries.
+    const expandQuerySpy = vi.fn(async () => [
+      { type: "lex", query: "should-not-reach" },
+      { type: "vec", query: "should-not-reach" },
+    ]) as any;
+    const onExpandSpy = vi.fn();
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: model } as any;
+    store.searchVec = searchVecSpy as any;
+    store.expandQuery = expandQuerySpy as any;
+
+    try {
+      await vectorSearchQuery(
+        store,
+        [
+          { type: "vec", query: "semantic web performance" },
+          { type: "hyde", query: "hypothetical web perf passage" },
+        ],
+        { limit: 5, minScore: 0, hooks: { onExpand: onExpandSpy } },
+      );
+
+      // expandQuery must not be called — caller has already provided queries.
+      expect(expandQuerySpy).not.toHaveBeenCalled();
+
+      // onExpand fires once with empty array (signals "pre-expanded input").
+      expect(onExpandSpy).toHaveBeenCalledTimes(1);
+      expect(onExpandSpy.mock.calls[0]?.[1]).toEqual([]);
+
+      // searchVec called exactly twice — once per vec/hyde entry, in order.
+      expect(searchVecSpy).toHaveBeenCalledTimes(2);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("semantic web performance");
+      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
+      expect(searchVecSpy.mock.calls[1]?.[0]).toBe("hypothetical web perf passage");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery drops non-vec/hyde entries when callers pass mixed types", async () => {
+    const store = await createTestStore();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: model } as any;
+    store.searchVec = searchVecSpy as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      // Mixed input: lex should be filtered out, vec should be embedded.
+      await vectorSearchQuery(
+        store,
+        [
+          { type: "lex", query: "should-be-skipped" },
+          { type: "vec", query: "kept" },
+        ],
+        { limit: 5, minScore: 0 },
+      );
+
+      expect(searchVecSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("kept");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery returns empty when all entries are non-vec/hyde", async () => {
+    const store = await createTestStore();
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: "any-model" } as any;
+    store.searchVec = searchVecSpy as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      const results = await vectorSearchQuery(
+        store,
+        [{ type: "lex", query: "only-lex" }],
+        { limit: 5, minScore: 0 },
+      );
+
+      expect(results).toEqual([]);
+      expect(searchVecSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
