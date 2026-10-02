@@ -4905,12 +4905,13 @@ export function findDocument(db: Database, filename: string, options: { includeB
     ${bodyCol}
   `;
 
-  // Try to match by virtual path first
+  // Try an exact virtual path or collection/path first, so the suffix match
+  // below cannot return other/docs/readme.md for docs/readme.md
   let doc = db.prepare(`
     SELECT ${selectCols}
     FROM documents d
     JOIN content ON content.hash = d.hash
-    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
+    WHERE ? IN ('qmd://' || d.collection || '/' || d.path, d.collection || '/' || d.path) AND d.active = 1
   `).get(filepath) as DbDocRow | null;
 
   // Try fuzzy match by virtual path

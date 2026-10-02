@@ -15,6 +15,10 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- `qmd get`, the SDK `get()`, and MCP `qmd://` resource reads now return the
+  exact `collection/path` you asked for. Before, `docs/readme.md` could return
+  `other/docs/readme.md` from another collection because its path ends the
+  same way (#1018).
 
 ## [2.8.3] - 2026-08-16
 
