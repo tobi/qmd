@@ -7,9 +7,17 @@
  * processes are recovered via PID identity checks (same spirit as mcp-pid.ts).
  */
 
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, linkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { isQmdMcpPid } from "./mcp-pid.js";
+import {
+  createProcessRecord,
+  processRecordStatus,
+  readProcessRecord,
+  sameProcessRecord,
+  serializeProcessRecord,
+  type QmdProcessRecord,
+} from "./mcp-pid.js";
 
 export type EmbedLockHandle = {
   lockPath: string;
@@ -21,35 +29,42 @@ export function embedLockPathForDb(dbPath: string): string {
   return join(dirname(dbPath), ".qmd-embed.lock");
 }
 
-function readLockPid(lockPath: string): number | null {
-  try {
-    const raw = readFileSync(lockPath, "utf-8").trim();
-    const pid = parseInt(raw, 10);
-    if (!Number.isInteger(pid) || pid <= 0) return null;
-    return pid;
-  } catch {
-    return null;
-  }
-}
-
-/** True if `pid` still owns a live embed/qmd process (or is this process). */
-export function isLiveEmbedLockHolder(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  // Same-process re-check: we obviously still hold our own lock.
-  if (pid === process.pid) return true;
-  return isQmdMcpPid(pid);
+/** True only when this exact process incarnation still owns an embed lock. */
+export function isLiveEmbedLockHolder(record: QmdProcessRecord): boolean {
+  // Live legacy PIDs and malformed/in-flight records fail closed. A numeric
+  // legacy lock becomes reclaimable only after its process is dead.
+  return processRecordStatus(record, "embed") !== "dead";
 }
 
 function createOwnedLock(lockPath: string): EmbedLockHandle {
-  writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
+  const record = createProcessRecord("embed");
+  const serialized = serializeProcessRecord(record);
+  const temporaryPath = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, serialized, { flag: "wx", flush: true });
+    try {
+      linkSync(temporaryPath, lockPath);
+    } catch (error: unknown) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+      if (code === "EEXIST") throw error;
+      writeFileSync(lockPath, serialized, { flag: "wx", flush: true });
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // Best-effort cleanup after an interrupted or contended publish.
+    }
+  }
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
     try {
       if (!existsSync(lockPath)) return;
-      const written = readLockPid(lockPath);
-      if (written === process.pid) unlinkSync(lockPath);
+      if (sameProcessRecord(record, readProcessRecord(lockPath))) unlinkSync(lockPath);
     } catch {
       // best-effort cleanup
     }
@@ -73,14 +88,33 @@ export function tryAcquireEmbedLock(lockPath: string): EmbedLockHandle | null {
           : undefined;
       if (code !== "EEXIST") throw err;
 
-      const holderPid = readLockPid(lockPath);
-      if (holderPid !== null && isLiveEmbedLockHolder(holderPid)) {
+      const holder = readProcessRecord(lockPath);
+      if (holder.kind === "invalid") {
+        try {
+          const before = statSync(lockPath);
+          const recheck = readProcessRecord(lockPath);
+          const after = statSync(lockPath);
+          if (
+            Date.now() - before.mtimeMs >= 30_000
+            && recheck.kind === "invalid"
+            && before.mtimeMs === after.mtimeMs
+            && before.size === after.size
+          ) {
+            unlinkSync(lockPath);
+            continue;
+          }
+        } catch {
+          // Another process changed the lock; retry the exclusive publish.
+          continue;
+        }
+      }
+      if (isLiveEmbedLockHolder(holder)) {
         return null;
       }
 
-      // Stale / unreadable / recycled PID — remove and retry once.
+      // Dead or recycled PID — remove and retry once.
       try {
-        unlinkSync(lockPath);
+        if (sameProcessRecord(holder, readProcessRecord(lockPath))) unlinkSync(lockPath);
       } catch {
         // Another process may have claimed it; loop and try wx again.
       }
@@ -88,8 +122,8 @@ export function tryAcquireEmbedLock(lockPath: string): EmbedLockHandle | null {
   }
 
   // Final attempt lost the race to a live holder (or repeated EEXIST).
-  const holderPid = readLockPid(lockPath);
-  if (holderPid !== null && isLiveEmbedLockHolder(holderPid)) {
+  const holder = readProcessRecord(lockPath);
+  if (isLiveEmbedLockHolder(holder)) {
     return null;
   }
   return null;
@@ -98,3 +132,7 @@ export function tryAcquireEmbedLock(lockPath: string): EmbedLockHandle | null {
 /** User-facing message when a second embed is skipped. */
 export const EMBED_LOCK_BUSY_MESSAGE =
   "Another embed process is already running. Skipping.";
+
+export function embedLockBusyMessage(lockPath: string): string {
+  return `${EMBED_LOCK_BUSY_MESSAGE}\nLock: ${lockPath}\nIf no embed is active and this file is corrupt, wait 30 seconds and retry; QMD will reclaim it.`;
+}
