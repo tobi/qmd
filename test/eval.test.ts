@@ -37,6 +37,10 @@ import {
   type RankedResult,
 } from "../src/store";
 import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
+import { hasSufficientFreeVramForIntegration } from "./_helpers/vram-precondition.js";
+
+// One-shot probe at module load.  Gates real-LLM integration suites below.
+const _vramSufficient = await hasSufficientFreeVramForIntegration();
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -156,7 +160,7 @@ describe("BM25 Search (FTS)", () => {
 // Vector Search Tests - Requires embedding model
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("Vector Search", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("Vector Search", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasEmbeddings = false;
@@ -268,7 +272,7 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
 // Hybrid Search (RRF) Tests - Combines BM25 + Vector
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("Hybrid Search (RRF)", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasVectors = false;
