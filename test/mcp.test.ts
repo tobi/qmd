@@ -5,7 +5,7 @@
  * Uses mocked Ollama responses and a test database.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
@@ -18,6 +18,8 @@ import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
 import { initializeMetadataSchema } from "../src/metadata-store";
+import { VEC_TABLE, createVectorMetadataTables, vecLayout } from "../src/vec-layout";
+import { migrateVectorLayout } from "../src/store-migrations";
 
 // =============================================================================
 // Test Database Setup
@@ -128,8 +130,10 @@ function initTestDatabase(db: Database): void {
 
   // Document metadata tables — searchFTS/searchVec join them for result metadata
   initializeMetadataSchema(db);
+  createVectorMetadataTables(db);
 }
 
+/** Seeds the legacy vector table, then runs the layout migration on it. */
 function seedTestData(db: Database): void {
   const now = new Date().toISOString();
 
@@ -192,6 +196,8 @@ function seedTestData(db: Database): void {
     db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL), now);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${doc.hash}_0`, embedding);
   }
+  expect(migrateVectorLayout(db, { sqliteVecAvailable: true })).toBe("applied");
+  expect(vecLayout(db)).toMatchObject({ kind: "partitioned", dimensions: 768 });
 }
 
 // =============================================================================
@@ -342,6 +348,7 @@ describe("MCP Server", () => {
       const emptyDb = openDatabase(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
+      emptyDb.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
 
       const results = await searchVec(emptyDb, "test", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBe(0);
@@ -1124,6 +1131,55 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.serverInfo.name).toBe("qmd");
   });
 
+  test("POST /mcp initialize serves cached instructions across requests", async () => {
+    // The legacy initialize path answers either JSON or a single SSE frame
+    // depending on how the transport negotiates; read both the same way.
+    const legacyInitialize = async (id: number) => {
+      const res = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "test-client", version: "1.0.0" },
+          },
+        }),
+      });
+      const text = await res.text();
+      const data = text.includes("data:")
+        ? text.split("\n").find(line => line.startsWith("data:"))!.slice(5).trim()
+        : text;
+      return JSON.parse(data) as any;
+    };
+
+    const first = await legacyInitialize(10);
+    const firstInstructions = first.result.instructions;
+    expect(typeof firstInstructions).toBe("string");
+    expect(firstInstructions.length).toBeGreaterThan(0);
+
+    // Change the index under the server. HTTP builds a fresh McpServer per
+    // request, so without the cache the next initialize rebuilds the
+    // instructions and reports the new document count; with it, the same
+    // string is served until the TTL lapses.
+    const db = openDatabase(httpTestDbPath);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run("hash-instr-cache", "# Cache probe\nbody", now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run("instructions-cache-probe.md", "Cache Probe", "hash-instr-cache", now, now);
+    db.close();
+
+    const second = await legacyInitialize(11);
+    expect(second.result.instructions).toBe(firstInstructions);
+  });
+
   test("POST /mcp tools/list returns registered tools without a session", async () => {
     const { status, json, contentType, headers } = await mcpRequest("tools/list");
     expect(status).toBe(200);
@@ -1379,6 +1435,106 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("mcp-session-id")).toBeNull();
+  });
+
+  // Each request gets a fresh McpServer, so these observe the per-store
+  // instructions cache through server/discover.
+  async function discoverInstructions(id: number): Promise<{ status: number; instructions?: string }> {
+    const { status, json } = await postMcp(
+      { jsonrpc: "2.0", id, method: "server/discover", params: { _meta: mcp2026Meta } },
+      { "MCP-Protocol-Version": MCP_2026, "Mcp-Method": "server/discover" },
+    );
+    return { status, instructions: json.result?.instructions };
+  }
+
+  function documentCount(instructions: string | undefined): number {
+    const match = instructions?.match(/over (\d+) markdown documents/);
+    if (!match) throw new Error(`no document count in instructions: ${instructions}`);
+    return Number(match[1]);
+  }
+
+  function activeDocuments(): number {
+    const db = openDatabase(dbPath);
+    try {
+      const row = db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE active = 1`).get() as { n: number };
+      return row.n;
+    } finally {
+      db.close();
+    }
+  }
+
+  function addDocument(slug: string): void {
+    const db = openDatabase(dbPath);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(`hash-${slug}`, `# ${slug}\nbody`, now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run(`${slug}.md`, slug, `hash-${slug}`, now, now);
+    db.close();
+  }
+
+  test("server/discover serves cached instructions after the index changes", async () => {
+    const first = await discoverInstructions(20);
+    expect(first.status).toBe(200);
+    addDocument("instructions-cache-hit");
+    const second = await discoverInstructions(21);
+    expect(second.status).toBe(200);
+    expect(second.instructions).toBe(first.instructions);
+  });
+
+  test("server/discover rebuilds instructions once the 60 s cache entry expires", async () => {
+    const realNow = Date.now.bind(Date);
+    const first = await discoverInstructions(22);
+    addDocument("instructions-cache-expiry");
+    const cached = await discoverInstructions(23);
+    expect(cached.instructions).toBe(first.instructions);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 61_000);
+    try {
+      const rebuilt = await discoverInstructions(24);
+      expect(rebuilt.status).toBe(200);
+      expect(documentCount(rebuilt.instructions)).toBe(activeDocuments());
+      expect(documentCount(rebuilt.instructions)).toBeGreaterThan(documentCount(first.instructions));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("server/discover retries a failed instructions build instead of caching the failure", async () => {
+    const realNow = Date.now.bind(Date);
+    // Past every earlier entry's TTL, so the next discover has to build.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000);
+    const db = openDatabase(dbPath);
+    try {
+      db.exec(`ALTER TABLE store_collections RENAME TO store_collections_offline`);
+      const failed = await discoverInstructions(25);
+      expect(failed.instructions).toBeUndefined();
+      db.exec(`ALTER TABLE store_collections_offline RENAME TO store_collections`);
+
+      const retried = await discoverInstructions(26);
+      expect(retried.status).toBe(200);
+      addDocument("instructions-cache-after-failure");
+      const cached = await discoverInstructions(27);
+      expect(cached.instructions).toBe(retried.instructions);
+    } finally {
+      const offline = db.prepare(`SELECT name FROM sqlite_master WHERE name = 'store_collections_offline'`).get();
+      if (offline) db.exec(`ALTER TABLE store_collections_offline RENAME TO store_collections`);
+      db.close();
+      clock.mockRestore();
+    }
+  });
+
+  test("server/discover rebuilds an entry stamped ahead of the clock once the clock steps back", async () => {
+    const realNow = Date.now.bind(Date);
+    // Built while the clock read ten minutes ahead, as after a backward step.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 20 * 60_000);
+    const ahead = await discoverInstructions(28);
+    clock.mockRestore();
+    addDocument("instructions-cache-clock-step");
+
+    const rebuilt = await discoverInstructions(29);
+    expect(rebuilt.status).toBe(200);
+    expect(rebuilt.instructions).not.toBe(ahead.instructions);
+    expect(documentCount(rebuilt.instructions)).toBe(activeDocuments());
   });
 });
 

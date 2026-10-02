@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
@@ -23,6 +23,7 @@ import {
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
+import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
 
 // =============================================================================
 // Test Helpers
@@ -850,6 +851,8 @@ describe("update", () => {
     expect(result.unchanged).toBe(0);
     expect(result.removed).toBe(0);
     expect(result.skipped).toBe(0);
+    expect(result.staleVectorsRemoved).toBe(0);
+    expect(result.vectorsCopied).toBe(0);
     expect(typeof result.needsEmbedding).toBe("number");
 
     await store.close();
@@ -1095,6 +1098,116 @@ describe("embed", () => {
         { collection: "docs", count: 3 },
         { collection: "notes", count: 3 },
       ]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.update drops stale vector rows and copies rows into a collection that gained an embedded hash", async () => {
+    const leftDir = join(testDir, `vector-rows-left-${Date.now()}`);
+    const rightDir = join(testDir, `vector-rows-right-${Date.now()}`);
+    await mkdir(leftDir, { recursive: true });
+    await mkdir(rightDir, { recursive: true });
+    const shared = "# Shared\n\nEmbedded once, then joins a second collection.\n";
+    await writeFile(join(leftDir, "shared.md"), shared);
+    await writeFile(join(rightDir, "gone.md"), "# Gone\n\nDisappears before the second update.\n");
+
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          left: { path: leftDir, pattern: "**/*.md" },
+          right: { path: rightDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = createFakeEmbedLlm() as any;
+
+    const partitionsOf = (path: string): string[] => {
+      const doc = store.internal.db.prepare(`SELECT hash FROM documents WHERE path = ? LIMIT 1`).get(path) as { hash: string };
+      const rows = store.internal.db.prepare(`
+        SELECT ci.name AS collection FROM ${VEC_ROWS_TABLE} vr
+        JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+        WHERE vr.hash = ?
+        ORDER BY ci.name
+      `).all(doc.hash) as Array<{ collection: string }>;
+      return rows.map((row) => row.collection);
+    };
+
+    try {
+      await store.update();
+      await store.embed();
+      expect(partitionsOf("shared.md")).toEqual(["left"]);
+      expect(partitionsOf("gone.md")).toEqual(["right"]);
+
+      await writeFile(join(rightDir, "shared.md"), shared);
+      await rm(join(rightDir, "gone.md"));
+      const result = await store.update();
+
+      expect(result.removed).toBe(1);
+      expect(result.staleVectorsRemoved).toBe(1);
+      expect(result.vectorsCopied).toBe(1);
+      expect(result.needsEmbedding).toBe(0);
+      expect(partitionsOf("shared.md")).toEqual(["left", "right"]);
+      expect(partitionsOf("gone.md")).toEqual([]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.update keeps the vectors of a document moved to another collection", async () => {
+    const fromDir = join(testDir, `vector-move-from-${Date.now()}`);
+    const toDir = join(testDir, `vector-move-to-${Date.now()}`);
+    await mkdir(fromDir, { recursive: true });
+    await mkdir(toDir, { recursive: true });
+    await writeFile(join(fromDir, "moved.md"), "# Moved\n\nEmbedded in one collection, then moved to another.\n");
+
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          from: { path: fromDir, pattern: "**/*.md" },
+          to: { path: toDir, pattern: "**/*.md" },
+        },
+      },
+    });
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = createFakeEmbedLlm() as any;
+
+    const db = store.internal.db;
+    const hashOf = () =>
+      (db.prepare(`SELECT hash FROM documents WHERE path = 'moved.md' LIMIT 1`).get() as { hash: string }).hash;
+    const chunkCount = (hash: string) =>
+      (db.prepare(`SELECT COUNT(*) AS n FROM content_vectors WHERE hash = ?`).get(hash) as { n: number }).n;
+    const partitionsOf = (hash: string): string[] =>
+      (db.prepare(`
+        SELECT ci.name AS collection FROM ${VEC_ROWS_TABLE} vr
+        JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+        WHERE vr.hash = ?
+        ORDER BY ci.name
+      `).all(hash) as Array<{ collection: string }>).map((row) => row.collection);
+
+    try {
+      await store.update();
+      await store.embed();
+      const hash = hashOf();
+      const embeddedChunks = chunkCount(hash);
+      expect(embeddedChunks).toBeGreaterThan(0);
+      expect(partitionsOf(hash)).toEqual(["from"]);
+
+      await rename(join(fromDir, "moved.md"), join(toDir, "moved.md"));
+      const result = await store.update();
+
+      expect(result.removed).toBe(1);
+      expect(result.indexed).toBe(1);
+      expect(chunkCount(hash)).toBe(embeddedChunks);
+      expect(partitionsOf(hash)).toEqual(["to"]);
+      expect(result.vectorsCopied).toBe(1);
+      expect(result.staleVectorsRemoved).toBe(1);
+      expect(result.needsEmbedding).toBe(0);
     } finally {
       setDefaultLlamaCpp(null);
       await store.close();

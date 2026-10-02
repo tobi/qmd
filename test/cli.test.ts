@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir, rename } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
@@ -15,6 +15,8 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
+import { createStore, insertContent, insertDocument } from "../src/store.ts";
+import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE } from "../src/vec-layout.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
@@ -687,6 +689,24 @@ describe("CLI Add Command", () => {
     }
   });
 
+  test("collection add skips files over 10 MB", async () => {
+    const env = await createIsolatedTestEnv("skip-too-large");
+    const collectionDir = join(testDir, `skip-too-large-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "good.md"), "alpha\n");
+    await writeFile(join(collectionDir, "big.md"), "a".repeat(10 * 1024 * 1024 + 1));
+
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["collection", "add", collectionDir, "--name", "skip-too-large"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed: 1 new");
+    expect(stderr).toContain("Skipped file over 10 MB: big.md");
+    expect(stderr).toContain("Skipped 1 file(s) over 10 MB");
+    expect(stderr).not.toContain("unreadable");
+  });
+
   test("can recreate collection with remove and add", async () => {
     // First add
     await runQmd(["collection", "add", "."]);
@@ -1247,6 +1267,27 @@ describe("CLI Multi-Get Command", () => {
 });
 
 describe("CLI Update Command", () => {
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports collection root permission failures and exits non-zero", async () => {
+    const env = await createIsolatedTestEnv("update-root-permissions");
+    const parent = join(testDir, "restricted-root");
+    const collectionPath = join(parent, "docs");
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "readme.md"), "# Readme\n\nPreserve this indexed document.\n");
+    const added = await runQmd(["collection", "add", collectionPath, "--name", "docs"], env);
+    expect(added.exitCode).toBe(0);
+    await chmod(parent, 0o000);
+    try {
+      const result = await runQmd(["update"], env);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("EACCES");
+      const search = await runQmd(["search", "Preserve", "--json"], env);
+      expect(search.exitCode).toBe(0);
+      expect(search.stdout).toContain("readme.md");
+    } finally {
+      await chmod(parent, 0o700);
+    }
+  }, 60000);
+
   let localDbPath: string;
 
   beforeEach(async () => {
@@ -1351,6 +1392,115 @@ describe("CLI Cleanup Command", () => {
   });
 });
 
+describe("qmd update stale vector rows", () => {
+  test("a document whose file disappeared loses its vector rows at the end of update", async () => {
+    const env = await createIsolatedTestEnv("stale-vector-rows");
+    const add = await runQmd(["collection", "add", fixturesDir, "--name", "fixtures"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+
+    const store = createStore(env.dbPath);
+    try {
+      const now = new Date().toISOString();
+      insertContent(store.db, "ghosthash", "# Ghost\n\ngone", now);
+      insertDocument(store.db, "fixtures", "ghost.md", "Ghost", "ghosthash", now, now);
+      store.ensureVecTable(3);
+      store.insertEmbedding("ghosthash", 0, 0, new Float32Array([1, 2, 3]), "test", now);
+      expect(store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 1 });
+    } finally {
+      store.close();
+    }
+
+    const update = await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).toContain("Removed 1 stale vector row(s)");
+
+    const db = openDatabase(env.dbPath);
+    try {
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE}`).get()).toEqual({ c: 0 });
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM content_vectors WHERE hash = 'ghosthash'`).get()).toEqual({ c: 0 });
+      expect(db.prepare(`SELECT active FROM documents WHERE path = 'ghost.md'`).get()).toEqual({ active: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("update leaves a collection whose directory is missing with its documents and vectors", async () => {
+    const env = await createIsolatedTestEnv("missing-root");
+    const root = join(testDir, `missing-root-${testCounter}`);
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "kept.md"), "# Kept\n\nstill here\n");
+    const add = await runQmd(["collection", "add", root, "--name", "mounted"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+
+    const store = createStore(env.dbPath);
+    try {
+      const { hash } = store.db.prepare(`SELECT hash FROM documents WHERE path = 'kept.md'`).get() as { hash: string };
+      store.ensureVecTable(3);
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 2, 3]), "test", new Date().toISOString());
+    } finally {
+      store.close();
+    }
+    await rename(root, `${root}-unmounted`);
+
+    const update = await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(update.exitCode).toBe(0);
+
+    const db = openDatabase(env.dbPath);
+    try {
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE}`).get()).toEqual({ c: 1 });
+      expect(db.prepare(`SELECT active FROM documents WHERE path = 'kept.md'`).get()).toEqual({ active: 1 });
+    } finally {
+      db.close();
+    }
+    expect(update.stderr).toContain("Collection root not found");
+  });
+
+  test("a collection that gains an already-embedded document receives its vector rows at the end of update", async () => {
+    const env = await createIsolatedTestEnv("copied-vector-rows");
+    const firstDir = join(testDir, `copied-vector-rows-first-${testCounter}`);
+    const secondDir = join(testDir, `copied-vector-rows-second-${testCounter}`);
+    await mkdir(firstDir, { recursive: true });
+    await mkdir(secondDir, { recursive: true });
+    await writeFile(join(firstDir, "shared.md"), "# Shared\n\nembedded once, then joins a second collection\n");
+    await writeFile(join(secondDir, "other.md"), "# Other\n\nonly in the second collection\n");
+
+    const addFirst = await runQmd(["collection", "add", firstDir, "--name", "first"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(addFirst.exitCode).toBe(0);
+    const addSecond = await runQmd(["collection", "add", secondDir, "--name", "second"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(addSecond.exitCode).toBe(0);
+
+    const store = createStore(env.dbPath);
+    let sharedHash: string;
+    try {
+      const now = new Date().toISOString();
+      sharedHash = (store.db.prepare(`SELECT hash FROM documents WHERE collection = 'first' AND path = 'shared.md' AND active = 1`).get() as { hash: string }).hash;
+      store.ensureVecTable(3);
+      store.insertEmbedding(sharedHash, 0, 0, new Float32Array([1, 2, 3]), "test", now);
+    } finally {
+      store.close();
+    }
+
+    await copyFile(join(firstDir, "shared.md"), join(secondDir, "shared.md"));
+
+    const update = await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).toContain("Copied 1 vector(s) into collections that gained already-embedded documents");
+
+    const db = openDatabase(env.dbPath);
+    try {
+      const partitions = db.prepare(`
+        SELECT ci.name AS collection FROM ${VEC_ROWS_TABLE} vr
+        JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+        WHERE vr.hash = ?
+        ORDER BY ci.name
+      `).all(sharedHash);
+      expect(partitions).toEqual([{ collection: "first" }, { collection: "second" }]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("orphaned embedding vectors (#768)", () => {
   let localDbPath: string;
   let localConfigDir: string;
@@ -1411,11 +1561,21 @@ describe("orphaned embedding vectors (#768)", () => {
     expect(stdout).toContain("qmd cleanup");
   });
 
-  test("update hints when orphan ratio exceeds 10%", async () => {
+  test("update leaves orphaned chunks for cleanup when there is no vector table", async () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("3 orphaned embedding chunks (75% of vectors)");
-    expect(stdout).toContain("run 'qmd cleanup' to reclaim space");
+    expect(stdout).not.toContain("orphaned embedding chunks");
+    expect(stdout).not.toContain("stale vector row");
+    const status = await runQmd(["status"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(status.stdout).toMatch(/Orphaned:\s+3 embedding chunks/);
+
+    const db = openDatabase(localDbPath);
+    const vectorlessLiveChunks = (db.prepare(`
+      SELECT COUNT(*) as c FROM content_vectors cv
+      WHERE EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1)
+    `).get() as { c: number }).c;
+    db.close();
+    expect(vectorlessLiveChunks).toBe(0);
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
@@ -1436,7 +1596,7 @@ describe("orphaned embedding vectors (#768)", () => {
     const cache = (db.prepare(`SELECT COUNT(*) as c FROM llm_cache`).get() as { c: number }).c;
     const inactive = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
     db.close();
-    expect(vectors).toBe(4);
+    expect(vectors).toBe(3);
     expect(cache).toBe(2);
     expect(inactive).toBe(1);
   });
