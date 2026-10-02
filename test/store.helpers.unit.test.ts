@@ -6,6 +6,7 @@ import { describe, test, expect } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { VEC_TABLE } from "../src/vec-layout.js";
 import {
   homedir,
   resolve,
@@ -169,10 +170,11 @@ describe("countOrphanedVectors", () => {
 describe("cleanupOrphanedVectors", () => {
   test("returns 0 when vec table exists in schema but sqlite-vec is unavailable", () => {
     const prepare = (sql: string) => {
-      if (sql.includes("sqlite_master") && sql.includes("vectors_vec")) {
-        return { get: () => ({ name: "vectors_vec" }) };
+      if (sql.includes("sqlite_master")) {
+        const row = { name: VEC_TABLE, sql: `CREATE VIRTUAL TABLE ${VEC_TABLE} USING vec0(collection_id INTEGER PARTITION KEY, embedding float[3] distance_metric=cosine)` };
+        return { get: () => row, all: () => [row] };
       }
-      if (sql.includes("SELECT 1 FROM vectors_vec LIMIT 0")) {
+      if (sql.includes(`SELECT 1 FROM ${VEC_TABLE} LIMIT 0`)) {
         return { get: () => { throw new Error("no such module: vec0"); } };
       }
       throw new Error(`Unexpected SQL in test: ${sql}`);
