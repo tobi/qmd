@@ -15,6 +15,9 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- SDK `addCollection()` now saves its `ignore` patterns to the YAML or inline
+  config. Before, the exclusions applied only to the current index, so a new
+  store opened from the same config indexed the excluded files again.
 
 ## [2.8.3] - 2026-08-16
 
