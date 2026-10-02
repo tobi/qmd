@@ -15,6 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createStore,
+  hashContent,
+  insertContent,
+  insertDocument,
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
@@ -344,6 +347,27 @@ describe("structuredSearch", () => {
     await expect(structuredSearch(store, [
       { type: "lex", query: "\"unfinished phrase", line: 2 }
     ])).rejects.toThrow(/unmatched double quote/);
+  });
+
+  test("ranks over the union of named collections, not by the order they are named", async () => {
+    const now = new Date().toISOString();
+    const add = async (collection: string, path: string, body: string) => {
+      const hash = await hashContent(body);
+      insertContent(store.db, hash, body, now);
+      insertDocument(store.db, collection, path, path, hash, now, now);
+    };
+    const filler = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(40);
+    await add("alpha", "alpha/weak.md", `${filler} zanzibarquartz ${filler}`);
+    await add("beta", "beta/strong.md", "zanzibarquartz zanzibarquartz zanzibarquartz notes");
+
+    const searches: ExpandedQuery[] = [{ type: "lex", query: "zanzibarquartz" }];
+    const unscoped = await structuredSearch(store, searches, { skipRerank: true });
+    expect(unscoped[0]?.displayPath).toContain("strong.md");
+
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      const results = await structuredSearch(store, searches, { collections, skipRerank: true });
+      expect(results.map(r => r.displayPath)).toEqual(unscoped.map(r => r.displayPath));
+    }
   });
 });
 
