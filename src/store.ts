@@ -1614,6 +1614,12 @@ export type ReindexResult = {
 };
 
 /**
+ * Directories never scanned for documents. `venv` is where `python -m venv` puts a virtualenv, whose
+ * packages carry thousands of READMEs and licenses; `.venv` is already skipped as a hidden path.
+ */
+export const EXCLUDED_DIRS = ["node_modules", ".git", ".cache", "vendor", "dist", "build", "venv"] as const;
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
  * Pure function — no console output, no db lifecycle management.
  */
@@ -1629,10 +1635,8 @@ export async function reindexCollection(
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
-
   const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
+    ...EXCLUDED_DIRS.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
   const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {

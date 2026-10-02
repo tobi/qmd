@@ -11,6 +11,9 @@
 ### Fixed
 
 - Filtered vector search binds candidate IDs as one JSON list, so a parser-valid metadata filter cannot exhaust Node's SQL variable limit during document lookup. Applies to both exact scans and the capped global fallback.
+- `qmd update` and `qmd collection add` skip `venv` directories, so a Python
+  virtualenv inside a collection no longer adds its package READMEs and
+  licenses to the index or slows every update. #1028 (thanks @brettdavies)
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
