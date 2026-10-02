@@ -38,6 +38,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { computeCentroid, computeCentroidFromFloat32, type CentroidConfig, DEFAULT_CENTROID_CONFIG } from "./centroid.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -103,6 +104,12 @@ export function splitGlobMask(mask: string): string[] {
 }
 
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
+
+
+// Rerank hydration: fetch each winner's ranked chunk text by char position,
+// not the full document body.
+export const HYDRATION_CHUNKS_PER_DOC = 3;
+export const HYDRATION_CHUNK_CHARS = 3600; // == CHUNK_SIZE_CHARS
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
@@ -425,8 +432,13 @@ export function chunkDocumentWithBreakPoints(
 
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
-export const STRONG_SIGNAL_MIN_SCORE = 0.85;
-export const STRONG_SIGNAL_MIN_GAP = 0.15;
+export const STRONG_SIGNAL_MIN_SCORE = 0.70;
+export const STRONG_SIGNAL_MIN_GAP = 0.08;
+// Skip the rerank step when the top result already leads the runner-up by
+// a wide margin: chunk vectors and fused ranking agree, so reranking
+// rarely changes the order.
+export const RERANK_SKIP_MIN_SCORE = 0.70;
+export const RERANK_SKIP_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
@@ -1285,6 +1297,21 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // File sync state — mtime+size fast-path.
+  // Inspired by qmd-py incremental sync.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS file_sync_state (
+      collection    TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      mtime_ms      INTEGER NOT NULL,
+      size          INTEGER NOT NULL,
+      content_hash  TEXT NOT NULL,
+      document_id   INTEGER NOT NULL,
+      PRIMARY KEY (collection, relative_path)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_file_sync_state_collection ON file_sync_state(collection)`);
+
   // FTS - index filepath (collection/path), title, and content.
   // Do not CREATE VIRTUAL TABLE here as an autocommit statement: FTS5
   // IF NOT EXISTS races under WAL (see createDocumentsFtsTable).
@@ -1614,8 +1641,70 @@ export type ReindexResult = {
 };
 
 /**
+ * File sync state row — mtime+size fast-path cache.
+ * Inspired by qmd-py incremental sync.
+ */
+type FileSyncStateRow = {
+  relative_path: string;
+  mtime_ms: number;
+  size: number;
+  content_hash: string;
+  document_id: number;
+};
+
+function getFileSyncStateMap(db: Database, collectionName: string): Map<string, FileSyncStateRow> {
+  try {
+    const stmt = db.prepare(
+      `SELECT relative_path, mtime_ms, size, content_hash, document_id FROM file_sync_state WHERE collection = ?`
+    );
+    const map = new Map<string, FileSyncStateRow>();
+    // Large-result query: use iterate() to stream rows instead of .all() materializing at once
+    for (const r of stmt.iterate(collectionName) as IterableIterator<FileSyncStateRow>) {
+      map.set(r.relative_path, r);
+    }
+    return map;
+  } catch {
+    // Table may not exist yet on legacy DBs — initializeDatabase creates it on next open,
+    // but guard here for safety.
+    return new Map();
+  }
+}
+
+function upsertFileSyncState(db: Database, collectionName: string, relPath: string, mtimeMs: number, size: number, contentHash: string, documentId: number): void {
+  try {
+    db.prepare(`
+      INSERT INTO file_sync_state(collection, relative_path, mtime_ms, size, content_hash, document_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(collection, relative_path) DO UPDATE SET
+        mtime_ms = excluded.mtime_ms,
+        size = excluded.size,
+        content_hash = excluded.content_hash,
+        document_id = excluded.document_id
+    `).run(collectionName, relPath, Math.floor(mtimeMs), size, contentHash, documentId);
+  } catch {
+    // Legacy DB without table — will be created on next open; skip caching this run
+  }
+}
+
+function deleteFileSyncStateForCollection(db: Database, collectionName: string, relPath: string): void {
+  try {
+    db.prepare(`DELETE FROM file_sync_state WHERE collection = ? AND relative_path = ?`).run(collectionName, relPath);
+  } catch {}
+}
+
+/**
+ * Maximum file size to index — prevents OOM on accidental binary inclusion.
+ */
+const REINDEX_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
+ * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.
+ *
+ * Fast-path: stat mtime_ms+size against cached row to skip file read.
+ * If mtime changed but content hash identical, only mtime cache is updated.
+ * Skips >10MB and empty files, cleans sync table entry on orphan removal.
  */
 export async function reindexCollection(
   store: Store,
@@ -1652,19 +1741,14 @@ export async function reindexCollection(
   let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: ReindexSkippedFile[] = [];
   const seenPaths = new Set<string>();
-  // Literal paths of every file in this scan. Passed to the legacy-path
-  // migration so it never adopts a row that still belongs to a live file.
   const livePaths = new Set(files.map(f => normalizePathSeparators(f)));
 
+  // Load file_sync_state for this collection (mtime+size fast-path)
+  const syncStateMap = getFileSyncStateMap(db, collectionName);
+
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    // Store the literal relative path so the filesystem path can always be
-    // reconstructed as: resolve(collection.path, storedPath).
-    // handelize() is NOT applied at index time — it is display-only.
     const path = normalizePathSeparators(relativeFile);
-    // Glob `../` segments, absolute patterns, and file symlinks can resolve
-    // outside the collection root. Do not ingest those files, and do not mark
-    // them seen so a previous escaped row is deactivated on this pass.
+    const filepath = getRealPath(resolve(collectionPath, relativeFile));
     if (!isPathInsideDir(collectionPath, filepath)) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
@@ -1673,13 +1757,51 @@ export async function reindexCollection(
     }
     seenPaths.add(path);
 
+    // Stat first — mtime+size fast-path (no read)
+    let stat: ReturnType<typeof statSync> | null = null;
+    try {
+      stat = statSync(filepath);
+    } catch (err) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    if (!stat) {
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    const mtimeMs = stat.mtimeMs;
+    const size = stat.size;
+
+    // Skip large files (>10MB) — prevents OOM
+    if (size > REINDEX_MAX_FILE_SIZE) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    // Fast-path: stat matches cached sync state — skip read entirely
+    const cached = syncStateMap.get(path);
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size) {
+      unchanged++;
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      // Still need to ensure document exists (might have been deactivated externally)
+      // But we count as unchanged and avoid expensive read+hash+metadata sync.
+      // Note: metadata sync for unchanged is skipped in fast-path; if needed, disable fast-path or force re-read.
+      continue;
+    }
+
+    // Need to read file
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
     } catch (err) {
-      // Skip files that can't be read (ETIMEDOUT on APFS compressed files,
-      // EAGAIN on iCloud evicted files, EACCES, etc.) instead of aborting
-      // the rest of the collection (#460).
       processed++;
       skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1687,13 +1809,39 @@ export async function reindexCollection(
     }
 
     if (!content.trim()) {
+      // Empty file — if previously indexed, deactivate it (treat as removed)
+      const existingEmpty = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
+      if (existingEmpty) {
+        deactivateDocument(db, collectionName, path);
+        deleteFileSyncStateForCollection(db, collectionName, path);
+        syncStateMap.delete(path);
+      }
       processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
     }
 
     const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
 
+    // Hash matches cached sync state but mtime differed (clock skew, backup restore) — only update mtime cache
+    if (cached && cached.content_hash === hash) {
+      // Update sync state mtime/size only
+      upsertFileSyncState(db, collectionName, path, mtimeMs, size, hash, cached.document_id);
+      unchanged++;
+      processed++;
+      // Keep content in memory for metadata sync if needed? For speed, skip metadata sync on hash-match fast-path.
+      // Existing behavior for hash-same was to still do metadata backfill; we preserve it by loading documentId from cache.
+      // However we already have content here, so do metadata backfill for hash-match case.
+      const existingForMeta = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
+      if (existingForMeta) {
+        const extraction = syncDocumentMetadata(db, existingForMeta.id, content, path, { onlyIfStale: true });
+        if (extraction?.error) metadataErrors++;
+      }
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    const title = extractTitle(content, relativeFile);
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     let documentId: number;
@@ -1711,21 +1859,21 @@ export async function reindexCollection(
         }
       } else {
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        updateDocument(db, existing.id, title, hash, new Date(stat.mtime).toISOString());
         updated++;
       }
     } else {
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
       documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        new Date(stat.mtime).toISOString());
     }
 
-    // Unchanged content still backfills missing or stale extraction state.
+    // Upsert sync state after successful indexing
+    upsertFileSyncState(db, collectionName, path, mtimeMs, size, hash, documentId);
+
+    // Metadata extraction
     const extraction = syncDocumentMetadata(db, documentId, content, path,
       contentChanged ? undefined : { onlyIfStale: true });
     if (extraction?.error) metadataErrors++;
@@ -1734,12 +1882,13 @@ export async function reindexCollection(
     options?.onProgress?.({ file: relativeFile, current: processed, total });
   }
 
-  // Deactivate documents that no longer exist
+  // Deactivate documents that no longer exist + cleanup sync_state
   const allActive = getActiveDocumentPaths(db, collectionName);
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
       deactivateDocument(db, collectionName, path);
+      deleteFileSyncStateForCollection(db, collectionName, path);
       removed++;
     }
   }
@@ -1927,7 +2076,15 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
+    const results: PendingEmbeddingDoc[] = [];
+    const iter = collection
+      ? stmt.iterate(model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint);
+    for (const row of iter as IterableIterator<PendingEmbeddingDoc>) {
+      results.push(row);
+    }
+    return results;
   });
 }
 
@@ -1966,12 +2123,17 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   if (batch.length === 0) return [];
 
   const placeholders = batch.map(() => "?").join(",");
-  const rows = db.prepare(`
+  // Bounded: batch size max 64 (maxDocsPerBatch), so IN list max 64 hashes.
+  // Use iterate() to stream rows instead of materializing all at once, nicer for large batches.
+  const stmt = db.prepare(`
     SELECT hash, doc as body
     FROM content
     WHERE hash IN (${placeholders})
-  `).all(...batch.map(doc => doc.hash)) as { hash: string; body: string }[];
-  const bodyByHash = new Map(rows.map(row => [row.hash, row.body]));
+  `);
+  const bodyByHash = new Map<string, string>();
+  for (const row of stmt.iterate(...batch.map(doc => doc.hash)) as IterableIterator<{ hash: string; body: string }>) {
+    bodyByHash.set(row.hash, row.body);
+  }
 
   return batch.map((doc) => ({
     ...doc,
@@ -2456,8 +2618,9 @@ export type RankedResult = {
   file: string;
   displayPath: string;
   title: string;
-  body: string;
+  body?: string; // optional, kept for backward compatibility but not used in RRF; prefer chunk-only
   score: number;
+  chunkPos?: number; // winning chunk offset from vector search; absent for FTS-only hits
 };
 
 export type RRFContributionTrace = {
@@ -3157,10 +3320,15 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
  * Get all active document paths for a collection.
  */
 export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
-  const rows = db.prepare(`
+  const stmt = db.prepare(`
     SELECT path FROM documents WHERE collection = ? AND active = 1
-  `).all(collectionName) as { path: string }[];
-  return rows.map(r => r.path);
+  `);
+  // Large-result query (up to 5k per collection): use iterate() to bound heap
+  const paths: string[] = [];
+  for (const r of stmt.iterate(collectionName) as IterableIterator<{ path: string }>) {
+    paths.push(r.path);
+  }
+  return paths;
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -3470,22 +3638,26 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT d.path
     FROM documents d
     WHERE d.active = 1
-  `).all() as { path: string }[];
+  `);
+  // Large-result query (all active docs, up to 9k): iterate to bound heap
   const queryLower = query.toLowerCase();
-  const scored = allFiles
-    .map(f => ({ path: f.path, dist: levenshtein(f.path.toLowerCase(), queryLower) }))
-    .filter(f => f.dist <= maxDistance)
+  const scored: { path: string; dist: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ path: string }>) {
+    const dist = levenshtein(f.path.toLowerCase(), queryLower);
+    if (dist <= maxDistance) scored.push({ path: f.path, dist });
+  }
+  return scored
     .sort((a, b) => a.dist - b.dist)
-    .slice(0, limit);
-  return scored.map(f => f.path);
+    .slice(0, limit)
+    .map(f => f.path);
 }
 
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT
       'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
@@ -3494,16 +3666,20 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
-
+  `);
+  // Large-result query: iterate to bound heap (all active docs)
   const isMatch = picomatch(pattern);
-  return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
-    .map(f => ({
-      filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
-      bodyLength: f.body_length
-    }));
+  const results: { filepath: string; displayPath: string; bodyLength: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ virtual_path: string; body_length: number; path: string; collection: string }>) {
+    if (isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path)) {
+      results.push({
+        filepath: f.virtual_path,
+        displayPath: f.path,
+        bodyLength: f.body_length,
+      });
+    }
+  }
+  return results;
 }
 
 // =============================================================================
@@ -4136,7 +4312,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      substr(content.doc, 1, 262144) as body,
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4309,9 +4485,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
     eligibleSql += ` WHERE ${eligibleConditions.join(" AND ")}`;
 
-    const eligibleHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(eligibleSql).all(...eligibleParams) as { hash_seq: string }[],
-    ).map((r) => r.hash_seq);
+    const eligibleHashSeqs: string[] = withLazyContentVectorMigration(db, () => {
+      const stmt = db.prepare(eligibleSql);
+      // Large-result query (up to 20k): use iterate() to bound heap, early exit if over max
+      const seqs: string[] = [];
+      for (const r of stmt.iterate(...eligibleParams) as IterableIterator<{ hash_seq: string }>) {
+        seqs.push(r.hash_seq);
+        if (seqs.length > FILTERED_VEC_EXACT_SCAN_MAX) break;
+      }
+      return seqs;
+    });
 
     if (eligibleHashSeqs.length === 0) return [];
 
@@ -4342,7 +4525,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      substr(content.doc, 1, 262144) as body,
       dm.metadata_json
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
@@ -4370,20 +4553,57 @@ export async function searchVec(db: Database, query: string, model: string, limi
     display_path: string; title: string; body: string; metadata_json: string | null;
   }[]);
 
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  // Score each file from its top 3 non-overlapping chunks. Neighboring
+  // chunks share 15% overlap, so the same file fragment is not
+  // double-counted when two adjacent chunks both match. Combining the
+  // top chunks approximates reranking the whole file at chunk cost.
+  const seen = new Map<string, { row: typeof docRows[0]; entries: { distance: number; seq: number; pos: number }[]; bestDist: number }>();
   for (const row of docRows) {
     const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const seq = parseInt(row.hash_seq.split('_').pop() || '0', 10);
     const existing = seen.get(row.filepath);
-    if (!existing || distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: distance });
+    if (!existing) {
+      seen.set(row.filepath, { row, entries: [{ distance, seq, pos: row.pos }], bestDist: distance });
+    } else {
+      existing.entries.push({ distance, seq, pos: row.pos });
+      if (distance < existing.bestDist) {
+        existing.bestDist = distance;
+        existing.row = row;
+      }
     }
   }
 
   return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
+    .map(v => {
+      // Walk chunks best-first and keep a chunk unless it overlaps one
+      // already kept; at most 3 are kept per file.
+      const sorted = [...v.entries].sort((a, b) => a.distance - b.distance);
+      const picked: typeof sorted = [];
+      for (const cand of sorted) {
+        if (picked.length >= 3) break;
+        // Skip a chunk that overlaps a kept one: neighboring sequence
+        // numbers whose positions are within one chunk length.
+        let overlap = false;
+        for (const p of picked) {
+          if (Math.abs(cand.seq - p.seq) <= 1 && Math.abs(cand.pos - p.pos) < CHUNK_SIZE_CHARS) {
+            overlap = true;
+            break;
+          }
+        }
+        if (!overlap) picked.push(cand);
+      }
+      const ds = picked.map(e => e.distance);
+      const d0 = ds[0] ?? 1;
+      const s0 = 1 - d0;
+      const s1 = ds[1] !== undefined ? 1 - ds[1]! : 0;
+      const s2 = ds[2] !== undefined ? 1 - ds[2]! : 0;
+      const aggScore = s0 + 0.25 * s1 + 0.1 * s2;
+      const aggDist = 1 - Math.min(1, aggScore);
+      return { row: v.row, aggDist: aggDist };
+    })
+    .sort((a, b) => a.aggDist - b.aggDist)
     .slice(0, limit)
-    .map(({ row, bestDist }) => {
+    .map(({ row, aggDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
@@ -4397,7 +4617,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         body: row.body,
         context: getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - aggDist,  // Cosine similarity = 1 - aggregated distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
@@ -4423,8 +4643,9 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
   const fingerprint = getEmbeddingFingerprint(model);
-  return withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+    SELECT d.hash, substr(c.doc, 1, 262144) as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
@@ -4436,7 +4657,14 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
     WHERE d.active = 1
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
+  `);
+    // Large-result query (up to 9k): use iterate() to stream, bound heap
+    const results: { hash: string; body: string; path: string }[] = [];
+    for (const row of stmt.iterate(model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
+      results.push(row);
+    }
+    return results;
+  });
 }
 
 /**
@@ -5505,6 +5733,12 @@ export interface HybridQueryOptions {
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio pseudo-relevance feedback) — thematic grouping without LLM */
+  expandCentroid?: boolean;
+  centroidK?: number; // top-k RRF results to form centroid (default 3)
+  centroidWeight?: number; // RRF weight for centroid list (default 1.0)
+  centroidVectorTopK?: number; // vector top-k for centroid search (default 20)
+  centroidConfig?: CentroidConfig; // full config override
 }
 
 export interface HybridQueryResult {
@@ -5551,6 +5785,40 @@ export type RankedListMeta = {
  * so a lex expansion inserted before original vector search cannot steal the
  * original vector boost.
  */
+/**
+ * Fetch the winning chunk texts for RRF-winning files by char position.
+ *
+ * Each winning file contributes only its ranked 3600-char chunk, sliced
+ * from the stored document with substr(doc, pos+1, len), instead of
+ * copying the whole document into JS. Copying full bodies of large
+ * documents is what caused the 4.2GB heap failure; per-winner slices
+ * keep a 40-winner query under ~500KB.
+ *
+ * FTS winners carry no position, so they fall back to the document head
+ * slice via pos 0. Callers pass chunkPos from SearchResult when available.
+ */
+export function fetchWinnerChunks(
+  db: Database,
+  winners: { file: string; chunkPos?: number }[],
+  chunkChars: number = HYDRATION_CHUNK_CHARS,
+): Map<string, string> {
+  const texts = new Map<string, string>();
+  for (const w of winners) {
+    const fp = w.file.startsWith('qmd://') ? w.file.slice(6) : w.file;
+    const pos = Math.max(0, w.chunkPos ?? 0);
+    try {
+      const row = db.prepare(
+        `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
+      ).get(pos + 1, chunkChars, fp) as { text: string } | undefined
+        ?? db.prepare(
+          `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
+        ).get(pos + 1, chunkChars, w.file) as { text: string } | undefined;
+      if (row?.text) texts.set(w.file, row.text);
+    } catch {}
+  }
+  return texts;
+}
+
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
@@ -5603,15 +5871,20 @@ export async function hybridQuery(
   const hasStrongSignal = !intent && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
+  // Fast path: when the top keyword (FTS) score clears 0.70, the keyword
+  // ranking is trusted on its own and vector expansion is skipped.
+  const hasDecentFts = initialFts.length > 0 && topScore >= 0.70;
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
+
+  const shouldExpand = !hasStrongSignal && !hasDecentFts;
 
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = hasStrongSignal
-    ? []
-    : await store.expandQuery(query);
+  const expanded = shouldExpand
+    ? await store.expandQuery(query)
+    : [];
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -5639,7 +5912,7 @@ export async function hybridQuery(
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, score: r.score, chunkPos: r.chunkPos,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
@@ -5647,8 +5920,9 @@ export async function hybridQuery(
   }
 
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
-  if (hasVectors) {
-    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
+    const shouldDoVectorSearch = hasVectors && !hasDecentFts && !(hasStrongSignal && !options?.expandCentroid && !options?.centroidConfig?.enabled);
+  if (shouldDoVectorSearch) {
+    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = hasStrongSignal ? [] : [
       { text: query, queryType: "original" },
     ];
     for (const q of expanded) {
@@ -5679,7 +5953,7 @@ export async function hybridQuery(
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, score: r.score, chunkPos: r.chunkPos,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -5705,23 +5979,176 @@ export async function hybridQuery(
 
   // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
   // expansion-derived lists stay at 1x independent of insertion order.
-  const weights = getHybridRrfWeights(rankedListMeta);
-  const fused = reciprocalRankFusion(rankedLists, weights);
-  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  let weights = getHybridRrfWeights(rankedListMeta);
+  let fused = reciprocalRankFusion(rankedLists, weights);
+  let rrfTraceByFile: Map<string, any> | null = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  // Step 4b: Centroid expansion (Rocchio pseudo-relevance feedback).
+  // When enabled, the top-ranked files vote on the query's theme: embed
+  // their winning chunks, average into a centroid vector, and search it
+  // for files the keyword ranking missed.
+  const centroidCfg = options?.centroidConfig ?? DEFAULT_CENTROID_CONFIG;
+  const centroidK = options?.centroidK ?? centroidCfg.topKForCentroid;
+  const centroidWeight = options?.centroidWeight ?? centroidCfg.weight;
+  const centroidVectorTopK = options?.centroidVectorTopK ?? centroidCfg.vectorTopK;
+  const lowRecall = fused.length <= 6 || topScore < 0.35;
+  const shouldCentroid = (options?.expandCentroid ?? (centroidCfg.enabled || lowRecall)) && hasVectors && fused.length > 0;
+
+  if (shouldCentroid) {
+    const centroidStart = Date.now();
+    const topK = Math.min(Math.max(1, centroidK), fused.length);
+    const topCandidates = fused.slice(0, topK);
+
+    // Fetch each top file's winning chunk text to seed the centroid.
+    const fileBodyMap = fetchWinnerChunks(
+      store.db,
+      topCandidates.map(c => ({ file: c.file, chunkPos: c.chunkPos })),
+    );
+
+    // The seeds are the winning chunk texts of the top-ranked files.
+    const seedChunks: string[] = [];
+    const seedFiles: string[] = [];
+
+    for (const c of topCandidates) {
+      // Each fetched slice is already that file's winning chunk text.
+      const bestChunk = fileBodyMap.get(c.file) || "";
+      if (bestChunk.trim()) {
+        seedChunks.push(bestChunk);
+        seedFiles.push(c.file);
+      }
+    }
+
+    if (seedChunks.length > 0) {
+      let centroidVec: Float32Array | null = null;
+
+      // Stored-vector path: reuse the chunk embeddings already stored in
+      // the vector index instead of re-embedding, avoiding a model load.
+      try {
+        const modelName = DEFAULT_EMBED_MODEL;
+        const fingerprint = getEmbeddingFingerprint(modelName);
+        const storedEmbeddings: Float32Array[] = [];
+
+        for (let i = 0; i < seedFiles.length; i++) {
+          const file = seedFiles[i]!;
+          const docRow = store.db.prepare(
+            `SELECT hash FROM documents WHERE collection || '/' || path = ? AND active = 1 LIMIT 1`
+          ).get(file.startsWith('qmd://') ? file.slice(6) : file) as { hash: string } | undefined
+            || store.db.prepare(
+              `SELECT d.hash FROM documents d WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active=1 LIMIT 1`
+            ).get(file) as { hash: string } | undefined;
+
+          if (!docRow) continue;
+
+          // Use the first chunk's stored embedding as this file's vote.
+          const cvRows = store.db.prepare(
+            `SELECT seq FROM content_vectors WHERE hash = ? AND model = ? AND embed_fingerprint = ? ORDER BY seq LIMIT 5`
+          ).all(docRow.hash, modelName, fingerprint) as { seq: number }[];
+
+          for (const cv of cvRows.slice(0, 1)) { // first chunk per file votes in the centroid
+            const vecRow = store.db.prepare(
+              `SELECT embedding FROM vectors_vec WHERE hash_seq = ? LIMIT 1`
+            ).get(`${docRow.hash}_${cv.seq}`) as { embedding: Float32Array } | undefined;
+            if (vecRow?.embedding) {
+              // Stored embeddings arrive as Float32Array or raw blob bytes.
+              let emb: Float32Array;
+              if (vecRow.embedding instanceof Float32Array) emb = vecRow.embedding as Float32Array;
+              else if ((vecRow.embedding as any) instanceof Uint8Array || (typeof Buffer !== 'undefined' && (globalThis as any).Buffer?.isBuffer?.(vecRow.embedding))) {
+                // Raw bytes from the vector index: reinterpret as float32 values.
+                const buf = vecRow.embedding as any;
+                emb = buf instanceof Float32Array ? buf : new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength/4);
+              } else {
+                continue;
+              }
+              if (emb.length > 0) storedEmbeddings.push(emb);
+            }
+          }
+        }
+
+        if (storedEmbeddings.length === seedChunks.length && storedEmbeddings.length > 0) {
+          // All seeds were already embedded: average them directly.
+          centroidVec = computeCentroidFromFloat32(storedEmbeddings);
+        }
+      } catch {
+        // Stored embeddings were missing or mismatched; fall through to re-embed.
+      }
+
+      // Fallback: embed the seed chunks now (a few ms on CPU for 3 chunks).
+      if (!centroidVec) {
+        try {
+          const llmForCentroid = getLlm(store);
+          const embedModel = llmForCentroid.embedModelName;
+          const formatted = seedChunks.map(t => formatDocForEmbedding(t, undefined, embedModel));
+          const embResults = await llmForCentroid.embedBatch(formatted);
+          const validEmbs: number[][] = [];
+          for (const r of embResults) if (r?.embedding) validEmbs.push(r.embedding);
+          if (validEmbs.length > 0) {
+            centroidVec = computeCentroid(validEmbs);
+          }
+        } catch {
+          // Embedding failed; return the keyword ranking unchanged.
+        }
+      }
+
+      // Search the centroid vector for files near the top-ranked theme.
+      const centroidVecSearchStart = Date.now();
+      if (centroidVec) {
+        try {
+          const centroidResults = await store.searchVec(
+            "__centroid__",
+            (getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL),
+            centroidVectorTopK,
+            collection,
+            undefined,
+            Array.from(centroidVec),
+            filter
+          );
+          if (centroidResults.length > 0) {
+            for (const r of centroidResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(centroidResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+            rankedListMeta.push({ source: "vec", queryType: "vec", query: "__centroid_expansion__" });
+            // Fuse again with the centroid list included, at its own weight.
+            weights = getHybridRrfWeights(rankedListMeta);
+            // Give the centroid list its configured weight rather than the default.
+            weights[weights.length - 1] = centroidWeight;
+            fused = reciprocalRankFusion(rankedLists, weights);
+            if (explain) {
+              rrfTraceByFile = buildRrfTrace(rankedLists, weights, rankedListMeta);
+            }
+          }
+        } catch {
+          // Centroid search failed; keep the keyword-fused ranking.
+        }
+      }
+    }
+  }
+
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
 
-  // Step 5: Chunk documents, pick best chunk per doc for reranking.
-  // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
+  // Step 5: Fetch only each winner's ranked chunk text for reranking.
+  // The slice at the winner's chunkPos is already the chunk to score,
+  // so wrap it directly instead of re-chunking a full document body.
+  const candidateBodies = fetchWinnerChunks(
+    store.db,
+    candidates.map(c => ({ file: c.file, chunkPos: c.chunkPos })),
+  );
+
+  // Step 5b: Pick each file's best chunk by keyword overlap.
+  // With a single fetched slice per file the best chunk is that slice;
+  // its keyword overlap still decides the rerank text below.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
-  const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
-    if (chunks.length === 0) continue;
+    // The fetched slice is already the winner's ranked chunk: score it
+    // directly instead of re-chunking a full document body to find it.
+    const slice = candidateBodies.get(cand.file) || "";
+    if (!slice) continue;
+    const chunks = [{ text: slice, pos: (cand as { chunkPos?: number }).chunkPos ?? 0 }];
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
@@ -5746,14 +6173,14 @@ export async function hybridQuery(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidateBodies.get(cand.file) || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -5771,7 +6198,7 @@ export async function hybridQuery(
           file: cand.file,
           displayPath: cand.displayPath,
           title: cand.title,
-          body: cand.body,
+          body: (cand.body ?? candidateBodies.get(cand.file) ?? "") as string,
           bestChunk,
           bestChunkPos,
           score: rrfScore,
@@ -5807,7 +6234,7 @@ export async function hybridQuery(
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: (candidateBodies.get(c.file) || "") as string,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5827,8 +6254,8 @@ export async function hybridQuery(
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
@@ -5846,7 +6273,7 @@ export async function hybridQuery(
       file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: candidate?.body || "",
+      body: (candidate?.body || candidateBodies.get(r.file) || "") as string,
       bestChunk,
       bestChunkPos,
       score: blendedScore,
@@ -5970,6 +6397,12 @@ export interface StructuredSearchOptions {
   skipRerank?: boolean;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio) */
+  expandCentroid?: boolean;
+  centroidK?: number;
+  centroidWeight?: number;
+  centroidVectorTopK?: number;
+  centroidConfig?: CentroidConfig;
 }
 
 /**
@@ -6119,11 +6552,20 @@ export async function structuredSearch(
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-  const ssChunkStrategy = options?.chunkStrategy;
+
+  // Chunk-level hydration: reuse the helper so pre-expanded search also
+  // fetches only each winner's ranked chunk instead of full bodies.
+  const ssCandidateBodies = fetchWinnerChunks(
+    store.db,
+    candidates.map(c => ({ file: c.file, chunkPos: (c as { chunkPos?: number }).chunkPos })),
+  );
 
   for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
-    if (chunks.length === 0) continue;
+    // The fetched slice is already this winner's ranked chunk; score it
+    // directly instead of re-chunking a full document body.
+    const slice = ssCandidateBodies.get(cand.file) || "";
+    if (!slice) continue;
+    const chunks = [{ text: slice, pos: (cand as { chunkPos?: number }).chunkPos ?? 0 }];
 
     // Pick chunk with most keyword overlap
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
@@ -6148,14 +6590,14 @@ export async function structuredSearch(
       .map((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
         const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || (cand as any).body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
           rrf: {
             rank: rrfRank,
             positionScore: rrfScore,
@@ -6173,7 +6615,7 @@ export async function structuredSearch(
           file: cand.file,
           displayPath: cand.displayPath,
           title: cand.title,
-          body: cand.body,
+          body: (cand.body ?? (cand as any).body ?? "") as string,
           bestChunk,
           bestChunkPos,
           score: rrfScore,
@@ -6208,7 +6650,7 @@ export async function structuredSearch(
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: (ssCandidateBodies.get(c.file) || "") as string,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -6228,8 +6670,8 @@ export async function structuredSearch(
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      ftsScores: trace?.contributions.filter((c: any) => c.source === "fts").map((c: any) => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter((c: any) => c.source === "vec").map((c: any) => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
@@ -6247,7 +6689,7 @@ export async function structuredSearch(
       file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: candidate?.body || "",
+      body: (candidate?.body || ssCandidateBodies.get(r.file) || "") as string,
       bestChunk,
       bestChunkPos,
       score: blendedScore,

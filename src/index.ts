@@ -219,7 +219,7 @@ export interface SearchOptions {
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
-  /** Rerank results using LLM (default: true) */
+  /** Rerank results using LLM (default: false, RRF order is returned as-is) */
   rerank?: boolean;
   /** Filter to a specific collection */
   collection?: string;
@@ -237,6 +237,10 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Enable centroid expansion (Rocchio) — thematic clustering */
+  expandCentroid?: boolean;
+  /** Top-k RRF results to form centroid (default 3) */
+  centroidK?: number;
 }
 
 /**
@@ -490,7 +494,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collection ? [opts.collection] : []),
         ...(opts.collections ?? []),
       ];
-      const skipRerank = opts.rerank === false;
+      const skipRerank = opts.rerank !== true;
       // The SDK is also a JavaScript boundary: TypeScript declarations do not
       // protect plain-JS callers or deserialized input. Apply the same bounded,
       // strict validation used by CLI, MCP, and HTTP before compiling SQL.
