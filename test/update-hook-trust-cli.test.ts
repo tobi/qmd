@@ -135,3 +135,35 @@ describe("qmd update with a checked-in .qmd config", () => {
     expect(list.stdout).toContain(join(projectDir, ".qmd", "index.yml"));
   }, 120_000);
 });
+
+describe("qmd update when an update command fails", () => {
+  test("still indexes the later collections, then exits non-zero naming the failure (#979)", async () => {
+    // A global config's hooks run without a trust prompt, so drop the checkout config.
+    rmSync(join(projectDir, ".qmd"), { recursive: true, force: true });
+    mkdirSync(join(projectDir, "notes"));
+    writeFileSync(join(projectDir, "notes", "todo.md"), "# Todo\n\nMore indexable content.\n", "utf-8");
+    writeFileSync(
+      join(configDir, "index.yml"),
+      [
+        "collections:",
+        "  docs:",
+        `    path: ${JSON.stringify(join(projectDir, "docs"))}`,
+        '    pattern: "**/*.md"',
+        '    update: "exit 3"',
+        "  notes:",
+        `    path: ${JSON.stringify(join(projectDir, "notes"))}`,
+        '    pattern: "**/*.md"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const result = await runQmd(["update"], { INDEX_PATH: join(configDir, "index.sqlite") });
+
+    const afterSecond = result.stdout.slice(result.stdout.indexOf("[2/2] notes"));
+    expect(result.stdout).toContain("[2/2] notes");
+    expect(afterSecond).toContain("Indexed: 1 new");
+    expect(afterSecond).toMatch(/failed.*docs/);
+    expect(result.exitCode).not.toBe(0);
+  }, 120_000);
+});

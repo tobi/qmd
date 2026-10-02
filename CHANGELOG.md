@@ -15,6 +15,12 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- A failing `update:` command no longer stops `qmd update` partway through.
+  Before, the first collection whose command failed ended the run, and every
+  collection after it was silently never re-indexed. Now QMD reports the
+  failure, still indexes that collection's files as they are, carries on with
+  the rest, and exits 1 at the end with the names of the failed collections
+  (#979).
 
 ## [2.8.3] - 2026-08-16
 
