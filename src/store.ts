@@ -2302,8 +2302,14 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
-    invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
+    expandQuery: (query: string, model?: string) => {
+      const llm = getLlm(store);
+      return expandQuery(query, model ?? llm.generateModelName ?? DEFAULT_QUERY_MODEL, db, llm);
+    },
+    invalidateExpansionCache: (query: string) => {
+      const llm = getLlm(store);
+      deleteExpansionCacheEntry(db, query, llm.generateModelName ?? DEFAULT_QUERY_MODEL);
+    },
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
@@ -4593,7 +4599,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  // Generation uses the configured LlamaCpp instance; model identifies the cache entry.
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).

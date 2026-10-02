@@ -1310,6 +1310,97 @@ describe("Caching", () => {
 });
 
 describe("Query expansion cache (#818)", () => {
+  test("expansion cache and invalidation follow the resolved default model (#970)", async () => {
+    const store = await createTestStore();
+    const query = "expansion cache model swap";
+    const makeMock = (model: string, text: string) => ({
+      generateModelName: model,
+      expandQuery: vi.fn(async () => [{ type: "lex", text }]),
+    });
+    const modelA = "hf:example/generate-a/a.gguf";
+    const modelB = "hf:example/generate-b/b.gguf";
+    const llmA = makeMock(modelA, "expanded by A");
+    const llmB = makeMock(modelB, "expanded by B");
+    const keyA = getCacheKey("expandQuery", { query, model: modelA });
+    const keyB = getCacheKey("expandQuery", { query, model: modelB });
+
+    try {
+      setDefaultLlamaCpp(llmA as any);
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "expanded by A" }]);
+      expect(llmA.expandQuery).toHaveBeenCalledTimes(1);
+
+      setDefaultLlamaCpp(llmB as any);
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "expanded by B" }]);
+      expect(llmB.expandQuery).toHaveBeenCalledTimes(1);
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "expanded by B" }]);
+      expect(llmB.expandQuery).toHaveBeenCalledTimes(1);
+
+      store.invalidateExpansionCache(query);
+      expect(store.getCachedResult(keyB)).toBeNull();
+      expect(store.getCachedResult(keyA)).not.toBeNull();
+      await store.expandQuery(query);
+      expect(llmB.expandQuery).toHaveBeenCalledTimes(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("expansion cache prefers the store model over the default model (#970)", async () => {
+    const store = await createTestStore();
+    const query = "store expansion model";
+    const globalModel = "hf:example/global-generate/model.gguf";
+    const storeModel = "hf:example/store-generate/model.gguf";
+    const globalLlm = {
+      generateModelName: globalModel,
+      expandQuery: vi.fn(async () => [{ type: "lex", text: "global expansion" }]),
+    };
+    const storeLlm = {
+      generateModelName: storeModel,
+      expandQuery: vi.fn(async () => [{ type: "lex", text: "store expansion" }]),
+    };
+    const globalKey = getCacheKey("expandQuery", { query, model: globalModel });
+    const storeKey = getCacheKey("expandQuery", { query, model: storeModel });
+
+    try {
+      setDefaultLlamaCpp(globalLlm as any);
+      store.llm = storeLlm as any;
+      store.setCachedResult(globalKey, JSON.stringify([{ type: "lex", query: "global expansion" }]));
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "store expansion" }]);
+      expect(storeLlm.expandQuery).toHaveBeenCalledTimes(1);
+      expect(globalLlm.expandQuery).not.toHaveBeenCalled();
+
+      store.invalidateExpansionCache(query);
+      expect(store.getCachedResult(storeKey)).toBeNull();
+      expect(store.getCachedResult(globalKey)).not.toBeNull();
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("expandQuery preserves an explicit cache model namespace", async () => {
+    const store = await createTestStore();
+    const query = "explicit expansion cache model";
+    const model = "explicit-cache-model";
+    const llm = {
+      generateModelName: "hf:example/generate/model.gguf",
+      expandQuery: vi.fn(async () => [{ type: "lex", text: "explicit expansion" }]),
+    };
+
+    try {
+      setDefaultLlamaCpp(llm as any);
+      expect(await store.expandQuery(query, model)).toEqual([{ type: "lex", query: "explicit expansion" }]);
+      await store.expandQuery(query, model);
+      expect(llm.expandQuery).toHaveBeenCalledTimes(1);
+      expect(store.getCachedResult(getCacheKey("expandQuery", { query, model }))).not.toBeNull();
+      expect(store.getCachedResult(getCacheKey("expandQuery", { query, model: llm.generateModelName }))).toBeNull();
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("expandQuery serves cached expansions without invoking the LLM", async () => {
     const store = await createTestStore();
     try {
@@ -1318,8 +1409,8 @@ describe("Query expansion cache (#818)", () => {
       store.setCachedResult(getCacheKey("expandQuery", { query: "cached question", model }), JSON.stringify(seeded));
 
       // CI mode makes any real generation throw, so a passing call proves the
-      // cache path; locally the seed always hits, so the LLM is never
-      // consulted either way.
+      // cache path; locally the seed always hits, so generation is never
+      // invoked either way.
       const out = await store.expandQuery("cached question");
       expect(out).toEqual([{ type: "lex", query: "seeded-term" }]);
     } finally {
