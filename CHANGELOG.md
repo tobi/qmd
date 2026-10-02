@@ -15,6 +15,11 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- Bench scoring no longer credits a result whose path merely ends with the
+  expected filename (`Vault Note Standards.md` for `Standards.md`), nor an
+  expected path longer than the result (`docs/api/README.md` for `README.md`).
+  `pathsMatch` now requires an exact normalized match or a suffix anchored at a
+  path separator (#943).
 
 ## [2.8.3] - 2026-08-16
 
