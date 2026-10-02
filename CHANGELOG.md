@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `qmd doctor` selects vector sample identities before loading document bodies,
+  avoiding excessive SQLite memory use on large indexes with duplicate paths.
+  #978 (thanks @naveenspark)
+- Vector diagnostics match passages by their saved character position, avoiding
+  false mismatches when earlier chunks change the sequence numbering.
+  #978 (thanks @naveenspark)
+
 ### Added
 
 - Added Oxlint lint fence.
@@ -15,6 +24,23 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- `qmd doctor` no longer stalls or fills the temp directory on large indexes
+  when checking legacy (empty-fingerprint) embeddings. The adoption sample
+  query joined `content` and grouped by the document body, so SQLite
+  materialized the full body once per legacy chunk and per active path before
+  `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
+  (#978). It now picks the sample row through indexes and loads only that
+  row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+
+### Changed
+
+- The MCP server caches its instructions per store for up to 60 seconds instead
+  of rebuilding them, with a full index-status scan, for every HTTP request.
+  Concurrent requests share one build and a failed build is not cached; index
+  changes from other processes show up in the instructions within a minute.
+  #815 (thanks @fxstein)
+- Avoid a redundant runtime process on packaged CLI calls where the launcher is
+  already running under its selected Node or Bun runtime. #923 (thanks @ilepn)
 
 ## [2.8.3] - 2026-08-16
 

@@ -7,11 +7,13 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { openDatabase, loadSqliteVec } from "../src/db.js";
+import { openDatabase, loadSqliteVec, isBun } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
@@ -4189,6 +4191,169 @@ describe("Embedding batching", () => {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
+  });
+
+  const legacyModel = "hf:test/legacy-sample.gguf";
+  // createFakeEmbedLlm().embed returns this vector for every text.
+  const matchingVector = new Float32Array([0.1, 0.2, 0.3]);
+  const otherVector = new Float32Array([0.3, -0.2, 0.1]);
+
+  function addLegacyChunk(
+    store: Store,
+    hash: string,
+    seq: number,
+    opts: { model?: string; fingerprint?: string; vector?: Float32Array } = {},
+  ): void {
+    const model = opts.model ?? legacyModel;
+    const fingerprint = opts.fingerprint ?? "";
+    const embeddedAt = new Date(0).toISOString();
+    if (opts.vector) {
+      store.insertEmbedding(hash, seq, 0, opts.vector, model, embeddedAt, 3, fingerprint);
+    } else {
+      store.db.prepare(`
+        INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, ?, 0, ?, ?, 3, ?)
+      `).run(hash, seq, model, fingerprint, embeddedAt);
+    }
+  }
+
+  test("legacy fingerprint adoption samples the lowest hash and seq when active documents share content", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Other legacy body.", displayPath: "other.md" });
+      addLegacyChunk(store, "hash-b", 0, { vector: otherVector });
+      // One body behind two active paths and an inactive one, with seqs inserted
+      // out of order so rowid order disagrees with ORDER BY hash, seq.
+      const body = "Shared legacy body without a heading.";
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "z.md" });
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "b.md" });
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "a.md", active: 0 });
+      addLegacyChunk(store, "hash-a", 2);
+      addLegacyChunk(store, "hash-a", 1);
+      addLegacyChunk(store, "hash-a", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 4 });
+      expect(result.reason).toMatch(/^sample hash-a_0 matched/);
+      // The title comes from the first active path (b.md), not the inactive a.md.
+      expect(fakeLlm.embedCalls.map(call => call.text)).toEqual([formatDocForEmbedding(body, "b", legacyModel)]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption skips rows without an active document or content", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-a", body: "Inactive body.", displayPath: "inactive.md", active: 0 });
+      addLegacyChunk(store, "hash-a", 0, { vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Missing body.", displayPath: "missing.md" });
+      addLegacyChunk(store, "hash-b", 0, { vector: otherVector });
+      // With foreign keys on, deleting content cascades to the document; turn
+      // them off so an active document is left pointing at missing content.
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.prepare(`DELETE FROM content WHERE hash = ?`).run("hash-b");
+      db.exec("PRAGMA foreign_keys = ON");
+
+      const skipped = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(skipped).toEqual({ checked: false, adopted: 0, reason: "2 legacy docs have no active sample" });
+      expect(fakeLlm.embedCalls).toHaveLength(0);
+
+      await insertTestDocument(db, "docs", { hash: "hash-c", body: "Active body.", displayPath: "active.md" });
+      addLegacyChunk(store, "hash-c", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 3 });
+      expect(result.reason).toMatch(/^sample hash-c_0 matched/);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption ignores other models and fingerprinted rows", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-a", body: "Other model body.", displayPath: "other-model.md" });
+      addLegacyChunk(store, "hash-a", 0, { model: "hf:test/other-model.gguf", vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Fingerprinted body.", displayPath: "fingerprinted.md" });
+      addLegacyChunk(store, "hash-b", 0, { fingerprint: "abc123", vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-c", body: "Legacy body.", displayPath: "legacy.md" });
+      addLegacyChunk(store, "hash-c", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 1 });
+      expect(result.reason).toMatch(/^sample hash-c_0 matched/);
+      expect(db.prepare(`SELECT hash, embed_fingerprint FROM content_vectors ORDER BY hash`).all()).toEqual([
+        { hash: "hash-a", embed_fingerprint: "" },
+        { hash: "hash-b", embed_fingerprint: "abc123" },
+        { hash: "hash-c", embed_fingerprint: getEmbeddingFingerprint(legacyModel) },
+      ]);
+
+      // No legacy rows remain for this model: a second pass is a no-op.
+      const again = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(again).toEqual({ checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" });
+      expect(fakeLlm.embedCalls).toHaveLength(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption loads one sample body within a 128 MiB SQLite budget", () => {
+    // SQLite's hard heap limit is process-wide and cannot be raised again, so
+    // the fixture runs in a worker. The limit binds only under Bun with an
+    // SQLite that tracks memory (Bun's bundled SQLite on Linux, Homebrew SQLite
+    // on macOS), where the old per-chunk query fails with SQLITE_NOMEM. Apple's
+    // system libsqlite3 and better-sqlite3 are built with
+    // SQLITE_DEFAULT_MEMSTATUS=0, so there this only checks the adoption result.
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-sample-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 20_000 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const adoption = JSON.parse(result.stdout) as { checked: boolean; adopted: number; reason: string };
+    // 16 documents x 32 legacy chunks, all adopted after one sample matched.
+    expect(adoption).toMatchObject({ checked: true, adopted: 512 });
+    expect(adoption.reason).toMatch(/^sample document-0_0 matched/);
+  });
+
+  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
+    // One legacy chunk, so only the active-path count multiplies the body. The
+    // limit binds under Bun only, as in the 128 MiB test above.
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const out = JSON.parse(result.stdout);
+    expect(out).toMatchObject({ checked: true, adopted: 1 });
+    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
