@@ -177,7 +177,29 @@ const child = spawn(runner, args, {
   shell: needsShell,
 });
 
+// Forward termination signals to the child. Without handlers this trampoline
+// dies on SIGTERM (e.g. `timeout`) while the child — possibly blocked in native
+// llama.cpp code that never services the signal — is reparented to init and
+// keeps running. After a grace period, SIGKILL the child so it cannot outlive us.
+const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+const KILL_GRACE_MS = 5000;
+let killTimer = null;
+
+function forwardSignal(sig) {
+  child.kill(sig);
+  killTimer ??= setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+}
+
+for (const sig of FORWARDED_SIGNALS) {
+  process.on(sig, forwardSignal);
+}
+
 child.on("exit", (code, signal) => {
+  clearTimeout(killTimer);
+  // Drop our handlers so re-raising the child's signal below terminates us.
+  for (const sig of FORWARDED_SIGNALS) {
+    process.off(sig, forwardSignal);
+  }
   if (signal) {
     process.kill(process.pid, signal);
   } else {

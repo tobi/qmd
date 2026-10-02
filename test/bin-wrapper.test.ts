@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -329,4 +329,51 @@ describe("bin/qmd package wrapper", () => {
     expect(result.stderr).toContain("npm install && npm run build");
     expect(result.stderr).toContain("qmd doctor");
   });
+
+  // The trampoline spawns the real CLI and used to only listen for the child's
+  // `exit`, so a SIGTERM (e.g. from `timeout`) killed the trampoline and left
+  // the CLI running, reparented to init. Stub a CLI that ignores SIGTERM (like
+  // a process blocked in native llama.cpp) and assert it is still reaped.
+  test.skipIf(process.platform === "win32")("SIGTERM to the launcher does not orphan the CLI child", async () => {
+    const { root, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    const pidPath = join(root, "child.pid");
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      [
+        'const { writeFileSync } = require("node:fs");',
+        'process.on("SIGTERM", () => {});',
+        `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+        'setInterval(() => {}, 1000);',
+        '',
+      ].join("\n"),
+    );
+
+    const launcher = spawn(join(packageRoot, "bin", "qmd"), ["--version"], {
+      env: { ...process.env, PATH: `${runtimeBin}:${process.env.PATH ?? ""}` },
+      stdio: "ignore",
+    });
+    const launcherExited = new Promise<void>((done) => launcher.on("exit", () => done()));
+    const isAlive = (pid: number) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let childPid = 0;
+    try {
+      for (let i = 0; i < 100 && !childPid; i++) {
+        try { childPid = Number(readFileSync(pidPath, "utf8")); } catch { await sleep(50); }
+      }
+      expect(childPid).toBeGreaterThan(0);
+
+      launcher.kill("SIGTERM");
+      await launcherExited;
+
+      // Grace period is 5s before SIGKILL; allow slack for slow CI.
+      for (let i = 0; i < 160 && isAlive(childPid); i++) await sleep(50);
+      expect(isAlive(childPid)).toBe(false);
+    } finally {
+      if (childPid && isAlive(childPid)) process.kill(childPid, "SIGKILL");
+    }
+  }, 20_000);
 });
