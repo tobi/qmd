@@ -228,6 +228,21 @@ describe("reindexCollection metadata synchronization", () => {
     expect(getMetadataForPath("doc.md")).toEqual({ status: "ok" });
   });
 
+  test("re-extracts an unchanged file whose metadata came from an older extraction version", async () => {
+    await writeFile(join(collectionDir, "doc.md"), buildDoc("qmd:\n  metadata:\n    status: ok\n", "# Doc\n"));
+    await reindex();
+
+    store.db.prepare(`UPDATE document_metadata SET extraction_version = 0`).run();
+    expect(countDocumentsPendingMetadata(store.db)).toBe(1);
+
+    const result = await reindex();
+    expect(result.unchanged).toBe(1);
+    const row = store.db.prepare(`SELECT extraction_version FROM document_metadata`).get() as { extraction_version: number };
+    expect(row.extraction_version).toBe(METADATA_EXTRACTION_VERSION);
+    expect(countDocumentsPendingMetadata(store.db)).toBe(0);
+    expect(getMetadataForPath("doc.md")).toEqual({ status: "ok" });
+  });
+
   test("counts extraction errors without aborting the collection", async () => {
     await writeFile(join(collectionDir, "bad.md"), buildDoc("qmd:\n  metadata:\n    mixed: [1, two]\n", "# Bad\n"));
     await writeFile(join(collectionDir, "good.md"), buildDoc("qmd:\n  metadata:\n    status: ok\n", "# Good\n"));

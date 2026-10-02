@@ -57,9 +57,17 @@ assertPath("dist/cli/qmd.js", "compiled CLI");
 
 run("compiled CLI under Node", process.execPath, ["dist/cli/qmd.js", "--help"], { quiet: true });
 run("package wrapper", "sh", ["bin/qmd", "--help"], { quiet: true });
+run("dist package wrapper under Node", process.execPath, ["bin/qmd", "--help"], {
+  quiet: true,
+  env: { ...process.env, QMD_SOURCE_MODE: "0" },
+});
 
 if (process.env.QMD_SKIP_BUN_SMOKE === "1") {
   console.log("==> compiled CLI under Bun (skipped by QMD_SKIP_BUN_SMOKE=1)");
 } else {
   run("compiled CLI under Bun", "bun", ["dist/cli/qmd.js", "--help"], { quiet: true });
+  run("dist package wrapper under Bun", "bun", ["bin/qmd", "--help"], {
+    quiet: true,
+    env: { ...process.env, QMD_SOURCE_MODE: "0" },
+  });
 }

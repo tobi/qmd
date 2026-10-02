@@ -28,6 +28,7 @@ import {
   resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
+  getEmbeddingVectorSamples,
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
@@ -80,6 +81,8 @@ import {
   createStore,
   getDefaultDbPath,
   reindexCollection,
+  scanWriteBatch,
+  REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
@@ -2130,13 +2133,23 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
 
+  const batch = scanWriteBatch(db);
   for (const relativeFile of files) {
+    batch.next();
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     // Store the literal relative path — handelize() is NOT applied at index time.
     const path = relativeFile.replace(/\\/g, '/');
     if (!isPathInsideDir(resolvedPwd, filepath)) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      progress.set((processed / total) * 100);
+      continue;
+    }
+    let tooLarge = false;
+    try { tooLarge = statSync(filepath).size > REINDEX_MAX_FILE_SIZE; } catch { /* the read below reports it */ }
+    if (tooLarge) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
       progress.set((processed / total) * 100);
       continue;
     }
@@ -2216,10 +2229,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
+      batch.next();
       deactivateDocument(db, collectionName, path);
       removed++;
     }
   }
+
+  batch.commit();
 
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
@@ -2257,16 +2273,21 @@ function reportMetadataErrors(metadataErrors: number): void {
 
 function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
   if (skippedFiles.length === 0) return;
+  const sizeLimitMb = Math.round(REINDEX_MAX_FILE_SIZE / (1024 * 1024));
   for (const skipped of skippedFiles) {
     if (skipped.code === "OUTSIDE_COLLECTION") {
       console.warn(`⚠ Skipped file outside collection: ${skipped.file}`);
+    } else if (skipped.code === "FILE_TOO_LARGE") {
+      console.warn(`⚠ Skipped file over ${sizeLimitMb} MB: ${skipped.file}`);
     } else {
       console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
     }
   }
   const escaped = skippedFiles.filter(f => f.code === "OUTSIDE_COLLECTION").length;
-  const unreadable = skippedFiles.length - escaped;
+  const tooLarge = skippedFiles.filter(f => f.code === "FILE_TOO_LARGE").length;
+  const unreadable = skippedFiles.length - escaped - tooLarge;
   if (escaped) console.warn(`Skipped ${escaped} file(s) outside the collection root`);
+  if (tooLarge) console.warn(`Skipped ${tooLarge} file(s) over ${sizeLimitMb} MB`);
   if (unreadable) console.warn(`Skipped ${unreadable} unreadable file(s)`);
 }
 
@@ -4198,7 +4219,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   }
 }
 
-async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+export async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
     return { ok: true, details: "no active documents indexed" };
@@ -4209,16 +4230,7 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     return { ok: false, details: "no vector table to test; please run qmd embed again" };
   }
 
-  const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ?
-    GROUP BY cv.hash, cv.seq, c.doc
-    ORDER BY random()
-    LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+  const samples = getEmbeddingVectorSamples(db, model, fingerprint, sampleSize);
 
   if (samples.length === 0) {
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
@@ -4231,7 +4243,9 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
       const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
-      const chunk = chunks[sample.seq];
+      // Sequence numbers identify stored vectors, but earlier chunks can split
+      // differently after a tokenizer/chunker change. Compare the saved passage.
+      const chunk = chunks.find(chunk => chunk.pos === sample.pos);
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
         continue;

@@ -687,6 +687,24 @@ describe("CLI Add Command", () => {
     }
   });
 
+  test("collection add skips files over 10 MB", async () => {
+    const env = await createIsolatedTestEnv("skip-too-large");
+    const collectionDir = join(testDir, `skip-too-large-${testCounter}`);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "good.md"), "alpha\n");
+    await writeFile(join(collectionDir, "big.md"), "a".repeat(10 * 1024 * 1024 + 1));
+
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["collection", "add", collectionDir, "--name", "skip-too-large"],
+      { dbPath: env.dbPath, configDir: env.configDir, cwd: collectionDir },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed: 1 new");
+    expect(stderr).toContain("Skipped file over 10 MB: big.md");
+    expect(stderr).toContain("Skipped 1 file(s) over 10 MB");
+    expect(stderr).not.toContain("unreadable");
+  });
+
   test("can recreate collection with remove and add", async () => {
     // First add
     await runQmd(["collection", "add", "."]);

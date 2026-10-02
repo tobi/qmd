@@ -7,11 +7,13 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { openDatabase, loadSqliteVec } from "../src/db.js";
+import { openDatabase, loadSqliteVec, isBun } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
@@ -50,6 +52,8 @@ import {
   isDocid,
   syncConfigToDb,
   reindexCollection,
+  removeCollection,
+  renameCollection,
   resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
@@ -3018,6 +3022,467 @@ describe("Reindex Collection", () => {
   });
 });
 
+describe("Reindex Collection file sync state (#962)", () => {
+  const BODY_CAP = 262_144;
+
+  async function collectionDir(prefix: string): Promise<string> {
+    const dir = join(testDir, `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  function activeBody(store: Store, collection: string, path: string): string | undefined {
+    const row = store.db.prepare(`
+      SELECT content.doc AS body FROM documents d JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(collection, path) as { body: string } | undefined;
+    return row?.body;
+  }
+
+  function syncRowCount(store: Store, collection: string, path: string): number {
+    const row = store.db.prepare(`
+      SELECT COUNT(*) AS n FROM file_sync_state WHERE collection = ? AND relative_path = ?
+    `).get(collection, path) as { n: number };
+    return row.n;
+  }
+
+  test("reindex trusts an unchanged mtime and size without reading the file", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-fast-path");
+    const file = join(dir, "doc.md");
+    try {
+      // A whole-second mtime survives utimes exactly under both runtimes; a
+      // millisecond Date can come back a fraction lower through Node's seconds.
+      const mtime = new Date("2026-01-02T03:04:05Z");
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, mtime, mtime);
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Different bytes of the same size, with the mtime put back.
+      await writeFile(file, "# A\n\nbravo\n");
+      await utimes(file, mtime, mtime);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("reindex does not read an unchanged file", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-no-read");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      // Older than the racy window, so the first pass stores a trusted row.
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Stat still works on an unreadable file; a read would fail with EACCES.
+      await chmod(file, 0o000);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.skippedFiles).toEqual([]);
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a touched file whose content is unchanged refreshes its sync row without re-indexing", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-touch");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      const touched = new Date("2026-01-02T03:05:05Z");
+      await utimes(file, touched, touched);
+
+      const first = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(first).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      const row = store.db.prepare(`SELECT mtime_ms FROM file_sync_state WHERE collection = ? AND relative_path = ?`)
+        .get("notes", "doc.md") as { mtime_ms: number };
+      expect(row.mtime_ms).toBe(touched.getTime());
+
+      // The refreshed row puts the file back on the fast path: a read would now report EACCES.
+      await chmod(file, 0o000);
+      const second = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(second.skippedFiles).toEqual([]);
+      expect(second).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a same-size rewrite that keeps a recent mtime is still read", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-racy");
+    const file = join(dir, "doc.md");
+    try {
+      // A whole second ahead of the clock: inside the racy window however slow the run.
+      const mtime = new Date((Math.floor(Date.now() / 1000) + 1) * 1000);
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, mtime, mtime);
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Rewritten within the same mtime granule: same size, same mtime.
+      await writeFile(file, "# A\n\nbravo\n");
+      await utimes(file, mtime, mtime);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result).toMatchObject({ indexed: 0, updated: 1, unchanged: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("bravo");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("reindexCollection groups its writes into transactions", async () => {
+    const store = await createTestStore();
+    const collectionPath = join(testDir, `batched-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    for (let i = 0; i < 5; i++) await writeFile(join(collectionPath, `d${i}.md`), `# D${i}\n\nbody ${i}\n`);
+    const seen: boolean[] = [];
+
+    try {
+      const result = await reindexCollection(store, collectionPath, "**/*.md", "batched", {
+        onProgress: () => seen.push(store.db.inTransaction),
+      });
+      expect(result.indexed).toBe(5);
+      expect(seen).toContain(true);
+      expect(store.db.inTransaction).toBe(false);
+      const rows = store.db.prepare(`SELECT COUNT(*) AS c FROM file_sync_state WHERE collection = ?`).get("batched") as { c: number };
+      expect(rows.c).toBe(5);
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a failed write rolls back the open batch and leaves no transaction behind", async () => {
+    const store = await createTestStore();
+    const collectionPath = join(testDir, `batch-fail-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    for (const name of ["a.md", "b.md", "c.md"]) await writeFile(join(collectionPath, name), `# ${name}\n\nbody\n`);
+    store.db.exec(`CREATE TRIGGER fail_b BEFORE INSERT ON documents WHEN NEW.path = 'b.md' BEGIN SELECT RAISE(ABORT, 'injected'); END`);
+
+    try {
+      await expect(reindexCollection(store, collectionPath, "**/*.md", "batch-fail")).rejects.toThrow("injected");
+      expect(store.db.inTransaction).toBe(false);
+
+      store.db.exec(`DROP TRIGGER fail_b`);
+      const retry = await reindexCollection(store, collectionPath, "**/*.md", "batch-fail");
+      expect(retry.indexed + retry.unchanged + retry.updated).toBe(3);
+      const rows = store.db.prepare(`SELECT COUNT(*) AS c FROM file_sync_state WHERE collection = ?`).get("batch-fail") as { c: number };
+      expect(rows.c).toBe(3);
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("files over 10 MB are skipped with FILE_TOO_LARGE and not indexed", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-too-large");
+    try {
+      await writeFile(join(dir, "big.md"), "a".repeat(10 * 1024 * 1024 + 1));
+      await writeFile(join(dir, "small.md"), "# Small\n\nfits\n");
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(result.skippedFiles).toEqual([{ file: "big.md", code: "FILE_TOO_LARGE" }]);
+      const rows = store.db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE collection = ? AND path = ?`)
+        .get("notes", "big.md") as { n: number };
+      expect(rows.n).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a previously indexed file that grows past 10 MB is reported and deactivated", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-grown");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      await writeFile(file, "# A\n\n" + "a".repeat(10 * 1024 * 1024));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.skippedFiles).toEqual([{ file: "doc.md", code: "FILE_TOO_LARGE" }]);
+      expect(activeBody(store, "notes", "doc.md")).toBeUndefined();
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a previously indexed file that becomes empty is deactivated", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-emptied");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      await writeFile(file, "");
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("deleting an indexed file removes its sync row on the next reindex", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-deleted");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await writeFile(join(dir, "keep.md"), "# B\n\nbravo\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(1);
+      await rm(join(dir, "doc.md"));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.removed).toBe(1);
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+      expect(syncRowCount(store, "notes", "keep.md")).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("removing a collection and adding it back re-indexes its files", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-readd");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      removeCollection(store.db, "notes");
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("removing and re-adding a collection re-indexes a file whose mtime moved but content did not", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-readd-touched");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      removeCollection(store.db, "notes");
+      await utimes(file, new Date("2026-01-02T03:05:05Z"), new Date("2026-01-02T03:05:05Z"));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("removing a collection deletes its sync rows", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-remove-rows");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(1);
+
+      removeCollection(store.db, "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("renaming a collection moves its sync rows, so the new name keeps the fast path", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-rename-rows");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      renameCollection(store.db, "notes", "archive");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+      expect(syncRowCount(store, "archive", "doc.md")).toBe(1);
+
+      // A read would now report EACCES.
+      await chmod(file, 0o000);
+      const result = await reindexCollection(store, dir, "**/*.md", "archive");
+      expect(result.skippedFiles).toEqual([]);
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("renaming a collection and adding the old name at another path indexes both", async () => {
+    const store = await createTestStore();
+    const first = await collectionDir("sync-rename-first");
+    const second = await collectionDir("sync-rename-second");
+    const mtime = new Date("2026-01-02T03:04:05Z");
+    try {
+      // Same relative path, size and mtime in both directories.
+      await writeFile(join(first, "doc.md"), "# A\n\nalpha\n");
+      await writeFile(join(second, "doc.md"), "# A\n\nbravo\n");
+      await utimes(join(first, "doc.md"), mtime, mtime);
+      await utimes(join(second, "doc.md"), mtime, mtime);
+      await reindexCollection(store, first, "**/*.md", "notes");
+      renameCollection(store.db, "notes", "archive");
+
+      await reindexCollection(store, first, "**/*.md", "archive");
+      const result = await reindexCollection(store, second, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "archive", "doc.md")).toContain("alpha");
+      expect(activeBody(store, "notes", "doc.md")).toContain("bravo");
+    } finally {
+      await rm(first, { recursive: true, force: true });
+      await rm(second, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a file whose document was deactivated elsewhere is re-indexed", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-deactivated");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Unchanged file and sync row; only the document went inactive.
+      store.deactivateDocument("notes", "doc.md");
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a file whose document now points at other content is re-read", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-rehashed");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Unchanged file and sync row; only the document's content changed.
+      const now = new Date().toISOString();
+      store.insertContent("elsewhere-hash", "# A\n\nwritten elsewhere\n", now);
+      const doc = store.db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`)
+        .get("notes", "doc.md") as { id: number };
+      store.updateDocument(doc.id, "A", "elsewhere-hash", now);
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchFTS returns at most 256 KiB of a document body", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Long\n\nzebracap " + "x".repeat(300 * 1024);
+      await insertTestDocument(store.db, "docs", { name: "long", body, displayPath: "long.md" });
+
+      const results = store.searchFTS("zebracap", 5);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body!.length).toBe(BODY_CAP);
+      expect(results[0]!.body).toBe(body.slice(0, BODY_CAP));
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchVec returns at most 256 KiB of a document body", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Long\n\nvector cap " + "y".repeat(300 * 1024);
+      const hash = await hashContent(body);
+      await insertTestDocument(store.db, "docs", { name: "long", body, hash, displayPath: "long.md" });
+      store.ensureVecTable(3);
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "cap-model", new Date().toISOString());
+
+      const results = await store.searchVec("q", "cap-model", 5, undefined, undefined, [1, 0, 0]);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body!.length).toBe(BODY_CAP);
+      expect(results[0]!.body).toBe(body.slice(0, BODY_CAP));
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchFTS returns a short body with an embedded NUL in full", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Nul\n\nzebranul before\u0000after \u00e4\u{1F600}";
+      await insertTestDocument(store.db, "docs", { name: "nul", body, displayPath: "nul.md" });
+
+      const results = store.searchFTS("zebranul", 5);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body).toBe(body);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchVec returns a short body with an embedded NUL in full", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Nul\n\nvector before\u0000after \u00e4\u{1F600}";
+      const hash = await hashContent(body);
+      await insertTestDocument(store.db, "docs", { name: "nul", body, hash, displayPath: "nul.md" });
+      store.ensureVecTable(3);
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "cap-model", new Date().toISOString());
+
+      const results = await store.searchVec("q", "cap-model", 5, undefined, undefined, [1, 0, 0]);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body).toBe(body);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("getHashesForEmbedding returns a short body with an embedded NUL in full", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Nul\n\nembed before\u0000after \u00e4\u{1F600}";
+      await insertTestDocument(store.db, "docs", { name: "nul", body, displayPath: "nul.md" });
+
+      expect(store.getHashesForEmbedding().map(row => row.body)).toEqual([body]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+});
+
 // =============================================================================
 // Index Status Tests
 // =============================================================================
@@ -4189,6 +4654,169 @@ describe("Embedding batching", () => {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
+  });
+
+  const legacyModel = "hf:test/legacy-sample.gguf";
+  // createFakeEmbedLlm().embed returns this vector for every text.
+  const matchingVector = new Float32Array([0.1, 0.2, 0.3]);
+  const otherVector = new Float32Array([0.3, -0.2, 0.1]);
+
+  function addLegacyChunk(
+    store: Store,
+    hash: string,
+    seq: number,
+    opts: { model?: string; fingerprint?: string; vector?: Float32Array } = {},
+  ): void {
+    const model = opts.model ?? legacyModel;
+    const fingerprint = opts.fingerprint ?? "";
+    const embeddedAt = new Date(0).toISOString();
+    if (opts.vector) {
+      store.insertEmbedding(hash, seq, 0, opts.vector, model, embeddedAt, 3, fingerprint);
+    } else {
+      store.db.prepare(`
+        INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, ?, 0, ?, ?, 3, ?)
+      `).run(hash, seq, model, fingerprint, embeddedAt);
+    }
+  }
+
+  test("legacy fingerprint adoption samples the lowest hash and seq when active documents share content", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Other legacy body.", displayPath: "other.md" });
+      addLegacyChunk(store, "hash-b", 0, { vector: otherVector });
+      // One body behind two active paths and an inactive one, with seqs inserted
+      // out of order so rowid order disagrees with ORDER BY hash, seq.
+      const body = "Shared legacy body without a heading.";
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "z.md" });
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "b.md" });
+      await insertTestDocument(db, "docs", { hash: "hash-a", body, displayPath: "a.md", active: 0 });
+      addLegacyChunk(store, "hash-a", 2);
+      addLegacyChunk(store, "hash-a", 1);
+      addLegacyChunk(store, "hash-a", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 4 });
+      expect(result.reason).toMatch(/^sample hash-a_0 matched/);
+      // The title comes from the first active path (b.md), not the inactive a.md.
+      expect(fakeLlm.embedCalls.map(call => call.text)).toEqual([formatDocForEmbedding(body, "b", legacyModel)]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption skips rows without an active document or content", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-a", body: "Inactive body.", displayPath: "inactive.md", active: 0 });
+      addLegacyChunk(store, "hash-a", 0, { vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Missing body.", displayPath: "missing.md" });
+      addLegacyChunk(store, "hash-b", 0, { vector: otherVector });
+      // With foreign keys on, deleting content cascades to the document; turn
+      // them off so an active document is left pointing at missing content.
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.prepare(`DELETE FROM content WHERE hash = ?`).run("hash-b");
+      db.exec("PRAGMA foreign_keys = ON");
+
+      const skipped = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(skipped).toEqual({ checked: false, adopted: 0, reason: "2 legacy docs have no active sample" });
+      expect(fakeLlm.embedCalls).toHaveLength(0);
+
+      await insertTestDocument(db, "docs", { hash: "hash-c", body: "Active body.", displayPath: "active.md" });
+      addLegacyChunk(store, "hash-c", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 3 });
+      expect(result.reason).toMatch(/^sample hash-c_0 matched/);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption ignores other models and fingerprinted rows", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(db, "docs", { hash: "hash-a", body: "Other model body.", displayPath: "other-model.md" });
+      addLegacyChunk(store, "hash-a", 0, { model: "hf:test/other-model.gguf", vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-b", body: "Fingerprinted body.", displayPath: "fingerprinted.md" });
+      addLegacyChunk(store, "hash-b", 0, { fingerprint: "abc123", vector: otherVector });
+      await insertTestDocument(db, "docs", { hash: "hash-c", body: "Legacy body.", displayPath: "legacy.md" });
+      addLegacyChunk(store, "hash-c", 0, { vector: matchingVector });
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(result).toMatchObject({ checked: true, adopted: 1 });
+      expect(result.reason).toMatch(/^sample hash-c_0 matched/);
+      expect(db.prepare(`SELECT hash, embed_fingerprint FROM content_vectors ORDER BY hash`).all()).toEqual([
+        { hash: "hash-a", embed_fingerprint: "" },
+        { hash: "hash-b", embed_fingerprint: "abc123" },
+        { hash: "hash-c", embed_fingerprint: getEmbeddingFingerprint(legacyModel) },
+      ]);
+
+      // No legacy rows remain for this model: a second pass is a no-op.
+      const again = await maybeAdoptLegacyEmbeddingFingerprint(store, legacyModel);
+
+      expect(again).toEqual({ checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" });
+      expect(fakeLlm.embedCalls).toHaveLength(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("legacy fingerprint adoption loads one sample body within a 128 MiB SQLite budget", () => {
+    // SQLite's hard heap limit is process-wide and cannot be raised again, so
+    // the fixture runs in a worker. The limit binds only under Bun with an
+    // SQLite that tracks memory (Bun's bundled SQLite on Linux, Homebrew SQLite
+    // on macOS), where the old per-chunk query fails with SQLITE_NOMEM. Apple's
+    // system libsqlite3 and better-sqlite3 are built with
+    // SQLITE_DEFAULT_MEMSTATUS=0, so there this only checks the adoption result.
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-sample-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 20_000 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const adoption = JSON.parse(result.stdout) as { checked: boolean; adopted: number; reason: string };
+    // 16 documents x 32 legacy chunks, all adopted after one sample matched.
+    expect(adoption).toMatchObject({ checked: true, adopted: 512 });
+    expect(adoption.reason).toMatch(/^sample document-0_0 matched/);
+  });
+
+  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
+    // One legacy chunk, so only the active-path count multiplies the body. The
+    // limit binds under Bun only, as in the 128 MiB test above.
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const out = JSON.parse(result.stdout);
+    expect(out).toMatchObject({ checked: true, adopted: 1 });
+    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {

@@ -103,6 +103,22 @@ export function splitGlobMask(mask: string): string[] {
 }
 
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
+
+/**
+ * Characters of a document body that search results and getHashesForEmbedding
+ * return, so one very large document cannot put its whole text on the heap
+ * per result.
+ */
+const BODY_CAP_CHARS = 262_144;
+
+/**
+ * SQL for the first BODY_CAP_CHARS characters of a body column. substr()
+ * stops at an embedded NUL, so a body whose UTF-8 encoding fits the cap is
+ * returned whole and only a longer one goes through substr().
+ */
+function cappedBodySql(column: string): string {
+  return `CASE WHEN length(CAST(${column} AS BLOB)) <= ${BODY_CAP_CHARS} THEN ${column} ELSE substr(${column}, 1, ${BODY_CAP_CHARS}) END`;
+}
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
@@ -1285,6 +1301,21 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // File sync state — mtime+size fast-path.
+  // Inspired by qmd-py incremental sync.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS file_sync_state (
+      collection    TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      mtime_ms      INTEGER NOT NULL,
+      size          INTEGER NOT NULL,
+      content_hash  TEXT NOT NULL,
+      document_id   INTEGER NOT NULL,
+      PRIMARY KEY (collection, relative_path)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_file_sync_state_collection ON file_sync_state(collection)`);
+
   // FTS - index filepath (collection/path), title, and content.
   // Do not CREATE VIRTUAL TABLE here as an autocommit statement: FTS5
   // IF NOT EXISTS races under WAL (see createDocumentsFtsTable).
@@ -1614,10 +1645,175 @@ export type ReindexResult = {
 };
 
 /**
+ * File sync state row — mtime+size fast-path cache.
+ * Inspired by qmd-py incremental sync.
+ */
+type FileSyncStateRow = {
+  relative_path: string;
+  mtime_ms: number;
+  size: number;
+  content_hash: string;
+  document_id: number;
+  /** 1 when the document has a metadata extraction at the current version. */
+  metadata_current: number;
+};
+
+function getFileSyncStateMap(db: Database, collectionName: string): Map<string, FileSyncStateRow> {
+  try {
+    // A row is trusted only while its document is still the active row for
+    // this collection, path and content. Removing a collection, or renaming it
+    // away, leaves rows behind; trusting those would count a file that has no
+    // active document as unchanged. A distrusted row is rewritten on reindex.
+    const stmt = db.prepare(`
+      SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id,
+        COALESCE(dm.extraction_version = ?, 0) AS metadata_current
+      FROM file_sync_state s
+      JOIN documents d ON d.id = s.document_id
+      LEFT JOIN document_metadata dm ON dm.document_id = s.document_id
+      WHERE s.collection = ?
+        AND d.active = 1
+        AND d.collection = s.collection
+        AND d.path = s.relative_path
+        AND d.hash = s.content_hash
+    `);
+    const map = new Map<string, FileSyncStateRow>();
+    // Large-result query: use iterate() to stream rows instead of .all() materializing at once
+    for (const r of stmt.iterate(METADATA_EXTRACTION_VERSION, collectionName) as IterableIterator<FileSyncStateRow>) {
+      map.set(r.relative_path, r);
+    }
+    return map;
+  } catch {
+    // Table may not exist yet on legacy DBs — initializeDatabase creates it on next open,
+    // but guard here for safety.
+    return new Map();
+  }
+}
+
+function upsertFileSyncState(db: Database, collectionName: string, relPath: string, mtimeMs: number, size: number, contentHash: string, documentId: number): void {
+  try {
+    db.prepare(`
+      INSERT INTO file_sync_state(collection, relative_path, mtime_ms, size, content_hash, document_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(collection, relative_path) DO UPDATE SET
+        mtime_ms = excluded.mtime_ms,
+        size = excluded.size,
+        content_hash = excluded.content_hash,
+        document_id = excluded.document_id
+    `).run(collectionName, relPath, Math.floor(mtimeMs), size, contentHash, documentId);
+  } catch {
+    // Legacy DB without table — will be created on next open; skip caching this run
+  }
+}
+
+function deleteFileSyncStateForCollection(db: Database, collectionName: string, relPath: string): void {
+  try {
+    db.prepare(`DELETE FROM file_sync_state WHERE collection = ? AND relative_path = ?`).run(collectionName, relPath);
+  } catch {}
+}
+
+/**
+ * A file modified within this long of the stat that read it gets its sync row
+ * stored with UNTRUSTED_SYNC_MTIME, which the fast path never matches. On a
+ * filesystem whose mtime granule is 1-2 s (HFS+, FAT, some network mounts), a
+ * same-size rewrite in that window would keep both mtime and size, and the
+ * fast path would skip it for good. The next update reads such a file once
+ * more and trusts it once its mtime is older: git's "racily clean" rule.
+ */
+const RACY_SYNC_WINDOW_MS = 2000;
+const UNTRUSTED_SYNC_MTIME = -1;
+
+/**
+ * Maximum file size to index — prevents OOM on accidental binary inclusion.
+ */
+export const REINDEX_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+/**
+ * Deactivate a previously indexed file that can no longer be indexed (it
+ * became empty or grew past REINDEX_MAX_FILE_SIZE) and drop its sync row, so
+ * its old content stops being searchable.
+ */
+function retireIndexedFile(
+  db: Database,
+  collectionName: string,
+  path: string,
+  livePaths: ReadonlySet<string>,
+  syncStateMap: Map<string, FileSyncStateRow>,
+): void {
+  if (!findOrMigrateLegacyDocument(db, collectionName, path, livePaths)) return;
+  deactivateDocument(db, collectionName, path);
+  deleteFileSyncStateForCollection(db, collectionName, path);
+  syncStateMap.delete(path);
+}
+
+/**
+ * Groups the per-file writes of a collection scan into short transactions.
+ * Committed one by one, a first index of a large collection writes a content
+ * row, a document, its metadata and a sync row per file, each its own WAL
+ * commit: 20,000 files took about 176 s that way. A batch closes after
+ * `maxFiles` files or `maxMs`, so other writers never wait longer than that.
+ */
+export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: number = 250) {
+  let open = false;
+  let files = 0;
+  let startedAt = 0;
+  const commit = (): void => {
+    if (!open) return;
+    open = false;
+    db.exec("COMMIT");
+  };
+  return {
+    /** Call before a file's writes; closes the batch when it is full or old. */
+    next(): void {
+      if (open && (files >= maxFiles || Date.now() - startedAt >= maxMs)) commit();
+      if (!open) {
+        db.exec("BEGIN");
+        open = true;
+        files = 0;
+        startedAt = Date.now();
+      }
+      files++;
+    },
+    commit,
+    rollback(): void {
+      if (!open) return;
+      open = false;
+      db.exec("ROLLBACK");
+    },
+  };
+}
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
+ * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.
+ *
+ * Fast-path: stat mtime_ms+size against cached row to skip file read.
+ * If mtime changed but content hash identical, only mtime cache is updated.
+ * Skips >10MB and empty files, cleans sync table entry on orphan removal.
  */
 export async function reindexCollection(
+  store: Store,
+  collectionPath: string,
+  globPattern: string,
+  collectionName: string,
+  options?: {
+    ignorePatterns?: string[];
+    onProgress?: (info: ReindexProgress) => void;
+  }
+): Promise<ReindexResult> {
+  const batch = scanWriteBatch(store.db);
+  try {
+    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, options);
+    batch.commit();
+    return result;
+  } catch (err) {
+    batch.rollback();
+    throw err;
+  }
+}
+
+async function reindexCollectionIn(
+  batch: ReturnType<typeof scanWriteBatch>,
   store: Store,
   collectionPath: string,
   globPattern: string,
@@ -1652,19 +1848,15 @@ export async function reindexCollection(
   let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: ReindexSkippedFile[] = [];
   const seenPaths = new Set<string>();
-  // Literal paths of every file in this scan. Passed to the legacy-path
-  // migration so it never adopts a row that still belongs to a live file.
   const livePaths = new Set(files.map(f => normalizePathSeparators(f)));
 
+  // Load file_sync_state for this collection (mtime+size fast-path)
+  const syncStateMap = getFileSyncStateMap(db, collectionName);
+
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    // Store the literal relative path so the filesystem path can always be
-    // reconstructed as: resolve(collection.path, storedPath).
-    // handelize() is NOT applied at index time — it is display-only.
+    batch.next();
     const path = normalizePathSeparators(relativeFile);
-    // Glob `../` segments, absolute patterns, and file symlinks can resolve
-    // outside the collection root. Do not ingest those files, and do not mark
-    // them seen so a previous escaped row is deactivated on this pass.
+    const filepath = getRealPath(resolve(collectionPath, relativeFile));
     if (!isPathInsideDir(collectionPath, filepath)) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
@@ -1673,13 +1865,57 @@ export async function reindexCollection(
     }
     seenPaths.add(path);
 
+    // Stat first — mtime+size fast-path (no read)
+    let stat: ReturnType<typeof statSync> | null = null;
+    const statTimeMs = Date.now();
+    try {
+      stat = statSync(filepath);
+    } catch (err) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    if (!stat) {
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    const mtimeMs = stat.mtimeMs;
+    const size = stat.size;
+    const syncMtimeMs = statTimeMs - mtimeMs < RACY_SYNC_WINDOW_MS ? UNTRUSTED_SYNC_MTIME : mtimeMs;
+
+    // Skip large files (>10MB) — prevents OOM
+    if (size > REINDEX_MAX_FILE_SIZE) {
+      retireIndexedFile(db, collectionName, path, livePaths, syncStateMap);
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    // Fast-path: stat matches cached sync state — skip read entirely
+    const cached = syncStateMap.get(path);
+    // Missing or stale metadata (an index from before the metadata schema, or
+    // an extraction-version bump) needs the content, so such a file is read and
+    // re-extracted through the hash-match branch below.
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && cached.metadata_current) {
+      unchanged++;
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      // Still need to ensure document exists (might have been deactivated externally)
+      // But we count as unchanged and avoid expensive read+hash+metadata sync.
+      // Note: metadata sync for unchanged is skipped in fast-path; if needed, disable fast-path or force re-read.
+      continue;
+    }
+
+    // Need to read file
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
     } catch (err) {
-      // Skip files that can't be read (ETIMEDOUT on APFS compressed files,
-      // EAGAIN on iCloud evicted files, EACCES, etc.) instead of aborting
-      // the rest of the collection (#460).
       processed++;
       skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1687,13 +1923,34 @@ export async function reindexCollection(
     }
 
     if (!content.trim()) {
+      // Empty file — if previously indexed, deactivate it (treat as removed)
+      retireIndexedFile(db, collectionName, path, livePaths, syncStateMap);
       processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
     }
 
     const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
 
+    // Hash matches cached sync state but mtime differed (clock skew, backup restore) — only update mtime cache
+    if (cached && cached.content_hash === hash) {
+      // Update sync state mtime/size only
+      upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, cached.document_id);
+      unchanged++;
+      processed++;
+      // Keep content in memory for metadata sync if needed? For speed, skip metadata sync on hash-match fast-path.
+      // Existing behavior for hash-same was to still do metadata backfill; we preserve it by loading documentId from cache.
+      // However we already have content here, so do metadata backfill for hash-match case.
+      const existingForMeta = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
+      if (existingForMeta) {
+        const extraction = syncDocumentMetadata(db, existingForMeta.id, content, path, { onlyIfStale: true });
+        if (extraction?.error) metadataErrors++;
+      }
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    const title = extractTitle(content, relativeFile);
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     let documentId: number;
@@ -1711,21 +1968,21 @@ export async function reindexCollection(
         }
       } else {
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        updateDocument(db, existing.id, title, hash, new Date(stat.mtime).toISOString());
         updated++;
       }
     } else {
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
       documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        new Date(stat.mtime).toISOString());
     }
 
-    // Unchanged content still backfills missing or stale extraction state.
+    // Upsert sync state after successful indexing
+    upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, documentId);
+
+    // Metadata extraction
     const extraction = syncDocumentMetadata(db, documentId, content, path,
       contentChanged ? undefined : { onlyIfStale: true });
     if (extraction?.error) metadataErrors++;
@@ -1734,15 +1991,19 @@ export async function reindexCollection(
     options?.onProgress?.({ file: relativeFile, current: processed, total });
   }
 
-  // Deactivate documents that no longer exist
+  // Deactivate documents that no longer exist + cleanup sync_state
   const allActive = getActiveDocumentPaths(db, collectionName);
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
+      batch.next();
       deactivateDocument(db, collectionName, path);
+      deleteFileSyncStateForCollection(db, collectionName, path);
       removed++;
     }
   }
+
+  batch.commit();
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
@@ -1927,7 +2188,15 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
+    const results: PendingEmbeddingDoc[] = [];
+    const iter = collection
+      ? stmt.iterate(model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint);
+    for (const row of iter as IterableIterator<PendingEmbeddingDoc>) {
+      results.push(row);
+    }
+    return results;
   });
 }
 
@@ -1966,12 +2235,17 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   if (batch.length === 0) return [];
 
   const placeholders = batch.map(() => "?").join(",");
-  const rows = db.prepare(`
+  // Bounded: batch size max 64 (maxDocsPerBatch), so IN list max 64 hashes.
+  // Use iterate() to stream rows instead of materializing all at once, nicer for large batches.
+  const stmt = db.prepare(`
     SELECT hash, doc as body
     FROM content
     WHERE hash IN (${placeholders})
-  `).all(...batch.map(doc => doc.hash)) as { hash: string; body: string }[];
-  const bodyByHash = new Map(rows.map(row => [row.hash, row.body]));
+  `);
+  const bodyByHash = new Map<string, string>();
+  for (const row of stmt.iterate(...batch.map(doc => doc.hash)) as IterableIterator<{ hash: string; body: string }>) {
+    bodyByHash.set(row.hash, row.body);
+  }
 
   return batch.map((doc) => ({
     ...doc,
@@ -2563,6 +2837,37 @@ export type IndexStatusSummary = Omit<IndexStatus, "collections"> & {
 // Index health
 // =============================================================================
 
+export type EmbeddingVectorSample = {
+  hash: string;
+  seq: number;
+  pos: number;
+  body: string;
+  path: string;
+};
+
+export function getEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): EmbeddingVectorSample[] {
+  // Limit chunk identities before reading bodies. Joining bodies to every chunk
+  // and duplicate path can make a three-row sample sort gigabytes of text.
+  return db.prepare(`
+    WITH sampled AS MATERIALIZED (
+      SELECT cv.hash, cv.seq, cv.pos
+      FROM content_vectors cv
+      JOIN content c ON c.hash = cv.hash
+      WHERE cv.model = ? AND cv.embed_fingerprint = ?
+        AND EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
+      ORDER BY random()
+      LIMIT ?
+    )
+    SELECT sampled.hash, sampled.seq, sampled.pos, c.doc AS body,
+      (SELECT MIN(d.path) FROM documents d
+       WHERE d.hash = sampled.hash AND d.active = 1) AS path
+    FROM sampled
+    JOIN content c ON c.hash = sampled.hash
+  `).all<EmbeddingVectorSample>(model, fingerprint, sampleSize);
+}
+
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
@@ -2608,16 +2913,39 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
     return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
   }
 
-  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ''
-    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
-    ORDER BY cv.hash, cv.seq
-    LIMIT 1
-  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+  // Pick the sample through indexes, then read one body by rowid; a join that
+  // carries c.doc costs one body copy per legacy chunk × active path. Both
+  // EXISTS filters depend only on hash, so this is still the lowest (hash, seq).
+  // One read transaction keeps the pick and the load on the same snapshot.
+  const sample = withLazyContentVectorMigration(db, () => {
+    const pickSample = db.prepare(`
+      SELECT cv.rowid AS rid
+      FROM content_vectors cv
+      WHERE cv.model = ? AND cv.embed_fingerprint = ''
+        AND cv.hash = (
+          SELECT l.hash
+          FROM content_vectors l
+          WHERE l.model = ? AND l.embed_fingerprint = ''
+            AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = l.hash AND d.active = 1)
+            AND EXISTS (SELECT 1 FROM content c WHERE c.hash = l.hash)
+          ORDER BY l.hash
+          LIMIT 1
+        )
+      ORDER BY cv.seq
+      LIMIT 1
+    `);
+    const loadSample = db.prepare(`
+      SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body,
+        (SELECT MIN(d.path) FROM documents d WHERE d.hash = cv.hash AND d.active = 1) AS path
+      FROM content_vectors cv
+      JOIN content c ON c.hash = cv.hash
+      WHERE cv.rowid = ?
+    `);
+    return db.transaction(() => {
+      const pick = pickSample.get(model, model) as { rid: number } | null | undefined;
+      return pick ? loadSample.get(pick.rid) : undefined;
+    })() as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | null | undefined;
+  });
 
   if (!sample) {
     return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
@@ -3157,10 +3485,15 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
  * Get all active document paths for a collection.
  */
 export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
-  const rows = db.prepare(`
+  const stmt = db.prepare(`
     SELECT path FROM documents WHERE collection = ? AND active = 1
-  `).all(collectionName) as { path: string }[];
-  return rows.map(r => r.path);
+  `);
+  // Large-result query (up to 5k per collection): use iterate() to bound heap
+  const paths: string[] = [];
+  for (const r of stmt.iterate(collectionName) as IterableIterator<{ path: string }>) {
+    paths.push(r.path);
+  }
+  return paths;
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -3470,22 +3803,26 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT d.path
     FROM documents d
     WHERE d.active = 1
-  `).all() as { path: string }[];
+  `);
+  // Large-result query (all active docs, up to 9k): iterate to bound heap
   const queryLower = query.toLowerCase();
-  const scored = allFiles
-    .map(f => ({ path: f.path, dist: levenshtein(f.path.toLowerCase(), queryLower) }))
-    .filter(f => f.dist <= maxDistance)
+  const scored: { path: string; dist: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ path: string }>) {
+    const dist = levenshtein(f.path.toLowerCase(), queryLower);
+    if (dist <= maxDistance) scored.push({ path: f.path, dist });
+  }
+  return scored
     .sort((a, b) => a.dist - b.dist)
-    .slice(0, limit);
-  return scored.map(f => f.path);
+    .slice(0, limit)
+    .map(f => f.path);
 }
 
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
-  const allFiles = db.prepare(`
+  const stmt = db.prepare(`
     SELECT
       'qmd://' || d.collection || '/' || d.path as virtual_path,
       LENGTH(content.doc) as body_length,
@@ -3494,16 +3831,20 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     FROM documents d
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
-
+  `);
+  // Large-result query: iterate to bound heap (all active docs)
   const isMatch = picomatch(pattern);
-  return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
-    .map(f => ({
-      filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
-      bodyLength: f.body_length
-    }));
+  const results: { filepath: string; displayPath: string; bodyLength: number }[] = [];
+  for (const f of stmt.iterate() as IterableIterator<{ virtual_path: string; body_length: number; path: string; collection: string }>) {
+    if (isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path)) {
+      results.push({
+        filepath: f.virtual_path,
+        displayPath: f.path,
+        bodyLength: f.body_length,
+      });
+    }
+  }
+  return results;
 }
 
 // =============================================================================
@@ -3700,6 +4041,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
   // Delete documents from database
   const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
+  db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
 
   // Clean up orphaned content hashes
   const cleanupResult = db.prepare(`
@@ -3724,6 +4066,10 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   // Update all documents with the new collection name in database
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
     .run(newName, oldName);
+  // The documents keep their ids and paths, so their sync rows stay valid
+  // under the new name. Rows already under it belong to no collection.
+  db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
+  db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
 
   // Rename in store_collections
   renameStoreCollection(db, oldName, newName);
@@ -4136,7 +4482,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      ${cappedBodySql("content.doc")} as body,
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4309,9 +4655,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
     eligibleSql += ` WHERE ${eligibleConditions.join(" AND ")}`;
 
-    const eligibleHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(eligibleSql).all(...eligibleParams) as { hash_seq: string }[],
-    ).map((r) => r.hash_seq);
+    const eligibleHashSeqs: string[] = withLazyContentVectorMigration(db, () => {
+      const stmt = db.prepare(eligibleSql);
+      // Large-result query (up to 20k): use iterate() to bound heap, early exit if over max
+      const seqs: string[] = [];
+      for (const r of stmt.iterate(...eligibleParams) as IterableIterator<{ hash_seq: string }>) {
+        seqs.push(r.hash_seq);
+        if (seqs.length > FILTERED_VEC_EXACT_SCAN_MAX) break;
+      }
+      return seqs;
+    });
 
     if (eligibleHashSeqs.length === 0) return [];
 
@@ -4342,7 +4695,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      ${cappedBodySql("content.doc")} as body,
       dm.metadata_json
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
@@ -4423,8 +4776,9 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
   const fingerprint = getEmbeddingFingerprint(model);
-  return withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+    SELECT d.hash, ${cappedBodySql("c.doc")} as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
@@ -4436,7 +4790,14 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
     WHERE d.active = 1
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
+  `);
+    // Large-result query (up to 9k): use iterate() to stream, bound heap
+    const results: { hash: string; body: string; path: string }[] = [];
+    for (const row of stmt.iterate(model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
+      results.push(row);
+    }
+    return results;
+  });
 }
 
 /**

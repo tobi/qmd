@@ -127,6 +127,8 @@ export function openDatabase(path: string): Database {
  * Common subset of the Database interface used throughout QMD.
  */
 export interface Database {
+  /** Both drivers expose it; true while a transaction or savepoint is open. */
+  readonly inTransaction: boolean;
   exec(sql: string): void;
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
