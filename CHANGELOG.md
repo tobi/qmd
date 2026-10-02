@@ -15,6 +15,10 @@
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
   stored vectors without initializing an unrelated provider.
+- `qmd doctor`'s model cache check now matches revision-pinned Hugging Face
+  models (`hf:org/model/file.gguf#<revision>`) against their cached blob
+  correctly instead of always reporting them missing, while still rejecting a
+  blob cached under a different revision.
 
 ## [2.8.3] - 2026-08-16
 
