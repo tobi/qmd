@@ -8,6 +8,9 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { runBenchmark } from "../src/bench/bench.js";
+import { createStore as createIndexStore } from "../src/index.js";
 import * as llmModule from "../src/llm.js";
 import { LlamaCpp, RerankTimeoutError, resolveRerankTimeoutMs, isLlamaPoisoned, resetLlamaPoisonedForTests } from "../src/llm.js";
 import {
@@ -184,8 +187,68 @@ describe("per-document rerank truncation", () => {
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });
 
+  test("a different QMD_RERANK_MAX_DOC_CHARS does not replay cached scores", async () => {
+    const llm = {
+      rerankModelName: "hf:example/rerank/keyed.gguf",
+      poison: vi.fn(),
+      rerank: vi.fn(async (_q: string, docs: { file: string; text: string }[]) => ({
+        results: docs.map((d, index) => ({ file: d.file, score: 0.5, index })),
+        model: "m",
+      })),
+    };
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+    const docs = [{ file: "long.md", text: "x".repeat(5000) }];
+
+    process.env.QMD_RERANK_MAX_DOC_CHARS = "100";
+    await store.rerank("q", docs);
+    await store.rerank("q", docs);
+    expect(llm.rerank).toHaveBeenCalledTimes(1);
+
+    process.env.QMD_RERANK_MAX_DOC_CHARS = "200";
+    await store.rerank("q", docs);
+    expect(llm.rerank).toHaveBeenCalledTimes(2);
+  });
+
   test("default budget is generous (6000 chars)", () => {
     delete process.env.QMD_RERANK_MAX_DOC_CHARS;
     expect(resolveRerankMaxDocChars()).toBe(6000);
+  });
+});
+
+describe("bench records a timed-out rerank row", () => {
+  test("the full backend is flagged rerank_timed_out instead of aborting", async () => {
+    const docs = join(testDir, "bench-docs");
+    await mkdir(docs, { recursive: true });
+    await writeFile(join(docs, "api.md"), "# API versioning\n\nUse /v1 and /v2 endpoints.\n");
+    await writeFile(join(docs, "api2.md"), "# API versioning notes\n\nMore on versioning.\n");
+    const dbPath = join(testDir, `bench-${Date.now()}.sqlite`);
+    const config = { collections: { docs: { path: docs, pattern: "**/*.md" } } };
+    const setup = await createIndexStore({ dbPath, config });
+    await setup.update();
+    await setup.close();
+
+    const fixturePath = join(testDir, "bench-fixture.json");
+    await writeFile(fixturePath, JSON.stringify({
+      description: "timeout fixture",
+      version: 1,
+      collection: "docs",
+      queries: [{
+        id: "q1",
+        query: "lex: API versioning",
+        type: "exact",
+        description: "keyword",
+        expected_files: ["api.md"],
+        expected_in_top_k: 1,
+      }],
+    }));
+    // The bench store builds its own LlamaCpp, so stub the instance methods.
+    vi.spyOn(LlamaCpp.prototype, "prepareRerank").mockResolvedValue(undefined);
+    vi.spyOn(LlamaCpp.prototype, "rerank").mockImplementation(() => new Promise<never>(() => {}));
+    vi.spyOn(LlamaCpp.prototype, "poison").mockImplementation(() => {});
+
+    const result = await runBenchmark(fixturePath, { json: true, dbPath, backends: ["full"], config });
+    const row = result.results[0]!.backends.full!;
+    expect(row.rerank_timed_out).toBe(true);
+    expect(row.top_files.length).toBeGreaterThan(0);
   });
 });

@@ -59,6 +59,8 @@ export interface BackendResult {
   matched_files: string[];
   /** Expected files missing from the returned result set */
   unmatched_expected_files: string[];
+  /** Set when the reranker timed out: results are RRF-only, or the row failed after the process was poisoned */
+  rerank_timed_out?: true;
 }
 
 export interface QueryResult {

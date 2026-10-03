@@ -25,6 +25,7 @@ import {
   type ExpandedQuery,
 } from "../index.js";
 import { scoreResults } from "./score.js";
+import { isLlamaPoisoned } from "../llm.js";
 import type {
   BenchmarkFixture,
   BenchmarkQuery,
@@ -35,7 +36,8 @@ import type {
 
 type Backend = {
   name: string;
-  run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string) => Promise<string[]>;
+  /** `flags` is an out-param a backend sets when its results are degraded. */
+  run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string, flags?: { rerankTimedOut?: boolean }) => Promise<string[]>;
 };
 
 type ParsedStructuredQuery = {
@@ -154,11 +156,12 @@ const BACKENDS: Backend[] = [
   },
   {
     name: "full",
-    run: async (store, query, limit, collection) => {
+    run: async (store, query, limit, collection, flags) => {
       const structured = parseStructuredQuery(query.query);
       const results = structured
         ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: true })
         : await store.search({ query: query.query, limit, collection, rerank: true });
+      if (flags && results.some(r => r.rerankTimedOut)) flags.rerankTimedOut = true;
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
@@ -174,11 +177,13 @@ async function runQuery(
   const start = Date.now();
 
   let resultFiles: string[];
+  const flags: { rerankTimedOut?: boolean } = {};
   try {
-    resultFiles = await backend.run(store, query, limit, collection);
+    resultFiles = await backend.run(store, query, limit, collection, flags);
   } catch {
     // Backend may not be available (e.g., no embeddings for vector search)
     return {
+      ...(backend.name === "full" && isLlamaPoisoned() ? { rerank_timed_out: true as const } : {}),
       precision_at_k: 0,
       recall: 0,
       recall_at_1: 0,
@@ -203,6 +208,7 @@ async function runQuery(
     total_expected: query.expected_files.length,
     latency_ms,
     top_files: resultFiles.slice(0, 10),
+    ...(flags.rerankTimedOut ? { rerank_timed_out: true as const } : {}),
   };
 }
 

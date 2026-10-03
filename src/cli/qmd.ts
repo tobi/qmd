@@ -2436,6 +2436,7 @@ type OutputRow = {
   docid?: string;
   metadata?: DocumentMetadata;
   explain?: HybridQueryExplain;
+  rerankTimedOut?: true;
 };
 
 const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
@@ -2563,6 +2564,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
+        ...(row.rerankTimedOut && { rerankTimedOut: true }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -3091,6 +3093,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       docid: r.docid,
       metadata: r.metadata,
       explain: r.explain,
+      rerankTimedOut: r.rerankTimedOut,
     })), displayQuery, { ...opts, limit: results.length });
     await exitIfRerankHung();
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
@@ -4820,8 +4823,11 @@ if (isMain) {
           configPath: configExists() ? getConfigPath() : undefined,
         });
       } catch (error) {
+        await exitIfRerankHung();
         exitWithError(error);
       }
+      // A timed-out rerank leaves a native call hung; the rows are already printed.
+      await exitIfRerankHung();
       break;
     }
 

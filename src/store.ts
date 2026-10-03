@@ -2678,6 +2678,7 @@ export type CacheKeyBody = {
   model?: string;
   chunk?: string;
   file?: string;
+  maxChars?: number;
 };
 
 export function getCacheKey(url: string, body: CacheKeyBody): string {
@@ -4622,6 +4623,10 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
+  // Scores depend on the truncated text actually sent, so the truncation limit
+  // is part of the cache key: changing QMD_RERANK_MAX_DOC_CHARS must not replay
+  // scores computed against a different cut of the chunk.
+  const maxChars = resolveRerankMaxDocChars();
 
   // Check cache for each document
   // Cache key includes chunk text — different queries can select different chunks
@@ -4629,9 +4634,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text, maxChars });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    // The legacy key predates maxChars, so it can only vouch for chunks that are sent whole.
+    const cached = getCachedResult(db, cacheKey) ?? (doc.text.length <= maxChars ? getCachedResult(db, legacyCacheKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
@@ -4642,7 +4648,6 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const maxChars = resolveRerankMaxDocChars();
     const sentDocs = uncachedDocs.map(d => d.text.length > maxChars ? { ...d, text: d.text.slice(0, maxChars) } : d);
     // Cold model/context load can legitimately take a while: keep it out of the budget.
     await llm.prepareRerank?.();
@@ -4668,7 +4673,7 @@ export async function rerank(query: string, documents: { file: string; text: str
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk, maxChars });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }

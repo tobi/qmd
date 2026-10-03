@@ -299,6 +299,10 @@ server configuration.
 - **Model-backed commands can be environment-sensitive.** If `qmd query`,
   `qmd vsearch`, or reranking fails because local models/GPU are unavailable,
   use `qmd search` and stronger lexical/structured terms.
+- **A stdio MCP server stays down after a rerank timeout.** A timed-out rerank
+  leaves a native call hung, so the server answers with unreranked results
+  (`rerankTimedOut: true`) and then kills itself; it does not come back for the
+  rest of the session. Fall back to `qmd search`, or restart the MCP server.
 - **Ambiguous user wording needs intent.** Add `intent:` rather than hoping query
   expansion guesses the right domain.
 - **Collection names matter.** Search `concepts` for synthesized wiki pages,
