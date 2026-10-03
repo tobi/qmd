@@ -312,6 +312,45 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
 }
 
+const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Budget for the rerank scoring itself (model load excluded). Override with QMD_RERANK_TIMEOUT_MS. */
+export function resolveRerankTimeoutMs(): number {
+  const raw = Number(process.env.QMD_RERANK_TIMEOUT_MS);
+  // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would time out instantly.
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_TIMEOUT_MS;
+}
+
+/** Thrown when a native rerank call does not settle within its budget. */
+export class RerankTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`Rerank did not finish within ${timeoutMs}ms`);
+    this.name = "RerankTimeoutError";
+  }
+}
+
+// Set once any LlamaCpp instance is poisoned. A hung native call (e.g. a GPU
+// fault leaving ggml-vulkan waiting on a fence forever) cannot be cancelled and
+// ignores SIGTERM, so callers use this to know they must exit the process.
+let llamaPoisoned = false;
+export function isLlamaPoisoned(): boolean {
+  return llamaPoisoned;
+}
+/**
+ * End the process without running exit(): under Node, exit() joins the libuv
+ * threadpool, which blocks forever on the stuck native worker. SIGKILL (exit
+ * code 137) is the only way out once a native call has hung.
+ */
+export function killProcessNow(): never {
+  process.kill(process.pid, "SIGKILL");
+  // Not reached; SIGKILL cannot be handled.
+  return process.exit(137);
+}
+export function resetLlamaPoisonedForTests(): void {
+  llamaPoisoned = false;
+}
+
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
   return {
     embed: resolveEmbedModel(config),
@@ -863,6 +902,25 @@ export class LlamaCpp implements LLM {
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
+  // Set after a native call hung; every later native call is refused.
+  private poisonReason: string | null = null;
+
+  get poisoned(): boolean {
+    return this.poisonReason !== null;
+  }
+
+  /** Refuse all further native calls on this instance. */
+  poison(reason: string): void {
+    this.poisonReason ??= reason;
+    llamaPoisoned = true;
+  }
+
+  private assertNotPoisoned(): void {
+    if (this.poisonReason !== null) {
+      throw new Error(`LlamaCpp instance is poisoned (${this.poisonReason}); restart the process`);
+    }
+  }
+
 
   constructor(config: LlamaCppConfig = {}) {
     // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
@@ -938,8 +996,9 @@ export class LlamaCpp implements LLM {
    * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
    */
   async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
-    if (this.disposed) {
+    // Don't unload if already disposed. A poisoned instance has a native call
+    // still running on its contexts: leak them rather than dispose underneath it.
+    if (this.disposed || this.poisonReason !== null) {
       return;
     }
 
@@ -1471,6 +1530,7 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    this.assertNotPoisoned();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1500,6 +1560,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1567,6 +1628,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1628,6 +1690,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1730,11 +1793,19 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  /** Load the rerank model and contexts so a caller can time the scoring alone. */
+  async prepareRerank(): Promise<void> {
+    this.assertNotPoisoned();
+    await this.ensureRerankContexts();
+    await this.ensureRerankModel();
+  }
+
   async rerank(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1862,8 +1933,9 @@ export class LlamaCpp implements LLM {
   }
 
   async dispose(): Promise<void> {
-    // Prevent double-dispose
-    if (this.disposed) {
+    // Prevent double-dispose. A poisoned instance is never disposed: a native
+    // call is still running on its contexts, and the process is going away.
+    if (this.disposed || this.poisonReason !== null) {
       return;
     }
     this.disposed = true;

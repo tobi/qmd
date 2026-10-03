@@ -9,6 +9,9 @@
 
 ### Fixed
 
+- A hung native rerank no longer hangs `qmd query`, the SDK, or the MCP server (#931, #474). A GPU fault can leave one worker spinning forever inside the Vulkan fence wait: the promise never settles and the process ignores SIGTERM. Rerank now has a 60 s budget (`QMD_RERANK_TIMEOUT_MS`). On timeout the search returns the unreranked hybrid (RRF) results with `rerankTimedOut: true` on each result, and the `LlamaCpp` instance is poisoned so no further native call runs. The timeout covers the scoring only, not the cold model load. The CLI prints the fallback results with a stderr warning and ends the process with SIGKILL (exit code 137), and the MCP server answers with the fallback and then does the same, because under Node `process.exit()` blocks on the stuck native worker thread.
+- Rerank sends at most 6000 characters per chunk (`QMD_RERANK_MAX_DOC_CHARS`), applied before the model call. Typical chunks are far below this and the model's own token truncation still applies.
+
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
