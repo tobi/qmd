@@ -46,7 +46,7 @@ import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
  */
 function exitIfRerankHung(): void {
   if (!isLlamaPoisoned()) return;
-  console.error("QMD: rerank timed out; served unreranked results and killing the process (restart the server)");
+  console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
   setTimeout(() => killProcessNow(), 1000);
 }
 

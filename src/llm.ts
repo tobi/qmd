@@ -322,11 +322,28 @@ export function resolveRerankTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_TIMEOUT_MS;
 }
 
+const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;
+
+/** Budget for the rerank model/context load (a cold load can take minutes). Override with QMD_RERANK_LOAD_TIMEOUT_MS. */
+export function resolveRerankLoadTimeoutMs(): number {
+  const raw = Number(process.env.QMD_RERANK_LOAD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_LOAD_TIMEOUT_MS;
+}
+
 /** Thrown when a native rerank call does not settle within its budget. */
 export class RerankTimeoutError extends Error {
   constructor(readonly timeoutMs: number) {
     super(`Rerank did not finish within ${timeoutMs}ms`);
     this.name = "RerankTimeoutError";
+  }
+}
+
+/** Thrown when the rerank model/context load does not settle within its budget. A RerankTimeoutError, so the RRF fallback and exit paths apply. */
+export class RerankLoadTimeoutError extends RerankTimeoutError {
+  constructor(timeoutMs: number) {
+    super(timeoutMs);
+    this.message = `Rerank model load did not finish within ${timeoutMs}ms`;
+    this.name = "RerankLoadTimeoutError";
   }
 }
 

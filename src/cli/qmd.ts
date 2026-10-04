@@ -290,7 +290,7 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
  */
 async function exitIfRerankHung(): Promise<void> {
   if (!isLlamaPoisoned()) return;
-  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS or check the GPU.\n");
+  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS (or QMD_RERANK_LOAD_TIMEOUT_MS if the model load hung) or check the GPU.\n");
   await flushWritable(process.stdout);
   await flushWritable(process.stderr);
   killProcessNow();

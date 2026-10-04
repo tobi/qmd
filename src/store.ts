@@ -29,7 +29,9 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
   resolveRerankTimeoutMs,
+  resolveRerankLoadTimeoutMs,
   RerankTimeoutError,
+  RerankLoadTimeoutError,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -4649,8 +4651,28 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const sentDocs = uncachedDocs.map(d => d.text.length > maxChars ? { ...d, text: d.text.slice(0, maxChars) } : d);
-    // Cold model/context load can legitimately take a while: keep it out of the budget.
-    await llm.prepareRerank?.();
+    // Cold model/context load can legitimately take a while: it gets its own, larger budget.
+    const loadPromise = llm.prepareRerank?.();
+    if (loadPromise) {
+      const loadTimeoutMs = resolveRerankLoadTimeoutMs();
+      let loadTimer: ReturnType<typeof setTimeout> | undefined;
+      // The loser of the race keeps running; swallow a late rejection.
+      loadPromise.catch(() => {});
+      try {
+        await Promise.race([
+          loadPromise,
+          new Promise<never>((_, reject) => {
+            loadTimer = setTimeout(() => reject(new RerankLoadTimeoutError(loadTimeoutMs)), loadTimeoutMs);
+          }),
+        ]);
+      } catch (err) {
+        // The hung native load cannot be cancelled: refuse all further native work.
+        if (err instanceof RerankLoadTimeoutError) llm.poison(err.message);
+        throw err;
+      } finally {
+        clearTimeout(loadTimer);
+      }
+    }
     const timeoutMs = resolveRerankTimeoutMs();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let rerankResult;
