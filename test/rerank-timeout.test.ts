@@ -200,7 +200,7 @@ describe("rerank load timeout", () => {
     expect(results.every(r => r.rerankTimedOut === true)).toBe(true);
   });
 
-  test("a load that rejects after the budget does not surface as an unhandledRejection", async () => {
+  test("regression guard: a late load rejection stays handled (Promise.race already subscribes to it)", async () => {
     process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "30";
     const llm = {
       ...neverLoads(),
