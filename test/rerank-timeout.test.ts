@@ -12,7 +12,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { runBenchmark } from "../src/bench/bench.js";
 import { createStore as createIndexStore } from "../src/index.js";
 import * as llmModule from "../src/llm.js";
-import { LlamaCpp, RerankTimeoutError, resolveRerankTimeoutMs, isLlamaPoisoned, resetLlamaPoisonedForTests } from "../src/llm.js";
+import { LlamaCpp, RerankTimeoutError, RerankLoadTimeoutError, resolveRerankTimeoutMs, resolveRerankLoadTimeoutMs, isLlamaPoisoned, resetLlamaPoisonedForTests } from "../src/llm.js";
 import {
   createStore,
   structuredSearch,
@@ -41,6 +41,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.QMD_RERANK_TIMEOUT_MS;
+  delete process.env.QMD_RERANK_LOAD_TIMEOUT_MS;
   delete process.env.QMD_RERANK_MAX_DOC_CHARS;
   resetLlamaPoisonedForTests();
   vi.restoreAllMocks();
@@ -134,6 +135,115 @@ describe("rerank budget", () => {
     const out = await store.rerank("q", [{ file: "a.md", text: "alpha" }]); // budget is 50 ms
     expect(out[0]!.score).toBe(0.7);
     expect(llm.poison).not.toHaveBeenCalled();
+  });
+});
+
+describe("rerank load timeout", () => {
+  const docs = [{ file: "a.md", text: "alpha" }];
+  const neverLoads = () => ({
+    rerankModelName: "hf:example/rerank/hang-load.gguf",
+    poison: vi.fn(),
+    prepareRerank: vi.fn(() => new Promise<void>(() => {})),
+    rerank: vi.fn(),
+  });
+
+  test("resolveRerankLoadTimeoutMs defaults to 10 min and honours QMD_RERANK_LOAD_TIMEOUT_MS", () => {
+    delete process.env.QMD_RERANK_LOAD_TIMEOUT_MS;
+    expect(resolveRerankLoadTimeoutMs()).toBe(600_000);
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "1500";
+    expect(resolveRerankLoadTimeoutMs()).toBe(1500);
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "garbage";
+    expect(resolveRerankLoadTimeoutMs()).toBe(600_000);
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "-5";
+    expect(resolveRerankLoadTimeoutMs()).toBe(600_000);
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "9999999999";
+    expect(resolveRerankLoadTimeoutMs()).toBe(2_147_483_647);
+  });
+
+  test("a never-resolving load rejects within budget, poisons, and never reaches rerank", async () => {
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "50";
+    const llm = neverLoads();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    const started = Date.now();
+    const err = await store.rerank("q", docs).catch(e => e);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(err).toBeInstanceOf(RerankLoadTimeoutError);
+    expect(err).toBeInstanceOf(RerankTimeoutError); // so the RRF fallback and exit paths apply
+    expect(llm.poison).toHaveBeenCalledTimes(1);
+    expect(llm.rerank).not.toHaveBeenCalled();
+  });
+
+  test("a real LlamaCpp whose load hangs is poisoned and refuses further native calls", async () => {
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "50";
+    const real = new LlamaCpp({});
+    vi.spyOn(real, "prepareRerank").mockImplementation(() => new Promise<void>(() => {})); // no native load
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(real);
+
+    await expect(store.rerank("q", docs)).rejects.toBeInstanceOf(RerankLoadTimeoutError);
+    expect(real.poisoned).toBe(true);
+    expect(isLlamaPoisoned()).toBe(true);
+    // The guard throws before any model/context is touched.
+    await expect(real.rerank("q", docs)).rejects.toThrow(/poisoned/);
+  });
+
+  test("structuredSearch falls back to RRF within budget when the load hangs", async () => {
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "50";
+    await insertDoc("a.md", "# A\n\nfallback keyword");
+    await insertDoc("b.md", "# B\n\nfallback keyword");
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(neverLoads() as any);
+
+    const started = Date.now();
+    const results = await structuredSearch(store, [{ type: "lex", query: "fallback keyword" }], {});
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(results.length).toBe(2);
+    expect(results.every(r => r.rerankTimedOut === true)).toBe(true);
+  });
+
+  test("a load that rejects after the budget does not surface as an unhandledRejection", async () => {
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "30";
+    const llm = {
+      ...neverLoads(),
+      prepareRerank: vi.fn(() => new Promise<void>((_, reject) => setTimeout(() => reject(new Error("late load failure")), 150))),
+    };
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => { unhandled.push(e); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await expect(store.rerank("q", docs)).rejects.toBeInstanceOf(RerankLoadTimeoutError);
+      await new Promise(r => setTimeout(r, 400));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
+  });
+
+  test("the load timer is cleared when the load succeeds", async () => {
+    process.env.QMD_RERANK_LOAD_TIMEOUT_MS = "123456";
+    const llm = {
+      ...neverLoads(),
+      prepareRerank: vi.fn(async () => {}),
+      rerank: vi.fn(async (_q: string, d: { file: string; text: string }[]) => ({
+        results: d.map((x, index) => ({ file: x.file, score: 0.7, index })), model: "m",
+      })),
+    };
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+    const armed: unknown[] = [];
+    const cleared: unknown[] = [];
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: any, ms?: number, ...a: any[]) => {
+      const h = realSet(fn, ms, ...a);
+      if (ms === 123456) armed.push(h);
+      return h;
+    }) as any);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(((h: any) => { cleared.push(h); return realClear(h); }) as any);
+
+    const out = await store.rerank("q", docs);
+    expect(out[0]!.score).toBe(0.7);
+    expect(armed.length).toBe(1);
+    expect(cleared).toContain(armed[0]);
   });
 });
 
