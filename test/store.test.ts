@@ -16,7 +16,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
+import { disposeDefaultLlamaCpp, setDefaultLlamaCpp, setDefaultLLM } from "../src/llm.js";
+import { RemoteQMD } from "../src/remote-qmd.js";
 import {
   createStore,
   DEFAULT_EMBED_MODEL,
@@ -1282,7 +1283,7 @@ describe("Caching", () => {
     const modelA = "hf:example/rerank-a/a.gguf";
     const modelB = "hf:example/rerank-b/b.gguf";
     const mockA = makeMock(modelA, 0.11);
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLLM").mockReturnValue(mockA.llm as any);
 
     try {
       const first = await store.rerank(query, docs);
@@ -5238,6 +5239,36 @@ describe("Vector Search collection filter", () => {
 // =============================================================================
 
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
+  // Opportunistic remote routing: when a local `qmd serve` is reachable, route
+  // these tests through it via RemoteQMD. Two wins: (a) the rerank tests pass
+  // on VRAM-constrained dev boxes where the local 2.3GB rerank model can't
+  // fit alongside a co-resident model (Ollama etc.), and (b) the integration
+  // suite becomes an actual end-to-end regression check for the remote path.
+  // Falls back to the local LlamaCpp singleton when the daemon isn't running.
+  const DEFAULT_QMD_SERVE_URL = "http://127.0.0.1:7832";
+  let routedRemote = false;
+
+  beforeAll(async () => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 1000);
+      const res = await fetch(`${DEFAULT_QMD_SERVE_URL}/health`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        setDefaultLLM(new RemoteQMD({ serverUrl: DEFAULT_QMD_SERVE_URL }));
+        routedRemote = true;
+      }
+    } catch {
+      // Daemon unreachable — fall through to local LlamaCpp.
+    }
+  });
+
+  afterAll(() => {
+    if (routedRemote) {
+      setDefaultLLM(null);
+    }
+  });
+
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -5426,7 +5457,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       model: "mock-reranker",
     }));
 
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLLM").mockReturnValue({
       rerank: rerankSpy,
     } as any);
 
