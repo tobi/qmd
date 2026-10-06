@@ -38,6 +38,10 @@
   the rows for good. The collection is now reported as not found and its index
   is left unchanged. Permission and I/O errors still fail with their original
   cause (#989). #990 (thanks @ParkerRex)
+- `qmd update` no longer aborts with `SQLITE_CONSTRAINT_PRIMARYKEY` when
+  `documents_fts` already holds a leftover row for a new document's rowid
+  (#926). The insert trigger now replaces the row, like the update trigger
+  already did, and existing indexes pick up the new trigger on next open.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

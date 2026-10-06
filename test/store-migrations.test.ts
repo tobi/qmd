@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { openDatabase, loadSqliteVec, type Database } from "../src/db.js";
 import { createStore, insertContent, insertDocument, type Store } from "../src/store.js";
 import {
+  FTS_INSERT_OR_REPLACE_VERSION,
   VECTOR_PARTITION_VERSION,
   getUserVersion,
   migrateVectorLayout,
@@ -153,7 +154,7 @@ describe("migrateVectorLayout", () => {
     const s = await openStore();
     expect(getUserVersion(s.db)).toBeGreaterThanOrEqual(1);
     expect(migrateVectorLayout(s.db, { sqliteVecAvailable: true })).toBe("applied");
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     expect(vecLayout(s.db).kind).toBe("none");
   });
 
@@ -418,14 +419,14 @@ describe("migrateVectorLayout", () => {
 describe("runStoreMigrations", () => {
   test("migrates a legacy table an older build created on a stamped store", async () => {
     const s = await openStore();
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     seedStandardFixture(s.db);
     s.db.exec(`PRAGMA user_version = ${VECTOR_PARTITION_VERSION}`);
     expect(vecLayout(s.db).kind).toBe("legacy");
 
     runStoreMigrations(s.db, { installFtsSyncTriggers: () => {}, sqliteVecAvailable: true });
 
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
     expect(tableNames(s.db, LEGACY_VEC_TABLE)).toEqual([]);
     expect(partitionCount(s.db, "a")).toBe(STANDARD_A_ROWS);
@@ -434,7 +435,7 @@ describe("runStoreMigrations", () => {
 
   test("keeps the legacy table in place when the repair fails on a stamped store", async () => {
     const s = await openStore();
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     seedStandardFixture(s.db);
     s.db.exec(`PRAGMA user_version = ${VECTOR_PARTITION_VERSION}`);
     createPartitionedVecTable(s.db, DIMS + 1);
@@ -444,7 +445,7 @@ describe("runStoreMigrations", () => {
     expect(() => runStoreMigrations(s.db, { installFtsSyncTriggers: () => {}, sqliteVecAvailable: true })).not.toThrow();
 
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("Legacy vector table left in place"));
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     expect(vecLayout(s.db).kind).toBe("legacy");
     warn.mockRestore();
   });
@@ -455,7 +456,7 @@ describe("runStoreMigrations", () => {
 
     runStoreMigrations(s.db, { installFtsSyncTriggers: () => { throw new Error("must not reinstall"); }, sqliteVecAvailable: true });
 
-    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(getUserVersion(s.db)).toBe(FTS_INSERT_OR_REPLACE_VERSION);
     expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
   });
 });

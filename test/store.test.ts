@@ -3253,6 +3253,59 @@ describe("Reindex Collection", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("inserts a document whose rowid already has a stale FTS row (#926)", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // A leftover documents_fts row (interrupted run, FTS rebuild) at the rowid
+    // the next document will get used to fail the AFTER INSERT trigger.
+    const { nextId } = store.db.prepare(`
+      SELECT COALESCE(MAX(id), 0) + 1 AS nextId FROM documents
+    `).get() as { nextId: number };
+    store.db.prepare(`
+      INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, 'stale/old.md', 'stale', 'stale body')
+    `).run(nextId);
+
+    const id = await insertTestDocument(store.db, collectionName, { name: "fresh" });
+    expect(id).toBe(nextId);
+
+    const ftsRows = store.db.prepare(`
+      SELECT filepath FROM documents_fts WHERE rowid = ?
+    `).all(id) as { filepath: string }[];
+    expect(ftsRows).toEqual([{ filepath: `${collectionName}/test/fresh.md` }]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("reopening an existing index upgrades the FTS insert trigger (#926)", async () => {
+    const store = await createTestStore();
+    const dbPath = store.dbPath;
+    // Simulate an index written by the previous release: old trigger body,
+    // user_version 2 (FTS triggers + vector partition applied).
+    store.db.exec(`DROP TRIGGER documents_ai`);
+    store.db.exec(`
+      CREATE TRIGGER documents_ai AFTER INSERT ON documents
+      WHEN new.active = 1
+      BEGIN
+        INSERT INTO documents_fts(rowid, filepath, title, body)
+        SELECT new.id, new.collection || '/' || new.path, new.title,
+          (SELECT doc FROM content WHERE hash = new.hash)
+        WHERE new.active = 1;
+      END
+    `);
+    store.db.exec(`PRAGMA user_version = 2`);
+    store.close();
+
+    const reopened = createStore(dbPath);
+    currentTestStore = reopened;
+    const { sql } = reopened.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'documents_ai'
+    `).get() as { sql: string };
+    expect(sql).toContain("INSERT OR REPLACE INTO documents_fts");
+
+    await cleanupTestDb(reopened);
+  });
 });
 
 describe("Reindex Collection file sync state (#962)", () => {

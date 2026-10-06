@@ -967,7 +967,7 @@ function installFtsSyncTriggers(db: Database): void {
     CREATE TRIGGER documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
         new.collection || '/' || new.path,
