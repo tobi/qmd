@@ -49,6 +49,9 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- Filling in default model URIs now updates only the `models` block of the
+  parsed config, so comments and quoting in a committed `.qmd/index.yml`
+  survive (#899).
 
 ### Changed
 
