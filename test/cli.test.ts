@@ -240,6 +240,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
+    expect(stdout).not.toContain("update [--pull]");
     expect(stdout).toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
   });
@@ -1301,6 +1302,14 @@ describe("CLI Update Command", () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
+  });
+
+  test("rejects --pull with an actionable alternative", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["update", "--pull"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("--pull");
+    expect(stderr).toContain("qmd collection update-cmd");
   });
 
   test("deactivates stale docs when collection has zero matching files", async () => {

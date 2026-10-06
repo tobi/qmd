@@ -3366,7 +3366,7 @@ function parseCLI() {
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
-      pull: { type: "boolean" },  // git pull before update
+      pull: { type: "boolean" },  // Recognize the retired no-op flag so we can reject it
       refresh: { type: "boolean" },
       progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
       "dry-run": { type: "boolean" },  // cleanup: report what would be removed
@@ -3393,6 +3393,11 @@ function parseCLI() {
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
   });
+
+  if (values.pull !== undefined) {
+    console.error("The --pull flag is not supported. Configure a pre-update command with qmd collection update-cmd <name> 'git pull --ff-only'.");
+    process.exit(1);
+  }
 
   if (values["no-gpu"]) {
     process.env.QMD_FORCE_CPU = "1";
@@ -3902,7 +3907,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update                    - Re-index collections (runs configured update commands)");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");

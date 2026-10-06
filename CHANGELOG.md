@@ -19,6 +19,9 @@
 
 ### Fixed
 
+- `qmd update --pull` now fails with guidance to configure a per-collection
+  update command instead of silently re-indexing without pulling. The help text
+  no longer advertises the no-op flag.
 - Filtered vector search binds candidate IDs as one JSON list, so a parser-valid metadata filter cannot exhaust Node's SQL variable limit during document lookup. Applies to both exact scans and the capped global fallback.
 - Collection- and metadata-scoped BM25 search (`qmd search -c`, the lex leg of
   `qmd query`, MCP, SDK `searchLex`) no longer returns false-empty or
