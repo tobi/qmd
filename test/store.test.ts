@@ -3063,6 +3063,25 @@ describe("Reindex Collection", () => {
     }
   });
 
+  test("skips files under a venv directory", async () => {
+    const store = await createTestStore();
+    const collectionPath = join(testDir, `venv-skip-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const pkg = join(collectionPath, "venv", "lib", "python3.12", "site-packages", "pkg-1.0.dist-info");
+    await mkdir(pkg, { recursive: true });
+    await writeFile(join(collectionPath, "notes.md"), "# Notes\n\nkept\n");
+    await writeFile(join(pkg, "LICENSE.md"), "# License\n\nnot a note\n");
+
+    try {
+      const result = await reindexCollection(store, collectionPath, "**/*.md", "venv-skip");
+      expect(result.indexed).toBe(1);
+      const paths = store.db.prepare(`SELECT path FROM documents WHERE collection = ?`).all("venv-skip") as { path: string }[];
+      expect(paths.map(r => r.path)).toEqual(["notes.md"]);
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("does not index a file symlink whose target is outside the collection", async () => {
     const store = await createTestStore();
     const parent = join(testDir, `escape-sym-${Date.now()}-${Math.random().toString(36).slice(2)}`);

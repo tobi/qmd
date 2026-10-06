@@ -86,6 +86,7 @@ import {
   reindexCollection,
   scanWriteBatch,
   REINDEX_MAX_FILE_SIZE,
+  EXCLUDED_DIRS,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
@@ -2096,7 +2097,6 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -2110,7 +2110,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.indeterminate();
   const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
+    ...EXCLUDED_DIRS.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
   const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
