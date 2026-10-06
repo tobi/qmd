@@ -4536,8 +4536,10 @@ export function sanitizeFTS5Term(term: string): string {
  * the same tokenizer to a quoted phrase, so leaving `apply_secrets` intact lets
  * it split symmetrically into `apply secrets` on both sides, and that is the
  * behaviour #305 shipped. The apostrophe is kept for the same reason.
+ * Combining marks are kept so an NFD word such as `impôt` (o + U+0302) is not
+ * split in two; sanitizeFTS5Term then drops the mark (#966).
  */
-const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
+const FTS5_SEPARATOR_RUN = /[^\p{L}\p{M}\p{N}'_]+/u;
 
 /**
  * Split one query term the way the tokenizer split the document text, and
