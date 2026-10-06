@@ -4054,7 +4054,7 @@ function formatModelDiagnosticPath(path: string): string {
 function findCachedModelInspection(model: string): CachedModelInspection {
   const invalid: string[] = [];
   if (model.startsWith("hf:")) {
-    const filename = model.split("/").pop();
+    const [filename, revision] = model.split("/").pop()?.split("#") ?? [];
     if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
     const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
     for (const entry of entries) {
@@ -4064,6 +4064,11 @@ function findCachedModelInspection(model: string): CachedModelInspection {
       // "invalid model" in `qmd doctor` whenever readdir yields the sidecar
       // before the blob (#812).
       if (!entry.isFile() || !entry.name.endsWith(".gguf") || !entry.name.includes(filename)) continue;
+      // A revision-pinned model URI (`hf:org/model/file.gguf#<sha>`) must
+      // match the blob node-llama-cpp wrote for that specific revision, not
+      // just any blob sharing the filename — otherwise a differently-pinned
+      // cached blob false-positives as satisfying the pin (#963).
+      if (revision && !entry.name.includes(revision)) continue;
       const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
       const inspection = inspectGgufFile(candidate);
       if (inspection.valid) return { path: candidate, invalid };
