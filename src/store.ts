@@ -4555,6 +4555,52 @@ function splitFTS5CompoundTerm(term: string): string[] {
 }
 
 /**
+ * Function words that carry no topic. A lex query that contains one is read as
+ * a natural-language question (see buildNaturalLanguageFTS5Query).
+ */
+const LEX_STOPWORDS = new Set(
+  ("a an and are as at be by can do does for from has have how in is it its of on or " +
+    "that the their this to was were what when where which while who why with would should could into than " +
+    "then there these those been being also not no").split(" ")
+);
+
+/**
+ * Build an FTS5 query for a plain natural-language question, or return null
+ * when the query is not one.
+ *
+ * Read as keywords, a question such as "how is the storage ring RF frequency
+ * tuned" asks for a document holding every one of its words, each as a prefix:
+ * few documents hold them all, and the prefixes of short function words
+ * ("a"*, "the"*) match nearly every row, so the query is both slow and usually
+ * empty. Read as a question, its content words are ORed without prefix
+ * expansion, and bm25 ranks the documents by how many of them they hold and
+ * how rare those are.
+ *
+ * A query counts as a question when it contains a stopword or ends with "?",
+ * uses none of the explicit syntax (quoted phrases, -negation), and keeps at
+ * least one content word. Keyword queries ("rf feedback", "multi-agent
+ * memory") keep the AND-of-prefixes reading.
+ */
+function buildNaturalLanguageFTS5Query(query: string): string | null {
+  const s = query.trim();
+  if (s.includes('"') || /(^|\s)-\S/.test(s)) return null;
+  const words = s.split(/\s+/)
+    .map(w => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(w => w.length > 0);
+  const isQuestion = s.endsWith('?') || words.some(w => LEX_STOPWORDS.has(w.toLowerCase()));
+  if (!isQuestion) return null;
+
+  const terms: string[] = [];
+  for (const word of words) {
+    if (LEX_STOPWORDS.has(word.toLowerCase())) continue;
+    const parts = containsCjk(word) ? [sanitizeFTS5Phrase(word)] : splitFTS5CompoundTerm(word);
+    const phrase = parts.filter(p => p).join(' ');
+    if (phrase && !terms.includes(`"${phrase}"`)) terms.push(`"${phrase}"`);
+  }
+  return terms.length > 0 ? terms.join(' OR ') : null;
+}
+
+/**
  * Parse lex query syntax into FTS5 query.
  *
  * Supports:
@@ -4580,8 +4626,15 @@ function splitFTS5CompoundTerm(term: string): string[] {
  *   -multi-agent            → NOT "multi agent"
  *   "DEC-0054"              → "dec 0054"
  *   src/lib/i18n.ts         → "src lib i18n ts"
+ *
+ * A plain natural-language question is read differently: its content words
+ * are ORed and ranked by bm25 (see buildNaturalLanguageFTS5Query).
+ *   how is the RF tuned?    → "rf" OR "tuned"
  */
 function buildFTS5Query(query: string): string | null {
+  const naturalLanguage = buildNaturalLanguageFTS5Query(query);
+  if (naturalLanguage) return naturalLanguage;
+
   const positive: string[] = [];
   const negative: string[] = [];
 
