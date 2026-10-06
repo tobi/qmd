@@ -80,6 +80,10 @@ import {
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 import { LEGACY_VEC_TABLE, VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
+import { hasSufficientFreeVramForIntegration } from "./_helpers/vram-precondition.js";
+
+// One-shot probe at module load.  Gates real-LLM integration suites below.
+const _vramSufficient = await hasSufficientFreeVramForIntegration();
 
 // =============================================================================
 // LlamaCpp Setup
@@ -693,7 +697,7 @@ describe("Document Chunking", () => {
   });
 });
 
-describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("Token-based Chunking", () => {
   test("chunkDocumentByTokens returns single chunk for small documents", async () => {
     const content = "This is a small document.";
     const chunks = await chunkDocumentByTokens(content, 900, 135);
@@ -5237,7 +5241,7 @@ describe("Vector Search collection filter", () => {
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
+describe.skipIf(!!process.env.CI || !_vramSufficient)("LlamaCpp Integration", () => {
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

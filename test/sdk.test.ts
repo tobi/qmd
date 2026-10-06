@@ -24,6 +24,10 @@ import {
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
+import { hasSufficientFreeVramForIntegration } from "./_helpers/vram-precondition.js";
+
+// One-shot probe at module load.  Gates real-LLM integration suites below.
+const _vramSufficient = await hasSufficientFreeVramForIntegration();
 
 // =============================================================================
 // Test Helpers
@@ -630,7 +634,7 @@ describe("search (unified API)", () => {
   });
 
   // Tests below use search({ query: ... }) which triggers LLM query expansion
-  describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
+  describe.skipIf(!!process.env.CI || !_vramSufficient)("with LLM query expansion", () => {
     test("search() with query and rerank:false returns results", async () => {
       const results = await store.search({ query: "authentication", rerank: false });
       expect(results.length).toBeGreaterThan(0);
