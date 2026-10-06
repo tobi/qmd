@@ -19,6 +19,9 @@
 
 ### Fixed
 
+- Query-expansion cache keys and invalidation use the resolved generation model
+  when the store falls back to the global LlamaCpp instance, so changing that
+  model cannot reuse another model's cached expansions.
 - Filtered vector search binds candidate IDs as one JSON list, so a parser-valid metadata filter cannot exhaust Node's SQL variable limit during document lookup. Applies to both exact scans and the capped global fallback.
 - Collection- and metadata-scoped BM25 search (`qmd search -c`, the lex leg of
   `qmd query`, MCP, SDK `searchLex`) no longer returns false-empty or
