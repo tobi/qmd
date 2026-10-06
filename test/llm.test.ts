@@ -795,7 +795,9 @@ describe("LlamaCpp rerank deduping", () => {
 
 describe("LlamaCpp ensureRerankContexts error reporting", () => {
   test("warns with the underlying error and does not retry identical options", async () => {
-    const llm = new LlamaCpp({}) as any;
+    // The default engine warns and degrades; low-VRAM mode rethrows a VRAM
+    // failure for withReclaim, and QMD_LOW_VRAM would otherwise select it.
+    const llm = new LlamaCpp({ lowVram: false }) as any;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const createRankingContext = vi.fn().mockRejectedValue(
