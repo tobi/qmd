@@ -21,14 +21,13 @@ export function normalizePath(p: string): string {
 
 /**
  * Check if two paths refer to the same file.
- * Handles different path formats by comparing normalized suffixes.
+ * Exact match after normalization, or the expected path as a whole
+ * path-segment suffix of the result (`dir/name`, never a mid-filename fragment).
  */
 export function pathsMatch(result: string, expected: string): boolean {
   const nr = normalizePath(result);
   const ne = normalizePath(expected);
-  if (nr === ne) return true;
-  if (nr.endsWith(ne) || ne.endsWith(nr)) return true;
-  return false;
+  return nr === ne || nr.endsWith("/" + ne);
 }
 
 type ScoreMetrics = {
