@@ -1436,6 +1436,8 @@ llm_cache              -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| `QMD_VEC_SCAN` | in memory | `qmd mcp` holds the vector table in memory and answers vector searches with an exact multi-threaded scan (4 bytes per dimension per stored chunk). Set to `vec0` to search sqlite-vec directly instead. |
+| `QMD_VEC_SCAN_THREADS` | `min(16, CPUs)` | Worker threads for the in-memory vector scan. |
 
 ## How It Works
 
