@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { disableVecScan, vecScanSearch } from "./vec-scan.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -2620,7 +2621,10 @@ export function createStore(dbPath?: string): Store {
   const store: Store = {
     db,
     dbPath: resolvedPath,
-    close: () => db.close(),
+    close: () => {
+      disableVecScan(db);
+      db.close();
+    },
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
@@ -4810,6 +4814,9 @@ interface VecMatch {
   distance: number;
 }
 
+/** Exact top-k vector rows for one target, from vec0 or from vec-scan's in-memory copy. */
+type VecScanner = (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] | Promise<VecMatch[]>;
+
 /** One KNN scan target: a collection's partition, or the whole table when no scope is given. */
 interface VecScanTarget {
   collectionId?: number;
@@ -4958,16 +4965,16 @@ function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: r
  * slot, so while the matches collapse into fewer than `limit` documents and
  * the target holds rows beyond them, k doubles, up to sqlite-vec's cap.
  */
-function nearestVecDocuments(
-  scan: ReturnType<typeof knnVecScanner>,
+async function nearestVecDocuments(
+  scan: VecScanner,
   resolve: ReturnType<typeof vecDocumentResolver>,
   queryVec: Float32Array,
   limit: number,
   target: VecScanTarget,
-): VecDocumentMatch[] {
+): Promise<VecDocumentMatch[]> {
   for (let k = limit * 3; ; k *= 2) {
     const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
-    const matches = scan(queryVec, vecK, target);
+    const matches = await scan(queryVec, vecK, target);
     const documents = resolve(matches);
     if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) return documents;
   }
@@ -5000,7 +5007,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
   const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
   if (scanTargets.length === 0) return [];
-  const scan = knnVecScanner(db, collectionIds !== undefined, filter);
+  const knn = knnVecScanner(db, collectionIds !== undefined, filter);
+  // A server that holds a current in-memory copy of the vectors scans that
+  // instead (same rows, same distances; see vec-scan.ts). A metadata filter
+  // restricts the scan to rows SQL selects, so filtered searches stay on vec0.
+  const scan: VecScanner = filter
+    ? knn
+    : async (embedding, k, target) => (await vecScanSearch(db, embedding, k, target.collectionId)) ?? knn(embedding, k, target);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
   // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
@@ -5010,8 +5023,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`. Ties go
   // to the smaller filepath, as in searchFTS.
-  return scanTargets
-    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+  const perTarget: VecDocumentMatch[][] = [];
+  for (const target of scanTargets) perTarget.push(await nearestVecDocuments(scan, resolve, queryVec, limit, target));
+  return perTarget
+    .flat()
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
