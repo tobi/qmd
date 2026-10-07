@@ -2547,6 +2547,8 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  expandCentroid?: boolean; // Enable centroid expansion (Rocchio)
+  centroidK?: number;       // top-k for centroid (default 3)
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
   filter?: MetadataFilter;  // Metadata filter (--filter JSON)
@@ -3243,7 +3245,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         },
       });
     } else {
-      // Standard hybrid query with automatic expansion
+      // Standard hybrid query with automatic expansion + optional centroid (Rocchio)
       results = await hybridQuery(store, query, {
         collection: collectionSearchFilter(collectionNames),
         filter: opts.filter,
@@ -3251,6 +3253,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        expandCentroid: opts.expandCentroid,
+        centroidK: opts.centroidK,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -3380,6 +3384,8 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "expand-centroid": { type: "boolean", default: false },
+      "centroid-k": { type: "string" },
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
@@ -3451,6 +3457,8 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    expandCentroid: !!values["expand-centroid"],
+    centroidK: values["centroid-k"] ? parseInt(String(values["centroid-k"]), 10) : undefined,
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -3963,6 +3971,8 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
+  console.log("  --expand-centroid        - Enable centroid expansion (Rocchio pseudo-relevance, +thematic recall)");
+  console.log("  --centroid-k <n>         - Top-k RRF results to form centroid (default 3)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
