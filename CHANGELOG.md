@@ -49,6 +49,10 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- `engines.node` now requires Node 22.14 or later (`^22.14.0 || >=23.6.0`).
+  `better-sqlite3` 13, used since 2.8.3, is built for Node-API 10, so on
+  Node 22.0 to 22.13 every command that opens the index segfaulted with no
+  error message. npm now warns at install time instead.
 
 ### Changed
 

@@ -570,7 +570,8 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### System Requirements
 
-- **Node.js** >= 22
+- **Node.js** >= 22.14. Older 22.x releases crash with a segfault on the first
+  database open, because `better-sqlite3` 13 needs Node-API 10.
 - **Bun** >= 1.0.0
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh

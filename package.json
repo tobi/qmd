@@ -100,7 +100,7 @@
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^22.14.0 || >=23.6.0"
   },
   "keywords": [
     "markdown",
