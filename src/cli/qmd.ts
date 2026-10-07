@@ -3145,15 +3145,44 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   checkIndexHealth(store.db);
   if (opts.filter) warnPendingMetadata(store.db, collectionNames);
 
+  // Detect structured query syntax. vsearch only supports vec and hyde;
+  // lex and intent are rejected up front because they have no vector equivalent.
+  const parsed = parseStructuredQuery(query);
+  if (parsed) {
+    if (parsed.searches.some(q => q.type === 'lex')) {
+      console.error(`${c.yellow}Error: vsearch does not support lex: lines (no FTS path). Use 'qmd query' for FTS-backed structured search.${c.reset}`);
+      process.exit(1);
+    }
+    if (parsed.intent !== undefined) {
+      console.error(`${c.yellow}Error: vsearch does not support intent: (no rerank/chunk/snippet pipeline). Use 'qmd query' for intent-steered search.${c.reset}`);
+      process.exit(1);
+    }
+  }
+  const useStructured = parsed !== null;
+  const queries: string | ExpandedQuery[] = useStructured ? parsed!.searches : query;
+
   await withLLMSession(async () => {
-    let results = await vectorSearchQuery(store, query, {
+    if (useStructured) {
+      // Mirror qmd query's structured-tree header so the two commands read the same.
+      const structuredQueries = queries as ExpandedQuery[];
+      const typeLabels = structuredQueries.map(s => s.type).join('+');
+      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+      for (const s of structuredQueries) {
+        let preview = s.query.replace(/\n/g, ' ');
+        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+      }
+      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+    }
+
+    let results = await vectorSearchQuery(store, queries, {
       collection: collectionSearchFilter(collectionNames),
       filter: opts.filter,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
-      intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
+          if (useStructured) return; // structured header printed above
           logExpansionTree(original, expanded);
           process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
         },
@@ -3886,6 +3915,7 @@ function showHelp(): void {
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd vsearch 'vec:..\\nhyde:..' - Structured query document (vec/hyde only, no lex/intent)");
   console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
