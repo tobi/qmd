@@ -1624,8 +1624,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -2657,8 +2657,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
+    searchFTS: (query, limit, collectionName, filter, retrieval) => searchFTS(db, query, limit, collectionName, filter, retrieval),
+    searchVec: (query, model, limit, collectionName, session, precomputedEmbedding, filter, retrieval) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter, retrieval),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -2806,6 +2806,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSeq?: number;          // Stored chunk sequence, returned by compact vector retrieval
 };
 
 /**
@@ -4707,7 +4708,25 @@ function compareFilepaths(a: { filepath: string }, b: { filepath: string }): num
   return a.filepath < b.filepath ? -1 : a.filepath > b.filepath ? 1 : 0;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
+export type VectorScanCoverage = {
+  collectionId: number | null;
+  collectionName: string | null;
+  requestedK: number;
+  matchedChunks: number;
+  resolvedDocuments: number;
+  backendCapReached: boolean;
+};
+
+export type SearchRetrievalOptions = {
+  /** Compact retrieval defers document bodies until candidate admission. */
+  includeBody?: boolean;
+  /** Defer context lookup until final representative selection. */
+  includeContext?: boolean;
+  /** Reports the final KNN scan of each collection target. */
+  onVectorScan?: (coverage: VectorScanCoverage) => void;
+};
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
 
   const ftsQuery = buildFTS5Query(query);
@@ -4743,7 +4762,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      ${cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "''" : cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "length(CAST(content.doc AS BLOB)) as body_length," : ""}
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4772,7 +4792,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC, filepath ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; body_length: number; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -4788,9 +4808,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       docid: getDocid(row.hash),
       collectionName,
       modifiedAt: "",  // Not available in FTS query
-      bodyLength: row.body.length,
-      body: row.body,
-      context: getContextForFile(db, row.filepath),
+      bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length,
+      ...(retrieval?.includeBody === false ? {} : { body: row.body }),
+      context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
       metadata: parseMetadataJson(row.metadata_json),
       score,
       source: "fts" as const,
@@ -4813,6 +4833,7 @@ interface VecMatch {
 /** One KNN scan target: a collection's partition, or the whole table when no scope is given. */
 interface VecScanTarget {
   collectionId?: number;
+  collectionName?: string;
 }
 
 /** The document behind a vector match, at its nearest chunk. */
@@ -4820,6 +4841,7 @@ interface VecDocumentMatch {
   rowid: number;
   hash: string;
   pos: number;
+  seq: number;
   filepath: string;
   display_path: string;
   title: string;
@@ -4925,6 +4947,7 @@ function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: r
       vr.id AS rowid,
       cv.hash,
       cv.pos,
+      cv.seq,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
@@ -4964,25 +4987,39 @@ function nearestVecDocuments(
   queryVec: Float32Array,
   limit: number,
   target: VecScanTarget,
+  onScan?: (coverage: VectorScanCoverage) => void,
 ): VecDocumentMatch[] {
   for (let k = limit * 3; ; k *= 2) {
     const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
     const matches = scan(queryVec, vecK, target);
     const documents = resolve(matches);
-    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) return documents;
+    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) {
+      onScan?.({
+        collectionId: target.collectionId ?? null,
+        collectionName: target.collectionName ?? null,
+        requestedK: vecK,
+        matchedChunks: matches.length,
+        resolvedDocuments: documents.length,
+        backendCapReached: vecK === SQLITE_VEC_MAX_K && matches.length === vecK,
+      });
+      return documents;
+    }
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
   const names = scopedCollectionNames(collectionName);
+  const collectionNamesById = new Map<number, string>();
   let collectionIds: number[] | undefined;
   if (names) {
-    collectionIds = Array.from(resolveCollectionIds(db, names).values());
+    const ids = resolveCollectionIds(db, names);
+    collectionIds = Array.from(ids.values());
+    for (const [name, id] of ids) collectionNamesById.set(id, name);
     if (collectionIds.length === 0) return [];
   }
   const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
@@ -4998,26 +5035,30 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // value only because SQLite runs vec0's filter once per value, which is a
   // planner detail rather than a vec0 contract.
   const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
-  const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
+  const scanTargets: VecScanTarget[] = scanned
+    ? scanned.map(collectionId => ({ collectionId, collectionName: collectionNamesById.get(collectionId) }))
+    : eligible?.size === 0 ? [] : [{}];
   if (scanTargets.length === 0) return [];
   const scan = knnVecScanner(db, collectionIds !== undefined, filter);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
   // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
   // put its whole text on the heap for each result.
-  const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
+  const bodyOf = db.prepare(retrieval?.includeBody === false
+    ? "SELECT '' AS doc, length(CAST(doc AS BLOB)) AS body_length FROM content WHERE hash = ?"
+    : `SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`. Ties go
   // to the smaller filepath, as in searchFTS.
   return scanTargets
-    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target, retrieval?.onVectorScan))
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
       // The body is read after resolution, outside its snapshot: another
       // process's orphaned-content cleanup can delete the row in between.
-      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+      const content = bodyOf.get(row.hash) as { doc: string; body_length: number } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
@@ -5029,13 +5070,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
-        bodyLength: body.length,
-        body,
-        context: getContextForFile(db, row.filepath),
+        bodyLength: retrieval?.includeBody === false ? content.body_length : body.length,
+        ...(retrieval?.includeBody === false ? {} : { body }),
+        context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        ...(retrieval?.includeBody === false ? { chunkSeq: row.seq } : {}),
       }];
     });
 }
@@ -5368,12 +5410,30 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
-export function reciprocalRankFusion(
-  resultLists: RankedResult[][],
+const DEFAULT_RRF_K = 60;
+
+export function rrfContribution(rank: number, weight: number, k: number = DEFAULT_RRF_K): number {
+  return weight / (k + rank);
+}
+
+export function rrfTopRankBonus(rank: number): number {
+  if (rank === 1) return 0.05;
+  if (rank <= 3) return 0.02;
+  return 0;
+}
+
+export function rrfPositionWeight(rank: number): number {
+  if (rank <= 3) return 0.75;
+  if (rank <= 10) return 0.60;
+  return 0.40;
+}
+
+export function reciprocalRankFusion<T extends { file: string; score: number }>(
+  resultLists: T[][],
   weights: number[] = [],
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
+  k: number = DEFAULT_RRF_K
+): T[] {
+  const scores = new Map<string, { result: T; rrfScore: number; topRank: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
@@ -5383,16 +5443,16 @@ export function reciprocalRankFusion(
     for (let rank = 0; rank < list.length; rank++) {
       const result = list[rank];
       if (!result) continue;
-      const rrfContribution = weight / (k + rank + 1);
+      const contribution = rrfContribution(rank + 1, weight, k);
       const existing = scores.get(result.file);
 
       if (existing) {
-        existing.rrfScore += rrfContribution;
+        existing.rrfScore += contribution;
         existing.topRank = Math.min(existing.topRank, rank);
       } else {
         scores.set(result.file, {
           result,
-          rrfScore: rrfContribution,
+          rrfScore: contribution,
           topRank: rank,
         });
       }
@@ -5401,11 +5461,7 @@ export function reciprocalRankFusion(
 
   // Top-rank bonus
   for (const entry of scores.values()) {
-    if (entry.topRank === 0) {
-      entry.rrfScore += 0.05;
-    } else if (entry.topRank <= 2) {
-      entry.rrfScore += 0.02;
-    }
+    entry.rrfScore += rrfTopRankBonus(entry.topRank + 1);
   }
 
   return Array.from(scores.values())
@@ -5420,7 +5476,7 @@ export function buildRrfTrace(
   resultLists: RankedResult[][],
   weights: number[] = [],
   listMeta: RankedListMeta[] = [],
-  k: number = 60
+  k: number = DEFAULT_RRF_K
 ): Map<string, RRFScoreTrace> {
   const traces = new Map<string, RRFScoreTrace>();
 
@@ -5438,7 +5494,7 @@ export function buildRrfTrace(
       const result = list[rank0];
       if (!result) continue;
       const rank = rank0 + 1; // 1-indexed rank for explain output
-      const contribution = weight / (k + rank);
+      const contribution = rrfContribution(rank, weight, k);
       const existing = traces.get(result.file);
 
       const detail: RRFContributionTrace = {
@@ -5469,9 +5525,7 @@ export function buildRrfTrace(
   }
 
   for (const trace of traces.values()) {
-    let bonus = 0;
-    if (trace.topRank === 1) bonus = 0.05;
-    else if (trace.topRank <= 3) bonus = 0.02;
+    const bonus = rrfTopRankBonus(trace.topRank);
     trace.topRankBonus = bonus;
     trace.totalScore = trace.baseScore + bonus;
   }
@@ -6027,6 +6081,27 @@ export const INTENT_WEIGHT_SNIPPET = 0.3;
 /** Weight for intent terms relative to query terms (1.0) in chunk selection */
 export const INTENT_WEIGHT_CHUNK = 0.5;
 
+export function selectBestChunkIndex(
+  chunks: readonly { text: string }[],
+  queryTerms: readonly string[],
+  intentTerms: readonly string[],
+): number {
+  let bestIndex = 0;
+  let bestScore = -1;
+  for (const [index, chunk] of chunks.entries()) {
+    const text = chunk.text.toLowerCase();
+    let score = queryTerms.reduce((sum, term) => sum + (text.includes(term) ? 1 : 0), 0);
+    for (const term of intentTerms) {
+      if (text.includes(term)) score += INTENT_WEIGHT_CHUNK;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
 // Common stop words filtered from intent strings before tokenization.
 // Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
 // 2-3 char function words so the length threshold can drop to >1 and let
@@ -6248,6 +6323,12 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+export function primaryQueryFor(queries: readonly ExpandedQuery[]): string {
+  return queries.find(query => query.type === "lex")?.query
+    || queries.find(query => query.type === "vec")?.query
+    || queries[0]?.query || "";
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -6416,16 +6497,7 @@ export async function hybridQuery(
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6504,10 +6576,7 @@ export async function hybridQuery(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6797,9 +6866,7 @@ export async function structuredSearch(
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
-  const primaryQuery = searches.find(s => s.type === 'lex')?.query
-    || searches.find(s => s.type === 'vec')?.query
-    || searches[0]?.query || "";
+  const primaryQuery = primaryQueryFor(searches);
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
@@ -6811,16 +6878,7 @@ export async function structuredSearch(
 
     // Pick chunk with most keyword overlap
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6898,10 +6956,7 @@ export async function structuredSearch(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
