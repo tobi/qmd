@@ -8,6 +8,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 
 /**
  * Pid/log filenames for the MCP HTTP daemon.
@@ -26,13 +27,32 @@ export function mcpDaemonStateFiles(indexName: string = "index"): { pidFile: str
 export function looksLikeQmdMcpCommand(cmdline: string): boolean {
   const s = cmdline.trim();
   if (!s) return false;
-  // Match bare `qmd`, `qmd.ts`/`qmd.js`, or a path ending in /qmd(.ts|.js)
-  return /(?:^|[\s/\\])qmd(?:\.(?:ts|js))?(?:[\s]|$)/i.test(s);
+  // Match bare `qmd`, `qmd.ts`/`qmd.js`, or a path ending in /qmd(.ts|.js).
+  // Windows quotes a path containing spaces, so a closing quote can end the token.
+  return /(?:^|[\s/\\])qmd(?:\.(?:ts|js))?"?(?:\s|$)/i.test(s);
 }
 
-/** Read process cmdline (Linux /proc preferred; ps fallback for macOS). */
+/** Read process cmdline (Linux /proc preferred; ps fallback for macOS; CIM on Windows). */
 export function readProcessCmdline(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+
+  if (process.platform === "win32") {
+    // No /proc, and a ps on PATH (e.g. Git Bash) does not know Windows PIDs (#908).
+    // Use the absolute path: by default Windows also looks for a bare name in the
+    // working directory, which may be an untrusted checkout.
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+    if (!systemRoot) return null;
+    try {
+      const cmdline = execFileSync(
+        join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter ProcessId=${pid}).CommandLine`],
+        { encoding: "utf-8", timeout: 10000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      return cmdline.trim() || null;
+    } catch {
+      return null;
+    }
+  }
 
   const procPath = `/proc/${pid}/cmdline`;
   if (existsSync(procPath)) {

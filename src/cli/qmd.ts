@@ -4,7 +4,7 @@ import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
@@ -5120,7 +5120,8 @@ if (isMain) {
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+            // --import takes a URL; a bare Windows path parses as scheme "c:" and the child exits.
+            ? ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href, selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],

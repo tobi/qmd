@@ -3,7 +3,12 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { looksLikeQmdMcpCommand, isQmdMcpPid, mcpDaemonStateFiles } from "../src/cli/mcp-pid.ts";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { looksLikeQmdMcpCommand, isQmdMcpPid, mcpDaemonStateFiles, readProcessCmdline } from "../src/cli/mcp-pid.ts";
 
 describe("looksLikeQmdMcpCommand", () => {
   test("matches bare qmd and common CLI script paths", () => {
@@ -12,6 +17,18 @@ describe("looksLikeQmdMcpCommand", () => {
     expect(looksLikeQmdMcpCommand("node /home/me/qmd/src/cli/qmd.ts mcp --http")).toBe(true);
     expect(looksLikeQmdMcpCommand("node /home/me/qmd/dist/cli/qmd.js mcp --http")).toBe(true);
     expect(looksLikeQmdMcpCommand("tsx src/cli/qmd.ts mcp --http --daemon")).toBe(true);
+  });
+
+  test("matches Windows command lines, including quoted paths with spaces (#908)", () => {
+    expect(looksLikeQmdMcpCommand(
+      '"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\me\\qmd\\dist\\cli\\qmd.js --index notes mcp --http --port 8181',
+    )).toBe(true);
+    expect(looksLikeQmdMcpCommand(
+      '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Jo Smith\\AppData\\Roaming\\npm\\node_modules\\@tobilu\\qmd\\dist\\cli\\qmd.js" mcp --http',
+    )).toBe(true);
+    expect(looksLikeQmdMcpCommand('"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Jo Smith\\server.js"')).toBe(false);
+    expect(looksLikeQmdMcpCommand('node /tmp/qmd"suffix mcp')).toBe(false);
+    expect(looksLikeQmdMcpCommand('node /tmp/qmd.js"suffix mcp')).toBe(false);
   });
 
   test("rejects empty / whitespace and unrelated processes", () => {
@@ -66,4 +83,26 @@ describe("isQmdMcpPid", () => {
       expect(isQmdMcpPid(self)).toBe(false);
     }
   });
+
+  test("reads a live child's command line on every platform (#908)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-pid-"));
+    const children: ChildProcess[] = [];
+    try {
+      for (const name of ["qmd.js", "other.js"]) writeFileSync(join(dir, name), "setInterval(() => {}, 1000);\n");
+      const qmdChild = spawn(process.execPath, [join(dir, "qmd.js"), "mcp"], { stdio: "ignore" });
+      const otherChild = spawn(process.execPath, [join(dir, "other.js"), "mcp"], { stdio: "ignore" });
+      children.push(qmdChild, otherChild);
+
+      expect(readProcessCmdline(qmdChild.pid!)).toContain("qmd.js");
+      expect(isQmdMcpPid(qmdChild.pid!)).toBe(true);
+      expect(isQmdMcpPid(otherChild.pid!)).toBe(false);
+    } finally {
+      const exited = children.map((child) =>
+        child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, "exit"),
+      );
+      for (const child of children) child.kill();
+      await Promise.all(exited);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
 });
