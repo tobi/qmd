@@ -2169,6 +2169,24 @@ describe("Document Retrieval", () => {
       const result = store.findDocument("docs/mydoc.md");
       expect("error" in result).toBe(false);
 
+      // other/docs/readme.md also ends with docs/readme.md and is inserted first
+      const other = await createTestCollection({ pwd: "/other", name: "other" });
+      const docs = await createTestCollection({ pwd: "/docs", name: "docs" });
+      await insertTestDocument(store.db, other, { displayPath: "docs/readme.md", body: "Other readme" });
+      await insertTestDocument(store.db, docs, { displayPath: "readme.md", body: "Docs readme" });
+
+      for (const [lookup, filepath, body] of [
+        ["docs/readme.md", "qmd://docs/readme.md", "Docs readme"],
+        ["other/docs/readme.md", "qmd://other/docs/readme.md", "Other readme"],
+      ] as const) {
+        const exact = store.findDocument(lookup, { includeBody: true });
+        expect("error" in exact).toBe(false);
+        if (!("error" in exact)) {
+          expect(exact.filepath).toBe(filepath);
+          expect(exact.body).toBe(body);
+        }
+      }
+
       await cleanupTestDb(store);
     });
 
