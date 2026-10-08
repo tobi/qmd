@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- The SDK's `renameCollection()` now moves the collection's indexed documents
+  to the new name. Before, only the configuration was renamed, so `get()`,
+  scoped search, and document counts under the new name found nothing until
+  the collection was indexed again. If writing the configuration fails, the
+  indexed documents and collection settings now keep their original names. (#1019)
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
