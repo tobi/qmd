@@ -17,7 +17,8 @@
  * sources can produce the same shape without touching storage or filtering.
  *
  * The raw document is never modified — frontmatter stays part of the stored,
- * indexed, chunked, and embedded content.
+ * chunked, and embedded content. Full-text search indexes it as its own `head`
+ * column (see splitFrontmatter).
  */
 
 import YAML from "yaml";
@@ -101,8 +102,8 @@ export function extractDocumentMetadata(content: string, path: string): Metadata
 
   if (!hasFrontmatterFileExtension(path)) return success({});
 
-  const frontmatterYaml = getFrontmatterYaml(content);
-  if (frontmatterYaml === null) return success({});
+  const frontmatterYaml = getFrontmatterYaml(content)?.text;
+  if (frontmatterYaml === undefined) return success({});
 
   if (Buffer.byteLength(frontmatterYaml, "utf-8") > METADATA_LIMITS.maxFrontmatterBytes) {
     return failure(`frontmatter exceeds ${METADATA_LIMITS.maxFrontmatterBytes} bytes`);
@@ -143,11 +144,27 @@ function hasFrontmatterFileExtension(path: string): boolean {
 }
 
 /**
- * Slice the YAML between a leading `---` line and a closing `---` or `...`
- * line. Tolerates a UTF-8 BOM and CRLF line endings. Returns null when the
- * document has no complete leading frontmatter block.
+ * A document split into its leading frontmatter (`head`, the YAML between the
+ * delimiters) and everything after the closing delimiter (`body`).
  */
-function getFrontmatterYaml(content: string): string | null {
+export type FrontmatterSplit = { head: string; body: string };
+
+/**
+ * Split off the leading frontmatter block (same rules as getFrontmatterYaml).
+ * Non-frontmatter file types and documents without a complete block: head "".
+ */
+export function splitFrontmatter(content: string, path: string): FrontmatterSplit {
+  if (!hasFrontmatterFileExtension(path)) return { head: "", body: content };
+  const yaml = getFrontmatterYaml(content);
+  if (yaml === null) return { head: "", body: content };
+  return { head: yaml.text, body: yaml.rest };
+}
+
+/**
+ * Slice the YAML between a leading `---` line and a closing `---` or `...` line,
+ * and the text after it. Tolerates a UTF-8 BOM and CRLF; null without a block.
+ */
+function getFrontmatterYaml(content: string): { text: string; rest: string } | null {
   const body = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
 
   const openMatch = body.match(/^---[ \t]*\r?\n/);
@@ -158,7 +175,11 @@ function getFrontmatterYaml(content: string): string | null {
   const closeMatch = body.slice(yamlStart).match(closePattern);
   if (!closeMatch || closeMatch.index === undefined) return null;
 
-  return body.slice(yamlStart, yamlStart + closeMatch.index);
+  const closeStart = yamlStart + closeMatch.index;
+  return {
+    text: body.slice(yamlStart, closeStart),
+    rest: body.slice(closeStart + closeMatch[0].length),
+  };
 }
 
 // =============================================================================

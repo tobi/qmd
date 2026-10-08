@@ -71,7 +71,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
-import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { METADATA_EXTRACTION_VERSION, splitFrontmatter, type DocumentMetadata } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -922,6 +922,9 @@ let _sqliteVecAvailable: boolean | null = null;
 const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
+// Stamped by the rebuild that fills `head`. An older binary's rebuild stamps
+// only the CJK version, so a store it repopulated is rebuilt again here.
+const FTS_HEAD_VERSION = "1";
 
 /**
  * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
@@ -951,7 +954,7 @@ function sanitizeFTS5Phrase(phrase: string): string {
 
 // FTS sync triggers keep documents_fts current for callers that write directly
 // to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
-// first). The bodies use DROP+CREATE rather than CREATE IF NOT EXISTS so a
+// and split frontmatter into `head` first; the triggers leave `head` NULL). The bodies use DROP+CREATE rather than CREATE IF NOT EXISTS so a
 // changed body propagates to existing databases. DROP and CREATE are separate
 // autocommit statements, so concurrent opens of one database interleave across
 // connections (A drops, B drops, A creates, B creates -> "trigger already
@@ -1025,8 +1028,8 @@ function vectorMigrationReporter(): (progress: VectorMigrationProgress) => void 
 }
 
 /**
- * True when documents_fts is the current standalone (filepath, title, body)
- * table. Older schemas used fts5(name, body, content='documents'), and
+ * True when documents_fts is the current standalone (filepath, title, body,
+ * head) table. A 3-column table predating `head` is rebuilt the same way. Older schemas used fts5(name, body, content='documents'), and
  * CREATE VIRTUAL TABLE IF NOT EXISTS will not replace them. A CJK rebuild
  * then runs `DELETE FROM documents_fts`, which FTS5 compiles against the
  * external content table as `SELECT T.name FROM documents AS T` — documents
@@ -1054,7 +1057,8 @@ function documentsFtsSchemaIsCurrent(db: Database): boolean {
     return false;
   }
   const names = new Set(documentsFtsColumnNames(db));
-  return names.has("filepath") && names.has("title") && names.has("body") && !names.has("name");
+  return names.has("filepath") && names.has("title") && names.has("body") && names.has("head")
+    && !names.has("name");
 }
 
 function isAlreadyExistsError(err: unknown): boolean {
@@ -1075,7 +1079,7 @@ function documentsFtsExists(db: Database): boolean {
 // concurrent "already exists" is treated as success when the table is present.
 const DOCUMENTS_FTS_DDL = `
   CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-    filepath, title, body,
+    filepath, title, body, head,
     tokenize='porter unicode61'
   )
 `;
@@ -1094,7 +1098,7 @@ function recreateDocumentsFts(db: Database): void {
   db.exec(`DROP TRIGGER IF EXISTS documents_au`);
   db.exec(`DROP TABLE IF EXISTS documents_fts`);
   createDocumentsFtsTable(db);
-  db.exec(`DELETE FROM store_config WHERE key = 'fts_cjk_normalized_version'`);
+  db.exec(`DELETE FROM store_config WHERE key IN ('fts_cjk_normalized_version', 'fts_head_version')`);
 }
 
 // Missing-table create and legacy-schema repair share one IMMEDIATE
@@ -1130,6 +1134,15 @@ function cjkRebuildVersion(db: Database): string | undefined {
   return version?.value;
 }
 
+function ftsHeadVersion(db: Database): string | undefined {
+  const version = db.prepare(`SELECT value FROM store_config WHERE key = 'fts_head_version'`).get() as { value?: string } | undefined;
+  return version?.value;
+}
+
+function ftsRebuildIsCurrent(db: Database): boolean {
+  return cjkRebuildVersion(db) === FTS_CJK_NORMALIZED_VERSION && ftsHeadVersion(db) === FTS_HEAD_VERSION;
+}
+
 function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
@@ -1144,7 +1157,7 @@ function rebuildFTSForCjkNormalization(db: Database): void {
   // `name` column would otherwise skip the rebuild, and DELETE still compiles
   // as SELECT T.name FROM documents (#792).
   ensureDocumentsFtsSchema(db);
-  if (cjkRebuildVersion(db) === FTS_CJK_NORMALIZED_VERSION) return;
+  if (ftsRebuildIsCurrent(db)) return;
 
   // Clean up the legacy fixed-name shadow table left by an interrupted older
   // rebuild implementation. New concurrent rebuilds use per-process names below.
@@ -1162,14 +1175,14 @@ function rebuildFTSForCjkNormalization(db: Database): void {
   try {
     db.exec(`
       CREATE VIRTUAL TABLE ${quotedRebuildTable} USING fts5(
-        filepath, title, body,
+        filepath, title, body, head,
         tokenize='porter unicode61'
       )
     `);
 
     type FtsRow = { id: number; collection: string; path: string; title: string; body: string };
 
-    const insert = db.prepare(`INSERT INTO ${quotedRebuildTable}(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+    const insert = db.prepare(`INSERT INTO ${quotedRebuildTable}(rowid, filepath, title, body, head) VALUES (?, ?, ?, ?, ?)`);
 
     // The transaction closes over a mutable `batch` buffer rather than taking the
     // batch as an argument: the wrapper's transaction() type only accepts scalar
@@ -1177,11 +1190,13 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     let batch: FtsRow[] = [];
     const flushBatch = db.transaction(() => {
       for (const row of batch) {
+        const { head, body } = splitFrontmatter(row.body, row.path);
         insert.run(
           row.id,
           normalizeCjkForFTS(`${row.collection}/${row.path}`),
           normalizeCjkForFTS(row.title),
-          normalizeCjkForFTS(row.body)
+          normalizeCjkForFTS(body),
+          normalizeCjkForFTS(head)
         );
       }
     });
@@ -1213,16 +1228,20 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     // drop this process's private shadow table.
     db.exec(`BEGIN IMMEDIATE`);
     try {
-      if (cjkRebuildVersion(db) !== FTS_CJK_NORMALIZED_VERSION) {
+      if (!ftsRebuildIsCurrent(db)) {
         db.exec(`DELETE FROM documents_fts`);
         db.exec(
-          `INSERT INTO documents_fts(rowid, filepath, title, body)
-           SELECT rowid, filepath, title, body FROM ${quotedRebuildTable}`
+          `INSERT INTO documents_fts(rowid, filepath, title, body, head)
+           SELECT rowid, filepath, title, body, head FROM ${quotedRebuildTable}`
         );
         db.prepare(`
           INSERT OR REPLACE INTO store_config(key, value)
           VALUES ('fts_cjk_normalized_version', ?)
         `).run(FTS_CJK_NORMALIZED_VERSION);
+        db.prepare(`
+          INSERT OR REPLACE INTO store_config(key, value)
+          VALUES ('fts_head_version', ?)
+        `).run(FTS_HEAD_VERSION);
       }
       db.exec(`COMMIT`);
     } catch (err) {
@@ -3543,14 +3562,16 @@ function rebuildDocumentFTS(db: Database, documentId: number): void {
   db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(documentId);
   if (!row) return;
 
+  const { head, body } = splitFrontmatter(row.body, row.path);
   db.prepare(`
-    INSERT INTO documents_fts(rowid, filepath, title, body)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO documents_fts(rowid, filepath, title, body, head)
+    VALUES (?, ?, ?, ?, ?)
   `).run(
     row.id,
     normalizeCjkForFTS(`${row.collection}/${row.path}`),
     normalizeCjkForFTS(row.title),
-    normalizeCjkForFTS(row.body)
+    normalizeCjkForFTS(body),
+    normalizeCjkForFTS(head)
   );
 }
 
@@ -4339,6 +4360,9 @@ export function renameCollection(db: Database, oldName: string, newName: string)
     }
 
     db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+    // The update trigger rewrote these FTS rows unsplit and un-normalized.
+    const renamed = db.prepare(`SELECT id FROM documents WHERE collection = ? AND active = 1`).all(newName) as { id: number }[];
+    for (const { id } of renamed) rebuildDocumentFTS(db, id);
     // The documents keep their ids and paths, so their sync rows stay valid
     // under the new name. Rows already under it belong to no collection.
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
@@ -4734,7 +4758,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 
   let sql = `
     WITH fts_matches AS ${scoped ? "MATERIALIZED " : ""}(
-      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+      -- Column weights: filepath, title, body, head (the frontmatter block).
+      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0, 2.0) as bm25_score
       FROM documents_fts
       WHERE documents_fts MATCH ?
       ${scoped ? "" : `ORDER BY bm25_score ASC LIMIT ${limit}`}
