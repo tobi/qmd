@@ -455,6 +455,22 @@ describe("YAML config file mode", () => {
     expect(parsed.collections.newcol!.path).toBe(docsDir);
   });
 
+  test("addCollection ignore patterns still apply after reopening from YAML", async () => {
+    const configPath = join(testDir, `config-ignore-${Date.now()}.yml`);
+    writeFileSync(configPath, YAML.stringify({ collections: {} }));
+
+    const store1 = await createStore({ dbPath: freshDbPath(), configPath });
+    await store1.addCollection("docs", { path: docsDir, pattern: "**/*.md", ignore: ["auth.md"] });
+    expect((await store1.update()).indexed).toBe(2);
+    await store1.close();
+
+    // A new index built from the written config must exclude the same file.
+    const store2 = await createStore({ dbPath: freshDbPath(), configPath });
+    expect((await store2.update()).indexed).toBe(2);
+    expect(await store2.searchLex("JWT")).toEqual([]);
+    await store2.close();
+  });
+
   test("context persists to YAML file", async () => {
     const configPath = join(testDir, `config-ctx-${Date.now()}.yml`);
     writeFileSync(configPath, YAML.stringify({
