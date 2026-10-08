@@ -45,6 +45,7 @@ import {
   type CodeFenceRegion,
   reciprocalRankFusion,
   extractSnippet,
+  formatRerankQuery,
   getCacheKey,
   normalizeVirtualPath,
   isVirtualPath,
@@ -1215,6 +1216,35 @@ export function hashPassword(password: string): string {
 // Caching Tests
 // =============================================================================
 
+class LegacyCacheReranker extends llmModule.LlamaCpp {
+  readonly calls: { query: string; documents: llmModule.RerankDocument[] }[] = [];
+
+  constructor(
+    rerankModel: string,
+    private readonly score: number,
+  ) {
+    super({ rerankModel });
+  }
+
+  override async rerank(
+    query: string,
+    documents: llmModule.RerankDocument[],
+  ): Promise<llmModule.RerankResult> {
+    this.calls.push({
+      query,
+      documents: documents.map(document => ({ ...document })),
+    });
+    return {
+      results: documents.map((document, index) => ({
+        file: document.file,
+        score: this.score,
+        index,
+      })),
+      model: this.rerankModelName,
+    };
+  }
+}
+
 describe("Caching", () => {
   test("getCacheKey generates consistent keys", () => {
     const key1 = getCacheKey("http://example.com", { query: "test" });
@@ -1311,6 +1341,41 @@ describe("Caching", () => {
       expect(third[0]!.score).toBe(0.99);
     } finally {
       llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("intent-prefixed reranking skips bare-query legacy cache entries", async () => {
+    const store = await createTestStore();
+    const query = "shared query";
+    const intent = "configuration commands";
+    const document = { file: "doc.md", text: "shared chunk" };
+    const reranker = new LegacyCacheReranker("hf:example/cache-reranker/model.gguf", 0.99);
+    store.llm = reranker;
+
+    const legacyCacheKey = getCacheKey("rerank", {
+      query,
+      file: document.file,
+      model: reranker.rerankModelName,
+      chunk: document.text,
+    });
+    store.setCachedResult(legacyCacheKey, "0.11");
+
+    try {
+      const withIntent = await store.rerank(query, [document], undefined, intent);
+      const repeatedIntent = await store.rerank(query, [document], undefined, intent);
+      const withoutIntent = await store.rerank(query, [document]);
+      const withEmptyIntent = await store.rerank(query, [document], undefined, "");
+
+      expect(reranker.calls).toEqual([{
+        query: formatRerankQuery(query, intent),
+        documents: [document],
+      }]);
+      expect(withIntent[0]!.score).toBe(0.99);
+      expect(repeatedIntent[0]!.score).toBe(0.99);
+      expect(withoutIntent[0]!.score).toBe(0.11);
+      expect(withEmptyIntent[0]!.score).toBe(0.11);
+    } finally {
       await cleanupTestDb(store);
     }
   });

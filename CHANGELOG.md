@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Reranking reuses bare query legacy scores for missing or empty intents.
+  Requests with a non-empty intent use their intent-prefixed scoring query
+  for cache lookup and score uncached passages with that same query.
+  Current-format cache entries retain priority.
+
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
