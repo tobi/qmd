@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- Chunks of 511 tokens or more no longer produce incorrect vectors (#897). The embedding
+  context used node-llama-cpp's default 512-token batch, so longer inputs were
+  split and EmbeddingGemma pooled only the last batch: every 511-token input
+  produced the same vector. The context now processes the whole input in one
+  batch. The embedding fingerprint changes, so `qmd update` and `qmd status`
+  report existing documents as pending and the next `qmd embed` replaces their
+  vectors; search keeps using the old ones until then. `qmd doctor` no longer
+  stamps legacy vectors as current based on one matching sample: they also
+  remain pending until re-embedded.
+
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
@@ -38,17 +48,10 @@
   the rows for good. The collection is now reported as not found and its index
   is left unchanged. Permission and I/O errors still fail with their original
   cause (#989). #990 (thanks @ParkerRex)
-- Embedding generation and legacy fingerprint adoption now tokenize documents
+- Embedding generation now tokenizes documents
   with the store-selected embedding model instead of the global default. This
-  keeps chunk boundaries aligned with the model that creates and verifies the
+  keeps chunk boundaries aligned with the model that creates the
   stored vectors without initializing an unrelated provider.
-- `qmd doctor` no longer stalls or fills the temp directory on large indexes
-  when checking legacy (empty-fingerprint) embeddings. The adoption sample
-  query joined `content` and grouped by the document body, so SQLite
-  materialized the full body once per legacy chunk and per active path before
-  `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
-  (#978). It now picks the sample row through indexes and loads only that
-  row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
 
 ### Changed
 

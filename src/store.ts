@@ -179,6 +179,8 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    // Whole-input batching changes vectors written by non-causal models (#897).
+    `embed_batch:whole_sequence`,
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
 }
@@ -2980,112 +2982,6 @@ export type IndexHealthInfo = {
   totalDocs: number;
   daysStale: number | null;
 };
-
-export type LegacyFingerprintAdoptionResult = {
-  checked: boolean;
-  adopted: number;
-  reason: string;
-};
-
-export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
-  const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
-  const legacyCount = withLazyContentVectorMigration(db, () => {
-    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
-    return row.count;
-  });
-  if (legacyCount === 0) {
-    return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
-  }
-
-  // Pick the sample through indexes, then read one body by rowid; a join that
-  // carries c.doc costs one body copy per legacy chunk × active path. Both
-  // EXISTS filters depend only on hash, so this is still the lowest (hash, seq).
-  // One read transaction keeps the pick and the load on the same snapshot.
-  const sample = withLazyContentVectorMigration(db, () => {
-    const pickSample = db.prepare(`
-      SELECT cv.rowid AS rid
-      FROM content_vectors cv
-      WHERE cv.model = ? AND cv.embed_fingerprint = ''
-        AND cv.hash = (
-          SELECT l.hash
-          FROM content_vectors l
-          WHERE l.model = ? AND l.embed_fingerprint = ''
-            AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = l.hash AND d.active = 1)
-            AND EXISTS (SELECT 1 FROM content c WHERE c.hash = l.hash)
-          ORDER BY l.hash
-          LIMIT 1
-        )
-      ORDER BY cv.seq
-      LIMIT 1
-    `);
-    const loadSample = db.prepare(`
-      SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body,
-        (SELECT MIN(d.path) FROM documents d WHERE d.hash = cv.hash AND d.active = 1) AS path
-      FROM content_vectors cv
-      JOIN content c ON c.hash = cv.hash
-      WHERE cv.rowid = ?
-    `);
-    return db.transaction(() => {
-      const pick = pickSample.get(model, model) as { rid: number } | null | undefined;
-      return pick ? loadSample.get(pick.rid) : undefined;
-    })() as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | null | undefined;
-  });
-
-  if (!sample) {
-    return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
-  }
-
-  if (!hasVectorIndex(db)) {
-    return { checked: false, adopted: 0, reason: "vector index is missing" };
-  }
-
-  const expectedHashSeq = `${sample.hash}_${sample.seq}`;
-  const title = extractTitle(sample.body, sample.path);
-  const llm = getLlm(store);
-
-  return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokensWithLlm(
-      llm,
-      sample.body,
-      undefined,
-      undefined,
-      undefined,
-      sample.path,
-      undefined,
-      session.signal,
-    );
-    const chunk = chunks[sample.seq];
-    if (!chunk) {
-      return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
-    }
-
-    const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
-    if (!result) {
-      return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
-    }
-
-    const nearest = db.prepare(`
-      SELECT rowid, distance
-      FROM ${VEC_TABLE}
-      WHERE embedding MATCH ? AND k = 1
-    `).get(new Float32Array(result.embedding)) as { rowid: number; distance: number } | undefined;
-    const nearestKey = nearest ? partitionRowKey(db, nearest.rowid) : undefined;
-
-    if (!nearest || !nearestKey) {
-      return { checked: true, adopted: 0, reason: "legacy sample vector not found" };
-    }
-
-    const threshold = 0.0001;
-    const nearestHashSeq = `${nearestKey.hash}_${nearestKey.seq}`;
-    if (nearestHashSeq !== expectedHashSeq || nearest.distance > threshold) {
-      return { checked: true, adopted: 0, reason: `legacy sample differs from current fingerprint (nearest ${nearestHashSeq}, distance ${nearest.distance.toFixed(6)})` };
-    }
-
-    const update = withLazyContentVectorMigration(db, () => db.prepare(`UPDATE content_vectors SET embed_fingerprint = ? WHERE model = ? AND embed_fingerprint = ''`).run(fingerprint, model));
-    return { checked: true, adopted: update.changes, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}` };
-  });
-}
 
 export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
