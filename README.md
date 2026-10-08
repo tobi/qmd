@@ -334,6 +334,8 @@ const expanded = await store.expandQuery("auth flow", { intent: "user login" })
 const results4 = await store.search({ queries: expanded })
 ```
 
+`inspectVectorIndex()` supplies an explicit [structural publication check](docs/VECTOR-INSPECTION.md).
+
 #### Retrieval
 
 ```typescript

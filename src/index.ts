@@ -69,6 +69,7 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import type { VectorIndexInspection } from "./vector-inspection.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -118,6 +119,7 @@ import {
 } from "./collections.js";
 
 // Re-export types for SDK consumers
+export type { VectorIndexInspection, VectorPartitionState } from "./vector-inspection.js";
 export type {
   DocumentResult,
   DocumentNotFound,
@@ -409,6 +411,9 @@ export interface QMDStore {
   /** Get index health info (stale embeddings, etc.) */
   getIndexHealth(): Promise<IndexHealthInfo>;
 
+  /** Inspect recorded vector generations and partition peers in one snapshot. */
+  inspectVectorIndex(options?: { model?: string }): Promise<VectorIndexInspection>;
+
   // ── Lifecycle ───────────────────────────────────────────────────────
 
   /** Close the store and release all resources (LLM models, DB connection) */
@@ -664,6 +669,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Index Health
     getStatus: async () => internal.getStatus(),
     getIndexHealth: async () => internal.getIndexHealth(),
+    inspectVectorIndex: async (opts) => {
+      if (opts?.model !== undefined && (typeof opts.model !== "string" || !opts.model.trim())) {
+        throw new Error("model must be a non-empty string");
+      }
+      return internal.inspectVectorIndex(opts?.model);
+    },
 
     // Lifecycle
     close: async () => {
