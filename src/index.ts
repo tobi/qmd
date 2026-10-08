@@ -69,6 +69,7 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { searchCandidates, type CandidateSearchOptions, type CandidateSearchResult } from "./candidate-search.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -118,6 +119,22 @@ import {
 } from "./collections.js";
 
 // Re-export types for SDK consumers
+export type {
+  CandidateSearchOptions,
+  CandidateSearchResult,
+  CandidateHit,
+  CandidateGroup,
+  CandidateMatch,
+  CandidateLegCoverage,
+} from "./candidate-search.js";
+export type {
+  SearchLocation,
+  LexicalLocation,
+  DocumentLocationRef,
+  Utf16Span,
+  PassageBudget,
+  PassageWindow,
+} from "./search-locations.js";
 export type {
   DocumentResult,
   DocumentNotFound,
@@ -310,6 +327,9 @@ export interface QMDStore {
 
   /** Full search: query expansion + multi-signal retrieval + LLM reranking */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
+
+  /** Retrieve metadata groups with per-leg admission and coverage accounting. */
+  searchCandidates(options: CandidateSearchOptions): Promise<CandidateSearchResult>;
 
   /** BM25 keyword search (fast, no LLM) */
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
@@ -529,6 +549,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
+    searchCandidates: opts => searchCandidates(internal, opts),
     searchLex: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
       return internal.searchFTS(q, opts?.limit, opts?.collection, filter);

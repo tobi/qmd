@@ -2,7 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- SDK candidate search accepts configurable passage budgets and opt-in source
+  locations. Results distinguish exact/approximate lexical anchors, stored
+  vector starts, and keyword/intent selection windows; every location carries
+  its physical document URI and full content hash. The source-aware path
+  fits the returned source passage to the selected reranker's token budget,
+  scores that exact passage, and reports unavailable body anchors.
+- SDK `searchCandidates()` groups eligible documents by a scalar metadata
+  key before per-leg admission and reciprocal rank fusion. Callers control
+  raw retrieval depth and group targets, receive contribution traces and
+  separate document-depth/vector-cap coverage, and hydrate admitted source
+  representatives by their expected hashes. Existing search paths keep their
+  options, ranking, and result shapes.
+
 ### Fixed
+
+- Reranking reuses bare query legacy scores for missing or empty intents.
+  Requests with a non-empty intent use their intent-prefixed scoring query
+  for cache lookup and score uncached passages with that same query.
+  Current-format cache entries retain priority.
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
