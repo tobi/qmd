@@ -3376,6 +3376,7 @@ function parseCLI() {
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output (search; default on for get/multi-get)
       "no-line-numbers": { type: "boolean" },  // disable line numbers for get/multi-get
+      compact: { type: "boolean" },  // mcp: opt-in compact responses (structuredContent only)
       "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
       // Query options
       "candidate-limit": { type: "string", short: "C" },
@@ -5067,6 +5068,10 @@ if (isMain) {
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
+
+      // --compact: opt-in compact responses (structuredContent only, no
+      // duplicated text render). Also activable via QMD_MCP_COMPACT=1.
+      if (cli.values.compact) process.env.QMD_MCP_COMPACT = "1";
 
       // Cache dir for PID/log files — scoped per --index so named daemons
       // do not collide with the default index (#772).
