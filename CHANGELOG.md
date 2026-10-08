@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- HTTP `POST /query` and `/search` now answer malformed `searches` with a 400
+  and a message naming the problem. A `null` entry, an unmatched quote in a
+  `lex` query, or a newline in a `vec` query used to return a bare 500, and an
+  unknown `type` used to return empty results. Like the MCP `query` tool, the
+  endpoint now takes 1 to 10 searches, so `searches: []` is a 400 instead of
+  an empty 200. (#998)
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
