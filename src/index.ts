@@ -113,6 +113,7 @@ import {
   setGlobalContext as collectionsSetGlobalContext,
   type Collection,
   type CollectionConfig,
+  type ModelsConfig,
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
@@ -291,6 +292,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Model URIs that take precedence over the config's `models` */
+  models?: ModelsConfig;
 }
 
 /**
@@ -473,9 +476,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
   const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
+    embedModel: options.models?.embed ?? config?.models?.embed,
+    generateModel: options.models?.generate ?? config?.models?.generate,
+    rerankModel: options.models?.rerank ?? config?.models?.rerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
