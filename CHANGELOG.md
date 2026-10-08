@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- The SDK's `removeCollection()` now deletes the collection's indexed
+  documents, not only its configuration. Before, search and `get()` kept
+  returning documents from a removed collection. Content that another
+  collection still uses is kept. If writing the configuration fails, the
+  collection and its indexed documents are preserved.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

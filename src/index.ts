@@ -33,7 +33,7 @@ import {
   getStoreGlobalContext,
   getStoreContexts,
   upsertStoreCollection,
-  deleteStoreCollection,
+  removeCollection as removeStoreCollection,
   renameStoreCollection,
   updateStoreContext,
   removeStoreContext,
@@ -554,11 +554,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       }
     },
     removeCollection: async (name) => {
-      const result = deleteStoreCollection(db, name);
-      if (hasYamlConfig || options.config) {
-        collectionsRemoveCollection(name);
-      }
-      return result;
+      // Keep indexed documents if config write-through fails.
+      const remove = db.transaction(() => {
+        const exists = getStoreCollection(db, name) !== null;
+        if (exists) {
+          removeStoreCollection(db, name);
+        }
+        if (hasYamlConfig || options.config) {
+          collectionsRemoveCollection(name);
+        }
+        return exists;
+      });
+      return remove();
     },
     renameCollection: async (oldName, newName) => {
       const result = renameStoreCollection(db, oldName, newName);
