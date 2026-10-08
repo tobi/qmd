@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- `qmd update`, `qmd collection add`, and the SDK's `update()` no longer erase
+  cached query expansions and reranking scores. Those entries are keyed by the
+  query, model, and passage text, so a refresh never makes them wrong, and
+  wiping them made the next `qmd query` rerun the models. `qmd cleanup` still
+  clears the cache. (#1010)
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
