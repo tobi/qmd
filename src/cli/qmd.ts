@@ -175,8 +175,11 @@ function getStore(): ReturnType<typeof createStore> {
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
       const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
+      // A missing config file is not an empty config: syncing one would delete
+      // every collection row, and the DB works without the file.
+      if (configExists()) {
+        syncConfigToDb(store.db, loadConfig());
+      }
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
@@ -209,6 +212,12 @@ function resyncConfig(): void {
   } catch {
     // Config may not exist — that's fine
   }
+}
+
+// Collections are looked up in the config file, so a lookup that comes up
+// empty because the file is missing says so.
+function noteMissingConfig(): void {
+  if (!configExists()) console.error(`No config file at ${getConfigPath()}`);
 }
 
 function closeDb(): void {
@@ -937,6 +946,14 @@ async function updateCollections(): Promise<void> {
     return;
   }
 
+  // Ignore patterns and update commands are read from the config file, so
+  // indexing without it could add files the config excludes.
+  if (!configExists()) {
+    noteMissingConfig();
+    closeDb();
+    process.exit(1);
+  }
+
   // A project-local .qmd/index.yml travels with a `git clone`, so its `update:`
   // hooks, out-of-project collection paths, and custom model URIs are somebody
   // else's choices until the user says otherwise (#886, #889).
@@ -1155,6 +1172,7 @@ function contextList(): void {
 
   if (allContexts.length === 0) {
     console.log(`${c.dim}No contexts configured. Use 'qmd context add' to add one.${c.reset}`);
+    noteMissingConfig();
     closeDb();
     return;
   }
@@ -1638,6 +1656,13 @@ function listFiles(pathArg?: string): void {
     const yamlCollections = yamlListCollections();
 
     if (yamlCollections.length === 0) {
+      // Without the config file the index can still hold collections, so this
+      // is not an empty index.
+      if (!configExists() && listCollections(db).length > 0) {
+        noteMissingConfig();
+        closeDb();
+        process.exit(1);
+      }
       console.log("No collections found. Run 'qmd collection add .' to index files.");
       closeDb();
       return;
@@ -1731,6 +1756,7 @@ function listFiles(pathArg?: string): void {
   const coll = getCollectionFromYaml(collectionName);
   if (!coll) {
     console.error(`Collection not found: ${collectionName}`);
+    noteMissingConfig();
     console.error(`Run 'qmd ls' to see available collections.`);
     closeDb();
     process.exit(1);
@@ -2343,6 +2369,9 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
+    // Without a config file, resolve the defaults in memory. Writing the file
+    // here would turn "no config" into "no collections" for the next command.
+    if (!configExists()) return resolveModels();
     const config = loadConfig();
     const models = resolveModels(config.models);
     const current = config.models ?? {};
@@ -2925,6 +2954,7 @@ function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults
     const coll = getCollectionFromYaml(name);
     if (!coll) {
       console.error(`Collection not found: ${name}`);
+      noteMissingConfig();
       closeDb();
       process.exit(1);
     }
@@ -4867,6 +4897,7 @@ if (isMain) {
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
+            noteMissingConfig();
             process.exit(1);
           }
           console.log(`Collection: ${name}`);
