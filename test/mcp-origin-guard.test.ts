@@ -133,6 +133,21 @@ describe("checkRequestOrigin", () => {
     expect(checkRequestOrigin({ origin: "null", host: "localhost:8181" }, guard).ok).toBe(false);
   });
 
+  test("matches an allowlisted browser-extension origin exactly, not every opaque scheme", () => {
+    // URL.origin is "null" for chrome-extension:, so a naive comparison would admit any extension.
+    const extensionGuard = resolveOriginGuard({
+      host: "localhost",
+      env: { QMD_ALLOWED_ORIGINS: "chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo" } as unknown as NodeJS.ProcessEnv,
+    });
+    expect(extensionGuard.allowedOrigins).toEqual(["chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo"]);
+    expect(checkRequestOrigin({ origin: "chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo", host: "localhost:8181" }, extensionGuard).ok).toBe(true);
+    expect(checkRequestOrigin({ origin: "CHROME-EXTENSION://IPNEICLPBLLKLGOLKIHOHGPLFHHOEGFO", host: "localhost:8181" }, extensionGuard).ok).toBe(true);
+    expect(checkRequestOrigin({ origin: "chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", host: "localhost:8181" }, extensionGuard).ok).toBe(false);
+    expect(checkRequestOrigin({ origin: "moz-extension://ipneiclpbllklgolkihohgplfhhoegfo", host: "localhost:8181" }, extensionGuard).ok).toBe(false);
+    expect(checkRequestOrigin({ origin: "null", host: "localhost:8181" }, extensionGuard).ok).toBe(false);
+    expect(checkRequestOrigin({ origin: "https://evil.example", host: "localhost:8181" }, extensionGuard).ok).toBe(false);
+  });
+
   test("rejects non-http schemes", () => {
     expect(checkRequestOrigin({ origin: "file://", host: "localhost:8181" }, guard).ok).toBe(false);
   });
