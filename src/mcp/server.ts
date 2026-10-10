@@ -39,6 +39,7 @@ import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { documentReadContent } from "./document-content.js";
 
 // =============================================================================
 // Types for structured content
@@ -514,9 +515,11 @@ Intent-aware lex (C++ performance, not sports):
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
         maxLines: z.number().optional().describe("Maximum number of lines to return"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
+        exposeToUser: z.boolean().optional().default(false).describe("Return a user-visible MCP resource instead of internal text."),
+        confirmUserApprovedExposure: z.literal(true).optional().describe("Set true only after explicit user approval to expose the retrieved document as a resource."),
       }),
     },
-    track(async ({ file, fromLine, maxLines, lineNumbers }) => {
+    track(async ({ file, fromLine, maxLines, lineNumbers, exposeToUser, confirmUserApprovedExposure }) => {
       // Support :line and :from:count suffixes in `file` (e.g. "foo.md:120" or
       // "foo.md:120:40"). Explicit fromLine/maxLines args take precedence.
       let parsedFromLine = fromLine;
@@ -562,16 +565,12 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return {
-        content: [{
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.displayPath)}`,
-            name: result.displayPath,
-            title: result.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        }],
+        content: [documentReadContent({
+          uri: `qmd://${encodeQmdPath(result.displayPath)}`,
+          name: result.displayPath,
+          title: result.title,
+          text,
+        }, { exposeToUser, confirmUserApprovedExposure })],
       };
     })
   );
@@ -591,9 +590,11 @@ Intent-aware lex (C++ performance, not sports):
         maxLines: z.number().optional().describe("Maximum lines per file"),
         maxBytes: z.number().optional().default(DEFAULT_MULTI_GET_MAX_BYTES).describe("Skip files larger than this (default: 65536 = 64KB)"),
         lineNumbers: z.boolean().optional().default(true).describe("Add line numbers to output (format: 'N: content'). On by default; set false for raw content."),
+        exposeToUser: z.boolean().optional().default(false).describe("Return a user-visible MCP resource instead of internal text."),
+        confirmUserApprovedExposure: z.literal(true).optional().describe("Set true only after explicit user approval to expose the retrieved document as a resource."),
       }),
     },
-    track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
+    track(async ({ pattern, maxLines, maxBytes, lineNumbers, exposeToUser, confirmUserApprovedExposure }) => {
       const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {
@@ -603,7 +604,7 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      const content: ({ type: "text"; text: string } | { type: "resource"; resource: { uri: string; name: string; title?: string; mimeType: string; text: string } })[] = [];
+      const content: ReturnType<typeof documentReadContent>[] = [];
 
       if (errors.length > 0) {
         content.push({ type: "text", text: `Errors:\n${errors.join('\n')}` });
@@ -633,16 +634,12 @@ Intent-aware lex (C++ performance, not sports):
           text = `<!-- Context: ${result.doc.context} -->\n\n` + text;
         }
 
-        content.push({
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.doc.displayPath)}`,
-            name: result.doc.displayPath,
-            title: result.doc.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        });
+        content.push(documentReadContent({
+          uri: `qmd://${encodeQmdPath(result.doc.displayPath)}`,
+          name: result.doc.displayPath,
+          title: result.doc.title,
+          text,
+        }, { exposeToUser, confirmUserApprovedExposure }));
       }
 
       return { content };
