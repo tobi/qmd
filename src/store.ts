@@ -5349,11 +5349,16 @@ export async function rerank(query: string, documents: { file: string; text: str
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
 
     // Cache results by chunk text so identical chunks across files are scored once.
+    // Fallback results are placeholder scores from a reranker that could not
+    // run; caching them would replay the placeholders on every later query.
+    const cacheable = rerankResult.model !== "fallback";
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
+      if (cacheable) {
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+      }
       cachedResults.set(chunk, result.score);
     }
   }
