@@ -1346,6 +1346,41 @@ describe("Caching", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("rerank does not cache placeholder scores from the fallback reranker", async () => {
+    const store = await createTestStore();
+    const query = "fallback reranker";
+    const docs = [{ file: "doc.md", text: "chunk" }];
+    const modelName = "hf:example/no-ranking/model.gguf";
+
+    // LlamaCpp.rerank() returns model "fallback" with a flat 0.5 score when
+    // no ranking context could be created for the configured model.
+    const fallbackSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+      results: scoredDocs.map((doc, index) => ({ file: doc.file, score: 0.5, index })),
+      model: "fallback",
+    }));
+    store.llm = { rerank: fallbackSpy, rerankModelName: modelName } as any;
+
+    try {
+      const first = await store.rerank(query, docs);
+      expect(first[0]!.score).toBe(0.5);
+      const cacheKey = getCacheKey("rerank", { query, model: modelName, chunk: "chunk" });
+      expect(store.getCachedResult(cacheKey)).toBeNull();
+
+      const realSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+        results: scoredDocs.map((doc, index) => ({ file: doc.file, score: 0.93, index })),
+        model: modelName,
+      }));
+      store.llm = { rerank: realSpy, rerankModelName: modelName } as any;
+
+      const second = await store.rerank(query, docs);
+      expect(realSpy).toHaveBeenCalledTimes(1);
+      expect(second[0]!.score).toBe(0.93);
+      expect(store.getCachedResult(cacheKey)).toBe("0.93");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 describe("Query expansion cache (#818)", () => {
