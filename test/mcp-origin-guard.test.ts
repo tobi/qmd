@@ -137,7 +137,7 @@ describe("checkRequestOrigin", () => {
     // URL.origin is "null" for chrome-extension:, so a naive comparison would admit any extension.
     const extensionGuard = resolveOriginGuard({
       host: "localhost",
-      env: { QMD_ALLOWED_ORIGINS: "chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo" } as unknown as NodeJS.ProcessEnv,
+      env: { QMD_ALLOWED_ORIGINS: "chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo" },
     });
     expect(extensionGuard.allowedOrigins).toEqual(["chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo"]);
     expect(checkRequestOrigin({ origin: "chrome-extension://ipneiclpbllklgolkihohgplfhhoegfo", host: "localhost:8181" }, extensionGuard).ok).toBe(true);
