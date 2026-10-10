@@ -1528,6 +1528,17 @@ describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
 });
 
 describe("idle unload vs in-flight operations (#938)", () => {
+  // bun:test's vitest shim has no vi.waitFor. Poll so both runners share this.
+  async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out after ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
   function fakeEmbedModel(events: string[]) {
     return {
       tokenize: (text: string) => Array.from(text),
@@ -1562,7 +1573,7 @@ describe("idle unload vs in-flight operations (#938)", () => {
 
     release();
     await expect(pending).resolves.toMatchObject({ embedding: [1, 0] });
-    await vi.waitFor(() => expect(events).toContain("model-dispose"), { timeout: 2000 });
+    await waitUntil(() => events.includes("model-dispose"));
     expect(events.indexOf("embed-end")).toBeLessThan(events.indexOf("ctx-dispose"));
   });
 
@@ -1608,7 +1619,7 @@ describe("idle unload vs in-flight operations (#938)", () => {
 
     releaseEmbed();
     await expect(first).resolves.toMatchObject({ embedding: [1] });
-    await vi.waitFor(() => expect(events).toContain("old-dispose-start"));
+    await waitUntil(() => events.includes("old-dispose-start"));
 
     const second = llm.embed("after unload started"); // must not touch oldCtx
     await new Promise((resolve) => setTimeout(resolve, 20));
