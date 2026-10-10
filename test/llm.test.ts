@@ -1526,3 +1526,160 @@ describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
     }
   });
 });
+
+describe("idle unload vs in-flight operations (#938)", () => {
+  // bun:test's vitest shim has no vi.waitFor. Poll so both runners share this.
+  async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out after ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  function fakeEmbedModel(events: string[]) {
+    return {
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+      dispose: vi.fn(async () => { events.push("model-dispose"); }),
+    };
+  }
+
+  test("idle timer never disposes the context or model under a running embed", async () => {
+    // Per-store shape used by createStore() / `qmd mcp`.
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 20, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ctx = {
+      getEmbeddingFor: vi.fn(async () => {
+        events.push("embed-start");
+        await gate;
+        events.push("embed-end");
+        return { vector: new Float32Array([1, 0]) };
+      }),
+      dispose: vi.fn(async () => { events.push("ctx-dispose"); }),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = fakeEmbedModel(events);
+
+    const pending = llm.embed("hello");
+    await new Promise((resolve) => setTimeout(resolve, 150)); // several idle periods
+    expect(ctx.dispose).not.toHaveBeenCalled();
+    expect(llm.embedModel.dispose).not.toHaveBeenCalled();
+
+    release();
+    await expect(pending).resolves.toMatchObject({ embedding: [1, 0] });
+    await waitUntil(() => events.includes("model-dispose"));
+    expect(events.indexOf("embed-end")).toBeLessThan(events.indexOf("ctx-dispose"));
+  });
+
+  test("unloadIdleResources drains in-flight work and new calls wait for disposal, then use fresh contexts", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: false }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((resolve) => { releaseEmbed = resolve; });
+    let releaseDispose!: () => void;
+    const disposeGate = new Promise<void>((resolve) => { releaseDispose = resolve; });
+    const oldCtx = {
+      getEmbeddingFor: vi.fn(async () => {
+        await embedGate;
+        events.push("old-embed-end");
+        return { vector: new Float32Array([1]) };
+      }),
+      dispose: vi.fn(async () => {
+        events.push("old-dispose-start");
+        await disposeGate;
+        events.push("old-dispose-end");
+      }),
+    };
+    const freshCtx = {
+      getEmbeddingFor: vi.fn(async () => {
+        events.push("fresh-embed");
+        return { vector: new Float32Array([2]) };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    llm.embedContexts = [oldCtx];
+    llm.embedModel = fakeEmbedModel(events);
+    llm.ensureEmbedContext = vi.fn(async () => {
+      if (llm.embedContexts.length === 0) llm.embedContexts = [freshCtx];
+      return llm.embedContexts[0];
+    });
+
+    const first = llm.embed("in flight");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const unload = llm.unloadIdleResources();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(oldCtx.dispose).not.toHaveBeenCalled(); // still draining
+
+    releaseEmbed();
+    await expect(first).resolves.toMatchObject({ embedding: [1] });
+    await waitUntil(() => events.includes("old-dispose-start"));
+
+    const second = llm.embed("after unload started"); // must not touch oldCtx
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(freshCtx.getEmbeddingFor).not.toHaveBeenCalled();
+
+    releaseDispose();
+    await unload;
+    await expect(second).resolves.toMatchObject({ embedding: [2] });
+    expect(oldCtx.getEmbeddingFor).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["old-embed-end", "old-dispose-start", "old-dispose-end", "fresh-embed"]);
+  });
+
+  test("a failed context dispose still drops the context and disposes the model", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    const ctx = {
+      dispose: vi.fn(async () => {
+        events.push("ctx-dispose");
+        throw new Error("boom");
+      }),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = {
+      dispose: vi.fn(async () => { events.push("model-dispose"); }),
+    };
+
+    await expect(llm.unloadIdleResources()).resolves.toBeUndefined();
+    expect(llm.embedContexts).toEqual([]);
+    expect(llm.embedModel).toBeNull();
+    expect(events).toEqual(["ctx-dispose", "model-dispose"]);
+  });
+
+  test("dispose waits for an in-flight embed and then rejects new calls", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ctx = {
+      getEmbeddingFor: vi.fn(async () => {
+        await gate;
+        return { vector: new Float32Array([1]) };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = fakeEmbedModel([]);
+
+    const pending = llm.embed("hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    let disposeResolved = false;
+    const disposing = llm.dispose().then(() => { disposeResolved = true; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(disposeResolved).toBe(false);
+    expect(ctx.dispose).not.toHaveBeenCalled();
+
+    release();
+    await expect(pending).resolves.toMatchObject({ embedding: [1] });
+    await disposing;
+    expect(ctx.dispose).toHaveBeenCalledTimes(1);
+    await expect(llm.embed("after")).rejects.toThrow(/disposed/);
+  });
+});
