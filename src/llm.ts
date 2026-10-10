@@ -799,6 +799,19 @@ async function disposeWithTimeout(resourceName: string, dispose: () => Promise<v
   }
 }
 
+// Idle unload reuses the instance afterwards, so it must wait out each
+// dispose. A timeout that continues while the native free is still running
+// would let the next query load a context on top of that free (the #938 crash).
+async function disposeSettled(resourceName: string, dispose: () => Promise<void>): Promise<void> {
+  try {
+    await dispose();
+  } catch (error) {
+    process.stderr.write(
+      `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing.\n`
+    );
+  }
+}
+
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
     if (!Number.isInteger(configValue) || configValue <= 0) {
@@ -914,6 +927,10 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
+    // dispose() may still be draining an in-flight call. Don't arm a new
+    // timer that would unload under (or after) that shutdown.
+    if (this.disposed) return;
+
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
@@ -973,10 +990,18 @@ export class LlamaCpp implements LLM {
    * Waits out an idle disposal that already started, so the call loads fresh
    * contexts instead of using ones being freed. Nested calls (e.g. countTokens
    * → tokenize) only bump the counter; they never wait on the drain phase.
+   * Calls after dispose() reject instead of touching freed native resources.
    */
   private async runOperation<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.disposed) {
+      throw new Error("LLM instance is disposed");
+    }
     while (this.idleDisposePromise) {
       await this.idleDisposePromise.catch(() => {});
+    }
+    // dispose() may have started while we waited out an idle disposal.
+    if (this.disposed) {
+      throw new Error("LLM instance is disposed");
     }
     this.activeOperations++;
     try {
@@ -1010,38 +1035,36 @@ export class LlamaCpp implements LLM {
   }
 
   private async disposeIdleResources(): Promise<void> {
-    // Dispose contexts first
+    // Detach before any await. A dispose() that throws must not leave the
+    // freed object cached for the next call, and must not skip the rest.
     const embedContexts = this.embedContexts;
     this.embedContexts = [];
     const rerankContexts = this.rerankContexts;
     this.rerankContexts = [];
+    this.embedContextsCreatePromise = null;
+    this.rerankContextsCreatePromise = null;
     for (const ctx of embedContexts) {
-      await ctx.dispose();
+      await disposeSettled("embedding context", () => ctx.dispose());
     }
     for (const ctx of rerankContexts) {
-      await ctx.dispose();
+      await disposeSettled("rerank context", () => ctx.dispose());
     }
 
-    // Optionally dispose models too (opt-in)
+    // Optionally dispose models too (opt-in). Same detach-then-dispose order.
     if (this.disposeModelsOnInactivity) {
-      if (this.embedModel) {
-        await this.embedModel.dispose();
-        this.embedModel = null;
-        this.embedModelPath = null;
-      }
-      if (this.generateModel) {
-        await this.generateModel.dispose();
-        this.generateModel = null;
-      }
-      if (this.rerankModel) {
-        await this.rerankModel.dispose();
-        this.rerankModel = null;
-      }
-      // Reset load promises so models can be reloaded later
+      const embedModel = this.embedModel;
+      const generateModel = this.generateModel;
+      const rerankModel = this.rerankModel;
+      this.embedModel = null;
+      this.embedModelPath = null;
+      this.generateModel = null;
+      this.rerankModel = null;
       this.embedModelLoadPromise = null;
       this.generateModelLoadPromise = null;
       this.rerankModelLoadPromise = null;
-      this.rerankContextsCreatePromise = null;
+      if (embedModel) await disposeSettled("embedding model", () => embedModel.dispose());
+      if (generateModel) await disposeSettled("generation model", () => generateModel.dispose());
+      if (rerankModel) await disposeSettled("rerank model", () => rerankModel.dispose());
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -1963,10 +1986,21 @@ export class LlamaCpp implements LLM {
     }
     this.disposed = true;
 
-    // Clear inactivity timer
+    // Clear inactivity timer before draining so a firing timer cannot start
+    // a second unload under this shutdown.
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
+    }
+
+    // In-flight calls are still using contexts. Wait them out, then join an
+    // idle unload that may already be disposing the same objects. Freeing
+    // here in parallel is the same use-after-free as #938.
+    while (this.activeOperations > 0) {
+      await new Promise<void>((resolve) => this.operationsDrainedWaiters.push(resolve));
+    }
+    if (this.idleUnloadPromise) {
+      await this.idleUnloadPromise.catch(() => {});
     }
 
     // Explicitly dispose in dependency order: contexts first, then models, then llama.
