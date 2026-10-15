@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- SDK embedding accepts opt-in `resume: true` checkpoints, reusing stored chunks
+  only for the same formatted chunk plan, positions, model and fingerprint.
+  Incomplete checkpoint documents are excluded from vector search before KNN
+  candidate selection; default incomplete-chunk cleanup is unchanged. #1064
+- SDK embedding accepts an optional AbortSignal. Cancellation stops admitting
+  later work, awaits native operations already in flight, and leaves unfinished
+  documents eligible for another embedding run. Native evaluation admission
+  also stops after abort without cancelling shared model setup for other callers. #1061
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,

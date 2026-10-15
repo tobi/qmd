@@ -187,6 +187,12 @@ export { getDefaultDbPath } from "./store.js";
 // Re-export Maintenance class for CLI housekeeping operations
 export { Maintenance } from "./maintenance.js";
 
+// Opt-in host-owned maintenance; importing these APIs starts no work.
+export { createMaintenanceJobs } from "./maintenance-jobs.js";
+export type { MaintenanceJob, MaintenanceJobState } from "./maintenance-jobs.js";
+export { createEmbeddingScheduler } from "./embedding-scheduler.js";
+export type { EmbeddingSchedulerOptions } from "./embedding-scheduler.js";
+
 /**
  * Progress info emitted during update() for each file processed.
  */
@@ -392,12 +398,18 @@ export interface QMDStore {
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
     force?: boolean;
+    /** Retain and resume only identical interrupted embedding plans. Default: false. */
+    resume?: boolean;
     model?: string;
     /** Restrict embedding to documents in one collection. */
     collection?: string;
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
+    /** Whole-session duration in milliseconds; <=0 disables the existing native cap. */
+    maxDurationMs?: number;
+    /** Stop admitting later work; await in-flight operations before rejecting. */
+    signal?: AbortSignal;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -652,11 +664,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     embed: async (embedOpts) => {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
+        resume: embedOpts?.resume,
         model: embedOpts?.model,
         collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
+        maxDurationMs: embedOpts?.maxDurationMs,
+        signal: embedOpts?.signal,
         onProgress: embedOpts?.onProgress,
       });
     },

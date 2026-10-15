@@ -5958,7 +5958,7 @@ describe("Embedding batching", () => {
 
       expect(result.chunksEmbedded).toBe(1);
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model, signal: expect.any(AbortSignal) }]);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);
@@ -5982,7 +5982,7 @@ describe("Embedding batching", () => {
 
       expect(result.chunksEmbedded).toBe(1);
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model, signal: expect.any(AbortSignal) }]);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);

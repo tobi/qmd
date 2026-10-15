@@ -421,6 +421,89 @@ const embedResult = await store.embed({
 })
 ```
 
+Pass an optional `signal` to `store.embed()` for cooperative cancellation. An
+already-aborted force call does not clear vectors. Cancellation stops admitting
+later native evaluations and awaits work already in flight before rejecting with
+the signal's reason. Shared model initialization stays available to other callers.
+Unfinished documents remain eligible for another run. Cancellation does not
+interrupt a native evaluation already started.
+
+Pass `resume: true` to retain successfully stored chunks of unfinished documents
+and reuse them on a later `store.embed({ resume: true })` call. A checkpoint is
+reused only when the entire formatted chunk plan, chunk positions, model and
+embedding fingerprint still match; a changed plan is regenerated. Partial
+checkpoints stay out of vector search until the document is complete, including
+collection- and metadata-scoped searches. Without `resume`, incomplete chunks
+are discarded as before, including checkpoints left by an earlier opt-in call.
+Existing complete legacy embeddings remain searchable. Use `force: true` when
+you want to regenerate already-complete documents with a different chunk plan.
+
+Pass `maxDurationMs` to `store.embed()` to use the existing native whole-session
+duration budget. Values <=0 disable that native cap. It is cooperative: admitted
+native batches still finish before the operation settles.
+
+#### Host-owned maintenance jobs
+
+`createMaintenanceJobs()` gives an SDK host one synchronous claim shared by its
+update and embedding callers, bounded completed-job retention (20 by default),
+progress and terminal receipts. Hosts can provide synchronous `admit(type)` for
+their existing storage/access policy, `finished(job)` for terminal notification,
+and `sanitizeError(error)` for public error text. `getJob(id)` returns a shallow
+receipt. `stop()` stops admission, aborts cooperatively and awaits actual work;
+call it before closing the store. Every maintenance caller must use the same
+owner to share this claim. Direct `store.embed()` calls remain available and do
+not automatically join it.
+
+```typescript
+import { createMaintenanceJobs } from '@tobilu/qmd'
+
+const maintenance = createMaintenanceJobs()
+const job = maintenance.startJob('embed', { collection: 'docs' },
+  (onProgress, signal) => store.embed({
+    collection: 'docs', resume: true, onProgress, signal,
+  }))
+await maintenance.waitForIdle()
+const receipt = maintenance.getJob(job.id)
+await maintenance.stop()
+```
+
+`createEmbeddingScheduler()` is an optional adapter for that same owner.
+Construction and the default `intervalMinutes: 0` create no timers or work.
+An enabled host calls `start()` explicitly, or `tick()` for one admission attempt,
+and awaits `stop()` before closing its store. Supply synchronous `collections()`
+for currently embedding-enabled collection names, `pending(names?)` for current
+debt, and `activeQueries()` for foreground activity from the host's existing
+state. Collection policy and debt are reloaded before each embedding call.
+These callbacks do not grant filesystem or database access.
+
+```typescript
+import { createMaintenanceJobs, createEmbeddingScheduler } from '@tobilu/qmd'
+
+const scheduledMaintenance = createMaintenanceJobs()
+const scheduler = createEmbeddingScheduler({
+  maintenance: scheduledMaintenance, intervalMinutes: 30, initialDelaySeconds: 60,
+  maxDurationMs: 5 * 60 * 1000, maxDocsPerBatch: 10, maxBatchBytes: 4 * 1024 * 1024,
+  collections: getEnabledCollectionNames,
+  pending: countPendingEmbeddings,
+  activeQueries: countActiveQueries,
+  embed: options => store.embed(options),
+})
+scheduler.start()
+// At host shutdown:
+await scheduler.stop()
+await scheduledMaintenance.stop()
+await store.close()
+```
+
+The host supplies the three state callbacks in this example. No scheduler is
+attached to a store, CLI, MCP server or service automatically. Sweeps rotate the
+first eligible collection, use resumable non-force native embedding with one
+shared monotonic deadline, and retain committed progress when later work fails.
+Query activity, policy changes, deadline and shutdown stop later admission;
+in-flight work is awaited. `health()` reports timer/admission state, while the
+maintenance receipt owns the final result. Positive bounded duration/batch
+budgets and finite nonnegative timer durations are validated before execution.
+
 #### Types
 
 Key types exported for SDK consumers:
