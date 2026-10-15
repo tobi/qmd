@@ -238,6 +238,40 @@ export function saveConfig(config: CollectionConfig): void {
 }
 
 /**
+ * Set model URIs in the config. A YAML file is edited as a parsed document, so
+ * its comments, quoting and key order survive (whitespace is normalized).
+ */
+export function saveModelsConfig(models: ModelsConfig): void {
+  if (configSource.type === 'inline' || !configExists()) {
+    const config = loadConfig();
+    saveConfig({ ...config, models: { ...config.models, ...models } });
+    return;
+  }
+
+  const configPath = getConfigPath();
+  try {
+    const doc = YAML.parseDocument(readFileSync(configPath, "utf-8"));
+    // setIn can't descend into a non-map `models`, e.g. a bare `models:` whose entries
+    // are all commented out (a null scalar). Replace it, carrying its comments over.
+    const current = doc.get("models", true);
+    if (!YAML.isMap(current)) {
+      const map = doc.createNode({});
+      if (YAML.isNode(current)) {
+        map.commentBefore = current.commentBefore;
+        map.comment = current.comment;
+      }
+      doc.set("models", map);
+    }
+    for (const [slot, uri] of Object.entries(models)) {
+      if (uri !== undefined) doc.setIn(["models", slot], uri);
+    }
+    writeFileSync(configPath, doc.toString({ indent: 2, lineWidth: 0 }), "utf-8");
+  } catch (error) {
+    throw new Error(`Failed to write ${configPath}: ${error}`);
+  }
+}
+
+/**
  * Get a specific collection by name
  * Returns null if not found
  */
