@@ -49,6 +49,11 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- Bench scoring no longer credits a result whose path merely ends with the
+  expected filename (`Vault Note Standards.md` for `Standards.md`), nor an
+  expected path longer than the result (`docs/api/README.md` for `README.md`).
+  `pathsMatch` now requires an exact normalized match or a suffix anchored at a
+  path separator (#943).
 
 ### Changed
 
