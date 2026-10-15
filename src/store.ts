@@ -5316,9 +5316,13 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
+export function formatRerankQuery(query: string, intent?: string): string {
+  return intent ? `${intent}\n\n${query}` : query;
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
-  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const rerankQuery = formatRerankQuery(query, intent);
   const llm = llmOverride ?? getDefaultLlamaCpp();
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
@@ -5335,7 +5339,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   for (const doc of documents) {
     const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    const cached = getCachedResult(db, cacheKey)
+      ?? (rerankQuery === query ? getCachedResult(db, legacyCacheKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
