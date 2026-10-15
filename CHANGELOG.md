@@ -49,6 +49,10 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- `qmd doctor`'s model cache check now matches revision-pinned Hugging Face
+  models (`hf:org/model/file.gguf#<revision>`) against their cached blob
+  correctly instead of always reporting them missing, while still rejecting a
+  blob cached under a different revision.
 
 ### Changed
 

@@ -849,6 +849,93 @@ describe("CLI Status Command", () => {
     expect(stdout).not.toContain(".etag");
   }, 20000);
 
+  test("qmd doctor matches a revision-pinned HF model to its cached blob", async () => {
+    // A model URI pinned to a specific HF revision (`#<sha>`) must still
+    // resolve against the blob node-llama-cpp wrote for that revision, even
+    // though the blob's filename embeds the revision between the org/model
+    // prefix and the trailing filename (#963).
+    const env = await createIsolatedTestEnv("doctor-revision-pinned-model");
+    const model = "hf:example/model/fixture.gguf#0123456789abcdef0123456789abcdef01234567";
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+    const cacheRoot = join(env.configDir, "cache");
+    const modelCacheDir = join(cacheRoot, "qmd", "models");
+    await mkdir(modelCacheDir, { recursive: true });
+    await writeFile(
+      join(modelCacheDir, "hf_example_model_0123456789abcdef0123456789abcdef01234567_fixture.gguf"),
+      Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]),
+    );
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        XDG_CACHE_HOME: cacheRoot,
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("downloaded and valid GGUF");
+    expect(stdout).not.toContain("missing");
+  }, 20000);
+
+  test("qmd doctor still reports a revision-pinned model missing when only a different revision is cached", async () => {
+    // A pinned request must not be satisfied by a *different* pin's blob —
+    // the revision itself has to match, not just the filename (#963).
+    const env = await createIsolatedTestEnv("doctor-revision-mismatch-model");
+    const model = "hf:example/model/fixture.gguf#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+    const cacheRoot = join(env.configDir, "cache");
+    const modelCacheDir = join(cacheRoot, "qmd", "models");
+    await mkdir(modelCacheDir, { recursive: true });
+    await writeFile(
+      join(modelCacheDir, "hf_example_model_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_fixture.gguf"),
+      Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]),
+    );
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        XDG_CACHE_HOME: cacheRoot,
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("missing 1");
+  }, 20000);
+
+  test("qmd doctor matches an unpinned HF model to a cached blob that carries an embedded revision", async () => {
+    // Backward compatibility: a model URI with no `#revision` has nothing to
+    // compare a revision against, so it must keep matching by filename alone
+    // even when the cached blob happens to carry a revision segment from an
+    // earlier pinned pull of the same model (#963).
+    const env = await createIsolatedTestEnv("doctor-unpinned-model-revisioned-blob");
+    const model = "hf:example/other-model/other.gguf";
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+    const cacheRoot = join(env.configDir, "cache");
+    const modelCacheDir = join(cacheRoot, "qmd", "models");
+    await mkdir(modelCacheDir, { recursive: true });
+    await writeFile(
+      join(modelCacheDir, "hf_example_other-model_cccccccccccccccccccccccccccccccccccccccc_other.gguf"),
+      Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]),
+    );
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        XDG_CACHE_HOME: cacheRoot,
+        QMD_DOCTOR_DEVICE_PROBE: "0",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("downloaded and valid GGUF");
+    expect(stdout).not.toContain("missing");
+  }, 20000);
+
   test("qmd doctor says when models are overridden by env", async () => {
     const env = await createIsolatedTestEnv("doctor-env-models");
     await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
