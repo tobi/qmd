@@ -54,14 +54,14 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -184,12 +184,14 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
- * falls back to the global singleton.
+ * Get the LLM instance for a store — prefers the store's own instance, falls
+ * back to the polymorphic global default (LlamaCpp locally, RemoteQMD when
+ * QMD_REMOTE_URL is set).
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
+
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -1585,8 +1587,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton). Can be LlamaCpp or RemoteQMD. */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -2336,6 +2338,9 @@ export async function generateEmbeddings(
 ): Promise<EmbedResult> {
   const db = store.db;
   const llm = getLlm(store);
+  // Remote backends populate model names asynchronously from /health; await so
+  // we tag vectors with the server's actual embedding model, not the default.
+  await llm.ready?.();
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
   const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
@@ -3838,7 +3843,7 @@ function stripUnpairedSurrogates(text: string): string {
  * for supported code files.
  */
 async function chunkDocumentByTokensWithLlm(
-  llm: LlamaCpp,
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -3909,16 +3914,20 @@ async function chunkDocumentByTokensWithLlm(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+      const fallbackTokenCount = Math.max(1, Math.min(tokens.length, maxTokens));
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
       // multiple tokens — truncating the token list can land mid-character.
-      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+      // Remote backends may not expose detokenize; approximate by characters.
+      const rawText = "detokenize" in llm && typeof llm.detokenize === "function"
+        ? await llm.detokenize(tokens.slice(0, fallbackTokenCount))
+        : text.slice(0, Math.max(1, Math.floor(fallbackTokenCount * actualCharsPerToken)));
+      const truncatedText = stripUnpairedSurrogates(rawText);
       if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
         pos,
-        tokens: fallbackTokens.length,
+        tokens: fallbackTokenCount,
       });
       return;
     }
@@ -3945,7 +3954,7 @@ export async function chunkDocumentByTokens(
   signal?: AbortSignal,
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   return await chunkDocumentByTokensWithLlm(
-    getDefaultLlamaCpp(),
+    getDefaultLLM(),
     content,
     maxTokens,
     overlapTokens,
@@ -4973,7 +4982,7 @@ function nearestVecDocuments(
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
@@ -5044,12 +5053,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -5261,7 +5270,7 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
@@ -5285,7 +5294,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query);
 
@@ -5316,10 +5325,10 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
   const cacheModel = llm.rerankModelName ?? model;
@@ -6350,7 +6359,7 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
+    const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -6610,7 +6619,7 @@ export async function vectorSearchQuery(
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
+  const embedModel = getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL;
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
@@ -6752,7 +6761,7 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
+      const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
