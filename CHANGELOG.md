@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Reranking no longer caches the flat 0.5 placeholder scores returned when the
+  configured reranker cannot create a ranking context. Before, those scores
+  were stored under the normal rerank cache key and replayed on later queries
+  even after the model was fixed. #1053
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
