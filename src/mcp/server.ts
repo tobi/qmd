@@ -248,7 +248,16 @@ function getInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promise<McpServer> {
+export interface McpServerOptions {
+  /** Separate routine no-rerank queries from explicitly selected bounded reranking. */
+  queryPolicy?: "standard" | "split-rerank";
+}
+
+export async function createMcpServer(
+  store: QMDStore,
+  inflight?: InflightGate,
+  options: McpServerOptions = {},
+): Promise<McpServer> {
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
   // work to settle before disposing the store/llm underneath it.
   const track = inflight?.track ?? (<T,>(fn: T): T => fn);
@@ -329,11 +338,65 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
     ),
   });
 
-  server.registerTool(
-    "query",
-    {
-      title: "Query",
-      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
+  const queryInputSchema = z.object({
+    query: z.string().optional().describe(
+      "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
+      "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+    ),
+    searches: z.array(subSearchSchema).max(10).optional().describe(
+      "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
+      "control over retrieval strategy. Mutually exclusive with 'query'."
+    ),
+    limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+    minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+    candidateLimit: z.number().optional().describe(
+      "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+    ),
+    collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+    filter: z.record(z.string(), z.unknown()).optional().describe(
+      "Metadata filter (recursive JSON AST). Every returned result satisfies it. " +
+      "Nodes are operator-discriminated: logical groups {operator:'and'|'or', operands:[...]}, " +
+      "negation {operator:'not', operand:{...}}, and conditions {field, operator, value} with " +
+      "operators eq/ne/gt/gte/lt/lte (comparison), in/nin/all (membership), contains/prefix/suffix (text), " +
+      "type (value is 'string'|'number'|'boolean'), exists (presence). " +
+      "Values are typed exactly (no coercion); missing keys do not match ne/nin. " +
+      "Conditions with a string value may add caseInsensitive:true (ASCII folding). " +
+      "Example: {\"operator\":\"and\",\"operands\":[{\"field\":\"topics\",\"operator\":\"all\",\"value\":[\"typescript\"]}," +
+      "{\"field\":\"status\",\"operator\":\"ne\",\"value\":\"draft\"}]}"
+    ),
+    intent: z.string().optional().describe(
+      "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
+    ),
+    rerank: z.boolean().optional().default(true).describe(
+      "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+    ),
+  });
+  const queryModes = options.queryPolicy === "split-rerank"
+    ? ["routine", "reranked"] as const
+    : ["standard"] as const;
+  for (const queryMode of queryModes) {
+    const inputSchema = queryMode === "routine"
+      ? queryInputSchema.omit({ candidateLimit: true, rerank: true }).extend({
+        query: z.string().optional().describe(
+          "Plain-text query, auto-expanded into lex/vec/hyde variants and fused without reranking. " +
+          "Mutually exclusive with 'searches'."
+        ),
+      })
+      : queryMode === "reranked"
+        ? queryInputSchema.omit({ rerank: true }).extend({
+          candidateLimit: z.number().int().min(1).max(20).optional().default(10).describe(
+            "Maximum candidates to rerank (default: 10, maximum: 20)"
+          ),
+        })
+        : queryInputSchema;
+
+    server.registerTool(
+      queryMode === "reranked" ? "query_reranked" : "query",
+      {
+        title: queryMode === "routine" ? "Query (no reranking)" : queryMode === "reranked" ? "Reranked Query" : "Query",
+        description: (queryMode === "routine"
+          ? "Reranking is disabled for this routine tool. Select query_reranked explicitly when needed.\n\n"
+          : queryMode === "reranked" ? "Explicit LLM reranking with at most 20 candidates.\n\n" : "") + `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
 
 Each result includes a \`line\` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call \`get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)\`.
 
@@ -363,7 +426,7 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, ${queryMode === "routine" ? "fused without reranking" : "fused, reranked"} |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -392,112 +455,81 @@ Intent-aware lex (C++ performance, not sports):
   { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
   { "type": "vec", "query": "how to optimize C++ program performance" }
 ]
-\`\`\``,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: z.object({
-        query: z.string().optional().describe(
-          "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
-        ),
-        searches: z.array(subSearchSchema).max(10).optional().describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
-          "control over retrieval strategy. Mutually exclusive with 'query'."
-        ),
-        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
-        candidateLimit: z.number().optional().describe(
-          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
-        ),
-        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
-        filter: z.record(z.string(), z.unknown()).optional().describe(
-          "Metadata filter (recursive JSON AST). Every returned result satisfies it. " +
-          "Nodes are operator-discriminated: logical groups {operator:'and'|'or', operands:[...]}, " +
-          "negation {operator:'not', operand:{...}}, and conditions {field, operator, value} with " +
-          "operators eq/ne/gt/gte/lt/lte (comparison), in/nin/all (membership), contains/prefix/suffix (text), " +
-          "type (value is 'string'|'number'|'boolean'), exists (presence). " +
-          "Values are typed exactly (no coercion); missing keys do not match ne/nin. " +
-          "Conditions with a string value may add caseInsensitive:true (ASCII folding). " +
-          "Example: {\"operator\":\"and\",\"operands\":[{\"field\":\"topics\",\"operator\":\"all\",\"value\":[\"typescript\"]}," +
-          "{\"field\":\"status\",\"operator\":\"ne\",\"value\":\"draft\"}]}"
-        ),
-        intent: z.string().optional().describe(
-          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
-        ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
-        ),
-      }),
-    },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
-      // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
-      if (!query && (!searches || searches.length === 0)) {
+\`\`\``  ,
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        inputSchema,
+      },
+      track(async ({ query, searches, limit = 10, minScore = 0, candidateLimit, collections, filter, intent, rerank }: z.input<typeof queryInputSchema>) => {
+        // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
+        if (!query && (!searches || searches.length === 0)) {
+          return {
+            content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
+            isError: true,
+          };
+        }
+        if (query && searches && searches.length > 0) {
+          return {
+            content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
+            isError: true,
+          };
+        }
+
+        const filterValidation = validateFilterArgument(filter);
+        if (filterValidation.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${filterValidation.error}` }],
+            isError: true,
+          };
+        }
+
+        // Use default collections if none specified
+        const effectiveCollections = collections ?? defaultCollectionNames;
+
+        // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
+        // `searches` runs the caller's typed sub-queries directly.
+        const searchOptions = query
+          ? { query }
+          : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
+
+        const results = await store.search({
+          ...searchOptions,
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          filter: filterValidation.filter,
+          limit,
+          minScore,
+          candidateLimit: queryMode === "routine" ? undefined : candidateLimit,
+          rerank: queryMode === "routine" ? false : queryMode === "reranked" ? true : rerank,
+          intent,
+        });
+
+        // Use the plain query, or the first lex/vec sub-query, for snippet extraction
+        const primaryQuery = query
+          || searches?.find(s => s.type === 'lex')?.query
+          || searches?.find(s => s.type === 'vec')?.query
+          || searches?.[0]?.query
+          || "";
+
+        const filtered: SearchResultItem[] = results.map(r => {
+          const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: r.context,
+            ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+            line,
+            snippet: addLineNumbers(snippet, line),
+          };
+        });
+
         return {
-          content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
-          isError: true,
+          content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
+          structuredContent: { results: filtered },
         };
-      }
-      if (query && searches && searches.length > 0) {
-        return {
-          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
-          isError: true,
-        };
-      }
-
-      const filterValidation = validateFilterArgument(filter);
-      if (filterValidation.error) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${filterValidation.error}` }],
-          isError: true,
-        };
-      }
-
-      // Use default collections if none specified
-      const effectiveCollections = collections ?? defaultCollectionNames;
-
-      // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
-      // `searches` runs the caller's typed sub-queries directly.
-      const searchOptions = query
-        ? { query }
-        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
-
-      const results = await store.search({
-        ...searchOptions,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        filter: filterValidation.filter,
-        limit,
-        minScore,
-        candidateLimit,
-        rerank,
-        intent,
-      });
-
-      // Use the plain query, or the first lex/vec sub-query, for snippet extraction
-      const primaryQuery = query
-        || searches?.find(s => s.type === 'lex')?.query
-        || searches?.find(s => s.type === 'vec')?.query
-        || searches?.[0]?.query
-        || "";
-
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
-          line,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
-      };
-    })
-  );
+      })
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // Tool: qmd_get (Retrieve document)
