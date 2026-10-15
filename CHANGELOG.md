@@ -38,6 +38,18 @@
   the rows for good. The collection is now reported as not found and its index
   is left unchanged. Permission and I/O errors still fail with their original
   cause (#989). #990 (thanks @ParkerRex)
+- `qmd search`, `qmd ls`, `qmd status` and other commands that only read the
+  index no longer remove every collection from it when the config file is
+  missing, for example when `QMD_CONFIG_DIR` points at a folder without
+  `index.yml`. The missing file read as an empty config, so opening the store
+  wrote an `index.yml` with no collections and synced it into the database,
+  and a scoped search then failed with "Collection not found". Without a
+  config file the index and the config folder are now left unchanged, and
+  read commands that look collections up in the config (`-c` filters, `ls`,
+  `collection show`, `context list`) name the missing file. When the index has
+  collections, `qmd update` exits 1 naming it instead of reporting none. An
+  existing config, including one with no collections, still syncs as before
+  (#1048).
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

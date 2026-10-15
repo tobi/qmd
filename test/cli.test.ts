@@ -2003,6 +2003,106 @@ describe("CLI Collection Commands", () => {
 });
 
 // =============================================================================
+// Missing Config File
+// =============================================================================
+
+describe("missing config file", () => {
+  let dbPath: string;
+  let configDir: string;
+  let missingConfigDir: string;
+  let notesDir: string;
+
+  beforeEach(async () => {
+    const env = await createIsolatedTestEnv("missing-config");
+    dbPath = env.dbPath;
+    configDir = env.configDir;
+    missingConfigDir = join(testDir, `missing-config-none-${testCounter}`);
+    await mkdir(missingConfigDir, { recursive: true });
+
+    notesDir = join(testDir, `missing-config-notes-${testCounter}`);
+    await mkdir(notesDir, { recursive: true });
+    await writeFile(join(notesDir, "a.md"), "# Alpha\n\napple banana\n");
+    const add = await runQmd(["collection", "add", notesDir, "--name", "notes"], { dbPath, configDir });
+    expect(add.exitCode).toBe(0);
+  });
+
+  function collectionNames(): string[] {
+    const db = openDatabase(dbPath);
+    try {
+      const rows = db.prepare(`SELECT name FROM store_collections ORDER BY name`).all() as { name: string }[];
+      return rows.map((row) => row.name);
+    } finally {
+      db.close();
+    }
+  }
+
+  function activePaths(): string[] {
+    const db = openDatabase(dbPath);
+    try {
+      const rows = db.prepare(`SELECT path FROM documents WHERE active = 1 ORDER BY path`).all() as { path: string }[];
+      return rows.map((row) => row.path);
+    } finally {
+      db.close();
+    }
+  }
+
+  test("read commands keep the collection rows and write no config file", async () => {
+    for (const args of [["search", "banana"], ["status"]]) {
+      const result = await runQmd(args, { dbPath, configDir: missingConfigDir });
+      expect(result.exitCode, args.join(" ")).toBe(0);
+    }
+
+    expect(collectionNames()).toEqual(["notes"]);
+    expect(existsSync(join(missingConfigDir, "index.yml"))).toBe(false);
+  });
+
+  test("read commands that look collections up in the config name the missing file", async () => {
+    const missing = `No config file at ${join(missingConfigDir, "index.yml")}`;
+    for (const args of [["search", "banana", "-c", "notes"], ["ls", "notes"], ["ls"], ["collection", "show", "notes"]]) {
+      const result = await runQmd(args, { dbPath, configDir: missingConfigDir });
+      expect(result.exitCode, args.join(" ")).toBe(1);
+      expect(result.stderr, args.join(" ")).toContain(missing);
+      expect(result.stdout, args.join(" ")).not.toContain("No collections found");
+    }
+    const contexts = await runQmd(["context", "list"], { dbPath, configDir: missingConfigDir });
+    expect(contexts.stderr).toContain(missing);
+    expect(collectionNames()).toEqual(["notes"]);
+    expect(existsSync(join(missingConfigDir, "index.yml"))).toBe(false);
+
+    const withConfig = await runQmd(["search", "banana", "-c", "notes"], { dbPath, configDir });
+    expect(withConfig.exitCode).toBe(0);
+    expect(withConfig.stdout).toContain("a.md");
+  });
+
+  test("ls on an index with no collections keeps its first-run message", async () => {
+    const fresh = await createIsolatedTestEnv("missing-config-fresh");
+    const result = await runQmd(["ls"], { dbPath: fresh.dbPath, configDir: missingConfigDir });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("No collections found");
+    expect(result.stderr).not.toContain("No config file at");
+  });
+
+  test("update refuses to run without the config file and indexes nothing", async () => {
+    await writeFile(join(notesDir, "b.md"), "# Beta\n\ncherry banana\n");
+
+    const result = await runQmd(["update"], { dbPath, configDir: missingConfigDir });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`No config file at ${join(missingConfigDir, "index.yml")}`);
+    expect(collectionNames()).toEqual(["notes"]);
+    expect(activePaths()).toEqual(["a.md"]);
+    expect(existsSync(join(missingConfigDir, "index.yml"))).toBe(false);
+  });
+
+  test("an existing config with no collections still removes them", async () => {
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+
+    const result = await runQmd(["ls"], { dbPath, configDir });
+    expect(result.exitCode).toBe(0);
+    expect(collectionNames()).toEqual([]);
+  });
+});
+
+// =============================================================================
 // Collection Ignore Patterns
 // =============================================================================
 
