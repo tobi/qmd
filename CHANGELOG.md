@@ -49,6 +49,9 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
+- Lex queries typed in decomposed Unicode (NFD), such as `impôt` spelled
+  `o` + U+0302, match again. The separator split treated the combining mark as
+  a separator and searched for `"impo t"`, which returned nothing (#966).
 
 ### Changed
 

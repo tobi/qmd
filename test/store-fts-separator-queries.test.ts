@@ -68,6 +68,7 @@ const PROBE_BODY = [
   "It touches src/lib/provision.ts and docs/SYNTAX.md, pins version 2026.4.10,",
   "calls apply_secrets and __init__, and reaches qmd://Vault/wiki over zero-SSH.",
   "Package @tobilu/qmd is a dependency.",
+  "Receipts for l'impôt were filed at the café.",
 ].join("\n");
 
 let testDir: string;
@@ -208,6 +209,33 @@ describe("underscores and case behave the same on both paths", () => {
   test("matching is case insensitive on both paths", async () => {
     const { store } = await createProbeStore();
     for (const query of ["pio-1384", "PIO-1384", '"pio-1384"', '"PIO-1384"', '"ZERO-ssh"']) {
+      expect(store.searchFTS(query, 10), query).toHaveLength(1);
+    }
+  });
+});
+
+// =============================================================================
+// Combining marks, upstream #966
+// =============================================================================
+
+describe("a combining mark does not split a word", () => {
+  // NFD spells ô as o + U+0302. The mark is neither a letter nor a digit, so a
+  // separator class without \p{M} split NFD "impôt" into the phrase "impo t",
+  // which no document holds. The corpus is NFC; the queries are NFD.
+  const nfd = (s: string) => s.normalize("NFD");
+
+  test("NFD terms match bare and quoted", async () => {
+    const { store } = await createProbeStore();
+    for (const word of ["impôt", "café"]) {
+      expect(nfd(word)).not.toBe(word);
+      expect(store.searchFTS(nfd(word), 10), `bare NFD ${word}`).toHaveLength(1);
+      expect(store.searchFTS(`"${nfd(word)}"`, 10), `quoted NFD ${word}`).toHaveLength(1);
+    }
+  });
+
+  test("NFC terms still match, and separators still split beside a mark", async () => {
+    const { store } = await createProbeStore();
+    for (const query of ["impôt", '"impôt"', "café", '"café"', "PIO-1384", '"PIO-1384"']) {
       expect(store.searchFTS(query, 10), query).toHaveLength(1);
     }
   });
