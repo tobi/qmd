@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- SDK `searchCandidates()` groups eligible documents by a scalar metadata
+  key before per-leg admission and reciprocal rank fusion. Callers control
+  raw retrieval depth and group targets, receive contribution traces and
+  separate document-depth/vector-cap coverage, and hydrate admitted source
+  representatives by their expected hashes. Existing search paths keep their
+  options, ranking, and result shapes.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
