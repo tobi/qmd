@@ -2127,6 +2127,12 @@ export type EmbedOptions = {
    * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
    */
   maxDurationMs?: number;
+  /**
+   * Cooperatively stop admitting new work when aborted. Already-started native
+   * operations are awaited before rejecting with the signal's reason; completed
+   * documents remain embedded and incomplete documents can be retried.
+   */
+  signal?: AbortSignal;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -2334,6 +2340,7 @@ export async function generateEmbeddings(
   store: Store,
   options?: EmbedOptions
 ): Promise<EmbedResult> {
+  options?.signal?.throwIfAborted();
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
@@ -2397,11 +2404,12 @@ export async function generateEmbeddings(
       retryQueue.delete(key);
     };
     const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
+      if (!session.isValid) return false;
       try {
         const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
         const result = await session.embed(text, { model });
         if (!result) {
-          recordFailure(chunk, "embedding returned no vector");
+          if (!options?.signal?.aborted) recordFailure(chunk, "embedding returned no vector");
           return false;
         }
         insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
@@ -2410,7 +2418,7 @@ export async function generateEmbeddings(
         clearFailure(chunk);
         return true;
       } catch (error) {
-        recordFailure(chunk, reasonFromError(error));
+        if (!options?.signal?.aborted) recordFailure(chunk, reasonFromError(error));
         return false;
       }
     };
@@ -2426,6 +2434,7 @@ export async function generateEmbeddings(
       do {
         let retried = 0;
         for (const [key, chunk] of [...retryQueue]) {
+          if (!session.isValid) break;
           const failure = failures.get(key);
           if (!failure || failure.attempts >= MAX_RETRY_ATTEMPTS) continue;
           retried++;
@@ -2452,6 +2461,7 @@ export async function generateEmbeddings(
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
       for (const doc of batchDocs) {
+        if (!session.isValid) break;
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
@@ -2463,6 +2473,7 @@ export async function generateEmbeddings(
           options?.chunkStrategy,
           session.signal,
         );
+        if (!session.isValid) break;
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -2480,6 +2491,7 @@ export async function generateEmbeddings(
         expectedChunksByHash.set(doc.hash, chunks.length);
       }
 
+      if (!session.isValid) break;
       totalChunks += batchChunks.length;
 
       if (batchChunks.length === 0) {
@@ -2492,6 +2504,7 @@ export async function generateEmbeddings(
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
         const firstResult = await session.embed(firstText, { model });
+        if (!session.isValid) break;
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -2506,7 +2519,9 @@ export async function generateEmbeddings(
         // Abort early if session has been invalidated (e.g. max duration exceeded)
         if (!session.isValid) {
           const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
+          if (!options?.signal?.aborted) {
+            for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
+          }
           console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
           break;
         }
@@ -2548,7 +2563,9 @@ export async function generateEmbeddings(
             successesSinceRetry++;
             clearFailure(chunk);
           }
-          for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
+          if (!options?.signal?.aborted) {
+            for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
+          }
           batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
           await retryFailedChunks();
         } catch (error) {
@@ -2557,10 +2574,13 @@ export async function generateEmbeddings(
           // cleared, so the visible error count reflects outstanding failures.
           const batchReason = reasonFromError(error);
           if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+            if (!options?.signal?.aborted) {
+              for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+            }
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
+              if (!session.isValid) break;
               await tryEmbedChunk(chunk);
               batchChunkBytesProcessed += chunk.bytes;
               await retryFailedChunks();
@@ -2593,7 +2613,9 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, signal: options?.signal, name: 'generateEmbeddings' });
+
+  options?.signal?.throwIfAborted();
 
   return {
     docsProcessed: totalDocs,

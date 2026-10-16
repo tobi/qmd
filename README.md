@@ -421,6 +421,13 @@ const embedResult = await store.embed({
 })
 ```
 
+Pass an optional `signal` to `store.embed()` for cooperative cancellation. An
+already-aborted force call does not clear vectors. Cancellation stops admitting
+later native evaluations and awaits work already in flight before rejecting with
+the signal's reason. Shared model initialization stays available to other callers.
+Unfinished documents remain eligible for another run; this does not retain partial
+document checkpoints or interrupt a native evaluation already started.
+
 #### Types
 
 Key types exported for SDK consumers:
