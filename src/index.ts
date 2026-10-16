@@ -550,7 +550,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     addCollection: async (name, opts) => {
       upsertStoreCollection(db, name, { path: opts.path, pattern: opts.pattern, ignore: opts.ignore });
       if (hasYamlConfig || options.config) {
-        collectionsAddCollection(name, opts.path, opts.pattern);
+        collectionsAddCollection(name, opts.path, opts.pattern, opts.ignore);
       }
     },
     removeCollection: async (name) => {

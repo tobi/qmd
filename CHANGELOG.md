@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- SDK `addCollection()` now saves its `ignore` patterns to the YAML or inline
+  config. Before, the exclusions applied only to the current index, so a new
+  store opened from the same config indexed the excluded files again.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
