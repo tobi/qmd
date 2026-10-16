@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 const root = new URL("..", import.meta.url);
 const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
@@ -106,5 +107,19 @@ describe("Nix flake package layout", () => {
     expect(flake).toContain('GGML_LOG_LEVEL:-error');
     expect(flake).toContain('GGML_BACKEND_SILENT:-1');
     expect(flake).toContain('GGML_METAL_NO_RESIDENCY:-1');
+  });
+});
+
+describe("package Node engine range", () => {
+  test("only admits Node releases with Node-API 10, which better-sqlite3 13 needs", () => {
+    // better-sqlite3 13 builds with NAPI_VERSION=10. Node 22.0 to 22.13 and
+    // 23.0 to 23.5 only support Node-API 9 and segfault on the first database
+    // open. If better-sqlite3 raises its Node-API version, raise this floor too.
+    const require = createRequire(import.meta.url);
+    const sqliteDir = dirname(require.resolve("better-sqlite3/package.json"));
+    const gyp = readFileSync(join(sqliteDir, "binding.gyp"), "utf8");
+    expect(gyp).toContain("NAPI_VERSION=10");
+
+    expect(pkg.engines.node).toBe("^22.14.0 || >=23.6.0");
   });
 });
