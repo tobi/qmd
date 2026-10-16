@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import YAML from "yaml";
+import { createHash } from "node:crypto";
 import {
   createStore,
   type QMDStore,
@@ -777,6 +778,32 @@ describe("get and multiGet", () => {
   test("multiGet retrieves multiple documents", async () => {
     const { docs, errors } = await store.multiGet("qmd://docs/*.md");
     expect(docs.length).toBeGreaterThan(0);
+  });
+
+  test("multiGet retrieves a glob beyond Node's SQLite parameter limit", async () => {
+    const batchStore = await createStore({
+      dbPath: ":memory:",
+      config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } },
+    });
+    try {
+      // better-sqlite3 allows at most 32,766 SQL parameters.
+      const count = 32_767;
+      const body = "# Batch document\n";
+      const hash = createHash("sha256").update(body).digest("hex");
+      const now = new Date().toISOString();
+      batchStore.internal.insertContent(hash, body, now);
+      for (let i = 0; i < count; i++) {
+        batchStore.internal.insertDocument("docs", `document-${i}.md`, "Batch document", hash, now, now);
+      }
+
+      const { docs, errors } = await batchStore.multiGet("qmd://docs/*.md", { includeBody: true });
+      expect(errors).toEqual([]);
+      expect(docs).toHaveLength(count);
+      expect(new Set(docs.map(result => result.doc.filepath)).size).toBe(count);
+      expect(docs.every(result => !result.skipped && result.doc.body === body)).toBe(true);
+    } finally {
+      await batchStore.close();
+    }
   });
 });
 

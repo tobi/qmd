@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- SDK `multiGet()` and MCP `multi_get` no longer fail with "too many SQL variables" on Node when a glob matches more than 32,766 documents.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

@@ -5901,13 +5901,12 @@ export function findDocuments(
       return { docs: [], errors };
     }
     const virtualPaths = matched.map(m => m.filepath);
-    const placeholders = virtualPaths.map(() => '?').join(',');
     fileRows = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
-    `).all(...virtualPaths) as DbDocRow[];
+      WHERE 'qmd://' || d.collection || '/' || d.path IN (SELECT value FROM json_each(?)) AND d.active = 1
+    `).all(JSON.stringify(virtualPaths)) as DbDocRow[];
   }
 
   const results: MultiGetResult[] = [];
