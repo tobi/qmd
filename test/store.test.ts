@@ -39,6 +39,7 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
+  findTableRegions,
   isInsideCodeFence,
   findBestCutoff,
   type BreakPoint,
@@ -848,6 +849,16 @@ describe("scanBreakPoints", () => {
 });
 
 describe("findCodeFences", () => {
+  test("finds a code fence at the start of the document", () => {
+    const text = "```md\n| name | value |\n| --- | --- |\n```\nAfter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: text.indexOf("\nAfter") }]);
+  });
+
+  test("finds tilde fences", () => {
+    const text = "~~~md\n| name | value |\n| --- | --- |\n~~~\nAfter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: text.indexOf("\nAfter") }]);
+  });
+
   test("finds single code fence", () => {
     const text = "Before\n```js\ncode here\n```\nAfter";
     const fences = findCodeFences(text);
@@ -874,6 +885,18 @@ describe("findCodeFences", () => {
     const text = "No code fences here";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(0);
+  });
+});
+
+describe("findTableRegions", () => {
+  test("requires a delimiter row and ignores pipe rows inside code fences", () => {
+    expect(findTableRegions("| prose |\n| still prose |\n" )).toEqual([]);
+
+    const fencedTable = "```md\n| name | value |\n| --- | --- |\n| x | y |\n```";
+    expect(findTableRegions(fencedTable)).toEqual([]);
+
+    const tildeFencedTable = "~~~md\n| name | value |\n| --- | --- |\n| x | y |\n~~~";
+    expect(findTableRegions(tildeFencedTable)).toEqual([]);
   });
 });
 
@@ -969,6 +992,70 @@ describe("findBestCutoff", () => {
 });
 
 describe("Smart Chunking Integration", () => {
+  test("chunkDocument keeps oversized markdown table rows intact and repeats the header", () => {
+    const header = "| parameter | type | default | description |\n| --- | --- | --- | --- |";
+    const rows = Array.from(
+      { length: 50 },
+      (_, i) => `| parameter_${i} | string | value_${i} | ${"description ".repeat(3)}${i} |`,
+    );
+    const content = `${header}\n${rows.join("\n")}`;
+
+    const chunks = chunkDocument(content, 1000, 100, 200);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.startsWith(header)).toBe(true);
+      expect(chunk.text.split("\n").every(line => line.startsWith("|"))).toBe(true);
+    }
+
+    const emittedRows = chunks.flatMap(chunk => chunk.text.split("\n").slice(2));
+    expect(new Set(emittedRows)).toEqual(new Set(rows));
+  });
+
+  test("does not split a table row that is longer than the chunk target", () => {
+    const header = `| ${"h".repeat(1200)} | type |`;
+    const delimiter = "| --- | --- |";
+    const rows = Array.from({ length: 4 }, (_, i) => `| row_${i} | ${"value ".repeat(12)} |`);
+    const content = [header, delimiter, ...rows].join("\n");
+
+    const chunks = chunkDocument(content, 1000, 100, 200);
+    const expectedLines = new Set([header, delimiter, ...rows]);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.split("\n").every(line => expectedLines.has(line))).toBe(true);
+    }
+    expect(new Set(chunks.flatMap(chunk => chunk.text.split("\n").filter(line => rows.includes(line))))).toEqual(new Set(rows));
+  });
+
+  test("recognizes tables without optional outer pipes", () => {
+    const header = "name | value";
+    const delimiter = "--- | ---";
+    const rows = Array.from({ length: 50 }, (_, i) => `item_${i} | ${"value ".repeat(3)}${i}`);
+    const content = [header, delimiter, ...rows].join("\n");
+
+    const chunks = chunkDocument(content, 300, 50, 100);
+    const expectedLines = new Set([header, delimiter, ...rows]);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.split("\n").every(line => expectedLines.has(line))).toBe(true);
+      expect(chunk.text.startsWith(header)).toBe(true);
+    }
+    expect(new Set(chunks.flatMap(chunk => chunk.text.split("\n").filter(line => rows.includes(line))))).toEqual(new Set(rows));
+  });
+
+  test("keeps a table together when it fits within the chunk allowance", () => {
+    const header = "| name | value |\n| --- | --- |";
+    const rows = Array.from({ length: 12 }, (_, i) => `| item_${i} | ${"value ".repeat(4)}${i} |`);
+    const content = `${header}\n${rows.join("\n")}`;
+
+    const chunks = chunkDocument(content, 400, 0, 100);
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.text).toBe(content);
+  });
+
   test("chunkDocument prefers headings over arbitrary breaks", () => {
     // Create content where the heading falls within the search window
     // We want the heading at ~1700 chars so it's in the window for a 2000 char target

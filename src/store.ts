@@ -205,12 +205,19 @@ export interface BreakPoint {
 }
 
 /**
- * A region where a code fence exists (between ``` markers).
+ * A region where a code fence exists (between matching backtick or tilde markers).
  * We should never split inside a code fence.
  */
 export interface CodeFenceRegion {
   start: number;  // position of opening ```
   end: number;    // position of closing ``` (or document end if unclosed)
+}
+
+/** A Markdown pipe table and the end of its header (header plus delimiter row). */
+export interface TableRegion {
+  start: number;
+  end: number;
+  headerEnd: number;
 }
 
 /**
@@ -264,27 +271,31 @@ export function scanBreakPoints(text: string): BreakPoint[] {
 
 /**
  * Find all code fence regions in the text.
- * Code fences are delimited by ``` and we should never split inside them.
+ * Code fences are delimited by matching backtick or tilde markers and we should never split inside them.
  */
 export function findCodeFences(text: string): CodeFenceRegion[] {
   const regions: CodeFenceRegion[] = [];
-  const fencePattern = /\n```/g;
-  let inFence = false;
-  let fenceStart = 0;
+  let openFence: { start: number; marker: string } | undefined;
+  let lineStart = 0;
 
-  for (const match of text.matchAll(fencePattern)) {
-    if (!inFence) {
-      fenceStart = match.index!;
-      inFence = true;
-    } else {
-      regions.push({ start: fenceStart, end: match.index! + match[0].length });
-      inFence = false;
+  for (const line of text.split("\n")) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (openFence) {
+      const marker = match?.[1];
+      const closingText = match?.[2];
+      if (marker && marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && /^\s*$/.test(closingText!)) {
+        regions.push({ start: openFence.start, end: lineStart + marker.length });
+        openFence = undefined;
+      }
+    } else if (match && (match[1]![0] !== "`" || !match[2]!.includes("`"))) {
+      openFence = { start: lineStart > 0 ? lineStart - 1 : 0, marker: match[1]! };
     }
+    lineStart += line.length + 1;
   }
 
   // Handle unclosed fence - extends to end of document
-  if (inFence) {
-    regions.push({ start: fenceStart, end: text.length });
+  if (openFence) {
+    regions.push({ start: openFence.start, end: text.length });
   }
 
   return regions;
@@ -295,6 +306,55 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
  */
 export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
   return fences.some(f => pos > f.start && pos < f.end);
+}
+
+/**
+ * Find contiguous Markdown pipe tables, excluding lines inside fenced code.
+ * A run qualifies only when its second pipe row is a delimiter row.
+ */
+export function findTableRegions(text: string, codeFences: CodeFenceRegion[] = findCodeFences(text)): TableRegion[] {
+  const lines: { start: number; next: number; text: string }[] = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    const end = offset + line.length;
+    lines.push({ start: offset, next: Math.min(end + 1, text.length), text: line.replace(/\r$/, "") });
+    offset = end + 1;
+  }
+
+  const isPipeRow = (line: typeof lines[number]): boolean => line.text.includes("|");
+  const isDelimiterRow = (line: typeof lines[number]): boolean => {
+    if (!isPipeRow(line)) return false;
+    const cells = line.text.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+    return cells.length > 0 && cells.every(cell => /^\s*:?-+:?\s*$/.test(cell));
+  };
+  const isInFence = (line: typeof lines[number]): boolean => isInsideCodeFence(line.start, codeFences);
+
+  const regions: TableRegion[] = [];
+  for (let i = 0; i + 1 < lines.length;) {
+    if (isInFence(lines[i]!) || isInFence(lines[i + 1]!) || !isPipeRow(lines[i]!) || !isDelimiterRow(lines[i + 1]!)) {
+      i++;
+      continue;
+    }
+
+    let last = i + 1;
+    while (last + 1 < lines.length && !isInFence(lines[last + 1]!) && isPipeRow(lines[last + 1]!)) last++;
+    regions.push({ start: lines[i]!.start, end: lines[last]!.next, headerEnd: lines[i + 1]!.next });
+    i = last + 1;
+  }
+  return regions;
+}
+
+function findTableRegionAt(pos: number, regions: TableRegion[]): TableRegion | undefined {
+  let low = 0;
+  let high = regions.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    const region = regions[mid]!;
+    if (pos <= region.start) high = mid;
+    else if (pos >= region.end) low = mid + 1;
+    else return region;
+  }
+  return undefined;
 }
 
 /**
@@ -428,15 +488,31 @@ export function chunkDocumentWithBreakPoints(
   }
 
   const chunks: { text: string; pos: number }[] = [];
+  const tableRegions = findTableRegions(content, codeFences);
+  const tableBreakPoints: BreakPoint[] = tableRegions.flatMap(table => [
+    { pos: table.start > 0 ? table.start - 1 : table.start, score: 60, type: "table-start" },
+    { pos: table.end, score: 60, type: "table-end" },
+  ]);
+  const allBreakPoints = mergeBreakPoints(breakPoints, tableBreakPoints);
+  let tableIndex = 0;
+  const eligibleBreakPoints = allBreakPoints.filter(bp => {
+    while (tableIndex < tableRegions.length && bp.pos >= tableRegions[tableIndex]!.end) tableIndex++;
+    const table = tableRegions[tableIndex];
+    return !table || bp.pos <= table.start || table.end - table.start > maxChars * 1.5;
+  });
   let charPos = 0;
 
   while (charPos < content.length) {
     const targetEndPos = Math.min(charPos + maxChars, content.length);
     let endPos = targetEndPos;
+    const crossedTable = findTableRegionAt(targetEndPos, tableRegions);
+    if (crossedTable && crossedTable.end - crossedTable.start <= maxChars * 1.5 && crossedTable.end <= charPos + maxChars * 1.5) {
+      endPos = crossedTable.end;
+    }
 
-    if (endPos < content.length) {
+    if (endPos === targetEndPos && endPos < content.length) {
       const bestCutoff = findBestCutoff(
-        breakPoints,
+        eligibleBreakPoints,
         targetEndPos,
         windowChars,
         0.7,
@@ -457,12 +533,37 @@ export function chunkDocumentWithBreakPoints(
     // remote embedding APIs.
     endPos = adjustSurrogateBoundary(content, endPos, charPos);
 
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+    // When a table row itself exceeds the chunk budget, keep the row intact
+    // even if no newline breakpoint falls inside the search window.
+    const tableAtChunkEnd = findTableRegionAt(endPos, tableRegions);
+    if (tableAtChunkEnd && content[endPos] !== "\n") {
+      const rowEnd = content.indexOf("\n", endPos);
+      endPos = rowEnd === -1 ? content.length : rowEnd;
+    }
+
+    const tableAtChunkStart = findTableRegionAt(charPos, tableRegions);
+    const continuedTable = tableAtChunkStart &&
+      tableAtChunkStart.end - tableAtChunkStart.start > maxChars * 1.5 &&
+      charPos >= tableAtChunkStart.headerEnd
+      ? tableAtChunkStart
+      : undefined;
+    const prefix = continuedTable ? content.slice(continuedTable.start, continuedTable.headerEnd) : "";
+    chunks.push({ text: prefix + content.slice(charPos, endPos), pos: charPos });
 
     if (endPos >= content.length) {
       break;
     }
     charPos = endPos - overlapChars;
+    const tableAtNextStart = findTableRegionAt(charPos, tableRegions);
+    if (tableAtNextStart) {
+      if (tableAtNextStart.end - tableAtNextStart.start <= maxChars * 1.5) {
+        charPos = tableAtNextStart.start;
+      } else {
+        if (content[charPos] === "\n") charPos++;
+        const lineStart = content.lastIndexOf("\n", charPos - 1) + 1;
+        charPos = Math.max(lineStart, tableAtNextStart.headerEnd);
+      }
+    }
     const lastChunkPos = chunks.at(-1)!.pos;
     if (charPos <= lastChunkPos) {
       charPos = endPos;
