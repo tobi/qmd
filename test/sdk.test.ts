@@ -8,6 +8,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { getEventListeners } from "node:events";
 import { join } from "node:path";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import YAML from "yaml";
@@ -985,6 +986,108 @@ describe("embed", () => {
       },
     };
   }
+
+  test("already-aborted embed does not clear existing vectors or enter the model", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } } });
+    const fakeLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+    try {
+      await store.update();
+      await store.embed();
+      const before = store.internal.db.prepare("SELECT COUNT(*) AS n FROM content_vectors").get();
+      const calls = fakeLlm.embedBatchCalls.length;
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled before admission");
+      controller.abort(reason);
+      await expect(store.embed({ force: true, signal: controller.signal })).rejects.toBe(reason);
+      expect(store.internal.db.prepare("SELECT COUNT(*) AS n FROM content_vectors").get()).toEqual(before);
+      expect(fakeLlm.embedBatchCalls).toHaveLength(calls);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("cancellation during document preparation does not enter native embedding", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } } });
+    const fakeLlm = createFakeEmbedLlm();
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled during tokenization");
+    let dimensionCalls = 0;
+    const tokenize = fakeLlm.tokenize;
+    fakeLlm.tokenize = async text => { controller.abort(reason); return tokenize(text); };
+    fakeLlm.embed = async () => { dimensionCalls++; return { embedding: [1, 2, 3], model: "fake-embed" }; };
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+    try {
+      await store.update();
+      await expect(store.embed({ signal: controller.signal })).rejects.toBe(reason);
+      expect(dimensionCalls).toBe(0);
+      expect(fakeLlm.embedBatchCalls).toHaveLength(0);
+      expect(store.internal.getHashesNeedingEmbedding()).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("cancellation awaits an in-flight batch and leaves later documents eligible", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } } });
+    const fakeLlm = createFakeEmbedLlm();
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled in flight");
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pendingNative = new Promise<void>(resolve => { release = resolve; });
+    const embedBatch = fakeLlm.embedBatch;
+    fakeLlm.embedBatch = async texts => { entered(); await pendingNative; return embedBatch(texts); };
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+    try {
+      await store.update();
+      let settled = false;
+      const progressErrors: number[] = [];
+      const operation = store.embed({ signal: controller.signal, maxDocsPerBatch: 1,
+        onProgress: progress => progressErrors.push(progress.errors) });
+      const outcome = operation.then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
+      await started;
+      controller.abort(reason);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      release();
+      expect(await outcome).toEqual({ error: reason });
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(progressErrors.every(errors => errors === 0)).toBe(true);
+      expect(store.internal.getHashesNeedingEmbedding()).toBe(2);
+      fakeLlm.embedBatch = embedBatch;
+      const resumed = await store.embed({ maxDocsPerBatch: 1 });
+      expect(resumed.chunksEmbedded).toBe(2);
+      expect(store.internal.getHashesNeedingEmbedding()).toBe(0);
+    } finally {
+      release();
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("completed embedding releases its external cancellation listener", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } } });
+    const controller = new AbortController();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = createFakeEmbedLlm() as any;
+    try {
+      await store.update();
+      await store.embed({ signal: controller.signal });
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      await store.embed({ signal: controller.signal, force: true });
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
 
   test("store.embed forwards batch limit options", async () => {
     const store = await createStore({

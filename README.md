@@ -421,6 +421,23 @@ const embedResult = await store.embed({
 })
 ```
 
+Pass an optional `signal` to `store.embed()` for cooperative cancellation. An
+already-aborted force call does not clear vectors. Cancellation stops admitting
+later native evaluations and awaits work already in flight before rejecting with
+the signal's reason. Shared model initialization stays available to other callers.
+Unfinished documents remain eligible for another run. Cancellation does not
+interrupt a native evaluation already started.
+
+Pass `resume: true` to retain successfully stored chunks of unfinished documents
+and reuse them on a later `store.embed({ resume: true })` call. A checkpoint is
+reused only when the entire formatted chunk plan, chunk positions, model and
+embedding fingerprint still match; a changed plan is regenerated. Partial
+checkpoints stay out of vector search until the document is complete, including
+collection- and metadata-scoped searches. Without `resume`, incomplete chunks
+are discarded as before, including checkpoints left by an earlier opt-in call.
+Existing complete legacy embeddings remain searchable. Use `force: true` when
+you want to regenerate already-complete documents with a different chunk plan.
+
 #### Types
 
 Key types exported for SDK consumers:

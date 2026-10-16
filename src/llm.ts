@@ -203,6 +203,8 @@ export type ModelInfo = {
  * Options for embedding
  */
 export type EmbedOptions = {
+  /** Stop admission after abort; shared setup and admitted native calls are awaited. */
+  signal?: AbortSignal;
   model?: string;
   isQuery?: boolean;
   title?: string;
@@ -1471,14 +1473,17 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (options.signal?.aborted) return null;
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
     try {
       const context = await this.ensureEmbedContext();
+      if (options.signal?.aborted) return null;
 
       // Guard: truncate text that exceeds model context window to prevent GGML crash
       const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+      if (options.signal?.aborted) return null;
       if (truncated) {
         console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
       }
@@ -1490,6 +1495,7 @@ export class LlamaCpp implements LLM {
         model: options.model ?? this.embedModelUri,
       };
     } catch (error) {
+      if (options.signal?.aborted) return null;
       console.error("Embedding error:", error);
       return null;
     }
@@ -1500,6 +1506,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (options.signal?.aborted) return texts.map(() => null);
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1508,6 +1515,7 @@ export class LlamaCpp implements LLM {
 
     try {
       const contexts = await this.ensureEmbedContexts();
+      if (options.signal?.aborted) return texts.map(() => null);
       const n = contexts.length;
 
       if (n === 1) {
@@ -1515,8 +1523,10 @@ export class LlamaCpp implements LLM {
         const context = contexts[0]!;
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
+          if (options.signal?.aborted) { embeddings.push(null); continue; }
           try {
             const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+            if (options.signal?.aborted) { embeddings.push(null); continue; }
             if (truncated) {
               console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
@@ -1542,8 +1552,10 @@ export class LlamaCpp implements LLM {
           const ctx = contexts[i]!;
           const results: (EmbeddingResult | null)[] = [];
           for (const text of chunk) {
+            if (options.signal?.aborted) { results.push(null); continue; }
             try {
               const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+              if (options.signal?.aborted) { results.push(null); continue; }
               if (truncated) {
                 console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
@@ -1561,6 +1573,7 @@ export class LlamaCpp implements LLM {
 
       return chunkResults.flat();
     } catch (error) {
+      if (options.signal?.aborted) return texts.map(() => null);
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
     }
@@ -1991,6 +2004,7 @@ class LLMSession implements ILLMSession {
   private abortController: AbortController;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
   private name: string;
+  private unlinkExternalSignal: (() => void) | null = null;
 
   constructor(manager: LLMSessionManager, options: LLMSessionOptions = {}) {
     this.manager = manager;
@@ -2002,9 +2016,10 @@ class LLMSession implements ILLMSession {
       if (options.signal.aborted) {
         this.abortController.abort(options.signal.reason);
       } else {
-        options.signal.addEventListener("abort", () => {
-          this.abortController.abort(options.signal!.reason);
-        }, { once: true });
+        const signal = options.signal;
+        const onAbort = () => this.abortController.abort(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.unlinkExternalSignal = () => signal.removeEventListener("abort", onAbort);
       }
     }
 
@@ -2042,6 +2057,8 @@ class LLMSession implements ILLMSession {
       this.maxDurationTimer = null;
     }
 
+    this.unlinkExternalSignal?.();
+    this.unlinkExternalSignal = null;
     this.abortController.abort(new Error("Session released"));
     this.manager.release();
   }
@@ -2069,11 +2086,11 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, { ...options, signal: options?.signal ? AbortSignal.any([this.signal, options.signal]) : this.signal }));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, { ...options, signal: options?.signal ? AbortSignal.any([this.signal, options.signal]) : this.signal }));
   }
 
   async expandQuery(
