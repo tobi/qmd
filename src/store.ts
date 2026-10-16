@@ -47,6 +47,7 @@ import {
   type VectorMigrationProgress,
 } from "./store-migrations.js";
 import type { Database, SQLiteValue } from "./db.js";
+import { inspectVectorIndex, type VectorIndexInspection } from "./vector-inspection.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -1593,6 +1594,7 @@ export type Store = {
   // Index health
   getHashesNeedingEmbedding: (model?: string) => number;
   getIndexHealth: (model?: string) => IndexHealthInfo;
+  inspectVectorIndex: (model?: string) => VectorIndexInspection;
   getStatus: (model?: string) => IndexStatus;
   getStatusSummary: (model?: string) => IndexStatusSummary;
 
@@ -2626,6 +2628,16 @@ export function createStore(dbPath?: string): Store {
     // Index health
     getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    inspectVectorIndex: (model?: string) => {
+      const selectedModel = model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
+      const embeddingFingerprint = getEmbeddingFingerprint(selectedModel);
+      return inspectVectorIndex(
+        db,
+        selectedModel,
+        embeddingFingerprint,
+        () => getHashesNeedingEmbedding(db, undefined, selectedModel),
+      );
+    },
     getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getStatusSummary: (model?: string) => getStatusSummary(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
 
