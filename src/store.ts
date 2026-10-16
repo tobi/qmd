@@ -4338,7 +4338,12 @@ export function renameCollection(db: Database, oldName: string, newName: string)
       }
     }
 
+    // The UPDATE trigger writes raw text; rebuild moved rows to retain CJK normalization.
+    const moved = db.prepare(`SELECT id FROM documents WHERE collection = ?`).all<{ id: number }>(oldName);
     db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+    for (const { id } of moved) {
+      rebuildDocumentFTS(db, id);
+    }
     // The documents keep their ids and paths, so their sync rows stay valid
     // under the new name. Rows already under it belong to no collection.
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);

@@ -34,7 +34,7 @@ import {
   getStoreContexts,
   upsertStoreCollection,
   deleteStoreCollection,
-  renameStoreCollection,
+  renameCollection as renameIndexedCollection,
   updateStoreContext,
   removeStoreContext,
   setStoreGlobalContext,
@@ -561,11 +561,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
-      if (hasYamlConfig || options.config) {
-        collectionsRenameCollection(oldName, newName);
-      }
-      return result;
+      // Keep indexed identities unchanged if config write-through fails.
+      const rename = db.transaction(() => {
+        const exists = getStoreCollection(db, oldName) !== null;
+        if (exists) {
+          renameIndexedCollection(db, oldName, newName);
+        }
+        if (hasYamlConfig || options.config) {
+          collectionsRenameCollection(oldName, newName);
+        }
+        return exists;
+      });
+      return rename();
     },
     listCollections: async () => storeListCollections(db),
     listMetadata: async (opts) => storeListMetadata(db, {
