@@ -242,6 +242,10 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Enable centroid expansion (Rocchio) — thematic clustering */
+  expandCentroid?: boolean;
+  /** Top-k RRF results to form centroid (default 3) */
+  centroidK?: number;
 }
 
 /**

@@ -426,9 +426,11 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        expandCentroid: z.boolean().optional().describe("Enable centroid expansion (Rocchio) — thematic clustering via mean of top-k embeddings, +recall on broad queries. Uses stored vectors when available, fallback re-embed."),
+        centroidK: z.number().optional().describe("Top-k RRF results to form centroid (default 3)"),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank, expandCentroid, centroidK }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -457,8 +459,8 @@ Intent-aware lex (C++ performance, not sports):
       // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
       // `searches` runs the caller's typed sub-queries directly.
       const searchOptions = query
-        ? { query }
-        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
+        ? { query, expandCentroid, centroidK }
+        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })), expandCentroid, centroidK };
 
       const results = await store.search({
         ...searchOptions,
