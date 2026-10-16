@@ -661,9 +661,19 @@ const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
+/**
+ * Detect if running inside WSL (Windows Subsystem for Linux).
+ * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths,
+ * and CUDA goes through the Windows GPU driver.
+ */
+export function isWSL(): boolean {
+  return !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+}
+
 type ParallelismOptions = {
   gpu: string | false;
   platform?: NodeJS.Platform;
+  wsl?: boolean;
   computed: number;
   envValue?: string;
 };
@@ -688,7 +698,11 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   // node-llama-cpp/llama.cpp CUDA on Windows is unstable with multiple
   // simultaneous contexts (ggml-cuda.cu:98 in #519). Vulkan and CPU do not
   // show the same failure mode, so only serialize Windows CUDA by default.
-  if ((options.platform ?? process.platform) === "win32" && options.gpu === "cuda") {
+  // WSL reports "linux" but its CUDA runs on the same Windows driver and
+  // aborts intermittently in cuMemAddressReserve (ggml-cuda.cu:106).
+  const platform = options.platform ?? process.platform;
+  const wsl = options.wsl ?? (platform === "linux" && isWSL());
+  if ((platform === "win32" || wsl) && options.gpu === "cuda") {
     return 1;
   }
 
