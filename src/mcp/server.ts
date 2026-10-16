@@ -248,7 +248,7 @@ function getInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promise<McpServer> {
+export async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promise<McpServer> {
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
   // work to settle before disposing the store/llm underneath it.
   const track = inflight?.track ?? (<T,>(fn: T): T => fn);
