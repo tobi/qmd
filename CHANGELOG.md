@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A lex query written as a question (it contains a stopword or ends with `?`,
+  and uses no quotes or `-negation`) is searched as an OR of its content words,
+  without prefix expansion, ranked by BM25. Before, every word was required as
+  a prefix, so a question rarely matched any document and the prefixes of
+  short function words made the query slow. Keyword queries and the explicit
+  syntax keep their parse.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
