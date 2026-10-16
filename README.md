@@ -217,6 +217,47 @@ Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return
 `qmd://collection/path` URIs in the `file` field, matching the CLI and MCP output.
 
+#### Embedded MCP query policy
+
+Integrations embedding QMD source can opt into separate routine and reranked search tools:
+
+```typescript
+import { createMcpServer } from './src/mcp/server.js'
+
+const server = await createMcpServer(store, undefined, { queryPolicy: 'split-rerank' })
+```
+
+The example imports the source factory; the npm package does not currently
+export an MCP subpath. This policy forces routine `query` to skip reranking and removes its
+`rerank`/`candidateLimit` inputs. The separate `query_reranked` tool always
+reranks, with `candidateLimit` defaulting to 10 and restricted to integers
+from 1 through 20. Both preserve plain/typed queries, collection defaults,
+metadata filtering and result formatting. Existing factory callers and
+CLI stdio/HTTP servers retain the standard `query` tool and its existing
+rerank toggle. This controls reranking only; query expansion and vector
+search can still use models.
+
+#### Embedded MCP source handoff
+
+Source integrations using the factory above can also set
+`sourceRoot: '/workspace/knowledge'`. Query results then include
+`collection` and `source_relative_path`: for a collection rooted at
+`/workspace/knowledge/notes`, an indexed `_meta/source_path.md` maps to
+`notes/_meta/source_path.md`. Exact source spelling is preserved in both
+routine and reranked query results.
+
+The mapping reads current registered collection configuration for each
+query and returns null for unknown, absolute, traversing or outside-root
+paths. Without `sourceRoot`, result fields remain unchanged. Absolute
+collection/root paths are never added to the result.
+
+This is lexical path metadata, not filesystem access or authorization.
+It does not check file existence, follow symlinks or guarantee that
+indexed text matches the current file. The authoritative filesystem
+consumer must enforce its own Roots/access policy when reopening it.
+The built-in CLI stdio/HTTP defaults are unchanged; this setting is an
+opt-in source-factory option.
+
 ### SDK / Library Usage
 
 Use QMD as a library in your own Node.js or Bun applications.
