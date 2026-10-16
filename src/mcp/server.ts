@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { existsSync } from "fs";
@@ -49,7 +50,7 @@ type SearchResultItem = {
   file: string;
   title: string;
   score: number;
-  context: string | null;
+  context?: string | null;  // Folder context (omitted per-row in compact mode)
   metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
   line: number;   // Absolute line in source markdown
   snippet: string;
@@ -121,6 +122,39 @@ function encodeQmdPath(path: string): string {
 /**
  * Format search results as human-readable text summary
  */
+/**
+ * Opt-in compact mode: when QMD_MCP_COMPACT=1, tool responses return
+ * structuredContent only and skip the duplicated human-readable text block
+ * (dual-render). Default behaviour is unchanged.
+ */
+export function isCompactMode(): boolean {
+  return process.env.QMD_MCP_COMPACT === "1";
+}
+
+/**
+ * Build a tool response honouring compact mode. Non-compact keeps the
+ * dual-render (text + structuredContent) that all clients understand.
+ */
+export function toolResponse(structured: CallToolResult["structuredContent"] & object, text: string): CallToolResult {
+  // content: [] keeps the SDK type happy; structuredContent carries the payload.
+  if (isCompactMode()) return { content: [], structuredContent: structured };
+  return { content: [{ type: "text", text }], structuredContent: structured };
+}
+
+/**
+ * Compact query responses: per-row folder `context` is highly repetitive
+ * (usually one value per collection), so hoist it to a single top-level
+ * `collection_context` — a string when uniform, an array when distinct.
+ */
+export function hoistCollectionContext<T extends { context?: string | null }>(
+  rows: T[],
+): { collection_context?: string | string[]; results: Omit<T, "context">[] } {
+  const results = rows.map(({ context: _drop, ...rest }) => rest);
+  const contexts = [...new Set(rows.map(r => r.context).filter((c): c is string => !!c))];
+  if (contexts.length === 0) return { results };
+  return { collection_context: contexts.length === 1 ? contexts[0]! : contexts, results };
+}
+
 function formatSearchSummary(results: SearchResultItem[], query: string): string {
   if (results.length === 0) {
     return `No results found for "${query}"`;
@@ -478,6 +512,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches?.[0]?.query
         || "";
 
+      const compact = isCompactMode();
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
         return {
@@ -485,17 +520,16 @@ Intent-aware lex (C++ performance, not sports):
           file: r.displayPath,
           title: r.title,
           score: Math.round(r.score * 100) / 100,
-          context: r.context,
+          // Compact: per-row context is hoisted to a top-level collection_context
+          ...(compact ? {} : { context: r.context }),
           ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
           line,
           snippet: addLineNumbers(snippet, line),
         };
       });
 
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
-      };
+      const structured = compact ? hoistCollectionContext(filtered) : { results: filtered };
+      return toolResponse(structured, formatSearchSummary(filtered, primaryQuery));
     })
   );
 
@@ -685,10 +719,7 @@ Intent-aware lex (C++ performance, not sports):
         summary.push(`  Metadata: call the 'metadata' tool to see values and counts before writing a 'filter'`);
       }
 
-      return {
-        content: [{ type: "text", text: summary.join('\n') }],
-        structuredContent: status,
-      };
+      return toolResponse(status, summary.join('\n'));
     })
   );
 
@@ -783,10 +814,7 @@ Every value reported here can be matched with \`{field: '<metadata-key>', operat
         emptyMessage: "No metadata matches. Call without match/filter to see which keys exist, or check the status tool for collections with metadata.",
       });
 
-      return {
-        content: [{ type: "text", text }],
-        structuredContent: result,
-      };
+      return toolResponse(result, text);
     })
   );
 

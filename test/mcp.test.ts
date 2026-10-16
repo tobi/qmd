@@ -1250,6 +1250,86 @@ const mcp2026Meta = {
   "io.modelcontextprotocol/clientCapabilities": {},
 };
 
+// =============================================================================
+// Compact mode (QMD_MCP_COMPACT=1) — opt-in payload reduction
+// =============================================================================
+
+import { isCompactMode, toolResponse, hoistCollectionContext } from "../src/mcp/server";
+
+describe("compact mode (QMD_MCP_COMPACT=1)", () => {
+  const ENV_KEY = "QMD_MCP_COMPACT";
+
+  test("isCompactMode reflects the env var", () => {
+    const prev = process.env[ENV_KEY];
+    try {
+      delete process.env[ENV_KEY];
+      expect(isCompactMode()).toBe(false);
+      process.env[ENV_KEY] = "1";
+      expect(isCompactMode()).toBe(true);
+      process.env[ENV_KEY] = "0";
+      expect(isCompactMode()).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = prev;
+    }
+  });
+
+  test("default (non-compact) keeps dual-render: content + structuredContent", () => {
+    const prev = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+    try {
+      const res = toolResponse({ results: [1] }, "summary text");
+      expect(res.content).toEqual([{ type: "text", text: "summary text" }]);
+      expect(res.structuredContent).toEqual({ results: [1] });
+    } finally {
+      if (prev !== undefined) process.env[ENV_KEY] = prev;
+    }
+  });
+
+  test("compact omits the duplicated text content block (empty content array)", () => {
+    const prev = process.env[ENV_KEY];
+    process.env[ENV_KEY] = "1";
+    try {
+      const res = toolResponse({ results: [1] }, "summary text");
+      expect(res.content).toEqual([]);
+      expect(res.structuredContent).toEqual({ results: [1] });
+    } finally {
+      if (prev === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = prev;
+    }
+  });
+
+  test("hoistCollectionContext dedupes per-row context into one top-level field", () => {
+    const rows = [
+      { file: "a.md", context: "Meetings" },
+      { file: "b.md", context: "Meetings" },
+    ];
+    const out = hoistCollectionContext(rows);
+    expect(out.collection_context).toBe("Meetings");
+    expect(out.results).toEqual([
+      { file: "a.md" },
+      { file: "b.md" },
+    ]);
+  });
+
+  test("hoistCollectionContext uses an array for distinct contexts", () => {
+    const rows = [
+      { file: "a.md", context: "Meetings" },
+      { file: "b.md", context: "Docs" },
+      { file: "c.md", context: null },
+    ];
+    const out = hoistCollectionContext(rows);
+    expect(out.collection_context).toEqual(["Meetings", "Docs"]);
+    expect(out.results.every(r => !("context" in r))).toBe(true);
+  });
+
+  test("hoistCollectionContext omits the field when no row has context", () => {
+    const out = hoistCollectionContext([{ file: "a.md", context: null }]);
+    expect("collection_context" in out).toBe(false);
+    expect(out.results).toEqual([{ file: "a.md" }]);
+  });
+});
+
 describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
   let handle: HttpServerHandle | undefined;
   let baseUrl: string;

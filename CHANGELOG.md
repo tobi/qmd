@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in compact MCP responses: start the server with `qmd mcp --compact` (or `QMD_MCP_COMPACT=1`) and the `query`, `status`, and `metadata` tools return `structuredContent` without the duplicated human-readable text block, and `query` results hoist the per-row folder `context` to a single top-level `collection_context` (string when uniform, array when distinct). Default (dual-render) behaviour is unchanged.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,

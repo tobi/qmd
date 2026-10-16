@@ -97,6 +97,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `status` — Index health and collection info, including each collection's top metadata keys
 - `metadata` — Discover metadata keys, types, and value counts to filter on
 
+**Compact mode (opt-in):** start the server with `qmd mcp --compact` (or `QMD_MCP_COMPACT=1`) to reduce response payload: tool responses return `structuredContent` only (no duplicated text block), and `query` results hoist the repetitive per-row folder `context` into a single top-level `collection_context`. Default behaviour is unchanged.
+
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
