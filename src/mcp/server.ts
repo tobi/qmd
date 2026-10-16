@@ -1180,7 +1180,13 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        const status = await store.getStatus();
+        const body = JSON.stringify({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          documents: status.totalDocuments,
+          needsEmbedding: status.needsEmbedding,
+        });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
