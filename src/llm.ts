@@ -224,6 +224,11 @@ export type RerankOptions = {
   model?: string;
 };
 
+export type RerankTokenBudget = {
+  maxDocumentTokens: number;
+  countTokens: (text: string) => number;
+};
+
 /**
  * Options for LLM sessions
  */
@@ -1730,6 +1735,25 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  private rerankTokenBudget(query: string, model: LlamaModel): RerankTokenBudget {
+    const queryTokens = model.tokenize(query).length;
+    const maxDocumentTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    if (maxDocumentTokens < 0) {
+      throw new RangeError("Rerank query exceeds the context window");
+    }
+    return {
+      maxDocumentTokens,
+      countTokens: text => model.tokenize(text).length,
+    };
+  }
+
+  /** Measure document text with the selected rerank model and its query budget. */
+  async getRerankTokenBudget(query: string): Promise<RerankTokenBudget> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    this.touchActivity();
+    return this.rerankTokenBudget(query, await this.ensureRerankModel());
+  }
+
   async rerank(
     query: string,
     documents: RerankDocument[],
@@ -1750,8 +1774,7 @@ export class LlamaCpp implements LLM {
 
     // Truncate documents that would exceed the rerank context size.
     // Budget = contextSize - template overhead - query tokens
-    const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const { maxDocumentTokens } = this.rerankTokenBudget(query, model);
     const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {
@@ -1761,9 +1784,9 @@ export class LlamaCpp implements LLM {
       }
 
       const tokens = model.tokenize(doc.text);
-      const truncatedText = tokens.length <= maxDocTokens
+      const truncatedText = tokens.length <= maxDocumentTokens
         ? doc.text
-        : model.detokenize(tokens.slice(0, maxDocTokens));
+        : model.detokenize(tokens.slice(0, maxDocumentTokens));
       truncationCache.set(doc.text, truncatedText);
 
       if (truncatedText === doc.text) return doc;
