@@ -163,7 +163,7 @@ def main():
 
     # Stats
     short_final = sum(1 for ex in all_examples if len(ex.query.split()) <= 2)
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     print(f"Total examples: {len(all_examples)}")
     print(f"Short queries: {short_final} ({100 * short_final / len(all_examples):.1f}%)")
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")

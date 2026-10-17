@@ -11,7 +11,6 @@ Requires: pip install unsloth unsloth_zoo
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -47,7 +46,7 @@ def main():
     output_dir = args.output or f"outputs/qwen3.5-{args.model}"
 
     print(f"{'='*60}")
-    print(f"QMD Query Expansion — Unsloth SFT")
+    print("QMD Query Expansion — Unsloth SFT")
     print(f"  Base model:  {model_name}")
     print(f"  Output:      {output_dir}")
     print(f"  Data:        {args.data}")
@@ -146,7 +145,7 @@ def main():
 
     print("\nStarting training...")
     stats = trainer.train()
-    print(f"\nTraining complete!")
+    print("\nTraining complete!")
     print(f"  Total steps: {stats.global_step}")
     print(f"  Final loss:  {stats.training_loss:.4f}")
 

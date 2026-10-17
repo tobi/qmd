@@ -149,7 +149,7 @@ def main():
     os.makedirs(gguf_dir, exist_ok=True)
     gguf_file = f"{gguf_dir}/{model_name}-f16.gguf"
 
-    print(f"\nStep 6: Converting to FP16 GGUF...")
+    print("\nStep 6: Converting to FP16 GGUF...")
     if not run_cmd([sys.executable, "/tmp/llama.cpp/convert_hf_to_gguf.py",
                     merged_dir, "--outfile", gguf_file, "--outtype", "f16"],
                    "Converting"):

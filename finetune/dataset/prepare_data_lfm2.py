@@ -11,7 +11,6 @@ No /no_think needed (that's Qwen3-specific).
 """
 
 import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -77,7 +76,7 @@ def main():
             f.write(json.dumps(ex) + "\n")
 
     print(f"Written {len(train)} train, {len(val)} val examples to {output_dir}")
-    print(f"\nSample formatted text:")
+    print("\nSample formatted text:")
     print(train[0]["text"][:500])
 
 

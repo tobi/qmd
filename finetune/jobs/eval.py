@@ -20,10 +20,8 @@ Self-contained script — inlines the reward function and test queries.
 import argparse
 import csv
 import io
-import json
 import os
 import re
-import sys
 from collections import Counter
 
 import torch
@@ -417,7 +415,7 @@ def evaluate_model(model, tokenizer, label):
 
     print(f"\n  {'─'*50}")
     print(f"  Average score: {avg:.1f}%")
-    print(f"  Ratings:")
+    print("  Ratings:")
     for rating in ["Excellent", "Good", "Acceptable", "Poor", "Failed"]:
         count = ratings.get(rating, 0)
         if count > 0:
@@ -425,7 +423,7 @@ def evaluate_model(model, tokenizer, label):
 
     # Show worst queries
     worst = sorted(results, key=lambda r: r["scores"]["percentage"])[:5]
-    print(f"\n  Bottom 5:")
+    print("\n  Bottom 5:")
     for r in worst:
         print(f"    {r['scores']['percentage']:5.1f}%  {r['query']}")
         if r["scores"]["deductions"]:
@@ -469,11 +467,11 @@ def main():
             repo_id=args.upload_repo,
             repo_type="model",
         )
-        print(f"  Uploaded: eval_comparison.csv")
+        print("  Uploaded: eval_comparison.csv")
 
         # Comparison
         print(f"\n{'='*70}")
-        print(f"  COMPARISON")
+        print("  COMPARISON")
         print(f"{'='*70}")
         print(f"  SFT  average: {sft_avg:.1f}%")
         print(f"  GRPO average: {grpo_avg:.1f}%")

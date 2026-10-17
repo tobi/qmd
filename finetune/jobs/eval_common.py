@@ -333,7 +333,7 @@ def run_eval(model, tokenizer, label, upload_repo="tobil/qmd-query-expansion-eva
             print(f"    {r:10s}: {c:2d}  {'█' * c}")
 
     worst = sorted(results, key=lambda r: r["score"])[:5]
-    print(f"\n  Bottom 5:")
+    print("\n  Bottom 5:")
     for r in worst:
         print(f"    {r['score']:5.1f}%  {r['query']}")
 

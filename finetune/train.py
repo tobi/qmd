@@ -41,7 +41,6 @@ from transformers import TrainerCallback
 
 def export_gguf(model, tokenizer, output_dir: str, model_name: str):
     """Export model to GGUF at Q4_K_M, Q6_K, Q8_0 quantizations."""
-    import shutil
     import tempfile
 
     output_path = Path(output_dir)

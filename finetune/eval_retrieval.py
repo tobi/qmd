@@ -473,11 +473,11 @@ def main():
                 for example in type_mismatches[:3]:
                     print(f"\nQuery: {example['query'][:60]}")
                     if example["unmatched_preds"]:
-                        print(f"  Unmatched predictions:")
+                        print("  Unmatched predictions:")
                         for pred, score in example["unmatched_preds"][:2]:
                             print(f"    - [{score:.2f}] {pred[:80]}{'...' if len(pred) > 80 else ''}")
                     if example["unmatched_golden"]:
-                        print(f"  Missing golden:")
+                        print("  Missing golden:")
                         for g in example["unmatched_golden"][:2]:
                             print(f"    - {g[:80]}{'...' if len(g) > 80 else ''}")
 

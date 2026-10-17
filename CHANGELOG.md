@@ -52,6 +52,8 @@
 
 ### Changed
 
+- Remove unused standard library imports and redundant f-string prefixes from
+  the fine-tuning scripts.
 - The MCP server caches its instructions per store for up to 60 seconds instead
   of rebuilding them, with a full index-status scan, for every HTTP request.
   Concurrent requests share one build and a failed build is not cached; index
