@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
@@ -182,5 +183,75 @@ describe("qmd update with only in-project paths", () => {
     expect(result.stdout).toContain("Indexed: 1 new");
     expect(result.stdout).not.toContain("qmd trust");
     expect(result.exitCode).toBe(0);
+  }, 120_000);
+});
+
+describe("qmd mcp with a checked-in custom model URI", () => {
+  function evilRerankConfig(): { evilModel: string; safeModel: string } {
+    const evilModel = join(outsideDir, "evil-rerank.gguf");
+    const safeModel = join(outsideDir, "safe-rerank.gguf");
+    writeLocalConfig([
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      `  rerank: ${JSON.stringify(evilModel)}`,
+      "",
+    ].join("\n"));
+    return { evilModel, safeModel };
+  }
+
+  test("stdio server ignores the untrusted model and says so on stderr only", async () => {
+    const { evilModel, safeModel } = evilRerankConfig();
+    // stdin is closed, so the stdio server starts and exits on EOF.
+    const result = await runQmd(["mcp"], { QMD_RERANK_MODEL: safeModel });
+
+    expect(result.stderr).toContain("qmd trust");
+    expect(result.stderr).not.toContain(evilModel);
+    expect(result.stdout).toBe("");
+  }, 120_000);
+
+  // Needs node-llama-cpp to resolve the rerank model path, which CI disables.
+  test.skipIf(!!process.env.CI)("HTTP server reranks with the env model, not the config model", async () => {
+    const { evilModel, safeModel } = evilRerankConfig();
+    writeFileSync(join(projectDir, "docs", "widgets.md"), "# Widgets\n\nwidgets and more widgets.\n", "utf-8");
+    writeFileSync(join(projectDir, "docs", "gadgets.md"), "# Gadgets\n\nsome widgets too.\n", "utf-8");
+    await runQmd(["update"]);
+
+    const port = await new Promise<number>((resolve) => {
+      const probe = createServer().listen(0, () => {
+        const address = probe.address();
+        probe.close(() => resolve(typeof address === "object" && address ? address.port : 0));
+      });
+    });
+    const proc = spawn(process.execPath, [...runnerArgs, "mcp", "--http", "--port", String(port)], {
+      cwd: projectDir,
+      env: { ...process.env, QMD_CONFIG_DIR: configDir, PWD: projectDir, QMD_RERANK_MODEL: safeModel },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    const listening = new Promise<void>((resolve) => {
+      proc.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString();
+        if (stderr.includes("listening on")) resolve();
+      });
+    });
+    const exited = new Promise<void>((resolve) => proc.on("close", () => resolve()));
+    try {
+      await listening;
+      // The model files do not exist, so the request fails; the error names the path it tried.
+      await fetch(`http://localhost:${port}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: [{ type: "lex", query: "widgets" }] }),
+      });
+    } finally {
+      proc.kill("SIGTERM");
+      await exited;
+    }
+
+    expect(stderr).toContain(`No model file found at "${safeModel}"`);
+    expect(stderr).not.toContain(`No model file found at "${evilModel}"`);
   }, 120_000);
 });

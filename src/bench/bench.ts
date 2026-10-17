@@ -331,6 +331,7 @@ export async function runBenchmark(
     dbPath?: string;
     configPath?: string;
     config?: import("../collections.js").CollectionConfig;
+    models?: import("../collections.js").ModelsConfig;
   } = {},
 ): Promise<BenchmarkResult> {
   // Load fixture
@@ -346,6 +347,7 @@ export async function runBenchmark(
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(options.configPath ? { configPath: options.configPath } : {}),
     ...(options.config ? { config: options.config } : {}),
+    models: options.models,
   });
 
   // Filter backends if requested
