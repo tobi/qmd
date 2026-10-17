@@ -52,6 +52,16 @@
 
 ### Changed
 
+- `qmd mcp` (stdio and HTTP) holds the vector table in memory and answers
+  vector searches with an exact cosine scan over a pool of worker threads,
+  instead of a sqlite-vec KNN query that reads every vector out of SQLite pages
+  per search. Results are unchanged; a collection-scoped search still ranks
+  only that collection. The copy is reloaded in the background when another
+  process embeds or cleans up, and searches use sqlite-vec until it is current
+  again, so a server never answers from stale vectors. Costs 4 bytes per
+  dimension per stored chunk; `QMD_VEC_SCAN=vec0` turns it off and
+  `QMD_VEC_SCAN_THREADS` sizes the pool. Searches with a metadata filter, and
+  one-shot CLI searches, keep using sqlite-vec.
 - The MCP server caches its instructions per store for up to 60 seconds instead
   of rebuilding them, with a full index-status scan, for every HTTP request.
   Concurrent requests share one build and a failed build is not cached; index

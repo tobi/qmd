@@ -38,6 +38,7 @@ import {
 import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
+import { enableVecScan } from "../vec-scan.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -1018,6 +1019,8 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
+  // A server answers many searches from one process: hold the vectors in memory.
+  enableVecScan(store.internal.db, store.dbPath);
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
@@ -1072,6 +1075,8 @@ export async function startMcpHttpServer(
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
+  // A server answers many searches from one process: hold the vectors in memory.
+  enableVecScan(store.internal.db, store.dbPath);
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
