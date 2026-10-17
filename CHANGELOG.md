@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `qmd get`, the SDK `get()`, and MCP `qmd://` resource reads now return the
+  exact `collection/path` you asked for. Before, `docs/readme.md` could return
+  `other/docs/readme.md` from another collection because its path ends the
+  same way (#1018).
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
