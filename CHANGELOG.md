@@ -38,6 +38,9 @@
   the rows for good. The collection is now reported as not found and its index
   is left unchanged. Permission and I/O errors still fail with their original
   cause (#989). #990 (thanks @ParkerRex)
+- `qmd update` and `qmd collection add` skip `venv` directories, so a Python
+  virtualenv inside a collection no longer adds its package READMEs and
+  licenses to the index or slows every update. #1028 (thanks @brettdavies)
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

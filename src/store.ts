@@ -1833,6 +1833,12 @@ export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: numb
 }
 
 /**
+ * Directories never scanned for documents. `venv` is where `python -m venv` puts a virtualenv, whose
+ * packages carry thousands of READMEs and licenses; `.venv` is already skipped as a hidden path.
+ */
+export const EXCLUDED_DIRS = ["node_modules", ".git", ".cache", "vendor", "dist", "build", "venv"] as const;
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
  * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.
@@ -1875,10 +1881,8 @@ async function reindexCollectionIn(
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
-
   const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
+    ...EXCLUDED_DIRS.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
 
