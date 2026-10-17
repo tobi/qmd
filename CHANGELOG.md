@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- The GEPA scoring command starts without a custom `PYTHONPATH` and prints its
+  ratings summary without a syntax error.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from example import example_from_json
 
@@ -74,8 +77,8 @@ def main() -> int:
         print(f"{path}: 0 scored, {errors} errors")
 
     if ratings:
-        rating_parts = [f\"{k}:{v}\" for k, v in sorted(ratings.items())]
-        print(f\"  ratings: {', '.join(rating_parts)}\")
+        rating_parts = [f"{k}:{v}" for k, v in sorted(ratings.items())]
+        print(f"  ratings: {', '.join(rating_parts)}")
 
     return 0
 
