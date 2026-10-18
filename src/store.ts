@@ -4624,7 +4624,25 @@ function buildFTS5Query(query: string): string | null {
       if (containsCjk(term)) {
         const sanitized = sanitizeFTS5Phrase(term);
         if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
+          // normalizeCjkForFTS() splits CJK runs into single-character tokens,
+          // so the phrase emitted here only matches a fully contiguous run —
+          // one unseen multi-character run voids the whole AND-combined query
+          // (#976). For terms spanning 3+ tokens, fall back to overlapping
+          // bigram phrases joined with OR: the term then matches on any
+          // adjacent token pair it shares with the document, while per-term
+          // AND semantics, negation, and bm25 ranking of longer shared runs
+          // are preserved. 1-2 token terms keep the exact phrase.
+          const tokens = sanitized.split(' ');
+          let ftsPhrase: string;
+          if (tokens.length <= 2) {
+            ftsPhrase = `"${sanitized}"`;
+          } else {
+            const grams: string[] = [];
+            for (let gi = 0; gi + 2 <= tokens.length; gi++) {
+              grams.push(`"${tokens[gi]} ${tokens[gi + 1]}"`);
+            }
+            ftsPhrase = `(${grams.join(" OR ")})`;
+          }
           if (negated) {
             negative.push(ftsPhrase);
           } else {
