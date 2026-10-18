@@ -4301,16 +4301,14 @@ export function removeCollection(db: Database, collectionName: string): { delete
     const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
 
-    const cleanupResult = db.prepare(`
-      DELETE FROM content
-      WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-    `).run();
+    // Inactive documents in other collections still reference their content.
+    const cleanedHashes = cleanupOrphanedContent(db);
 
     deleteStoreCollection(db, collectionName);
 
     return {
       deletedDocs: docResult.changes,
-      cleanedHashes: cleanupResult.changes,
+      cleanedHashes,
     };
   }).immediate();
 }
