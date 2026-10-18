@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- A failing `update:` command no longer stops `qmd update` partway through.
+  Before, the first collection whose command failed ended the run, and every
+  collection after it was silently never re-indexed. Now QMD reports the
+  failure, still indexes that collection's files as they are, carries on with
+  the rest, and exits 1 at the end with the names of the failed collections
+  (#979).
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

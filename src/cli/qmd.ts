@@ -945,6 +945,9 @@ async function updateCollections(): Promise<void> {
 
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
+  // One collection's broken hook must not stop the others from being indexed (#979).
+  const failedHooks: string[] = [];
+
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
     if (!col) continue;
@@ -983,12 +986,12 @@ async function updateCollections(): Promise<void> {
         }
 
         if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
-          process.exit(exitCode);
+          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}; indexing the files as they are${c.reset}`);
+          failedHooks.push(col.name);
         }
       } catch (err) {
-        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
-        process.exit(1);
+        console.log(`${c.yellow}✗ Update command failed: ${err}; indexing the files as they are${c.reset}`);
+        failedHooks.push(col.name);
       }
     }
 
@@ -1034,7 +1037,11 @@ async function updateCollections(): Promise<void> {
   const needsEmbedding = getHashesNeedingEmbedding(db);
   closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (failedHooks.length > 0) {
+    console.log(`${c.yellow}⚠ All collections indexed, but the update command failed for: ${failedHooks.join(", ")}${c.reset}`);
+  } else {
+    console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  }
   if (staleVectors > 0) {
     console.log(`Removed ${staleVectors} stale vector row(s)`);
   }
@@ -1043,6 +1050,10 @@ async function updateCollections(): Promise<void> {
   }
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+  if (failedHooks.length > 0) {
+    // Exit here: finishSuccessfulCliCommand would reset process.exitCode to 0.
+    process.exit(1);
   }
 }
 
