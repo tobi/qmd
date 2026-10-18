@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node-version: ["22", "23"]
+        node-version: ["22"]
 
     steps:
       - uses: actions/checkout@v4
