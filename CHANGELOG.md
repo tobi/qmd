@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- `qmd update --pull` exits with an error pointing to `qmd collection update-cmd`
+  instead of re-indexing without pulling, and the help text no longer lists the
+  flag. #985 (direction from #1033, thanks @xinpingzh)
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

@@ -3366,7 +3366,7 @@ function parseCLI() {
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
-      pull: { type: "boolean" },  // git pull before update
+      pull: { type: "boolean" },  // retired: `update --pull` is rejected (#985)
       refresh: { type: "boolean" },
       progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
       "dry-run": { type: "boolean" },  // cleanup: report what would be removed
@@ -3902,7 +3902,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update                    - Re-index collections (runs update commands first)");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
@@ -4951,6 +4951,13 @@ if (isMain) {
       break;
 
     case "update":
+      // --pull never did anything. A per-collection update command is the way
+      // to pull before re-indexing, so say that instead of ignoring the flag.
+      if (cli.values.pull !== undefined) {
+        console.error("qmd update --pull is not supported. To pull before re-indexing, set an update command:");
+        console.error("  qmd collection update-cmd <name> 'git pull --ff-only'");
+        process.exit(1);
+      }
       await updateCollections();
       break;
 
