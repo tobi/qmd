@@ -52,6 +52,8 @@ import {
   normalizeDocid,
   isDocid,
   syncConfigToDb,
+  getStoreCollections,
+  getHashesNeedingEmbedding,
   reindexCollection,
   resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
@@ -239,7 +241,7 @@ async function syncTestConfig(): Promise<void> {
 
 // Helper to create a test collection in YAML config
 async function createTestCollection(
-  options: { pwd?: string; glob?: string; name?: string; ignore?: string[] } = {}
+  options: { pwd?: string; glob?: string; name?: string; ignore?: string[]; embedIgnore?: string[]; embedMaxBytes?: number } = {}
 ): Promise<string> {
   const pwd = options.pwd || "/test/collection";
   const glob = options.glob || "**/*.md";
@@ -256,6 +258,8 @@ async function createTestCollection(
     path: pwd,
     pattern: glob,
     ...(options.ignore ? { ignore: options.ignore } : {}),
+    ...(options.embedIgnore ? { embedIgnore: options.embedIgnore } : {}),
+    ...(options.embedMaxBytes !== undefined ? { embedMaxBytes: options.embedMaxBytes } : {}),
   };
 
   // Write back
@@ -3894,6 +3898,121 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("getHashesNeedingEmbedding skips documents matched by embed rules", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({
+      embedIgnore: ["**/*.csv.md"],
+      embedMaxBytes: 64,
+    });
+
+    await insertTestDocument(store.db, collectionName, { displayPath: "notes/plan.md", body: "# Plan\n\nShort note." });
+    await insertTestDocument(store.db, collectionName, { displayPath: "data/export.csv.md", body: "# Export\n\na,b,c" });
+    await insertTestDocument(store.db, collectionName, { displayPath: "data/big.xlsx.md", body: `# Big\n\n${"cell ".repeat(40)}` });
+
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+    expect(store.getStatus().needsEmbedding).toBe(1);
+    // Skipped documents stay in the BM25 index
+    expect(store.searchFTS("Export", 10).map(r => r.displayPath)).toContain(`${collectionName}/data/export.csv.md`);
+    expect(store.searchFTS("cell", 10).map(r => r.displayPath)).toContain(`${collectionName}/data/big.xlsx.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embed rules keep content pending while any document may embed it", async () => {
+    const store = await createTestStore();
+    const skipping = await createTestCollection({ pwd: "/test/skipping", embedIgnore: ["**"] });
+    const embedding = await createTestCollection({ pwd: "/test/embedding" });
+    const body = "# Shared\n\nSame content in two collections.";
+
+    await insertTestDocument(store.db, skipping, { displayPath: "a.md", body });
+    expect(store.getHashesNeedingEmbedding()).toBe(0);
+
+    await insertTestDocument(store.db, embedding, { displayPath: "b.md", body });
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("invalid embed rules warn and do not stop the config sync", async () => {
+    const store = await createTestStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      syncConfigToDb(store.db, {
+        collections: {
+          a: { path: "/test/a", pattern: "**/*.md" },
+          b: { path: "/test/b", pattern: "**/*.md", embedMaxBytes: "1MB" as any, embedIgnore: "**/*.csv.md" as any },
+          c: { path: "/test/c", pattern: "**/*.md", embedMaxBytes: 0 },
+        },
+      });
+
+      const synced = getStoreCollections(store.db);
+      expect(synced.map(coll => coll.name).sort()).toEqual(["a", "b", "c"]);
+      expect(synced.some(coll => coll.embedIgnore || coll.embedMaxBytes)).toBe(false);
+      const warnings = warn.mock.calls.map(call => String(call[0]));
+      expect(warnings.some(w => w.includes("collections.b.embedMaxBytes"))).toBe(true);
+      expect(warnings.some(w => w.includes("collections.b.embedIgnore"))).toBe(true);
+      expect(warnings.some(w => w.includes("collections.c.embedMaxBytes"))).toBe(true);
+      expect(store.db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get()).toBeTruthy();
+    } finally {
+      warn.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("collection-scoped pending counts apply embed rules", async () => {
+    const store = await createTestStore();
+    const skipping = await createTestCollection({ pwd: "/test/skipping", embedIgnore: ["**/*.csv.md"] });
+    const plain = await createTestCollection({ pwd: "/test/plain" });
+
+    await insertTestDocument(store.db, skipping, { displayPath: "rows.csv.md", body: "# Rows\n\na,b" });
+    await insertTestDocument(store.db, skipping, { displayPath: "notes.md", body: "# Notes\n\nKeep." });
+    await insertTestDocument(store.db, plain, { displayPath: "rows.csv.md", body: "# Other rows\n\nc,d" });
+
+    expect(getHashesNeedingEmbedding(store.db, skipping)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db, plain)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db)).toBe(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embedMaxBytes works without octet_length()", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ embedMaxBytes: 64 });
+    await insertTestDocument(store.db, collectionName, { displayPath: "small.md", body: "# Small\n\nShort." });
+    await insertTestDocument(store.db, collectionName, { displayPath: "big.md", body: `# Big\n\n${"word ".repeat(40)}` });
+
+    // SQLite before 3.43 has no octet_length(); the probe fails and the
+    // length(CAST(... AS BLOB)) fallback must give the same answer.
+    const oldSqlite = failingDb(store.db, "octet_length", "no such function: octet_length");
+    expect(getHashesNeedingEmbedding(oldSqlite)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db)).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("stores created before embed rules gain the embed columns on open", async () => {
+    const store = await createTestStore();
+    const dbPath = testDbPath;
+    store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_ignore_patterns`);
+    store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_max_bytes`);
+    // An older qmd stored the hash of a config whose embed rules it could not save.
+    store.db.prepare(`INSERT OR REPLACE INTO store_config (key, value) VALUES ('config_hash', 'from-older-qmd')`).run();
+    store.close();
+
+    const reopened = createStore(dbPath);
+    currentTestStore = reopened;
+    const cols = (reopened.db.prepare(`PRAGMA table_info(store_collections)`).all() as { name: string }[]).map(c => c.name);
+    expect(cols).toContain("embed_ignore_patterns");
+    expect(cols).toContain("embed_max_bytes");
+    expect(reopened.db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get()).toBeFalsy();
+
+    const collectionName = await createTestCollection({ embedIgnore: ["skip/**"] });
+    await insertTestDocument(reopened.db, collectionName, { displayPath: "skip/a.md", body: "# A\n\nSkipped." });
+    expect(reopened.getHashesNeedingEmbedding()).toBe(0);
+
+    await cleanupTestDb(reopened);
+  });
+
   test("embedding health is scoped to the active embed model", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -5599,6 +5718,33 @@ describe("Embedding batching", () => {
       },
     };
   }
+
+  test("generateEmbeddings skips documents matched by embed rules", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      const collectionName = await createTestCollection({
+        embedIgnore: ["**/*.csv.md"],
+        embedMaxBytes: 200,
+      });
+      await insertTestDocument(store.db, collectionName, { displayPath: "plan.md", body: "# Plan\n\nembed-me-marker" });
+      await insertTestDocument(store.db, collectionName, { displayPath: "rows.csv.md", body: "# Rows\n\nignored-marker" });
+      await insertTestDocument(store.db, collectionName, { displayPath: "big.md", body: `# Big\n\noversized-marker ${"x".repeat(300)}` });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.docsProcessed).toBe(1);
+      const embedded = fakeLlm.embedBatchCalls.flat().join("\n");
+      expect(embedded).toContain("embed-me-marker");
+      expect(embedded).not.toContain("ignored-marker");
+      expect(embedded).not.toContain("oversized-marker");
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 
   test("generateEmbeddings tokenizes with the store-local LLM", async () => {
     const store = await createTestStore();

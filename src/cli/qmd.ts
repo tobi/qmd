@@ -134,6 +134,7 @@ import {
   getLocalDbPath,
   getConfigPath,
   configExists,
+  normalizeEmbedRules,
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
@@ -1837,6 +1838,14 @@ function collectionList(): void {
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
     if (yamlColl?.ignore?.length) {
       console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
+    }
+    const embedRules = yamlColl ? normalizeEmbedRules(coll.name, yamlColl) : null;
+    const embedSkips = [
+      ...(embedRules?.embedIgnore ?? []),
+      ...(embedRules?.embedMaxBytes != null ? [`> ${formatBytes(embedRules.embedMaxBytes)}`] : []),
+    ];
+    if (embedSkips.length) {
+      console.log(`  ${c.dim}No embed:${c.reset} ${embedSkips.join(', ')}`);
     }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     const metadataOverview = metadataOverviews.get(coll.name);

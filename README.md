@@ -769,6 +769,9 @@ collections:
     ignore:                      # glob patterns to exclude from indexing
       - "Archive/**"
       - "**/drafts/**"
+    embedIgnore:                 # glob patterns to keep in BM25 but not embed
+      - "**/*.csv.md"
+    embedMaxBytes: 1048576       # keep larger documents in BM25 but do not embed them
     update: "git pull --rebase"  # bash command run before each `qmd update`
     includeByDefault: true       # include in unscoped queries (default: true)
     context:                     # path prefix → description; longest match wins
@@ -784,6 +787,8 @@ collections:
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
+| `collections.<name>.embedIgnore` | per-collection | Glob patterns for documents that `qmd embed` skips. The documents stay in the collection, and BM25 search (`qmd search`, the lex leg of `qmd query`) finds them. Use it for data exports and other text that gives poor vectors. **YAML-only.** |
+| `collections.<name>.embedMaxBytes` | per-collection | `qmd embed` skips documents larger than this number of bytes. The documents stay in the BM25 index. **YAML-only.** |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
 | `collections.<name>.context` | per-collection | Path-prefix → description map; the most specific (longest) matching prefix wins. Set via `qmd context add`. |
@@ -791,6 +796,11 @@ collections:
 > **Note:** Editing `index.yml` changes which directories and models QMD *uses*,
 > but does not re-index on its own. Run `qmd update` after changing `path`,
 > `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
+> A change to `embedIgnore` or `embedMaxBytes` applies to the next `qmd embed`.
+> It does not delete vectors that already exist. The rules match the path that
+> `qmd ls` shows. A skipped document can still appear in vector search when
+> another document has the same content and gets embedded, because both
+> documents share the vectors.
 
 #### Automatic update commands
 

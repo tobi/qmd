@@ -28,6 +28,8 @@ export interface Collection {
   path: string;              // Absolute path to index
   pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
+  embedIgnore?: string[];    // Glob patterns to index for BM25 but never embed (e.g., ["**/*.csv.md"])
+  embedMaxBytes?: number;    // Index larger documents for BM25 but never embed them
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
@@ -60,6 +62,40 @@ export interface CollectionConfig {
  */
 export interface NamedCollection extends Collection {
   name: string;
+}
+
+export type EmbedRules = {
+  embedIgnore: string[] | null;
+  embedMaxBytes: number | null;
+  /** One message per invalid key. Invalid keys are dropped, not fatal. */
+  problems: string[];
+};
+
+/**
+ * Read a collection's embed rules from untrusted YAML. A bad value must not
+ * stop the config sync for other collections, so it is reported and dropped.
+ */
+export function normalizeEmbedRules(name: string, collection: Pick<Collection, "embedIgnore" | "embedMaxBytes">): EmbedRules {
+  const problems: string[] = [];
+  let embedIgnore: string[] | null = null;
+  const patterns: unknown = collection.embedIgnore;
+  if (patterns != null) {
+    if (Array.isArray(patterns) && patterns.every(p => typeof p === "string")) {
+      embedIgnore = patterns.length > 0 ? patterns : null;
+    } else {
+      problems.push(`collections.${name}.embedIgnore must be a list of glob patterns; ignoring it`);
+    }
+  }
+  let embedMaxBytes: number | null = null;
+  const maxBytes: unknown = collection.embedMaxBytes;
+  if (maxBytes != null) {
+    if (typeof maxBytes === "number" && Number.isInteger(maxBytes) && maxBytes >= 1) {
+      embedMaxBytes = maxBytes;
+    } else {
+      problems.push(`collections.${name}.embedMaxBytes must be a positive integer number of bytes; ignoring it`);
+    }
+  }
+  return { embedIgnore, embedMaxBytes, problems };
 }
 
 // ============================================================================

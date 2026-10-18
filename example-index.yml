@@ -76,6 +76,17 @@ collections:
       "/api": "API reference and endpoint docs"
       "/guides": "How-to guides and tutorials"
 
+  # ── Keyword search only: index for BM25 but do not embed ───────────────────
+  # embedIgnore and embedMaxBytes keep documents in the collection and in BM25
+  # search, but qmd embed skips them. Use them for data exports, logs, and very
+  # large files, which take a long time to embed and give poor vectors.
+  exports:
+    path: ~/work/exports
+    pattern: "**/*.md"
+    embedIgnore:
+      - "**/*.csv.md"         # spreadsheet exports: keyword search only
+    embedMaxBytes: 1048576    # skip vectors for documents over 1 MiB
+
   # ── Exclude from default searches ──────────────────────────────────────────
   # includeByDefault: false → skipped unless you name it: qmd query -c vendor "..."
   # Set via CLI: qmd collection exclude vendor
