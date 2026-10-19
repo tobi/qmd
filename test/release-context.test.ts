@@ -28,7 +28,8 @@ afterEach(() => {
 });
 
 function git(cwd: string, args: string[]) {
-  const result = spawnSync("git", ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", ...args], {
+  // Pin hooksPath so a contributor's global hooks never run on fixture commits.
+  const result = spawnSync("git", ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
     cwd,
     encoding: "utf8",
     env: {
@@ -102,6 +103,31 @@ function makeReleaseFixture(opts?: { dirty?: boolean }) {
   return root;
 }
 
+/**
+ * Run `fn` under a global git config whose hooks reject every commit, the way
+ * a contributor's global `core.hooksPath` (a commit-message linter, a secret
+ * scanner) would. Fixture commits must not depend on the contributor's hooks.
+ */
+function withRejectingGlobalHooks<T>(fn: () => T): T {
+  const root = mkdtempSync(join(tmpdir(), "qmd-release-hooks-"));
+  fixtures.push(root);
+  const hooks = join(root, "hooks");
+  mkdirSync(hooks);
+  for (const name of ["pre-commit", "commit-msg"]) {
+    writeFileSync(join(hooks, name), "#!/bin/sh\necho 'rejected by a global hook' >&2\nexit 1\n", { mode: 0o755 });
+  }
+  const config = join(root, "gitconfig");
+  writeFileSync(config, `[core]\n\thooksPath = ${hooks}\n`);
+  const saved = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = config;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved;
+  }
+}
+
 function runContext(cwd: string, versionArg: string) {
   return spawnSync("bash", [join(cwd, "skills", "release", "scripts", "release-context.sh"), versionArg], {
     cwd,
@@ -121,6 +147,11 @@ describe("skills/release/scripts/release-context.sh (#796)", () => {
     const steps = skill.split("## Dependency Policy")[0]!;
     const nums = [...steps.matchAll(/^(\d+)\. \*\*/gm)].map(m => m[1]);
     expect(nums).toEqual(["1", "2", "3", "4", "5", "6", "7", "8"]);
+  });
+
+  test("fixture commits under a global core.hooksPath that rejects every commit", () => {
+    const root = withRejectingGlobalHooks(() => makeReleaseFixture());
+    expect(git(root, ["rev-list", "--count", "HEAD"]).stdout.trim()).toBe("2");
   });
 
   test("fails without a version argument", () => {

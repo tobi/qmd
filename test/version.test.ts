@@ -26,7 +26,8 @@ import {
 let testDir: string;
 
 function git(args: string[], cwd: string): string {
-  return execFileSync("git", args, {
+  // Pin hooksPath so a contributor's global hooks never run on fixture commits.
+  return execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
     cwd,
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
@@ -52,6 +53,31 @@ function initRepo(dir: string): string {
   return git(["rev-parse", "--short", "HEAD"], dir);
 }
 
+/**
+ * Run `fn` under a global git config whose hooks reject every commit, the way
+ * a contributor's global `core.hooksPath` (a commit-message linter, a secret
+ * scanner) would. Fixture commits must not depend on the contributor's hooks.
+ */
+async function withRejectingGlobalHooks<T>(fn: () => T): Promise<T> {
+  const root = await mkdtemp(join(tmpdir(), "qmd-version-hooks-"));
+  const hooks = join(root, "hooks");
+  await mkdir(hooks);
+  for (const name of ["pre-commit", "commit-msg"]) {
+    await writeFile(join(hooks, name), "#!/bin/sh\necho 'rejected by a global hook' >&2\nexit 1\n", { mode: 0o755 });
+  }
+  const config = join(root, "gitconfig");
+  await writeFile(config, `[core]\n\thooksPath = ${hooks}\n`);
+  const saved = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = config;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved;
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 /** package root + the directory the CLI runs from (dist/cli or src/cli). */
 async function makePackage(root: string): Promise<{ packageRoot: string; scriptDir: string }> {
   const scriptDir = join(root, "dist", "cli");
@@ -66,6 +92,16 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await rm(testDir, { recursive: true, force: true });
+});
+
+describe("fixture repos", () => {
+  test("commit under a global core.hooksPath that rejects every commit", async () => {
+    const repo = join(testDir, "global-hooks");
+    await mkdir(repo, { recursive: true });
+
+    const head = await withRejectingGlobalHooks(() => initRepo(repo));
+    expect(head).toMatch(/^[0-9a-f]{7,}$/);
+  });
 });
 
 describe("gitCommitForCheckout", () => {
