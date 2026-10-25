@@ -2145,6 +2145,16 @@ export async function startMcpHttpServer(
           restFilter = filterValidation.filter;
         }
 
+        let restChunkStrategy: "auto" | "regex" | undefined;
+        if (params.chunkStrategy !== undefined) {
+          if (params.chunkStrategy !== "auto" && params.chunkStrategy !== "regex") {
+            nodeRes.writeHead(400, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({ error: "Invalid field: chunkStrategy (must be \"auto\" or \"regex\")" }));
+            return;
+          }
+          restChunkStrategy = params.chunkStrategy;
+        }
+
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
@@ -2161,6 +2171,7 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          chunkStrategy: restChunkStrategy,
         });
 
         // Use first lex or vec query for snippet extraction

@@ -1273,6 +1273,24 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const db = openDatabase(dbPath);
     initTestDatabase(db);
     seedTestData(db);
+    const filler = (label: string, index: number): string =>
+      `  const filler${index} = "${label}_${"x".repeat(90)}";\n`;
+    const first = "export function first() {\n"
+      + Array.from({ length: 25 }, (_, i) => filler(i === 19 ? "alpha" : "first", i)).join("")
+      + "}\n";
+    const second = "export function second() {\n"
+      + Array.from({ length: 10 }, (_, i) => filler(i === 0 ? "beta" : i === 1 ? "gamma" : "second", i + 25)).join("")
+      + "}\n";
+    const third = "export function third() {\n"
+      + Array.from({ length: 20 }, (_, i) => filler("third", i + 35)).join("")
+      + "}\n";
+    const chunkStrategyBody = first + second + third;
+    const fixtureHash = "hash-chunk-strategy";
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(fixtureHash, chunkStrategyBody, now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run("chunk-strategy.ts", "Chunk Strategy Fixture", fixtureHash, now, now);
     const testConfig: CollectionConfig = {
       collections: {
         docs: { path: "/test/docs", pattern: "**/*.md" },
@@ -1445,6 +1463,83 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("mcp-session-id")).toBeNull();
+  });
+
+  test("query chunkStrategy selects different code passages", async () => {
+    const query = async (chunkStrategy: "auto" | "regex") => {
+      const { status, json } = await postMcp(
+        {
+          jsonrpc: "2.0",
+          id: chunkStrategy === "auto" ? 6 : 7,
+          method: "tools/call",
+          params: {
+            name: "query",
+            arguments: {
+              searches: [{ type: "lex", query: "alpha beta gamma" }],
+              rerank: false,
+              chunkStrategy,
+            },
+            _meta: mcp2026Meta,
+          },
+        },
+        {
+          "MCP-Protocol-Version": MCP_2026,
+          "Mcp-Method": "tools/call",
+          "Mcp-Name": "query",
+        },
+      );
+      expect(status).toBe(200);
+      return json.result.structuredContent.results.find((r: { file: string }) => r.file === "docs/chunk-strategy.ts");
+    };
+
+    const regex = await query("regex");
+    const auto = await query("auto");
+    expect(regex).toBeDefined();
+    expect(auto).toBeDefined();
+    expect(regex.line).not.toBe(auto.line);
+    expect(regex.snippet).toContain("alpha_");
+    expect(regex.snippet).not.toContain("beta_");
+    expect(auto.snippet).toContain("beta_");
+    expect(auto.snippet).toContain("gamma_");
+  });
+
+  test("POST /query and /search accept and validate chunkStrategy", async () => {
+    for (const pathname of ["/query", "/search"]) {
+      const query = async (chunkStrategy: "auto" | "regex") => {
+        const res = await fetch(`${baseUrl}${pathname}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            searches: [{ type: "lex", query: "alpha beta gamma" }],
+            rerank: false,
+            chunkStrategy,
+          }),
+        });
+        expect(res.status).toBe(200);
+        const { results } = await res.json() as { results: { file: string; snippet: string }[] };
+        return results.find(r => r.file === "qmd://docs/chunk-strategy.ts");
+      };
+
+      const regex = await query("regex");
+      const auto = await query("auto");
+      expect(regex?.snippet).toContain("alpha_");
+      expect(regex?.snippet).not.toContain("beta_");
+      expect(auto?.snippet).toContain("beta_");
+      expect(auto?.snippet).toContain("gamma_");
+
+      const invalid = await fetch(`${baseUrl}${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          searches: [{ type: "lex", query: "readme" }],
+          chunkStrategy: "not-a-strategy",
+        }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toEqual({
+        error: "Invalid field: chunkStrategy (must be \"auto\" or \"regex\")",
+      });
+    }
   });
 
   // Each request gets a fresh McpServer, so these observe the per-store
