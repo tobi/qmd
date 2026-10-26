@@ -195,6 +195,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
 | `query` | `candidateLimit` | number | Max candidates to rerank (default 40) |
 | `query` | `rerank` | boolean | Run LLM reranking (default **true**); set false for RRF-only |
+| `query` | `chunkStrategy` | `"auto"` \| `"regex"` | Passage chunking for selection and reranking (default `regex`); use `auto` for AST-aware code boundaries |
 | `get` | `file` | string | Path, docid (`#abc123`), or `path:from:count` (e.g. `#abc123:120:40`) |
 | `get` | `fromLine` | number | Start line (1-indexed); overrides the `:from` suffix |
 | `get` | `maxLines` | number | Limit returned lines |

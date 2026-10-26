@@ -209,6 +209,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("  - File paths in results are relative to their collection.");
   lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
   lines.push("  - Results include a `context` field describing the content type.");
+  lines.push("  - For indexed code, pass `chunkStrategy: 'auto'` to preserve AST-aware function, class, type, and import boundaries during reranking.");
 
   return lines.join("\n");
 }
@@ -426,9 +427,12 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        chunkStrategy: z.enum(["auto", "regex"]).optional().describe(
+          "Chunking used to select and rerank candidate passages. Use auto for AST-aware code boundaries; default: regex."
+        ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank, chunkStrategy }) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -468,6 +472,7 @@ Intent-aware lex (C++ performance, not sports):
         minScore,
         candidateLimit,
         rerank,
+        chunkStrategy,
         intent,
       });
 
@@ -1237,6 +1242,16 @@ export async function startMcpHttpServer(
           restFilter = filterValidation.filter;
         }
 
+        let restChunkStrategy: "auto" | "regex" | undefined;
+        if (params.chunkStrategy !== undefined) {
+          if (params.chunkStrategy !== "auto" && params.chunkStrategy !== "regex") {
+            nodeRes.writeHead(400, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({ error: "Invalid field: chunkStrategy (must be \"auto\" or \"regex\")" }));
+            return;
+          }
+          restChunkStrategy = params.chunkStrategy;
+        }
+
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
@@ -1249,6 +1264,7 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          chunkStrategy: restChunkStrategy,
         });
 
         // Use first lex or vec query for snippet extraction
