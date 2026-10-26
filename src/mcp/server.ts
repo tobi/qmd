@@ -37,8 +37,9 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, isDocid } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { validateMcpGlobPattern, MCP_GLOB_MAX_LENGTH } from "./glob-guard.js";
 
 // =============================================================================
 // Types for structured content
@@ -594,6 +595,12 @@ Intent-aware lex (C++ performance, not sports):
       }),
     },
     track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
+      // a docid (quoted or not) is routed by findDocuments to the docid path, never picomatch;
+      // isDocid has no length limit, so an over-long one still goes through the length cap
+      const refusal = isDocid(pattern) && pattern.length <= MCP_GLOB_MAX_LENGTH ? null : validateMcpGlobPattern(pattern);
+      if (refusal) {
+        return { content: [{ type: "text", text: refusal }], isError: true };
+      }
       const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {

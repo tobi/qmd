@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- MCP `multi_get` allowlists its glob before it reaches picomatch, whose ReDoS
+  advisories have no patched release: name characters plus `*`, `?` and
+  `[...]` classes only (no braces, parentheses, `|`, `+` or `!`), at most 256
+  characters, 3 runs of `*` and 3 classes; plain comma lists (which never reach
+  picomatch) are bounded at 200 entries, 256 characters per entry and 16 KiB
+  instead, and a docid over 256 characters is refused; the CLI is unchanged.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
