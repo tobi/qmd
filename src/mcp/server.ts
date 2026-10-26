@@ -411,7 +411,7 @@ Intent-aware lex (C++ performance, not sports):
         candidateLimit: z.number().optional().describe(
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
-        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        collections: z.array(z.string()).max(MAX_COLLECTIONS_PER_REQUEST).optional().describe("Filter to collections (OR match)"),
         filter: z.record(z.string(), z.unknown()).optional().describe(
           "Metadata filter (recursive JSON AST). Every returned result satisfies it. " +
           "Nodes are operator-discriminated: logical groups {operator:'and'|'or', operands:[...]}, " +
@@ -730,7 +730,7 @@ Counts are documents, not values. \`keys\` is one window of \`totalKeys\` in cov
 Every value reported here can be matched with \`{field: '<metadata-key>', operator: 'eq', value}\` under the same collections.`,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: z.object({
-        collections: z.array(z.string()).optional().describe("Restrict to these collections (default: the same collections query searches)"),
+        collections: z.array(z.string()).max(MAX_COLLECTIONS_PER_REQUEST).optional().describe("Restrict to these collections (default: the same collections query searches)"),
         match: z.record(z.string(), z.unknown()).optional().describe(
           "Report only metadata entries matching this condition. Same recursive AST as 'filter', evaluated per entry: " +
           "a condition's field is 'key' (the entry's key name) or 'value' (its value). Default: every entry. " +
@@ -1743,6 +1743,16 @@ export async function startMcpServer(options: McpStdioServerOptions = {}): Promi
 // Transport: Streamable HTTP
 // =============================================================================
 
+const MAX_HTTP_BODY_BYTES = 1024 * 1024;
+const MAX_COLLECTIONS_PER_REQUEST = 1000;
+
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super("Request body too large");
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
 export type HttpServerHandle = {
   httpServer: Server;
   port: number;
@@ -1908,11 +1918,38 @@ export async function startMcpHttpServer(
     return headers;
   }
 
+  function respondRequestBodyTooLarge(req: IncomingMessage, res: ServerResponse, mcp: boolean): void {
+    const body = mcp
+      ? JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32700, message: "Parse error: Request body too large" },
+        id: null,
+      })
+      : JSON.stringify({ error: "Request body too large" });
+    res.writeHead(413, { "Content-Type": "application/json" });
+    res.end(body);
+    req.resume();
+  }
+
   // Helper to collect request body
   async function collectBody(req: IncomingMessage): Promise<string> {
+    const contentLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(contentLength) && contentLength > MAX_HTTP_BODY_BYTES) {
+      throw new RequestBodyTooLargeError();
+    }
+
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    return Buffer.concat(chunks).toString();
+    let totalBytes = 0;
+    // Throwing out of the default iterator destroys the request, and a client
+    // still uploading can then see EPIPE instead of the 413. Keep it alive so
+    // respondRequestBodyTooLarge can drain the rest of the body.
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > MAX_HTTP_BODY_BYTES) throw new RequestBodyTooLargeError();
+      chunks.push(buffer);
+    }
+    return Buffer.concat(chunks, totalBytes).toString();
   }
 
   /**
@@ -2093,7 +2130,14 @@ export async function startMcpHttpServer(
       // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
+        let rawBody: string;
+        try {
+          rawBody = await collectBody(nodeReq);
+        } catch (err) {
+          if (!(err instanceof RequestBodyTooLargeError)) throw err;
+          respondRequestBodyTooLarge(nodeReq, nodeRes, false);
+          return;
+        }
         let parsedParams: unknown;
         try {
           parsedParams = JSON.parse(rawBody);
@@ -2142,6 +2186,16 @@ export async function startMcpHttpServer(
 
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
+        if (params.collections !== undefined && !Array.isArray(params.collections)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid field: collections (must be an array)" }));
+          return;
+        }
+        if (Array.isArray(params.collections) && params.collections.length > MAX_COLLECTIONS_PER_REQUEST) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: `Invalid field: collections (maximum ${MAX_COLLECTIONS_PER_REQUEST} items)` }));
+          return;
+        }
 
         // The abort signal reaches the embedding/rerank stages, so a client
         // that hangs up or a shutdown deadline stops paying for work whose
@@ -2185,7 +2239,14 @@ export async function startMcpHttpServer(
 
       // REST endpoint: POST /metadata — metadata discovery, same body as the metadata tool
       if (pathname === "/metadata" && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
+        let rawBody: string;
+        try {
+          rawBody = await collectBody(nodeReq);
+        } catch (err) {
+          if (!(err instanceof RequestBodyTooLargeError)) throw err;
+          respondRequestBodyTooLarge(nodeReq, nodeRes, false);
+          return;
+        }
         let parsedParams: unknown;
         try {
           parsedParams = rawBody.trim() === "" ? {} : JSON.parse(rawBody);
@@ -2246,6 +2307,11 @@ export async function startMcpHttpServer(
           nodeRes.end(JSON.stringify({ error: "Invalid field: collections (must be an array)" }));
           return;
         }
+        if (Array.isArray(params.collections) && params.collections.length > MAX_COLLECTIONS_PER_REQUEST) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: `Invalid field: collections (maximum ${MAX_COLLECTIONS_PER_REQUEST} items)` }));
+          return;
+        }
 
         // The JSON type is checked here; the store checks each number's domain.
         const numberFields = readNumberFields(params, ["keyLimit", "keyOffset", "valueLimit", "valueOffset", "minCount"]);
@@ -2281,9 +2347,16 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === "/mcp") {
-        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD"
-          ? await collectBody(nodeReq)
-          : undefined;
+        let rawBody: string | undefined;
+        if (nodeReq.method !== "GET" && nodeReq.method !== "HEAD") {
+          try {
+            rawBody = await collectBody(nodeReq);
+          } catch (err) {
+            if (!(err instanceof RequestBodyTooLargeError)) throw err;
+            respondRequestBodyTooLarge(nodeReq, nodeRes, true);
+            return;
+          }
+        }
         let parsedBody: unknown;
         if (rawBody) {
           try {
