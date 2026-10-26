@@ -10,6 +10,11 @@
 - Vector diagnostics match passages by their saved character position, avoiding
   false mismatches when earlier chunks change the sequence numbering.
   #978 (thanks @naveenspark)
+- HTTP bodies over 1 MiB get a 413 on `/mcp`, `/query`, `/search` and
+  `/metadata`, checked while streaming including chunked uploads without
+  `Content-Length`. Requests allow at most 1000 collections (MCP `query` and
+  `metadata`, REST `/query`, `/search` and `/metadata`), returning 400 on REST
+  and an input validation error on MCP.
 
 ### Added
 

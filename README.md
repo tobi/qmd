@@ -181,14 +181,14 @@ server that is reachable off-host.
 
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
-Point any MCP client at `http://localhost:8181/mcp` to connect.
+Point any MCP client at `http://localhost:8181/mcp` to connect. Request bodies are limited to 1 MiB (larger ones get HTTP 413).
 
 #### MCP Tool Parameters
 
 | Tool | Parameter | Type | Notes |
 |------|-----------|------|-------|
 | `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. **Required.** First gets 2x weight. |
-| `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
+| `query` | `collections` | string[] | Filter by collection names (OR), up to 1000. **Array only** — singular `collection` is silently ignored. |
 | `query` | `filter` | object | Metadata filter (recursive `operator`-discriminated JSON AST; see [Metadata Filtering](#metadata-filtering)) |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
