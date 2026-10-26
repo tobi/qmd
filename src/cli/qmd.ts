@@ -2547,7 +2547,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
-  chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  chunkStrategy?: ChunkStrategy;  // "regex" (default) or "auto" (AST for code files)
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
   filter?: MetadataFilter;  // Metadata filter (--filter JSON)
 };
