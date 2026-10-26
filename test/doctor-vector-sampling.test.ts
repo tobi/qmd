@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isBun } from "../src/db.js";
+import { bunSqliteTracksMemory } from "./_helpers/heap-limit.js";
 import { chunkDocumentByTokens, createStore, extractTitle, formatDocForEmbedding, getEmbeddingVectorSamples, type Store } from "../src/store.js";
 import { checkEmbeddingVectorSamples } from "../src/cli/qmd.js";
 import { setDefaultLlamaCpp, LlamaCpp } from "../src/llm.js";
@@ -120,7 +121,8 @@ describe("doctor vector sampling", () => {
     expect(result.status).toBe(0);
     const out = JSON.parse(result.stdout);
     expect(out).toMatchObject({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    // The budget only binds where SQLite tracks memory, which Bun under Linux
+    // did until 1.4.4 (see bunSqliteTracksMemory).
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(bunSqliteTracksMemory);
   });
 });

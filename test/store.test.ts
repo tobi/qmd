@@ -9,6 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec, isBun } from "../src/db.js";
 import type { Database, SQLiteValue } from "../src/db.js";
+import { bunSqliteTracksMemory } from "./_helpers/heap-limit.js";
 import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5803,9 +5804,10 @@ describe("Embedding batching", () => {
 
   test("legacy fingerprint adoption loads one sample body within a 128 MiB SQLite budget", () => {
     // SQLite's hard heap limit is process-wide and cannot be raised again, so
-    // the fixture runs in a worker. The limit binds only under Bun with an
-    // SQLite that tracks memory (Bun's bundled SQLite on Linux, Homebrew SQLite
-    // on macOS), where the old per-chunk query fails with SQLITE_NOMEM. Apple's
+    // the fixture runs in a worker. The limit binds only under Bun before 1.4.4
+    // with an SQLite that tracks memory (Bun's bundled SQLite on Linux, Homebrew
+    // SQLite on macOS), where the old per-chunk query fails with SQLITE_NOMEM;
+    // Bun 1.4.4 turns the statistics off (see bunSqliteTracksMemory). Apple's
     // system libsqlite3 and better-sqlite3 are built with
     // SQLITE_DEFAULT_MEMSTATUS=0, so there this only checks the adoption result.
     const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -5824,7 +5826,7 @@ describe("Embedding batching", () => {
 
   test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
     // One legacy chunk, so only the active-path count multiplies the body. The
-    // limit binds under Bun only, as in the 128 MiB test above.
+    // limit binds under Bun before 1.4.4 only, as in the 128 MiB test above.
     const projectRoot = fileURLToPath(new URL("..", import.meta.url));
     const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
@@ -5835,8 +5837,9 @@ describe("Embedding batching", () => {
     expect(result.status).toBe(0);
     const out = JSON.parse(result.stdout);
     expect(out).toMatchObject({ checked: true, adopted: 1 });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    // The budget only binds where SQLite tracks memory, which Bun under Linux
+    // did until 1.4.4 (see bunSqliteTracksMemory).
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(bunSqliteTracksMemory);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
