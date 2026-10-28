@@ -205,12 +205,19 @@ export interface BreakPoint {
 }
 
 /**
- * A region where a code fence exists (between ``` markers).
+ * A region where a code fence exists (between matching backtick or tilde markers).
  * We should never split inside a code fence.
  */
 export interface CodeFenceRegion {
   start: number;  // position of opening ```
   end: number;    // position of closing ``` (or document end if unclosed)
+}
+
+/** A Markdown pipe table and the end of its header (header plus delimiter row). */
+export interface TableRegion {
+  start: number;
+  end: number;
+  headerEnd: number;
 }
 
 /**
@@ -264,27 +271,31 @@ export function scanBreakPoints(text: string): BreakPoint[] {
 
 /**
  * Find all code fence regions in the text.
- * Code fences are delimited by ``` and we should never split inside them.
+ * Code fences are delimited by matching backtick or tilde markers and we should never split inside them.
  */
 export function findCodeFences(text: string): CodeFenceRegion[] {
   const regions: CodeFenceRegion[] = [];
-  const fencePattern = /\n```/g;
-  let inFence = false;
-  let fenceStart = 0;
+  let openFence: { start: number; marker: string } | undefined;
+  let lineStart = 0;
 
-  for (const match of text.matchAll(fencePattern)) {
-    if (!inFence) {
-      fenceStart = match.index!;
-      inFence = true;
-    } else {
-      regions.push({ start: fenceStart, end: match.index! + match[0].length });
-      inFence = false;
+  for (const line of text.split("\n")) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (openFence) {
+      const marker = match?.[1];
+      const closingText = match?.[2];
+      if (marker && marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && /^\s*$/.test(closingText!)) {
+        regions.push({ start: openFence.start, end: lineStart + line.length - closingText!.length });
+        openFence = undefined;
+      }
+    } else if (match && (match[1]![0] !== "`" || !match[2]!.includes("`"))) {
+      openFence = { start: lineStart > 0 ? lineStart - 1 : 0, marker: match[1]! };
     }
+    lineStart += line.length + 1;
   }
 
   // Handle unclosed fence - extends to end of document
-  if (inFence) {
-    regions.push({ start: fenceStart, end: text.length });
+  if (openFence) {
+    regions.push({ start: openFence.start, end: text.length });
   }
 
   return regions;
@@ -295,6 +306,55 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
  */
 export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
   return fences.some(f => pos > f.start && pos < f.end);
+}
+
+/**
+ * Find contiguous Markdown pipe tables, excluding lines inside fenced code.
+ * A run qualifies only when its second pipe row is a delimiter row.
+ */
+export function findTableRegions(text: string, codeFences: CodeFenceRegion[] = findCodeFences(text)): TableRegion[] {
+  const lines: { start: number; next: number; text: string }[] = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    const end = offset + line.length;
+    lines.push({ start: offset, next: Math.min(end + 1, text.length), text: line.replace(/\r$/, "") });
+    offset = end + 1;
+  }
+
+  const isPipeRow = (line: typeof lines[number]): boolean => line.text.includes("|");
+  const isDelimiterRow = (line: typeof lines[number]): boolean => {
+    if (!isPipeRow(line)) return false;
+    const cells = line.text.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+    return cells.length > 0 && cells.every(cell => /^\s*:?-+:?\s*$/.test(cell));
+  };
+  const isInFence = (line: typeof lines[number]): boolean => isInsideCodeFence(line.start, codeFences);
+
+  const regions: TableRegion[] = [];
+  for (let i = 0; i + 1 < lines.length;) {
+    if (isInFence(lines[i]!) || isInFence(lines[i + 1]!) || !isPipeRow(lines[i]!) || !isDelimiterRow(lines[i + 1]!)) {
+      i++;
+      continue;
+    }
+
+    let last = i + 1;
+    while (last + 1 < lines.length && !isInFence(lines[last + 1]!) && isPipeRow(lines[last + 1]!)) last++;
+    regions.push({ start: lines[i]!.start, end: lines[last]!.next, headerEnd: lines[i + 1]!.next });
+    i = last + 1;
+  }
+  return regions;
+}
+
+function findTableRegionAt(pos: number, regions: TableRegion[]): TableRegion | undefined {
+  let low = 0;
+  let high = regions.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    const region = regions[mid]!;
+    if (pos <= region.start) high = mid;
+    else if (pos >= region.end) low = mid + 1;
+    else return region;
+  }
+  return undefined;
 }
 
 /**
@@ -422,21 +482,38 @@ export function chunkDocumentWithBreakPoints(
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
-): { text: string; pos: number }[] {
+): { text: string; pos: number; prefixLength: number }[] {
   if (content.length <= maxChars) {
-    return [{ text: content, pos: 0 }];
+    return [{ text: content, pos: 0, prefixLength: 0 }];
   }
 
-  const chunks: { text: string; pos: number }[] = [];
+  const chunks: { text: string; pos: number; prefixLength: number }[] = [];
+  const tableRegions = findTableRegions(content, codeFences);
+  const tableBreakPoints: BreakPoint[] = tableRegions.flatMap(table => [
+    { pos: table.start > 0 ? table.start - 1 : table.start, score: 60, type: "table-start" },
+    { pos: table.end, score: 60, type: "table-end" },
+  ]);
+  const allBreakPoints = mergeBreakPoints(breakPoints, tableBreakPoints);
+  let tableIndex = 0;
+  const eligibleBreakPoints = allBreakPoints.filter(bp => {
+    while (tableIndex < tableRegions.length && bp.pos >= tableRegions[tableIndex]!.end) tableIndex++;
+    const table = tableRegions[tableIndex];
+    return !table || bp.pos <= table.start || table.end - table.start > maxChars * 1.5;
+  });
   let charPos = 0;
+  let lastEnd = 0;
 
   while (charPos < content.length) {
     const targetEndPos = Math.min(charPos + maxChars, content.length);
     let endPos = targetEndPos;
+    const crossedTable = findTableRegionAt(targetEndPos, tableRegions);
+    if (crossedTable && crossedTable.end - crossedTable.start <= maxChars * 1.5 && crossedTable.end <= charPos + maxChars * 1.5) {
+      endPos = crossedTable.end;
+    }
 
-    if (endPos < content.length) {
+    if (endPos === targetEndPos && endPos < content.length) {
       const bestCutoff = findBestCutoff(
-        breakPoints,
+        eligibleBreakPoints,
         targetEndPos,
         windowChars,
         0.7,
@@ -457,12 +534,55 @@ export function chunkDocumentWithBreakPoints(
     // remote embedding APIs.
     endPos = adjustSurrogateBoundary(content, endPos, charPos);
 
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+    // A table that fits the budget is re-emitted whole from its start by the
+    // overlap rewind below, so cutting inside it would emit its leading rows
+    // twice. End the chunk just before such a table instead. When a table row
+    // itself exceeds the chunk budget, keep the row intact even if no newline
+    // breakpoint falls inside the search window.
+    const tableAtChunkEnd = findTableRegionAt(endPos, tableRegions);
+    if (tableAtChunkEnd && (content[endPos] !== "\n" || endPos < tableAtChunkEnd.headerEnd)) {
+      const fitsBudget = tableAtChunkEnd.end - tableAtChunkEnd.start <= maxChars * 1.5;
+      if (fitsBudget && tableAtChunkEnd.start - 1 > charPos) {
+        // Prose before the table that the previous chunk already holds would
+        // make this chunk pure overlap, so start at the table instead.
+        if (tableAtChunkEnd.start - 1 <= lastEnd) {
+          charPos = tableAtChunkEnd.start;
+          continue;
+        }
+        endPos = tableAtChunkEnd.start - 1;
+      } else {
+        // Never end inside the header: a chunk holding only the header is useless.
+        const rowEnd = content.indexOf("\n", Math.max(endPos, tableAtChunkEnd.headerEnd));
+        endPos = rowEnd === -1 ? content.length : rowEnd;
+      }
+    }
+
+    const tableAtChunkStart = findTableRegionAt(charPos, tableRegions);
+    const continuedTable = tableAtChunkStart &&
+      tableAtChunkStart.end - tableAtChunkStart.start > maxChars * 1.5 &&
+      charPos >= tableAtChunkStart.headerEnd
+      ? tableAtChunkStart
+      : undefined;
+    const prefix = continuedTable ? content.slice(continuedTable.start, continuedTable.headerEnd) : "";
+    chunks.push({ text: prefix + content.slice(charPos, endPos), pos: charPos, prefixLength: prefix.length });
+    lastEnd = endPos;
 
     if (endPos >= content.length) {
       break;
     }
     charPos = endPos - overlapChars;
+    const tableAtNextStart = findTableRegionAt(charPos, tableRegions);
+    if (tableAtNextStart) {
+      if (tableAtNextStart.end - tableAtNextStart.start <= maxChars * 1.5) {
+        // A table the chunk just emitted holds whole adds nothing to the
+        // overlap; rewinding to its start would emit it a second time.
+        charPos = tableAtNextStart.end <= endPos ? tableAtNextStart.end : tableAtNextStart.start;
+      } else {
+        if (content[charPos] === "\n") charPos++;
+        const lineStart = content.lastIndexOf("\n", charPos - 1) + 1;
+        charPos = Math.max(lineStart, tableAtNextStart.headerEnd);
+      }
+    }
     const lastChunkPos = chunks.at(-1)!.pos;
     if (charPos <= lastChunkPos) {
       charPos = endPos;
@@ -3741,7 +3861,7 @@ export function chunkDocument(
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
-): { text: string; pos: number }[] {
+): { text: string; pos: number; prefixLength: number }[] {
   const breakPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
   return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
@@ -3762,7 +3882,7 @@ export async function chunkDocumentAsync(
   windowChars: number = CHUNK_WINDOW_CHARS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
-): Promise<{ text: string; pos: number }[]> {
+): Promise<{ text: string; pos: number; prefixLength: number }[]> {
   const regexPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
 
@@ -3860,12 +3980,17 @@ async function chunkDocumentByTokensWithLlm(
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
+  // Source span of the last emitted piece, so a piece that repeats it can be dropped.
+  let lastSpan: { pos: number; end: number } | undefined;
   const clampOverlapChars = (value: number, maxChars: number): number => {
     if (maxChars <= 1) return 0;
     return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
   };
 
-  const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+  // `pos` is the source offset of text[prefixLength]: the first prefixLength
+  // characters of a continued table chunk are its header, repeated and not
+  // present at that offset in the source.
+  const pushChunkWithinTokenLimit = async (text: string, pos: number, prefixLength: number): Promise<void> => {
     if (signal?.aborted) return;
 
     const tokens = await llm.tokenize(text);
@@ -3875,6 +4000,11 @@ async function chunkDocumentByTokensWithLlm(
       // so this only ever strips something for already-malformed input.
       const safeText = stripUnpairedSurrogates(text);
       if (safeText.length === 0) return;
+      // A piece whose source span lies inside the previous piece's adds nothing;
+      // splitting a row that nearly fills the budget can produce such pieces.
+      const end = pos + safeText.length - prefixLength;
+      if (lastSpan && pos >= lastSpan.pos && end <= lastSpan.end) return;
+      lastSpan = { pos, end };
       results.push({ text: safeText, pos, tokens: tokens.length });
       return;
     }
@@ -3891,24 +4021,24 @@ async function chunkDocumentByTokensWithLlm(
       safeMaxChars,
     );
     let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+    // Each recursion step must strictly shrink every piece. A continued table
+    // re-adds its header to each piece, so a piece can match its parent's length
+    // when the header and one row already exceed the budget.
+    const splitsProgress = (subs: { text: string }[]): boolean =>
+      subs.length > 1 && subs.every(sub => sub.text.length < text.length);
+
     let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
 
     // Pathological single-line blobs can produce no meaningful breakpoint progress.
     // Fall back to a simple half split so every recursion step strictly shrinks.
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
+    if (!splitsProgress(subChunks)) {
       safeMaxChars = Math.max(1, Math.floor(text.length / 2));
       nextOverlapChars = 0;
       nextWindowChars = 0;
       subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
     }
 
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
+    if (!splitsProgress(subChunks)) {
       const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
@@ -3923,13 +4053,22 @@ async function chunkDocumentByTokensWithLlm(
       return;
     }
 
+    // subChunk.text is the authoritative piece (re-slicing `text` by its length
+    // would drop a continued table's header). subChunk.pos indexes `text`, so
+    // map it back to the source: text[prefixLength] sits at `pos`.
     for (const subChunk of subChunks) {
-      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+      // A piece starting inside this text's header carries that header as
+      // literal text, so its synthetic prefix is what remains of it.
+      await pushChunkWithinTokenLimit(
+        subChunk.text,
+        pos + Math.max(0, subChunk.pos - prefixLength),
+        Math.max(subChunk.prefixLength, prefixLength - subChunk.pos),
+      );
     }
   };
 
   for (const chunk of charChunks) {
-    await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
+    await pushChunkWithinTokenLimit(chunk.text, chunk.pos, chunk.prefixLength);
   }
 
   return results;

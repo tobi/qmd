@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Markdown table chunks keep rows intact and repeat their header when a large
+  table spans multiple chunks, including on the token-based embedding path. A
+  table that fits a chunk is no longer emitted twice across adjacent chunks, and
+  chunk positions on that path point into the document text (#955).
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

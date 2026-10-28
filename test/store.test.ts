@@ -39,6 +39,7 @@ import {
   mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
+  findTableRegions,
   isInsideCodeFence,
   findBestCutoff,
   type BreakPoint,
@@ -692,6 +693,50 @@ describe("Document Chunking", () => {
     expect(chunks[0]!.text.length).toBeGreaterThan(2800);
     expect(chunks[0]!.text.length).toBeLessThanOrEqual(3600);
   });
+
+  test("chunkDocument does not emit table rows twice when the table fits the budget but overhangs the window", () => {
+    // The table starts more than a window before the target and ends past
+    // charPos + maxChars * 1.5, so the first chunk cannot extend to its end.
+    // Cutting inside it and then rewinding the next chunk to the table start
+    // used to emit rows 0-5 in one chunk and all 12 rows in the next.
+    const rows = Array.from({ length: 12 }, (_, i) => `| row${i} | ${"v".repeat(30)} |`);
+    const table = ["| name | value |", "|---|---|", ...rows].join("\n");
+    const content = "x".repeat(150) + "\n\n" + table + "\n\n" + "Tail paragraph. ".repeat(40);
+    const chunks = chunkDocument(content, 400, 60, 100);
+
+    for (let i = 0; i < rows.length; i++) {
+      expect(chunks.filter(chunk => chunk.text.includes(`| row${i} |`))).toHaveLength(1);
+    }
+    expect(chunks.some(chunk => rows.every(row => chunk.text.includes(row)))).toBe(true);
+  });
+
+  test("chunkDocument never emits a chunk that only repeats the overlap before a table", () => {
+    // The table fits the budget but overhangs the window, so it is kept whole
+    // in its own chunk. When the overlap lands in the prose before it, the
+    // chunk cut before the table used to contain nothing beyond the overlap.
+    const rows = Array.from({ length: 12 }, (_, i) => `| row${i} | ${"v".repeat(34)} |`);
+    const table = ["| name | value |", "|---|---|", ...rows].join("\n");
+    const content = "x".repeat(300) + "\n\n" + table + "\n\n" + "tail ".repeat(60);
+    const chunks = chunkDocument(content, 400, 60, 100);
+
+    const rawEnd = (chunk: { text: string; pos: number; prefixLength: number }) =>
+      chunk.pos + chunk.text.length - chunk.prefixLength;
+    for (let i = 1; i < chunks.length; i++) {
+      expect(rawEnd(chunks[i]!)).toBeGreaterThan(rawEnd(chunks[i - 1]!));
+    }
+  });
+
+  test("chunkDocument does not end a chunk inside an oversized table's header", () => {
+    // The cut lands on the newline that ends the delimiter row. The chunk would
+    // hold the header alone, so it must reach the first row instead.
+    const rows = Array.from({ length: 12 }, (_, i) => `| r${i} | ${"v".repeat(60)} |`);
+    const content = "p".repeat(32) + "\n| h0 | h1 |\n|---|---|\n" + rows.join("\n");
+    const chunks = chunkDocument(content, 100, 0, 46);
+
+    for (const chunk of chunks) {
+      expect(chunk.text.trimEnd().split("\n").at(-1)).not.toBe("|---|---|");
+    }
+  });
 });
 
 describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
@@ -848,6 +893,21 @@ describe("scanBreakPoints", () => {
 });
 
 describe("findCodeFences", () => {
+  test("finds a code fence at the start of the document", () => {
+    const text = "```md\n| name | value |\n| --- | --- |\n```\nAfter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: text.indexOf("\nAfter") }]);
+  });
+
+  test("finds tilde fences", () => {
+    const text = "~~~md\n| name | value |\n| --- | --- |\n~~~\nAfter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: text.indexOf("\nAfter") }]);
+  });
+
+  test("ends an indented closing fence just past its marker", () => {
+    const text = "```\nx\n  ```\nafter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: text.indexOf("\nafter") }]);
+  });
+
   test("finds single code fence", () => {
     const text = "Before\n```js\ncode here\n```\nAfter";
     const fences = findCodeFences(text);
@@ -874,6 +934,18 @@ describe("findCodeFences", () => {
     const text = "No code fences here";
     const fences = findCodeFences(text);
     expect(fences.length).toBe(0);
+  });
+});
+
+describe("findTableRegions", () => {
+  test("requires a delimiter row and ignores pipe rows inside code fences", () => {
+    expect(findTableRegions("| prose |\n| still prose |\n" )).toEqual([]);
+
+    const fencedTable = "```md\n| name | value |\n| --- | --- |\n| x | y |\n```";
+    expect(findTableRegions(fencedTable)).toEqual([]);
+
+    const tildeFencedTable = "~~~md\n| name | value |\n| --- | --- |\n| x | y |\n~~~";
+    expect(findTableRegions(tildeFencedTable)).toEqual([]);
   });
 });
 
@@ -969,6 +1041,70 @@ describe("findBestCutoff", () => {
 });
 
 describe("Smart Chunking Integration", () => {
+  test("chunkDocument keeps oversized markdown table rows intact and repeats the header", () => {
+    const header = "| parameter | type | default | description |\n| --- | --- | --- | --- |";
+    const rows = Array.from(
+      { length: 50 },
+      (_, i) => `| parameter_${i} | string | value_${i} | ${"description ".repeat(3)}${i} |`,
+    );
+    const content = `${header}\n${rows.join("\n")}`;
+
+    const chunks = chunkDocument(content, 1000, 100, 200);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.startsWith(header)).toBe(true);
+      expect(chunk.text.split("\n").every(line => line.startsWith("|"))).toBe(true);
+    }
+
+    const emittedRows = chunks.flatMap(chunk => chunk.text.split("\n").slice(2));
+    expect(new Set(emittedRows)).toEqual(new Set(rows));
+  });
+
+  test("does not split a table row that is longer than the chunk target", () => {
+    const header = `| ${"h".repeat(1200)} | type |`;
+    const delimiter = "| --- | --- |";
+    const rows = Array.from({ length: 4 }, (_, i) => `| row_${i} | ${"value ".repeat(12)} |`);
+    const content = [header, delimiter, ...rows].join("\n");
+
+    const chunks = chunkDocument(content, 1000, 100, 200);
+    const expectedLines = new Set([header, delimiter, ...rows]);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.split("\n").every(line => expectedLines.has(line))).toBe(true);
+    }
+    expect(new Set(chunks.flatMap(chunk => chunk.text.split("\n").filter(line => rows.includes(line))))).toEqual(new Set(rows));
+  });
+
+  test("recognizes tables without optional outer pipes", () => {
+    const header = "name | value";
+    const delimiter = "--- | ---";
+    const rows = Array.from({ length: 50 }, (_, i) => `item_${i} | ${"value ".repeat(3)}${i}`);
+    const content = [header, delimiter, ...rows].join("\n");
+
+    const chunks = chunkDocument(content, 300, 50, 100);
+    const expectedLines = new Set([header, delimiter, ...rows]);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.text.split("\n").every(line => expectedLines.has(line))).toBe(true);
+      expect(chunk.text.startsWith(header)).toBe(true);
+    }
+    expect(new Set(chunks.flatMap(chunk => chunk.text.split("\n").filter(line => rows.includes(line))))).toEqual(new Set(rows));
+  });
+
+  test("keeps a table together when it fits within the chunk allowance", () => {
+    const header = "| name | value |\n| --- | --- |";
+    const rows = Array.from({ length: 12 }, (_, i) => `| item_${i} | ${"value ".repeat(4)}${i} |`);
+    const content = `${header}\n${rows.join("\n")}`;
+
+    const chunks = chunkDocument(content, 400, 0, 100);
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.text).toBe(content);
+  });
+
   test("chunkDocument prefers headings over arbitrary breaks", () => {
     // Create content where the heading falls within the search window
     // We want the heading at ~1700 chars so it's in the window for a 2000 char target
@@ -6779,6 +6915,97 @@ describe("Token chunking guardrails", () => {
       const chunks = await chunkDocumentByTokens("\uD800", 900, 135);
 
       expect(chunks.length).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens keeps the table header on every chunk and never cuts a row", async () => {
+    // Token-dense table rows overflow the token budget, so each char-level
+    // chunk is re-split in pushChunkWithinTokenLimit. Every piece must still
+    // start with the table header and contain only whole rows.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const header = "| param | a | b | c | unit |\n|---|---|---|---|---|";
+      const rows = Array.from({ length: 300 }, (_, i) => `| p${i} | 0 | ${i % 17} | 0 | ms |`);
+      const source = `${header}\n${rows.join("\n")}`;
+      const chunks = await chunkDocumentByTokens(source, 200, 30, 30);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      const seen = new Set<number>();
+      for (const chunk of chunks) {
+        expect(chunk.tokens).toBeLessThanOrEqual(200);
+        const [headerLine, separatorLine, ...bodyLines] = chunk.text.split("\n");
+        expect(`${headerLine}\n${separatorLine}`).toBe(header);
+        // pos is the source offset of the chunk's own text; a continued
+        // chunk's repeated header is not in the source at that offset.
+        const raw = source.startsWith(chunk.text, chunk.pos) ? chunk.text : chunk.text.slice(header.length + 1);
+        expect(source.startsWith(raw, chunk.pos)).toBe(true);
+        for (const line of bodyLines) {
+          expect(line).toMatch(/^\| p\d+ \| 0 \| \d+ \| 0 \| ms \|$/);
+          seen.add(Number(line.match(/^\| p(\d+) /)![1]));
+        }
+      }
+      expect(seen.size).toBe(rows.length);
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens does not emit the same piece twice when a row nearly fills the budget", async () => {
+    // Each row is about the budget, so splitting a continued table re-emits the
+    // row's pieces from the overlapping outer chunks.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: Math.ceil(text.length / 3) }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length * 3);
+      },
+    } as any);
+
+    try {
+      const header = "| name | payload |\n|---|---|";
+      const rows = Array.from({ length: 20 }, (_, i) => `| r${i} | ${"p".repeat(2000)} |`);
+      const chunks = await chunkDocumentByTokens(`${header}\n${rows.join("\n")}`, 900, 135, 200);
+
+      const keys = chunks.map((chunk) => `${chunk.pos}:${chunk.text}`);
+      expect(new Set(keys).size).toBe(keys.length);
+      for (let i = 0; i < rows.length; i++) {
+        expect(chunks.some((chunk) => chunk.text.includes(`| r${i} |`))).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens terminates when a table header and one row exceed the token budget", async () => {
+    // Each re-split piece of a continued table repeats the header, so a piece
+    // can be as long as its parent; the recursion must still make progress.
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const header = "| name | value |\n|---|---|";
+      const rows = Array.from({ length: 16 }, (_, i) => `| r${i} | ${"v".repeat(40)} |`);
+      const chunks = await chunkDocumentByTokens(`${header}\n${rows.join("\n")}`, 90, 14, 23);
+
+      expect(chunks.length).toBeGreaterThan(0);
+      expect(chunks.every((chunk) => chunk.tokens <= 90)).toBe(true);
     } finally {
       setDefaultLlamaCpp(null);
     }
