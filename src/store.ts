@@ -6495,8 +6495,11 @@ export async function hybridQuery(
   const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
-  // Step 7: Blend RRF position score with reranker score
-  // Position-aware weights: top retrieval results get more protection from reranker disagreement
+  // Step 7: Order by reranker score; RRF rank breaks ties.
+  // The previous position-aware blend (tiered weight × 1/rank) was not monotonic in rank:
+  // at equal reranker score, a candidate at RRF rank 11-40 outscored one at rank 3-10
+  // (rank 3 → 0.75/3 + 0.25·s, rank 11 → 0.40/11 + 0.60·s), so strong reranker
+  // judgments pushed mid-ranked hits below deep candidates.
   const candidateMap = new Map(candidates.map(c => [c.file, {
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
@@ -6509,7 +6512,7 @@ export async function hybridQuery(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6545,7 +6548,7 @@ export async function hybridQuery(
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score || (rrfRankMap.get(a.file) ?? candidateLimit) - (rrfRankMap.get(b.file) ?? candidateLimit));
 
   // Step 8: Dedup by file (safety net — prevents duplicate output)
   const seenFiles = new Set<string>();
@@ -6903,7 +6906,7 @@ export async function structuredSearch(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6939,7 +6942,7 @@ export async function structuredSearch(
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score || (rrfRankMap.get(a.file) ?? candidateLimit) - (rrfRankMap.get(b.file) ?? candidateLimit));
 
   // Step 7: Dedup by file
   const seenFiles = new Set<string>();
