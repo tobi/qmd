@@ -397,7 +397,9 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
 
   let sizeBytes = 0;
   try {
-    sizeBytes = statSync(filePath).size;
+    const file = statSync(filePath);
+    sizeBytes = file.size;
+    if (!file.isFile()) throw new Error("path is not a regular file");
     const fd = openSync(filePath, "r");
     const sniff = Buffer.alloc(512);
     try {
@@ -441,9 +443,7 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
       details: `not valid GGUF (expected magic "GGUF", got "${magic}", ${formatModelFileSize(sizeBytes)})`,
     };
   } catch (error) {
-    // stat/open/read threw, so the header was never seen. Reporting this as
-    // "invalid" would claim a verdict no read supports, and `magic` stays
-    // undefined for the same reason.
+    // No header was read: "invalid" would falsely authorize cache replacement.
     return {
       exists: true,
       valid: false,

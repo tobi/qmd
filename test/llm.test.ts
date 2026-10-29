@@ -8,9 +8,12 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { fileURLToPath } from "node:url";
+import { z } from "zod";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -92,13 +95,37 @@ describe("inspectGgufFile", () => {
     expect(result.magic).toBeDefined();
   });
 
-  // A read/stat failure (fd exhaustion, a concurrent loader, a volume that
-  // briefly went away) must not be reported as "invalid": that kind means the
-  // content was read and confirmed bad, which is what drives validateGgufFile
-  // to delete the file. Opening a directory as if it were a file is a
-  // portable, privilege-free way to make open/read fail after stat has already
-  // succeeded, which is the shape of the real failure.
-  test("unreadable path (read fails after stat succeeds) is reported as unreadable, not invalid", () => {
+  test.skipIf(process.platform === "win32")("refuses a FIFO without blocking on its contents", () => {
+    const fifo = join(dir, "blocked.gguf");
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(root, "test", "_helpers", "inspect-gguf-worker.ts");
+    const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+    const args = isBun ? [worker, fifo] : ["--import", "tsx", worker, fifo];
+    const result = spawnSync(process.execPath, args, {
+      cwd: root, encoding: "utf8", timeout: 5000, killSignal: "SIGKILL",
+    });
+    expect({ status: result.status, signal: result.signal, error: result.error?.message })
+      .toEqual({ status: 0, signal: null, error: undefined });
+    const inspected = z.object({ exists: z.boolean(), valid: z.boolean(), kind: z.string() }).parse(JSON.parse(result.stdout));
+    expect(inspected).toEqual({ exists: true, valid: false, kind: "unreadable" });
+  }, 10000);
+
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a regular file that cannot be opened remains unreadable", () => {
+    const path = join(dir, "unreadable.gguf");
+    writeFileSync(path, Buffer.from("GGUF"));
+    chmodSync(path, 0);
+    try {
+      const result = inspectGgufFile(path);
+      expect(result.kind).toBe("unreadable");
+      expect(result.valid).toBe(false);
+      expect(result.magic).toBeUndefined();
+    } finally {
+      chmodSync(path, 0o600);
+    }
+  });
+
+  test("a directory is unreadable model input, not invalid model bytes", () => {
     const dirAsFile = join(dir, "actually-a-directory.gguf");
     mkdirSync(dirAsFile);
 

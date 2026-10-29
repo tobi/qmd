@@ -849,6 +849,44 @@ describe("CLI Status Command", () => {
     expect(stdout).not.toContain(".etag");
   }, 20000);
 
+  describe.skipIf(process.platform === "win32")("linked model cache", () => {
+    test.each(["gguf", "html", "missing", "directory"] as const)("doctor inspects the %s link target", async (kind) => {
+      const env = await createIsolatedTestEnv(`doctor-model-link-${kind}`);
+      const model = "hf:example/linked/linked.gguf";
+      await writeFile(join(env.configDir, "index.yml"),
+        `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
+      const cacheRoot = join(env.configDir, "cache");
+      const modelCacheDir = join(cacheRoot, "qmd", "models");
+      await mkdir(modelCacheDir, { recursive: true });
+      const target = join(env.configDir, "shared-model");
+      if (kind === "directory") await mkdir(target);
+      else if (kind !== "missing") await writeFile(target,
+        kind === "gguf" ? Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]) : "<html>blocked</html>");
+      symlinkSync(target, join(modelCacheDir, "hf_example_linked.gguf"));
+
+      const result = await runQmd(["doctor"], {
+        ...env, env: { XDG_CACHE_HOME: cacheRoot, QMD_DOCTOR_DEVICE_PROBE: "0" },
+      });
+      expect(result.exitCode).toBe(0);
+      const cache = result.stdout.split("\n").find(line => line.includes("model cache:"));
+      if (kind === "gguf") {
+        expect(cache).toContain("downloaded and valid GGUF");
+        expect(result.stdout).not.toContain("qmd pull");
+      } else if (kind === "html") {
+        expect(cache).toContain("invalid 1");
+        expect(result.stdout).toContain("qmd pull --refresh");
+      } else if (kind === "missing") {
+        expect(cache).toContain("missing 1/1");
+        expect(cache).not.toContain("invalid");
+        expect(result.stdout).not.toContain("qmd pull --refresh");
+      } else {
+        expect(cache).toContain("unreadable 1");
+        expect(cache).not.toContain("invalid");
+        expect(result.stdout).not.toContain("qmd pull");
+      }
+    }, 20000);
+  });
+
   test("qmd doctor says when models are overridden by env", async () => {
     const env = await createIsolatedTestEnv("doctor-env-models");
     await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");

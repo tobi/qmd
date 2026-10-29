@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- `qmd doctor` inspects linked model-cache files through the existing GGUF
+  validator, recognizing valid shared assets and diagnosing invalid link targets.
+- Model inspection rejects non-regular paths before opening them, retaining the
+  unreadable result and avoiding a blocking read from a named pipe.
+- Doctor distinguishes missing, invalid and unreadable model inputs; unreadable
+  paths require an access/path correction before recommending model replacement.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

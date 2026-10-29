@@ -107,7 +107,7 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, type GgufFileInspection } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -4045,6 +4045,7 @@ function cosineDistance(a: ArrayLike<number>, b: ArrayLike<number>): number {
 type CachedModelInspection = {
   path: string | null;
   invalid: string[];
+  unreadable: string[];
 };
 
 function formatModelDiagnosticPath(path: string): string {
@@ -4053,29 +4054,31 @@ function formatModelDiagnosticPath(path: string): string {
 
 function findCachedModelInspection(model: string): CachedModelInspection {
   const invalid: string[] = [];
+  const unreadable: string[] = [];
+  const recordFailure = (candidate: string, inspection: GgufFileInspection): void => {
+    if (!inspection.exists) return;
+    const detail = `${formatModelDiagnosticPath(candidate)}: ${inspection.details}`;
+    (inspection.kind === "unreadable" ? unreadable : invalid).push(detail);
+  };
   if (model.startsWith("hf:")) {
     const filename = model.split("/").pop();
-    if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
-    const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
+    if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid, unreadable };
+    const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR);
     for (const entry of entries) {
-      // Only consider real `.gguf` blobs. `qmd pull` writes a `<filename>.etag`
-      // HTTP sidecar next to each download; that name also satisfies
-      // `includes(filename)`, so inspecting it as GGUF false-positives
-      // "invalid model" in `qmd doctor` whenever readdir yields the sidecar
-      // before the blob (#812).
-      if (!entry.isFile() || !entry.name.endsWith(".gguf") || !entry.name.includes(filename)) continue;
-      const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
+      // The shared inspector owns file kinds; .etag sidecars are not models.
+      if (!entry.endsWith(".gguf") || !entry.includes(filename)) continue;
+      const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry);
       const inspection = inspectGgufFile(candidate);
-      if (inspection.valid) return { path: candidate, invalid };
-      invalid.push(`${formatModelDiagnosticPath(candidate)}: ${inspection.details}`);
+      if (inspection.valid) return { path: candidate, invalid, unreadable };
+      recordFailure(candidate, inspection);
     }
-    return { path: null, invalid };
+    return { path: null, invalid, unreadable };
   }
 
   const inspection = inspectGgufFile(model);
-  if (inspection.valid) return { path: model, invalid };
-  if (inspection.exists) invalid.push(`${formatModelDiagnosticPath(model)}: ${inspection.details}`);
-  return { path: null, invalid };
+  if (inspection.valid) return { path: model, invalid, unreadable };
+  recordFailure(model, inspection);
+  return { path: null, invalid, unreadable };
 }
 
 type EnvOverride = {
@@ -4212,30 +4215,37 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   const missing: string[] = [];
   const cached: string[] = [];
   const invalid: string[] = [];
+  const unreadable: string[] = [];
   for (const [model, roles] of unique) {
     const label = `${roles.join("+")}: ${model}`;
     const inspection = findCachedModelInspection(model);
     invalid.push(...inspection.invalid.map(detail => `${label} (${detail})`));
+    unreadable.push(...inspection.unreadable.map(detail => `${label} (${detail})`));
     if (inspection.path) {
       cached.push(label);
-    } else {
+    } else if (inspection.unreadable.length === 0) {
       missing.push(label);
     }
   }
 
-  if (missing.length === 0 && invalid.length === 0) {
+  if (missing.length === 0 && invalid.length === 0 && unreadable.length === 0) {
     doctorCheck("model cache", true, `${cached.length} active ${cached.length === 1 ? "model is" : "models are"} downloaded and valid GGUF`);
     return;
   }
 
   const parts: string[] = [];
   if (invalid.length > 0) parts.push(`invalid ${invalid.length}: ${invalid.join("; ")}`);
+  if (unreadable.length > 0) parts.push(`unreadable ${unreadable.length}: ${unreadable.join("; ")}`);
   if (missing.length > 0) parts.push(`missing ${missing.length}/${unique.size}: ${missing.join("; ")}`);
-  const next = invalid.length > 0
+  const next = unreadable.length > 0
+    ? "Next: fix the unreadable model paths, then rerun `qmd doctor`"
+    : invalid.length > 0
     ? "Next: run `qmd pull --refresh` (or remove the bad cached file)"
     : "Next: run `qmd pull`";
   doctorCheck("model cache", false, `${parts.join("; ")}. ${next}`);
-  if (invalid.length > 0) {
+  if (unreadable.length > 0) {
+    nextSteps.push("Fix the listed unreadable model paths, then rerun `qmd doctor`.");
+  } else if (invalid.length > 0) {
     nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
   } else {
     nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
