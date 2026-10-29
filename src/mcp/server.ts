@@ -206,6 +206,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   // --- Non-obvious things that prevent mistakes ---
   lines.push("");
   lines.push("Tips:");
+  lines.push("  - Hidden directories are excluded by default. If the user authorizes indexing .claude/ documents, run `qmd collection include-dot-dirs <collection> claude` in the CLI, then `qmd update`. Hidden files, collection masks, and ignore exclusions still apply.");
   lines.push("  - File paths in results are relative to their collection.");
   lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
   lines.push("  - Results include a `context` field describing the content type.");

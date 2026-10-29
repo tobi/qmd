@@ -105,6 +105,7 @@ import {
 import {
   setConfigSource,
   loadConfig,
+  updateCollectionSettings,
   addCollection as collectionsAddCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
@@ -334,7 +335,7 @@ export interface QMDStore {
   // ── Collection Management ───────────────────────────────────────────
 
   /** Add or update a collection */
-  addCollection(name: string, opts: { path: string; pattern?: string; ignore?: string[] }): Promise<void>;
+  addCollection(name: string, opts: { path: string; pattern?: string; ignore?: string[]; includeDotDirs?: string[] }): Promise<void>;
 
   /** Remove a collection */
   removeCollection(name: string): Promise<boolean>;
@@ -548,9 +549,17 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Collection Management — write to SQLite + write-through to YAML/inline if configured
     addCollection: async (name, opts) => {
-      upsertStoreCollection(db, name, { path: opts.path, pattern: opts.pattern, ignore: opts.ignore });
+      upsertStoreCollection(db, name, {
+        path: opts.path,
+        pattern: opts.pattern,
+        ignore: opts.ignore,
+        includeDotDirs: opts.includeDotDirs,
+      });
       if (hasYamlConfig || options.config) {
         collectionsAddCollection(name, opts.path, opts.pattern);
+        if (opts.includeDotDirs !== undefined) {
+          updateCollectionSettings(name, { includeDotDirs: opts.includeDotDirs });
+        }
       }
     },
     removeCollection: async (name) => {
@@ -616,6 +625,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          includeDotDirs: col.includeDotDirs,
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,

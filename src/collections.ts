@@ -31,6 +31,18 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  includeDotDirs?: string[]; // Hidden directory names without leading dots (default: none)
+}
+
+/** Validate literal directory names before using them in filesystem globs. */
+export function parseIncludeDotDirs(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || Array.from(value).some(name =>
+    typeof name !== "string" || !name || name.startsWith(".") || /[\0/\\*?[\]{}()!|]/.test(name)
+  )) {
+    throw new Error("includeDotDirs must be an array of literal directory names without leading dots, path separators, or glob characters");
+  }
+  return [...new Set(value as string[])];
 }
 
 /**
@@ -183,6 +195,9 @@ function ensureConfigDir(): void {
 export function loadConfig(): CollectionConfig {
   // SDK inline config mode
   if (configSource.type === 'inline') {
+    for (const collection of Object.values(configSource.config.collections)) {
+      parseIncludeDotDirs(collection.includeDotDirs);
+    }
     return configSource.config;
   }
 
@@ -202,6 +217,9 @@ export function loadConfig(): CollectionConfig {
       config.collections = {};
     }
 
+    for (const collection of Object.values(config.collections)) {
+      parseIncludeDotDirs(collection.includeDotDirs);
+    }
     return config;
   } catch (error) {
     throw new Error(`Failed to parse ${configPath}: ${error}`);
@@ -214,6 +232,9 @@ export function loadConfig(): CollectionConfig {
  * - File-based: writes to YAML file (default ~/.config/qmd/index.yml)
  */
 export function saveConfig(config: CollectionConfig): void {
+  for (const collection of Object.values(config.collections)) {
+    parseIncludeDotDirs(collection.includeDotDirs);
+  }
   // SDK inline config mode: update in place, no file I/O
   if (configSource.type === 'inline') {
     configSource.config = config;
@@ -282,8 +303,10 @@ export function getDefaultCollectionNames(): string[] {
  */
 export function updateCollectionSettings(
   name: string,
-  settings: { update?: string | null; includeByDefault?: boolean }
+  settings: { update?: string | null; includeByDefault?: boolean; includeDotDirs?: string[] | null }
 ): boolean {
+  const includeDotDirs = settings.includeDotDirs === null
+    ? [] : parseIncludeDotDirs(settings.includeDotDirs);
   const config = loadConfig();
   const collection = config.collections[name];
   if (!collection) return false;
@@ -302,6 +325,14 @@ export function updateCollectionSettings(
       delete collection.includeByDefault;
     } else {
       collection.includeByDefault = settings.includeByDefault;
+    }
+  }
+
+  if (settings.includeDotDirs !== undefined) {
+    if (includeDotDirs.length === 0) {
+      delete collection.includeDotDirs;
+    } else {
+      collection.includeDotDirs = includeDotDirs;
     }
   }
 
