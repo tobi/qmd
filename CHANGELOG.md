@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Collection indexing and SDK updates retain reusable query-expansion and rerank
+  results. Explicit cleanup still clears the model-result cache.
+- Rerank cache keys include the effective intent, chunk content, model and context
+  token limit; unqualified legacy keys are no longer reused.
+- Degraded or unexpected-model rerank results are returned to the current caller
+  without being saved as successful model results for later queries.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

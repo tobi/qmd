@@ -5,7 +5,7 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -832,6 +832,26 @@ describe("index health", () => {
 // =============================================================================
 
 describe("update", () => {
+  test("update preserves reusable model results", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(), config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } },
+    });
+    try {
+      const llm = store.internal.llm;
+      if (!llm) throw new Error("SDK store did not bind its model owner");
+      const generation = vi.spyOn(llm, "expandQuery").mockResolvedValue([
+        { type: "vec", text: "authentication token handling" },
+      ]);
+      const first = await store.expandQuery("authentication");
+      await store.update();
+      const second = await store.expandQuery("authentication");
+      expect(second).toEqual(first);
+      expect(generation).toHaveBeenCalledTimes(1);
+    } finally {
+      await store.close();
+    }
+  });
+
   test("indexes files and returns correct stats", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),

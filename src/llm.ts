@@ -893,6 +893,10 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
+  get rerankContextTokens(): number {
+    return LlamaCpp.RERANK_CONTEXT_SIZE;
+  }
+
   /**
    * Reset the inactivity timer. Called after each model operation.
    * When timer fires, models are unloaded to free memory (if no active sessions).
@@ -1368,7 +1372,7 @@ export class LlamaCpp implements LLM {
       for (let i = 0; i < n; i++) {
         try {
           this.rerankContexts.push(await model.createRankingContext({
-            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            contextSize: this.rerankContextTokens,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch (error) {
@@ -1751,7 +1755,7 @@ export class LlamaCpp implements LLM {
     // Truncate documents that would exceed the rerank context size.
     // Budget = contextSize - template overhead - query tokens
     const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const maxDocTokens = this.rerankContextTokens - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
     const truncationCache = new Map<string, string>();
 
     const truncatedDocs = documents.map((doc) => {

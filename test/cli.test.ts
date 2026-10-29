@@ -1267,6 +1267,24 @@ describe("CLI Multi-Get Command", () => {
 });
 
 describe("CLI Update Command", () => {
+  test.each(["update", "collection-add"])("%s preserves existing model-result cache entries", async (operation) => {
+    const env = await createIsolatedTestEnv(`model-cache-${operation}`);
+    const seed = createStore(env.dbPath);
+    const key = seed.getCacheKey("expandQuery", { query: "authentication", model: DEFAULT_GENERATE_MODEL_URI });
+    const value = JSON.stringify([{ type: "vec", query: "authentication token handling" }]);
+    seed.setCachedResult(key, value);
+    seed.close();
+    const args = operation === "update" ? ["update"] : ["collection", "add", fixturesDir, "--name", "docs"];
+    const result = await runQmd(args, env);
+    expect(result.exitCode).toBe(0);
+    const inspected = createStore(env.dbPath);
+    try {
+      expect(inspected.getCachedResult(key)).toBe(value);
+    } finally {
+      inspected.close();
+    }
+  });
+
   test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports collection root permission failures and exits non-zero", async () => {
     const env = await createIsolatedTestEnv("update-root-permissions");
     const parent = join(testDir, "restricted-root");
@@ -1579,8 +1597,6 @@ describe("orphaned embedding vectors (#768)", () => {
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
-    // `qmd update` clears llm_cache; re-seed so dry-run has something to report.
-    seedOrphans({ live: 0, orphaned: 0, cache: 2, inactive: 0 });
     const { stdout, exitCode } = await runQmd(["cleanup", "--dry-run"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Dry run — no changes made");

@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
+import { z } from "zod";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
@@ -1217,6 +1218,125 @@ export function hashPassword(password: string): string {
 // =============================================================================
 
 describe("Caching", () => {
+  function controlledReranker(modelName: string, score: number) {
+    const llm = new llmModule.LlamaCpp({ rerankModel: modelName });
+    const spy = vi.spyOn(llm, "rerank").mockImplementation(async (_query, documents) => ({
+      results: documents.map((doc, index) => ({ file: doc.file, score, index })),
+      model: modelName,
+    }));
+    return { llm, spy };
+  }
+
+  test("rerank reuses renamed chunks but scores changed chunks and intent", async () => {
+    const store = await createTestStore();
+    const model = controlledReranker("hf:example/cache-reranker/model.gguf", 0.37);
+    store.llm = model.llm;
+    try {
+      await store.rerank("query", [{ file: "first.md", text: "Same source" }]);
+      expect((await store.rerank("query", [{ file: "renamed.md", text: "Same source" }]))[0]?.score).toBe(0.37);
+      expect(model.spy).toHaveBeenCalledTimes(1);
+      await store.rerank("query", [{ file: "renamed.md", text: "Changed source" }]);
+      expect(model.spy).toHaveBeenCalledTimes(2);
+      await store.rerank("query", [{ file: "renamed.md", text: "Same source" }], undefined, "different intent");
+      expect(model.spy).toHaveBeenCalledTimes(3);
+    } finally {
+      await model.llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rerank deduplicates identical chunks across files", async () => {
+    const store = await createTestStore();
+    const model = controlledReranker("hf:example/dedup-reranker/model.gguf", 0.91);
+    store.llm = model.llm;
+    try {
+      const docs = [{ file: "doc1.md", text: "Shared chunk text" }, { file: "doc2.md", text: "Shared chunk text" }];
+      expect(await store.rerank("shared", docs)).toHaveLength(2);
+      expect(await store.rerank("shared", docs)).toHaveLength(2);
+      expect(model.spy).toHaveBeenCalledTimes(1);
+      expect(model.spy.mock.calls[0]?.[1]).toEqual([{ file: "doc2.md", text: "Shared chunk text" }]);
+    } finally {
+      await model.llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rerank cache distinguishes the static context-size environment boundary", async () => {
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "rerank-context-cache-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const database = join(testDir, "context-cache.sqlite");
+    const scores = [];
+    for (const contextTokens of [4096, 8192]) {
+      const result = spawnSync(process.execPath, [...args, database], {
+        encoding: "utf8", timeout: 20_000,
+        env: { ...process.env, CI: "true", QMD_RERANK_CONTEXT_SIZE: String(contextTokens) },
+      });
+      expect(result.status).toBe(0);
+      const parsed = z.object({ score: z.number().finite() }).parse(JSON.parse(result.stdout));
+      scores.push(parsed.score);
+    }
+    expect(scores).toEqual([0.4096, 0.8192]);
+  });
+
+  test.each(["hf:example/reranker/model.gguf", "fallback"])("unavailable reranker results do not become successful cached scores (%s)", async (modelName) => {
+    const store = await createTestStore();
+    const llm = new llmModule.LlamaCpp({ rerankModel: modelName });
+    const docs = [{ file: "doc.md", text: "Relevant source text" }];
+    const scoring = vi.spyOn(llm, "rerank")
+      .mockResolvedValueOnce({ results: [{ file: "doc.md", index: 0, score: 0.5 }], model: "fallback" })
+      .mockResolvedValue({ results: [{ file: "doc.md", index: 0, score: 0.83 }], model: llm.rerankModelName });
+    store.llm = llm;
+    try {
+      expect((await store.rerank("relevant query", docs))[0]?.score).toBe(0.5);
+      expect((await store.rerank("relevant query", docs))[0]?.score).toBe(0.83);
+      expect(scoring).toHaveBeenCalledTimes(2);
+    } finally {
+      await llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a genuine model score of one half remains cacheable", async () => {
+    const store = await createTestStore();
+    const llm = new llmModule.LlamaCpp({ rerankModel: "hf:example/reranker/model.gguf" });
+    const scoring = vi.spyOn(llm, "rerank").mockResolvedValue({
+      results: [{ file: "doc.md", index: 0, score: 0.5 }], model: llm.rerankModelName,
+    });
+    store.llm = llm;
+    const docs = [{ file: "doc.md", text: "Relevant source text" }];
+    try {
+      expect((await store.rerank("query", docs))[0]?.score).toBe(0.5);
+      expect((await store.rerank("query", docs))[0]?.score).toBe(0.5);
+      expect(scoring).toHaveBeenCalledTimes(1);
+    } finally {
+      await llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test.each([false, true])("unqualified old rerank keys cannot satisfy intent scoring (file key: %s)", async (fileKey) => {
+    const store = await createTestStore();
+    const llm = new llmModule.LlamaCpp({ rerankModel: "hf:example/reranker/model.gguf" });
+    const scoring = vi.spyOn(llm, "rerank").mockResolvedValue({
+      results: [{ file: "doc.md", index: 0, score: 0.12 }], model: llm.rerankModelName,
+    });
+    store.llm = llm;
+    const query = "performance";
+    const docs = [{ file: "doc.md", text: "Unchanged source text" }];
+    const body = fileKey
+      ? { query, file: "doc.md", model: llm.rerankModelName, chunk: docs[0]!.text }
+      : { query, model: llm.rerankModelName, chunk: docs[0]!.text };
+    store.setCachedResult(getCacheKey("rerank", body), "0.99");
+    try {
+      expect((await store.rerank(query, docs, undefined, "database query latency"))[0]?.score).toBe(0.12);
+      expect(scoring).toHaveBeenCalledTimes(1);
+    } finally {
+      await llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
   test("getCacheKey generates consistent keys", () => {
     const key1 = getCacheKey("http://example.com", { query: "test" });
     const key2 = getCacheKey("http://example.com", { query: "test" });
@@ -1256,8 +1376,7 @@ describe("Caching", () => {
     // Retrieve cache
     expect(store.getCachedResult(key)).toBe(value);
 
-    // Clear cache
-    store.clearCache();
+    expect(store.deleteLLMCache()).toBe(1);
     expect(store.getCachedResult(key)).toBeNull();
 
     await cleanupTestDb(store);
@@ -1269,29 +1388,19 @@ describe("Caching", () => {
     const chunk = "identical chunk text";
     const docs = [{ file: "doc.md", text: chunk }];
 
-    const makeMock = (modelName: string, score: number) => {
-      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
-        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
-        model: modelName,
-      }));
-      return {
-        spy: rerankSpy,
-        llm: { rerank: rerankSpy, rerankModelName: modelName },
-      };
-    };
-
     const modelA = "hf:example/rerank-a/a.gguf";
     const modelB = "hf:example/rerank-b/b.gguf";
-    const mockA = makeMock(modelA, 0.11);
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
+    const mockA = controlledReranker(modelA, 0.11);
+    const mockB = controlledReranker(modelB, 0.99);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm);
 
     try {
       const first = await store.rerank(query, docs);
       expect(first[0]!.score).toBe(0.11);
       expect(mockA.spy).toHaveBeenCalledTimes(1);
 
-      const keyA = getCacheKey("rerank", { query, model: modelA, chunk });
-      const keyB = getCacheKey("rerank", { query, model: modelB, chunk });
+      const keyA = getCacheKey("rerank:v2", { query, model: modelA, contextTokens: mockA.llm.rerankContextTokens, chunk });
+      const keyB = getCacheKey("rerank:v2", { query, model: modelB, contextTokens: mockB.llm.rerankContextTokens, chunk });
       const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk });
       const keyNoModel = getCacheKey("rerank", { query, chunk });
 
@@ -1299,8 +1408,7 @@ describe("Caching", () => {
       expect(store.getCachedResult(keyNoModel)).toBeNull();
       expect(store.getCachedResult(keyDefault)).toBeNull();
 
-      const mockB = makeMock(modelB, 0.99);
-      llmSpy.mockReturnValue(mockB.llm as any);
+      llmSpy.mockReturnValue(mockB.llm);
 
       const second = await store.rerank(query, docs);
       expect(mockB.spy).toHaveBeenCalledTimes(1);
@@ -1312,6 +1420,8 @@ describe("Caching", () => {
       expect(third[0]!.score).toBe(0.99);
     } finally {
       llmSpy.mockRestore();
+      await mockA.llm.dispose();
+      await mockB.llm.dispose();
       await cleanupTestDb(store);
     }
   });
@@ -1321,29 +1431,23 @@ describe("Caching", () => {
     const query = "store.llm model swap";
     const docs = [{ file: "doc.md", text: "chunk" }];
 
-    const makeMock = (modelName: string, score: number) => {
-      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
-        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
-        model: modelName,
-      }));
-      return { spy: rerankSpy, llm: { rerank: rerankSpy, rerankModelName: modelName } };
-    };
-
-    const mockA = makeMock("hf:example/store-llm-a/a.gguf", 0.21);
-    const mockB = makeMock("hf:example/store-llm-b/b.gguf", 0.87);
-    store.llm = mockA.llm as any;
+    const mockA = controlledReranker("hf:example/store-llm-a/a.gguf", 0.21);
+    const mockB = controlledReranker("hf:example/store-llm-b/b.gguf", 0.87);
+    store.llm = mockA.llm;
 
     try {
       const first = await store.rerank(query, docs);
       expect(first[0]!.score).toBe(0.21);
       expect(mockA.spy).toHaveBeenCalledTimes(1);
 
-      store.llm = mockB.llm as any;
+      store.llm = mockB.llm;
       const second = await store.rerank(query, docs);
       expect(second[0]!.score).toBe(0.87);
       expect(mockB.spy).toHaveBeenCalledTimes(1);
       expect(mockA.spy).toHaveBeenCalledTimes(1);
     } finally {
+      await mockA.llm.dispose();
+      await mockB.llm.dispose();
       await cleanupTestDb(store);
     }
   });
@@ -5416,40 +5520,6 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(results).toHaveLength(1);
 
     await cleanupTestDb(store);
-  });
-
-  test("rerank deduplicates identical chunks across files", async () => {
-    const store = await createTestStore();
-    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
-      results: docs.map((doc, index) => ({
-        file: doc.file,
-        score: 1 - index * 0.1,
-        index,
-      })),
-      model: "mock-reranker",
-    }));
-
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
-      rerank: rerankSpy,
-    } as any);
-
-    try {
-      const docs = [
-        { file: "doc1.md", text: "Shared chunk text" },
-        { file: "doc2.md", text: "Shared chunk text" },
-      ];
-
-      const first = await store.rerank("shared", docs);
-      const second = await store.rerank("shared", docs);
-
-      expect(first).toHaveLength(2);
-      expect(second).toHaveLength(2);
-      expect(rerankSpy).toHaveBeenCalledTimes(1);
-      expect(rerankSpy.mock.calls[0]?.[1]).toEqual([{ file: "doc2.md", text: "Shared chunk text" }]);
-    } finally {
-      llmSpy.mockRestore();
-      await cleanupTestDb(store);
-    }
   });
 
 });
