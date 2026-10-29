@@ -1018,8 +1018,8 @@ export class LlamaCpp implements LLM {
       const canBuild = allowBuild && canWriteLlamaDir();
 
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
-      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") =>
-        await withNativeStdoutRedirectedToStderr(() => getLlama({
+      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") => {
+        const result = await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
           // node-llama-cpp documents gpu:"auto" as the best default: Metal on
           // Apple Silicon, CUDA when fully available, Vulkan where available,
@@ -1031,6 +1031,8 @@ export class LlamaCpp implements LLM {
           progressLogs: false,
           skipDownload: !sourceBuildAllowed,
         }));
+        return result;
+      };
       const loadCpuCompatibleLlama = async () => {
         try {
           return await loadLlama(false, false);
@@ -1042,10 +1044,19 @@ export class LlamaCpp implements LLM {
           if (!cpuForcedPrebuiltFallbackWarningShown) {
             cpuForcedPrebuiltFallbackWarningShown = true;
             process.stderr.write(
-              `QMD Warning: CPU-only llama.cpp prebuilt not available (${err instanceof Error ? err.message : String(err)}); using packaged backend with GPU offloading disabled.\n`
+              `QMD Warning: CPU-only llama.cpp prebuilt not available (${err instanceof Error ? err.message : String(err)}); trying local CPU build before packaged backend.\n`
             );
           }
-          return await loadLlama("auto", false);
+          // Prefer a locally built CPU backend (llama/localBuilds/) when present;
+          // only fall back to the packaged Metal prebuilt (build:"never") as a last resort.
+          try {
+            return await loadLlama(false, true);
+          } catch (localBuildErr) {
+            process.stderr.write(
+              `QMD Warning: no local CPU build usable (${localBuildErr instanceof Error ? localBuildErr.message : String(localBuildErr)}); using packaged backend with GPU offloading disabled.\n`
+            );
+            return await loadLlama("auto", false);
+          }
         }
       };
 
@@ -1125,6 +1136,17 @@ export class LlamaCpp implements LLM {
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
+    // Offline fast path: when the model file is already in the cache dir
+    // (e.g. manually downloaded because HF is unreachable), use it directly.
+    // node-llama-cpp's hf: resolution performs network metadata checks that
+    // hang indefinitely behind a blocked connection, with no timeout.
+    const filename = modelUri.split("/").pop();
+    if (filename && modelUri.startsWith("hf:")) {
+      const cachedPath = join(this.modelCacheDir, filename);
+      if (existsSync(cachedPath)) {
+        return cachedPath;
+      }
+    }
     // resolveModelFile handles HF URIs and downloads to the cache dir
     const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, resolveModelFileArgs(this.modelCacheDir));
