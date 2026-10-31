@@ -5031,9 +5031,7 @@ if (isMain) {
       }
       const db = getDb();
       const collectionNames = resolveCollectionFilter(cli.opts.collection, true);
-      const collectionFilter = collectionNames?.[0];
-      const limit = cli.opts.limit;
-      const results = findSimilarByEmbedding(db, cli.args[0], limit, collectionFilter);
+      const results = findSimilarByEmbedding(db, cli.args[0], cli.opts.limit, collectionNames);
       if (results.length === 0) {
         console.log(`${c.dim}No similar documents found. Make sure embeddings exist (run 'qmd embed').${c.reset}`);
       } else {
