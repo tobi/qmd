@@ -1051,6 +1051,9 @@ async function updateCollections(): Promise<void> {
  * Debounces rapid changes per collection (500ms).
  */
 async function watchCollections(autoEmbed: boolean): Promise<void> {
+  // Same gate as `qmd update`: prompt before opening the store (#889).
+  const allowed = await resolveLocalConfigTrust();
+
   const db = getDb();
   const storeInstance = getStore();
   const collections = listCollections(db);
@@ -1063,6 +1066,7 @@ async function watchCollections(autoEmbed: boolean): Promise<void> {
 
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const watchers: ReturnType<typeof fsWatch>[] = [];
+  const configPath = getConfigPath();
 
   console.log(`${c.bold}Watching ${collections.length} collection(s) for changes...${c.reset}`);
   for (const col of collections) {
@@ -1073,6 +1077,13 @@ async function watchCollections(autoEmbed: boolean): Promise<void> {
 
   for (const col of collections) {
     if (!col) continue;
+    // An out-of-project path in an untrusted checkout is not ours to index (#886, #889).
+    const rawPath = getCollectionFromYaml(col.name)?.path ?? col.pwd;
+    if (!allowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
+      console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
+      console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
     if (!existsSync(col.pwd)) {
       console.log(`${c.yellow}⚠${c.reset} ${col.name}: directory not found (${col.pwd}), skipping`);
       continue;
