@@ -60,7 +60,6 @@
     "@modelcontextprotocol/server": "2.0.0",
     "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.20.0",
     "picomatch": "4.0.5",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
@@ -72,6 +71,7 @@
     "zod": "4.2.1"
   },
   "optionalDependencies": {
+    "node-llama-cpp": "3.20.0",
     "sqlite-vec-darwin-arm64": "0.1.9",
     "sqlite-vec-darwin-x64": "0.1.9",
     "sqlite-vec-linux-arm64": "0.1.9",
