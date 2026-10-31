@@ -6446,7 +6446,7 @@ export async function hybridQuery(
       if (match) {
         const row = store.db.prepare(
           `SELECT modified_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
-        ).get(match[1], match[2]) as { modified_at: string } | undefined;
+        ).get(match[1]!, match[2]!) as { modified_at: string } | undefined;
         if (row) modifiedAtMap.set(vp, row.modified_at);
       }
     }
@@ -6862,7 +6862,7 @@ export async function structuredSearch(
       if (match) {
         const row = store.db.prepare(
           `SELECT modified_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
-        ).get(match[1], match[2]) as { modified_at: string } | undefined;
+        ).get(match[1]!, match[2]!) as { modified_at: string } | undefined;
         if (row) modifiedAtMap.set(cand.file, row.modified_at);
       }
     }
