@@ -49,6 +49,8 @@ export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   editor_uri?: string;                        // Editor URI template for terminal hyperlinks
   editor_uri_template?: string;               // Alias for editor_uri
+  editorUri?: string;                         // camelCase alias for editor_uri
+  "editor-uri"?: string;                      // kebab-case alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
 }
@@ -99,17 +101,22 @@ export function setConfigSource(source?: { configPath?: string; config?: Collect
  * Config file will be ~/.config/qmd/{indexName}.yml
  */
 export function setConfigIndexName(name: string): void {
-  // Resolve relative paths to absolute paths and sanitize for use as filename
-  if (name.includes('/')) {
-    const absolutePath = resolve(process.cwd(), name);
+  // Resolve relative paths to absolute paths and sanitize for use as filename.
+  // Windows absolute paths (C:\..., \\server\share) are already absolute --
+  // skip resolve() for those (POSIX path.resolve doesn't recognize a drive
+  // letter as absolute and would wrongly prefix it with cwd) and sanitize
+  // `:` and `\` alongside `/` so the derived filename is valid on Windows.
+  const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\/.test(name);
+  if (isWindowsAbsolute || /[\\/]/.test(name)) {
+    const absolutePath = isWindowsAbsolute ? name : resolve(process.cwd(), name);
     // Replace path separators with underscores to create a valid filename
-    currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+    currentIndexName = absolutePath.replace(/[:\\/]+/g, '_').replace(/^_+/, '');
   } else {
     currentIndexName = name;
   }
 }
 
-function getConfigDir(): string {
+export function getConfigDir(): string {
   // Allow override via QMD_CONFIG_DIR for testing
   if (process.env.QMD_CONFIG_DIR) {
     return process.env.QMD_CONFIG_DIR;

@@ -3,6 +3,10 @@
  */
 
 import { describe, test, expect } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { VEC_TABLE } from "../src/vec-layout.js";
 import {
   homedir,
   resolve,
@@ -10,6 +14,7 @@ import {
   _resetProductionModeForTesting,
   getPwd,
   getRealPath,
+  isPathInsideDir,
   isVirtualPath,
   parseVirtualPath,
   normalizeVirtualPath,
@@ -17,8 +22,10 @@ import {
   isDocid,
   handelize,
   cleanupOrphanedVectors,
+  countOrphanedVectors,
   sanitizeFTS5Term,
-} from "../src/store";
+  splitGlobMask,
+} from "../src/store.js";
 
 // =============================================================================
 // Path Utilities
@@ -85,19 +92,89 @@ describe("Path Utilities", () => {
     expect(result).toBeTruthy();
     expect(result === "/tmp" || result === "/private/tmp").toBe(true);
   });
+
+  test("isPathInsideDir accepts descendants and rejects escapes", () => {
+    const root = mkdtempSync(join(tmpdir(), "qmd-inside-"));
+    try {
+      mkdirSync(join(root, "sub"));
+      writeFileSync(join(root, "sub", "a.md"), "ok\n");
+      expect(isPathInsideDir(root, join(root, "sub", "a.md"))).toBe(true);
+      expect(isPathInsideDir(root, root)).toBe(true);
+      expect(isPathInsideDir(root, join(root, "..", "nope.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isPathInsideDir rejects a file symlink that points outside the dir", () => {
+    const parent = mkdtempSync(join(tmpdir(), "qmd-sym-"));
+    const dir = join(parent, "col");
+    mkdirSync(dir);
+    const outside = join(parent, "secret.md");
+    writeFileSync(outside, "secret\n");
+    const link = join(dir, "link.md");
+    try {
+      symlinkSync(outside, link);
+    } catch {
+      rmSync(parent, { recursive: true, force: true });
+      return;
+    }
+    try {
+      expect(isPathInsideDir(dir, link)).toBe(false);
+      writeFileSync(join(dir, "inside.md"), "ok\n");
+      symlinkSync(join(dir, "inside.md"), join(dir, "alias.md"));
+      expect(isPathInsideDir(dir, join(dir, "alias.md"))).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("isPathInsideDir still treats an unreadable in-tree file as inside", () => {
+    const root = mkdtempSync(join(tmpdir(), "qmd-mode0-"));
+    const file = join(root, "bad.md");
+    writeFileSync(file, "x\n");
+    try {
+      chmodSync(file, 0);
+      expect(isPathInsideDir(root, file)).toBe(true);
+    } finally {
+      try { chmodSync(file, 0o644); } catch { /* ignore */ }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // =============================================================================
 // Handelize Tests
 // =============================================================================
 
+describe("countOrphanedVectors", () => {
+  test("returns 0 when content_vectors is missing", () => {
+    const db = {
+      prepare: () => { throw new Error("no such table: content_vectors"); },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(0);
+  });
+
+  test("returns the COUNT of hashes not referenced by an active document (#768)", () => {
+    const db = {
+      prepare: (sql: string) => {
+        expect(sql).toContain("content_vectors");
+        expect(sql).toContain("d.active = 1");
+        return { get: () => ({ c: 42 }) };
+      },
+    } as any;
+    expect(countOrphanedVectors(db)).toBe(42);
+  });
+});
+
 describe("cleanupOrphanedVectors", () => {
   test("returns 0 when vec table exists in schema but sqlite-vec is unavailable", () => {
     const prepare = (sql: string) => {
-      if (sql.includes("sqlite_master") && sql.includes("vectors_vec")) {
-        return { get: () => ({ name: "vectors_vec" }) };
+      if (sql.includes("sqlite_master")) {
+        const row = { name: VEC_TABLE, sql: `CREATE VIRTUAL TABLE ${VEC_TABLE} USING vec0(collection_id INTEGER PARTITION KEY, embedding float[3] distance_metric=cosine)` };
+        return { get: () => row, all: () => [row] };
       }
-      if (sql.includes("SELECT 1 FROM vectors_vec LIMIT 0")) {
+      if (sql.includes(`SELECT 1 FROM ${VEC_TABLE} LIMIT 0`)) {
         return { get: () => { throw new Error("no such module: vec0"); } };
       }
       throw new Error(`Unexpected SQL in test: ${sql}`);
@@ -285,5 +362,43 @@ describe("sanitizeFTS5Term", () => {
   test("handles unicode letters and numbers", () => {
     expect(sanitizeFTS5Term("café")).toBe("café");
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
+  });
+});
+
+// =============================================================================
+// splitGlobMask (#557)
+// =============================================================================
+
+describe("splitGlobMask", () => {
+  test("splits comma-separated patterns into a union", () => {
+    expect(splitGlobMask("a.md,X - *.md")).toEqual(["a.md", "X - *.md"]);
+    expect(splitGlobMask("sources/**/*.md,CO - *.md")).toEqual([
+      "sources/**/*.md",
+      "CO - *.md",
+    ]);
+  });
+
+  test("leaves brace expansion intact", () => {
+    expect(splitGlobMask("{a.md,X - *.md}")).toEqual(["{a.md,X - *.md}"]);
+    expect(splitGlobMask("**/*.{md,txt}")).toEqual(["**/*.{md,txt}"]);
+  });
+
+  test("splits only top-level commas", () => {
+    expect(splitGlobMask("a.md,{b,c}.md")).toEqual(["a.md", "{b,c}.md"]);
+  });
+
+  test("does not split commas inside character classes", () => {
+    expect(splitGlobMask("file[a,b].md")).toEqual(["file[a,b].md"]);
+  });
+
+  test("trims whitespace and drops empty segments", () => {
+    expect(splitGlobMask(" a.md , *.txt ")).toEqual(["a.md", "*.txt"]);
+    expect(splitGlobMask("a.md,")).toEqual(["a.md"]);
+    expect(splitGlobMask("a.md,,b.md")).toEqual(["a.md", "b.md"]);
+  });
+
+  test("returns a single pattern unchanged", () => {
+    expect(splitGlobMask("**/*.md")).toEqual(["**/*.md"]);
+    expect(splitGlobMask("notes/*.md")).toEqual(["notes/*.md"]);
   });
 });

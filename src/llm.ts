@@ -17,7 +17,10 @@ type WriteCallback = (err?: Error | null) => void;
 type NodeLlamaCppModule = {
   getLlama: (options: Record<string, unknown>) => Promise<Llama>;
   getLlamaGpuTypes?: (include?: "supported" | "allValid") => Promise<LlamaGpuMode[]>;
-  resolveModelFile: (model: string, cacheDir: string) => Promise<string>;
+  resolveModelFile: (
+    model: string,
+    optionsOrDirectory?: string | { directory?: string; cli?: boolean },
+  ) => Promise<string>;
   LlamaChatSession: new (options: { contextSequence: unknown }) => {
     prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
   };
@@ -49,6 +52,7 @@ export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null):
   failedGpuInitModes.clear();
   noGpuAccelerationWarningShown = false;
   cpuForcedPrebuiltFallbackWarningShown = false;
+  llamaDirWritableOverride = undefined;
 }
 
 export function resetNodeLlamaCppModuleForTest(): void {
@@ -56,6 +60,7 @@ export function resetNodeLlamaCppModuleForTest(): void {
   failedGpuInitModes.clear();
   noGpuAccelerationWarningShown = false;
   cpuForcedPrebuiltFallbackWarningShown = false;
+  llamaDirWritableOverride = undefined;
 }
 
 type StdoutWrite = typeof process.stdout.write;
@@ -90,8 +95,9 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 }
 
 import { homedir } from "os";
-import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { dirname, join } from "path";
+import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { createRequire } from "node:module";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -130,6 +136,31 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+// =============================================================================
+// Build Writability Check
+// =============================================================================
+
+const llamaCppRequire = createRequire(import.meta.url);
+
+/** Test override for canWriteLlamaDir(); `undefined` uses the real probe. */
+let llamaDirWritableOverride: boolean | undefined;
+
+export function setLlamaDirWritableForTest(writable: boolean | undefined): void {
+  llamaDirWritableOverride = writable;
+}
+
+/** Whether node-llama-cpp can write to its llama/ directory (false on NixOS). */
+export function canWriteLlamaDir(pkgDir?: string): boolean {
+  if (llamaDirWritableOverride !== undefined) return llamaDirWritableOverride;
+  try {
+    const dir = pkgDir ?? dirname(llamaCppRequire.resolve("node-llama-cpp/package.json"));
+    accessSync(join(dir, "llama"), constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -354,7 +385,13 @@ const GGUF_MAGIC = Buffer.from("GGUF");
 export type GgufFileInspection = {
   exists: boolean;
   valid: boolean;
-  kind: "missing" | "gguf" | "html" | "invalid";
+  /**
+   * "html" and "invalid" mean the header was read and is confirmed bad.
+   * "unreadable" means the read itself failed, so nothing is known about the
+   * content. The two stay distinct because only the first justifies deleting
+   * the file.
+   */
+  kind: "missing" | "gguf" | "html" | "invalid" | "unreadable";
   sizeBytes?: number;
   magic?: string;
   details: string;
@@ -424,10 +461,13 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
       details: `not valid GGUF (expected magic "GGUF", got "${magic}", ${formatModelFileSize(sizeBytes)})`,
     };
   } catch (error) {
+    // stat/open/read threw, so the header was never seen. Reporting this as
+    // "invalid" would claim a verdict no read supports, and `magic` stays
+    // undefined for the same reason.
     return {
       exists: true,
       valid: false,
-      kind: "invalid",
+      kind: "unreadable",
       sizeBytes,
       details: `cannot read model file: ${error instanceof Error ? error.message : String(error)}`,
     };
@@ -443,10 +483,27 @@ function validateGgufFile(filePath: string, modelUri: string): void {
   const inspection = inspectGgufFile(filePath);
   if (!inspection.exists || inspection.valid) return; // let downstream handle missing files
 
-  // Remove the bad file so the next attempt re-downloads
+  // A read that failed says nothing about the bytes on disk. Deleting here
+  // throws away a file that is usually fine (fd exhaustion, a concurrent
+  // loader, a volume that briefly went away) and re-downloading it can cost
+  // gigabytes, so surface the real error and leave the file alone.
+  if (inspection.kind === "unreadable") {
+    throw new Error(
+      `Model file could not be read, so it could not be validated (${inspection.details}).\n` +
+      `Model: ${modelUri}\n` +
+      `Path:  ${filePath}\n\n` +
+      `The file has been left in place. If this repeats, check open file limits, ` +
+      `permissions, and whether the volume holding the model cache is still mounted.`
+    );
+  }
+
+  // Confirmed bad content: remove it so the next attempt re-downloads.
+  let removed = true;
   try {
     unlinkSync(filePath);
-  } catch { /* best effort */ }
+  } catch {
+    removed = false;
+  }
 
   if (inspection.kind === "html") {
     throw new Error(
@@ -466,13 +523,26 @@ function validateGgufFile(filePath: string, modelUri: string): void {
     `Model file is not valid GGUF (expected magic "GGUF", got "${inspection.magic ?? "unknown"}", file is ${formatModelFileSize(inspection.sizeBytes ?? 0)}).\n` +
     `Model: ${modelUri}\n` +
     `Path:  ${filePath}\n\n` +
-    `The file has been removed. Run the command again to re-download.`
+    (removed
+      ? `The file has been removed. Run the command again to re-download.`
+      : `The file could NOT be removed. Delete it manually, then run the command again.`)
   );
+}
+
+
+/**
+ * node-llama-cpp prints a multi-line download progress bar when the second
+ * argument is a directory string (`cli` defaults to true). Agent transcripts
+ * capture that as thousands of tokens. Always pass an options object so the
+ * bar is off unless the caller opts in (#776).
+ */
+function resolveModelFileArgs(cacheDir: string, cli = false): { directory: string; cli: boolean } {
+  return { directory: cacheDir, cli };
 }
 
 export async function pullModels(
   models: string[],
-  options: { refresh?: boolean; cacheDir?: string } = {}
+  options: { refresh?: boolean; cacheDir?: string; cli?: boolean } = {}
 ): Promise<PullResult[]> {
   const cacheDir = options.cacheDir || MODEL_CACHE_DIR;
   if (!existsSync(cacheDir)) {
@@ -517,7 +587,7 @@ export async function pullModels(
     const llamaModule = await loadNodeLlamaCpp();
     if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
     const { resolveModelFile } = llamaModule;
-    const path = await resolveModelFile(model, cacheDir);
+    const path = await resolveModelFile(model, resolveModelFileArgs(cacheDir, options.cli === true));
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
@@ -647,6 +717,62 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   return Math.max(1, options.computed);
 }
 
+/** Measured nomic-embed / embeddinggemma-300M embedding-context cost at 2048 tokens. */
+export const BASELINE_EMBED_CONTEXT_MB = 150;
+
+/**
+ * VRAM to leave free when sizing the embedding-context pool so `query` can
+ * still create a rerank context afterwards. Matches the 1000 MB figure
+ * `ensureRerankContexts` already uses as its per-context cost.
+ */
+export const EMBED_POOL_RERANK_RESERVE_MB = 1000;
+
+/**
+ * GPU embedding-context pool size from free VRAM.
+ *
+ * Uses 25% of (free − reserve), then clamps to `[1, cap]`. The reserve keeps
+ * the pool from consuming the memory `query` needs next for the reranker (#799).
+ */
+export function computeGpuContextPoolSize(options: {
+  freeMB: number;
+  perContextMB: number;
+  reserveMB?: number;
+  cap?: number;
+}): number {
+  const perContextMB = Math.max(1, options.perContextMB);
+  const reserveMB = Math.max(0, options.reserveMB ?? 0);
+  const cap = options.cap ?? 8;
+  const usableMB = Math.max(0, options.freeMB - reserveMB);
+  const maxByVram = Math.floor((usableMB * 0.25) / perContextMB);
+  return Math.max(1, Math.min(cap, maxByVram));
+}
+
+/**
+ * Estimate one embedding context's VRAM from the GGUF weight-file size.
+ *
+ * Small models (nomic / embeddinggemma-class, ≲350 MB) stay at the measured
+ * 150 MB baseline so default `qmd embed` throughput is unchanged. Larger
+ * files — Qwen3-Embedding-0.6B-Q8 is ~640 MB — were measured at ~1190 MB per
+ * 2048-token context, about 1.85× the weight file, because the KV cache
+ * dominates (#799).
+ */
+export function estimateEmbedContextMB(options: {
+  modelBytes: number;
+  contextSize?: number;
+}): number {
+  const contextSize = options.contextSize && options.contextSize > 0 ? options.contextSize : 2048;
+  const modelMB = options.modelBytes / (1024 * 1024);
+  const ctxScale = contextSize / 2048;
+  if (!(modelMB > 0) || !Number.isFinite(modelMB)) {
+    return Math.max(1, Math.round(BASELINE_EMBED_CONTEXT_MB * ctxScale));
+  }
+  const SMALL_MODEL_MB = 350;
+  if (modelMB <= SMALL_MODEL_MB) {
+    return Math.max(1, Math.round(BASELINE_EMBED_CONTEXT_MB * ctxScale));
+  }
+  return Math.max(1, Math.round(modelMB * 1.85 * ctxScale));
+}
+
 export function resolveLlamaGpuMode(
   envValue = process.env.QMD_LLAMA_GPU,
   forceCpuValue = process.env.QMD_FORCE_CPU
@@ -663,6 +789,19 @@ export function resolveLlamaGpuMode(
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
   return "auto";
+}
+
+
+/** node-llama-cpp 3.20 made LlamaContextSequence.dispose() async (llama.cpp b10361).
+ * Context.onDispose fires sequence.dispose() without awaiting, so dispose the
+ * sequence first and wait, then dispose the parent context.
+ */
+async function disposeSequenceThenContext(
+  sequence: { dispose: () => void | Promise<void> } | undefined,
+  context: { dispose: () => Promise<void> },
+): Promise<void> {
+  if (sequence) await sequence.dispose();
+  await context.dispose();
 }
 
 async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
@@ -715,6 +854,7 @@ export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
+  private embedModelPath: string | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
@@ -730,6 +870,7 @@ export class LlamaCpp implements LLM {
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  private rerankContextsCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> | null = null;
   // Guard against concurrent ensureLlama() calls creating duplicate Llama
   // instances. Without this, two concurrent callers each build their own
   // runtime and the last write to this.llama wins, leaving models/grammars
@@ -746,9 +887,10 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
-    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
-    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
+    // set GGML_METAL_NO_RESIDENCY=1 on darwin BEFORE the native binding loads,
+    // which prevents the libggml-metal static destructor assertion at process
+    // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
 
@@ -844,6 +986,7 @@ export class LlamaCpp implements LLM {
       if (this.embedModel) {
         await this.embedModel.dispose();
         this.embedModel = null;
+        this.embedModelPath = null;
       }
       if (this.generateModel) {
         await this.generateModel.dispose();
@@ -857,6 +1000,7 @@ export class LlamaCpp implements LLM {
       this.embedModelLoadPromise = null;
       this.generateModelLoadPromise = null;
       this.rerankModelLoadPromise = null;
+      this.rerankContextsCreatePromise = null;
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -892,11 +1036,13 @@ export class LlamaCpp implements LLM {
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
+      // Skip source build when install dir is read-only (e.g. NixOS store).
+      const canBuild = allowBuild && canWriteLlamaDir();
 
       const llamaModule = await loadNodeLlamaCpp();
       if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = llamaModule;
-      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
+      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
           // node-llama-cpp documents gpu:"auto" as the best default: Metal on
@@ -1007,7 +1153,7 @@ export class LlamaCpp implements LLM {
     const llamaModule = await loadNodeLlamaCpp();
     if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
     const { resolveModelFile } = llamaModule;
-    const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
+    const modelPath = await resolveModelFile(modelUri, resolveModelFileArgs(this.modelCacheDir));
     validateGgufFile(modelPath, modelUri);
     return modelPath;
   }
@@ -1028,6 +1174,7 @@ export class LlamaCpp implements LLM {
       const modelPath = await this.resolveModel(this.embedModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.embedModel = model;
+      this.embedModelPath = modelPath;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
@@ -1049,15 +1196,14 @@ export class LlamaCpp implements LLM {
    *      true parallelism (each context runs on its own cores). Use at most
    *      half the math cores, with at least 4 threads per context.
    */
-  private async computeParallelism(perContextMB: number): Promise<number> {
+  private async computeParallelism(perContextMB: number, reserveMB = 0): Promise<number> {
     const llama = await this.ensureLlama();
 
     if (!this.isCpuOffloadForced() && llama.gpu) {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
-        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        const computed = Math.max(1, Math.min(8, maxByVram));
+        const computed = computeGpuContextPoolSize({ freeMB, perContextMB, reserveMB });
         return resolveSafeParallelism({ gpu: llama.gpu, computed });
       } catch {
         return resolveSafeParallelism({ gpu: llama.gpu, computed: 2 });
@@ -1100,8 +1246,21 @@ export class LlamaCpp implements LLM {
 
     this.embedContextsCreatePromise = (async () => {
       const model = await this.ensureEmbedModel();
-      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
-      const n = await this.computeParallelism(150);
+      // Per-context cost depends on the loaded GGUF. The old hardcoded 150 MB
+      // figure was measured for nomic-embed; Qwen3-Embedding-0.6B is ~1190 MB
+      // and opening 8 of those exhausted VRAM so the reranker could not load (#799).
+      let perContextMB = BASELINE_EMBED_CONTEXT_MB;
+      if (this.embedModelPath) {
+        try {
+          perContextMB = estimateEmbedContextMB({
+            modelBytes: statSync(this.embedModelPath).size,
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+          });
+        } catch {
+          // Keep the baseline if the file cannot be stat'd.
+        }
+      }
+      const n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
@@ -1195,10 +1354,8 @@ export class LlamaCpp implements LLM {
    * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
    * Each context has its own sequence, so they can evaluate independently.
    *
-   * Tuning choices:
-   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
-   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
-   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
+   * VRAM per context is governed by contextSize alone —
+   * LlamaRankingContextOptions has no flashAttention option.
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Default 2048 was too small for longer documents (e.g. session transcripts,
@@ -1217,9 +1374,21 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity();
+      return this.rerankContexts;
+    }
+
+    if (this.rerankContextsCreatePromise) {
+      return await this.rerankContextsCreatePromise;
+    }
+
+    // Same mutex as ensureEmbedContexts: two overlapping query/rerank calls on a
+    // cold MCP server both saw length === 0, both created ranking contexts, and
+    // the inactivity timer disposed the loser → "Object is disposed" (#682).
+    this.rerankContextsCreatePromise = (async () => {
+      this.touchActivity();
       const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
       const n = Math.min(await this.computeParallelism(1000), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
@@ -1228,24 +1397,32 @@ export class LlamaCpp implements LLM {
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
-        } catch {
+        } catch (error) {
           if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
+            // Surface the underlying failure (e.g. out of VRAM). A previous
+            // "retry without flash attention" path was dead: ranking contexts
+            // never accepted that option, so the retry repeated identical
+            // arguments and the real error was discarded.
+            const detail = error instanceof Error ? error.message : String(error);
+            console.warn(
+              `Reranker unavailable — skipping reranking (${detail}). ` +
+              "Use --no-rerank to silence this warning.",
+            );
+            return [];
           }
+          // At least one context exists — continue with reduced parallelism.
           break;
         }
       }
+      this.touchActivity();
+      return this.rerankContexts;
+    })();
+
+    try {
+      return await this.rerankContextsCreatePromise;
+    } finally {
+      this.rerankContextsCreatePromise = null;
     }
-    this.touchActivity();
-    return this.rerankContexts;
   }
 
   // ==========================================================================
@@ -1454,8 +1631,8 @@ export class LlamaCpp implements LLM {
         done: true,
       };
     } finally {
-      // Dispose context (which disposes dependent sequences/sessions per lifecycle rules)
-      await context.dispose();
+      // Sequence dispose is async as of node-llama-cpp 3.20; await it before the parent context.
+      await disposeSequenceThenContext(sequence, context);
     }
   }
 
@@ -1478,7 +1655,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1489,15 +1666,18 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const intent = options.intent;
-    const prompt = intent
-      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
-      : `/no_think Expand this search query: ${query}`;
+    // The expansion prompt consumes ONLY the query text. Caller intent is
+    // free-form meta-language that the expansion model reproduced verbatim as
+    // lex/vec sub-queries — degenerate terms that match nothing. Intent still
+    // shapes retrieval where it belongs: the reranker query prefix and
+    // keyword-based chunk/snippet selection.
+    const prompt = `/no_think Expand this search query: ${query}`;
 
     // Set up inside the try so any failure (grammar creation, context
     // allocation/VRAM, session prompt) falls back to the original query
     // instead of propagating and failing the caller's operation.
     let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
+    let sequence: { dispose: () => void | Promise<void> } | undefined;
     try {
       const grammar = await llama.createGrammar({
         grammar: `
@@ -1512,7 +1692,7 @@ export class LlamaCpp implements LLM {
       genContext = await this.generateModel!.createContext({
         contextSize: this.expandContextSize,
       });
-      const sequence = genContext.getSequence();
+      sequence = genContext.getSequence();
       const llamaModule = await loadNodeLlamaCpp();
       if (!llamaModule) throw new Error(NODE_LLAMA_CPP_UNAVAILABLE_MESSAGE);
       const { LlamaChatSession } = llamaModule;
@@ -1570,7 +1750,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      if (genContext) await genContext.dispose();
+      if (genContext) await disposeSequenceThenContext(sequence, genContext);
     }
   }
 
@@ -1590,6 +1770,12 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     const contexts = await this.ensureRerankContexts();
+    if (contexts.length === 0) {
+      return {
+        results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
+        model: "fallback",
+      };
+    }
     const model = await this.ensureRerankModel();
 
     // Truncate documents that would exceed the rerank context size.
@@ -1735,6 +1921,7 @@ export class LlamaCpp implements LLM {
     if (this.embedModel) {
       await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
       this.embedModel = null;
+      this.embedModelPath = null;
     }
     if (this.generateModel) {
       await disposeWithTimeout("generation model", () => this.generateModel!.dispose());
@@ -1755,6 +1942,7 @@ export class LlamaCpp implements LLM {
     this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.rerankContextsCreatePromise = null;
     this.llamaLoadPromise = null;
   }
 }

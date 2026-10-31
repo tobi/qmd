@@ -27,9 +27,7 @@ describe("LLM module loading", () => {
     const pkg = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf-8"));
 
     expect(pkg.dependencies).not.toHaveProperty("node-llama-cpp");
-    expect(pkg.optionalDependencies).toMatchObject({
-      "node-llama-cpp": "3.18.1",
-    });
+    expect(pkg.optionalDependencies).toHaveProperty("node-llama-cpp");
   });
 
   test("CLI LLM availability guard reports the actionable optional dependency error", async () => {

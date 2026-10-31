@@ -9,6 +9,7 @@ qmd collection add . --name <n>   # Create/index collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
+qmd collection metadata [name...] # Discover metadata keys, types, and value counts (--match, --filter, --key-limit, --value-limit)
 qmd init                          # Create a project-local .qmd index
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
@@ -20,6 +21,7 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd doctor                        # Diagnose config, index, model, and device issues
 qmd update                        # Re-index collections; configured update hooks run first
+qmd trust [list|revoke]           # Approve a checked-in .qmd config's hooks/paths/models
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
@@ -46,8 +48,15 @@ qmd collection remove mynotes
 # Rename a collection
 qmd collection rename mynotes my-notes
 
-# Show collection details
+# Show collection details, including the top metadata keys
 qmd collection show mynotes
+
+# Discover metadata keys and values to filter on
+qmd collection metadata mynotes
+qmd collection metadata mynotes --match '{"field":"key","operator":"eq","value":"topics"}'
+qmd collection metadata mynotes --match '{"field":"value","operator":"eq","value":"docs-team"}'
+qmd collection metadata mynotes --match '{"field":"key","operator":"eq","value":"topics"}' --filter '{"field":"status","operator":"eq","value":"published"}'
+qmd collection metadata mynotes --key-limit 50 --key-offset 50   # next page of keys
 
 # Set or clear the pre-update hook (runs before re-indexing on `qmd update`)
 qmd collection update-cmd mynotes 'git pull --ff-only'

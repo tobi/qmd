@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "2.6.3",
+  "version": "2.8.3",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "main": "dist/index.js",
@@ -26,8 +26,9 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
+    "prepare": "node scripts/install-hooks.mjs && node scripts/build.mjs",
     "build": "node scripts/build.mjs",
+    "lint": "oxlint",
     "test": "node scripts/test-all.mjs",
     "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
     "test:node": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000",
@@ -56,21 +57,21 @@
     "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "better-sqlite3": "12.10.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",
-    "picomatch": "4.0.4",
+    "picomatch": "4.0.5",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "web-tree-sitter": "0.26.8",
+    "web-tree-sitter": "0.26.12",
     "yaml": "2.9.0",
     "zod": "4.2.1"
   },
   "optionalDependencies": {
-    "node-llama-cpp": "3.18.1",
+    "node-llama-cpp": "3.20.0",
     "sqlite-vec-darwin-arm64": "0.1.9",
     "sqlite-vec-darwin-x64": "0.1.9",
     "sqlite-vec-linux-arm64": "0.1.9",
@@ -78,9 +79,12 @@
     "sqlite-vec-windows-x64": "0.1.9"
   },
   "devDependencies": {
+    "@oxlint/plugins": "1.78.0",
     "@types/better-sqlite3": "7.6.13",
-    "tsx": "4.21.0",
-    "vitest": "3.2.4"
+    "@types/bun": "1.4.3",
+    "oxlint": "1.78.0",
+    "tsx": "4.23.12",
+    "vitest": "3.2.7"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -88,7 +92,6 @@
       "esbuild",
       "node-llama-cpp",
       "tree-sitter-go",
-      "tree-sitter-javascript",
       "tree-sitter-python",
       "tree-sitter-rust",
       "tree-sitter-typescript"

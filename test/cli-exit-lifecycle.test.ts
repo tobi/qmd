@@ -105,7 +105,7 @@ describe("CLI successful-exit lifecycle", () => {
       },
     });
 
-    Object.assign(llm as unknown as Record<string, unknown>, {
+    Object.assign(llm, {
       embedContexts: [disposable("embed-context")],
       rerankContexts: [disposable("rerank-context")],
       embedModel: disposable("embed-model"),

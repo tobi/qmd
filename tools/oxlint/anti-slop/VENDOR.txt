@@ -1,0 +1,2 @@
+Vendored from https://github.com/dmmulroy/anti-slop (MIT).
+Copy of src/ as of 6d538555cb151d4121ed51a27db81890eacf8ae9.
