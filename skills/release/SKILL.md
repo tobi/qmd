@@ -29,28 +29,30 @@ When the user triggers `/release <version>`:
    the commits and file changes from the context output. Follow the changelog
    standard below. Re-run the context script after committing if needed.
 
-4. **Cut the release** — run `scripts/release.sh <version>`. This renames
-   `[Unreleased]` → `[X.Y.Z] - date`, inserts a fresh `[Unreleased]`,
-   bumps `package.json`, commits, and tags.
+4. **Check dependency updates** — before cutting the release, check for
+   updates to `sqlite-vec` (and platform packages), `node-llama-cpp`,
+   and `better-sqlite3`. Run `pnpm outdated` and report any available
+   updates for these packages. If updates exist, bump them (pinned, no
+   `^` ranges) and re-run tests before proceeding.
 
-5. **Show the final changelog** — print the full `[Unreleased]` +
+5. **Cut the release** — run `scripts/release.sh <version>`. This renames
+   `[Unreleased]` → `[X.Y.Z] - date`, inserts a fresh `[Unreleased]`,
+   bumps `package.json` and the plugin version in
+   `.claude-plugin/marketplace.json` (so installed plugins see the update),
+   commits, and tags.
+
+6. **Show the final changelog** — print the full `[Unreleased]` +
    minor series rollup via `scripts/extract-changelog.sh <version>`.
    Ask the user to confirm before pushing.
 
-6. **Push** — after explicit confirmation, run `git push origin main --tags`.
+7. **Push** — after explicit confirmation, run `git push origin main --tags`.
 
-7. **Watch CI** — after the push, start a background dispatch to watch the
+8. **Watch CI** — after the push, start a background dispatch to watch the
    publish workflow. Use `interactive_shell` in dispatch mode with:
    ```
    gh run watch $(gh run list --workflow=publish.yml --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status
    ```
    The agent will be notified when CI completes and should report the result.
-
-7. **Check dependency updates** — before cutting the release, check for
-   updates to `sqlite-vec` (and platform packages), `node-llama-cpp`,
-   and `better-sqlite3`. Run `pnpm outdated` and report any available
-   updates for these packages. If updates exist, bump them (pinned, no
-   `^` ranges) and re-run tests before proceeding.
 
 If any step fails, stop and explain. Never force-push or skip validation.
 
