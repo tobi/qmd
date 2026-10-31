@@ -39,6 +39,20 @@ qmd embed
 }
 ```
 
+## Protocol
+
+QMD speaks MCP **2026-07-28** (SDK 2.x) and dual-speaks 2025-era stdio clients.
+
+- **stdio** (`qmd mcp`): hosts still launch this as a subprocess. Opening
+  `initialize` (2025) or a `_meta`-enveloped request / `server/discover`
+  (2026) pins the connection's era.
+- **HTTP** (`qmd mcp --http`): sessionless Streamable HTTP. No
+  `Mcp-Session-Id`, no handshake. Each POST is independent. 2026 clients
+  MUST send `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`)
+  `Mcp-Name`. Version/caps travel in `_meta`. Call `server/discover` to
+  learn supported versions and capabilities. `tools/list` is cacheable
+  (`ttlMs` / `cacheScope`) and returns tools in a stable order.
+
 ## HTTP Mode
 
 ```bash
@@ -46,6 +60,9 @@ qmd mcp --http              # Port 8181
 qmd mcp --http --daemon     # Background
 qmd mcp stop                # Stop daemon
 ```
+
+`POST /mcp` is the MCP endpoint (JSON). `GET /health` is a liveness check.
+There is no session GET stream and no idle-session TTL.
 
 ## Tools
 

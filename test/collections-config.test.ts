@@ -85,6 +85,15 @@ describe("getConfigDir via getConfigPath", () => {
     expect(getConfigPath()).toBe(join("/xdg/config", "qmd", "myindex.yml"));
   });
 
+  test("sanitizes a Windows absolute index name into a safe filename", () => {
+    delete process.env.QMD_CONFIG_DIR;
+    process.env.XDG_CONFIG_HOME = "/xdg/config";
+    setConfigIndexName("C:\\Users\\axulo\\Documents\\ppttest");
+    expect(getConfigPath()).toBe(
+      join("/xdg/config", "qmd", "C_Users_axulo_Documents_ppttest.yml")
+    );
+  });
+
   test("loadConfig treats an empty YAML file as an empty config", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-empty-config-"));
     try {

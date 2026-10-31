@@ -13,6 +13,13 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   clearAllEmbeddings,
+  optimizeDocumentsFts,
+  previewCleanup,
+  repackVectors,
+  runCleanup,
+  vectorTableLayout,
+  type CleanupStats,
+  type VectorTableLayout,
 } from "./store.js";
 
 export class Maintenance {
@@ -50,5 +57,34 @@ export class Maintenance {
   /** Clear all vector embeddings (forces re-embedding) */
   clearEmbeddings(): void {
     clearAllEmbeddings(this.store.db);
+  }
+
+  /** Compact FTS5 so deleted rows leave documents_fts_data (#550). */
+  optimizeFts(): void {
+    optimizeDocumentsFts(this.store.db);
+  }
+
+  /** Chunk layout of the vector table, or null without one. */
+  vectorLayout(): VectorTableLayout | null {
+    return vectorTableLayout(this.store.db);
+  }
+
+  /** Move the live rows of mostly-empty vector chunks to the tail; see {@link repackVectors}. */
+  repackVectors(): VectorTableLayout | null {
+    return repackVectors(this.store.db);
+  }
+
+  /** Preview what {@link run} would remove, without writing. */
+  preview(): CleanupStats {
+    return previewCleanup(this.store.db);
+  }
+
+  /**
+   * Full cleanup: cache, orphaned vectors, vector repack when the table is
+   * mostly holes, inactive docs, orphaned content, FTS optimize, vacuum. Same
+   * sequence as `qmd cleanup`.
+   */
+  run(): CleanupStats {
+    return runCleanup(this.store.db);
   }
 }

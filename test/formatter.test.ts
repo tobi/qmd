@@ -48,6 +48,7 @@ function makeSearchResult(overrides: Partial<SearchResult> = {}): SearchResult {
     modifiedAt: "2024-01-01T00:00:00Z",
     bodyLength: 100,
     body: "---\ntitle: Summit Keynote\n---\n\nThis is the keynote content.",
+    metadata: {},
     score: 0.84,
     source: "fts",
     ...overrides,

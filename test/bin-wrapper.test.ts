@@ -1,12 +1,25 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const fixtures: string[] = [];
+
+// Shebang-forward for bin/qmd must exec a real Node binary, not bun.
+// `bun test` sets process.execPath to bun; interpolating that would run the
+// trampoline under bun and hit the PATH-`node` fallback, which is the
+// opposite of the NODE_MODULE_VERSION case this suite pins.
+function realNodeExecPath(): string {
+  if (typeof process.versions.bun !== "string") return process.execPath;
+  const result = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+  const resolved = result.stdout?.trim();
+  if (result.status === 0 && resolved) return resolved;
+  return "node";
+}
+const REAL_NODE = realNodeExecPath();
 
 function makeTempFixture() {
   const root = mkdtempSync(join(tmpdir(), "qmd-bin-wrapper-"));
@@ -18,18 +31,18 @@ function makeTempFixture() {
   for (const runtime of ["node", "bun"]) {
     const runtimePath = join(runtimeBin, runtime);
     if (runtime === "node") {
+      // Shebang of bin/qmd is `#!/usr/bin/env node`, so PATH `node` must
+      // still launch the trampoline. The trampoline itself must NOT
+      // re-resolve `node` from PATH for the child (#577 leftover): that
+      // is the NODE_MODULE_VERSION bug. Exit 42 if it does.
       writeFileSync(
         runtimePath,
         `#!/bin/sh
 if [ "$(basename "$1")" = "qmd" ]; then
-  exec "${process.execPath}" "$@"
+  exec "${REAL_NODE}" "$@"
 else
-  {
-    printf '%s\\n' 'node'
-    printf '%s\\n' "$1"
-    shift
-    printf '%s\\n' "$@"
-  } > "$QMD_WRAPPER_CAPTURE"
+  echo "qmd launcher must not re-resolve node from PATH" >&2
+  exit 42
 fi
 `,
       );
@@ -45,15 +58,36 @@ fi
   return { root, capturePath, runtimeBin };
 }
 
+function guardedEsmCli(body: string): string {
+  return [
+    'import { realpathSync, writeFileSync } from "node:fs";',
+    'import { fileURLToPath } from "node:url";',
+    'const __filename = fileURLToPath(import.meta.url);',
+    'const argv1 = process.argv[1];',
+    'const isMain = argv1 === __filename',
+    '  || argv1?.endsWith("/qmd.ts")',
+    '  || argv1?.endsWith("/qmd.js")',
+    '  || (argv1 != null && realpathSync(argv1) === __filename);',
+    'if (isMain) {',
+    `  ${body}`,
+    '}',
+    '',
+  ].join("\n");
+}
+
 function makePackage(root: string, packagePath: string, lockfiles: string[] = [], options: { dist?: boolean; source?: boolean; tsx?: boolean; git?: boolean } = {}) {
   const packageRoot = join(root, packagePath);
   const includeDist = options.dist ?? true;
   mkdirSync(join(packageRoot, "bin"), { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), '{"type":"module"}\n');
   copyFileSync(join(repoRoot, "bin", "qmd"), join(packageRoot, "bin", "qmd"));
   chmodSync(join(packageRoot, "bin", "qmd"), 0o755);
   if (includeDist) {
     mkdirSync(join(packageRoot, "dist", "cli"), { recursive: true });
-    writeFileSync(join(packageRoot, "dist", "cli", "qmd.js"), "// fixture\n");
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, ["node", process.argv[1], ...process.argv.slice(2)].join("\\n") + "\\n");'),
+    );
   }
   if (options.source) {
     mkdirSync(join(packageRoot, "src", "cli"), { recursive: true });
@@ -61,7 +95,17 @@ function makePackage(root: string, packagePath: string, lockfiles: string[] = []
   }
   if (options.tsx) {
     mkdirSync(join(packageRoot, "node_modules", "tsx", "dist"), { recursive: true });
-    writeFileSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs"), "// tsx fixture\n");
+    writeFileSync(
+      join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs"),
+      [
+        'import { writeFileSync } from "node:fs";',
+        'const capture = process.env.QMD_WRAPPER_CAPTURE;',
+        'if (capture) {',
+        '  writeFileSync(capture, ["node", process.argv[1], ...process.argv.slice(2)].join("\\n") + "\\n");',
+        '}',
+        '',
+      ].join("\n"),
+    );
   }
   if (options.git) {
     mkdirSync(join(packageRoot, ".git"), { recursive: true });
@@ -264,6 +308,106 @@ describe("bin/qmd package wrapper", () => {
     expect(result.runtime).toBe("node");
     expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs")));
     expect(result.args).toEqual([realpathSync(join(packageRoot, "src", "cli", "qmd.ts")), "--version"]);
+  });
+
+  test("source-mode Node child uses process.execPath, not a different PATH node (#577 leftover)", () => {
+    const { root, runtimeBin, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "qmd", [], { source: true, tsx: true, git: true });
+
+    const child = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "--version"], {
+      env: {
+        ...process.env,
+        PATH: `${runtimeBin}${delimiter}${process.env.PATH ?? ""}`,
+        QMD_WRAPPER_CAPTURE: capturePath,
+      },
+      encoding: "utf8",
+    });
+    const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split("\n");
+
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(runtime).toBe("node");
+    expect(scriptPath).toBe(realpathSync(join(packageRoot, "node_modules", "tsx", "dist", "cli.mjs")));
+    expect(args).toEqual([realpathSync(join(packageRoot, "src", "cli", "qmd.ts")), "--version"]);
+  });
+
+  test("imports dist in the current Node process when Node is already selected", () => {
+    const { root, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, String(process.pid));'),
+    );
+
+    const result = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "--version"], {
+      env: { ...process.env, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(Number(readFileSync(capturePath, "utf8"))).toBe(result.pid);
+  });
+
+  test.skipIf(typeof process.versions.bun !== "string")("imports dist in the current Bun process when Bun is already selected", () => {
+    const { root, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"]);
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, String(process.pid));'),
+    );
+
+    const result = spawnSync(process.execPath, [join(packageRoot, "bin", "qmd"), "--version"], {
+      env: { ...process.env, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(Number(readFileSync(capturePath, "utf8"))).toBe(result.pid);
+  });
+
+  test("an in-process dist import keeps the CLI's argv and exit status", () => {
+    const { root, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    const distEntry = join(packageRoot, "dist", "cli", "qmd.js");
+    writeFileSync(
+      distEntry,
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, JSON.stringify({ pid: process.pid, argv: process.argv.slice(1) })); process.exit(3);'),
+    );
+
+    const result = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "search", "x"], {
+      env: { ...process.env, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(3);
+    const captured = JSON.parse(readFileSync(capturePath, "utf8"));
+    expect(captured.pid).toBe(result.pid);
+    expect(realpathSync(captured.argv[0])).toBe(realpathSync(distEntry));
+    expect(captured.argv.slice(1)).toEqual(["search", "x"]);
+  });
+
+  test("a Node launch of a Bun-locked package still hands off to a bun child", () => {
+    const { root, capturePath, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"]);
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, "in-process\\n");'),
+    );
+
+    const result = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "search", "x"], {
+      env: { ...process.env, PATH: `${runtimeBin}${delimiter}${process.env.PATH ?? ""}`, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split("\n");
+    expect(runtime).toBe("bun");
+    expect(realpathSync(scriptPath!)).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
+    expect(args).toEqual(["search", "x"]);
   });
 
   test("explains how to build when dist is missing and source cannot run", () => {
