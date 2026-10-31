@@ -38,6 +38,9 @@ import {
   handelize,
   normalizePathSeparators,
   syncConfigToDb,
+  findOrMigrateLegacyDocument,
+  findActiveDocument,
+  findDocument,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -329,6 +332,181 @@ describe("Path fidelity — CLI integration", () => {
     const hit = results.find((r) => r.file.includes("normal-file"));
     expect(hit).toBeDefined();
     expect(hit!.file).toContain("normal-file.md");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Separator collisions: files whose names differ only in the characters the
+// legacy slug collapsed to "-" (spaces, underscores) must all survive indexing.
+// Regression for #717 — the legacy-path migration used to adopt the row of a
+// live file, evicting it from the index. `qmd get` / `qmd ls` also treated "_"
+// as a SQL LIKE wildcard.
+// ---------------------------------------------------------------------------
+
+function activePaths(dbPath: string): string[] {
+  const db = openDatabase(dbPath);
+  const rows = db.prepare(
+    "SELECT path FROM documents WHERE active = 1 ORDER BY path"
+  ).all() as { path: string }[];
+  db.close();
+  return rows.map((r) => r.path);
+}
+
+async function createCollectionWith(
+  prefix: string,
+  files: Array<{ name: string; content: string }>
+): Promise<{ collectionDir: string; dbPath: string; configDir: string }> {
+  const envDir = join(testDir, prefix);
+  const collectionDir = join(envDir, "corpus");
+  const dbPath = join(envDir, "test.sqlite");
+  const configDir = join(envDir, "config");
+
+  await mkdir(collectionDir, { recursive: true });
+  await mkdir(configDir, { recursive: true });
+  for (const f of files) {
+    await writeFile(join(collectionDir, f.name), f.content);
+  }
+  await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+
+  return { collectionDir: realpathSync(collectionDir), dbPath, configDir };
+}
+
+describe("Path fidelity — separator collisions (#717)", () => {
+  const twins: Array<{ name: string; content: string }> = [
+    { name: "2026-06-16.md", content: "# Hyphen\n\nJournal searchterm-twin hyphenated.\n" },
+    { name: "2026_06_16.md", content: "# Underscore\n\nJournal searchterm-twin underscored.\n" },
+    { name: "my file.md", content: "# Spaced\n\nFile searchterm-twin with spaces.\n" },
+    { name: "my-file.md", content: "# Hyphenated\n\nFile searchterm-twin hyphenated.\n" },
+  ];
+
+  test("legacy migration does not adopt a row owned by a live file", async () => {
+    const dbPath = join(testDir, "live-guard.sqlite");
+    const store = createStore(dbPath);
+    const now = new Date().toISOString();
+    const hyphen = twins[0]!;
+    const underscore = twins[1]!;
+    const hyphenHash = await hashContent(hyphen.content);
+    insertContent(store.db, hyphenHash, hyphen.content, now);
+    insertDocument(store.db, "collide", hyphen.name, "Hyphen", hyphenHash, now, now);
+
+    const livePaths = new Set([hyphen.name, underscore.name]);
+    const migrated = findOrMigrateLegacyDocument(
+      store.db, "collide", underscore.name, livePaths
+    );
+    expect(migrated).toBeNull();
+    expect(findActiveDocument(store.db, "collide", hyphen.name)?.hash).toBe(hyphenHash);
+    expect(findActiveDocument(store.db, "collide", underscore.name)).toBeNull();
+    store.close();
+  });
+
+  test("legacy rows still migrate when no live file owns the slug", async () => {
+    const dbPath = join(testDir, "legacy-migrate.sqlite");
+    const store = createStore(dbPath);
+    const now = new Date().toISOString();
+    const underscore = twins[1]!;
+    const slug = handelize(underscore.name);
+    expect(slug).toBe("2026-06-16.md");
+    const hash = await hashContent(underscore.content);
+    insertContent(store.db, hash, underscore.content, now);
+    insertDocument(store.db, "collide", slug, "Underscore", hash, now, now);
+
+    const livePaths = new Set([underscore.name]);
+    const migrated = findOrMigrateLegacyDocument(
+      store.db, "collide", underscore.name, livePaths
+    );
+    expect(migrated).not.toBeNull();
+    expect(findActiveDocument(store.db, "collide", underscore.name)?.hash).toBe(hash);
+    expect(findActiveDocument(store.db, "collide", slug)).toBeNull();
+    store.close();
+  });
+
+  test("findDocument matches underscores literally, not as LIKE wildcards", async () => {
+    const dbPath = join(testDir, "like-get.sqlite");
+    const store = createStore(dbPath);
+    const now = new Date().toISOString();
+    for (const f of [twins[0]!, twins[1]!]) {
+      const hash = await hashContent(f.content);
+      insertContent(store.db, hash, f.content, now);
+      insertDocument(store.db, "collide", f.name, f.name, hash, now, now);
+    }
+
+    const underscore = findDocument(store.db, "2026_06_16.md", { includeBody: true });
+    expect("error" in underscore).toBe(false);
+    if (!("error" in underscore)) {
+      expect(underscore.displayPath).toBe("collide/2026_06_16.md");
+      expect(underscore.body).toContain("underscored");
+    }
+
+    const hyphen = findDocument(store.db, "2026-06-16.md", { includeBody: true });
+    expect("error" in hyphen).toBe(false);
+    if (!("error" in hyphen)) {
+      expect(hyphen.displayPath).toBe("collide/2026-06-16.md");
+      expect(hyphen.body).toContain("hyphenated");
+    }
+    store.close();
+  });
+
+  test("a fresh index keeps every file whose name differs only by separators", async () => {
+    const { collectionDir, dbPath, configDir } = await createCollectionWith("collide-fresh", twins);
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+
+    const paths = activePaths(dbPath);
+    for (const f of twins) {
+      expect(paths, `${f.name} missing from index`).toContain(f.name);
+    }
+    expect(paths).toHaveLength(twins.length);
+  });
+
+  test("adding an underscore twin to an indexed collection does not evict the hyphen file", async () => {
+    const { collectionDir, dbPath, configDir } = await createCollectionWith(
+      "collide-incremental",
+      [twins[0]!]
+    );
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+    expect(activePaths(dbPath)).toEqual(["2026-06-16.md"]);
+
+    await writeFile(join(collectionDir, twins[1]!.name), twins[1]!.content);
+    const update = await runQmd(["update"], { cwd: collectionDir, dbPath, configDir });
+    expect(update.exitCode, `qmd update failed: ${update.stderr}`).toBe(0);
+
+    expect(activePaths(dbPath)).toEqual(["2026-06-16.md", "2026_06_16.md"]);
+
+    const hyphen = await runQmd(["get", "2026-06-16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(hyphen.exitCode, `get hyphen failed: ${hyphen.stderr}`).toBe(0);
+    expect(hyphen.stdout).toContain("hyphenated");
+
+    const underscore = await runQmd(["get", "2026_06_16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(underscore.exitCode, `get underscore failed: ${underscore.stderr}`).toBe(0);
+    expect(underscore.stdout).toContain("underscored");
+  });
+
+  test("underscores in a path are matched literally, not as LIKE wildcards", async () => {
+    const { collectionDir, dbPath, configDir } = await createCollectionWith("collide-like", twins);
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "collide"],
+      { cwd: collectionDir, dbPath, configDir }
+    );
+    expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
+
+    const got = await runQmd(["get", "2026_06_16.md"], { cwd: collectionDir, dbPath, configDir });
+    expect(got.exitCode, `get failed: ${got.stderr}`).toBe(0);
+    expect(got.stdout).toContain("underscored");
+    expect(got.stdout).not.toContain("hyphenated");
+
+    const ls = await runQmd(["ls", "collide/2026_06"], { cwd: collectionDir, dbPath, configDir });
+    expect(ls.exitCode, `ls failed: ${ls.stderr}`).toBe(0);
+    expect(ls.stdout).toContain("2026_06_16.md");
+    expect(ls.stdout).not.toContain("2026-06-16.md");
   });
 });
 
