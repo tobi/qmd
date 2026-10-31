@@ -25,6 +25,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocument,
+  findSimilarByEmbedding,
   resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
@@ -3886,6 +3887,7 @@ function showHelp(): void {
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd similar <path|#docid>     - Find documents similar to a given document");
   console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
@@ -5014,6 +5016,30 @@ if (isMain) {
       cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
       search(cli.query, cli.opts);
       break;
+
+    case "similar": {
+      if (!cli.args[0]) {
+        console.error("Usage: qmd similar <path-or-docid> [options]");
+        console.error("");
+        console.error("Find documents similar to the given document using embedding similarity.");
+        console.error("");
+        console.error("Examples:");
+        console.error("  qmd similar docs/api.md");
+        console.error("  qmd similar #abc123");
+        console.error("  qmd similar notes/meeting.md -c notes -n 10");
+        process.exit(1);
+      }
+      const db = getDb();
+      const collectionNames = resolveCollectionFilter(cli.opts.collection, true);
+      const results = findSimilarByEmbedding(db, cli.args[0], cli.opts.limit, collectionNames);
+      if (results.length === 0) {
+        console.log(`${c.dim}No similar documents found. Make sure embeddings exist (run 'qmd embed').${c.reset}`);
+      } else {
+        console.log(formatSearchResults(results, cli.opts.format, { full: cli.opts.full }));
+      }
+      closeDb();
+      break;
+    }
 
     case "vsearch":
     case "vector-search": // undocumented alias

@@ -1640,6 +1640,7 @@ export type Store = {
 
   // Fuzzy matching and docid lookup
   findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
+  findSimilarByEmbedding: (pathOrDocid: string, limit?: number, collectionName?: CollectionScope) => SearchResult[];
   matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
   findDocumentByDocid: (docid: string) => { filepath: string; hash: string } | null;
 
@@ -2678,6 +2679,7 @@ export function createStore(dbPath?: string): Store {
 
     // Fuzzy matching and docid lookup
     findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
+    findSimilarByEmbedding: (pathOrDocid: string, limit?: number, collectionName?: CollectionScope) => findSimilarByEmbedding(db, pathOrDocid, limit, collectionName),
     matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
     findDocumentByDocid: (docid: string) => findDocumentByDocid(db, docid),
 
@@ -5034,6 +5036,68 @@ export async function searchVec(db: Database, query: string, model: string, limi
         context: getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
+        source: "vec" as const,
+        chunkPos: row.pos,
+      }];
+    });
+}
+
+// =============================================================================
+// Similar Documents (by embedding cosine similarity)
+// =============================================================================
+
+export function findSimilarByEmbedding(db: Database, pathOrDocid: string, limit: number = 5, collectionName?: CollectionScope): SearchResult[] {
+  if (!hasVectorIndex(db)) return [];
+
+  const doc = findDocument(db, pathOrDocid);
+  if ('error' in doc) return [];
+  const targetHash = doc.hash;
+
+  const names = scopedCollectionNames(collectionName);
+  let collectionIds: number[] | undefined;
+  if (names) {
+    collectionIds = Array.from(resolveCollectionIds(db, names).values());
+    if (collectionIds.length === 0) return [];
+  }
+
+  // The first chunk stands in for the document. One read per step: sqlite-vec
+  // virtual tables hang when joined, the same reason searchVec has two steps.
+  const vectorRow = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = 0 LIMIT 1`)
+    .get(targetHash) as { id: number } | undefined;
+  if (!vectorRow) return [];
+  const stored = db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`)
+    .get(vecInteger(vectorRow.id)) as { embedding: Uint8Array } | undefined;
+  if (!stored) return [];
+  const queryVec = new Float32Array(Uint8Array.from(stored.embedding).buffer);
+
+  const targets: VecScanTarget[] = collectionIds ? collectionIds.map(collectionId => ({ collectionId })) : [{}];
+  const scan = knnVecScanner(db, collectionIds !== undefined);
+  const resolve = vecDocumentResolver(db);
+  // Filtering inside the resolver lets nearestVecDocuments widen k past the
+  // source's own chunks, and drops any copy of it stored under another path.
+  const others: typeof resolve = (matches) => resolve(matches).filter(row => row.hash !== targetHash);
+  const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
+
+  return targets
+    .flatMap(target => nearestVecDocuments(scan, others, queryVec, limit, target))
+    .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
+    .slice(0, limit)
+    .flatMap((row): SearchResult[] => {
+      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+      if (content == null) return [];
+      return [{
+        filepath: row.filepath,
+        displayPath: row.display_path,
+        title: row.title,
+        hash: row.hash,
+        docid: getDocid(row.hash),
+        collectionName: row.filepath.split('//')[1]?.split('/')[0] || "",
+        modifiedAt: "",
+        bodyLength: content.doc.length,
+        body: content.doc,
+        context: getContextForFile(db, row.filepath),
+        metadata: parseMetadataJson(row.metadata_json),
+        score: 1 - row.distance,
         source: "vec" as const,
         chunkPos: row.pos,
       }];

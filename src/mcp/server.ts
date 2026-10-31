@@ -201,6 +201,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("");
   lines.push("Retrieval:");
   lines.push("  - `get` — single document by path or docid (#abc123). Supports a line-range suffix: `file.md:100` (from line 100) or `file.md:100:40` (40 lines from line 100).");
+  lines.push("  - `similar` — find documents similar to a given path or docid");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`), comma-separated list, or docids (#abc123).");
 
   // --- Non-obvious things that prevent mistakes ---
@@ -500,6 +501,31 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: qmd_similar (Find similar documents by embedding)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "similar",
+    {
+      title: "Find Similar Documents",
+      description: "Find documents semantically similar to a given document using embedding cosine similarity. Provide a file path or docid.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        path: z.string().describe("File path or docid (#abc123) of the source document"),
+        n: z.number().optional().default(5).describe("Max results (default 5)"),
+        collection: z.string().optional().describe("Restrict to a specific collection"),
+      },
+    },
+    async ({ path, n, collection }) => {
+      const results = store.findSimilarByEmbedding(path, n, collection);
+      if (results.length === 0) {
+        return { content: [{ type: "text" as const, text: "No similar documents found. Make sure embeddings exist (run 'qmd embed')." }] };
+      }
+      const formatted = results.map(r => `${r.displayPath} (${Math.round(r.score * 100)}% similar)\n  ${r.title || "(no title)"}`).join("\n\n");
+      return { content: [{ type: "text" as const, text: formatted }] };
+    }
+  );
+
   // Tool: qmd_get (Retrieve document)
   // ---------------------------------------------------------------------------
 
