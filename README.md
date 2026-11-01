@@ -1404,9 +1404,9 @@ either backend alone.
 field (`exact`, `semantic`, `topical`, `cross-domain`, `alias`) labels queries for
 grouping — it does not change search behavior.
 
-> **Heads-up:** if the fixture's collection isn't indexed, bench currently runs to
-> completion and reports all zeros with no warning. Verify setup with
-> `qmd ls <collection>` first.
+> Bench refuses missing or empty indexed collections. A thrown search error fails
+> the run rather than becoming a quality score. Successful all-zero runs warn on
+> stderr; verify the fixture's expected files with `qmd ls <collection>`.
 
 ## Data Storage
 

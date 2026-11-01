@@ -957,6 +957,28 @@ describe("CLI Status Command", () => {
   });
 });
 
+describe("CLI Benchmark Command", () => {
+  test("fails without a successful report when a search throws", async () => {
+    const environment = await createIsolatedTestEnv("bench-search-error");
+    const indexed = await runQmd(["collection", "add", join(fixturesDir, "notes"), "--name", "bench-docs"], environment);
+    expect(indexed.exitCode).toBe(0);
+    const fixturePath = join(testDir, "bench-search-error.json");
+    await writeFile(fixturePath, JSON.stringify({
+      description: "search error",
+      version: 1,
+      collection: "bench-docs",
+      queries: [{
+        id: "invalid-query", query: "vec:", type: "semantic", description: "empty vector input",
+        expected_files: ["meeting.md"], expected_in_top_k: 1,
+      }],
+    }));
+    const result = await runQmd(["bench", fixturePath, "--json"], environment);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("vec:");
+  });
+});
+
 describe("CLI Search Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files

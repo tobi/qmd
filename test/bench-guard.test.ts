@@ -1,12 +1,8 @@
 /**
- * Bench collection guardrails (#716).
- *
- * `qmd bench` used to run every fixture query against a missing/empty
- * collection and print a wall of 0.00. These tests lock the fail-fast
- * checks and the all-zero stderr warning.
+ * Benchmark admission, failed searches, and genuine zero-result runs.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -91,7 +87,7 @@ describe("allZeroBenchWarning", () => {
   });
 });
 
-describe("runBenchmark collection guard", () => {
+describe("runBenchmark", () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -99,6 +95,7 @@ describe("runBenchmark collection guard", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -118,6 +115,21 @@ describe("runBenchmark collection guard", () => {
       }],
     }));
     return fixturePath;
+  }
+
+  async function indexedCollection() {
+    const docs = join(dir, "docs");
+    await mkdir(docs, { recursive: true });
+    await writeFile(join(docs, "api.md"), "# API versioning\n\nUse /v1 and /v2 endpoints.\n");
+    const dbPath = join(dir, "index.sqlite");
+    const config = { collections: { docs: { path: docs, pattern: "**/*.md" } } };
+    const store = await createStore({ dbPath, config });
+    try {
+      await store.update();
+    } finally {
+      await store.close();
+    }
+    return { dbPath, config };
   }
 
   test("errors before searching when the fixture collection does not exist", async () => {
@@ -145,65 +157,43 @@ describe("runBenchmark collection guard", () => {
   });
 
   test("runs bm25 against an indexed collection", async () => {
-    const docs = join(dir, "docs");
-    await mkdir(docs, { recursive: true });
-    await writeFile(join(docs, "api.md"), "# API versioning\n\nUse /v1 and /v2 endpoints.\n");
-    const dbPath = join(dir, "index.sqlite");
-    const config = { collections: { docs: { path: docs, pattern: "**/*.md" } } };
-    const store = await createStore({ dbPath, config });
-    await store.update();
-    await store.close();
+    const { dbPath, config } = await indexedCollection();
 
     const fixturePath = writeFixture("docs", "API versioning", "api.md");
-    const stderr: string[] = [];
-    const origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
-      return origWrite(chunk as string, ...(rest as []));
-    }) as typeof process.stderr.write;
-    try {
-      const result = await runBenchmark(fixturePath, {
-        json: true,
-        dbPath,
-        backends: ["bm25"],
-        config,
-      });
-      expect(result.summary.bm25?.avg_recall).toBeGreaterThan(0);
-      expect(stderr.join("")).not.toContain("All benchmark scores were 0.00");
-    } finally {
-      process.stderr.write = origWrite;
-    }
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const result = await runBenchmark(fixturePath, {
+      json: true,
+      dbPath,
+      backends: ["bm25"],
+      config,
+    });
+    expect(result.summary.bm25?.avg_recall).toBeGreaterThan(0);
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("All benchmark scores were 0.00"));
   });
 
   test("warns on stderr when every backend scores zero", async () => {
-    const docs = join(dir, "docs");
-    await mkdir(docs, { recursive: true });
-    await writeFile(join(docs, "api.md"), "# API versioning\n\nUse /v1 and /v2 endpoints.\n");
-    const dbPath = join(dir, "index.sqlite");
-    const config = { collections: { docs: { path: docs, pattern: "**/*.md" } } };
-    const store = await createStore({ dbPath, config });
-    await store.update();
-    await store.close();
+    const { dbPath, config } = await indexedCollection();
 
     const fixturePath = writeFixture("docs", "zzzz-no-such-token-in-corpus", "missing.md");
-    const stderr: string[] = [];
-    const origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
-      return origWrite(chunk as string, ...(rest as []));
-    }) as typeof process.stderr.write;
-    try {
-      const result = await runBenchmark(fixturePath, {
-        json: true,
-        dbPath,
-        backends: ["bm25"],
-        config,
-      });
-      expect(result.summary.bm25?.avg_recall).toBe(0);
-      expect(stderr.join("")).toContain("All benchmark scores were 0.00");
-      expect(stderr.join("")).toContain("qmd ls docs");
-    } finally {
-      process.stderr.write = origWrite;
-    }
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const result = await runBenchmark(fixturePath, {
+      json: true,
+      dbPath,
+      backends: ["bm25"],
+      config,
+    });
+    expect(result.summary.bm25?.avg_recall).toBe(0);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("qmd ls docs"));
+  });
+
+  test.each(["bm25", "vector", "hybrid", "full"])("rejects %s search failures instead of scoring them as misses", async (backend) => {
+    const { dbPath, config } = await indexedCollection();
+    const fixturePath = writeFixture("docs", "vec:");
+    await expect(runBenchmark(fixturePath, {
+      json: true,
+      dbPath,
+      backends: [backend],
+      config,
+    })).rejects.toThrow(/Line 1 \(vec:\)/);
   });
 });

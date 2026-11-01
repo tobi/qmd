@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- `qmd bench` propagates search errors instead of reporting failed queries as
+  zero-quality results. Successful searches with no relevant results still score zero.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

@@ -173,27 +173,7 @@ async function runQuery(
   const limit = Math.max(query.expected_in_top_k, 10);
   const start = Date.now();
 
-  let resultFiles: string[];
-  try {
-    resultFiles = await backend.run(store, query, limit, collection);
-  } catch {
-    // Backend may not be available (e.g., no embeddings for vector search)
-    return {
-      precision_at_k: 0,
-      recall: 0,
-      recall_at_1: 0,
-      recall_at_3: 0,
-      recall_at_5: 0,
-      mrr: 0,
-      f1: 0,
-      hits_at_k: 0,
-      total_expected: query.expected_files.length,
-      latency_ms: Date.now() - start,
-      top_files: [],
-      matched_files: [],
-      unmatched_expected_files: query.expected_files,
-    };
-  }
+  const resultFiles = await backend.run(store, query, limit, collection);
 
   const latency_ms = Date.now() - start;
   const scores = scoreResults(resultFiles, query.expected_files, query.expected_in_top_k);
