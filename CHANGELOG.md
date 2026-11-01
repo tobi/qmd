@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Indexing and collection updates preserve cached query expansions and rerank
+  scores. Changed passages still require fresh reranking; explicit cache cleanup
+  remains available. Temporary fallback rerank scores are no longer cached under
+  the real model's name, allowing later queries to retry the recovered model.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

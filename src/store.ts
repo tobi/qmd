@@ -5353,7 +5353,10 @@ export async function rerank(query: string, documents: { file: string; text: str
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
       const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
+      // Unavailable ranking contexts return neutral fallback scores, not model judgments.
+      if (rerankResult.model !== "fallback") {
+        setCachedResult(db, cacheKey, result.score.toString());
+      }
       cachedResults.set(chunk, result.score);
     }
   }

@@ -19,6 +19,7 @@ import { createStore, insertContent, insertDocument } from "../src/store.ts";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE } from "../src/vec-layout.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
+import { qmdRunnerArgs } from "./qmd-runner.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -30,16 +31,6 @@ let testCounter = 0; // Unique counter for each test run
 // Get the directory where this test file lives
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
-const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
-const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
-const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
-const qmdCommand = isBunRuntime
-  ? { command: process.execPath, args: [qmdScript] }
-  : { command: process.execPath, args: [tsxCli, qmdScript] };
-
-function qmdRunnerArgs(args: string[]): { command: string; args: string[] } {
-  return { command: qmdCommand.command, args: [...qmdCommand.args, ...args] };
-}
 
 // Helper to run qmd command with test database
 async function runQmd(
@@ -1579,8 +1570,6 @@ describe("orphaned embedding vectors (#768)", () => {
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
-    // `qmd update` clears llm_cache; re-seed so dry-run has something to report.
-    seedOrphans({ live: 0, orphaned: 0, cache: 2, inactive: 0 });
     const { stdout, exitCode } = await runQmd(["cleanup", "--dry-run"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Dry run — no changes made");
