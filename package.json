@@ -60,7 +60,7 @@
     "@modelcontextprotocol/server": "2.0.0",
     "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.20.0",
+    "node-llama-cpp": "3.22.2",
     "picomatch": "4.0.5",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",

@@ -52,6 +52,8 @@
 
 ### Changed
 
+- Update `node-llama-cpp` to 3.22.2 so EmbeddingGemma 2 can be selected for
+  text embeddings. The default model is unchanged. Refs #1089.
 - The MCP server caches its instructions per store for up to 60 seconds instead
   of rebuilding them, with a full index-status scan, for every HTTP request.
   Concurrent requests share one build and a failed build is not cached; index

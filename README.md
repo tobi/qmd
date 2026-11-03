@@ -599,12 +599,16 @@ This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
 # Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
 export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
 
+# Or use EmbeddingGemma 2 (text only):
+# export QMD_EMBED_MODEL="hf:ggml-org/embeddinggemma-2-GGUF/embeddinggemma-2-Q8_0.gguf"
+
 # After changing the model, re-embed all collections:
 qmd embed -f
 ```
 
 Supported model families:
 - **embeddinggemma** (default) — English-optimized, small footprint
+- **EmbeddingGemma 2** — Optional text-only embeddings
 - **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
 
 > **Note:** When switching embedding models, you must re-index with `qmd embed -f`
@@ -1565,6 +1569,10 @@ Override them per-role without touching source via the `models:` block in
 `QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
 
 ### EmbeddingGemma Prompt Format
+
+Both EmbeddingGemma versions use these prefixes. Inputs longer than one
+512-token batch can produce incorrect embeddings; this existing issue is
+tracked in [#993](https://github.com/tobi/qmd/pull/993).
 
 ```
 // For queries
