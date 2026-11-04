@@ -1527,3 +1527,227 @@ describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
     }
   });
 });
+
+describe("idle unload vs in-flight operations (#938)", () => {
+  // bun:test's vitest shim has no vi.waitFor. Poll so both runners share this.
+  async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out after ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  function fakeEmbedModel(events: string[]) {
+    return {
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+      dispose: vi.fn(async () => { events.push("model-dispose"); }),
+    };
+  }
+
+  test("idle timer never disposes the context or model under a running embed", async () => {
+    // Per-store shape used by createStore() / `qmd mcp`.
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 20, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ctx = {
+      getEmbeddingFor: vi.fn(async () => {
+        events.push("embed-start");
+        await gate;
+        events.push("embed-end");
+        return { vector: new Float32Array([1, 0]) };
+      }),
+      dispose: vi.fn(async () => { events.push("ctx-dispose"); }),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = fakeEmbedModel(events);
+
+    const pending = llm.embed("hello");
+    await new Promise((resolve) => setTimeout(resolve, 150)); // several idle periods
+    expect(ctx.dispose).not.toHaveBeenCalled();
+    expect(llm.embedModel.dispose).not.toHaveBeenCalled();
+
+    release();
+    await expect(pending).resolves.toMatchObject({ embedding: [1, 0] });
+    await waitUntil(() => events.includes("model-dispose"));
+    expect(events.indexOf("embed-end")).toBeLessThan(events.indexOf("ctx-dispose"));
+  });
+
+  test("unloadIdleResources drains in-flight work and new calls wait for disposal, then use fresh contexts", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: false }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((resolve) => { releaseEmbed = resolve; });
+    let releaseDispose!: () => void;
+    const disposeGate = new Promise<void>((resolve) => { releaseDispose = resolve; });
+    const oldCtx = {
+      getEmbeddingFor: vi.fn(async () => {
+        await embedGate;
+        events.push("old-embed-end");
+        return { vector: new Float32Array([1]) };
+      }),
+      dispose: vi.fn(async () => {
+        events.push("old-dispose-start");
+        await disposeGate;
+        events.push("old-dispose-end");
+      }),
+    };
+    const freshCtx = {
+      getEmbeddingFor: vi.fn(async () => {
+        events.push("fresh-embed");
+        return { vector: new Float32Array([2]) };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    llm.embedContexts = [oldCtx];
+    llm.embedModel = fakeEmbedModel(events);
+    llm.ensureEmbedContext = vi.fn(async () => {
+      if (llm.embedContexts.length === 0) llm.embedContexts = [freshCtx];
+      return llm.embedContexts[0];
+    });
+
+    const first = llm.embed("in flight");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const unload = llm.unloadIdleResources();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(oldCtx.dispose).not.toHaveBeenCalled(); // still draining
+
+    releaseEmbed();
+    await expect(first).resolves.toMatchObject({ embedding: [1] });
+    await waitUntil(() => events.includes("old-dispose-start"));
+
+    const second = llm.embed("after unload started"); // must not touch oldCtx
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(freshCtx.getEmbeddingFor).not.toHaveBeenCalled();
+
+    releaseDispose();
+    await unload;
+    await expect(second).resolves.toMatchObject({ embedding: [2] });
+    expect(oldCtx.getEmbeddingFor).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["old-embed-end", "old-dispose-start", "old-dispose-end", "fresh-embed"]);
+  });
+
+  test("a failed context dispose still drops the context and disposes the model", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    const ctx = {
+      dispose: vi.fn(async () => {
+        events.push("ctx-dispose");
+        throw new Error("boom");
+      }),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = {
+      dispose: vi.fn(async () => { events.push("model-dispose"); }),
+    };
+
+    await expect(llm.unloadIdleResources()).resolves.toBeUndefined();
+    expect(llm.embedContexts).toEqual([]);
+    expect(llm.embedModel).toBeNull();
+    expect(events).toEqual(["ctx-dispose", "model-dispose"]);
+  });
+
+  test("rerank holds the operation open until every context's rankAll settles, then propagates the failure", async () => {
+    // Parallel rerank fan-out: one context rejects, the other is still ranking.
+    // The instance must keep counting the survivor as in-flight so an idle
+    // unload cannot dispose it mid-rank; only then may the rejection surface.
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    // Real-time window: proving absence of disposal mid-rank needs a wall-clock
+    // slice; fake timers cannot advance another context's pending promise.
+    const { promise: slowGate, resolve: releaseSlow } = Promise.withResolvers<void>();
+
+    const badCtx = {
+      rankAll: vi.fn(async () => {
+        throw new Error("bad rankAll");
+      }),
+      dispose: vi.fn(async () => { events.push("bad-disposed"); }),
+    };
+    const slowCtx = {
+      rankAll: vi.fn(async (_query: string, docs: string[]) => {
+        events.push("slow-start");
+        await slowGate;
+        events.push("slow-finished");
+        return docs.map(() => 0.5);
+      }),
+      dispose: vi.fn(async () => { events.push("slow-disposed"); }),
+    };
+    // Real LlamaCpp lifecycle end to end: fakes live in the same fields the
+    // real ensure* methods read and disposeIdleResources frees.
+    llm.rerankContexts = [badCtx, slowCtx];
+    llm.rerankModel = {
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+      dispose: vi.fn(async () => { events.push("model-disposed"); }),
+    };
+
+    const documents: RerankDocument[] = Array.from({ length: 20 }, (_, i) => ({
+      file: `doc${i}.md`,
+      text: `Document number ${i}`,
+    }));
+
+    const pending = llm.rerank("query", documents);
+    await waitUntil(() => events.includes("slow-start"));
+    expect(badCtx.rankAll).toHaveBeenCalledTimes(1);
+    expect(slowCtx.rankAll).toHaveBeenCalledTimes(1);
+
+    // Ownership is still held while the slow rankAll is gated.
+    const unload = llm.unloadIdleResources();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events).not.toContain("slow-finished");
+    expect(events).not.toContain("bad-disposed");
+    expect(events).not.toContain("slow-disposed");
+    expect(events).not.toContain("model-disposed");
+
+    // Once every launched rankAll settles, the failure propagates and only
+    // then may disposal happen.
+    releaseSlow();
+    await expect(pending).rejects.toThrow("bad rankAll");
+    await unload;
+    expect(events).toEqual([
+      "slow-start",
+      "slow-finished",
+      "bad-disposed",
+      "slow-disposed",
+      "model-disposed",
+    ]);
+  });
+
+  test("dispose waits for an in-flight embed and then rejects new calls", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ctx = {
+      getEmbeddingFor: vi.fn(async () => {
+        await gate;
+        return { vector: new Float32Array([1]) };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    llm.embedContexts = [ctx];
+    llm.embedModel = fakeEmbedModel([]);
+
+    const pending = llm.embed("hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    let disposeResolved = false;
+    const disposing = llm.dispose().then(() => { disposeResolved = true; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(disposeResolved).toBe(false);
+    expect(ctx.dispose).not.toHaveBeenCalled();
+
+    release();
+    await expect(pending).resolves.toMatchObject({ embedding: [1] });
+    await disposing;
+    expect(ctx.dispose).toHaveBeenCalledTimes(1);
+    await expect(llm.embed("after")).rejects.toThrow(/disposed/);
+  });
+});
