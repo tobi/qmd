@@ -1653,6 +1653,73 @@ describe("idle unload vs in-flight operations (#938)", () => {
     expect(events).toEqual(["ctx-dispose", "model-dispose"]);
   });
 
+  test("rerank holds the operation open until every context's rankAll settles, then propagates the failure", async () => {
+    // Parallel rerank fan-out: one context rejects, the other is still ranking.
+    // The instance must keep counting the survivor as in-flight so an idle
+    // unload cannot dispose it mid-rank; only then may the rejection surface.
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false;
+    const events: string[] = [];
+    // Real-time window: proving absence of disposal mid-rank needs a wall-clock
+    // slice; fake timers cannot advance another context's pending promise.
+    const { promise: slowGate, resolve: releaseSlow } = Promise.withResolvers<void>();
+
+    const badCtx = {
+      rankAll: vi.fn(async () => {
+        throw new Error("bad rankAll");
+      }),
+      dispose: vi.fn(async () => { events.push("bad-disposed"); }),
+    };
+    const slowCtx = {
+      rankAll: vi.fn(async (_query: string, docs: string[]) => {
+        events.push("slow-start");
+        await slowGate;
+        events.push("slow-finished");
+        return docs.map(() => 0.5);
+      }),
+      dispose: vi.fn(async () => { events.push("slow-disposed"); }),
+    };
+    // Real LlamaCpp lifecycle end to end: fakes live in the same fields the
+    // real ensure* methods read and disposeIdleResources frees.
+    llm.rerankContexts = [badCtx, slowCtx];
+    llm.rerankModel = {
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+      dispose: vi.fn(async () => { events.push("model-disposed"); }),
+    };
+
+    const documents: RerankDocument[] = Array.from({ length: 20 }, (_, i) => ({
+      file: `doc${i}.md`,
+      text: `Document number ${i}`,
+    }));
+
+    const pending = llm.rerank("query", documents);
+    await waitUntil(() => events.includes("slow-start"));
+    expect(badCtx.rankAll).toHaveBeenCalledTimes(1);
+    expect(slowCtx.rankAll).toHaveBeenCalledTimes(1);
+
+    // Ownership is still held while the slow rankAll is gated.
+    const unload = llm.unloadIdleResources();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events).not.toContain("slow-finished");
+    expect(events).not.toContain("bad-disposed");
+    expect(events).not.toContain("slow-disposed");
+    expect(events).not.toContain("model-disposed");
+
+    // Once every launched rankAll settles, the failure propagates and only
+    // then may disposal happen.
+    releaseSlow();
+    await expect(pending).rejects.toThrow("bad rankAll");
+    await unload;
+    expect(events).toEqual([
+      "slow-start",
+      "slow-finished",
+      "bad-disposed",
+      "slow-disposed",
+      "model-disposed",
+    ]);
+  });
+
   test("dispose waits for an in-flight embed and then rejects new calls", async () => {
     const llm = new LlamaCpp({ inactivityTimeoutMs: 0, disposeModelsOnInactivity: true }) as any;
     llm._ciMode = false;

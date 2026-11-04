@@ -1920,8 +1920,18 @@ export class LlamaCpp implements LLM {
       texts.slice(i * chunkSize, (i + 1) * chunkSize)
     ).filter(chunk => chunk.length > 0);
 
-    const allScores = await Promise.all(
+    // allSettled, not Promise.all: a fail-fast rejection would end the
+    // runOperation lifetime while another context's rankAll is still ranking,
+    // letting an idle unload free that context mid-flight (#938 class).
+    const settled = await Promise.allSettled(
       chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
+    );
+    const firstRejection = settled.find(
+      (s): s is PromiseRejectedResult => s.status === "rejected"
+    );
+    if (firstRejection) throw firstRejection.reason;
+    const allScores = settled.flatMap((s) =>
+      s.status === "fulfilled" ? s.value : []
     );
 
     // Reassemble scores in original order and sort

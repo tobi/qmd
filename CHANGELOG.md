@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `qmd mcp` no longer idle-unloads llama contexts or models while an embed, rerank, expand, or tokenize is still running on that instance. The per-store LLM is invisible to the global session check, so the inactivity timer could free a context under a live Metal call and SIGSEGV (#938, #947).
+- `qmd mcp` no longer idle-unloads llama contexts or models while an embed, rerank, expand, or tokenize is still running on that instance. The per-store LLM is invisible to the global session check, so the inactivity timer could free a context under a live Metal call and SIGSEGV (#938, #947). A rerank that fails on one context now stays in flight until every sibling context finishes ranking, so the failure can no longer release the operation early and dispose a still-ranking context.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
