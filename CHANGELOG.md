@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Chunking time no longer grows quadratically with a document's break points
+  and code fences. A 1 MiB document of nothing but fence lines took about 4.4 s
+  and now takes about 0.1 s. Chunk boundaries do not change. #1102
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
