@@ -5348,13 +5348,20 @@ export async function rerank(query: string, documents: { file: string; text: str
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
+    // Cache results by chunk text so identical chunks across files are scored
+    // once. Key them under the identity of the backend that actually produced
+    // the scores (rerankResult.model): a remote outage's local-fallback scores
+    // must never be served as remote scores (and vice versa). Neutral
+    // "fallback" results are not cached at all — they would poison every
+    // future query with 0.5 scores for a model that never produced them.
+    if (rerankResult.model !== "fallback") {
+      const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+      for (const result of rerankResult.results) {
+        const chunk = textByFile.get(result.file) || "";
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: rerankResult.model, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
     }
   }
 

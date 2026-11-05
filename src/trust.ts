@@ -21,7 +21,7 @@
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { getConfigDir } from "./collections.js";
+import { getConfigDir, type CollectionConfig } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
 
 /** A collection's pre-update hook, as it will be executed. */
@@ -160,6 +160,52 @@ export function gatedItems(
 
 export function hasGatedItems(gated: GatedItems): boolean {
   return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0;
+}
+
+/**
+ * Remote `*_api_*` endpoints are exfiltration channels exactly like custom
+ * model URIs: queries and document text are sent to the endpoint. Digest them
+ * into the model slot so a project-local config that sets one is gated (the
+ * #705 fix; see ai-ag2026's PR #705 rebase notes). Any future `*_api_*` slot
+ * must be added here too.
+ */
+function withRemoteEndpoint(uri: string | undefined, apiUrl: string | undefined, apiModel: string | undefined): string | undefined {
+  if (!apiUrl && !apiModel) return uri;
+  return [uri, `remote:${apiUrl ?? "(inherited)"}#${apiModel ?? ""}`].filter(Boolean).join(" + ");
+}
+
+/** Sensitive snapshot (hooks, collection paths, models) of a loaded config. */
+export function snapshotFromConfig(config: CollectionConfig): SensitiveSnapshot {
+  const models = config.models ?? {};
+  return {
+    hooks: Object.entries(config.collections ?? {})
+      .filter(([, col]) => !!col.update)
+      .map(([name, col]) => ({ collection: name, command: col.update! })),
+    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
+      collection: name,
+      path: col.path,
+    })),
+    models: {
+      embed: models.embed,
+      rerank: withRemoteEndpoint(models.rerank, models.rerank_api_url, models.rerank_api_model),
+      generate: models.generate,
+    },
+  };
+}
+
+/** True when this process may use a config's gated fields: hooks,
+ *  out-of-project collection paths, custom model URIs, and remote endpoints. */
+export function snapshotIsTrusted(
+  configPath: string,
+  snapshot: SensitiveSnapshot,
+  builtins: BuiltinModels,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!isLocalConfigPath(configPath)) return true;
+  if (isLocalConfigTrustOptedIn(env)) return true;
+  const gated = gatedItems(configPath, snapshot, builtins);
+  if (!hasGatedItems(gated)) return true;
+  return isTrusted(configPath, sensitiveDigest(snapshot, configPath, builtins));
 }
 
 function byFirst(a: string[], b: string[]): number {
