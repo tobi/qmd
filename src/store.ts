@@ -4621,7 +4621,16 @@ function buildFTS5Query(query: string): string | null {
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
       const term = s.slice(start, i);
 
-      if (containsCjk(term)) {
+      if (/^\d{1,3}(,\d{3})+$/.test(term)) {
+        // Accept both indexed spellings of a thousands-grouped integer.
+        // Group the alternatives so AND and NOT apply to the whole number.
+        const ftsTerm = `("${term.replace(/,/g, ' ')}" OR "${term.replace(/,/g, '')}")`;
+        if (negated) {
+          negative.push(ftsTerm);
+        } else {
+          positive.push(ftsTerm);
+        }
+      } else if (containsCjk(term)) {
         const sanitized = sanitizeFTS5Phrase(term);
         if (sanitized) {
           const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
