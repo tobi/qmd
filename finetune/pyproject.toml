@@ -26,5 +26,7 @@ dev = []
 constraint-dependencies = [
   "authlib>=1.6.9",
   "aiohttp>=3.13.4",
+  "brotli>=1.2.1",
   "cryptography>=46.0.7",
+  "filelock>=4.2.1; python_full_version >= '3.11'",
 ]
