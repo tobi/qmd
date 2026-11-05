@@ -877,6 +877,21 @@ describe("findCodeFences", () => {
   });
 });
 
+// Documents that put fences and break points where an off-by-one would show.
+const CHUNKER_EDGE_DOCS = [
+  "",
+  "```",
+  "```\ncode\n```\nafter\n\nmore",
+  "intro\n```\nnever closed\n\n# heading\n\nmore\n",
+  "a\n```\nb\n```\nc\n```\nd\n\ne",
+  "\n```\n```\n```\n```\n```\n```\n",
+  "\n``````\n``````\n```",
+  "x\n````\ncode\n```\ninner\n````\ny\n",
+  "intro\r\n\r\n```\r\ncode\r\n```\r\n\r\n# head\r\n\r\nbody\r\n---\r\nend\r\n",
+  "é\n\n```\n😀😀\n```\n\n# 見出し\n\n- 😀\n1. é\n",
+  "# a\n```\n# not a heading\n\n\n```\n# b\n",
+];
+
 describe("isInsideCodeFence", () => {
   test("returns true for position inside fence", () => {
     const fences: CodeFenceRegion[] = [{ start: 10, end: 30 }];
@@ -904,6 +919,37 @@ describe("isInsideCodeFence", () => {
     expect(isInsideCodeFence(20, fences)).toBe(true);
     expect(isInsideCodeFence(60, fences)).toBe(true);
     expect(isInsideCodeFence(40, fences)).toBe(false);
+  });
+
+  test("handles no fences", () => {
+    expect(isInsideCodeFence(5, [])).toBe(false);
+  });
+
+  test("treats the edge shared by two tight fences as outside both", () => {
+    const fences = findCodeFences("\n```\n```\n```\n```");
+    expect(fences).toEqual([{ start: 0, end: 8 }, { start: 8, end: 16 }]);
+    expect(isInsideCodeFence(7, fences)).toBe(true);
+    expect(isInsideCodeFence(8, fences)).toBe(false);
+    expect(isInsideCodeFence(9, fences)).toBe(true);
+  });
+
+  test("agrees with a linear scan at every position", () => {
+    for (const text of CHUNKER_EDGE_DOCS) {
+      const fences = findCodeFences(text);
+      for (let pos = -1; pos <= text.length + 1; pos++) {
+        expect(isInsideCodeFence(pos, fences)).toBe(fences.some(f => pos > f.start && pos < f.end));
+      }
+    }
+  });
+
+  test("reads only a few of many fences", () => {
+    let reads = 0;
+    const fences: CodeFenceRegion[] = Array.from({ length: 100_000 }, (_, i) => ({
+      get start() { reads++; return i * 10; },
+      end: i * 10 + 8,
+    }));
+    expect(isInsideCodeFence(999_995, fences)).toBe(true);
+    expect(reads).toBeLessThan(100);
   });
 });
 
@@ -965,6 +1011,63 @@ describe("findBestCutoff", () => {
   test("handles empty break points array", () => {
     const cutoff = findBestCutoff([], 200, 100, 0.7);
     expect(cutoff).toBe(200);
+  });
+
+  test("considers a break point exactly on the window edge, and not one before it", () => {
+    const onEdge: BreakPoint = { pos: 100, score: 100, type: 'h1' };
+    const beforeEdge: BreakPoint = { pos: 99, score: 100, type: 'h1' };
+    expect(findBestCutoff([onEdge], 200, 100, 0.7)).toBe(100);
+    expect(findBestCutoff([beforeEdge], 200, 100, 0.7)).toBe(200);
+  });
+
+  test("considers a break point exactly on the target, and not one after it", () => {
+    const onTarget: BreakPoint = { pos: 200, score: 1, type: 'newline' };
+    const afterTarget: BreakPoint = { pos: 201, score: 100, type: 'h1' };
+    expect(findBestCutoff([onTarget, afterTarget], 200, 100, 0.7)).toBe(200);
+    expect(findBestCutoff([afterTarget], 200, 100, 0.7)).toBe(200);
+  });
+
+  test("agrees with a linear walk for every target and window", () => {
+    const linearCutoff = (
+      breakPoints: BreakPoint[], target: number, windowChars: number, codeFences: CodeFenceRegion[]
+    ): number => {
+      let bestScore = -1;
+      let bestPos = target;
+      for (const bp of breakPoints) {
+        if (bp.pos < target - windowChars) continue;
+        if (bp.pos > target) break;
+        if (codeFences.some(f => bp.pos > f.start && bp.pos < f.end)) continue;
+        const normalizedDist = (target - bp.pos) / windowChars;
+        const finalScore = bp.score * (1.0 - (normalizedDist * normalizedDist) * 0.7);
+        if (finalScore > bestScore) {
+          bestScore = finalScore;
+          bestPos = bp.pos;
+        }
+      }
+      return bestPos;
+    };
+
+    for (const text of CHUNKER_EDGE_DOCS) {
+      const breakPoints = scanBreakPoints(text);
+      const fences = findCodeFences(text);
+      for (let target = 0; target <= text.length + 1; target++) {
+        for (const windowChars of [0, 1, 8, 50]) {
+          expect(findBestCutoff(breakPoints, target, windowChars, 0.7, fences))
+            .toBe(linearCutoff(breakPoints, target, windowChars, fences));
+        }
+      }
+    }
+  });
+
+  test("reads only the break points near its window", () => {
+    let reads = 0;
+    const breakPoints: BreakPoint[] = Array.from({ length: 100_000 }, (_, i) => ({
+      get pos() { reads++; return i * 10; },
+      score: 1,
+      type: 'newline',
+    }));
+    expect(findBestCutoff(breakPoints, 999_000, 100, 0.7)).toBe(999_000);
+    expect(reads).toBeLessThan(100);
   });
 });
 

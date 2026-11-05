@@ -291,10 +291,30 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
 }
 
 /**
+ * Index of the first item for which `isBefore` is false. `items` must hold every
+ * item for which it is true ahead of every item for which it is false.
+ */
+function partitionPoint<T>(items: T[], isBefore: (item: T) => boolean): number {
+  let lo = 0;
+  let hi = items.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (isBefore(items[mid]!)) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
  * Check if a position is inside a code fence region.
+ *
+ * `fences` must be sorted and non-overlapping, as findCodeFences returns them.
+ * Only the last fence starting before `pos` can then contain it: every earlier
+ * fence has ended by the time that one starts.
  */
 export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
-  return fences.some(f => pos > f.start && pos < f.end);
+  const next = partitionPoint(fences, f => f.start < pos);
+  return next > 0 && pos < fences[next - 1]!.end;
 }
 
 /**
@@ -303,7 +323,7 @@ export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boole
  * Uses squared distance for gentler early decay - headings far back still win
  * over low-quality breaks near the target.
  *
- * @param breakPoints - Pre-scanned break points from scanBreakPoints()
+ * @param breakPoints - Pre-scanned break points from scanBreakPoints(), sorted by position
  * @param targetCharPos - The ideal cut position (e.g., maxChars boundary)
  * @param windowChars - How far back to search for break points (default ~200 tokens)
  * @param decayFactor - How much to penalize distance (0.7 = 30% score at window edge)
@@ -321,8 +341,11 @@ export function findBestCutoff(
   let bestScore = -1;
   let bestPos = targetCharPos;
 
-  for (const bp of breakPoints) {
-    if (bp.pos < windowStart) continue;
+  // Sorted, so jump to the window: a document's chunks would otherwise each walk
+  // every break point before it.
+  const first = partitionPoint(breakPoints, bp => bp.pos < windowStart);
+  for (let i = first; i < breakPoints.length; i++) {
+    const bp = breakPoints[i]!;
     if (bp.pos > targetCharPos) break;  // sorted, so we can stop
 
     // Skip break points inside code fences
