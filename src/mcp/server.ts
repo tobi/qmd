@@ -37,7 +37,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, MAX_ADDITIONAL_SEARCHES, MAX_ADDITIONAL_SEARCH_QUERY_CHARS } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -328,6 +328,9 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
       "For vec: natural language question. For hyde: 50-100 word answer passage."
     ),
   });
+  const additionalSearchSchema = subSearchSchema.extend({
+    query: z.string().max(MAX_ADDITIONAL_SEARCH_QUERY_CHARS),
+  });
 
   server.registerTool(
     "query",
@@ -359,7 +362,7 @@ Good lex examples:
 
 ## Strategy
 
-Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
+Combine types for best results. For structured searches, the first sub-query gets 2× weight — put your strongest signal first. With a plain query, add typed searches through \`additionalSearches\`.
 
 | Goal | Approach |
 |------|----------|
@@ -397,11 +400,14 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+          "RRF and reranked. Recommended default for most searches. Can be combined with 'additionalSearches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
           "control over retrieval strategy. Mutually exclusive with 'query'."
+        ),
+        additionalSearches: z.array(additionalSearchSchema).max(MAX_ADDITIONAL_SEARCHES).optional().describe(
+          `Additional typed sub-queries fused with automatic expansion of 'query' (up to ${MAX_ADDITIONAL_SEARCHES}, ${MAX_ADDITIONAL_SEARCH_QUERY_CHARS} characters each).`
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
@@ -428,17 +434,23 @@ Intent-aware lex (C++ performance, not sports):
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
-      // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
+    track(async ({ query, searches, additionalSearches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
+      // Require either a plain query or structured searches; additions require a plain query.
       if (!query && (!searches || searches.length === 0)) {
         return {
           content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
           isError: true,
         };
       }
-      if (query && searches && searches.length > 0) {
+      if (!query && additionalSearches !== undefined) {
         return {
-          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
+          content: [{ type: "text" as const, text: "Error: 'additionalSearches' requires 'query'" }],
+          isError: true,
+        };
+      }
+      if (query && searches?.length) {
+        return {
+          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; use 'additionalSearches' instead" }],
           isError: true,
         };
       }
@@ -457,7 +469,7 @@ Intent-aware lex (C++ performance, not sports):
       // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
       // `searches` runs the caller's typed sub-queries directly.
       const searchOptions = query
-        ? { query }
+        ? { query, additionalSearches }
         : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
 
       const results = await store.search({

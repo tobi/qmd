@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- The SDK and MCP `query` tool accept `additionalSearches` alongside a plain
+  query and fuse those typed searches with automatic expansion.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,

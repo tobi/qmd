@@ -54,6 +54,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
+  SessionReleasedError,
   LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
@@ -495,6 +496,9 @@ export type ExpandedQuery = {
   /** Optional line number for error reporting (CLI parser) */
   line?: number;
 };
+// Bound caller-controlled embedding work before tokenization.
+export const MAX_ADDITIONAL_SEARCHES = 10;
+export const MAX_ADDITIONAL_SEARCH_QUERY_CHARS = 8_192;
 
 // =============================================================================
 // Path utilities
@@ -6198,6 +6202,7 @@ export interface HybridQueryOptions {
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  additionalSearches?: ExpandedQuery[];
 }
 
 export interface HybridQueryResult {
@@ -6231,21 +6236,19 @@ export type RankedListMeta = {
   source: "fts" | "vec";
   queryType: "original" | "lex" | "vec" | "hyde";
   query: string;
+  rrfWeight?: number;
+  callerSearchIndex?: number;
 };
-
 /**
  * RRF list weights for hybridQuery.
  *
- * Original-query retrieval paths are the primary evidence and get 2x weight:
- * - original FTS
- * - original vector search
- *
- * Expansion-derived lists (lex/vec/hyde) stay at 1x regardless of list order,
- * so a lex expansion inserted before original vector search cannot steal the
- * original vector boost.
+ * Without caller-supplied searches, original FTS and vector lists default to
+ * 2x. Additive searches retain the structured-search first-nonempty 2x boost:
+ * original FTS gets it first, then original vector, then caller searches.
+ * Generated expansion lists stay at 1x and cannot consume that boost.
  */
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
-  return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
+  return rankedListMeta.map(meta => meta.rrfWeight ?? (meta.queryType === "original" ? 2.0 : 1.0));
 }
 
 /**
@@ -6275,6 +6278,14 @@ export async function hybridQuery(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+  if (options?.additionalSearches !== undefined && (!Array.isArray(options.additionalSearches)
+    || options.additionalSearches.length > MAX_ADDITIONAL_SEARCHES
+    || options.additionalSearches.some(search => !search || !["lex", "vec", "hyde"].includes(search.type)
+      || typeof search.query !== "string" || !search.query.trim()
+      || search.query.length > MAX_ADDITIONAL_SEARCH_QUERY_CHARS || /[\r\n]/.test(search.query)
+      || (search.type === "lex" ? !!validateLexQuery(search.query) : !!validateSemanticQuery(search.query))))) {
+    throw new Error(`additionalSearches must contain at most ${MAX_ADDITIONAL_SEARCHES} valid typed searches, each no longer than ${MAX_ADDITIONAL_SEARCH_QUERY_CHARS} characters`);
+  }
 
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
@@ -6300,11 +6311,22 @@ export async function hybridQuery(
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = hasStrongSignal
-    ? []
-    : await store.expandQuery(query);
+  let expanded: ExpandedQuery[] = [];
+  let expansionFailed = false;
+  if (!hasStrongSignal) {
+    try {
+      expanded = await store.expandQuery(query);
+    } catch (error) {
+      if (!(options?.additionalSearches?.length)
+        || error instanceof SessionReleasedError
+        || (error instanceof Error && error.name === "AbortError")) throw error;
+      expansionFailed = true;
+      console.warn("QMD Warning: Automatic query expansion failed; continuing with caller-supplied additional searches.");
+    }
+  }
+  const searches = [...expanded, ...(options?.additionalSearches ?? [])];
 
-  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  if (!expansionFailed) hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -6322,8 +6344,8 @@ export async function hybridQuery(
   // batch-embed all vector queries in one embedBatch() call, then run
   // sqlite-vec lookups with pre-computed embeddings.
 
-  // 3a: Run FTS for all lex expansions right away (no LLM needed)
-  for (const q of expanded) {
+  // 3a: Run all lex searches right away (no LLM needed)
+  for (const [index, q] of searches.entries()) {
     if (q.type === 'lex') {
       const ftsResults = store.searchFTS(q.query, 20, collection, filter);
       if (ftsResults.length > 0) {
@@ -6332,19 +6354,25 @@ export async function hybridQuery(
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
-        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
+        rankedListMeta.push({
+          source: "fts", queryType: "lex", query: q.query,
+          ...(index >= expanded.length ? { callerSearchIndex: index - expanded.length } : {}),
+        });
       }
     }
   }
 
-  // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
+  // 3b: Collect vector searches (original query plus vec/hyde searches)
   if (hasVectors) {
-    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
+    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde"; callerSearchIndex?: number }[] = [
       { text: query, queryType: "original" },
     ];
-    for (const q of expanded) {
+    for (const [index, q] of searches.entries()) {
       if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.query, queryType: q.type });
+        vecQueries.push({
+          text: q.query, queryType: q.type,
+          ...(index >= expanded.length ? { callerSearchIndex: index - expanded.length } : {}),
+        });
       }
     }
 
@@ -6376,7 +6404,22 @@ export async function hybridQuery(
           source: "vec",
           queryType: vecQueries[i]!.queryType,
           query: vecQueries[i]!.text,
+          ...(vecQueries[i]!.callerSearchIndex !== undefined ? { callerSearchIndex: vecQueries[i]!.callerSearchIndex } : {}),
         });
+      }
+    }
+  }
+  if (options?.additionalSearches?.length) {
+    const originalVector = rankedListMeta.find(meta => meta.source === "vec" && meta.queryType === "original");
+    if (originalVector) {
+      originalVector.rrfWeight = initialFts.length > 0 ? 1.0 : 2.0;
+    } else if (initialFts.length === 0) {
+      const firstCallerSearchIndex = Math.min(...rankedListMeta
+        .filter(meta => meta.callerSearchIndex !== undefined)
+        .map(meta => meta.callerSearchIndex!));
+      if (Number.isFinite(firstCallerSearchIndex)) {
+        const firstCallerSearch = rankedListMeta.find(meta => meta.callerSearchIndex === firstCallerSearchIndex);
+        if (firstCallerSearch) firstCallerSearch.rrfWeight = 2.0;
       }
     }
   }
@@ -6388,14 +6431,14 @@ export async function hybridQuery(
   // execute and say nothing about the expansion's quality.
   if (expanded.length > 0) {
     const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
-    const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
+    const expansionContributed = rankedListMeta.some(m => m.queryType !== "original" && m.callerSearchIndex === undefined);
     if (runnable.length > 0 && !expansionContributed) {
       store.invalidateExpansionCache(query);
     }
   }
 
-  // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
-  // expansion-derived lists stay at 1x independent of insertion order.
+  // Step 4: RRF fusion — original lists keep their 2x default; automatic
+  // expansion lists stay 1x, with the first caller-supplied list explicitly 2x.
   const weights = getHybridRrfWeights(rankedListMeta);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
