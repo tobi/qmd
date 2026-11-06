@@ -976,6 +976,12 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
         .run("absolute-line-fixture.md", "Absolute Line Fixture", fixtureHash, now, now);
     }
+    const now = new Date().toISOString();
+    const strongSignalBody = "qmdraresignal raretulip opalengine swiftbadger ".repeat(10);
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run("hash-strong-signal", strongSignalBody, now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run("strong-signal-fixture.md", "Strong Signal Fixture", "hash-strong-signal", now, now);
 
     // Sync config into SQLite
     const httpTestConfig: CollectionConfig = {
@@ -1201,6 +1207,20 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result).toBeDefined();
     expect(json.result.content.length).toBeGreaterThan(0);
     expect(json.result.content[0].type).toBe("text");
+  });
+  test("POST /mcp query fuses additional typed searches with plain query", async () => {
+    const { status, json } = await mcpRequest(
+      "tools/call",
+      { name: "query", arguments: {
+        query: "qmdraresignal raretulip opalengine swiftbadger",
+        additionalSearches: [{ type: "lex", query: "readme" }],
+        rerank: false,
+      } },
+      { "Mcp-Name": "query" },
+      6,
+    );
+    expect(status).toBe(200);
+    expect(json.result.structuredContent.results.some((result: { file: string }) => result.file === "docs/readme.md")).toBe(true);
   });
 
   test("POST /mcp tools/call get returns document", async () => {
