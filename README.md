@@ -760,6 +760,17 @@ models:
   embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
   rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
   generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+  # Remote rerank (optional) — Cohere-shaped POST <rerank_api_url>/rerank.
+  # Embedding and query expansion stay local; only reranking is offloaded.
+  # rerank_api_url: "http://gpu-box:8082/v1"     # llama.cpp / vLLM / TEI / cohere
+  # rerank_api_model: "BAAI/bge-reranker-v2-m3"
+  # rerank_api_key: "secret"                     # optional bearer token
+  # rerank_score: "auto"                         # logits | probability | auto (default)
+  # rerank_api_timeout: 10000                    # ms
+  #
+  # Endpoint fields are trusted-config only: set them in ~/.config/qmd/index.yml,
+  # or approve a project-local .qmd/index.yml with `qmd trust` — an untrusted
+  # project config cannot point queries at a remote endpoint.
 
 # One entry per collection. The key is the collection name.
 collections:
@@ -1577,6 +1588,10 @@ Override them per-role without touching source via the `models:` block in
 ### Qwen3-Reranker
 
 Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+
+#### Remote reranking
+
+Set `rerank_api_url` + `rerank_api_model` (optional `rerank_api_key`, `rerank_score`, `rerank_api_timeout`) in the `models:` block to POST a Cohere-shaped `/v1/rerank` request to any OpenAI-compatible server (llama.cpp, vLLM, TEI, Cohere). Everything else — embedding, query expansion, generation — stays local. On remote failure QMD falls back to the local rerank model, and if that is unavailable too it continues with neutral (0.5) scores and a warning instead of failing the query. Scores are normalized per `rerank_score`: `logits` always applies the sigmoid (llama.cpp cross-encoders emit log-odds), `probability` passes scores through, `auto` (default) applies the sigmoid only when a batch contains a score outside [0,1]. Rerank cache entries are keyed by the backend that actually produced the scores, so fallback scores are never served as remote scores.
 
 ### Qwen3 (Query Expansion)
 

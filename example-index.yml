@@ -27,6 +27,13 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 #   embed: "hf:<user>/<repo>/<file>.gguf"
 #   rerank: "hf:<user>/<repo>/<file>.gguf"
 #   generate: "hf:<user>/<repo>/<file>.gguf"
+#   # Remote rerank (optional; everything else stays local). Trusted config only:
+#   # in a project-local .qmd/index.yml these require `qmd trust` approval.
+#   # rerank_api_url: "http://gpu-box:8082/v1"
+#   # rerank_api_model: "BAAI/bge-reranker-v2-m3"
+#   # rerank_api_key: "secret"        # optional bearer token
+#   # rerank_score: "auto"            # logits | probability | auto (default)
+#   # rerank_api_timeout: 10000       # ms
 
 # ─── Collections ─────────────────────────────────────────────────────────────
 collections:
