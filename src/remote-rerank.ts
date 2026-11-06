@@ -20,7 +20,8 @@ export type RemoteRerankConfig = {
   apiKey?: string;
   scoreMode: RerankScoreMode;
   timeoutMs: number;
-  /** Stable cache identity of the remote reranker: remote:<model>@<url>. */
+  /** Stable cache identity of the remote reranker: remote:<model>@<url>@<scoreMode>.
+   *  Score mode participates because cached scores are already normalized. */
   identity: string;
 };
 
@@ -69,7 +70,7 @@ export function resolveRemoteRerankConfig(
   const scoreMode = parseScoreMode(scoreModeRaw ?? process.env.QMD_RERANK_SCORE);
   const timeoutRaw = trusted ? models?.rerank_api_timeout : undefined;
   const timeoutMs = timeoutRaw !== undefined ? parseTimeoutMs(timeoutRaw) : envTimeoutMs(process.env.QMD_RERANK_API_TIMEOUT);
-  return { url, model, apiKey, scoreMode, timeoutMs, identity: `remote:${model}@${url}` };
+  return { url, model, apiKey, scoreMode, timeoutMs, identity: `remote:${model}@${url}@${scoreMode}` };
 }
 
 function sigmoid(x: number): number {

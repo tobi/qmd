@@ -217,13 +217,27 @@ describe("resolveRemoteRerankConfig", () => {
     expect(cfg?.apiKey).toBe("sk-test");
     expect(cfg?.scoreMode).toBe("logits");
     expect(cfg?.timeoutMs).toBe(2500);
-    expect(cfg?.identity).toBe("remote:bge-yaml@http://yaml:2/v1");
+    expect(cfg?.identity).toBe("remote:bge-yaml@http://yaml:2/v1@logits");
   });
 
   test("score mode defaults to auto and timeout to 10000ms", () => {
     const cfg = resolveRemoteRerankConfig({ rerank_api_url: "http://x:1/v1", rerank_api_model: "bge" }, { trusted: true });
     expect(cfg?.scoreMode).toBe("auto");
     expect(cfg?.timeoutMs).toBe(10000);
+  });
+
+  test("score mode participates in the cache identity", () => {
+    // The identity doubles as the store's rerank cache key, and cached scores
+    // are already normalized — switching rerank_score must not serve old
+    // normalized scores under the new mode.
+    const base: ModelsConfig = { rerank_api_url: "http://host:8082/v1", rerank_api_model: "bge" };
+    const auto = resolveRemoteRerankConfig(base, { trusted: true });
+    const logits = resolveRemoteRerankConfig({ ...base, rerank_score: "logits" }, { trusted: true });
+    const probability = resolveRemoteRerankConfig({ ...base, rerank_score: "probability" }, { trusted: true });
+    expect(auto?.identity).not.toBe(logits?.identity);
+    expect(logits?.identity).not.toBe(probability?.identity);
+    expect(new LlamaCpp({ remoteRerank: auto! }).rerankModelName)
+      .not.toBe(new LlamaCpp({ remoteRerank: logits! }).rerankModelName);
   });
 
   test("rejects invalid score mode and timeout", () => {
@@ -304,6 +318,24 @@ describe("trust gate over remote rerank endpoints", () => {
     expect(snapshotIsTrusted(localPath, snapshot, builtinModels())).toBe(false);
   });
 
+  test("absent and built-in local rerank approve identically (ensureModels fill-in keeps trust)", () => {
+    // ensureModelsConfiguredForCli() writes the built-in rerank URI into the
+    // YAML on the first query; that fill-in must not re-arm the remote gate.
+    const localPath = join(projectDir, localYml);
+    const endpoint = { rerank_api_url: "http://trusted.example:8082/v1", rerank_api_model: "bge" };
+    const absent = snapshotFromConfig({ collections: {}, models: { ...endpoint } });
+    const builtinFilled = snapshotFromConfig({ collections: {}, models: { rerank: builtinModels().rerank, ...endpoint } });
+    recordTrust(localPath, sensitiveDigest(absent, localPath, builtinModels()));
+    try {
+      expect(snapshotIsTrusted(localPath, builtinFilled, builtinModels())).toBe(true);
+      // A genuinely custom local rerank still re-arms the gate.
+      const custom = snapshotFromConfig({ collections: {}, models: { rerank: "hf:custom/reranker", ...endpoint } });
+      expect(snapshotIsTrusted(localPath, custom, builtinModels())).toBe(false);
+    } finally {
+      revokeTrust(localPath);
+    }
+  });
+
   test("EXFIL: rerank with an untrusted project-local endpoint never contacts the server", async () => {
     captureWarnings();
     const server = await startRerankServer(rerankResults([{ index: 0, relevance_score: 0.9 }]));
@@ -350,7 +382,7 @@ describe("remote rerank client", () => {
       top_n: 1,
     });
     expect(out.results[0]!.file).toBe("a.md");
-    expect(out.model).toMatch(/^remote:bge-test@http:\/\/127\.0\.0\.1:\d+\/v1$/);
+    expect(out.model).toMatch(/^remote:bge-test@http:\/\/127\.0\.0\.1:\d+\/v1@auto$/);
   });
 
   test("reverse-ordered logits come back sorted with normalized scores (auto)", async () => {
@@ -504,7 +536,7 @@ describe("remote rerank client", () => {
 
   test("rerankModelName reflects the remote identity for cache keys", () => {
     const llm = remoteLlm(remoteConfig("http://host:8082/v1"));
-    expect(llm.rerankModelName).toBe("remote:bge-test@http://host:8082/v1");
+    expect(llm.rerankModelName).toBe("remote:bge-test@http://host:8082/v1@auto");
     expect(new LlamaCpp({}).rerankModelName).not.toMatch(/^remote:/);
   });
 });
@@ -561,5 +593,19 @@ describe("rerank cache identity", () => {
     const fallbackKey = store.getCacheKey("rerank", { query: "q", model: "fallback", chunk: "alpha" });
     expect(store.getCachedResult(remoteKey)).toBeNull();
     expect(store.getCachedResult(fallbackKey)).toBeNull();
+  });
+
+  test("neutral fallback scores flow to the per-call results instead of zeros", async () => {
+    class NeutralFallbackLlm extends FakeRerankLlm {
+      constructor() { super("remote:bge@http://s/v1", "fallback", 0.5); }
+      override async rerank(): Promise<RerankResult> {
+        return { results: DOCS.map((d, i) => ({ ...d, score: 0.5, index: i })), model: "fallback" };
+      }
+    }
+    const out = await rerankWithLlm("q", DOCS, undefined, store.db, undefined, new NeutralFallbackLlm());
+    expect(out.map((r) => r.score)).toEqual([0.5, 0.5, 0.5]);
+    // ...while staying out of the persistent cache.
+    const remoteKey = store.getCacheKey("rerank", { query: "q", model: "remote:bge@http://s/v1", chunk: "beta" });
+    expect(store.getCachedResult(remoteKey)).toBeNull();
   });
 });

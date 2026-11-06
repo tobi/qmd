@@ -22,6 +22,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { getConfigDir, type CollectionConfig } from "./collections.js";
+import { builtinModels } from "./llm.js";
 import { qmdHomedir } from "./paths.js";
 
 /** A collection's pre-update hook, as it will be executed. */
@@ -171,7 +172,11 @@ export function hasGatedItems(gated: GatedItems): boolean {
  */
 function withRemoteEndpoint(uri: string | undefined, apiUrl: string | undefined, apiModel: string | undefined): string | undefined {
   if (!apiUrl && !apiModel) return uri;
-  return [uri, `remote:${apiUrl ?? "(inherited)"}#${apiModel ?? ""}`].filter(Boolean).join(" + ");
+  // An absent local rerank and the built-in default are the same model:
+  // ensureModelsConfiguredForCli() may fill the default into the YAML at any
+  // time, and that fill-in must not re-arm the remote gate (digest churn).
+  const local = uri === builtinModels().rerank ? undefined : uri;
+  return [local, `remote:${apiUrl ?? "(inherited)"}#${apiModel ?? ""}`].filter(Boolean).join(" + ");
 }
 
 /** Sensitive snapshot (hooks, collection paths, models) of a loaded config. */

@@ -5352,15 +5352,15 @@ export async function rerank(query: string, documents: { file: string; text: str
     // once. Key them under the identity of the backend that actually produced
     // the scores (rerankResult.model): a remote outage's local-fallback scores
     // must never be served as remote scores (and vice versa). Neutral
-    // "fallback" results are not cached at all — they would poison every
-    // future query with 0.5 scores for a model that never produced them.
-    if (rerankResult.model !== "fallback") {
-      const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-      for (const result of rerankResult.results) {
-        const chunk = textByFile.get(result.file) || "";
-        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: rerankResult.model, chunk });
-        setCachedResult(db, cacheKey, result.score.toString());
-        cachedResults.set(chunk, result.score);
+    // "fallback" results feed this call's results but are never persisted —
+    // they would poison every future query with 0.5 scores for a model that
+    // never produced them.
+    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+    for (const result of rerankResult.results) {
+      const chunk = textByFile.get(result.file) || "";
+      cachedResults.set(chunk, result.score);
+      if (rerankResult.model !== "fallback") {
+        setCachedResult(db, getCacheKey("rerank", { query: rerankQuery, model: rerankResult.model, chunk }), result.score.toString());
       }
     }
   }
