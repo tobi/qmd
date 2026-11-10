@@ -834,6 +834,11 @@ export class LlamaCpp implements LLM {
   private embedModel: LlamaModel | null = null;
   private embedModelPath: string | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
+  // Set once a GPU embedding context fails to allocate (e.g. another process
+  // is holding the VRAM). Latches so we don't repeat the doomed GPU load on
+  // every subsequent embed call in this instance's lifetime — see
+  // ensureEmbedContexts().
+  private embedContextGpuFailed = false;
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
@@ -1135,7 +1140,7 @@ export class LlamaCpp implements LLM {
   /**
    * Load embedding model (lazy)
    */
-  private async ensureEmbedModel(): Promise<LlamaModel> {
+  private async ensureEmbedModel(forceCpu = false): Promise<LlamaModel> {
     if (this.embedModel) {
       return this.embedModel;
     }
@@ -1146,7 +1151,10 @@ export class LlamaCpp implements LLM {
     this.embedModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.embedModelUri);
-      const model = await llama.loadModel(this.modelLoadOptions(modelPath));
+      const loadOptions = forceCpu
+        ? { ...this.modelLoadOptions(modelPath), gpuLayers: 0 }
+        : this.modelLoadOptions(modelPath);
+      const model = await llama.loadModel(loadOptions);
       this.embedModel = model;
       this.embedModelPath = modelPath;
       // Model loading counts as activity - ping to keep alive
@@ -1170,10 +1178,10 @@ export class LlamaCpp implements LLM {
    *      true parallelism (each context runs on its own cores). Use at most
    *      half the math cores, with at least 4 threads per context.
    */
-  private async computeParallelism(perContextMB: number, reserveMB = 0): Promise<number> {
+  private async computeParallelism(perContextMB: number, reserveMB = 0, forceCpu = false): Promise<number> {
     const llama = await this.ensureLlama();
 
-    if (!this.isCpuOffloadForced() && llama.gpu) {
+    if (!forceCpu && !this.isCpuOffloadForced() && llama.gpu) {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
@@ -1195,9 +1203,9 @@ export class LlamaCpp implements LLM {
    * Get the number of threads each context should use, given N parallel contexts.
    * Splits available math cores evenly across contexts.
    */
-  private async threadsPerContext(parallelism: number): Promise<number> {
+  private async threadsPerContext(parallelism: number, forceCpu = false): Promise<number> {
     const llama = await this.ensureLlama();
-    if (!this.isCpuOffloadForced() && llama.gpu) return 0; // GPU: let the library decide
+    if (!forceCpu && !this.isCpuOffloadForced() && llama.gpu) return 0; // GPU: let the library decide
     const cores = llama.cpuMathCores || 4;
     return Math.max(1, Math.floor(cores / parallelism));
   }
@@ -1219,32 +1227,60 @@ export class LlamaCpp implements LLM {
     }
 
     this.embedContextsCreatePromise = (async () => {
-      const model = await this.ensureEmbedModel();
+      let model = await this.ensureEmbedModel(this.embedContextGpuFailed);
+
       // Per-context cost depends on the loaded GGUF. The old hardcoded 150 MB
       // figure was measured for nomic-embed; Qwen3-Embedding-0.6B is ~1190 MB
       // and opening 8 of those exhausted VRAM so the reranker could not load (#799).
-      let perContextMB = BASELINE_EMBED_CONTEXT_MB;
-      if (this.embedModelPath) {
+      const measurePerContextMB = () => {
+        if (!this.embedModelPath) return BASELINE_EMBED_CONTEXT_MB;
         try {
-          perContextMB = estimateEmbedContextMB({
+          return estimateEmbedContextMB({
             modelBytes: statSync(this.embedModelPath).size,
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
           });
         } catch {
           // Keep the baseline if the file cannot be stat'd.
+          return BASELINE_EMBED_CONTEXT_MB;
         }
-      }
-      const n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB);
-      const threads = await this.threadsPerContext(n);
+      };
+
+      let perContextMB = measurePerContextMB();
+      let n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB, this.embedContextGpuFailed);
+      let threads = await this.threadsPerContext(n, this.embedContextGpuFailed);
+
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
-        } catch {
-          if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
-          break;
+        } catch (err) {
+          if (this.embedContexts.length > 0) break;
+
+          if (this.embedContextGpuFailed || this.isCpuOffloadForced()) {
+            throw new Error("Failed to create any embedding context");
+          }
+
+          // The GPU backend and the model itself both loaded successfully —
+          // this is a context-allocation failure, most likely another
+          // process holding the VRAM right now. ensureLlama() already falls
+          // back to CPU when the GPU *backend* fails to initialize; do the
+          // same thing one layer deeper by reloading the embedding model
+          // with gpuLayers: 0 and retrying context creation against it.
+          const detail = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `QMD Warning: GPU embedding context init failed (${detail}), reloading embedding model on CPU.\n`
+          );
+          this.embedContextGpuFailed = true;
+          await disposeWithTimeout("embedding model", () => model.dispose());
+          this.embedModel = null;
+          this.embedModelPath = null;
+          model = await this.ensureEmbedModel(true);
+          perContextMB = measurePerContextMB();
+          n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB, true);
+          threads = await this.threadsPerContext(n, true);
+          i = -1; // restart the loop against the freshly CPU-loaded model
         }
       }
       this.touchActivity();
