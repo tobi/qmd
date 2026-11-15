@@ -72,6 +72,8 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { copyCommandProcessorSpec, snapshotProcessor, type DocumentProcessor } from "./processors.js";
+import { initializeProcessorSchema, requireProcessor, reindexProcessedFiles, removeProcessorState, renameProcessorState } from "./processor-store.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -1313,6 +1315,7 @@ function initializeDatabase(db: Database): void {
   // Document metadata — extraction state plus normalized value rows for
   // metadata filtering. Keyed by document identity, not content hash.
   initializeMetadataSchema(db);
+  initializeProcessorSchema(db);
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -1377,9 +1380,11 @@ type StoreCollectionRow = {
   context: string | null;
 };
 
-function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
+function rowToNamedCollection(row: StoreCollectionRow, db: Database): NamedCollection {
+  const spec = db.prepare("SELECT spec FROM processor_specs WHERE collection = ?").get(row.name) as { spec: string } | undefined;
   return {
     name: row.name,
+    ...(spec ? { processor: copyCommandProcessorSpec(JSON.parse(spec.spec)) } : {}),
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
@@ -1391,13 +1396,13 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
 
 export function getStoreCollections(db: Database): NamedCollection[] {
   const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
-  return rows.map(rowToNamedCollection);
+  return rows.map(row => rowToNamedCollection(row, db));
 }
 
 export function getStoreCollection(db: Database, name: string): NamedCollection | null {
   const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
   if (row == null) return null;
-  return rowToNamedCollection(row);
+  return rowToNamedCollection(row, db);
 }
 
 export function getStoreGlobalContext(db: Database): string | undefined {
@@ -1428,6 +1433,11 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 }
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  const spec = collection.processor === undefined ? undefined : copyCommandProcessorSpec(collection.processor);
+  if (spec) {
+    db.prepare(`INSERT INTO processor_specs(collection, spec) VALUES (?, ?)
+      ON CONFLICT(collection) DO UPDATE SET spec = excluded.spec`).run(name, JSON.stringify(spec));
+  } else db.prepare("DELETE FROM processor_specs WHERE collection = ?").run(name);
   db.prepare(`
     INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1502,6 +1512,8 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
  * External config always wins. Skips sync if config hash hasn't changed.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  // Config sync is also used on externally seeded databases before Store opens.
+  initializeProcessorSchema(db);
   // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
@@ -1849,12 +1861,16 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
+  const processor = options?.processor ? snapshotProcessor(options.processor) : undefined;
+  requireProcessor(store.db, collectionName, !!getStoreCollection(store.db, collectionName)?.processor, processor);
   const batch = scanWriteBatch(store.db);
   try {
-    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, options);
+    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, processor ? { ...options, processor } : options);
     batch.commit();
     return result;
   } catch (err) {
@@ -1871,6 +1887,8 @@ async function reindexCollectionIn(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1914,6 +1932,10 @@ async function reindexCollectionIn(
     const parts = file.split("/");
     return !parts.some(part => part.startsWith("."));
   });
+
+  if (options?.processor) {
+    return reindexProcessedFiles(db, batch, collectionPath, collectionName, files.map(normalizePathSeparators), options.processor, options);
+  }
 
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
@@ -4311,6 +4333,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
 
     const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
+    removeProcessorState(db, collectionName);
 
     const cleanupResult = db.prepare(`
       DELETE FROM content
@@ -4355,6 +4378,7 @@ export function renameCollection(db: Database, oldName: string, newName: string)
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
     db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
     renameCollectionId(db, oldName, newName);
+    renameProcessorState(db, oldName, newName);
   }).immediate();
 }
 

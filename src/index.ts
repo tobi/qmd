@@ -35,6 +35,8 @@ import {
   upsertStoreCollection,
   deleteStoreCollection,
   renameStoreCollection,
+  removeCollection as removeIndexedCollection,
+  renameCollection as renameIndexedCollection,
   updateStoreContext,
   removeStoreContext,
   setStoreGlobalContext,
@@ -74,6 +76,10 @@ export { RemoteEmbedder } from "./remote-embed.js";
 export type { RemoteEmbedOptions } from "./remote-embed.js";
 export { JevReranker } from "./jev.js";
 export type { JevRerankOptions } from "./jev.js";
+export { createCommandProcessor } from "./processors.js";
+export type { DocumentProcessor, ProcessorInput, ProcessorDocument, CommandProcessorSpec } from "./processors.js";
+import { snapshotProcessor, type DocumentProcessor } from "./processors.js";
+import { requireProcessor, hasProcessorMode } from "./processor-store.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -393,6 +399,8 @@ export interface QMDStore {
 
   /** Re-index collections by scanning the filesystem */
   update(options?: {
+    processors?: Record<string, DocumentProcessor>;
+    signal?: AbortSignal;
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
@@ -567,14 +575,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       }
     },
     removeCollection: async (name) => {
-      const result = deleteStoreCollection(db, name);
+      const processed = hasProcessorMode(db, name) || !!getStoreCollection(db, name)?.processor;
+      const result = processed ? !!getStoreCollection(db, name) : deleteStoreCollection(db, name);
+      if (processed) removeIndexedCollection(db, name);
       if (hasYamlConfig || options.config) {
         collectionsRemoveCollection(name);
       }
       return result;
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
+      const processed = hasProcessorMode(db, oldName) || !!getStoreCollection(db, oldName)?.processor;
+      const result = processed ? !!getStoreCollection(db, oldName) : renameStoreCollection(db, oldName, newName);
+      if (processed) renameIndexedCollection(db, oldName, newName);
       if (hasYamlConfig || options.config) {
         collectionsRenameCollection(oldName, newName);
       }
@@ -622,13 +634,21 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
 
+      const prepared = filtered.map(col => {
+        const registered = updateOpts?.processors?.[col.name];
+        const processor = registered ? snapshotProcessor(registered) : undefined;
+        requireProcessor(db, col.name, !!col.processor, processor);
+        return { col, processor };
+      });
       internal.clearCache();
 
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
-      for (const col of filtered) {
+      for (const { col, processor } of prepared) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          processor,
+          signal: updateOpts?.signal,
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,
