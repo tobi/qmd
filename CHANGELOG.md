@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `qmd mcp --http` streams responses instead of buffering them. The
+  `subscriptions/listen` acknowledgment now reaches the client at once, so
+  2026-07-28 clients such as Claude Code connect in milliseconds instead of
+  waiting about 25 seconds for the listen request to time out.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)

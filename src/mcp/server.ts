@@ -1390,9 +1390,12 @@ export async function startMcpHttpServer(
           : (nodeReq.method || "GET");
         const hostHeader = typeof nodeReq.headers.host === "string" ? nodeReq.headers.host : `localhost:${port}`;
         const url = `http://${hostHeader}${pathname}`;
+        const abort = new AbortController();
+        nodeRes.on("close", () => abort.abort());
         const request = new Request(url, {
           method: nodeReq.method || "GET",
           headers: nodeHeadersToWeb(nodeReq),
+          signal: abort.signal,
           ...(rawBody !== undefined ? { body: rawBody } : {}),
         });
         const response = await mcpHandler.fetch(
@@ -1401,7 +1404,23 @@ export async function startMcpHttpServer(
         );
 
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        nodeRes.flushHeaders();
+        if (response.body) {
+          const reader = response.body.getReader();
+          nodeRes.on("close", () => {
+            reader.cancel().catch(() => {});
+          });
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              nodeRes.write(value);
+            }
+          } catch {
+            // The client disconnected and the stream was cancelled.
+          }
+        }
+        nodeRes.end();
         log(`${ts()} ${nodeReq.method} /mcp ${label} (${Date.now() - reqStart}ms)`);
         return;
       }
