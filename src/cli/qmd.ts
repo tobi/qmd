@@ -1,6 +1,8 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
+import { createCommandProcessor } from "../processors.js";
+import { hasProcessorMode, requireProcessor } from "../processor-store.js";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
@@ -757,6 +759,9 @@ function builtinModels(): BuiltinModels {
 function collectSensitiveSnapshot(): SensitiveSnapshot {
   const config = loadConfig();
   return {
+    processors: Object.entries(config.collections ?? {})
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
     hooks: Object.entries(config.collections ?? {})
       .filter(([, col]) => !!col.update)
       .map(([name, col]) => ({ collection: name, command: col.update! })),
@@ -813,6 +818,7 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 function printGatedItems(gated: GatedItems): void {
+  if (gated.processors?.length) console.log(`${c.yellow}Collection processor commands require approval: ${gated.processors.map(p => p.collection).join(", ")}${c.reset}`);
   if (gated.rerankOptions !== undefined) {
     console.log(`${c.yellow}Custom remote rerank options (revision/credential variable name)${c.reset}`);
   }
@@ -960,19 +966,33 @@ async function updateCollections(): Promise<void> {
   const hooksAllowed = allowed;
   const configPath = getConfigPath();
 
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
-
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
-
-    // Execute custom update command if specified in YAML
+  // Validate every selected collection before hooks or document writes. Keep the
+  // same config and authorized adapter throughout this update, without rereads.
+  const prepared = collections.map(col => {
     const yamlCol = getCollectionFromYaml(col.name);
     const rawPath = yamlCol?.path ?? col.pwd;
-    if (!hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
+    const skip = !hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)
+      ? "path" : yamlCol?.processor && !hooksAllowed ? "processor" : undefined;
+    const processor = !skip && yamlCol?.processor ? createCommandProcessor(yamlCol.processor, { cwd: col.pwd }) : undefined;
+    if (!skip) requireProcessor(db, col.name, !!yamlCol?.processor, processor);
+    return { col, yamlCol, rawPath, processor, skip };
+  });
+
+  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+
+  for (let i = 0; i < prepared.length; i++) {
+    const entry = prepared[i];
+    if (!entry) continue;
+    const { col, yamlCol, rawPath, processor, skip } = entry;
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+
+    if (skip === "path") {
       console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
       console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
+    if (skip === "processor") {
+      console.log(`${c.yellow}Skipping processor collection '${col.name}' — config is not trusted. Approve with 'qmd trust'.${c.reset}`);
       continue;
     }
     if (yamlCol?.update && hooksAllowed) {
@@ -1015,6 +1035,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      processor,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1924,11 +1945,13 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
     process.exit(1);
   }
 
+  // Typing a path does not approve unrelated processor commands in this config.
+  const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
   // The user just typed this path, so it needs no separate approval (#889).
-  trustCurrentConfig();
+  if (mayRefreshTrust) trustCurrentConfig();
   resyncConfig();
 
   // Create the collection and index files
@@ -2121,6 +2144,23 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Collection name must be provided (from YAML)
   if (!collectionName) {
     throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
+  }
+
+  const processorSpec = getCollectionFromYaml(collectionName)?.processor;
+  if (processorSpec || hasProcessorMode(db, collectionName)) {
+    if (processorSpec && !await resolveLocalConfigTrust()) {
+      console.log("Skipping processor collection — config is not trusted. Approve with 'qmd trust'.");
+      closeDb();
+      return;
+    }
+    const processor = processorSpec ? createCommandProcessor(processorSpec, { cwd: resolvedPwd }) : undefined;
+    const result = await reindexCollection(getStore(), resolvedPwd, globPattern, collectionName, { ignorePatterns, processor });
+    console.log(`Indexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
+    reportMetadataErrors(result.metadataErrors);
+    copyVectorsToNewCollections(db, collectionName);
+    closeDb();
+    return;
   }
 
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
@@ -4864,10 +4904,11 @@ if (isMain) {
             console.error(`Collection not found: ${name}`);
             process.exit(1);
           }
+          const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
           updateCollectionSettings(name, { update: cmd });
           // The user just typed this command, so it needs no separate approval;
           // re-record so the digest covers the new hook set (#886).
-          trustCurrentConfig();
+          if (mayRefreshTrust) trustCurrentConfig();
           if (cmd) {
             console.log(`✓ Set update command for '${name}': ${cmd}`);
           } else {

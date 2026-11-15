@@ -1017,6 +1017,9 @@ async function createMcpStore(options: McpStartupOptions): Promise<QMDStore> {
   // Read once: the approval and store must use the same config snapshot.
   const config = loadConfig();
   const snapshot: SensitiveSnapshot = {
+    processors: Object.entries(config.collections)
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
     hooks: Object.entries(config.collections)
       .filter(([, col]) => !!col.update)
       .map(([collection, col]) => ({ collection, command: col.update! })),

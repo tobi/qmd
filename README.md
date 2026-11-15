@@ -401,6 +401,8 @@ await store.setGlobalContext(undefined)  // clear global
 
 #### Indexing
 
+[Collection processors](docs/PROCESSORS.md) optionally turn each source file into multiple stable-key Markdown index documents, through explicit SDK callbacks or trusted CLI commands.
+
 ```typescript
 // Re-index collections by scanning the filesystem
 const result = await store.update({

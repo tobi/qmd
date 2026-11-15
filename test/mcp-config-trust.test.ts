@@ -37,6 +37,9 @@ let selected: typeof builtins[];
 
 function snapshot(): SensitiveSnapshot {
   return {
+    processors: Object.entries(config.collections)
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
     hooks: Object.entries(config.collections)
       .filter(([, col]) => !!col.update)
       .map(([collection, col]) => ({ collection, command: col.update! })),
@@ -158,6 +161,17 @@ describe("MCP startup config trust (also runs in CI)", () => {
     recordTrust(configPath, sensitiveDigest(snapshot(), configPath, builtins));
     expect((await startAndStop()).rerank).toBe(new JevReranker(config.models!.rerank!, config.models!.rerankOptions).modelName);
     config.models!.rerankOptions!.apiKeyEnv = "QMD_TEST_MCP_OTHER_CREDENTIAL";
+    writeConfig();
+    expect(await startAndStop()).toEqual(builtins);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  test("changing only a processor invalidates model approval", async () => {
+    config.collections.docs!.processor = { command: ["synthetic-not-executed"], version: "fixture-v1" };
+    recordTrust(configPath, sensitiveDigest(snapshot(), configPath, builtins));
+    writeConfig();
+    expect((await startAndStop()).embed).toBe(new RemoteEmbedder(config.models!.embed!, config.models!.embedOptions).modelName);
+    config.collections.docs!.processor!.version = "fixture-v2";
     writeConfig();
     expect(await startAndStop()).toEqual(builtins);
     expect(globalThis.fetch).not.toHaveBeenCalled();

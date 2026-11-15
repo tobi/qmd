@@ -17,6 +17,13 @@
 
 ### Added
 
+- Per-collection processors turn source files into stable-key Markdown index
+  documents through explicit SDK callbacks or trusted argv commands. Bounded
+  whole-source validation and SQL savepoints retain the last complete result on
+  processing failures; source fingerprints skip unchanged work and preserve
+  unchanged output vectors. Empty coverage and processor-mode markers prevent
+  silent raw-input fallback after configuration removal. Commands are not an OS
+  sandbox; see `docs/PROCESSORS.md` for trust, versioning and crash boundaries.
 - Optional TypeSafe System One reranking through `models.rerank: typesafe:<model>`
   and copied per-store `rerankOptions` (revision and credential variable name).
   Independent per-document scores use bounded two-worker HTTP, caller/session
