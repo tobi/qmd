@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, JevReranker, type CollectionConfig, type QMDStore } from "../src/index.js";
 import { JEV_ENDPOINT } from "../src/jev.js";
+import { setConfigSource } from "../src/collections.js";
 import { LlamaCpp, DEFAULT_RERANK_MODEL_URI, pullModels, setNodeLlamaCppModuleForTest, withLLMSessionForLlm } from "../src/llm.js";
 import { sensitiveDigest, type SensitiveSnapshot } from "../src/trust.js";
 
@@ -18,6 +19,7 @@ afterEach(async () => {
   for (const close of cleanup.splice(0)) await close();
   vi.restoreAllMocks();
   setNodeLlamaCppModuleForTest(null);
+  setConfigSource();
   delete process.env.TYPESAFE_API_KEY;
   delete process.env.QMD_TEST_JEV_MISSING;
   delete process.env.QMD_TEST_JEV_CUSTOM;
