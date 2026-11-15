@@ -68,7 +68,10 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  builtinModels,
 } from "./llm.js";
+import { resolveRemoteRerankConfig } from "./remote-rerank.js";
+import { snapshotFromConfig, snapshotIsTrusted } from "./trust.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -472,10 +475,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
+  // Remote rerank endpoints: an inline config is the embedding app's own
+  // choice (trusted like env); a configPath read from disk must pass the
+  // same trust gate as the CLI (#705 exfiltration fix).
+  const remoteRerankTrusted = options.config
+    ? true
+    : options.configPath
+      ? snapshotIsTrusted(options.configPath, snapshotFromConfig(config ?? { collections: {} }), builtinModels())
+      : false;
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    remoteRerank: resolveRemoteRerankConfig(config?.models, { trusted: remoteRerankTrusted }),
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });

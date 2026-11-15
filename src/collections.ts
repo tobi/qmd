@@ -40,6 +40,17 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  // Remote rerank (Cohere-shaped /v1/rerank). Endpoints are trusted-config
+  // only: a project-local .qmd/index.yml must be approved via `qmd trust`
+  // before these are honored — otherwise they are ignored (see trust.ts; this
+  // closes #705's exfiltration vector).
+  rerank_api_url?: string;
+  rerank_api_model?: string;
+  rerank_api_key?: string;
+  /** Score normalization: "logits" | "probability" | "auto" (default auto). Raw YAML value; validated by resolveRemoteRerankConfig. */
+  rerank_score?: string;
+  /** Request timeout in milliseconds (default 10000). */
+  rerank_api_timeout?: number;
 }
 
 /**

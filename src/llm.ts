@@ -11,6 +11,8 @@ import type {
   Token as LlamaToken,
 } from "node-llama-cpp";
 
+import { remoteRerank, type RemoteRerankConfig } from "./remote-rerank.js";
+
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
 
@@ -318,6 +320,11 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
     generate: resolveGenerateModel(config),
     rerank: resolveRerankModel(config),
   };
+}
+
+/** The built-in default model URIs, used as the trust-gate comparison set. */
+export function builtinModels(): { embed: string; rerank: string; generate: string } {
+  return { embed: DEFAULT_EMBED_MODEL, rerank: DEFAULT_RERANK_MODEL, generate: DEFAULT_GENERATE_MODEL };
 }
 
 // Local model cache directory
@@ -650,6 +657,13 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Remote rerank endpoint (Cohere-shaped /v1/rerank). When set, rerank() calls
+   * the remote first and falls back to the local model on failure; embedding
+   * and query expansion are unaffected. Resolve via resolveRemoteRerankConfig
+   * so the config trust gate is honored.
+   */
+  remoteRerank?: RemoteRerankConfig | null;
 };
 
 /**
@@ -843,6 +857,7 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
+  private readonly remoteRerankConfig: RemoteRerankConfig | null;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -879,6 +894,7 @@ export class LlamaCpp implements LLM {
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.remoteRerankConfig = config.remoteRerank ?? null;
   }
 
   get embedModelName(): string {
@@ -890,7 +906,9 @@ export class LlamaCpp implements LLM {
   }
 
   get rerankModelName(): string {
-    return this.rerankModelUri;
+    // The remote identity doubles as the rerank cache key, so cached scores are
+    // always read under the backend configured to produce them.
+    return this.remoteRerankConfig?.identity ?? this.rerankModelUri;
   }
 
   /**
@@ -1731,6 +1749,35 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    if (documents.length === 0) return { results: [], model: this.rerankModelName };
+    if (this.remoteRerankConfig) {
+      try {
+        return await remoteRerank(query, documents, this.remoteRerankConfig);
+      } catch (error) {
+        console.warn(`⚠ Remote rerank failed (${error instanceof Error ? error.message : String(error)}); falling back to the local rerank model`);
+      }
+      try {
+        return await this.localRerank(query, documents, options);
+      } catch (error) {
+        console.warn(`⚠ Local rerank unavailable (${error instanceof Error ? error.message : String(error)}); continuing with neutral (0.5) scores`);
+        return {
+          results: documents.map((d, i) => ({ ...d, score: 0.5, index: i })),
+          model: "fallback",
+        };
+      }
+    }
+    return this.localRerank(query, documents, options);
+  }
+
+  /**
+   * Local GGUF rerank path. Remote-failure fallback target; behavior is
+   * unchanged when no remote endpoint is configured (including the CI guard).
+   */
+  protected async localRerank(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}

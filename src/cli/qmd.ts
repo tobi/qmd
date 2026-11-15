@@ -107,7 +107,8 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, builtinModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { resolveRemoteRerankConfig } from "../remote-rerank.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -148,6 +149,8 @@ import {
   listTrusted,
   recordTrust,
   revokeTrust,
+  snapshotFromConfig,
+  snapshotIsTrusted,
   sensitiveDigest,
   type BuiltinModels,
   type GatedItems,
@@ -179,11 +182,14 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
+      // Remote rerank endpoints follow the same gate: an untrusted local
+      // config's rerank_api_* fields are ignored (#705 exfiltration fix).
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
       const llm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
         rerankModel: modelsForLlm.rerank,
+        remoteRerank: resolveRemoteRerankConfig(config.models, { trusted: localConfigIsFullyTrusted() }),
       });
       setDefaultLlamaCpp(llm);
       store.llm = llm;
@@ -732,35 +738,14 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-function builtinModels(): BuiltinModels {
-  return {
-    embed: DEFAULT_EMBED_MODEL,
-    rerank: DEFAULT_RERANK_MODEL,
-    generate: DEFAULT_QUERY_MODEL,
-  };
-}
-
 /**
- * Gated surface of the active YAML: hooks, collection paths, models.
+ * Gated surface of the active YAML: hooks, collection paths, models —
+ * including remote `*_api_*` endpoints, which are exfiltration channels.
  * Read from the YAML rather than the synced SQLite copy so `qmd trust`
  * and `qmd update` always digest the same set.
  */
 function collectSensitiveSnapshot(): SensitiveSnapshot {
-  const config = loadConfig();
-  return {
-    hooks: Object.entries(config.collections ?? {})
-      .filter(([, col]) => !!col.update)
-      .map(([name, col]) => ({ collection: name, command: col.update! })),
-    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
-      collection: name,
-      path: col.path,
-    })),
-    models: {
-      embed: config.models?.embed,
-      rerank: config.models?.rerank,
-      generate: config.models?.generate,
-    },
-  };
+  return snapshotFromConfig(loadConfig());
 }
 
 function localConfigDigest(configPath: string, snapshot: SensitiveSnapshot): string {
@@ -773,13 +758,7 @@ function localConfigGated(configPath: string, snapshot: SensitiveSnapshot): Gate
 
 /** True when this process may use the local config's gated fields. */
 function localConfigIsFullyTrusted(): boolean {
-  const configPath = getConfigPath();
-  if (!isLocalConfigPath(configPath)) return true;
-  if (isLocalConfigTrustOptedIn()) return true;
-  const snapshot = collectSensitiveSnapshot();
-  const gated = localConfigGated(configPath, snapshot);
-  if (!hasGatedItems(gated)) return true;
-  return isTrusted(configPath, localConfigDigest(configPath, snapshot));
+  return snapshotIsTrusted(getConfigPath(), collectSensitiveSnapshot(), builtinModels());
 }
 
 /** Record the active config's current gated set as approved. */
