@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { getConfigDir } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
+import { copyRemoteEmbedOptions, isRemoteEmbedModel, parseRemoteEmbedUri, type RemoteEmbedOptions } from "./remote-embed.js";
 
 /** A collection's pre-update hook, as it will be executed. */
 export type UpdateHook = {
@@ -39,6 +40,7 @@ export type ModelSlot = "embed" | "rerank" | "generate";
 
 export type ModelsSnapshot = {
   embed?: string;
+  embedOptions?: RemoteEmbedOptions;
   rerank?: string;
   generate?: string;
 };
@@ -53,9 +55,10 @@ export type GatedItems = {
   hooks: UpdateHook[];
   paths: CollectionPath[];
   models: Array<{ slot: ModelSlot; uri: string }>;
+  embedOptions?: Readonly<RemoteEmbedOptions>;
 };
 
-export type BuiltinModels = Required<ModelsSnapshot>;
+export type BuiltinModels = Required<Pick<ModelsSnapshot, ModelSlot>>;
 
 export type TrustRecord = {
   /** Digest of the gated set that was approved. */
@@ -140,6 +143,10 @@ export function gatedModels(
   for (const slot of ["embed", "rerank", "generate"] as const) {
     const uri = models[slot];
     if (!uri) continue;
+    if (slot === "embed") {
+      if (typeof uri !== "string") throw new Error("Embedding model must be a single URI string");
+      if (isRemoteEmbedModel(uri)) parseRemoteEmbedUri(uri);
+    }
     if (uri === builtins[slot]) continue;
     out.push({ slot, uri });
   }
@@ -155,11 +162,12 @@ export function gatedItems(
     hooks: snapshot.hooks,
     paths: snapshot.paths.filter(p => !isCollectionPathInsideProject(configPath, p.path)),
     models: gatedModels(snapshot.models, builtins),
+    ...(snapshot.models.embedOptions !== undefined ? { embedOptions: copyRemoteEmbedOptions(snapshot.models.embedOptions) } : {}),
   };
 }
 
 export function hasGatedItems(gated: GatedItems): boolean {
-  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0;
+  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0 || gated.embedOptions !== undefined;
 }
 
 function byFirst(a: string[], b: string[]): number {
@@ -202,6 +210,7 @@ export function sensitiveDigest(
     models: gated.models
       .map(m => [m.slot, m.uri] as [string, string])
       .sort(byFirst),
+    ...(gated.embedOptions !== undefined ? { embedOptions: gated.embedOptions } : {}),
   });
   return createHash("sha256").update(canonical).digest("hex");
 }

@@ -180,7 +180,8 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
   ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+  const digest = createHash("sha256").update(significant).digest("hex");
+  return model.startsWith("remote-openai:") ? digest : digest.slice(0, 6);
 }
 
 /**
@@ -2110,6 +2111,7 @@ export type EmbedResult = {
 };
 
 export type EmbedOptions = {
+  signal?: AbortSignal;
   force?: boolean;
   model?: string;
   /**
@@ -2389,7 +2391,7 @@ export async function generateEmbeddings(
         attempts: (previous?.attempts ?? 0) + 1,
         reason,
       });
-      retryQueue.set(key, chunk);
+      if (!model.startsWith("remote-openai:")) retryQueue.set(key, chunk);
     };
     const clearFailure = (chunk: ChunkItem) => {
       const key = chunkKey(chunk);
@@ -2556,8 +2558,10 @@ export async function generateEmbeddings(
           // individual retry succeeds, any prior failure for that chunk is
           // cleared, so the visible error count reflects outstanding failures.
           const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+          if (!session.isValid || model.startsWith("remote-openai:")) {
+            // A remote batch is one bounded attempt; malformed/partial responses
+            // must not be rescued by individual HTTP calls.
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed: ${batchReason}`);
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
@@ -2593,7 +2597,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, signal: options?.signal, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -3847,6 +3851,13 @@ async function chunkDocumentByTokensWithLlm(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (llm.embedModelName?.startsWith("remote-openai:")) {
+    signal?.throwIfAborted();
+    // Fixed remote format v1: the existing surrogate-safe character chunker,
+    // never a local tokenizer or token-truncation pass. Tokens are estimates.
+    return chunkDocument(content, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, CHUNK_WINDOW_CHARS)
+      .map(chunk => ({ ...chunk, tokens: Math.ceil(chunk.text.length / 4) }));
+  }
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -4973,12 +4984,58 @@ function nearestVecDocuments(
   }
 }
 
+/** Enforce remote spaces in KNN scope without changing local-to-local compatibility. */
+function assertRemoteEmbeddingBoundary(db: Database, model: string, collectionName?: string | readonly string[], filter?: MetadataFilter): void {
+  if (!hasVectorIndex(db)) return;
+  const names = scopedCollectionNames(collectionName);
+  const ids = names ? Array.from(resolveCollectionIds(db, names).values()) : undefined;
+  if (ids?.length === 0) return;
+  const eligible = filter ? metadataEligibleRowsSql(filter) : undefined;
+  const conditions: string[] = [];
+  const params: SQLiteValue[] = [];
+  if (ids) {
+    conditions.push(`vr.collection_id IN (${ids.map(() => "?").join(",")})`);
+    params.push(...ids);
+  }
+  if (eligible) {
+    conditions.push(`vr.id IN (SELECT vr.id ${eligible.sql})`);
+    params.push(...eligible.params);
+  }
+  conditions.push(`EXISTS (SELECT 1 FROM ${VEC_TABLE} v WHERE v.rowid = vr.id)`);
+  if (model.startsWith("remote-openai:")) {
+    conditions.push("(cv.model IS NULL OR cv.model != ? OR cv.embed_fingerprint != ?)");
+    params.push(model, getEmbeddingFingerprint(model));
+  } else {
+    // Local labels and legacy fingerprints keep their existing semantics, but
+    // a local query must never rank a remote embedding space (or load ML first).
+    conditions.push("cv.model GLOB 'remote-openai:*'");
+  }
+  const foreign = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT 1 FROM ${VEC_ROWS_TABLE} vr
+    LEFT JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
+    WHERE ${conditions.join(" AND ")} LIMIT 1
+  `).get(...params));
+  if (foreign) throw new Error("Vector space mismatch; re-embed the selected collections with the configured model");
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
-
+  // No read transaction spans HTTP. Fail before paying for a query, then
+  // recheck after the await in the SAME snapshot as KNN and document resolution.
+  assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
+  session?.signal.throwIfAborted();
 
+  return db.transaction(() => {
+    if (!hasVectorIndex(db)) return [];
+    assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
+    return searchVecSnapshot(db, embedding, limit, collectionName, filter);
+  })();
+}
+
+/** Synchronous reads only; called inside the post-embedding read transaction. */
+function searchVecSnapshot(db: Database, embedding: number[], limit: number, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   let collectionIds: number[] | undefined;
   if (names) {
@@ -5015,8 +5072,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
-      // The body is read after resolution, outside its snapshot: another
-      // process's orphaned-content cleanup can delete the row in between.
+      // Body, vector, metadata and context reads share the search snapshot.
       const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
@@ -6351,6 +6407,7 @@ export async function hybridQuery(
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
     const embedModel = llm.embedModelName;
+    assertRemoteEmbeddingBoundary(store.db, embedModel, collection, filter);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -6753,6 +6810,7 @@ export async function structuredSearch(
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
       const embedModel = llm.embedModelName;
+      assertRemoteEmbeddingBoundary(store.db, embedModel, collections, filter);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();

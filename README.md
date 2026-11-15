@@ -611,6 +611,103 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Remote Embeddings
+
+Local GGUF defaults are unchanged. To explicitly use an OpenAI-compatible
+embedding server instead, set one API-base URI with a `#model-id` fragment:
+
+```yaml
+models:
+  embed: "http://localhost:1234/v1#my-embedding-model"
+  embedOptions:
+    dimensions: 768             # optional, integer 1..4096
+    revision: "deployment-v1"   # optional, nonempty string, at most 256 characters
+    apiKeyEnv: EMBEDDING_KEY    # optional environment variable NAME, not a key
+```
+
+QMD sends `POST /v1/embeddings` with `model`, `input`, `encoding_format: "float"`,
+and `dimensions` when configured. The base may have a different path; QMD appends
+`/embeddings`. HTTP and HTTPS are intentional choices; use HTTPS for credentials
+outside a trusted local connection. URL credentials, query strings, control
+characters, endpoint lists, plaintext-key options, and unknown options are rejected.
+`apiKeyEnv` accepts `[A-Za-z_][A-Za-z0-9_]{0,127}`. Its value is read at each
+request, never saved in the index or shown in errors. Without it, requests are
+keyless: there is **no** `OPENAI_API_KEY` or other ambient auth fallback. A declared
+but missing/invalid credential fails before HTTP. Changing these options, including
+the credential variable name, re-arms a project-local config's `qmd trust` approval.
+
+```sh
+qmd update
+qmd embed
+# Embedding-only retrieval: no local expansion or reranking model needed.
+qmd query 'vec: your semantic query' --no-rerank
+```
+
+`qmd search` remains lexical. Ordinary free-text `query` and `vsearch` still use
+local query expansion, and reranking is still local: remote embeddings do not
+replace those models. `qmd pull` skips the remote embedding role but still pulls
+local generation/reranking models. `status` and `doctor` describe remote embedding
+as configured, **not verified**; they do not probe the server or download/load an
+embedding model. Doctor also skips its native device probe in this mode.
+
+The SDK uses the same config, captured per store (later input mutation does not
+change that store's embedding selection):
+
+```typescript
+import { createStore, RemoteEmbedder } from '@tobilu/qmd'
+
+const controller = new AbortController()
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: {
+    collections: { docs: { path: '/path/to/docs', pattern: '**/*.md' } },
+    models: {
+      embed: 'http://localhost:1234/v1#my-embedding-model',
+      embedOptions: { dimensions: 768, revision: 'deployment-v1', apiKeyEnv: 'EMBEDDING_KEY' }
+    }
+  }
+})
+await store.update()
+await store.embed({ signal: controller.signal })
+const results = await store.searchVector('your semantic query', { signal: controller.signal })
+await store.close()
+
+// Standalone embedding client; pass already-formatted text.
+const client = new RemoteEmbedder('http://localhost:1234/v1#my-embedding-model')
+const vectors = await client.embedBatch(['document text'], controller.signal)
+```
+
+Remote input formatting is pinned: raw queries, and `title + "\n" + document`
+when a title exists. Documents use the existing surrogate-safe character chunker
+(3600 UTF-16 units, 540 overlap), never a local tokenizer or token truncation pass.
+The opaque `remote-openai:<sha256>` space identity includes the canonical endpoint,
+model ID, requested dimensions (or server-default marker), revision, and format/
+chunk version. Two hosts advertising the same model ID are **different spaces**.
+Credentials are excluded: change `revision` when an account or deployment changes
+embedding semantics. Re-embed after changing spaces; use `qmd embed --force` when
+switching chunk formats or dimensions. Dimensions never automatically clear a table.
+QMD has one vector table and content-scoped chunk metadata, not independent model
+indexes per collection; a shared content hash is embedded for all its collections.
+
+Vector searches enforce a remote embedding boundary in their selected collection/
+metadata scope before requesting a query embedding: a remote query requires exact
+model/fingerprint matches on every selected vector row; a local query refuses
+selected remote vector rows before loading a local model. Existing local-to-local
+behavior, including legacy empty fingerprints and differing local model labels,
+is unchanged. After HTTP, QMD rechecks the same boundary and reads KNN matches,
+documents, metadata and bodies in one SQLite read snapshot. No read transaction
+is held over the network.
+
+Each HTTP call is one attempt (no redirects, retries, fallback or normalization),
+with a 30-second timeout combined with the caller/session signal. Limits: 64 inputs,
+64 KiB UTF-8 per input, 2 MiB encoded request, 8 MiB streamed response, 4096 dimensions.
+Oversized input is refused, never truncated. Responses must be valid UTF-8 JSON,
+echo the exact model
+and contain exactly one uniquely indexed, uniformly dimensioned, finite nonzero
+Float32-representable vector per input. An invalid/partial batch returns no vectors;
+indexing does not rescue it with individual remote calls. Errors never include
+response bodies, credentials, headers or provider error messages.
+
 ## Installation
 
 ```sh
@@ -780,7 +877,8 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.rerank` / `.generate` | top-level | GGUF URIs overriding the built-in defaults per role. `embed` also accepts one HTTP API-base URI with `#model-id`; see [Remote Embeddings](#remote-embeddings). |
+| `models.embedOptions` | top-level | Remote-only `dimensions`, `revision`, and `apiKeyEnv` (environment variable name, never a key). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
