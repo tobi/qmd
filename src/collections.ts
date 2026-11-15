@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
+import type { RemoteEmbedOptions } from "./remote-embed.js";
 
 // ============================================================================
 // Types
@@ -38,6 +39,7 @@ export interface Collection {
  */
 export interface ModelsConfig {
   embed?: string;
+  embedOptions?: RemoteEmbedOptions;
   rerank?: string;
   generate?: string;
 }
