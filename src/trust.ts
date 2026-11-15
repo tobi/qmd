@@ -23,6 +23,9 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { getConfigDir } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
+import { copyCommandProcessorSpec, type CommandProcessorSpec } from "./processors.js";
+import { copyRemoteEmbedOptions, isRemoteEmbedModel, parseRemoteEmbedUri, type RemoteEmbedOptions } from "./remote-embed.js";
+import { copyJevRerankOptions, isJevModel, parseJevModel, type JevRerankOptions } from "./jev.js";
 
 /** A collection's pre-update hook, as it will be executed. */
 export type UpdateHook = {
@@ -39,23 +42,29 @@ export type ModelSlot = "embed" | "rerank" | "generate";
 
 export type ModelsSnapshot = {
   embed?: string;
+  embedOptions?: RemoteEmbedOptions;
   rerank?: string;
+  rerankOptions?: JevRerankOptions;
   generate?: string;
 };
 
 export type SensitiveSnapshot = {
+  processors?: Array<{ collection: string; spec: CommandProcessorSpec }>;
   hooks: UpdateHook[];
   paths: CollectionPath[];
   models: ModelsSnapshot;
 };
 
 export type GatedItems = {
+  processors?: Array<{ collection: string; spec: Readonly<CommandProcessorSpec> }>;
   hooks: UpdateHook[];
   paths: CollectionPath[];
   models: Array<{ slot: ModelSlot; uri: string }>;
+  embedOptions?: Readonly<RemoteEmbedOptions>;
+  rerankOptions?: Readonly<JevRerankOptions>;
 };
 
-export type BuiltinModels = Required<ModelsSnapshot>;
+export type BuiltinModels = Required<Pick<ModelsSnapshot, ModelSlot>>;
 
 export type TrustRecord = {
   /** Digest of the gated set that was approved. */
@@ -140,6 +149,14 @@ export function gatedModels(
   for (const slot of ["embed", "rerank", "generate"] as const) {
     const uri = models[slot];
     if (!uri) continue;
+    if (slot === "embed") {
+      if (typeof uri !== "string") throw new Error("Embedding model must be a single URI string");
+      if (isRemoteEmbedModel(uri)) parseRemoteEmbedUri(uri);
+    }
+    if (slot === "rerank") {
+      if (typeof uri !== "string") throw new Error("Rerank model must be a single URI string");
+      if (isJevModel(uri)) parseJevModel(uri);
+    }
     if (uri === builtins[slot]) continue;
     out.push({ slot, uri });
   }
@@ -152,14 +169,17 @@ export function gatedItems(
   builtins: BuiltinModels,
 ): GatedItems {
   return {
+    ...(snapshot.processors?.length ? { processors: snapshot.processors.map(p => ({ collection: p.collection, spec: copyCommandProcessorSpec(p.spec) })) } : {}),
     hooks: snapshot.hooks,
     paths: snapshot.paths.filter(p => !isCollectionPathInsideProject(configPath, p.path)),
     models: gatedModels(snapshot.models, builtins),
+    ...(snapshot.models.embedOptions !== undefined ? { embedOptions: copyRemoteEmbedOptions(snapshot.models.embedOptions) } : {}),
+    ...(snapshot.models.rerankOptions !== undefined ? { rerankOptions: copyJevRerankOptions(snapshot.models.rerankOptions) } : {}),
   };
 }
 
 export function hasGatedItems(gated: GatedItems): boolean {
-  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0;
+  return !!gated.processors?.length || gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0 || gated.embedOptions !== undefined || gated.rerankOptions !== undefined;
 }
 
 function byFirst(a: string[], b: string[]): number {
@@ -195,6 +215,7 @@ export function sensitiveDigest(
 ): string {
   const gated = gatedItems(configPath, snapshot, builtins);
   const canonical = JSON.stringify({
+    ...(gated.processors?.length ? { processors: gated.processors.map(p => [p.collection, p.spec] as const).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0) } : {}),
     hooks: gated.hooks.map(h => [h.collection, h.command]).sort(byFirst),
     paths: gated.paths
       .map(p => [p.collection, resolveConfigCollectionPath(p.path, configPath)] as [string, string])
@@ -202,6 +223,8 @@ export function sensitiveDigest(
     models: gated.models
       .map(m => [m.slot, m.uri] as [string, string])
       .sort(byFirst),
+    ...(gated.embedOptions !== undefined ? { embedOptions: gated.embedOptions } : {}),
+    ...(gated.rerankOptions !== undefined ? { rerankOptions: gated.rerankOptions } : {}),
   });
   return createHash("sha256").update(canonical).digest("hex");
 }

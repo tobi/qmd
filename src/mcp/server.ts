@@ -35,7 +35,9 @@ import {
   MetadataBindingBudgetError,
   MetadataOptionError,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, loadConfig } from "../collections.js";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../llm.js";
+import { decideLocalConfigGate, type SensitiveSnapshot } from "../trust.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
@@ -1006,6 +1008,48 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
   return shutdown;
 }
 
+/** Apply the non-interactive local-config trust gate before SDK model selection. */
+async function createMcpStore(options: McpStartupOptions): Promise<QMDStore> {
+  const dbPath = options.dbPath ?? getDefaultDbPath();
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) return createStore({ dbPath });
+
+  // Read once: the approval and store must use the same config snapshot.
+  const config = loadConfig();
+  const snapshot: SensitiveSnapshot = {
+    processors: Object.entries(config.collections)
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
+    hooks: Object.entries(config.collections)
+      .filter(([, col]) => !!col.update)
+      .map(([collection, col]) => ({ collection, command: col.update! })),
+    paths: Object.entries(config.collections).map(([collection, col]) => ({ collection, path: col.path })),
+    models: {
+      embed: config.models?.embed,
+      embedOptions: config.models?.embedOptions,
+      rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
+      generate: config.models?.generate,
+    },
+  };
+  const decision = decideLocalConfigGate({
+    configPath,
+    snapshot,
+    builtins: {
+      embed: DEFAULT_EMBED_MODEL_URI,
+      rerank: DEFAULT_RERANK_MODEL_URI,
+      generate: DEFAULT_GENERATE_MODEL_URI,
+    },
+    isInteractive: false,
+  });
+  const storeConfig = { ...config };
+  // Drop every configured URI and option, not the deliberate process env or
+  // built-in defaults. Never mutate the loaded config or write it back to YAML.
+  if (decision.action !== "run") delete storeConfig.models;
+  // MCP exposes no config mutations, so inline config needs no write-through.
+  return createStore({ dbPath, config: storeConfig });
+}
+
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
@@ -1013,11 +1057,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // isolation for downstream suites that expect the default (development)
   // database path behaviour.
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
+  const store = await createMcpStore(options);
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
@@ -1067,11 +1107,7 @@ export async function startMcpHttpServer(
   // HTTP transport resolves the real database path, without leaking state into
   // callers that only import this module for its exports (e.g. tests).
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
+  const store = await createMcpStore(options);
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
