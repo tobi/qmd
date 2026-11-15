@@ -1937,8 +1937,8 @@ function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): stri
 }
 
 /** Shared configuration step for `collection add` and `setup-collection`:
- * name derivation, duplicate checks, YAML write, trust recording, and the
- * SQLite config sync. Returns the collection name. Indexing/embedding is left
+ * name derivation, duplicate checks, YAML write, and the SQLite config sync.
+ * Returns the collection name. Indexing/embedding is left
  * to the caller so setup can apply ignore patterns before the first index. */
 async function configureCollection(
   pwd: string,
@@ -1982,8 +1982,6 @@ async function configureCollection(
     ...(settings.ignore && settings.ignore.length > 0 ? { ignore: settings.ignore } : {}),
     ...(settings.includeByDefault === false ? { includeByDefault: false } : {}),
   });
-  // The user just typed this path, so it needs no separate approval (#889).
-  if (mayRefreshTrust) trustCurrentConfig();
   resyncConfig();
 
   return collName;

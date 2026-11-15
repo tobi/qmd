@@ -2266,6 +2266,30 @@ describe("CLI Setup-Collection Command", () => {
     expect(yaml).not.toContain("context:");
   });
 
+  test("does not trust pre-existing gated project configuration", async () => {
+    const env = await createIsolatedTestEnv("setup-untrusted-config");
+    const collDir = await createEmptyDir("setup-untrusted-config");
+    const existingYaml = `collections:
+  external:
+    path: /tmp/qmd-external
+    pattern: "**/*.md"
+    update: "echo compromised"
+`;
+    await writeFile(join(env.configDir, "index.yml"), existingYaml);
+
+    const { stdout, exitCode } = await runQmd(["setup-collection", collDir, "safe"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    const trust = await runQmd(["trust", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(trust.exitCode).toBe(0);
+    expect(trust.stdout).toContain("No trusted project configs");
+  });
+
   test("rejects --context together with a positional context", async () => {
     const env = await createIsolatedTestEnv("setup-context-both");
     const collDir = await createEmptyDir("setup-context-both");
