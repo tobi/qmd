@@ -220,6 +220,8 @@ export type UpdateResult = {
 export interface SearchOptions {
   /** Simple query string — will be auto-expanded via LLM */
   query?: string;
+  /** Additional caller-supplied typed searches fused with query expansion */
+  additionalSearches?: ExpandedQuery[];
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
@@ -487,6 +489,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Search
     search: async (opts) => {
+      if (opts.additionalSearches !== undefined && (!opts.query || opts.queries !== undefined)) {
+        throw new Error("search() additionalSearches requires a plain query and cannot be combined with queries");
+      }
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -527,6 +532,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
+        additionalSearches: opts.additionalSearches,
       });
     },
     searchLex: async (q, opts) => {

@@ -5,7 +5,7 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
-import { setDefaultLlamaCpp } from "../src/llm.js";
+import { SessionReleasedError, setDefaultLlamaCpp } from "../src/llm.js";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
 
 // =============================================================================
@@ -613,6 +613,199 @@ describe("search (unified API)", () => {
       rerank: false,
     });
     expect(results.length).toBeGreaterThan(0);
+  });
+  test("search() fuses additional typed searches with automatic expansion", async () => {
+    const fixtureDir = await mkdtemp(join(testDir, "additional-search-"));
+    const testStore = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: { docs: { path: fixtureDir, pattern: "**/*.md" } } },
+    });
+    try {
+      await Promise.all(Array.from({ length: 50 }, (_, index) =>
+        writeFile(join(fixtureDir, `search-fixture-${index}.md`),
+          `${index === 0 ? "qmdraresignal raretulip opalengine swiftbadger ".repeat(10) : "unrelated"} session ${"noise ".repeat(index + 1)}`)));
+      await testStore.update();
+      const strongQuery = "qmdraresignal raretulip opalengine swiftbadger";
+      const before = testStore.internal.searchFTS(strongQuery, 20, "docs");
+      expect(before[0]?.score).toBeGreaterThanOrEqual(0.85);
+      expect(before[1]?.score ?? 0).toBe(0);
+      const results = await testStore.search({
+        query: strongQuery,
+        additionalSearches: [{ type: "lex", query: "session" }],
+        rerank: false,
+      });
+      expect(results.length).toBeGreaterThan(1);
+      await expect(testStore.search({
+        query: strongQuery,
+        additionalSearches: Array.from({ length: 11 }, () => ({ type: "lex" as const, query: "session" })),
+        rerank: false,
+      })).rejects.toThrow("at most 10 valid typed searches");
+      await expect(testStore.search({
+        query: strongQuery,
+        additionalSearches: [{ type: "hyde", query: "x".repeat(8_193) }],
+        rerank: false,
+      })).rejects.toThrow("8192 characters");
+    } finally {
+      await testStore.close();
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
+  });
+  test("FTS-only additive search gives its first nonempty caller list 2x", async () => {
+    const fixtureDir = await mkdtemp(join(testDir, "fts-only-additional-search-"));
+    const testStore = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: { docs: { path: fixtureDir, pattern: "**/*.md" } } },
+    });
+    const originalExpand = testStore.internal.expandQuery;
+    testStore.internal.expandQuery = async () => [];
+    try {
+      await writeFile(join(fixtureDir, "weighted.md"), "# Weighted\nweightedtoken exact match");
+      await testStore.update();
+      const results = await testStore.search({
+        query: "qmdnotpresent",
+        additionalSearches: [{ type: "lex", query: "weightedtoken" }],
+        rerank: false,
+        explain: true,
+      });
+      expect(results.some(result => result.file === "qmd://docs/weighted.md")).toBe(true);
+      const contribution = results.find(result => result.file === "qmd://docs/weighted.md")
+        ?.explain?.rrf?.contributions.find(item => item.queryType === "lex");
+      expect(contribution?.weight).toBe(2);
+    } finally {
+      testStore.internal.expandQuery = originalExpand;
+      await testStore.close();
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("hybrid search fuses deterministic HyDE on strong and expansion paths", async () => {
+    const fixtureDir = await mkdtemp(join(testDir, "hybrid-search-"));
+    const vectorStore = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: { docs: { path: fixtureDir, pattern: "**/*.md" } } },
+    });
+    const expansion = [{ type: "hyde" as const, query: "synthetic hydetarget passage" }];
+    const fakeLlm = {
+      embedModelName: "test-deterministic",
+      async tokenize(text: string) { return [...text].map(character => character.charCodeAt(0)); },
+      async detokenize(tokens: readonly number[]) { return String.fromCharCode(...tokens); },
+      async embed(text: string) {
+        const embedding = text.includes("no-original-vector")
+          ? undefined
+          : text.includes("hydetarget") ? [1, 0, 0] : [0, 1, 0];
+        return { embedding, model: "test-deterministic" };
+      },
+      async embedBatch(texts: string[]) {
+        return texts.map(text => ({
+          embedding: text.includes("no-original-vector")
+            ? undefined
+            : text.includes("hydetarget") || text.includes("task: search result | query:") ? [1, 0, 0] : [0, 1, 0],
+          model: "test-deterministic",
+        }));
+      },
+    };
+    const originalExpand = vectorStore.internal.expandQuery;
+    let expansionCalls = 0;
+    vectorStore.internal.llm = fakeLlm as any;
+    vectorStore.internal.expandQuery = async () => {
+      expansionCalls++;
+      return expansion;
+    };
+    try {
+      await writeFile(join(fixtureDir, "strong.md"), `# Strong\n${"qmdraresignal raretulip opalengine swiftbadger ".repeat(10)}`);
+      await writeFile(join(fixtureDir, "hyde-target.md"), "# HyDE target\nhydetarget");
+      await Promise.all(Array.from({ length: 50 }, (_, index) =>
+        writeFile(join(fixtureDir, `noise-${index}.md`), `# Noise ${index}\nunrelated session ${"filler ".repeat(index + 1)}`)));
+      await vectorStore.update();
+      await vectorStore.embed();
+      const strongQuery = "qmdraresignal raretulip opalengine swiftbadger";
+      const strongSignal = vectorStore.internal.searchFTS(strongQuery, 20, "docs");
+      expect(strongSignal[0]?.score).toBeGreaterThanOrEqual(0.85);
+      expect(strongSignal[1]?.score ?? 0).toBe(0);
+
+      const strongResults = await vectorStore.search({
+        query: strongQuery,
+        additionalSearches: expansion,
+        rerank: false,
+        explain: true,
+      });
+      expect(strongResults.some(result => result.file === "qmd://docs/hyde-target.md")).toBe(true);
+      const strongContributions = strongResults.flatMap(result => result.explain?.rrf?.contributions ?? []);
+      expect(strongContributions.find(contribution => contribution.source === "fts" && contribution.queryType === "original")?.weight).toBe(2);
+      expect(strongContributions.find(contribution => contribution.source === "vec" && contribution.queryType === "original")?.weight).toBe(1);
+      const callerHyde = strongResults.find(result => result.file === "qmd://docs/hyde-target.md")?.explain?.rrf?.contributions;
+      expect(callerHyde?.find(contribution => contribution.queryType === "hyde")?.weight).toBe(1);
+
+      const plainResults = await vectorStore.search({ query: strongQuery, rerank: false, explain: true });
+      const plainContributions = plainResults.flatMap(result => result.explain?.rrf?.contributions ?? []);
+      expect(plainContributions.find(contribution => contribution.source === "vec" && contribution.queryType === "original")?.weight).toBe(2);
+      expect(expansionCalls).toBe(0);
+
+      const noVectorBaselineResults = await vectorStore.search({
+        query: "no-original-vector",
+        additionalSearches: expansion,
+        rerank: false,
+        explain: true,
+      });
+      const noVectorBaselineHyde = noVectorBaselineResults.find(result => result.file === "qmd://docs/hyde-target.md")?.explain?.rrf?.contributions
+        .filter(contribution => contribution.queryType === "hyde").map(contribution => contribution.weight);
+      expect(noVectorBaselineHyde).toContain(1);
+      expect(noVectorBaselineHyde).toContain(2);
+      expect(expansionCalls).toBe(1);
+
+      const expandedResults = await vectorStore.search({
+        query: "weak unmatched query",
+        additionalSearches: [{ type: "lex", query: strongQuery }],
+        rerank: false,
+        explain: true,
+      });
+      expect(expandedResults.some(result => result.file === "qmd://docs/hyde-target.md")).toBe(true);
+      const callerLex = expandedResults.flatMap(result => result.explain?.rrf?.contributions ?? []);
+      expect(callerLex.find(contribution => contribution.queryType === "lex")?.weight).toBe(1);
+      expect(callerLex.find(contribution => contribution.source === "vec" && contribution.queryType === "original")?.weight).toBe(2);
+      const autoHyde = expandedResults.find(result => result.file === "qmd://docs/hyde-target.md")?.explain?.rrf?.contributions;
+      expect(autoHyde?.find(contribution => contribution.queryType === "hyde")?.weight).toBe(1);
+      expect(expansionCalls).toBe(2);
+    } finally {
+      vectorStore.internal.expandQuery = originalExpand;
+      await vectorStore.close();
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
+  });
+  test("additional searches survive expansion failure but propagate cancellation", async () => {
+    const secret = "private-expansion-query";
+    const failure = new Error(secret);
+    const originalExpand = store.internal.expandQuery;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store.internal.expandQuery = async () => { throw failure; };
+    try {
+      await expect(store.search({ query: "weak unmatched query", rerank: false })).rejects.toBe(failure);
+      const results = await store.search({
+        query: "authentication",
+        additionalSearches: [{ type: "lex", query: "roadmap resource allocation" }],
+        rerank: false,
+        intent: "account login help",
+      });
+      expect(results.some(result => result.file.endsWith("auth.md"))).toBe(true);
+      expect(results.some(result => result.file.endsWith("meeting-2025-01.md"))).toBe(true);
+      expect(warning).toHaveBeenCalledWith(expect.not.stringContaining(secret));
+
+      for (const cancellation of [
+        new SessionReleasedError(),
+        Object.assign(new Error("request aborted"), { name: "AbortError" }),
+      ]) {
+        store.internal.expandQuery = async () => { throw cancellation; };
+        await expect(store.search({
+          query: "weak unmatched query",
+          additionalSearches: [{ type: "lex", query: "authentication" }],
+          rerank: false,
+        })).rejects.toBe(cancellation);
+      }
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      store.internal.expandQuery = originalExpand;
+      warning.mockRestore();
+    }
   });
 
   test("search() forwards candidateLimit to structured search", async () => {
