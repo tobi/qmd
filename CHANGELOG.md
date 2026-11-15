@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Security: MCP stdio and HTTP startup now enforce project-local config trust
+  before selecting models, ignoring all unapproved model URIs and options,
+  including remote embedding credential environment variable names.
+
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
