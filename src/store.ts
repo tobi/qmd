@@ -1632,7 +1632,7 @@ export type Store = {
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
@@ -2667,12 +2667,12 @@ export function createStore(dbPath?: string): Store {
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
       // store.llm is unset made keys stable across config swaps (#764).
       const llm = getLlm(store);
-      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm);
+      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm, signal);
     },
 
     // Document retrieval
@@ -5372,11 +5372,14 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp, signal?: AbortSignal): Promise<{ file: string; score: number }[]> {
+  signal?.throwIfAborted();
+  // Snapshot cache inputs too: caller mutation during HTTP must not change keys.
+  documents = documents.map(doc => ({ file: doc.file, text: doc.text }));
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
+  // Prefer the LLM instance's resolved identity so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
   const cacheModel = llm.rerankModelName ?? model;
 
@@ -5402,22 +5405,32 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    const callOptions = signal ? { model: cacheModel, signal } : { model: cacheModel };
+    const rerankResult = cacheModel.startsWith("remote-typesafe:")
+      ? await withLLMSessionForLlm(llm, session => session.rerank(rerankQuery, uncachedDocs, callOptions), { signal, name: "rerank" })
+      : await llm.rerank(rerankQuery, uncachedDocs, callOptions);
+    signal?.throwIfAborted();
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
-    }
+    // Complete scores arrive before any writes. Index, not file, identifies a
+    // chunk: two different chunks can have the same file name.
+    db.transaction(() => {
+      for (const result of rerankResult.results) {
+        signal?.throwIfAborted();
+        const chunk = uncachedDocs[result.index]!.text;
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
+      signal?.throwIfAborted();
+    })();
   }
 
-  // Return all results sorted by score
-  return documents
+  // Return all results sorted by score, including a fully cached call.
+  const results = documents
     .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
+  signal?.throwIfAborted();
+  return results;
 }
 
 // =============================================================================
@@ -6244,6 +6257,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
+  signal?: AbortSignal;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6322,6 +6336,8 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6355,12 +6371,15 @@ export async function hybridQuery(
 
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
+  signal?.throwIfAborted();
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
+  signal?.throwIfAborted();
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  signal?.throwIfAborted();
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -6411,8 +6430,11 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    signal?.throwIfAborted();
+    const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+    signal?.throwIfAborted();
     hooks?.onEmbedDone?.(Date.now() - embedStart);
+    signal?.throwIfAborted();
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -6423,6 +6445,7 @@ export async function hybridQuery(
         vecQueries[i]!.text, embedModel, 20, collection,
         undefined, embedding, filter
       );
+      signal?.throwIfAborted();
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
@@ -6443,6 +6466,7 @@ export async function hybridQuery(
   // replays the same misses on every warm repeat. Only judge sub-queries the
   // store could actually run: on FTS-only stores, vec/hyde expansions never
   // execute and say nothing about the expansion's quality.
+  signal?.throwIfAborted();
   if (expanded.length > 0) {
     const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
     const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
@@ -6468,7 +6492,9 @@ export async function hybridQuery(
 
   const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
@@ -6535,7 +6561,9 @@ export async function hybridQuery(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -6549,7 +6577,8 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6614,7 +6643,9 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }
 
 export interface VectorSearchOptions {
@@ -6704,6 +6735,7 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSearchOptions {
+  signal?: AbortSignal;
   collections?: string[];   // Filter to specific collections (OR match)
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6741,6 +6773,8 @@ export async function structuredSearch(
   searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6814,8 +6848,11 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      signal?.throwIfAborted();
+      const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+      signal?.throwIfAborted();
       hooks?.onEmbedDone?.(Date.now() - embedStart);
+      signal?.throwIfAborted();
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -6825,6 +6862,7 @@ export async function structuredSearch(
           vecSearches[i]!.query, embedModel, 20, collections,
           undefined, embedding, filter
         );
+        signal?.throwIfAborted();
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -6852,6 +6890,7 @@ export async function structuredSearch(
   if (candidates.length === 0) return [];
 
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+  signal?.throwIfAborted();
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
@@ -6864,7 +6903,9 @@ export async function structuredSearch(
   const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
@@ -6931,7 +6972,9 @@ export async function structuredSearch(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 5: Rerank chunks
@@ -6945,7 +6988,8 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -7009,5 +7053,7 @@ export async function structuredSearch(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }

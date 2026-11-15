@@ -24,6 +24,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { getConfigDir } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
 import { copyRemoteEmbedOptions, isRemoteEmbedModel, parseRemoteEmbedUri, type RemoteEmbedOptions } from "./remote-embed.js";
+import { copyJevRerankOptions, isJevModel, parseJevModel, type JevRerankOptions } from "./jev.js";
 
 /** A collection's pre-update hook, as it will be executed. */
 export type UpdateHook = {
@@ -42,6 +43,7 @@ export type ModelsSnapshot = {
   embed?: string;
   embedOptions?: RemoteEmbedOptions;
   rerank?: string;
+  rerankOptions?: JevRerankOptions;
   generate?: string;
 };
 
@@ -56,6 +58,7 @@ export type GatedItems = {
   paths: CollectionPath[];
   models: Array<{ slot: ModelSlot; uri: string }>;
   embedOptions?: Readonly<RemoteEmbedOptions>;
+  rerankOptions?: Readonly<JevRerankOptions>;
 };
 
 export type BuiltinModels = Required<Pick<ModelsSnapshot, ModelSlot>>;
@@ -147,6 +150,10 @@ export function gatedModels(
       if (typeof uri !== "string") throw new Error("Embedding model must be a single URI string");
       if (isRemoteEmbedModel(uri)) parseRemoteEmbedUri(uri);
     }
+    if (slot === "rerank") {
+      if (typeof uri !== "string") throw new Error("Rerank model must be a single URI string");
+      if (isJevModel(uri)) parseJevModel(uri);
+    }
     if (uri === builtins[slot]) continue;
     out.push({ slot, uri });
   }
@@ -163,11 +170,12 @@ export function gatedItems(
     paths: snapshot.paths.filter(p => !isCollectionPathInsideProject(configPath, p.path)),
     models: gatedModels(snapshot.models, builtins),
     ...(snapshot.models.embedOptions !== undefined ? { embedOptions: copyRemoteEmbedOptions(snapshot.models.embedOptions) } : {}),
+    ...(snapshot.models.rerankOptions !== undefined ? { rerankOptions: copyJevRerankOptions(snapshot.models.rerankOptions) } : {}),
   };
 }
 
 export function hasGatedItems(gated: GatedItems): boolean {
-  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0 || gated.embedOptions !== undefined;
+  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0 || gated.embedOptions !== undefined || gated.rerankOptions !== undefined;
 }
 
 function byFirst(a: string[], b: string[]): number {
@@ -211,6 +219,7 @@ export function sensitiveDigest(
       .map(m => [m.slot, m.uri] as [string, string])
       .sort(byFirst),
     ...(gated.embedOptions !== undefined ? { embedOptions: gated.embedOptions } : {}),
+    ...(gated.rerankOptions !== undefined ? { rerankOptions: gated.rerankOptions } : {}),
   });
   return createHash("sha256").update(canonical).digest("hex");
 }
