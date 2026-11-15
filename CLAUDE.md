@@ -51,6 +51,10 @@ qmd collection rename mynotes my-notes
 # Show collection details, including the top metadata keys
 qmd collection show mynotes
 
+# Opt into .claude/ and .agents/ directories; omit names to clear
+qmd collection include-dot-dirs mynotes claude agents
+qmd update
+
 # Discover metadata keys and values to filter on
 qmd collection metadata mynotes
 qmd collection metadata mynotes --match '{"field":"key","operator":"eq","value":"topics"}'

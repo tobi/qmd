@@ -322,6 +322,8 @@ qmd update
 qmd embed
 ```
 
+Hidden directories are excluded by default. When the user authorizes indexing them, opt in per collection with `qmd collection include-dot-dirs notes claude agents`, then run `qmd update`. Omit the names to clear the setting and run `qmd update` to remove those documents. Masks and ignore patterns still apply; hidden files remain excluded.
+
 Health and diagnostics:
 
 ```bash

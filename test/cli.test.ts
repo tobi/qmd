@@ -2007,6 +2007,37 @@ describe("CLI Collection Commands", () => {
 // =============================================================================
 
 describe("collection ignore patterns", () => {
+  test("CLI enables, displays, validates, and clears hidden directory opt-in", async () => {
+    const env = await createIsolatedTestEnv("hidden-cli");
+    const collectionDir = join(testDir, "hidden-cli-docs");
+    await mkdir(join(collectionDir, ".claude"), { recursive: true });
+    await writeFile(join(collectionDir, "README.md"), "# Visible");
+    await writeFile(join(collectionDir, ".claude", "public.md"), "# Public instructions");
+    await writeFile(join(collectionDir, ".claude", "private.md"), "# Private instructions");
+    const options = { ...env, cwd: collectionDir };
+    expect((await runQmd(["collection", "add", collectionDir, "--name", "hidden", "--mask", "**/*.md,!**/private.md"], options)).exitCode).toBe(0);
+    expect((await runQmd(["ls", "hidden"], options)).stdout).not.toContain("public.md");
+    expect((await runQmd(["collection", "include-dot-dirs", "hidden", ".claude"], options)).exitCode).toBe(0);
+    const configPath = join(env.configDir, "index.yml");
+    const configured = readFileSync(configPath, "utf8");
+    expect(configured).toContain("includeDotDirs");
+    for (const invalid of ["*", "..", "../claude", "claude/child", "a|b"]) {
+      const rejected = await runQmd(["collection", "include-dot-dirs", "hidden", invalid], options);
+      expect(rejected.exitCode).toBe(1);
+      expect(rejected.stderr).toContain("literal directory names");
+      expect(readFileSync(configPath, "utf8")).toBe(configured);
+    }
+    expect((await runQmd(["update"], options)).exitCode).toBe(0);
+    const listed = await runQmd(["ls", "hidden"], options);
+    expect(listed.stdout).toContain("public.md");
+    expect(listed.stdout).not.toContain("private.md");
+    expect((await runQmd(["collection", "show", "hidden"], options)).stdout).toContain("Include-dot-dirs: .claude");
+    expect((await runQmd(["collection", "list"], options)).stdout).toContain(".claude");
+    expect((await runQmd(["collection", "include-dot-dirs", "hidden"], options)).exitCode).toBe(0);
+    expect((await runQmd(["update"], options)).exitCode).toBe(0);
+    expect((await runQmd(["ls", "hidden"], options)).stdout).not.toContain("public.md");
+  });
+
   let localDbPath: string;
   let localConfigDir: string;
   let ignoreTestDir: string;

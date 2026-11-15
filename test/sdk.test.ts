@@ -832,6 +832,98 @@ describe("index health", () => {
 // =============================================================================
 
 describe("update", () => {
+  for (const mode of ["inline", "yaml", "db"] as const) {
+    test(`hidden directory opt-in survives ${mode} configuration, DB-only reopen, and clearing`, async () => {
+      const collectionDir = await mkdtemp(join(testDir, "hidden-sdk-"));
+      const dbPath = freshDbPath();
+      const configPath = join(collectionDir, "index.yml");
+      const collection = {
+        path: collectionDir,
+        pattern: "**/*.md",
+        includeDotDirs: ["claude", "git", "cache"],
+      };
+      await mkdir(join(collectionDir, ".claude"));
+      await mkdir(join(collectionDir, ".git"));
+      await mkdir(join(collectionDir, ".cache"));
+      await writeFile(join(collectionDir, "README.md"), "# Visible");
+      await writeFile(join(collectionDir, ".claude", "public.md"), "# Hidden instructions");
+      await writeFile(join(collectionDir, ".git", "private.md"), "# Git internals");
+      await writeFile(join(collectionDir, ".cache", "private.md"), "# Cache internals");
+      const config: CollectionConfig = { collections: { hidden: collection } };
+      if (mode === "yaml") await writeFile(configPath, YAML.stringify(config));
+      let store = await createStore({
+        dbPath,
+        ...(mode === "inline" ? { config } : mode === "yaml" ? { configPath } : {}),
+      });
+      try {
+        if (mode === "db") await store.addCollection("hidden", collection);
+        expect((await store.update()).indexed).toBe(2);
+        expect(await store.get("qmd://hidden/.claude/public.md")).not.toHaveProperty("error");
+        await store.close();
+        store = await createStore({ dbPath });
+        expect(store.internal.db.prepare(`SELECT include_dot_dirs FROM store_collections WHERE name = 'hidden'`).get())
+          .toEqual({ include_dot_dirs: JSON.stringify(collection.includeDotDirs) });
+        expect((await store.update()).unchanged).toBe(2);
+        await store.addCollection("hidden", { ...collection, includeDotDirs: [] });
+        expect((await store.update()).removed).toBe(1);
+        expect(await store.get("qmd://hidden/.claude/public.md")).toHaveProperty("error", "not_found");
+      } finally {
+        await store.close();
+      }
+    });
+  }
+
+  test("legacy collection schema resyncs an unchanged config after migration", async () => {
+    const dbPath = freshDbPath();
+    const config: CollectionConfig = {
+      collections: { docs: { path: docsDir, pattern: "**/*.md", includeDotDirs: ["claude"] } },
+    };
+    let store = await createStore({ dbPath, config });
+    store.internal.db.exec("ALTER TABLE store_collections DROP COLUMN include_dot_dirs");
+    expect(store.internal.db.prepare("SELECT value FROM store_config WHERE key = 'config_hash'").get()).toBeTruthy();
+    await store.close();
+    store = await createStore({ dbPath, config });
+    try {
+      expect(store.internal.db.prepare("SELECT include_dot_dirs FROM store_collections WHERE name = 'docs'").get())
+        .toEqual({ include_dot_dirs: '["claude"]' });
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("SDK validates directory names before modifying SQLite or YAML", async () => {
+    const configPath = join(testDir, "hidden-sdk-validation.yml");
+    await writeFile(configPath, "collections: {}\n");
+    const store = await createStore({ dbPath: freshDbPath(), configPath });
+    try {
+      for (const invalid of [["*"], [".claude"], ["../claude"], ["claude/child"], ["claude\\child"], [""], ["a|b"]]) {
+        await expect(store.addCollection("invalid", { path: docsDir, includeDotDirs: invalid }))
+          .rejects.toThrow("literal directory names");
+      }
+      expect(await store.listCollections()).toEqual([]);
+      expect(YAML.parse(readFileSync(configPath, "utf8"))).toEqual({ collections: {} });
+      const widerCollection = {
+        path: docsDir,
+        pattern: "**/*.md",
+        includeDotDirs: ["claude", "claude", "agent notes"],
+        context: { "/": "Unsupported context" },
+        update: "echo unsupported",
+        includeByDefault: false,
+      };
+      await store.addCollection("valid", widerCollection);
+      expect(store.internal.db.prepare("SELECT context, update_command, include_by_default FROM store_collections WHERE name = 'valid'").get())
+        .toEqual({ context: null, update_command: null, include_by_default: 1 });
+      expect(YAML.parse(readFileSync(configPath, "utf8")).collections.valid.includeDotDirs)
+        .toEqual(["claude", "agent notes"]);
+      const invalidYaml = readFileSync(configPath, "utf8").replace("agent notes", "a*");
+      await writeFile(configPath, invalidYaml);
+      const { loadConfig } = await import("../src/collections.js");
+      expect(() => loadConfig()).toThrow("literal directory names");
+    } finally {
+      await store.close();
+    }
+  });
+
   test("indexes files and returns correct stats", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),

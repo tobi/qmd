@@ -53,6 +53,7 @@ import {
   isDocid,
   syncConfigToDb,
   reindexCollection,
+  globCollectionFiles,
   resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
@@ -80,6 +81,7 @@ import {
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 import { LEGACY_VEC_TABLE, VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
+import { getCollection as getCollectionFromYaml } from "../src/collections.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -239,7 +241,7 @@ async function syncTestConfig(): Promise<void> {
 
 // Helper to create a test collection in YAML config
 async function createTestCollection(
-  options: { pwd?: string; glob?: string; name?: string; ignore?: string[] } = {}
+  options: { pwd?: string; glob?: string; name?: string; ignore?: string[]; includeDotDirs?: string[] } = {}
 ): Promise<string> {
   const pwd = options.pwd || "/test/collection";
   const glob = options.glob || "**/*.md";
@@ -256,6 +258,7 @@ async function createTestCollection(
     path: pwd,
     pattern: glob,
     ...(options.ignore ? { ignore: options.ignore } : {}),
+    ...(options.includeDotDirs ? { includeDotDirs: options.includeDotDirs } : {}),
   };
 
   // Write back
@@ -4325,6 +4328,130 @@ describe("Integration", () => {
 
       expect(counts).toEqual({ active: 2, inactive: 3, total: 5 });
       expect(contentCount.count).toBe(5);
+    } finally {
+      await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hidden directory opt-in preserves masks, pruning, and hidden file exclusion", async () => {
+    const collectionDir = await mkdtemp(join(testDir, "dotdir-masks-"));
+    const forbidden = join(collectionDir, ".forbidden");
+    try {
+      for (const path of [
+        "README.md", ".claude/public.md", ".claude/private.md", ".claude/.secret.md", ".a+b/public.md",
+        ".claude/nested/.agents/public.md", ".claude/.forbidden/public.md",
+        "nested/.claude/public.md", "nested/.agents/public.md",
+        ".forbidden/public.md", "visible/.claude",
+        "node_modules/.claude/public.md", ".git/.claude/public.md",
+      ]) {
+        const fullPath = join(collectionDir, path);
+        await mkdir(join(fullPath, ".."), { recursive: true });
+        await writeFile(fullPath, "# Document");
+      }
+      await chmod(forbidden, 0o000);
+      const options = {
+        cwd: collectionDir,
+        includeDotDirs: ["claude", "agents", "a+b"],
+        ignore: ["**/node_modules/**", "**/.git/**"],
+      };
+      expect((await globCollectionFiles("**/*.md,!**/private.md", options)).sort()).toEqual([
+        ".a+b/public.md", ".claude/nested/.agents/public.md", ".claude/public.md", "README.md",
+        "nested/.agents/public.md", "nested/.claude/public.md",
+      ].sort());
+      expect(await globCollectionFiles("README.md", options)).toEqual(["README.md"]);
+      expect(await globCollectionFiles(".claude/*.md", options)).toEqual([
+        ".claude/private.md", ".claude/public.md",
+      ]);
+      expect((await globCollectionFiles("**/*", { ...options, ignore: [...options.ignore, "**/.claude/**"] })).sort()).toEqual([
+        ".a+b/public.md", "README.md", "nested/.agents/public.md",
+      ].sort());
+      expect(await globCollectionFiles("**/*.md", { cwd: collectionDir, ignore: [] })).toEqual(["README.md"]);
+      expect(await globCollectionFiles(".claude/*.md", { cwd: collectionDir, ignore: [] })).toEqual([]);
+      await expect(globCollectionFiles("**/*.md", { ...options, includeDotDirs: ["*"] })).rejects.toThrow("literal directory names");
+      await expect(globCollectionFiles("**/*.md", { ...options, includeDotDirs: Array(1) })).rejects.toThrow("literal directory names");
+    } finally {
+      await chmod(forbidden, 0o755);
+      await rm(collectionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("reindexCollection indexes .claude/ only for collections configured with includeDotDirs", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "dotdir-regression-"));
+    const collectionName = "dotdir-regression-configured";
+
+    try {
+      await writeFile(join(collectionDir, "README.md"), "# Top-level doc");
+
+      // Would-be allow-listed dir: only indexed once a collection opts in via config.
+      await mkdir(join(collectionDir, ".claude"), { recursive: true });
+      await writeFile(join(collectionDir, ".claude", "CLAUDE.md"), "# Root project instructions");
+      await mkdir(join(collectionDir, "nested", ".claude"), { recursive: true });
+      await writeFile(join(collectionDir, "nested", ".claude", "CLAUDE.md"), "# Nested project instructions");
+
+      // Never allow-listed: must stay excluded regardless of config.
+      await mkdir(join(collectionDir, ".venv", "site-packages"), { recursive: true });
+      await writeFile(join(collectionDir, ".venv", "site-packages", "README.md"), "# Vendored package doc");
+      await mkdir(join(collectionDir, ".git"), { recursive: true });
+      await writeFile(join(collectionDir, ".git", "COMMIT_EDITMSG.md"), "# Not a real doc");
+
+      // Configure this collection's YAML entry with includeDotDirs: ["claude"] — the same
+      // config field `qmd collection include-dot-dirs <name> claude` writes, and the same
+      // field updateCollections() reads via `yamlCol?.includeDotDirs` on `qmd update`.
+      await createTestCollection({
+        pwd: collectionDir,
+        glob: "**/*.md",
+        name: collectionName,
+        includeDotDirs: ["claude"],
+      });
+      const yamlColl = getCollectionFromYaml(collectionName);
+      expect(yamlColl?.includeDotDirs).toEqual(["claude"]);
+
+      const result = await reindexCollection(store, collectionDir, "**/*.md", collectionName, {
+        includeDotDirs: yamlColl?.includeDotDirs,
+      });
+      expect(result.indexed).toBe(3);
+
+      const docs = store.db.prepare(`SELECT doc FROM content`).all() as { doc: string }[];
+      const bodies = docs.map(d => d.doc);
+
+      expect(bodies).toContain("# Top-level doc");
+      expect(bodies).toContain("# Root project instructions");
+      expect(bodies).toContain("# Nested project instructions");
+      expect(bodies).not.toContain("# Vendored package doc");
+      expect(bodies).not.toContain("# Not a real doc");
+    } finally {
+      await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("reindexCollection still excludes .claude/ for a collection with no includeDotDirs configured", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "dotdir-regression-"));
+    const collectionName = "dotdir-regression-unconfigured";
+
+    try {
+      await writeFile(join(collectionDir, "README.md"), "# Top-level doc");
+      await mkdir(join(collectionDir, ".claude"), { recursive: true });
+      await writeFile(join(collectionDir, ".claude", "CLAUDE.md"), "# Root project instructions");
+
+      // No includeDotDirs set — this is the default for every existing collection.
+      await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+      const yamlColl = getCollectionFromYaml(collectionName);
+      expect(yamlColl?.includeDotDirs).toBeUndefined();
+
+      const result = await reindexCollection(store, collectionDir, "**/*.md", collectionName, {
+        includeDotDirs: yamlColl?.includeDotDirs,
+      });
+      expect(result.indexed).toBe(1);
+
+      const docs = store.db.prepare(`SELECT doc FROM content`).all() as { doc: string }[];
+      const bodies = docs.map(d => d.doc);
+
+      expect(bodies).toContain("# Top-level doc");
+      expect(bodies).not.toContain("# Root project instructions");
     } finally {
       await rm(collectionDir, { recursive: true, force: true });
       await cleanupTestDb(store);

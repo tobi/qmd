@@ -71,6 +71,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { parseIncludeDotDirs } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
@@ -1320,6 +1321,7 @@ function initializeDatabase(db: Database): void {
       path TEXT NOT NULL,
       pattern TEXT NOT NULL DEFAULT '**/*.md',
       ignore_patterns TEXT,
+      include_dot_dirs TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
       context TEXT
@@ -1333,6 +1335,18 @@ function initializeDatabase(db: Database): void {
       value TEXT
     )
   `);
+
+  const hasIncludeDotDirs = () => db.prepare(
+    `SELECT 1 FROM pragma_table_info('store_collections') WHERE name = 'include_dot_dirs'`
+  ).get() != null;
+  if (!hasIncludeDotDirs()) {
+    db.transaction(() => {
+      if (hasIncludeDotDirs()) return;
+      db.exec(`ALTER TABLE store_collections ADD COLUMN include_dot_dirs TEXT`);
+      // WHY: Older stores hashed this option without persisting it; resync unchanged configs.
+      db.exec(`DELETE FROM store_config WHERE key = 'config_hash'`);
+    }).immediate();
+  }
 
   // File sync state — mtime+size fast-path.
   // Inspired by qmd-py incremental sync.
@@ -1371,6 +1385,7 @@ type StoreCollectionRow = {
   path: string;
   pattern: string;
   ignore_patterns: string | null;
+  include_dot_dirs: string | null;
   include_by_default: number;
   update_command: string | null;
   context: string | null;
@@ -1382,6 +1397,7 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
+    ...(row.include_dot_dirs ? { includeDotDirs: parseIncludeDotDirs(JSON.parse(row.include_dot_dirs)) } : {}),
     ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
@@ -1427,13 +1443,15 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 }
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  const includeDotDirs = parseIncludeDotDirs(collection.includeDotDirs);
   db.prepare(`
-    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_dot_dirs, include_by_default, update_command, context)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       path = excluded.path,
       pattern = excluded.pattern,
       ignore_patterns = excluded.ignore_patterns,
+      include_dot_dirs = excluded.include_dot_dirs,
       include_by_default = excluded.include_by_default,
       update_command = excluded.update_command,
       context = excluded.context
@@ -1442,6 +1460,7 @@ export function upsertStoreCollection(db: Database, name: string, collection: Om
     collection.path,
     collection.pattern || '**/*.md',
     collection.ignore ? JSON.stringify(collection.ignore) : null,
+    includeDotDirs.length ? JSON.stringify(includeDotDirs) : null,
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
     collection.context ? JSON.stringify(collection.context) : null,
@@ -1501,6 +1520,9 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
  * External config always wins. Skips sync if config hash hasn't changed.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  for (const collection of Object.values(config.collections)) {
+    parseIncludeDotDirs(collection.includeDotDirs);
+  }
   // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
@@ -1833,6 +1855,33 @@ export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: numb
 }
 
 /**
+ * Apply collection-relative masks while pruning unapproved hidden directories.
+ * Hidden files stay excluded even when their basename matches an allowed directory.
+ */
+export async function globCollectionFiles(
+  globPattern: string,
+  options: { cwd: string; ignore: string[]; includeDotDirs?: string[] }
+): Promise<string[]> {
+  const { cwd, ignore } = options;
+  const includeDotDirs = parseIncludeDotDirs(options.includeDotDirs);
+  const alternatives = includeDotDirs.map(name => name.replace(/\+/g, "\\+")).join("|");
+  // WHY: The trailing /** prunes excluded trees before traversal, including explicit masks.
+  const hiddenDirectoryIgnore = includeDotDirs.length
+    ? `**/.!(${alternatives})/**`
+    : "**/.@(*)/**";
+  const files = await fastGlob(splitGlobMask(globPattern), {
+    cwd, onlyFiles: true, followSymbolicLinks: false,
+    dot: includeDotDirs.length > 0,
+    ignore: [...ignore, hiddenDirectoryIgnore],
+  });
+  return files.filter(file => {
+    const parts = file.split("/");
+    return !parts.pop()!.startsWith(".") &&
+      !parts.some(part => part.startsWith(".") && !includeDotDirs.includes(part.slice(1)));
+  });
+}
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
  * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.
@@ -1848,6 +1897,7 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    includeDotDirs?: string[];
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1870,6 +1920,7 @@ async function reindexCollectionIn(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    includeDotDirs?: string[];
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1881,7 +1932,6 @@ async function reindexCollectionIn(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
-
   // A missing root (unmounted drive, offline share, deleted folder) globs to
   // an empty list, which the deactivation pass below would read as "every
   // file was deleted". Leave the index alone and report the root instead.
@@ -1901,17 +1951,10 @@ async function reindexCollectionIn(
     };
   }
 
-  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
+  const files = await globCollectionFiles(globPattern, {
     cwd: collectionPath,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
     ignore: allIgnore,
-  });
-  // Filter hidden files/folders
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
+    includeDotDirs: options?.includeDotDirs,
   });
 
   const total = files.length;

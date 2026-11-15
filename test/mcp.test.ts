@@ -115,6 +115,7 @@ function initTestDatabase(db: Database): void {
       path TEXT NOT NULL,
       pattern TEXT NOT NULL DEFAULT '**/*.md',
       ignore_patterns TEXT,
+      include_dot_dirs TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
       context TEXT
@@ -1163,6 +1164,8 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const firstInstructions = first.result.instructions;
     expect(typeof firstInstructions).toBe("string");
     expect(firstInstructions.length).toBeGreaterThan(0);
+    expect(firstInstructions).toContain("qmd collection include-dot-dirs <collection> claude");
+    expect(firstInstructions).toContain("If the user authorizes");
 
     // Change the index under the server. HTTP builds a fresh McpServer per
     // request, so without the cache the next initialize rebuilds the

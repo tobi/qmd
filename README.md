@@ -670,7 +670,17 @@ qmd collection exclude notes
 # Run a command before every `qmd update` (e.g. git pull); empty arg clears it
 qmd collection update-cmd notes 'git pull --rebase'
 qmd collection update-cmd notes
+
+# Include .claude/ and .agents/ directories, then apply the setting
+qmd collection include-dot-dirs myproject claude agents
+qmd update
+
+# Clear the setting; the next update removes those hidden documents
+qmd collection include-dot-dirs myproject
+qmd update
 ```
+
+Hidden directories are excluded by default. `include-dot-dirs` opts a collection into literal directory names at any depth; a leading dot is optional in the CLI. Hidden files remain excluded, and collection masks, ignore patterns, and built-in exclusions still apply. The SDK accepts the same names without leading dots through `Collection.includeDotDirs` or `addCollection(..., { includeDotDirs: ["claude"] })`.
 
 ### Generate Vector Embeddings
 
@@ -771,6 +781,7 @@ collections:
       - "**/drafts/**"
     update: "git pull --rebase"  # bash command run before each `qmd update`
     includeByDefault: true       # include in unscoped queries (default: true)
+    includeDotDirs: ["claude"]    # index .claude/ directories (default: none)
     context:                     # path prefix → description; longest match wins
       "/": "Personal notes and ideas"
       "/work": "Work-related notes"
@@ -786,11 +797,10 @@ collections:
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
+| `collections.<name>.includeDotDirs` | per-collection | Hidden directory names to index, without leading dots or glob syntax. Set via `qmd collection include-dot-dirs`. Default `[]`; hidden files stay excluded. |
 | `collections.<name>.context` | per-collection | Path-prefix → description map; the most specific (longest) matching prefix wins. Set via `qmd context add`. |
 
-> **Note:** Editing `index.yml` changes which directories and models QMD *uses*,
-> but does not re-index on its own. Run `qmd update` after changing `path`,
-> `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
+> **Note:** Editing `index.yml` changes which directories and models QMD *uses*, but does not re-index on its own. Run `qmd update` after changing `path`, `pattern`, `ignore`, or `includeDotDirs`, and `qmd embed` after changing `models.embed`.
 
 #### Automatic update commands
 
