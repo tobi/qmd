@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, unlinkSync, renameSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import YAML from "yaml";
 import { createStore, createCommandProcessor, type DocumentProcessor, type ProcessorInput, type ProcessorDocument } from "../src/index.js";
 import { reindexCollection } from "../src/store.js";
@@ -214,9 +214,29 @@ test("processor validation is bounded and rejects whole results; command adapter
     expect(() => validateProcessorDocuments([{ key: "a.md", markdown: "a" }, { key: "a.md", markdown: "b" }])).toThrow();
     expect(() => validateProcessorDocuments(Array.from({ length: 1001 }, (_, n) => ({ key: `${n}.md`, markdown: "" })))).toThrow();
     expect(() => validateProcessorDocuments([{ key: "a.md", markdown: "a".repeat(16 * 1024 * 1024 + 1) }])).toThrow();
-    const source = `let s='';process.stdin.on('data',b=>s+=b);process.stdin.on('end',()=>{const i=JSON.parse(s);if(Object.keys(process.env).some(k=>!['PATH','HOME','LANG'].includes(k))||i.source.contentBase64!==''||i.source.path!=='empty.bin')process.exit(2);process.stdout.write(JSON.stringify({version:1,documents:[{key:'empty.md',markdown:'# Empty'}]}))})`;
+    // macOS may inject CoreFoundation metadata into a clean child's environment.
+    // Compare with the same runtime launched directly with only the allowed keys,
+    // rather than mistaking runtime additions for inherited parent credentials.
+    const baseline = spawnSync(process.execPath, ["-e", "console.log(JSON.stringify(Object.keys(process.env).sort()))"], {
+      cwd: f.docs, env: { PATH: process.env.PATH, HOME: f.docs, LANG: "C.UTF-8" }, encoding: "utf8", timeout: 10000,
+    });
+    expect(baseline.error).toBeUndefined();
+    expect(baseline.status).toBe(0);
+    const environmentNames = JSON.parse(baseline.stdout) as string[];
+    const source = `let s='';process.stdin.on('data',b=>s+=b);process.stdin.on('end',()=>{const i=JSON.parse(s);process.stdout.write(JSON.stringify({version:1,documents:[{key:'empty.md',markdown:JSON.stringify({environmentNames:Object.keys(process.env).sort(),contentBase64:i.source.contentBase64,path:i.source.path})}]}))})`;
     const processor = createCommandProcessor({ command: [process.execPath, "-e", source], version: "v1" }, { cwd: f.docs });
-    expect(await executeProcessor(processor, input)).toEqual([{ key: "empty.md", markdown: "# Empty" }]);
+    const parentOnly = process.env.QMD_TEST_PROCESSOR_PARENT_ONLY;
+    process.env.QMD_TEST_PROCESSOR_PARENT_ONLY = "synthetic-not-inherited";
+    try {
+      const documents = await executeProcessor(processor, input);
+      expect(documents).toHaveLength(1);
+      expect(documents[0]!.key).toBe("empty.md");
+      expect(JSON.parse(documents[0]!.markdown)).toEqual({ environmentNames, contentBase64: "", path: "empty.bin" });
+      expect(environmentNames).not.toContain("QMD_TEST_PROCESSOR_PARENT_ONLY");
+    } finally {
+      if (parentOnly === undefined) delete process.env.QMD_TEST_PROCESSOR_PARENT_ONLY;
+      else process.env.QMD_TEST_PROCESSOR_PARENT_ONLY = parentOnly;
+    }
     const normalized = copyCommandProcessorSpec({ command: ["node"], version: "v1" });
     expect(Object.isFrozen(normalized.command)).toBe(true);
     expect(normalized.timeoutMs).toBe(10000);
