@@ -932,13 +932,18 @@ export class CollectionConfigScope {
     name: string,
     path: string,
     pattern: string = "**/*.md",
-    mirror?: ConfigMirror,
+    options?: ConfigMirror | AddCollectionSettings,
   ): void {
+    const settings = typeof options === "function" ? undefined : options;
+    const mirror = typeof options === "function" ? options : undefined;
     this.mutateConfig((config) => {
       config.collections[name] = {
         path,
         pattern,
-        context: config.collections[name]?.context, // Preserve existing context
+        // Preserve existing context unless the caller provides one.
+        context: settings?.context ?? config.collections[name]?.context,
+        ...(settings?.ignore && settings.ignore.length > 0 ? { ignore: settings.ignore } : {}),
+        ...(settings?.includeByDefault === false ? { includeByDefault: false } : {}),
       };
       return { value: undefined, changed: true };
     }, mirror, { kind: "names", names: [name] });
@@ -1399,14 +1404,31 @@ export function updateCollectionSettings(
   return defaultScope.updateCollectionSettings(name, settings);
 }
 
-/** Add or update a collection in the default scope. */
+/**
+ * Optional settings when adding a collection.
+ * Used by `qmd setup-collection` to apply context, ignore patterns, and
+ * default inclusion at creation time, before the first index pass.
+ */
+export interface AddCollectionSettings {
+  context?: ContextMap;        // Context definitions (e.g., { "/": "..." })
+  ignore?: string[];           // Glob patterns to exclude from indexing
+  includeByDefault?: boolean;  // Include in default queries (default: true)
+}
+
+/**
+ * Add or update a collection
+ *
+ * The optional `settings` argument lets callers apply a root context, ignore
+ * patterns, and default inclusion in the same write. Existing callers that
+ * pass only (name, path, pattern) keep their exact behavior.
+ */
 export function addCollection(
   name: string,
   path: string,
   pattern: string = "**/*.md",
-  mirror?: ConfigMirror,
+  options?: ConfigMirror | AddCollectionSettings,
 ): void {
-  defaultScope.addCollection(name, path, pattern, mirror);
+  defaultScope.addCollection(name, path, pattern, options);
 }
 
 /** Remove a collection from the default scope. */
