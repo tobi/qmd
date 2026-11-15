@@ -108,6 +108,7 @@ import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
 import { RemoteEmbedder, isRemoteEmbedModel } from "../remote-embed.js";
+import { JevReranker, isJevModel } from "../jev.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -191,6 +192,7 @@ function getStore(): ReturnType<typeof createStore> {
       embedOptions: trusted ? config.models?.embedOptions : undefined,
       generateModel: modelsForLlm.generate,
       rerankModel: modelsForLlm.rerank,
+      rerankOptions: trusted ? config.models?.rerankOptions : undefined,
     });
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB.
@@ -696,7 +698,7 @@ async function showStatus(): Promise<void> {
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
     console.log(`  Embedding:   ${isRemoteEmbedModel(activeModels.embed) ? "configured remote (not probed; no local download)" : hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
+    console.log(`  Reranking:   ${isJevModel(activeModels.rerank) ? "configured remote TypeSafe (not probed; no local download)" : hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
@@ -766,6 +768,7 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       embed: config.models?.embed,
       embedOptions: config.models?.embedOptions,
       rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
       generate: config.models?.generate,
     },
   };
@@ -810,6 +813,9 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 function printGatedItems(gated: GatedItems): void {
+  if (gated.rerankOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote rerank options (revision/credential variable name)${c.reset}`);
+  }
   if (gated.embedOptions !== undefined) {
     console.log(`${c.yellow}Custom remote embedding options (dimensions/revision/credential variable name)${c.reset}`);
   }
@@ -2364,6 +2370,8 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   // Invalid remote selection must fail closed, never fall back to local ML.
   if (isRemoteEmbedModel(models.embed)) new RemoteEmbedder(models.embed, current.embedOptions);
   else if (current.embedOptions !== undefined) throw new Error("embedOptions requires a remote embedding URI");
+  if (isJevModel(models.rerank)) new JevReranker(models.rerank, current.rerankOptions);
+  else if (current.rerankOptions !== undefined) throw new Error("rerankOptions requires a typesafe: rerank model");
   if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
     saveConfig({
       ...config,
@@ -4224,6 +4232,10 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (role === "reranking" && isJevModel(model)) {
+      doctorCheck("rerank configuration", true, "configured remote TypeSafe (not probed; no local download)");
+      continue;
+    }
     if (role === "embedding" && isRemoteEmbedModel(model)) {
       doctorCheck("embedding configuration", true, "configured remote (not probed; no local download)");
       continue;
@@ -5021,6 +5033,7 @@ if (isMain) {
         activeModels.rerank,
       ];
       if (isRemoteEmbedModel(activeModels.embed)) console.log("Embedding: configured remote; no local download (not probed)");
+      if (isJevModel(activeModels.rerank)) console.log("Reranking: configured remote TypeSafe; no local download (not probed)");
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,

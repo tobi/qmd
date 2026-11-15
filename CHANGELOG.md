@@ -17,6 +17,14 @@
 
 ### Added
 
+- Optional TypeSafe System One reranking through `models.rerank: typesafe:<model>`
+  and copied per-store `rerankOptions` (revision and credential variable name).
+  Independent per-document scores use bounded two-worker HTTP, caller/session
+  cancellation and revision-specific cache identities, without a local reranker.
+  Public SDK search accepts a signal; duplicate-file chunks cache by result index.
+  Status/doctor do not probe the remote service; pull skips its download.
+  Local models and cache keys are unchanged. Adapted from #1014
+  (thanks @caseymanos).
 - Explicit OpenAI-compatible remote embeddings through `models.embed` API-base
   URIs (`http[s]://host/v1#model-id`), with bounded requests/responses,
   caller/session cancellation and opt-in credential environment variable names.

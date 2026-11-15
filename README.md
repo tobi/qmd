@@ -644,8 +644,9 @@ qmd query 'vec: your semantic query' --no-rerank
 ```
 
 `qmd search` remains lexical. Ordinary free-text `query` and `vsearch` still use
-local query expansion, and reranking is still local: remote embeddings do not
-replace those models. `qmd pull` skips the remote embedding role but still pulls
+local query expansion. Reranking uses its separately selected model (local by
+default; see [TypeSafe System One](#remote-reranking-with-typesafe-system-one)).
+Remote embeddings do not replace those models. `qmd pull` skips the remote embedding role but still pulls
 local generation/reranking models. `status` and `doctor` describe remote embedding
 as configured, **not verified**; they do not probe the server or download/load an
 embedding model. Doctor also skips its native device probe in this mode.
@@ -877,8 +878,9 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | GGUF URIs overriding the built-in defaults per role. `embed` also accepts one HTTP API-base URI with `#model-id`; see [Remote Embeddings](#remote-embeddings). |
+| `models.embed` / `.rerank` / `.generate` | top-level | GGUF URIs overriding the built-in defaults per role. `embed` also accepts one HTTP API-base URI with `#model-id`; see [Remote Embeddings](#remote-embeddings). `rerank` also accepts `typesafe:<model>`; see [TypeSafe System One](#remote-reranking-with-typesafe-system-one). |
 | `models.embedOptions` | top-level | Remote-only `dimensions`, `revision`, and `apiKeyEnv` (environment variable name, never a key). |
+| `models.rerankOptions` | top-level | TypeSafe-only `revision` and `apiKeyEnv` (default variable name `TYPESAFE_API_KEY`). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
@@ -1675,6 +1677,91 @@ Override them per-role without touching source via the `models:` block in
 ### Qwen3-Reranker
 
 Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+
+### Remote reranking with TypeSafe System One
+
+Select `typesafe:<model>` to score each candidate chunk independently through
+TypeSafe's fixed `https://api.typesafe.ai/v1/systemone` endpoint instead of loading
+a local reranker. There is no configurable endpoint, model discovery, local
+fallback or retry. Embeddings and query expansion keep their own selections.
+
+```yaml
+models:
+  rerank: "typesafe:jev-latest"
+  rerankOptions:
+    revision: "deployment-v1"      # optional, nonempty string, at most 256 characters
+    apiKeyEnv: TYPESAFE_API_KEY     # optional variable NAME; this is also the default
+```
+
+Set the named credential in the process environment, never in YAML. Explicit
+TypeSafe selection requires a credential: a missing/invalid named variable fails
+before HTTP, with no fallback to another environment variable. `apiKeyEnv` accepts
+`[A-Za-z_][A-Za-z0-9_]{0,127}`. Unknown options are rejected. Model/revision strings
+must be well-formed, bounded and free of control characters. Options are copied
+and frozen per store; changing their revision or credential variable name re-arms
+project-local `qmd trust` approval. Credential values never enter cache identities,
+status, diagnostics or errors.
+
+The SDK accepts the same model config. For retrieval without local query expansion,
+use pre-expanded queries (also available as `qmd query 'vec: your query'`):
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: {
+    collections: { docs: { path: '/path/to/docs', pattern: '**/*.md' } },
+    models: {
+      embed: 'http://localhost:1234/v1#my-embedding-model',
+      rerank: 'typesafe:jev-latest',
+      rerankOptions: { revision: 'deployment-v1' }
+    }
+  }
+})
+await store.update()
+await store.embed()
+const controller = new AbortController()
+const results = await store.search({
+  queries: [{ type: 'vec', query: 'your semantic query' }],
+  signal: controller.signal
+})
+await store.close()
+```
+
+`SearchOptions.signal` cancels remote embedding and rerank stages, including queued
+requests and fully cached reranks. Existing local inference may finish before
+cancellation is observed. The standalone `JevReranker` export also accepts these
+model/options and a caller signal on `rerank(query, documents, signal)`.
+
+Each document produces its own request: `model`, `state: { query, document }`
+(with `document_title` if supplied), and one `questions.relevant` noul question:
+"Does the document contain information that answers or directly addresses the
+search query?" File identifiers are not sent. Responses must be valid UTF-8 JSON
+with a finite `answers.relevant.noul` score in 0..1, including zero; an optional
+returned model must match the requested model. No normalization or score-zero
+rescue is applied. Results preserve original indexes and sort stably by score.
+
+The opaque `remote-typesafe:<sha256>` rerank identity pins the fixed endpoint,
+model, revision and prompt format. Scores stay independently cached by query and
+chunk text, even for different chunks sharing a file name. Other models/revisions
+cannot reuse them. Credentials are excluded; change `revision` when changing an
+account or deployment's scoring semantics. Local model cache keys are unchanged.
+
+A call has at most two in-flight requests, 64 documents and 2 MiB of aggregate
+encoded request JSON. Queries are limited to 64 KiB UTF-8, titles to 8 KiB and
+logical file identifiers to 4 KiB; input is refused, never silently truncated.
+The whole call, including its queue, has a 30-second deadline combined with
+caller/session cancellation. Each HTTP request also uses the shared byte/stream
+bounds (2 MiB request, 8 MiB response). Failure stops dispatch, aborts and drains
+in-flight work, and returns no partial scores or new score-cache rows.
+
+**These are resource bounds, not a spending cap.** The service can bill per sent
+document; cancellation cannot retract requests already sent. `status` and `doctor`
+report configured remote reranking, not a verified working service, without probes
+or local reranker downloads. `pull` skips this role but still downloads selected
+local models. Remote rerank selection alone does not skip local embedding device
+checks. Free-text query expansion remains local unless bypassed with typed queries.
 
 ### Qwen3 (Query Expansion)
 

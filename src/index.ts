@@ -72,6 +72,8 @@ import {
 } from "./llm.js";
 export { RemoteEmbedder } from "./remote-embed.js";
 export type { RemoteEmbedOptions } from "./remote-embed.js";
+export { JevReranker } from "./jev.js";
+export type { JevRerankOptions } from "./jev.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -221,6 +223,8 @@ export type UpdateResult = {
  * Options for the unified search() method.
  */
 export interface SearchOptions {
+  /** Cancels remote embedding/rerank stages; local generation may finish before cancellation is observed. */
+  signal?: AbortSignal;
   /** Simple query string — will be auto-expanded via LLM */
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
@@ -476,6 +480,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     embedOptions: config?.models?.embedOptions,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    rerankOptions: config?.models?.rerankOptions,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
@@ -490,6 +495,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Search
     search: async (opts) => {
+      opts.signal?.throwIfAborted();
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -507,6 +513,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
+          signal: opts.signal,
           collections: collections.length > 0 ? collections : undefined,
           filter,
           limit: opts.limit,
@@ -521,6 +528,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
+        signal: opts.signal,
         collection: collections.length > 0 ? collections : undefined,
         filter,
         limit: opts.limit,
