@@ -4,7 +4,7 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { createStore, RemoteEmbedder, type CollectionConfig } from "../src/index.js";
+import { createStore, JevReranker, RemoteEmbedder, type CollectionConfig } from "../src/index.js";
 import { findLocalConfigPath, loadConfig, setConfigSource } from "../src/collections.js";
 import {
   DEFAULT_EMBED_MODEL_URI,
@@ -77,7 +77,8 @@ beforeEach(async () => {
     models: {
       embed: "https://mcp-embedding.invalid/v1#synthetic-model",
       embedOptions: { apiKeyEnv: "QMD_TEST_MCP_CREDENTIAL", dimensions: 2, revision: "fixture-v1" },
-      rerank: "hf:synthetic/mcp-reranker/model.gguf",
+      rerank: "typesafe:synthetic-mcp-reranker",
+      rerankOptions: { apiKeyEnv: "QMD_TEST_MCP_CREDENTIAL", revision: "fixture-v1" },
       generate: "hf:synthetic/mcp-generator/model.gguf",
     },
   };
@@ -144,10 +145,19 @@ describe("MCP startup config trust (also runs in CI)", () => {
     recordTrust(configPath, sensitiveDigest(snapshot(), configPath, builtins));
     expect(await startAndStop()).toEqual({
       embed: new RemoteEmbedder(config.models!.embed!, config.models!.embedOptions).modelName,
-      rerank: config.models!.rerank,
+      rerank: new JevReranker(config.models!.rerank!, config.models!.rerankOptions).modelName,
       generate: config.models!.generate,
     });
     config.models!.embedOptions!.apiKeyEnv = "QMD_TEST_MCP_OTHER_CREDENTIAL";
+    writeConfig();
+    expect(await startAndStop()).toEqual(builtins);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  test("changing only rerank credential options invalidates approval", async () => {
+    recordTrust(configPath, sensitiveDigest(snapshot(), configPath, builtins));
+    expect((await startAndStop()).rerank).toBe(new JevReranker(config.models!.rerank!, config.models!.rerankOptions).modelName);
+    config.models!.rerankOptions!.apiKeyEnv = "QMD_TEST_MCP_OTHER_CREDENTIAL";
     writeConfig();
     expect(await startAndStop()).toEqual(builtins);
     expect(globalThis.fetch).not.toHaveBeenCalled();
@@ -183,7 +193,7 @@ describe("MCP startup config trust (also runs in CI)", () => {
     setConfigSource({ configPath });
     expect(await startAndStop()).toEqual({
       embed: new RemoteEmbedder(config.models!.embed!, config.models!.embedOptions).modelName,
-      rerank: config.models!.rerank,
+      rerank: new JevReranker(config.models!.rerank!, config.models!.rerankOptions).modelName,
       generate: config.models!.generate,
     });
   });

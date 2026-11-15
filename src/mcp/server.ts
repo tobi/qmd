@@ -1025,6 +1025,7 @@ async function createMcpStore(options: McpStartupOptions): Promise<QMDStore> {
       embed: config.models?.embed,
       embedOptions: config.models?.embedOptions,
       rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
       generate: config.models?.generate,
     },
   };
