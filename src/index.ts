@@ -35,6 +35,8 @@ import {
   upsertStoreCollection,
   deleteStoreCollection,
   renameStoreCollection,
+  removeCollection as removeIndexedCollection,
+  renameCollection as renameIndexedCollection,
   updateStoreContext,
   removeStoreContext,
   setStoreGlobalContext,
@@ -68,7 +70,16 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  withLLMSessionForLlm,
 } from "./llm.js";
+export { RemoteEmbedder } from "./remote-embed.js";
+export type { RemoteEmbedOptions } from "./remote-embed.js";
+export { JevReranker } from "./jev.js";
+export type { JevRerankOptions } from "./jev.js";
+export { createCommandProcessor } from "./processors.js";
+export type { DocumentProcessor, ProcessorInput, ProcessorDocument, CommandProcessorSpec } from "./processors.js";
+import { snapshotProcessor, type DocumentProcessor } from "./processors.js";
+import { requireProcessor, hasProcessorMode } from "./processor-store.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -218,6 +229,8 @@ export type UpdateResult = {
  * Options for the unified search() method.
  */
 export interface SearchOptions {
+  /** Cancels remote embedding/rerank stages; local generation may finish before cancellation is observed. */
+  signal?: AbortSignal;
   /** Simple query string — will be auto-expanded via LLM */
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
@@ -258,6 +271,7 @@ export interface LexSearchOptions {
  * Options for searchVector() — vector similarity search.
  */
 export interface VectorSearchOptions {
+  signal?: AbortSignal;
   limit?: number;
   collection?: string | string[];
   /** Metadata filter — every returned result satisfies it */
@@ -385,12 +399,15 @@ export interface QMDStore {
 
   /** Re-index collections by scanning the filesystem */
   update(options?: {
+    processors?: Record<string, DocumentProcessor>;
+    signal?: AbortSignal;
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
 
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
+    signal?: AbortSignal;
     force?: boolean;
     model?: string;
     /** Restrict embedding to documents in one collection. */
@@ -448,25 +465,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
-  // Create the internal store (opens DB, creates tables)
-  const internal = createStoreInternal(options.dbPath);
-  const db = internal.db;
-
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
-  // Sync config into SQLite store_collections
+  // Resolve and validate model selection before opening SQLite.
   let config: CollectionConfig | undefined;
   if (options.configPath) {
-    // YAML mode: inject config source for write-through, sync to DB
+    // YAML mode: inject config source for write-through.
     setConfigSource({ configPath: options.configPath });
     config = loadConfig();
-    syncConfigToDb(db, config);
   } else if (options.config) {
-    // Inline config mode: inject config source for mutations, sync to DB
+    // Inline config mode: inject config source for mutations.
     setConfigSource({ config: options.config });
     config = options.config;
-    syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
 
@@ -474,11 +485,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // auto-unloads after 5 min inactivity to free VRAM.
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
+    embedOptions: config?.models?.embedOptions,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    rerankOptions: config?.models?.rerankOptions,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
+  const internal = createStoreInternal(options.dbPath);
+  const db = internal.db;
+  if (config) syncConfigToDb(db, config);
   internal.llm = llm;
 
   const store: QMDStore = {
@@ -487,6 +503,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Search
     search: async (opts) => {
+      opts.signal?.throwIfAborted();
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -504,6 +521,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
+          signal: opts.signal,
           collections: collections.length > 0 ? collections : undefined,
           filter,
           limit: opts.limit,
@@ -518,6 +536,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
+        signal: opts.signal,
         collection: collections.length > 0 ? collections : undefined,
         filter,
         limit: opts.limit,
@@ -535,7 +554,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+      return withLLMSessionForLlm(llm, session =>
+        internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, session, undefined, filter),
+        { signal: opts?.signal, name: "searchVector" });
     },
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
@@ -554,14 +575,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       }
     },
     removeCollection: async (name) => {
-      const result = deleteStoreCollection(db, name);
+      const processed = hasProcessorMode(db, name) || !!getStoreCollection(db, name)?.processor;
+      const result = processed ? !!getStoreCollection(db, name) : deleteStoreCollection(db, name);
+      if (processed) removeIndexedCollection(db, name);
       if (hasYamlConfig || options.config) {
         collectionsRemoveCollection(name);
       }
       return result;
     },
     renameCollection: async (oldName, newName) => {
-      const result = renameStoreCollection(db, oldName, newName);
+      const processed = hasProcessorMode(db, oldName) || !!getStoreCollection(db, oldName)?.processor;
+      const result = processed ? !!getStoreCollection(db, oldName) : renameStoreCollection(db, oldName, newName);
+      if (processed) renameIndexedCollection(db, oldName, newName);
       if (hasYamlConfig || options.config) {
         collectionsRenameCollection(oldName, newName);
       }
@@ -609,13 +634,21 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
 
+      const prepared = filtered.map(col => {
+        const registered = updateOpts?.processors?.[col.name];
+        const processor = registered ? snapshotProcessor(registered) : undefined;
+        requireProcessor(db, col.name, !!col.processor, processor);
+        return { col, processor };
+      });
       internal.clearCache();
 
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
-      for (const col of filtered) {
+      for (const { col, processor } of prepared) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          processor,
+          signal: updateOpts?.signal,
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,
@@ -651,6 +684,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     embed: async (embedOpts) => {
       return generateEmbeddings(internal, {
+        signal: embedOpts?.signal,
         force: embedOpts?.force,
         model: embedOpts?.model,
         collection: embedOpts?.collection,

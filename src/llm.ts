@@ -78,6 +78,8 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 import { createRequire } from "node:module";
+import { RemoteEmbedder, isRemoteEmbedModel, type RemoteEmbedOptions } from "./remote-embed.js";
+import { JevReranker, isJevModel, type JevRerankOptions } from "./jev.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -98,6 +100,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (uri.startsWith("remote-openai:") || isRemoteEmbedModel(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -111,6 +114,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (uri.startsWith("remote-openai:") || isRemoteEmbedModel(uri)) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -203,6 +207,7 @@ export type ModelInfo = {
  * Options for embedding
  */
 export type EmbedOptions = {
+  signal?: AbortSignal;
   model?: string;
   isQuery?: boolean;
   title?: string;
@@ -221,6 +226,7 @@ export type GenerateOptions = {
  * Options for reranking
  */
 export type RerankOptions = {
+  signal?: AbortSignal;
   model?: string;
 };
 
@@ -301,7 +307,9 @@ export type ModelResolutionConfig = {
 };
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  const model = config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  if (typeof model !== "string") throw new Error("Embedding model must be a single URI string");
+  return model;
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {
@@ -309,7 +317,9 @@ export function resolveGenerateModel(config?: ModelResolutionConfig): string {
 }
 
 export function resolveRerankModel(config?: ModelResolutionConfig): string {
-  return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+  const model = config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+  if (typeof model !== "string") throw new Error("Rerank model must be a single URI string");
+  return model;
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
@@ -531,6 +541,15 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
+    if (isJevModel(model)) {
+      new JevReranker(model); // Configuration only: no HTTP or local download.
+      continue;
+    }
+    if (isRemoteEmbedModel(model)) {
+      // Validate, but never probe or download a configured HTTP embedding model.
+      new RemoteEmbedder(model);
+      continue;
+    }
     let refreshed = false;
     const hfRef = parseHfUri(model);
     const filename = model.split("/").pop();
@@ -627,8 +646,10 @@ export interface LLM {
 
 export type LlamaCppConfig = {
   embedModel?: string;
+  embedOptions?: RemoteEmbedOptions;
   generateModel?: string;
   rerankModel?: string;
+  rerankOptions?: JevRerankOptions;
   modelCacheDir?: string;
   /**
    * Context size used for query expansion generation contexts.
@@ -839,8 +860,10 @@ export class LlamaCpp implements LLM {
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
   private embedModelUri: string;
+  private readonly remoteEmbedder?: RemoteEmbedder;
   private generateModelUri: string;
   private rerankModelUri: string;
+  private readonly jevReranker?: JevReranker;
   private modelCacheDir: string;
   private expandContextSize: number;
 
@@ -873,8 +896,18 @@ export class LlamaCpp implements LLM {
     // diagnostics. No constructor-time guard installation is needed.
 
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    if (isRemoteEmbedModel(this.embedModelUri)) {
+      this.remoteEmbedder = new RemoteEmbedder(this.embedModelUri, config.embedOptions);
+    } else if (config.embedOptions !== undefined) {
+      throw new Error("embedOptions requires a remote embedding URI");
+    }
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
+    if (isJevModel(this.rerankModelUri)) {
+      this.jevReranker = new JevReranker(this.rerankModelUri, config.rerankOptions);
+    } else if (config.rerankOptions !== undefined) {
+      throw new Error("rerankOptions requires a typesafe: rerank model");
+    }
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -882,7 +915,16 @@ export class LlamaCpp implements LLM {
   }
 
   get embedModelName(): string {
-    return this.embedModelUri;
+    return this.remoteEmbedder?.modelName ?? this.embedModelUri;
+  }
+
+  private async embedRemote(texts: string[], options: EmbedOptions): Promise<EmbeddingResult[]> {
+    if (this.disposed) throw new Error("LLM has been disposed");
+    if (options.model !== undefined && options.model !== this.embedModelName) {
+      throw new Error("Remote embedding model override does not match configured space");
+    }
+    const vectors = await this.remoteEmbedder!.embedBatch(texts, options.signal);
+    return vectors.map(embedding => ({ embedding, model: this.embedModelName }));
   }
 
   get generateModelName(): string {
@@ -890,7 +932,7 @@ export class LlamaCpp implements LLM {
   }
 
   get rerankModelName(): string {
-    return this.rerankModelUri;
+    return this.jevReranker?.modelName ?? this.rerankModelUri;
   }
 
   /**
@@ -1471,6 +1513,7 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (this.remoteEmbedder) return (await this.embedRemote([text], options))[0]!;
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1500,6 +1543,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (this.remoteEmbedder) return this.embedRemote(texts, options);
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1609,6 +1653,9 @@ export class LlamaCpp implements LLM {
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
+    if (isRemoteEmbedModel(modelUri) || modelUri.startsWith("remote-openai:") || isJevModel(modelUri) || modelUri.startsWith("remote-typesafe:")) {
+      return { name: modelUri, exists: false }; // configured, not a verified local model
+    }
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
     if (modelUri.startsWith("hf:")) {
@@ -1735,6 +1782,13 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (this.jevReranker) {
+      if (this.disposed) throw new Error("LLM has been disposed");
+      if (options.model !== undefined && options.model !== this.rerankModelName) {
+        throw new Error("TypeSafe rerank model override does not match configured identity");
+      }
+      return this.jevReranker.rerank(query, documents, options.signal);
+    }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1742,7 +1796,7 @@ export class LlamaCpp implements LLM {
     const contexts = await this.ensureRerankContexts();
     if (contexts.length === 0) {
       return {
-        results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
+        results: documents.map((d, index) => ({ ...d, score: 0.5, index })),
         model: "fallback",
       };
     }
@@ -2068,12 +2122,16 @@ class LLMSession implements ILLMSession {
     }
   }
 
+  private operationSignal(caller?: AbortSignal): AbortSignal {
+    return caller ? AbortSignal.any([this.signal, caller]) : this.signal;
+  }
+
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 
   async expandQuery(
@@ -2088,7 +2146,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 }
 

@@ -72,6 +72,8 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { copyCommandProcessorSpec, snapshotProcessor, type DocumentProcessor } from "./processors.js";
+import { initializeProcessorSchema, requireProcessor, reindexProcessedFiles, removeProcessorState, renameProcessorState } from "./processor-store.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -180,7 +182,8 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
   ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+  const digest = createHash("sha256").update(significant).digest("hex");
+  return model.startsWith("remote-openai:") ? digest : digest.slice(0, 6);
 }
 
 /**
@@ -1312,6 +1315,7 @@ function initializeDatabase(db: Database): void {
   // Document metadata — extraction state plus normalized value rows for
   // metadata filtering. Keyed by document identity, not content hash.
   initializeMetadataSchema(db);
+  initializeProcessorSchema(db);
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -1376,9 +1380,11 @@ type StoreCollectionRow = {
   context: string | null;
 };
 
-function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
+function rowToNamedCollection(row: StoreCollectionRow, db: Database): NamedCollection {
+  const spec = db.prepare("SELECT spec FROM processor_specs WHERE collection = ?").get(row.name) as { spec: string } | undefined;
   return {
     name: row.name,
+    ...(spec ? { processor: copyCommandProcessorSpec(JSON.parse(spec.spec)) } : {}),
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
@@ -1390,13 +1396,13 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
 
 export function getStoreCollections(db: Database): NamedCollection[] {
   const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
-  return rows.map(rowToNamedCollection);
+  return rows.map(row => rowToNamedCollection(row, db));
 }
 
 export function getStoreCollection(db: Database, name: string): NamedCollection | null {
   const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
   if (row == null) return null;
-  return rowToNamedCollection(row);
+  return rowToNamedCollection(row, db);
 }
 
 export function getStoreGlobalContext(db: Database): string | undefined {
@@ -1427,6 +1433,11 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 }
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  const spec = collection.processor === undefined ? undefined : copyCommandProcessorSpec(collection.processor);
+  if (spec) {
+    db.prepare(`INSERT INTO processor_specs(collection, spec) VALUES (?, ?)
+      ON CONFLICT(collection) DO UPDATE SET spec = excluded.spec`).run(name, JSON.stringify(spec));
+  } else db.prepare("DELETE FROM processor_specs WHERE collection = ?").run(name);
   db.prepare(`
     INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1501,6 +1512,8 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
  * External config always wins. Skips sync if config hash hasn't changed.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  // Config sync is also used on externally seeded databases before Store opens.
+  initializeProcessorSchema(db);
   // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
@@ -1631,7 +1644,7 @@ export type Store = {
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
@@ -1848,12 +1861,16 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
+  const processor = options?.processor ? snapshotProcessor(options.processor) : undefined;
+  requireProcessor(store.db, collectionName, !!getStoreCollection(store.db, collectionName)?.processor, processor);
   const batch = scanWriteBatch(store.db);
   try {
-    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, options);
+    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, processor ? { ...options, processor } : options);
     batch.commit();
     return result;
   } catch (err) {
@@ -1870,6 +1887,8 @@ async function reindexCollectionIn(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1913,6 +1932,10 @@ async function reindexCollectionIn(
     const parts = file.split("/");
     return !parts.some(part => part.startsWith("."));
   });
+
+  if (options?.processor) {
+    return reindexProcessedFiles(db, batch, collectionPath, collectionName, files.map(normalizePathSeparators), options.processor, options);
+  }
 
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
@@ -2110,6 +2133,7 @@ export type EmbedResult = {
 };
 
 export type EmbedOptions = {
+  signal?: AbortSignal;
   force?: boolean;
   model?: string;
   /**
@@ -2389,7 +2413,7 @@ export async function generateEmbeddings(
         attempts: (previous?.attempts ?? 0) + 1,
         reason,
       });
-      retryQueue.set(key, chunk);
+      if (!model.startsWith("remote-openai:")) retryQueue.set(key, chunk);
     };
     const clearFailure = (chunk: ChunkItem) => {
       const key = chunkKey(chunk);
@@ -2556,8 +2580,10 @@ export async function generateEmbeddings(
           // individual retry succeeds, any prior failure for that chunk is
           // cleared, so the visible error count reflects outstanding failures.
           const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+          if (!session.isValid || model.startsWith("remote-openai:")) {
+            // A remote batch is one bounded attempt; malformed/partial responses
+            // must not be rescued by individual HTTP calls.
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed: ${batchReason}`);
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
@@ -2593,7 +2619,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, signal: options?.signal, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -2663,12 +2689,12 @@ export function createStore(dbPath?: string): Store {
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
       // store.llm is unset made keys stable across config swaps (#764).
       const llm = getLlm(store);
-      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm);
+      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm, signal);
     },
 
     // Document retrieval
@@ -3847,6 +3873,13 @@ async function chunkDocumentByTokensWithLlm(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (llm.embedModelName?.startsWith("remote-openai:")) {
+    signal?.throwIfAborted();
+    // Fixed remote format v1: the existing surrogate-safe character chunker,
+    // never a local tokenizer or token-truncation pass. Tokens are estimates.
+    return chunkDocument(content, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, CHUNK_WINDOW_CHARS)
+      .map(chunk => ({ ...chunk, tokens: Math.ceil(chunk.text.length / 4) }));
+  }
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -4300,6 +4333,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
 
     const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
+    removeProcessorState(db, collectionName);
 
     const cleanupResult = db.prepare(`
       DELETE FROM content
@@ -4344,6 +4378,7 @@ export function renameCollection(db: Database, oldName: string, newName: string)
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
     db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
     renameCollectionId(db, oldName, newName);
+    renameProcessorState(db, oldName, newName);
   }).immediate();
 }
 
@@ -4973,12 +5008,58 @@ function nearestVecDocuments(
   }
 }
 
+/** Enforce remote spaces in KNN scope without changing local-to-local compatibility. */
+function assertRemoteEmbeddingBoundary(db: Database, model: string, collectionName?: string | readonly string[], filter?: MetadataFilter): void {
+  if (!hasVectorIndex(db)) return;
+  const names = scopedCollectionNames(collectionName);
+  const ids = names ? Array.from(resolveCollectionIds(db, names).values()) : undefined;
+  if (ids?.length === 0) return;
+  const eligible = filter ? metadataEligibleRowsSql(filter) : undefined;
+  const conditions: string[] = [];
+  const params: SQLiteValue[] = [];
+  if (ids) {
+    conditions.push(`vr.collection_id IN (${ids.map(() => "?").join(",")})`);
+    params.push(...ids);
+  }
+  if (eligible) {
+    conditions.push(`vr.id IN (SELECT vr.id ${eligible.sql})`);
+    params.push(...eligible.params);
+  }
+  conditions.push(`EXISTS (SELECT 1 FROM ${VEC_TABLE} v WHERE v.rowid = vr.id)`);
+  if (model.startsWith("remote-openai:")) {
+    conditions.push("(cv.model IS NULL OR cv.model != ? OR cv.embed_fingerprint != ?)");
+    params.push(model, getEmbeddingFingerprint(model));
+  } else {
+    // Local labels and legacy fingerprints keep their existing semantics, but
+    // a local query must never rank a remote embedding space (or load ML first).
+    conditions.push("cv.model GLOB 'remote-openai:*'");
+  }
+  const foreign = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT 1 FROM ${VEC_ROWS_TABLE} vr
+    LEFT JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
+    WHERE ${conditions.join(" AND ")} LIMIT 1
+  `).get(...params));
+  if (foreign) throw new Error("Vector space mismatch; re-embed the selected collections with the configured model");
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
-
+  // No read transaction spans HTTP. Fail before paying for a query, then
+  // recheck after the await in the SAME snapshot as KNN and document resolution.
+  assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
+  session?.signal.throwIfAborted();
 
+  return db.transaction(() => {
+    if (!hasVectorIndex(db)) return [];
+    assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
+    return searchVecSnapshot(db, embedding, limit, collectionName, filter);
+  })();
+}
+
+/** Synchronous reads only; called inside the post-embedding read transaction. */
+function searchVecSnapshot(db: Database, embedding: number[], limit: number, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   let collectionIds: number[] | undefined;
   if (names) {
@@ -5015,8 +5096,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
-      // The body is read after resolution, outside its snapshot: another
-      // process's orphaned-content cleanup can delete the row in between.
+      // Body, vector, metadata and context reads share the search snapshot.
       const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
@@ -5316,11 +5396,14 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp, signal?: AbortSignal): Promise<{ file: string; score: number }[]> {
+  signal?.throwIfAborted();
+  // Snapshot cache inputs too: caller mutation during HTTP must not change keys.
+  documents = documents.map(doc => ({ file: doc.file, text: doc.text }));
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
+  // Prefer the LLM instance's resolved identity so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
   const cacheModel = llm.rerankModelName ?? model;
 
@@ -5346,22 +5429,32 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    const callOptions = signal ? { model: cacheModel, signal } : { model: cacheModel };
+    const rerankResult = cacheModel.startsWith("remote-typesafe:")
+      ? await withLLMSessionForLlm(llm, session => session.rerank(rerankQuery, uncachedDocs, callOptions), { signal, name: "rerank" })
+      : await llm.rerank(rerankQuery, uncachedDocs, callOptions);
+    signal?.throwIfAborted();
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
-    }
+    // Complete scores arrive before any writes. Index, not file, identifies a
+    // chunk: two different chunks can have the same file name.
+    db.transaction(() => {
+      for (const result of rerankResult.results) {
+        signal?.throwIfAborted();
+        const chunk = uncachedDocs[result.index]!.text;
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
+      signal?.throwIfAborted();
+    })();
   }
 
-  // Return all results sorted by score
-  return documents
+  // Return all results sorted by score, including a fully cached call.
+  const results = documents
     .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
+  signal?.throwIfAborted();
+  return results;
 }
 
 // =============================================================================
@@ -6188,6 +6281,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
+  signal?: AbortSignal;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6266,6 +6360,8 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6299,12 +6395,15 @@ export async function hybridQuery(
 
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
+  signal?.throwIfAborted();
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
+  signal?.throwIfAborted();
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  signal?.throwIfAborted();
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -6351,11 +6450,15 @@ export async function hybridQuery(
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
     const embedModel = llm.embedModelName;
+    assertRemoteEmbeddingBoundary(store.db, embedModel, collection, filter);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    signal?.throwIfAborted();
+    const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+    signal?.throwIfAborted();
     hooks?.onEmbedDone?.(Date.now() - embedStart);
+    signal?.throwIfAborted();
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -6366,6 +6469,7 @@ export async function hybridQuery(
         vecQueries[i]!.text, embedModel, 20, collection,
         undefined, embedding, filter
       );
+      signal?.throwIfAborted();
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
@@ -6386,6 +6490,7 @@ export async function hybridQuery(
   // replays the same misses on every warm repeat. Only judge sub-queries the
   // store could actually run: on FTS-only stores, vec/hyde expansions never
   // execute and say nothing about the expansion's quality.
+  signal?.throwIfAborted();
   if (expanded.length > 0) {
     const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
     const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
@@ -6411,7 +6516,9 @@ export async function hybridQuery(
 
   const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
@@ -6478,7 +6585,9 @@ export async function hybridQuery(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -6492,7 +6601,8 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6557,7 +6667,9 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }
 
 export interface VectorSearchOptions {
@@ -6647,6 +6759,7 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSearchOptions {
+  signal?: AbortSignal;
   collections?: string[];   // Filter to specific collections (OR match)
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6684,6 +6797,8 @@ export async function structuredSearch(
   searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6753,11 +6868,15 @@ export async function structuredSearch(
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
       const embedModel = llm.embedModelName;
+      assertRemoteEmbeddingBoundary(store.db, embedModel, collections, filter);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      signal?.throwIfAborted();
+      const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+      signal?.throwIfAborted();
       hooks?.onEmbedDone?.(Date.now() - embedStart);
+      signal?.throwIfAborted();
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -6767,6 +6886,7 @@ export async function structuredSearch(
           vecSearches[i]!.query, embedModel, 20, collections,
           undefined, embedding, filter
         );
+        signal?.throwIfAborted();
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -6794,6 +6914,7 @@ export async function structuredSearch(
   if (candidates.length === 0) return [];
 
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+  signal?.throwIfAborted();
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
@@ -6806,7 +6927,9 @@ export async function structuredSearch(
   const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
@@ -6873,7 +6996,9 @@ export async function structuredSearch(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 5: Rerank chunks
@@ -6887,7 +7012,8 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6951,5 +7077,7 @@ export async function structuredSearch(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }

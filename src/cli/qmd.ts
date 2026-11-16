@@ -1,6 +1,8 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
+import { createCommandProcessor } from "../processors.js";
+import { hasProcessorMode, requireProcessor } from "../processor-store.js";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
@@ -107,6 +109,8 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
+import { RemoteEmbedder, isRemoteEmbedModel } from "../remote-embed.js";
+import { JevReranker, isJevModel } from "../jev.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -171,25 +175,32 @@ let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
-    store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const activeModels = ensureModelsConfiguredForCli();
+    let config: CollectionConfig;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      config = loadConfig();
     } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // Keep diagnostics available for invalid YAML. Valid but unsafe remote
+      // selections already failed above, outside this parse-only catch.
+      store = createStore(storeDbPathOverride);
+      return store;
     }
+    // Untrusted project-local custom model URIs/options must not be loaded;
+    // status still displays the YAML values via resolveModelsForCli (#889).
+    const trusted = localConfigIsFullyTrusted();
+    const modelsForLlm = trusted ? activeModels : resolveModels();
+    const llm = new LlamaCpp({
+      embedModel: modelsForLlm.embed,
+      embedOptions: trusted ? config.models?.embedOptions : undefined,
+      generateModel: modelsForLlm.generate,
+      rerankModel: modelsForLlm.rerank,
+      rerankOptions: trusted ? config.models?.rerankOptions : undefined,
+    });
+    store = createStore(storeDbPathOverride);
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB.
+    syncConfigToDb(store.db, config);
+    setDefaultLlamaCpp(llm);
+    store.llm = llm;
   }
   return store;
 }
@@ -688,8 +699,8 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
+    console.log(`  Embedding:   ${isRemoteEmbedModel(activeModels.embed) ? "configured remote (not probed; no local download)" : hfLink(activeModels.embed)}`);
+    console.log(`  Reranking:   ${isJevModel(activeModels.rerank) ? "configured remote TypeSafe (not probed; no local download)" : hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
@@ -748,6 +759,9 @@ function builtinModels(): BuiltinModels {
 function collectSensitiveSnapshot(): SensitiveSnapshot {
   const config = loadConfig();
   return {
+    processors: Object.entries(config.collections ?? {})
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
     hooks: Object.entries(config.collections ?? {})
       .filter(([, col]) => !!col.update)
       .map(([name, col]) => ({ collection: name, command: col.update! })),
@@ -757,7 +771,9 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
     })),
     models: {
       embed: config.models?.embed,
+      embedOptions: config.models?.embedOptions,
       rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
       generate: config.models?.generate,
     },
   };
@@ -802,6 +818,13 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 function printGatedItems(gated: GatedItems): void {
+  if (gated.processors?.length) console.log(`${c.yellow}Collection processor commands require approval: ${gated.processors.map(p => p.collection).join(", ")}${c.reset}`);
+  if (gated.rerankOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote rerank options (revision/credential variable name)${c.reset}`);
+  }
+  if (gated.embedOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote embedding options (dimensions/revision/credential variable name)${c.reset}`);
+  }
   if (gated.hooks.length > 0) {
     console.log(`${c.yellow}This project's config defines update commands:${c.reset}`);
     for (const hook of gated.hooks) {
@@ -943,19 +966,33 @@ async function updateCollections(): Promise<void> {
   const hooksAllowed = allowed;
   const configPath = getConfigPath();
 
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
-
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
-
-    // Execute custom update command if specified in YAML
+  // Validate every selected collection before hooks or document writes. Keep the
+  // same config and authorized adapter throughout this update, without rereads.
+  const prepared = collections.map(col => {
     const yamlCol = getCollectionFromYaml(col.name);
     const rawPath = yamlCol?.path ?? col.pwd;
-    if (!hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
+    const skip = !hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)
+      ? "path" : yamlCol?.processor && !hooksAllowed ? "processor" : undefined;
+    const processor = !skip && yamlCol?.processor ? createCommandProcessor(yamlCol.processor, { cwd: col.pwd }) : undefined;
+    if (!skip) requireProcessor(db, col.name, !!yamlCol?.processor, processor);
+    return { col, yamlCol, rawPath, processor, skip };
+  });
+
+  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+
+  for (let i = 0; i < prepared.length; i++) {
+    const entry = prepared[i];
+    if (!entry) continue;
+    const { col, yamlCol, rawPath, processor, skip } = entry;
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+
+    if (skip === "path") {
       console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
       console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
+    if (skip === "processor") {
+      console.log(`${c.yellow}Skipping processor collection '${col.name}' — config is not trusted. Approve with 'qmd trust'.${c.reset}`);
       continue;
     }
     if (yamlCol?.update && hooksAllowed) {
@@ -998,6 +1035,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      processor,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1907,11 +1945,13 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
     process.exit(1);
   }
 
+  // Typing a path does not approve unrelated processor commands in this config.
+  const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
   // The user just typed this path, so it needs no separate approval (#889).
-  trustCurrentConfig();
+  if (mayRefreshTrust) trustCurrentConfig();
   resyncConfig();
 
   // Create the collection and index files
@@ -2104,6 +2144,23 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Collection name must be provided (from YAML)
   if (!collectionName) {
     throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
+  }
+
+  const processorSpec = getCollectionFromYaml(collectionName)?.processor;
+  if (processorSpec || hasProcessorMode(db, collectionName)) {
+    if (processorSpec && !await resolveLocalConfigTrust()) {
+      console.log("Skipping processor collection — config is not trusted. Approve with 'qmd trust'.");
+      closeDb();
+      return;
+    }
+    const processor = processorSpec ? createCommandProcessor(processorSpec, { cwd: resolvedPwd }) : undefined;
+    const result = await reindexCollection(getStore(), resolvedPwd, globPattern, collectionName, { ignorePatterns, processor });
+    console.log(`Indexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
+    reportMetadataErrors(result.metadataErrors);
+    copyVectorsToNewCollections(db, collectionName);
+    closeDb();
+    return;
   }
 
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
@@ -2342,29 +2399,36 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  let config: CollectionConfig;
   try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    config = loadConfig();
   } catch {
-    return resolveModels();
+    return resolveModels(); // Doctor reports the parse error without loading ML.
   }
+  const models = resolveModels(config.models);
+  const current = config.models ?? {};
+  // Invalid remote selection must fail closed, never fall back to local ML.
+  if (isRemoteEmbedModel(models.embed)) new RemoteEmbedder(models.embed, current.embedOptions);
+  else if (current.embedOptions !== undefined) throw new Error("embedOptions requires a remote embedding URI");
+  if (isJevModel(models.rerank)) new JevReranker(models.rerank, current.rerankOptions);
+  else if (current.rerankOptions !== undefined) throw new Error("rerankOptions requires a typesafe: rerank model");
+  if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+    saveConfig({
+      ...config,
+      models: {
+        ...current,
+        embed: models.embed,
+        generate: models.generate,
+        rerank: models.rerank,
+      },
+    });
+  }
+  return models;
 }
 
 export function resolveEmbedModelForCli(): string {
-  return ensureModelsConfiguredForCli().embed;
+  const uri = ensureModelsConfiguredForCli().embed;
+  return isRemoteEmbedModel(uri) ? new RemoteEmbedder(uri, loadConfig().models?.embedOptions).modelName : uri;
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2394,6 +2458,7 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  if (isRemoteEmbedModel(model)) model = storeInstance.llm!.embedModelName;
 
   // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
@@ -4103,7 +4168,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const consequence = configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
-    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+    overrides.push({ name, value: key === "embed" && isRemoteEmbedModel(raw) ? "<remote URI>" : envValueForDisplay(raw), consequence });
   };
 
   add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
@@ -4186,7 +4251,8 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
     } else if (check.configured && check.configured !== check.defaultModel) {
       notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
     } else if (envValue && check.active !== envValue) {
-      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
+      const display = check.key === "embed" && isRemoteEmbedModel(envValue) ? "<remote URI>" : envValue;
+      notes.push(`${check.role}: ${check.envName} is set to ${display} but index config uses ${check.active}`);
     }
   }
 
@@ -4206,6 +4272,14 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (role === "reranking" && isJevModel(model)) {
+      doctorCheck("rerank configuration", true, "configured remote TypeSafe (not probed; no local download)");
+      continue;
+    }
+    if (role === "embedding" && isRemoteEmbedModel(model)) {
+      doctorCheck("embedding configuration", true, "configured remote (not probed; no local download)");
+      continue;
+    }
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4443,7 +4517,8 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = resolveEmbedModelForCli();
+  const remoteEmbed = isRemoteEmbedModel(activeModels.embed);
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
@@ -4474,10 +4549,13 @@ async function showDoctor(): Promise<void> {
   checkModelDefaults(activeModels, configModels);
   checkModelCache(activeModels, nextSteps);
 
-  await runDoctorDeviceChecks(nextSteps);
+  if (!remoteEmbed) await runDoctorDeviceChecks(nextSteps);
+  else doctorCheck("device probe", true, "skipped for remote embedding configuration");
 
   try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    const adoption = remoteEmbed
+      ? { checked: false, adopted: 0, reason: "remote embedding identities have no legacy local fingerprint" }
+      : await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
     if (adoption.checked || adoption.adopted > 0) {
       doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
     }
@@ -4536,7 +4614,9 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    const vectorSample = remoteEmbed
+      ? { ok: true, details: "not probed: remote embedding configuration (no HTTP request)" }
+      : await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
@@ -4824,10 +4904,11 @@ if (isMain) {
             console.error(`Collection not found: ${name}`);
             process.exit(1);
           }
+          const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
           updateCollectionSettings(name, { update: cmd });
           // The user just typed this command, so it needs no separate approval;
           // re-record so the digest covers the new hook set (#886).
-          trustCurrentConfig();
+          if (mayRefreshTrust) trustCurrentConfig();
           if (cmd) {
             console.log(`✓ Set update command for '${name}': ${cmd}`);
           } else {
@@ -4992,6 +5073,8 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
+      if (isRemoteEmbedModel(activeModels.embed)) console.log("Embedding: configured remote; no local download (not probed)");
+      if (isJevModel(activeModels.rerank)) console.log("Reranking: configured remote TypeSafe; no local download (not probed)");
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,

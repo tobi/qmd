@@ -9,6 +9,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
+import type { RemoteEmbedOptions } from "./remote-embed.js";
+import type { JevRerankOptions } from "./jev.js";
+import type { CommandProcessorSpec } from "./processors.js";
 
 // ============================================================================
 // Types
@@ -29,6 +32,7 @@ export interface Collection {
   pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
   context?: ContextMap;      // Optional context definitions
+  processor?: CommandProcessorSpec; // Optional file-to-Markdown command (CLI trust required)
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
 }
@@ -38,7 +42,9 @@ export interface Collection {
  */
 export interface ModelsConfig {
   embed?: string;
+  embedOptions?: RemoteEmbedOptions;
   rerank?: string;
+  rerankOptions?: JevRerankOptions;
   generate?: string;
 }
 
