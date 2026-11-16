@@ -112,6 +112,56 @@ Retrieve multiple documents.
 
 Index health and collections. No params.
 
+## Compare a local runbook with upstream docs
+
+Use QMD to find what your team configured. If you also want to verify the
+upstream default, ask your MCP client to look it up with a separate web tool.
+
+Try it with a sample runbook in a scratch directory:
+
+```bash
+example_dir=$(mktemp -d)
+cd "$example_dir"
+mkdir runbooks
+qmd init
+cat > runbooks/sqlite.md <<'EOF'
+# SQLite runbook
+
+Our service sets SQLite WAL autocheckpoint to 2000 pages.
+EOF
+qmd collection add ./runbooks --name runbooks
+```
+
+From the same directory, add the local QMD server to Claude Code. The second
+command adds Parallel as an optional web connector using anonymous access.
+
+```bash
+claude mcp add --scope local --transport stdio qmd-example-local -- qmd mcp
+claude mcp add --scope local --transport http qmd-example-web \
+  https://mcp.parallel.ai/mcp --header "User-Agent: qmd-mcp-example"
+```
+
+Start Claude Code in that directory and ask:
+
+> Use `qmd-example-local` to run a `query` with a single `lex` search for
+> "SQLite WAL autocheckpoint" in `runbooks` and set `rerank` to false. Read
+> the match with `get` using the returned docid. Then use `qmd-example-web`
+> to search for "SQLite WAL default autocheckpoint threshold" and fetch
+> the matching page on sqlite.org. Send only the public lookup to the web
+> tool. Cite the runbook path and line for our setting and the sqlite.org URL
+> for the default.
+
+You should see 2,000 pages from `qmd://runbooks/sqlite.md` (line 3) and
+1,000 pages from [SQLite's WAL docs](https://sqlite.org/wal.html#automatic_checkpoint).
+If the web lookup is unavailable or you decline it, report the runbook
+setting and leave the upstream default unverified. Keep local excerpts,
+paths, and internal settings out of web requests.
+
+Remove the optional connector with
+`claude mcp remove --scope local qmd-example-web`. When you're done with the
+example, remove the local entry with
+`claude mcp remove --scope local qmd-example-local`.
+
 ## Troubleshooting
 
 - **Not starting**: `which qmd`, `qmd mcp` manually

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- The MCP setup guide shows how to cite a local runbook and verify a public
+  default with an optional web connector.
+
 ### Fixed
 
 - Security: MCP stdio and HTTP startup now enforce project-local config trust
