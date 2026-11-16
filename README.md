@@ -794,6 +794,9 @@ qmd collection update-cmd notes
 command, so ignore patterns and context apply before the first index pass:
 
 ```sh
+# The simplest form: path, name, and an optional positional context
+qmd setup-collection . mynotes "Personal notes and ideas"
+
 # Documentation collection: markdown only, keep it out of default searches
 qmd setup-collection . repo-a-documentation \
   --context "Repository A documentation" \
@@ -801,18 +804,6 @@ qmd setup-collection . repo-a-documentation \
   --ignore "AGENTS.md" \
   --ignore "**/AGENTS.md" \
   --exclude
-
-# Code collection: source files with AST-aware chunking at embed time
-qmd setup-collection . repo-a-code \
-  --context "Repository A source code" \
-  --mask "**/*.{ts,tsx,js,jsx,py,go,rs}" \
-  --ignore "node_modules/**" \
-  --ignore "dist/**" \
-  --exclude \
-  --chunk-strategy auto
-
-# The context can also be passed positionally
-qmd setup-collection . mynotes "Personal notes and ideas"
 ```
 
 The collection name is the stable identifier used later by `qmd query "..."`
@@ -839,7 +830,7 @@ Behavior and caveats:
 
   ```sh
   qmd update
-  qmd embed -c repo-a-code --chunk-strategy auto
+  qmd embed -c <name> --chunk-strategy auto
   ```
 
 - `--exclude` affects unscoped searches only; a collection in the shared index

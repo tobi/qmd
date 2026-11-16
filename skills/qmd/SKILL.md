@@ -318,7 +318,7 @@ retrieving are safe; collection/index mutation is not a casual first step.
 ```bash
 npm install -g @tobilu/qmd
 qmd collection add ~/notes --name notes
-qmd setup-collection ~/project myproject --context "Project docs" --mask "**/*.md" --exclude
+qmd setup-collection ~/project myproject "Project docs" --mask "**/*.md" --exclude
 qmd update
 qmd embed
 ```
