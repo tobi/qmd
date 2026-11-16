@@ -1431,6 +1431,36 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     expect(json.error?.data?.supported).toEqual(expect.arrayContaining([MCP_2026]));
   });
 
+  test("subscriptions/listen streams its acknowledgment before the stream ends", async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const res = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+          "MCP-Protocol-Version": MCP_2026,
+          "Mcp-Method": "subscriptions/listen",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "listen-1",
+          method: "subscriptions/listen",
+          params: { _meta: mcp2026Meta, notifications: { toolsListChanged: true } },
+        }),
+        signal: controller.signal,
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const { value } = await res.body!.getReader().read();
+      expect(new TextDecoder().decode(value)).toContain("notifications/subscriptions/acknowledged");
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
+  });
+
   test("GET /mcp is 405 (no session GET stream)", async () => {
     const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
     expect(res.status).toBe(405);
