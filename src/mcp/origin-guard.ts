@@ -47,7 +47,16 @@ function originHostname(origin: string): string | undefined {
 /** Normalize an origin for comparison against the allowlist. */
 function normalizeOrigin(origin: string): string | undefined {
   try {
-    return new URL(origin.trim()).origin.toLowerCase();
+    const url = new URL(origin.trim());
+    // WHATWG serializes the origin of every non-special scheme (chrome-extension:,
+    // moz-extension:, app:) as the opaque "null", so comparing `.origin` would let an
+    // allowlist entry for one browser extension admit every extension. Rebuild the
+    // scheme + host pair so opaque origins compare exactly; the literal header value
+    // "null" (sandboxed frames) does not parse as a URL and stays rejected.
+    if (url.origin === "null") {
+      return url.host ? `${url.protocol}//${url.host}`.toLowerCase() : undefined;
+    }
+    return url.origin.toLowerCase();
   } catch {
     return undefined;
   }
