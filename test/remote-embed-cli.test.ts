@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { LlamaCpp, withLLMSessionForLlm } from "../src/llm.js";
+import { DEFAULT_GENERATE_MODEL_URI, LlamaCpp, withLLMSessionForLlm } from "../src/llm.js";
+import { openDatabase } from "../src/db.js";
+import { getCacheKey } from "../src/store.js";
 
 const project = fileURLToPath(new URL("..", import.meta.url));
 const script = join(project, "src", "cli", "qmd.ts");
@@ -81,6 +83,55 @@ test("CLI update/embed/typed vector query uses explicit loopback embeddings; sta
     expect(requests).toBe(before);
     expect(unexpected).toEqual([]);
     expect(embed.stderr + result.stderr + doctor.stderr).not.toMatch(/Loading model|Downloading|LLM operations are disabled/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI vsearch --min-score 0 keeps hits below the 0.3 default", async () => {
+  const root = mkdtempSync(join(tmpdir(), "qmd-remote-vsearch-"));
+  const query = "distant cosmos";
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    response.setHeader("Content-Type", "application/json");
+    // Documents embed to [1, 0]; the query sits at cosine similarity 0.2 from them.
+    response.end(JSON.stringify({ model: body.model, data: body.input.map((text: string, index: number) => ({ index, embedding: text === query ? [0.2, Math.sqrt(0.96)] : [1, 0] })) }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("No loopback port");
+  mkdirSync(join(root, "docs"));
+  mkdirSync(join(root, "config"));
+  writeFileSync(join(root, "docs", "stars.md"), "# Nebula\nA cloud of distant stars.\n");
+  writeFileSync(join(root, "config", "index.yml"), `collections:\n  docs:\n    path: ${JSON.stringify(join(root, "docs"))}\n    pattern: '**/*.md'\nmodels:\n  embed: 'http://127.0.0.1:${address.port}/v1#synthetic'\n  embedOptions:\n    dimensions: 2\n    revision: test-v1\n`);
+  try {
+    const update = await run(root, ["update"]);
+    expect(update.code, update.stderr).toBe(0);
+    const embed = await run(root, ["embed"]);
+    expect(embed.code, embed.stderr).toBe(0);
+    // vsearch always expands the query: cache a lex-only expansion so no local generation model is needed.
+    const db = openDatabase(join(root, "index.sqlite"));
+    try {
+      db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(
+        getCacheKey("expandQuery", { query, model: DEFAULT_GENERATE_MODEL_URI }),
+        JSON.stringify([{ type: "lex", query: "cosmos" }]),
+        new Date().toISOString(),
+      );
+    } finally {
+      db.close();
+    }
+    const byDefault = await run(root, ["vsearch", query, "--json"]);
+    expect(byDefault.code, byDefault.stderr).toBe(0);
+    expect(JSON.parse(byDefault.stdout)).toEqual([]);
+    const unfiltered = await run(root, ["vsearch", query, "--json", "--min-score", "0"]);
+    expect(unfiltered.code, unfiltered.stderr).toBe(0);
+    const hits = JSON.parse(unfiltered.stdout) as { title: string; score: number }[];
+    expect(hits.map(hit => hit.title)).toEqual(["Nebula"]);
+    expect(hits[0]!.score).toBeCloseTo(0.2, 2);
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     rmSync(root, { recursive: true, force: true });

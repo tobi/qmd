@@ -3215,7 +3215,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       collection: collectionSearchFilter(collectionNames),
       filter: opts.filter,
       limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
+      // main() applies the 0.3 default when --min-score is absent; an explicit 0 disables the cutoff.
+      minScore: opts.minScore,
       intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
