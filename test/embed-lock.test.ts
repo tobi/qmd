@@ -25,35 +25,43 @@ import {
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const holderScript = join(thisDir, "_helpers", "embed-lock-holder.ts");
-const tsxCli = join(thisDir, "..", "node_modules", "tsx", "dist", "cli.mjs");
+// Loaded with `--import`, so the helper *is* the process we spawn: SIGKILL
+// reaches the lock holder. The tsx CLI wrapper would exec a second node that
+// owns the lock and forward its output, so a kill would orphan the real holder
+// and readiness would arrive one event loop late.
+const tsxImport = join(thisDir, "..", "node_modules", "tsx", "dist", "esm", "index.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
 type Child = {
   proc: ChildProcess;
   output: () => string;
-  /** Resolves once the child's combined output contains `needle`. */
-  waitFor: (needle: string, timeoutMs?: number) => Promise<void>;
+  /** Write one command line (GO / RELEASE) to the helper's stdin. */
+  send: (line: string) => void;
+  /** Resolves once the child's combined output matches `needle`. */
+  waitFor: (needle: string | RegExp, timeoutMs?: number) => Promise<void>;
   done: Promise<number | null>;
 };
 
 /**
  * Spawn the lock-holder helper on `lockPath`; it reports HOLD / ACQUIRED / BUSY
- * on stdout. Trailing qmd tokens keep the child's command line looking like qmd.
+ * on stdout and keeps the lock until this process writes RELEASE, so no
+ * assertion races a hold timer. Trailing qmd tokens keep its command line
+ * looking like qmd.
  */
-function spawnHolder(lockPath: string, holdMs: number, env: Record<string, string> = {}): Child {
+function spawnHolder(lockPath: string, env: Record<string, string> = {}): Child {
   const args = isBunRuntime
-    ? [holderScript, lockPath, String(holdMs), "qmd", "embed"]
-    : [tsxCli, holderScript, lockPath, String(holdMs), "qmd", "embed"];
+    ? [holderScript, lockPath, "qmd", "embed"]
+    : ["--import", tsxImport, holderScript, lockPath, "qmd", "embed"];
   const proc = spawn(process.execPath, args, {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },
   });
 
   let output = "";
-  const waiters = new Set<{ needle: string; resolve: () => void }>();
+  const waiters = new Set<{ found: () => boolean; resolve: () => void }>();
   const publish = () => {
     for (const waiter of waiters) {
-      if (!output.includes(waiter.needle)) continue;
+      if (!waiter.found()) continue;
       waiters.delete(waiter);
       waiter.resolve();
     }
@@ -67,10 +75,12 @@ function spawnHolder(lockPath: string, holdMs: number, env: Record<string, strin
     publish();
   });
 
-  const waitFor = (needle: string, timeoutMs = 15_000): Promise<void> => {
-    if (output.includes(needle)) return Promise.resolve();
+  const waitFor = (needle: string | RegExp, timeoutMs = 15_000): Promise<void> => {
+    const found = () =>
+      typeof needle === "string" ? output.includes(needle) : needle.test(output);
+    if (found()) return Promise.resolve();
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const waiter = { needle, resolve };
+    const waiter = { found, resolve };
     waiters.add(waiter);
     // Failure guard only: it never decides the outcome, it bounds a hung child.
     const timer = setTimeout(() => {
@@ -87,7 +97,13 @@ function spawnHolder(lockPath: string, holdMs: number, env: Record<string, strin
   const { promise: done, resolve: onClose } = Promise.withResolvers<number | null>();
   proc.on("close", (code) => onClose(code));
 
-  return { proc, output: () => output, waitFor, done };
+  return {
+    proc,
+    output: () => output,
+    send: (line: string) => proc.stdin?.write(`${line}\n`),
+    waitFor,
+    done,
+  };
 }
 
 describe("embedLockPathForDb", () => {
@@ -155,22 +171,25 @@ describe("tryAcquireEmbedLock", () => {
   test("cross-process: live holder blocks; its release allows proceed", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-xp-"));
     const lockPath = join(dir, ".qmd-embed.lock");
-    let child: Child | null = null;
+    const child = spawnHolder(lockPath);
     try {
-      child = spawnHolder(lockPath, 1_000);
+      // The holder keeps the lock until this process says so, so the assertion
+      // below cannot race a hold timer on a loaded runner.
       await child.waitFor("HOLD");
 
       expect(acquireEmbedLock(lockPath)).toEqual({ status: "busy", reason: { kind: "sidecar" } });
+      expect(child.output()).not.toContain("RELEASED");
+      expect(tryAcquireEmbedLock(lockPath)).toBeNull();
 
-      const exitCode = await child.done;
+      child.send("RELEASE");
+      expect(await child.done).toBe(0);
       expect(child.output()).toContain("RELEASED");
-      expect(exitCode).toBe(0);
 
       const after = tryAcquireEmbedLock(lockPath);
       expect(after).not.toBeNull();
       after!.release();
     } finally {
-      child?.proc.kill("SIGKILL");
+      child.proc.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -178,7 +197,7 @@ describe("tryAcquireEmbedLock", () => {
   test("crash recovery: a killed holder needs no cleanup or stale detection", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-crash-"));
     const lockPath = join(dir, ".qmd-embed.lock");
-    const child = spawnHolder(lockPath, 60_000);
+    const child = spawnHolder(lockPath);
     try {
       await child.waitFor("HOLD");
       expect(tryAcquireEmbedLock(lockPath)).toBeNull();
@@ -204,24 +223,36 @@ describe("tryAcquireEmbedLock", () => {
     try {
       for (let i = 0; i < contenders; i++) {
         children.push(
-          spawnHolder(lockPath, 1_000, { EMBED_LOCK_TRY_ONCE: "1", EMBED_LOCK_BARRIER: "1" }),
+          spawnHolder(lockPath, { EMBED_LOCK_TRY_ONCE: "1", EMBED_LOCK_BARRIER: "1" }),
         );
       }
       // Start them together so they collide on acquisition, not on spawn cost.
       await Promise.all(children.map((child) => child.waitFor("READY")));
-      for (const child of children) child.proc.stdin?.write("go\n");
+      for (const child of children) child.send("GO");
 
-      const codes = await Promise.all(children.map((child) => child.done));
-      expect(codes.every((code) => code === 0)).toBe(true);
+      // Every contender reports its attempt before the winner lets go: the
+      // verdict is decided while the lock is still held, so no straggler can
+      // find it free and claim a second ACQUIRED.
+      await Promise.all(
+        children.map((child) => child.waitFor(/(^|\n)(?:ACQUIRED|BUSY)\n/)),
+      );
       const winners = children.filter((child) => /(^|\n)ACQUIRED\n/.test(child.output()));
       const losers = children.filter((child) => /(^|\n)BUSY\n/.test(child.output()));
       expect(winners).toHaveLength(1);
       expect(losers).toHaveLength(contenders - 1);
 
+      // Only the winner is still holding: a loser has already exited, and
+      // writing to its closed stdin would surface as EPIPE.
+      winners[0]!.send("RELEASE");
+      const codes = await Promise.all(children.map((child) => child.done));
+      expect(codes.every((code) => code === 0)).toBe(true);
+      expect(winners[0]!.output()).toContain("RELEASED");
+
       const after = tryAcquireEmbedLock(lockPath);
       expect(after).not.toBeNull();
       after!.release();
     } finally {
+      // Also on a failed assertion: a holder must not outlive the test.
       for (const child of children) child.proc.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
