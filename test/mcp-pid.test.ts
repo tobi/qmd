@@ -3,7 +3,7 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { looksLikeQmdMcpCommand, isQmdMcpPid, mcpDaemonStateFiles } from "../src/cli/mcp-pid.ts";
+import { looksLikeQmdMcpCommand, isQmdMcpPid, mcpDaemonLockStatePath, mcpDaemonStateFiles } from "../src/cli/mcp-pid.ts";
 
 describe("looksLikeQmdMcpCommand", () => {
   test("matches bare qmd and common CLI script paths", () => {
@@ -42,6 +42,13 @@ describe("mcpDaemonStateFiles", () => {
       pidFile: "mcp-hsm-public-repro.pid",
       logFile: "mcp-hsm-public-repro.log",
     });
+  });
+});
+
+describe("mcpDaemonLockStatePath", () => {
+  test("scopes the critical-section sidecar to the pidfile it guards", () => {
+    expect(mcpDaemonLockStatePath("/cache/qmd/mcp.pid")).toBe("/cache/qmd/mcp.pid.lock.sqlite");
+    expect(mcpDaemonLockStatePath("/cache/qmd/mcp-named.pid")).toBe("/cache/qmd/mcp-named.pid.lock.sqlite");
   });
 });
 

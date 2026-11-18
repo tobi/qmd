@@ -2,7 +2,59 @@
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-11-17
+
+QMD adds document processors, metadata filtering, and remote model support.
+This release also updates llama.cpp and hardens concurrent indexing and MCP
+shutdown.
+
 ### Fixed
+
+- Serialize trust-record mutations and atomically publish the trust file, so
+  concurrent approvals and revocations do not overwrite each other.
+- Share a crash-recoverable SQLite sidecar lock across CLI, SDK and direct
+  embedding runs, preventing concurrent partial-vector cleanup from deleting
+  another run's completed vectors.
+- Hold the index's embed lock in `clearAllEmbeddings`, so a clear cannot drop
+  the vector table under a running embed or resurrect vectors it just deleted.
+- Keep SDK configuration sources separate per store. Coordinate LLM sessions,
+  idle unloading and disposal so in-flight operations retain their resources.
+- Wait for admitted SDK operations before closing their store, and reject
+  reentrant closes instead of closing SQLite beneath active work.
+- Bound MCP shutdown to a five-second grace period by default. On timeout,
+  cancel requests and report failure without disposing resources still in use.
+- Stream MCP event responses instead of buffering them indefinitely, and cancel
+  requests when their clients disconnect.
+- Serialize overlapping scans on one connection and make processor publication
+  and embedding retry states explicit.
+- Reconcile document changes made during CJK FTS shadow rebuilding before
+  publishing, so concurrent writes remain searchable.
+- Serialize YAML configuration mutations and publish them atomically, retaining
+  concurrent edits and the permissions and targets of existing config files.
+  Synchronize SQLite against the current locked config snapshot so an older
+  opener cannot remove another process's newly added collection, and publish
+  SDK collection and context changes before mirroring them, so a refused config
+  write leaves no database-only edit or stale `config_hash`. A rename records
+  the old→new pair before publishing, so an interrupted index move is finished
+  by repeating the command and is never inferred from a name that merely exists;
+  repeating a removal finishes it the same way. While that marker is live, a
+  second rename or any change to either name is refused with
+  `PendingRenameError` instead of destroying the only evidence, and an
+  unreadable or malformed marker fails closed with `CorruptPendingRenameError`
+  rather than being read as "no rename".
+- Coordinate MCP daemon PID-file claims and stale recovery between current
+  versions, preventing concurrent starters from displacing a live daemon.
+- Avoid leaking Nix libc to host subprocesses, and use the build target instead
+  of running `uname` to select the Darwin launcher mitigation.
+- Expose the matching C++ runtime in the Linux Nix development shell so Bun can
+  load the packaged llama.cpp backend.
+- Correct the Python and Go grammar repair hints to use their pinned versions.
+- Keep memory-regression coverage effective when Bun's SQLite does not track
+  allocations for `hard_heap_limit`.
+
+- Security: MCP stdio and HTTP startup now enforce project-local config trust
+  before selecting models, ignoring all unapproved model URIs and options,
+  including remote embedding credential environment variable names.
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
@@ -13,6 +65,34 @@
 
 ### Added
 
+- Check bounded TLA+ models for lock, trust, indexing, processor, SDK and
+  server lifecycles in CI, including intentional counterexample controls.
+
+- Per-collection processors turn source files into stable-key Markdown index
+  documents through explicit SDK callbacks or trusted argv commands. Bounded
+  whole-source validation and SQL savepoints retain the last complete result on
+  processing failures; source fingerprints skip unchanged work and preserve
+  unchanged output vectors. Empty coverage and processor-mode markers prevent
+  silent raw-input fallback after configuration removal. Commands are not an OS
+  sandbox; see `docs/PROCESSORS.md` for trust, versioning and crash boundaries.
+- Optional TypeSafe System One reranking through `models.rerank: typesafe:<model>`
+  and copied per-store `rerankOptions` (revision and credential variable name).
+  Independent per-document scores use bounded two-worker HTTP, caller/session
+  cancellation and revision-specific cache identities, without a local reranker.
+  Public SDK search accepts a signal; duplicate-file chunks cache by result index.
+  Status/doctor do not probe the remote service; pull skips its download.
+  Local models and cache keys are unchanged. Adapted from #1014
+  (thanks @caseymanos).
+- Explicit OpenAI-compatible remote embeddings through `models.embed` API-base
+  URIs (`http[s]://host/v1#model-id`), with bounded requests/responses,
+  caller/session cancellation and opt-in credential environment variable names.
+  SDK and CLI indexing need no local embedding model or tokenizer. Remote space
+  identities pin the endpoint, model, dimensions, revision and input format;
+  vector search enforces remote space boundaries in scope and reads matches
+  from one post-request SQLite snapshot. Remote queries require exact model/
+  fingerprint matches; local queries refuse remote rows without changing existing
+  local-to-local or legacy-fingerprint behavior. Local GGUF defaults are unchanged.
+  Adapted from #761 (thanks @epruseal).
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, `contains`/`prefix`/`suffix` text matching, `type` for the stored type of a key's values, and `exists` presence, with an optional `caseInsensitive` flag on any condition whose value is a string (ASCII folding). Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 - Metadata discovery. Filtering is only useful when the caller knows what to filter on, so every surface now reports the metadata keys, types, and value counts already in the index — read from the existing metadata tables, with no re-indexing. The CLI adds `qmd collection metadata [name...]` with `--filter <json>` to count only documents matching a filter (same AST as search) and `--match <json>` to select which metadata entries are reported (the same AST evaluated per entry, where a condition's `field` is the entry's `key` or `value`, so one grammar covers a single key, a family of keys, reverse lookup of a value, typed thresholds, and any `and`/`or`/`not` composition), plus `--key-limit`/`--key-offset`/`--all-keys` and `--value-limit`/`--value-offset`/`--all-values` to page both windows, and `--sort count|value` and `--min-count <n>` to order and trim values. Every windowed list reports its exact remainder, counts are documents rather than values, numbers report min/median/max, keys whose documents disagree on type are split per type with their own counts, and with `--filter` every coverage count is measured against the documents the filter admits. `qmd collection list` names each collection's top keys, `qmd collection show` details them with a value preview, and `qmd status` summarizes coverage. The SDK adds `listMetadata(options)` (the same options, spelled `keyLimit`, `valueLimit`, and so on, with `MetadataOptionError` for a value outside its domain and `MetadataBindingBudgetError` for a filter and match that together bind too many SQL parameters), the MCP server adds a `metadata` tool and lists each collection's most covered keys in `status`, and the HTTP server adds `POST /metadata`. `MetadataFilter` and `MetadataMatch` are both `MetadataPredicate<Condition>`, one recursive grammar over the conditions a document or a metadata entry admits.
@@ -51,6 +131,11 @@
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
 
 ### Changed
+
+- Update `node-llama-cpp` 3.20.0 → 3.22.3 (llama.cpp v0.9.0), MCP server
+  2.0.0 → 2.4.0, `web-tree-sitter` 0.26.12 → 0.27.2, and other compatible
+  runtime and development dependencies. Refresh Bun, pnpm and Nix dependency
+  metadata; Vitest stays on 3 and TypeScript on 5 for compatibility.
 
 - The MCP server caches its instructions per store for up to 60 seconds instead
   of rebuilding them, with a full index-status scan, for every HTTP request.
@@ -1381,6 +1466,7 @@ notes, journals, and meeting transcripts.
 - CLI: `qmd add`, `qmd embed`, `qmd search`, `qmd vsearch`, `qmd query`,
   `qmd get`. ~1800 lines of TypeScript in a single `qmd.ts` file.
 
-[Unreleased]: https://github.com/tobi/qmd/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/tobi/qmd/compare/v2.9.0...HEAD
+[2.9.0]: https://github.com/tobi/qmd/compare/v2.8.3...v2.9.0
 [1.0.0]: https://github.com/tobi/qmd/releases/tag/v1.0.0
 [0.9.0]: https://github.com/tobi/qmd/compare/v0.8.0...v0.9.0

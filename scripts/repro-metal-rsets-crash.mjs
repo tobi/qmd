@@ -30,8 +30,8 @@
  *      that the dispose path would normally clean up).
  *   3. Skip explicit dispose. Just let the process exit.
  *
- * Expected behavior on macOS 15+ with Apple Silicon, current llama.cpp
- * (bundled in node-llama-cpp 3.18.1, llama.cpp tag b8390):
+ * Observed behavior on macOS 15+ with Apple Silicon using node-llama-cpp
+ * 3.18.1 (llama.cpp tag b8390):
  *   - Without GGML_METAL_NO_RESIDENCY:
  *       Script writes "ok" and main() returns, then ggml_abort fires the
  *       assertion, prints a multi-kB backtrace, and the process exits with

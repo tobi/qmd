@@ -99,28 +99,66 @@ describe("doctor vector sampling", () => {
     expect(getEmbeddingVectorSamples(store.db, "missing", "current")).toEqual([]);
   });
 
-  test("samples large documents with duplicate paths within a 32 MiB SQLite budget", () => {
-    // SQLite's hard heap limit is process-wide and cannot be raised again.
+  // Both budget workers bound the kernel's peak-RSS high-water mark, which
+  // records the transient spike of one synchronous statement whatever SQLite
+  // build is in use; PRAGMA hard_heap_limit only binds where SQLite tracks its
+  // own memory, which Bun's bundled SQLite on Linux no longer does. Each worker
+  // also proves the probe resolves the budget by materialising a blob twice
+  // its size afterwards, so a blind probe cannot pass.
+  function expectPeakRssBudget(report: {
+    budgetBytes: number;
+    controlBlobBytes: number;
+    windowGrowthBytes: number | null;
+    controlGrowthBytes: number | null;
+  }): void {
+    expect(report.controlBlobBytes).toBe(2 * report.budgetBytes);
+    // Peak RSS is a Linux counter; elsewhere only the functional result holds.
+    if (report.windowGrowthBytes === null || report.controlGrowthBytes === null) {
+      expect(process.platform).not.toBe("linux");
+      return;
+    }
+    expect(report.windowGrowthBytes).toBeLessThanOrEqual(report.budgetBytes);
+    expect(report.controlGrowthBytes).toBeGreaterThanOrEqual(report.budgetBytes);
+  }
+
+  test("samples large documents with duplicate paths within a 32 MiB peak-RSS budget", () => {
     const worker = join(projectRoot, "test", "_helpers", "doctor-vector-sample-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
     const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 20_000 });
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ samples: 3, distinctChunks: 3, bodiesComplete: true });
+    const out = JSON.parse(result.stdout) as {
+      samples: number;
+      distinctChunks: number;
+      bodiesComplete: boolean;
+      budgetBytes: number;
+      controlBlobBytes: number;
+      queryGrowthBytes: number | null;
+      controlGrowthBytes: number | null;
+    };
+    // Three distinct chunks with each body read whole: the sample limits chunk
+    // identities before it joins any body in.
+    expect(out).toMatchObject({ samples: 3, distinctChunks: 3, bodiesComplete: true });
+    expectPeakRssBudget({ ...out, windowGrowthBytes: out.queryGrowthBytes });
   });
 
-  test("the doctor check verifies large documents with duplicate paths within a 32 MiB SQLite budget", () => {
-    // SQLite's hard heap limit is process-wide and cannot be raised again.
+  test("the doctor check verifies large documents with duplicate paths within a 32 MiB peak-RSS budget", () => {
     const worker = join(projectRoot, "test", "_helpers", "doctor-vector-check-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
     const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    const out = JSON.parse(result.stdout);
+    const out = JSON.parse(result.stdout) as {
+      ok: boolean;
+      details: string;
+      budgetBytes: number;
+      controlBlobBytes: number;
+      checkGrowthBytes: number | null;
+      controlGrowthBytes: number | null;
+    };
     expect(out).toMatchObject({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    expectPeakRssBudget({ ...out, windowGrowthBytes: out.checkGrowthBytes });
   });
 });
