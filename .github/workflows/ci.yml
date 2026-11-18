@@ -54,9 +54,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Bun 1.4.4 no longer enforces the SQLite hard heap limit on Linux.
-          # Keep the memory-budget regressions meaningful until that is fixed.
-          bun-version: "1.4.3"
+          # Memory-budget tests assert peak RSS, so CI pins 1.4.4.
+          bun-version: "1.4.4"
 
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
@@ -75,3 +74,9 @@ jobs:
           CI: true
           DYLD_LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
           LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
+
+      - name: Formal model checks
+        if: runner.os == 'Linux'
+        run: bun scripts/check-formal.ts
+        env:
+          CI: true

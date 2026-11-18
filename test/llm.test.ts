@@ -8,9 +8,10 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -117,6 +118,18 @@ describe("inspectGgufFile", () => {
 });
 
 describe("canWriteLlamaDir", () => {
+  test("checks the installed package even when package.json is not exported", () => {
+    const require = createRequire(import.meta.url);
+    const dir = join(dirname(dirname(require.resolve("node-llama-cpp"))), "llama");
+    let writable = true;
+    try {
+      accessSync(dir, constants.W_OK);
+    } catch {
+      writable = false;
+    }
+    expect(canWriteLlamaDir()).toBe(writable);
+  });
+
   test("returns true when llama/ exists and is writable", () => {
     const dir = mkdtempSync(join(tmpdir(), "qmd-llama-rw-"));
     mkdirSync(join(dir, "llama"));

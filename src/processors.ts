@@ -116,23 +116,26 @@ export function createCommandProcessor(spec: CommandProcessorSpec, options: { cw
       });
       const chunks: Buffer[] = [];
       let stdoutBytes = 0, stderrBytes = 0, settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const dispose = (): void => {
         if (child.pid) {
           try { if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* already exited */ }
         }
         child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
       };
+      // Settlement must survive cleanup: a child whose pipes or process table
+      // entry is already gone still has to release the caller's await, exactly
+      // once, or the source would look alive until the outer timeout fires.
       const finish = (error?: ProcessorFailure, documents?: readonly ProcessorDocument[]): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         signal.removeEventListener("abort", abort);
-        dispose();
+        try { dispose(); } catch { /* the child is already gone */ }
         if (error) reject(error); else resolve(documents!);
       };
       const abort = (): void => finish(new ProcessorFailure("PROCESSOR_ABORTED"));
-      const timer = setTimeout(() => finish(new ProcessorFailure("PROCESSOR_TIMEOUT")), normalized.timeoutMs);
-      signal.addEventListener("abort", abort, { once: true });
+      timer = setTimeout(() => finish(new ProcessorFailure("PROCESSOR_TIMEOUT")), normalized.timeoutMs);
       child.on("error", () => finish(new ProcessorFailure("PROCESSOR_SPAWN_FAILED")));
       child.stdin.on("error", () => finish(new ProcessorFailure("PROCESSOR_INPUT_FAILED")));
       child.stdout.on("data", (chunk: Buffer) => {

@@ -1,16 +1,24 @@
-import type { Database } from "../../src/db.js";
+import { readFileSync } from "node:fs";
 
 /**
- * Whether SQLite enforces the hard heap limit just set on `db`: an allocation
- * past it fails with SQLITE_NOMEM only when SQLite tracks memory. Bun's bundled
- * SQLite on Linux does; better-sqlite3 (DEFAULT_MEMSTATUS=0) does not, so a
- * heap-budget test proves its budget only where this returns true.
+ * Peak resident memory this process has used, in bytes, or null where the
+ * kernel keeps no such counter for it (anything but Linux).
+ *
+ * Budget tests that spawn a worker use this instead of `PRAGMA
+ * hard_heap_limit`: the limit only binds where SQLite tracks its own
+ * allocations, which Bun's bundled SQLite on Linux no longer does, whereas
+ * VmHWM is the resident high-water mark of the whole process whatever SQLite
+ * build is in use. Being monotonic, it also records a transient spike that is
+ * gone by the time the next read happens - so reading it before and after one
+ * synchronous statement is enough to see what that statement touched.
  */
-export function heapLimitBinds(db: Database, limitBytes: number): boolean {
+export function peakRssBytes(): number | null {
+  let status: string;
   try {
-    db.prepare(`SELECT length(randomblob(?)) AS n`).get(limitBytes + 8 * 1024 * 1024);
-    return false;
+    status = readFileSync("/proc/self/status", "utf8");
   } catch {
-    return true;
+    return null;
   }
+  const match = /^VmHWM:\s+(\d+)\s+kB$/m.exec(status);
+  return match ? Number(match[1]) * 1024 : null;
 }
