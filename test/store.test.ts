@@ -2729,6 +2729,18 @@ describe("Snippet Extraction", () => {
     expect(snippet).toContain("keyword");
   });
 
+  test("extractSnippet locates a quoted Chinese term", () => {
+    const body = "# 周会记录\n议程\n进度\n决定：月底报销仅需提交电子单据。";
+    const result = extractSnippet(body, '"月底报销"');
+    expect(result.line).toBe(4);
+    expect(result.snippet).toContain("月底报销");
+  });
+
+  test("extractSnippet prefers the whole quoted phrase over an isolated word", () => {
+    const body = "Travel tips\nOther business\nNew travel policy applies next week";
+    expect(extractSnippet(body, '"travel policy"').line).toBe(3);
+  });
+
   test("extractSnippet includes context lines", () => {
     const body = "Line 1\nLine 2\nLine 3 has keyword\nLine 4\nLine 5";
     const { snippet } = extractSnippet(body, "keyword", 500);

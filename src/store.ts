@@ -6754,7 +6754,12 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   }
 
   const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  // Score quoted phrases together: the FTS query delimiters aren't part of
+  // the matching text, and a line containing only one word isn't an exact hit.
+  const queryTerms = Array.from(
+    query.toLowerCase().matchAll(/"([^"]*)"|([^\s"]+)/g),
+    match => (match[1] ?? match[2]!).trim(),
+  ).filter(Boolean);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
