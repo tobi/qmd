@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- The MCP `query` tool now exposes `chunkStrategy: "auto" | "regex"` and
+  forwards it through the shared search pipeline. Code collections embedded
+  with AST-aware chunks can now use the same function, class, type, and import
+  boundaries when MCP selects passages for reranking; server instructions tell
+  agents to opt in with `auto` for indexed code; HTTP `POST /query` and
+  `/search` accept it too.
+
 ## [2.9.0] - 2026-11-17
 
 QMD adds document processors, metadata filtering, and remote model support.
