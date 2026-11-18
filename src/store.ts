@@ -12,6 +12,15 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+// The embed lock is the one crash-safe cross-process domain for embedding this
+// index; store.ts is where every embed entry point (SDK, CLI, direct calls)
+// funnels through, so it joins that domain here rather than in each caller.
+import {
+  acquireEmbedLock,
+  embedLockPathForDb,
+  type EmbedLockBusyReason,
+  type EmbedLockHandle,
+} from "./cli/embed-lock.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -52,6 +61,7 @@ import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
@@ -72,6 +82,8 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { copyCommandProcessorSpec, snapshotProcessor, type DocumentProcessor } from "./processors.js";
+import { initializeProcessorSchema, requireProcessor, reindexProcessedFiles, removeProcessorState, renameProcessorState } from "./processor-store.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -180,7 +192,8 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
   ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+  const digest = createHash("sha256").update(significant).digest("hex");
+  return model.startsWith("remote-openai:") ? digest : digest.slice(0, 6);
 }
 
 /**
@@ -1138,6 +1151,56 @@ function dropTableIfExists(db: Database, tableName: string): void {
   db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`);
 }
 
+/** A document id the publish step must re-read from the documents table. */
+type FtsRefreshId = { id: number };
+
+/**
+ * Rewrite the FTS rows of documents the shadow published stale, from the
+ * documents table as it is inside the publish transaction — the exact state
+ * that commits. A document that is no longer active ends up with no row.
+ */
+function refreshFtsRowsFromDocuments(db: Database, ...idSets: readonly FtsRefreshId[][]): void {
+  const selectDoc = db.prepare(`
+    SELECT d.collection AS collection, d.path AS path, d.title AS title, content.doc AS body
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.id = ? AND d.active = 1
+  `);
+  const deleteRow = db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`);
+  const insertRow = db.prepare(`INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+
+  for (const ids of idSets) {
+    for (const { id } of ids) {
+      deleteRow.run(id);
+      // One document at a time: bodies are large and independently capped, so
+      // a corpus-wide change set never builds one huge JS array here.
+      const doc = selectDoc.get(id) as { collection: string; path: string; title: string; body: string } | undefined;
+      if (!doc) continue;
+      insertRow.run(
+        id,
+        normalizeCjkForFTS(`${doc.collection}/${doc.path}`),
+        normalizeCjkForFTS(doc.title),
+        normalizeCjkForFTS(doc.body)
+      );
+    }
+  }
+}
+
+/**
+ * Test-only seam between the shadow build and its publish. A regression test
+ * needs another connection to commit in exactly that window, which nothing
+ * in-process can interleave with because the rebuild is synchronous.
+ * Production never installs a hook.
+ */
+let _ftsRebuildBeforePublishHook: ((db: Database) => void) | null = null;
+
+/** @internal Install the rebuild publish-race seam; pass null to clear it. */
+export function _setFtsRebuildBeforePublishHookForTesting(
+  hook: ((db: Database) => void) | null
+): void {
+  _ftsRebuildBeforePublishHook = hook;
+}
+
 function rebuildFTSForCjkNormalization(db: Database): void {
   // Repair leftover content-external FTS *before* the version check or the
   // later `DELETE FROM documents_fts`. A stamped CJK version with a legacy
@@ -1150,14 +1213,18 @@ function rebuildFTSForCjkNormalization(db: Database): void {
   // rebuild implementation. New concurrent rebuilds use per-process names below.
   dropTableIfExists(db, "documents_fts_rebuild");
 
-  // Stream rows from disk and build into a per-process shadow FTS table. A fixed
-  // shadow name made concurrent cold opens collide (`database is locked`, then
-  // `no such table: documents_fts_rebuild`) before the schema version could be
-  // stamped. The final live-table swap is protected by BEGIN IMMEDIATE and a
-  // double-checked version read, so only one process publishes the rebuild.
+  // Stream rows from disk and build into a per-process shadow FTS table plus a
+  // per-row identity snapshot. A fixed shadow name made concurrent cold opens
+  // collide (`database is locked`, then `no such table: documents_fts_rebuild`)
+  // before the schema version could be stamped. Publishing runs in one
+  // BEGIN IMMEDIATE with a double-checked version read, so only one process
+  // installs the rebuild, and it reconciles the snapshot's changes first.
   const BATCH_SIZE = 500;
-  const rebuildTable = `documents_fts_rebuild_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const rebuildSuffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const rebuildTable = `documents_fts_rebuild_${rebuildSuffix}`;
+  const snapshotTable = `documents_fts_snapshot_${rebuildSuffix}`;
   const quotedRebuildTable = quoteSqlIdentifier(rebuildTable);
+  const quotedSnapshotTable = quoteSqlIdentifier(snapshotTable);
 
   try {
     db.exec(`
@@ -1167,9 +1234,22 @@ function rebuildFTSForCjkNormalization(db: Database): void {
       )
     `);
 
-    type FtsRow = { id: number; collection: string; path: string; title: string; body: string };
+    // Identity of every shadow row as it was read: a plain table keyed by
+    // document id, so publishing can diff it against documents in SQL instead
+    // of re-reading bodies or holding the writer lock during the build.
+    db.exec(`
+      CREATE TABLE ${quotedSnapshotTable} (
+        id INTEGER PRIMARY KEY,
+        hash TEXT NOT NULL,
+        filepath TEXT NOT NULL,
+        title TEXT NOT NULL
+      )
+    `);
+
+    type FtsRow = { id: number; collection: string; path: string; title: string; body: string; hash: string };
 
     const insert = db.prepare(`INSERT INTO ${quotedRebuildTable}(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+    const insertSnapshot = db.prepare(`INSERT INTO ${quotedSnapshotTable}(id, hash, filepath, title) VALUES (?, ?, ?, ?)`);
 
     // The transaction closes over a mutable `batch` buffer rather than taking the
     // batch as an argument: the wrapper's transaction() type only accepts scalar
@@ -1177,12 +1257,14 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     let batch: FtsRow[] = [];
     const flushBatch = db.transaction(() => {
       for (const row of batch) {
+        const filepath = `${row.collection}/${row.path}`;
         insert.run(
           row.id,
-          normalizeCjkForFTS(`${row.collection}/${row.path}`),
+          normalizeCjkForFTS(filepath),
           normalizeCjkForFTS(row.title),
           normalizeCjkForFTS(row.body)
         );
+        insertSnapshot.run(row.id, row.hash, filepath, row.title);
       }
     });
 
@@ -1190,7 +1272,7 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     // transaction. Holding a better-sqlite3 iterator open while beginning a
     // transaction on the same connection raises "database is busy".
     const selectBatch = db.prepare(`
-      SELECT d.id, d.collection, d.path, d.title, content.doc as body
+      SELECT d.id, d.hash, d.collection, d.path, d.title, content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
       WHERE d.active = 1
@@ -1207,18 +1289,64 @@ function rebuildFTSForCjkNormalization(db: Database): void {
       lastId = batch[batch.length - 1]!.id;
     }
 
-    // Atomic publish: copy the completed shadow index into the live table and
-    // stamp the version while holding the writer lock. If another process won
-    // the race while this one was building its shadow, skip the publish and only
-    // drop this process's private shadow table.
+    // Both the shadow and its identity snapshot are complete; a concurrent
+    // writer may commit from here on and is reconciled by the publish.
+    _ftsRebuildBeforePublishHook?.(db);
+
+    // Atomic publish. The shadow was read without the writer lock, so another
+    // connection may have committed documents after their shadow row was read
+    // (`qmd update`, an MCP write, a cold open in another process). A blind
+    // DELETE+INSERT would then publish the corpus as of the read — a document
+    // committed after it keeps no row, and one updated after it gets its old
+    // text back — and the stamp would make that permanent.
+    //
+    // The copy therefore runs in the same IMMEDIATE transaction as a set diff
+    // between the identity recorded for every shadow row and the documents
+    // table at commit time: a row whose document is inactive or gone is not
+    // published, a row whose document changed content/path/title is re-read
+    // with CJK normalization, and a document the shadow never saw is added the
+    // same way. The diff compares ids and hashes, so it never re-reads an
+    // unchanged body and the lock covers only the copy plus the changed set.
+    // If another process won the race while this one was building its shadow,
+    // skip the publish and only drop this process's private tables.
     db.exec(`BEGIN IMMEDIATE`);
     try {
       if (cjkRebuildVersion(db) !== FTS_CJK_NORMALIZED_VERSION) {
+        // Same id, different identity: the document was rewritten (or
+        // deactivated/removed) after its shadow row was read, so that row is
+        // stale and must not be published by the bulk copy below.
+        const changedRows = db.prepare(`
+          SELECT s.id AS id
+          FROM ${quotedSnapshotTable} s
+          LEFT JOIN documents d ON d.id = s.id
+          WHERE d.id IS NULL
+            OR d.active = 0
+            OR d.hash <> s.hash
+            OR s.filepath <> d.collection || '/' || d.path
+            OR s.title <> d.title
+        `).all() as FtsRefreshId[];
+        // Documents committed after the shadow's last batch read, plus
+        // documents that were inactive when their id was passed and are active
+        // now.
+        const unseenRows = db.prepare(`
+          SELECT d.id AS id
+          FROM documents d
+          LEFT JOIN ${quotedSnapshotTable} s ON s.id = d.id
+          WHERE d.active = 1 AND s.id IS NULL
+        `).all() as FtsRefreshId[];
+
+        // Bulk copy first: one statement and no per-row JS for the (normally
+        // overwhelming) part of the corpus that did not change mid-rebuild.
         db.exec(`DELETE FROM documents_fts`);
         db.exec(
           `INSERT INTO documents_fts(rowid, filepath, title, body)
            SELECT rowid, filepath, title, body FROM ${quotedRebuildTable}`
         );
+
+        if (changedRows.length > 0 || unseenRows.length > 0) {
+          refreshFtsRowsFromDocuments(db, changedRows, unseenRows);
+        }
+
         db.prepare(`
           INSERT OR REPLACE INTO store_config(key, value)
           VALUES ('fts_cjk_normalized_version', ?)
@@ -1231,6 +1359,7 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     }
   } finally {
     dropTableIfExists(db, rebuildTable);
+    dropTableIfExists(db, snapshotTable);
   }
 }
 
@@ -1312,6 +1441,7 @@ function initializeDatabase(db: Database): void {
   // Document metadata — extraction state plus normalized value rows for
   // metadata filtering. Keyed by document identity, not content hash.
   initializeMetadataSchema(db);
+  initializeProcessorSchema(db);
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -1376,9 +1506,11 @@ type StoreCollectionRow = {
   context: string | null;
 };
 
-function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
+function rowToNamedCollection(row: StoreCollectionRow, db: Database): NamedCollection {
+  const spec = db.prepare("SELECT spec FROM processor_specs WHERE collection = ?").get(row.name) as { spec: string } | undefined;
   return {
     name: row.name,
+    ...(spec ? { processor: copyCommandProcessorSpec(JSON.parse(spec.spec)) } : {}),
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
@@ -1390,13 +1522,13 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
 
 export function getStoreCollections(db: Database): NamedCollection[] {
   const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
-  return rows.map(rowToNamedCollection);
+  return rows.map(row => rowToNamedCollection(row, db));
 }
 
 export function getStoreCollection(db: Database, name: string): NamedCollection | null {
   const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
   if (row == null) return null;
-  return rowToNamedCollection(row);
+  return rowToNamedCollection(row, db);
 }
 
 export function getStoreGlobalContext(db: Database): string | undefined {
@@ -1427,6 +1559,11 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 }
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  const spec = collection.processor === undefined ? undefined : copyCommandProcessorSpec(collection.processor);
+  if (spec) {
+    db.prepare(`INSERT INTO processor_specs(collection, spec) VALUES (?, ?)
+      ON CONFLICT(collection) DO UPDATE SET spec = excluded.spec`).run(name, JSON.stringify(spec));
+  } else db.prepare("DELETE FROM processor_specs WHERE collection = ?").run(name);
   db.prepare(`
     INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1497,43 +1634,71 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
 }
 
 /**
+ * Clear the stored config hash so the next sync re-derives `store_collections`
+ * from the configuration instead of trusting a hash that was stamped before a
+ * direct database write. Every mirror of a configuration mutation uses it: the
+ * rows and the hash must not certify different documents.
+ */
+export function invalidateConfigHash(db: Database): void {
+  db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+}
+
+/**
  * Sync external config (YAML/inline) into SQLite store_collections.
  * External config always wins. Skips sync if config hash hasn't changed.
+ *
+ * The whole mirror is one immediate transaction, so a reader never observes a
+ * half-applied config and the hash commits with the rows it certifies. Callers
+ * that read the config from a file must read it under the file's lock and call
+ * this while still holding it — see `CollectionConfigScope.withLockedConfig` —
+ * otherwise a mutation another process published between the read and this
+ * call is deleted from `store_collections` and the stale hash is stamped over
+ * it. Cross-resource atomicity is not claimed: a crash between the file
+ * publish and this commit leaves the database behind the file, and the
+ * `config_hash` mismatch makes the next sync repair it.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
-  // Check config hash — skip sync if unchanged
+  // Config sync is also used on externally seeded databases before Store opens.
+  initializeProcessorSchema(db);
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
 
-  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
-  if (existingHash != null && existingHash.value === hash) {
-    return; // Config unchanged, skip sync
-  }
-
-  // Sync collections
-  const configNames = new Set(Object.keys(config.collections));
-
-  for (const [name, coll] of Object.entries(config.collections)) {
-    upsertStoreCollection(db, name, coll);
-  }
-
-  // Delete collections not in config
-  const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
-  for (const row of dbCollections) {
-    if (!configNames.has(row.name)) {
-      db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+  const apply = (): void => {
+    // Check config hash — skip sync if unchanged
+    const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
+    if (existingHash != null && existingHash.value === hash) {
+      return; // Config unchanged, skip sync
     }
-  }
 
-  // Sync global context
-  if (config.global_context !== undefined) {
-    setStoreGlobalContext(db, config.global_context);
-  } else {
-    setStoreGlobalContext(db, undefined);
-  }
+    // Sync collections
+    const configNames = new Set(Object.keys(config.collections));
 
-  // Save config hash
-  db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+    for (const [name, coll] of Object.entries(config.collections)) {
+      upsertStoreCollection(db, name, coll);
+    }
+
+    // Delete collections not in config
+    const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
+    for (const row of dbCollections) {
+      if (!configNames.has(row.name)) {
+        db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+      }
+    }
+
+    // Sync global context
+    if (config.global_context !== undefined) {
+      setStoreGlobalContext(db, config.global_context);
+    } else {
+      setStoreGlobalContext(db, undefined);
+    }
+
+    // Save config hash last: a crash before it leaves the rows uncertified.
+    db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+  };
+
+  // Already inside a caller's transaction: join it instead of opening one.
+  if (db.inTransaction) apply();
+  else db.transaction(apply).immediate();
 }
 
 
@@ -1631,7 +1796,7 @@ export type Store = {
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
@@ -1796,40 +1961,166 @@ function retireIndexedFile(
 }
 
 /**
+ * Lifecycle of the write transaction a scan batch owns:
+ *
+ *   idle --next()--> open --commit()/rollback()--> idle
+ *
+ * `commit()` returns the batch to `idle` instead of closing it, so callers can
+ * release the transaction between files (and must, before awaiting).
+ *
+ * One SQLite connection holds at most one transaction, and three guards follow
+ * from that: `next()` refuses to begin while `db.inTransaction` (which covers
+ * every writer on the connection, batched or not); the registry below
+ * identifies the batch that owns the open transaction, so a second batch can
+ * never commit or roll back somebody else's rows; and `next()` re-checks the
+ * lease every file, so a transaction that user code (`onProgress`, a processor)
+ * ended fails the scan instead of degrading it to one autocommit per file.
+ *
+ * Writers that bypass `scanWriteBatch` (`db.transaction(...)`, a bare
+ * `insertEmbedding`, …) are not tracked here. Isolation from them rests on the
+ * rule above: an open batch transaction never spans an `await`, so every other
+ * writer runs in a task where no batch transaction is open. Synchronous SQL run
+ * by a callback the scan itself invokes joins the batch by design.
+ */
+type WriteBatchPhase = "idle" | "open";
+
+const writeBatchOwners = new WeakMap<Database, symbol>();
+
+/**
  * Groups the per-file writes of a collection scan into short transactions.
  * Committed one by one, a first index of a large collection writes a content
  * row, a document, its metadata and a sync row per file, each its own WAL
  * commit: 20,000 files took about 176 s that way. A batch closes after
  * `maxFiles` files or `maxMs`, so other writers never wait longer than that.
+ *
+ * An open transaction must never outlive the synchronous stretch that opened
+ * it: while the batch is suspended on an `await`, any other writer's statements
+ * would execute inside this transaction. `commit()` before awaiting.
  */
 export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: number = 250) {
-  let open = false;
+  const token = Symbol("scanWriteBatch");
+  let phase: WriteBatchPhase = "idle";
   let files = 0;
   let startedAt = 0;
-  const commit = (): void => {
-    if (!open) return;
-    open = false;
-    db.exec("COMMIT");
+
+  const assertOwnsOpenTransaction = (action: string): void => {
+    const owner = writeBatchOwners.get(db);
+    if (owner === token) return;
+    throw new Error(
+      owner
+        ? `scanWriteBatch: cannot ${action} — another write batch owns this connection's transaction; serialize writers that share one store`
+        : `scanWriteBatch: cannot ${action} — this batch's transaction was closed outside the batch`
+    );
   };
+
+  const openTransaction = (): void => {
+    if (db.inTransaction) {
+      throw new Error(
+        "scanWriteBatch: cannot BEGIN — the connection already has an open transaction; " +
+          "serialize writers that share one store instead of interleaving their scans"
+      );
+    }
+    if (writeBatchOwners.has(db)) {
+      // An owner with no transaction holds nothing: it was committed or rolled
+      // back outside its batch. Reclaim the connection instead of failing every
+      // later scan on it.
+      writeBatchOwners.delete(db);
+    }
+    db.exec("BEGIN");
+    writeBatchOwners.set(db, token);
+    phase = "open";
+    files = 0;
+    startedAt = Date.now();
+  };
+
+  const closeTransaction = (statement: "COMMIT" | "ROLLBACK"): void => {
+    assertOwnsOpenTransaction(statement === "COMMIT" ? "commit" : "roll back");
+    if (!db.inTransaction) {
+      // The transaction went away behind the batch's back. Reporting a commit
+      // here would claim writes that no longer exist, so it fails; a rollback
+      // has nothing left to undo.
+      writeBatchOwners.delete(db);
+      phase = "idle";
+      if (statement === "COMMIT") {
+        throw new Error("scanWriteBatch: cannot commit — this batch's transaction was closed outside the batch");
+      }
+      return;
+    }
+    db.exec(statement);
+    writeBatchOwners.delete(db);
+    phase = "idle";
+  };
+
   return {
     /** Call before a file's writes; closes the batch when it is full or old. */
     next(): void {
-      if (open && (files >= maxFiles || Date.now() - startedAt >= maxMs)) commit();
-      if (!open) {
-        db.exec("BEGIN");
-        open = true;
-        files = 0;
-        startedAt = Date.now();
+      if (phase === "open") {
+        if (!db.inTransaction) {
+          // User code that runs inside the batch - a progress callback, a
+          // processor - or anything else on the connection ended the
+          // transaction. Writing on would autocommit every file, so fail here
+          // with the cause instead of losing atomicity silently.
+          writeBatchOwners.delete(db);
+          phase = "idle";
+          throw new Error("scanWriteBatch: the batch's transaction was closed while the batch was open");
+        }
+        if (files < maxFiles && Date.now() - startedAt < maxMs) {
+          files++;
+          return;
+        }
+        closeTransaction("COMMIT");
       }
-      files++;
+      openTransaction();
+      files = 1;
     },
-    commit,
+    commit(): void {
+      if (phase === "idle") return;
+      closeTransaction("COMMIT");
+    },
     rollback(): void {
-      if (!open) return;
-      open = false;
-      db.exec("ROLLBACK");
+      if (phase === "idle") return;
+      closeTransaction("ROLLBACK");
     },
   };
+}
+
+/**
+ * `reindexCollection` is async (globbing, processors) while a store owns a
+ * single connection whose scan batch cannot be shared: two overlapping calls
+ * would nest `BEGIN` (which throws) and either call's `ROLLBACK` could discard
+ * files the other had already written. Reindexes on one connection are queued
+ * FIFO instead, so each one still commits only its own batch.
+ */
+const reindexQueues = new WeakMap<Database, Promise<void>>();
+
+/**
+ * The connection whose scan is currently driving an in-process processor.
+ * `AsyncLocalStorage` confines it to that processor's own promise chain, so an
+ * independent caller - another collection's update, an MCP request - does not
+ * inherit it and is queued by `withExclusiveReindex` instead of being mistaken
+ * for a nested call. Only a scan started from inside the processor is rejected,
+ * because it would wait on the slot its own caller holds.
+ */
+const processorCallContext = new AsyncLocalStorage<Database>();
+
+async function withExclusiveReindex<T>(db: Database, run: () => Promise<T>): Promise<T> {
+  if (processorCallContext.getStore() === db) {
+    throw new Error(
+      "reindexCollection: cannot start a scan from inside a processor of the scan that is running on this store"
+    );
+  }
+  const predecessor = reindexQueues.get(db) ?? Promise.resolve();
+  // Resolve-only: a failing reindex must not reject the wait of its successor.
+  const released = Promise.withResolvers<void>();
+  const tail = predecessor.then(() => released.promise);
+  reindexQueues.set(db, tail);
+  try {
+    await predecessor;
+    return await run();
+  } finally {
+    released.resolve();
+    if (reindexQueues.get(db) === tail) reindexQueues.delete(db);
+  }
 }
 
 /**
@@ -1848,18 +2139,37 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
+    /**
+     * Called synchronously from inside the scan's write-batch transaction.
+     * Statements it runs join that transaction by design (they commit or roll
+     * back with the scan), so it must not commit or roll it back, and it must
+     * not start another scan of this store. It must return synchronously: work
+     * it defers can land in a later batch's transaction.
+     */
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
-  const batch = scanWriteBatch(store.db);
-  try {
-    const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, options);
-    batch.commit();
-    return result;
-  } catch (err) {
-    batch.rollback();
-    throw err;
-  }
+  const processor = options?.processor ? snapshotProcessor(options.processor) : undefined;
+  requireProcessor(store.db, collectionName, !!getStoreCollection(store.db, collectionName)?.processor, processor);
+  return withExclusiveReindex(store.db, async () => {
+    const batch = scanWriteBatch(store.db);
+    try {
+      const result = await reindexCollectionIn(batch, store, collectionPath, globPattern, collectionName, processor ? { ...options, processor } : options);
+      batch.commit();
+      return result;
+    } catch (err) {
+      try {
+        batch.rollback();
+      } catch (rollbackError) {
+        // A batch that no longer owns the transaction cannot undo its own
+        // writes; report both failures instead of hiding the original one.
+        throw new AggregateError([err, rollbackError], "reindexCollection failed and its write batch could not be rolled back");
+      }
+      throw err;
+    }
+  });
 }
 
 async function reindexCollectionIn(
@@ -1870,6 +2180,8 @@ async function reindexCollectionIn(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    processor?: DocumentProcessor;
+    signal?: AbortSignal;
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1913,6 +2225,16 @@ async function reindexCollectionIn(
     const parts = file.split("/");
     return !parts.some(part => part.startsWith("."));
   });
+
+  if (options?.processor) {
+    // A processor is arbitrary in-process code. A scan it starts on this store
+    // would wait for the slot this one holds, so it is rejected - but only that
+    // processor's own call chain carries the context; independent callers queue.
+    const processor = options.processor;
+    return await processorCallContext.run(db, () =>
+      reindexProcessedFiles(db, batch, collectionPath, collectionName, files.map(normalizePathSeparators), processor, options)
+    );
+  }
 
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
@@ -2000,7 +2322,10 @@ async function reindexCollectionIn(
       continue;
     }
 
-    const hash = await hashContent(content);
+    // Synchronous on purpose: hashing is CPU work, and awaiting it here would
+    // suspend the scan with this batch's transaction open, letting a concurrent
+    // writer (a second scan, an embedding batch) collide with or join it.
+    const hash = hashContentSync(content);
 
     // Hash matches cached sync state but mtime differed (clock skew, backup restore) — only update mtime cache
     if (cached && cached.content_hash === hash) {
@@ -2107,9 +2432,56 @@ export type EmbedResult = {
   errors: number;
   failures?: EmbedFailure[];
   durationMs: number;
+  /**
+   * True when this run found no documents waiting for embeddings, so a caller
+   * can report "everything is already embedded" instead of a zero-chunk run.
+   *
+   * This is answered inside the embed lock on purpose: probing for pending work
+   * before taking the lock can see another run's in-flight state, and taking
+   * the lock to probe and then taking it again would reintroduce the very
+   * double acquisition the lock exists to prevent. Callers that want their
+   * "no work" message to be authoritative must use this flag — a zero
+   * docsProcessed alone also covers runs whose documents were all empty.
+   */
+  nothingToDo: boolean;
 };
 
+/**
+ * Thrown when an embed run cannot start because another run already owns this
+ * index's embed lock — another process (CLI, SDK, or a direct
+ * generateEmbeddings call), or a run this process already has in flight.
+ *
+ * Embedding is exclusive per index. Two runs embedding the same hashes
+ * interleave their partial-chunk cleanup and their vector publication, so each
+ * can delete what the other just completed and the index can be left with
+ * chunks no run believes it wrote (#825). Ownership is a sidecar SQLite write
+ * transaction next to the index (`cli/embed-lock.ts`), so a crashed holder can
+ * never leave the lock stuck.
+ *
+ * The CLI reports this as "Another embed process is already running.
+ * Skipping."; library callers can catch it to back off or ask the user to wait
+ * for the running embed to finish.
+ */
+export class EmbedLockBusyError extends Error {
+  /** Sidecar lock path that another run owns. */
+  readonly lockPath: string;
+  /** Which artifact made this attempt lose (current sidecar or legacy pidfile). */
+  readonly reason: EmbedLockBusyReason;
+
+  constructor(lockPath: string, reason: EmbedLockBusyReason) {
+    super(
+      reason.kind === "legacy"
+        ? `Another qmd process (pid ${reason.pid}) is already embedding this index: ${lockPath}`
+        : `Another embed run already owns this index: ${lockPath}`
+    );
+    this.name = "EmbedLockBusyError";
+    this.lockPath = lockPath;
+    this.reason = reason;
+  }
+}
+
 export type EmbedOptions = {
+  signal?: AbortSignal;
   force?: boolean;
   model?: string;
   /**
@@ -2160,7 +2532,10 @@ function validatePositiveIntegerOption(name: string, value: number | undefined, 
   return value;
 }
 
-function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions, "maxDocsPerBatch" | "maxBatchBytes">> {
+/** Batch sizing validated from EmbedOptions, shared by the embed run. */
+type ResolvedEmbedBatchOptions = Required<Pick<EmbedOptions, "maxDocsPerBatch" | "maxBatchBytes">>;
+
+function resolveEmbedOptions(options?: EmbedOptions): ResolvedEmbedBatchOptions {
   return {
     maxDocsPerBatch: validatePositiveIntegerOption("maxDocsPerBatch", options?.maxDocsPerBatch, DEFAULT_EMBED_MAX_DOCS_PER_BATCH),
     maxBatchBytes: validatePositiveIntegerOption("maxBatchBytes", options?.maxBatchBytes, DEFAULT_EMBED_MAX_BATCH_BYTES),
@@ -2326,31 +2701,97 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
 }
 
 /**
+ * The on-disk file behind this connection's main database, or null when it has
+ * none (a true in-memory or temp database). `PRAGMA database_list` reports the
+ * file SQLite actually opened, so a plain path and any `file:` URI alias for
+ * the same index resolve to one lock instead of two, and a URI that names a
+ * shared on-disk database is still serialized. `realpathSync` collapses the
+ * remaining spellings (relative vs absolute, symlinks) once the file exists.
+ */
+function mainDatabaseFilePath(db: Database): string | null {
+  const rows = db.prepare(`PRAGMA database_list`).all() as { name?: string; file?: string }[];
+  const main = rows.find(row => row.name === "main");
+  const file = main?.file;
+  if (!file) return null;
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+/**
+ * Take the index's exclusive embed lock for one run over `db`, or null when the
+ * connection has no shared on-disk database (a true in-memory or temp
+ * database, which no other process can be embedding).
+ *
+ * Every run takes its own ownership: there is no way for a caller to hand one
+ * in, because a stale or unrelated handle would silently disable the mutual
+ * exclusion that keeps two runs from deleting each other's chunks. A caller
+ * that already holds the lock (an embedding run clearing its own vectors for
+ * `force`) calls the `...WithIndexLockHeld` body instead of re-acquiring here.
+ */
+function acquireEmbedLockForDb(db: Database): EmbedLockHandle | null {
+  const file = mainDatabaseFilePath(db);
+  if (!file) return null;
+  const lockPath = embedLockPathForDb(file);
+  const result = acquireEmbedLock(lockPath);
+  if (result.status === "busy") throw new EmbedLockBusyError(lockPath, result.reason);
+  return result.handle;
+}
+
+/**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
  * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ *
+ * Exclusive per index: the run holds the sidecar embed lock from before it
+ * clears, copies or reads pending vectors until after its last publication, so
+ * a concurrent CLI/SDK/direct run cannot interleave partial-chunk cleanup and
+ * vector writes with this one. Rejects with {@link EmbedLockBusyError} when
+ * another run already owns the lock; the lock is released on success, error
+ * and cancellation. A `force` clear goes through the lock-held body: this run
+ * already owns the lock and must not try to acquire it again.
  */
 export async function generateEmbeddings(
   store: Store,
   options?: EmbedOptions
 ): Promise<EmbedResult> {
+  // Reject invalid batch options before taking the lock, so a caller with a bad
+  // option sees that error rather than a "busy" from someone else's run.
+  const batchOptions = resolveEmbedOptions(options);
+  const lock = acquireEmbedLockForDb(store.db);
+  try {
+    return await embedWithIndexLockHeld(store, batchOptions, options);
+  } finally {
+    // Success, failure or cancellation: the next run must be able to start.
+    lock?.release();
+  }
+}
+
+/** The embedding run itself; generateEmbeddings() owns the index lock. */
+async function embedWithIndexLockHeld(
+  store: Store,
+  batchOptions: ResolvedEmbedBatchOptions,
+  options?: EmbedOptions
+): Promise<EmbedResult> {
+  const { maxDocsPerBatch, maxBatchBytes } = batchOptions;
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
   const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
-  const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
 
   if (options?.force) {
-    clearAllEmbeddings(db, options?.collection);
+    clearEmbeddingsWithIndexLockHeld(db, options?.collection);
   }
 
   const chunksCopied = copyVectorsToNewCollections(db, options?.collection).copied;
   const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
 
   if (docsToEmbed.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
+    return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0, nothingToDo: true };
   }
   const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
   const totalDocs = docsToEmbed.length;
@@ -2368,33 +2809,50 @@ export async function generateEmbeddings(
     const BATCH_SIZE = 32;
     const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
     const MAX_RETRY_ATTEMPTS = 3;
-    const failures = new Map<string, EmbedFailure>();
-    const retryQueue = new Map<string, ChunkItem>();
+    // Chunk retry lifecycle. A failed chunk starts `retryable`; each attempt
+    // spends one of MAX_RETRY_ATTEMPTS; the transition to `exhausted` is what
+    // removes a chunk from the retry pass and lets the forced pass terminate.
+    // A model whose batch call is one bounded attempt (remote) starts exhausted,
+    // so its failures are reported but never retried individually.
+    type RetryPhase = "retryable" | "exhausted";
+    type FailedChunk = { chunk: ChunkItem; attempts: number; phase: RetryPhase; reason: string };
+    const failuresAreRetryable = !model.startsWith("remote-openai:");
+    const failedChunks = new Map<string, FailedChunk>();
     let successesSinceRetry = 0;
 
-    const failureList = () => [...failures.values()];
-    const activeErrorCount = () => failures.size;
+    const failureList = (): EmbedFailure[] =>
+      [...failedChunks.values()].map(({ chunk, attempts, reason }) => ({
+        path: chunk.path,
+        hash: chunk.hash,
+        seq: chunk.seq,
+        attempts,
+        reason,
+      }));
+    const activeErrorCount = () => failedChunks.size;
     const chunkKey = (chunk: ChunkItem) => `${chunk.hash}:${chunk.seq}`;
     const reasonFromError = (error: unknown) => {
       const raw = error instanceof Error ? error.message : String(error);
       return raw.length > 180 ? `${raw.slice(0, 177)}...` : raw;
     };
+    const retryableChunks = (): FailedChunk[] =>
+      [...failedChunks.values()].filter((state) => state.phase === "retryable");
     const recordFailure = (chunk: ChunkItem, reason: string) => {
       const key = chunkKey(chunk);
-      const previous = failures.get(key);
-      failures.set(key, {
-        path: chunk.path,
-        hash: chunk.hash,
-        seq: chunk.seq,
-        attempts: (previous?.attempts ?? 0) + 1,
-        reason,
-      });
-      retryQueue.set(key, chunk);
+      const attempts = (failedChunks.get(key)?.attempts ?? 0) + 1;
+      const phase: RetryPhase = failuresAreRetryable && attempts < MAX_RETRY_ATTEMPTS ? "retryable" : "exhausted";
+      failedChunks.set(key, { chunk, attempts, phase, reason });
     };
     const clearFailure = (chunk: ChunkItem) => {
-      const key = chunkKey(chunk);
-      failures.delete(key);
-      retryQueue.delete(key);
+      failedChunks.delete(chunkKey(chunk));
+    };
+    // This writer expects to own every transaction it writes in; an open one
+    // belongs to another writer on the shared connection, and embedding rows
+    // written now would be committed or rolled back with that writer's work.
+    // The chunk fails instead, so the loss shows up as a retryable error.
+    const assertNoForeignTransaction = (): void => {
+      if (db.inTransaction) {
+        throw new Error("connection is inside another writer's transaction");
+      }
     };
     const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
       try {
@@ -2404,6 +2862,7 @@ export async function generateEmbeddings(
           recordFailure(chunk, "embedding returned no vector");
           return false;
         }
+        assertNoForeignTransaction();
         insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
         chunksEmbedded++;
         successesSinceRetry++;
@@ -2415,27 +2874,22 @@ export async function generateEmbeddings(
       }
     };
     const retryFailedChunks = async (force = false) => {
-      if (!session.isValid || retryQueue.size === 0) return;
+      if (!session.isValid) return;
       if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS) return;
+      if (retryableChunks().length === 0) return;
       successesSinceRetry = 0;
 
       // Normal mode: one retry pass after enough unrelated chunks succeeded.
       // Force mode: we have run out of other chunks for this batch, so keep
-      // retrying outstanding failures until they recover or hit the cap. The
-      // cap prevents endless loops on permanently bad chunks.
+      // retrying what is still retryable until it recovers or is exhausted.
       do {
         let retried = 0;
-        for (const [key, chunk] of [...retryQueue]) {
-          const failure = failures.get(key);
-          if (!failure || failure.attempts >= MAX_RETRY_ATTEMPTS) continue;
+        for (const state of retryableChunks()) {
           retried++;
-          await tryEmbedChunk(chunk);
+          await tryEmbedChunk(state.chunk);
         }
         if (!force || retried === 0) break;
-      } while (session.isValid && [...retryQueue].some(([key]) => {
-        const failure = failures.get(key);
-        return !!failure && failure.attempts < MAX_RETRY_ATTEMPTS;
-      }));
+      } while (session.isValid && retryableChunks().length > 0);
     };
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
@@ -2529,6 +2983,9 @@ export async function generateEmbeddings(
           // One IMMEDIATE transaction per batch: every chunk writes several
           // rows across three tables, and a kill mid-batch must not leave
           // them out of step. Failure bookkeeping runs after the commit.
+          // Checked after the await, immediately before the write, because the
+          // transaction this writer opens must be its own.
+          assertNoForeignTransaction();
           const stored: ChunkItem[] = [];
           const unembedded: ChunkItem[] = [];
           db.transaction(() => {
@@ -2556,8 +3013,18 @@ export async function generateEmbeddings(
           // individual retry succeeds, any prior failure for that chunk is
           // cleared, so the visible error count reflects outstanding failures.
           const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+          if (db.inTransaction) {
+            // The per-batch transaction is this writer's own and is always
+            // closed by the time the catch runs, so an open one belongs to
+            // another writer. Individual retries would write their rows into
+            // that transaction and be committed or rolled back with it, so the
+            // batch fails instead of writing outside its own transaction.
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed: ${batchReason}`);
+            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
+          } else if (!session.isValid || !failuresAreRetryable) {
+            // A remote batch is one bounded attempt; malformed/partial responses
+            // must not be rescued by individual HTTP calls.
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed: ${batchReason}`);
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
@@ -2593,7 +3060,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, signal: options?.signal, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -2602,6 +3069,7 @@ export async function generateEmbeddings(
     errors: result.errors,
     failures: result.failures,
     durationMs: Date.now() - startTime,
+    nothingToDo: false,
   };
 }
 
@@ -2663,12 +3131,12 @@ export function createStore(dbPath?: string): Store {
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
       // store.llm is unset made keys stable across config swaps (#764).
       const llm = getLlm(store);
-      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm);
+      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm, signal);
     },
 
     // Document retrieval
@@ -3481,10 +3949,18 @@ export function runCleanup(db: Database, hooks: CleanupHooks = {}): CleanupStats
 // Document helpers
 // =============================================================================
 
+/**
+ * Synchronous core of {@link hashContent}. Callers that hash while their write
+ * batch holds the connection's transaction (collection scans, the CLI index
+ * loop) must use this: awaiting a hash hands that transaction to whatever else
+ * runs during the suspension.
+ */
+export function hashContentSync(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
 export async function hashContent(content: string): Promise<string> {
-  const hash = createHash("sha256");
-  hash.update(content);
-  return hash.digest("hex");
+  return hashContentSync(content);
 }
 
 const titleExtractors: Record<string, (content: string) => string | null> = {
@@ -3847,6 +4323,13 @@ async function chunkDocumentByTokensWithLlm(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (llm.embedModelName?.startsWith("remote-openai:")) {
+    signal?.throwIfAborted();
+    // Fixed remote format v1: the existing surrogate-safe character chunker,
+    // never a local tokenizer or token-truncation pass. Tokens are estimates.
+    return chunkDocument(content, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, CHUNK_WINDOW_CHARS)
+      .map(chunk => ({ ...chunk, tokens: Math.ceil(chunk.text.length / 4) }));
+  }
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -4288,8 +4771,99 @@ function deleteVectorPartition(db: Database, collectionName: string): void {
 }
 
 /**
+ * Whether the index holds documents under this collection name.
+ *
+ * A rename target that owns documents is a real collection, not a name a config
+ * sync reserved from an already published file. See
+ * {@link assertRenameTargetAvailable}.
+ */
+function hasCollectionDocuments(db: Database, name: string): boolean {
+  // Loose comparison: bun:sqlite returns null for "no row" and better-sqlite3
+  // returns undefined, so `!== undefined` reported every name as populated.
+  return db.prepare(`SELECT 1 FROM documents WHERE collection = ? LIMIT 1`).get(name) != null;
+}
+
+/**
+ * Whether the index still holds anything keyed by this collection name:
+ * documents, sync rows, processor state or a vector partition.
+ *
+ * The store_collections row is deliberately excluded. A config sync writes that
+ * row straight from the configuration, so a removal or rename whose index half
+ * failed — or that crashed between publishing the file and moving the index —
+ * leaves the state below under the old name while the row already reflects the
+ * published file. Re-running the command finishes that state; see
+ * {@link reconcilePublishedRename}.
+ */
+export function hasCollectionIndexState(db: Database, name: string): boolean {
+  // Loose comparison again: null from bun:sqlite, undefined from
+  // better-sqlite3 for "no row".
+  const hasRow = (sql: string): boolean => db.prepare(sql).get(name) != null;
+  return (
+    hasCollectionDocuments(db, name)
+    || hasRow(`SELECT 1 FROM file_sync_state WHERE collection = ? LIMIT 1`)
+    || hasRow(`SELECT 1 FROM processor_specs WHERE collection = ? LIMIT 1`)
+    || hasRow(`SELECT 1 FROM processor_modes WHERE collection = ? LIMIT 1`)
+    || hasRow(`SELECT 1 FROM processor_outputs WHERE collection = ? LIMIT 1`)
+    || hasRow(`SELECT 1 FROM processor_sources WHERE collection = ? LIMIT 1`)
+    || resolveCollectionId(db, name) !== undefined
+  );
+}
+
+/**
+ * Refuse a rename whose target the index cannot take: a populated collection of
+ * that name, or a removed collection of that name whose vector partition only a
+ * sqlite-vec loaded build can drop.
+ *
+ * A caller that publishes the configuration before renaming the index calls
+ * this first, so an ordinary refusal happens before the file changes. A target
+ * row with no documents is not a refusal: a config sync writes rows from the
+ * already published file, and {@link reconcilePublishedRename} finishes that
+ * rename instead.
+ */
+export function assertRenameTargetAvailable(db: Database, newName: string): void {
+  if (hasCollectionDocuments(db, newName)) {
+    throw new Error(`Collection '${newName}' already exists`);
+  }
+  if (resolveCollectionId(db, newName) !== undefined && !isSqliteVecAvailable()) {
+    throw new Error(
+      `Cannot rename to '${newName}': a removed collection of that name still has a vector partition, which only qmd with sqlite-vec loaded can drop. ` +
+      `Open qmd with sqlite-vec loaded and retry the rename.`
+    );
+  }
+}
+
+/**
+ * Move every name-keyed index structure from `oldName` to `newName`:
+ * documents, sync rows, the vector partition id and processor state.
+ *
+ * A removed collection keeps its id while sqlite-vec is not loaded to drop its
+ * partition; the renamed collection's id cannot take that name.
+ */
+function moveCollectionNameInIndex(db: Database, oldName: string, newName: string): void {
+  if (resolveCollectionId(db, newName) !== undefined) {
+    deleteVectorPartition(db, newName);
+    if (resolveCollectionId(db, newName) !== undefined) {
+      throw new Error(
+        `Cannot rename to '${newName}': a removed collection of that name still has a vector partition, which only qmd with sqlite-vec loaded can drop. ` +
+        `Open qmd with sqlite-vec loaded and retry the rename.`
+      );
+    }
+  }
+
+  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+  // The documents keep their ids and paths, so their sync rows stay valid
+  // under the new name. Rows already under it belong to no collection.
+  db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
+  db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
+  renameCollectionId(db, oldName, newName);
+  renameProcessorState(db, oldName, newName);
+}
+
+/**
  * Remove a collection: its vector partition, its documents, the content no
- * active document references any more, and its store_collections row.
+ * active document references any more, and its store_collections row. Safe to
+ * repeat: every step is keyed by the name, so finishing a removal that a
+ * later config sync already dropped the row for still deletes what is left.
  */
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
   // One commit: a partition delete that lands without the documents delete
@@ -4300,6 +4874,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
 
     const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
+    removeProcessorState(db, collectionName);
 
     const cleanupResult = db.prepare(`
       DELETE FROM content
@@ -4317,7 +4892,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
 
 /**
  * Rename a collection: its documents, its vector partition id, and its
- * store_collections row.
+ * store_collections row. Throws when the target row already exists.
  */
 export function renameCollection(db: Database, oldName: string, newName: string): void {
   // One commit: the vector id name is UNIQUE, so a rename that fails after
@@ -4325,25 +4900,50 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   // still belongs to the old one, and vector search would miss them.
   db.transaction(() => {
     renameStoreCollection(db, oldName, newName);
+    moveCollectionNameInIndex(db, oldName, newName);
+  }).immediate();
+}
 
-    // A removed collection keeps its id while sqlite-vec is not loaded to
-    // drop its partition; the renamed collection's id cannot take that name.
-    if (resolveCollectionId(db, newName) !== undefined) {
-      deleteVectorPartition(db, newName);
-      if (resolveCollectionId(db, newName) !== undefined) {
-        throw new Error(
-          `Cannot rename to '${newName}': a removed collection of that name still has a vector partition, which only qmd with sqlite-vec loaded can drop. ` +
-          `Open qmd with sqlite-vec loaded and retry the rename.`
-        );
+/**
+ * Finish a rename whose configuration was already published: move whatever the
+ * index still holds under `oldName` to `newName`.
+ *
+ * This is the recovery path for a rename interrupted after its file publish —
+ * by a failed index commit or by a crash — and it is idempotent. The caller
+ * must only invoke it with evidence of that specific rename (the configuration
+ * scope's pending-rename marker, or the publication it just made): "the file no
+ * longer lists the old name and lists another name" is not evidence, because
+ * that other name may be an unrelated collection and moving documents into it
+ * would corrupt its ownership.
+ *
+ * A config sync may already have written the target row from the published file
+ * while the documents were still under the old name, so an existing target row
+ * is not a conflict here; a target that owns documents is, and is refused
+ * rather than merged. Returns whether the index held anything under either name.
+ *
+ * The configuration stays authoritative: if this throws, the file already
+ * reflects the rename and re-running the same rename finishes it.
+ */
+export function reconcilePublishedRename(db: Database, oldName: string, newName: string): boolean {
+  return db.transaction(() => {
+    const target = getStoreCollection(db, newName);
+    const touched =
+      hasCollectionIndexState(db, oldName)
+      || getStoreCollection(db, oldName) !== null
+      || target !== null;
+
+    if (target !== null) {
+      // The target row is what the published file says; the old row is stale.
+      if (hasCollectionDocuments(db, newName)) {
+        throw new Error(`Collection '${newName}' already exists`);
       }
+      deleteStoreCollection(db, oldName);
+    } else {
+      renameStoreCollection(db, oldName, newName);
     }
 
-    db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
-    // The documents keep their ids and paths, so their sync rows stay valid
-    // under the new name. Rows already under it belong to no collection.
-    db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
-    db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
-    renameCollectionId(db, oldName, newName);
+    moveCollectionNameInIndex(db, oldName, newName);
+    return touched;
   }).immediate();
 }
 
@@ -4973,12 +5573,58 @@ function nearestVecDocuments(
   }
 }
 
+/** Enforce remote spaces in KNN scope without changing local-to-local compatibility. */
+function assertRemoteEmbeddingBoundary(db: Database, model: string, collectionName?: string | readonly string[], filter?: MetadataFilter): void {
+  if (!hasVectorIndex(db)) return;
+  const names = scopedCollectionNames(collectionName);
+  const ids = names ? Array.from(resolveCollectionIds(db, names).values()) : undefined;
+  if (ids?.length === 0) return;
+  const eligible = filter ? metadataEligibleRowsSql(filter) : undefined;
+  const conditions: string[] = [];
+  const params: SQLiteValue[] = [];
+  if (ids) {
+    conditions.push(`vr.collection_id IN (${ids.map(() => "?").join(",")})`);
+    params.push(...ids);
+  }
+  if (eligible) {
+    conditions.push(`vr.id IN (SELECT vr.id ${eligible.sql})`);
+    params.push(...eligible.params);
+  }
+  conditions.push(`EXISTS (SELECT 1 FROM ${VEC_TABLE} v WHERE v.rowid = vr.id)`);
+  if (model.startsWith("remote-openai:")) {
+    conditions.push("(cv.model IS NULL OR cv.model != ? OR cv.embed_fingerprint != ?)");
+    params.push(model, getEmbeddingFingerprint(model));
+  } else {
+    // Local labels and legacy fingerprints keep their existing semantics, but
+    // a local query must never rank a remote embedding space (or load ML first).
+    conditions.push("cv.model GLOB 'remote-openai:*'");
+  }
+  const foreign = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT 1 FROM ${VEC_ROWS_TABLE} vr
+    LEFT JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
+    WHERE ${conditions.join(" AND ")} LIMIT 1
+  `).get(...params));
+  if (foreign) throw new Error("Vector space mismatch; re-embed the selected collections with the configured model");
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
-
+  // No read transaction spans HTTP. Fail before paying for a query, then
+  // recheck after the await in the SAME snapshot as KNN and document resolution.
+  assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
+  session?.signal.throwIfAborted();
 
+  return db.transaction(() => {
+    if (!hasVectorIndex(db)) return [];
+    assertRemoteEmbeddingBoundary(db, model, collectionName, filter);
+    return searchVecSnapshot(db, embedding, limit, collectionName, filter);
+  })();
+}
+
+/** Synchronous reads only; called inside the post-embedding read transaction. */
+function searchVecSnapshot(db: Database, embedding: number[], limit: number, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   let collectionIds: number[] | undefined;
   if (names) {
@@ -5015,8 +5661,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
-      // The body is read after resolution, outside its snapshot: another
-      // process's orphaned-content cleanup can delete the row in between.
+      // Body, vector, metadata and context reads share the search snapshot.
       const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
@@ -5086,6 +5731,14 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
 /**
  * Clear embeddings for the whole index, or just for one collection.
  *
+ * Takes the index's exclusive embed lock, like an embedding run, because a
+ * clear and a run both delete vector rows: a whole-index clear drops the vec0
+ * table under a run that is publishing chunks into it, and a scoped clear that
+ * commits between a run's pending-vector read and its writes can resurrect
+ * vectors the user asked to delete. Throws {@link EmbedLockBusyError} instead
+ * of interleaving. An embedding run clearing its own vectors for `force` calls
+ * the lock-held body, since it already owns the lock.
+ *
  * When `collection` is omitted the content_vectors and vector_rows tables are
  * emptied and the vec0 table is dropped (it is recreated with the right
  * dimensions on the next embed run).
@@ -5100,6 +5753,17 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  * embed can recreate it with the current dimensions.
  */
 export function clearAllEmbeddings(db: Database, collection?: string): void {
+  const lock = acquireEmbedLockForDb(db);
+  try {
+    clearEmbeddingsWithIndexLockHeld(db, collection);
+  } finally {
+    // Success or failure: the next run or clear must be able to start.
+    lock?.release();
+  }
+}
+
+/** The clear itself; clearAllEmbeddings() owns the index lock. */
+function clearEmbeddingsWithIndexLockHeld(db: Database, collection?: string): void {
   if (!collection) {
     db.transaction(() => {
       db.exec(`DELETE FROM content_vectors`);
@@ -5316,11 +5980,14 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp, signal?: AbortSignal): Promise<{ file: string; score: number }[]> {
+  signal?.throwIfAborted();
+  // Snapshot cache inputs too: caller mutation during HTTP must not change keys.
+  documents = documents.map(doc => ({ file: doc.file, text: doc.text }));
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
+  // Prefer the LLM instance's resolved identity so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
   const cacheModel = llm.rerankModelName ?? model;
 
@@ -5346,22 +6013,32 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    const callOptions = signal ? { model: cacheModel, signal } : { model: cacheModel };
+    const rerankResult = cacheModel.startsWith("remote-typesafe:")
+      ? await withLLMSessionForLlm(llm, session => session.rerank(rerankQuery, uncachedDocs, callOptions), { signal, name: "rerank" })
+      : await llm.rerank(rerankQuery, uncachedDocs, callOptions);
+    signal?.throwIfAborted();
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
-    }
+    // Complete scores arrive before any writes. Index, not file, identifies a
+    // chunk: two different chunks can have the same file name.
+    db.transaction(() => {
+      for (const result of rerankResult.results) {
+        signal?.throwIfAborted();
+        const chunk = uncachedDocs[result.index]!.text;
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
+      signal?.throwIfAborted();
+    })();
   }
 
-  // Return all results sorted by score
-  return documents
+  // Return all results sorted by score, including a fully cached call.
+  const results = documents
     .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
+  signal?.throwIfAborted();
+  return results;
 }
 
 // =============================================================================
@@ -6188,6 +6865,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
+  signal?: AbortSignal;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6266,6 +6944,8 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6299,12 +6979,15 @@ export async function hybridQuery(
 
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
+  signal?.throwIfAborted();
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
+  signal?.throwIfAborted();
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  signal?.throwIfAborted();
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -6351,11 +7034,15 @@ export async function hybridQuery(
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
     const embedModel = llm.embedModelName;
+    assertRemoteEmbeddingBoundary(store.db, embedModel, collection, filter);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    signal?.throwIfAborted();
+    const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+    signal?.throwIfAborted();
     hooks?.onEmbedDone?.(Date.now() - embedStart);
+    signal?.throwIfAborted();
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -6366,6 +7053,7 @@ export async function hybridQuery(
         vecQueries[i]!.text, embedModel, 20, collection,
         undefined, embedding, filter
       );
+      signal?.throwIfAborted();
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
@@ -6386,6 +7074,7 @@ export async function hybridQuery(
   // replays the same misses on every warm repeat. Only judge sub-queries the
   // store could actually run: on FTS-only stores, vec/hyde expansions never
   // execute and say nothing about the expansion's quality.
+  signal?.throwIfAborted();
   if (expanded.length > 0) {
     const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
     const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
@@ -6411,7 +7100,9 @@ export async function hybridQuery(
 
   const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
@@ -6478,7 +7169,9 @@ export async function hybridQuery(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
@@ -6492,7 +7185,8 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6557,7 +7251,9 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }
 
 export interface VectorSearchOptions {
@@ -6647,6 +7343,7 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSearchOptions {
+  signal?: AbortSignal;
   collections?: string[];   // Filter to specific collections (OR match)
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6684,6 +7381,8 @@ export async function structuredSearch(
   searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6753,11 +7452,15 @@ export async function structuredSearch(
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
       const embedModel = llm.embedModelName;
+      assertRemoteEmbeddingBoundary(store.db, embedModel, collections, filter);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      signal?.throwIfAborted();
+      const embeddings = await llm.embedBatch(textsToEmbed, signal ? { signal } : undefined);
+      signal?.throwIfAborted();
       hooks?.onEmbedDone?.(Date.now() - embedStart);
+      signal?.throwIfAborted();
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -6767,6 +7470,7 @@ export async function structuredSearch(
           vecSearches[i]!.query, embedModel, 20, collections,
           undefined, embedding, filter
         );
+        signal?.throwIfAborted();
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -6794,6 +7498,7 @@ export async function structuredSearch(
   if (candidates.length === 0) return [];
 
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+  signal?.throwIfAborted();
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
@@ -6806,7 +7511,9 @@ export async function structuredSearch(
   const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
+    signal?.throwIfAborted();
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
+    signal?.throwIfAborted();
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
@@ -6873,7 +7580,9 @@ export async function structuredSearch(
       })
       .filter(r => r.score >= minScore)
       .slice(0, limit);
-    return attachResultMetadata(store.db, rrfResults);
+    const results = attachResultMetadata(store.db, rrfResults);
+    signal?.throwIfAborted();
+    return results;
   }
 
   // Step 5: Rerank chunks
@@ -6887,7 +7596,8 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, signal);
+  signal?.throwIfAborted();
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6951,5 +7661,7 @@ export async function structuredSearch(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
-  return attachResultMetadata(store.db, finalResults);
+  const results = attachResultMetadata(store.db, finalResults);
+  signal?.throwIfAborted();
+  return results;
 }

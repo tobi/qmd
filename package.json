@@ -1,6 +1,6 @@
 {
   "name": "@tobilu/qmd",
-  "version": "2.8.3",
+  "version": "2.9.0",
   "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
   "type": "module",
   "main": "dist/index.js",
@@ -57,19 +57,19 @@
     "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
-    "better-sqlite3": "^13.0.3",
+    "@modelcontextprotocol/server": "2.4.0",
+    "better-sqlite3": "13.2.0",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.20.0",
-    "picomatch": "4.0.5",
+    "node-llama-cpp": "3.22.3",
+    "picomatch": "4.0.7",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "web-tree-sitter": "0.26.12",
-    "yaml": "2.9.0",
-    "zod": "4.2.1"
+    "web-tree-sitter": "0.27.2",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
   },
   "optionalDependencies": {
     "sqlite-vec-darwin-arm64": "0.1.9",
@@ -79,11 +79,11 @@
     "sqlite-vec-windows-x64": "0.1.9"
   },
   "devDependencies": {
-    "@oxlint/plugins": "1.78.0",
-    "@types/better-sqlite3": "7.6.13",
-    "@types/bun": "1.4.3",
-    "oxlint": "1.78.0",
-    "tsx": "4.23.12",
+    "@oxlint/plugins": "1.94.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/bun": "1.4.4",
+    "oxlint": "1.94.0",
+    "tsx": "4.23.15",
     "vitest": "3.2.7"
   },
   "pnpm": {

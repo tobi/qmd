@@ -3,12 +3,60 @@ set -euo pipefail
 
 # Pre-push hook: validates v* tag pushes before they reach the remote.
 #
-# Checks:
+# Checks (all fail closed — missing or unreadable data blocks the push):
 #   1. package.json version matches the tag
 #   2. CHANGELOG.md has a "## [{version}] - {date}" entry
-#   3. CI passed upstream on GitHub for the tagged commit
+#   3. GitHub Actions has completed, successful `push` runs for the tagged
+#      commit on every required workflow (ci.yml, nix.yml)
 #
-# All failures block the push and write to stderr.
+# Non-tag pushes and tag deletions are ignored.
+
+REQUIRED_WORKFLOWS=(ci.yml nix.yml)
+
+fail() {
+  echo >&2 "ABORT: $*"
+  exit 1
+}
+
+# Verify one workflow has only completed, successful push runs for $commit.
+require_passing_workflow() {
+  local commit="$1" workflow="$2"
+  local endpoint="repos/{owner}/{repo}/actions/workflows/${workflow}/runs"
+  local query="head_sha=${commit}&event=push&per_page=100"
+  local runs_json summary count bad
+
+  if ! runs_json=$(gh api "${endpoint}?${query}" 2>/dev/null); then
+    fail "cannot read GitHub Actions '${workflow}' runs for ${commit} (API unreachable or unauthorized)"
+  fi
+
+  if ! jq -e '.workflow_runs | type == "array"' >/dev/null 2>&1 <<<"$runs_json"; then
+    fail "unexpected GitHub Actions '${workflow}' response for ${commit}"
+  fi
+
+  # Only runs for this exact commit and push event count.
+  if ! summary=$(jq -r --arg sha "$commit" '
+    [.workflow_runs[] | select(.head_sha == $sha and .event == "push")] as $runs
+    | "\($runs | length)\t\([$runs[] | select(.status != "completed" or .conclusion != "success") | "\(.status // "unknown")/\(.conclusion // "none")"] | join(","))"
+  ' <<<"$runs_json" 2>/dev/null); then
+    fail "cannot parse GitHub Actions '${workflow}' runs for ${commit}"
+  fi
+
+  IFS=$'\t' read -r count bad <<<"$summary"
+
+  if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+    fail "cannot parse GitHub Actions '${workflow}' runs for ${commit}"
+  fi
+
+  if [[ "$count" -eq 0 ]]; then
+    fail "no GitHub Actions '${workflow}' push run found for ${commit}; push the commit to main and wait for CI"
+  fi
+
+  if [[ -n "$bad" ]]; then
+    fail "GitHub Actions '${workflow}' is not green for ${commit}: ${bad}"
+  fi
+
+  echo >&2 "  CI (${workflow}): ${count} run(s) passed ✓"
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   # Only validate v* tag pushes
@@ -49,43 +97,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   echo >&2 "  CHANGELOG.md: [$VERSION] ✓"
 
   # --- 3. CI must have passed on GitHub for this commit ---
-  # Resolve annotated tag to its underlying commit
-  COMMIT=$(git rev-list -n 1 "$TAG" 2>/dev/null || git rev-parse HEAD)
+  # Resolve the tag (annotated or lightweight) to its underlying commit.
+  COMMIT=""
+  if ! COMMIT=$(git rev-list -n 1 "$local_sha" 2>/dev/null) || [[ -z "$COMMIT" ]] || [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    fail "cannot resolve $TAG ($local_sha) to a commit"
+  fi
 
   if ! command -v gh &>/dev/null; then
-    echo >&2 "  CI: skipped (no gh CLI)"
-    continue
+    fail "gh CLI is required to verify CI for $TAG (install: https://cli.github.com)"
   fi
 
-  CHECK_JSON=$(gh api "repos/{owner}/{repo}/commits/$COMMIT/check-runs" 2>/dev/null || echo "")
-
-  if [[ -z "$CHECK_JSON" ]]; then
-    echo >&2 "  CI: skipped (GitHub API unreachable)"
-    continue
+  if ! command -v jq &>/dev/null; then
+    fail "jq is required to verify CI for $TAG"
   fi
 
-  TOTAL=$(echo "$CHECK_JSON" | jq -r '.total_count // 0' 2>/dev/null || echo "0")
-
-  if [[ "$TOTAL" -eq 0 ]] 2>/dev/null; then
-    echo >&2 "  CI: no runs found (push commit to main first and wait for CI)"
-  else
-    FAILED=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo "0")
-    PENDING=$(echo "$CHECK_JSON" | jq '[.check_runs // [] | .[] | select(.status != "completed")] | length' 2>/dev/null || echo "0")
-
-    if [[ "$FAILED" -gt 0 ]] 2>/dev/null; then
-      echo >&2 "ABORT: CI failed for $COMMIT"
-      echo >&2 "https://github.com/tobi/qmd/commit/$COMMIT"
-      exit 1
-    fi
-
-    if [[ "$PENDING" -gt 0 ]] 2>/dev/null; then
-      echo >&2 "ABORT: CI still running ($PENDING pending)"
-      echo >&2 "Wait for CI to finish, then push again."
-      exit 1
-    fi
-
-    echo >&2 "  CI: passed ✓"
-  fi
+  for workflow in "${REQUIRED_WORKFLOWS[@]}"; do
+    require_passing_workflow "$COMMIT" "$workflow"
+  done
 
   echo >&2 "All checks passed for $TAG ✓"
 done

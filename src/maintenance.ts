@@ -54,7 +54,7 @@ export class Maintenance {
     return deleteInactiveDocuments(this.store.db);
   }
 
-  /** Clear all vector embeddings (forces re-embedding) */
+  /** Clear all vector embeddings; throws EmbedLockBusyError while an embed runs. */
   clearEmbeddings(): void {
     clearAllEmbeddings(this.store.db);
   }
