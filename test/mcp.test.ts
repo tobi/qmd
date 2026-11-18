@@ -1483,6 +1483,30 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     }
   });
 
+  test("REST /query and /search reject more than 10 searches, matching MCP query", async () => {
+    const searches = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({ type: "lex", query: `readme ${index}` }));
+    for (const pathname of ["/query", "/search"]) {
+      const atCap = await fetch(`${baseUrl}${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: searches(10) }),
+      });
+      expect(atCap.status).toBe(200);
+      await atCap.body?.cancel();
+
+      const overCap = await fetch(`${baseUrl}${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: searches(11) }),
+      });
+      expect(overCap.status).toBe(400);
+      expect(await overCap.json()).toEqual({
+        error: "Invalid field: searches (maximum 10 items)",
+      });
+    }
+  });
+
   test("MCP query and metadata reject over-cap collections", async () => {
     const tooManyCollections = Array.from({ length: 1001 }, (_, index) => `collection-${index}`);
     for (const [id, name, args] of [

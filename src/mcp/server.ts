@@ -402,7 +402,7 @@ Intent-aware lex (C++ performance, not sports):
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
           "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
         ),
-        searches: z.array(subSearchSchema).max(10).optional().describe(
+        searches: z.array(subSearchSchema).max(MAX_SEARCHES_PER_REQUEST).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
           "control over retrieval strategy. Mutually exclusive with 'query'."
         ),
@@ -1745,6 +1745,8 @@ export async function startMcpServer(options: McpStdioServerOptions = {}): Promi
 
 const MAX_HTTP_BODY_BYTES = 1024 * 1024;
 const MAX_COLLECTIONS_PER_REQUEST = 1000;
+/** Typed sub-queries per request; each one can trigger its own search and embedding. */
+const MAX_SEARCHES_PER_REQUEST = 10;
 
 class RequestBodyTooLargeError extends Error {
   constructor() {
@@ -2157,6 +2159,11 @@ export async function startMcpHttpServer(
         if (!params.searches || !Array.isArray(params.searches)) {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          return;
+        }
+        if (params.searches.length > MAX_SEARCHES_PER_REQUEST) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: `Invalid field: searches (maximum ${MAX_SEARCHES_PER_REQUEST} items)` }));
           return;
         }
 
