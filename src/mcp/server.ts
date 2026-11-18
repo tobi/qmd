@@ -8,7 +8,8 @@
  * 2025-era clients via the official SDK entries (`serveStdio` / `createMcpHandler`).
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
@@ -35,7 +36,9 @@ import {
   MetadataBindingBudgetError,
   MetadataOptionError,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, loadConfig } from "../collections.js";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../llm.js";
+import { decideLocalConfigGate, type SensitiveSnapshot } from "../trust.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
@@ -431,7 +434,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank, recencyDays }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank, recencyDays }, ctx) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -463,8 +466,12 @@ Intent-aware lex (C++ performance, not sports):
         ? { query }
         : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
 
+      // The SDK's per-request abort signal is cancelled when the client goes
+      // away (or the transport closes), so remote embedding/rerank stages stop
+      // instead of finishing work nobody can read.
       const results = await store.search({
         ...searchOptions,
+        signal: ctx.mcpReq.signal,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         filter: filterValidation.filter,
         limit,
@@ -805,58 +812,517 @@ export type McpStartupOptions = {
   dbPath?: string;
 };
 
+// =============================================================================
+// Lifecycle: serving -> draining -> stopped
+// =============================================================================
+
 /**
- * Counts running request handlers so shutdown can wait for them to settle
- * before tearing down their llm/store dependencies. The SDK aborts in-flight
- * request controllers on close, but qmd's handlers finish their current
- * store/llm work rather than observing the signal mid-operation.
+ * Admission state of an MCP transport.
+ *
+ * The transition order is the safety property both transports depend on, so it
+ * is modelled explicitly instead of being implied by the order of teardown
+ * calls: work may only touch the shared store/llm while `serving`; `draining`
+ * refuses new work while already-admitted work settles; `stopped` is terminal
+ * and means the store has been closed. Teardown MUST go
+ * `serving -> draining -> stopped` and MUST NOT close the store before it
+ * reaches `draining`, or an admitted handler keeps running against a closed
+ * database.
  */
-export type InflightGate = {
-  /** Wraps a handler so the gate counts it while it runs. */
-  track<T extends (...args: never[]) => unknown>(fn: T): T;
-  /** Resolves once no tracked handler runs, or after timeoutMs. Returns whether idle was reached. */
-  waitForIdle(timeoutMs: number): Promise<boolean>;
+export type McpLifecycleState = "serving" | "draining" | "stopped";
+
+export type McpLifecycle = {
+  state(): McpLifecycleState;
+  /**
+   * Admit one unit of work, or return null once admission is closed
+   * (`draining`/`stopped`). The returned release function is idempotent.
+   * Callers MUST NOT touch the store when admission is refused.
+   */
+  admit(): (() => void) | null;
+  /** `serving -> draining`. False when admission was already closed. */
+  beginDrain(): boolean;
+  /** `draining -> stopped`. False when called from `serving` or `stopped`. */
+  finishTeardown(): boolean;
+  /**
+   * Resolves once no admitted work runs -- or, when `timeoutMs` is given,
+   * after at most that long; the boolean reports whether idle was reached.
+   * Omitting the timeout waits until idle, which is the graceful default: a
+   * deadline is what interrupts work that is still using the store, so only a
+   * caller that asks for one gets one.
+   */
+  waitForIdle(timeoutMs?: number): Promise<boolean>;
 };
 
-export function createInflightGate(): InflightGate {
-  // `active` is a running-handler counter, not a closed admission barrier.
-  // The barrier comes from the caller's ordering: registerStdioEofShutdown
-  // runs closeServer() (which stops the transport from dispatching new
-  // requests) BEFORE waitForIdle(), so by the time we wait, the only handlers
-  // that can still be running are ones already dispatched — there is no source
-  // of late admissions to guard against under the stdio transport.
+export function createMcpLifecycle(): McpLifecycle {
+  let state: McpLifecycleState = "serving";
   let active = 0;
   const waiters: Array<() => void> = [];
+
   return {
-    track(fn) {
-      const wrapped = async (...args: never[]) => {
-        active += 1;
-        try {
-          return await fn(...args);
-        } finally {
-          active -= 1;
-          if (active === 0) {
-            while (waiters.length > 0) waiters.shift()!();
-          }
-        }
+    state: () => state,
+
+    admit() {
+      if (state !== "serving") return null;
+      active += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        active -= 1;
+        if (active !== 0) return;
+        // Drain waiters are one-shot: they resolve now and are forgotten.
+        while (waiters.length > 0) waiters.shift()!();
       };
-      return wrapped as typeof fn;
     },
-    waitForIdle(timeoutMs: number): Promise<boolean> {
+
+    beginDrain() {
+      if (state !== "serving") return false;
+      state = "draining";
+      return true;
+    },
+
+    finishTeardown() {
+      if (state !== "draining") return false;
+      state = "stopped";
+      return true;
+    },
+
+    waitForIdle(timeoutMs?: number): Promise<boolean> {
       if (active === 0) return Promise.resolve(true);
-      return new Promise((resolve) => {
-        const onIdle = () => {
-          clearTimeout(timer);
-          resolve(true);
-        };
-        const timer = setTimeout(() => {
+      const { promise, resolve } = Promise.withResolvers<boolean>();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onIdle = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      // Without a timeout the waiter stays registered and the release that
+      // makes the count zero resolves it; nothing can expire it.
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
           const i = waiters.indexOf(onIdle);
           if (i >= 0) waiters.splice(i, 1);
           resolve(false);
         }, timeoutMs);
         timer.unref?.();
-        waiters.push(onIdle);
-      });
+      }
+      waiters.push(onIdle);
+      return promise;
+    },
+  };
+}
+
+/**
+ * Default graceful-shutdown deadline.
+ *
+ * Both transports bound their teardown with it: admitted work gets this long
+ * to finish, then the remaining requests are aborted, the sockets are severed
+ * and the stop call reports a {@link McpShutdownTimeoutError}. Cleanup keeps
+ * going in the background -- the store is never closed underneath an operation
+ * that is still running -- so "timed out" means "reported, and abandoned to
+ * finish safely", not "the listener or store was torn down under live work".
+ *
+ * `shutdownDrainTimeoutMs` (HTTP) and `idleTimeoutMs` (stdio) override it.
+ */
+export const MCP_SHUTDOWN_TIMEOUT_MS = 5000;
+
+/** Which teardown step was running when the deadline expired. */
+export type McpShutdownPhase = "drain" | "transport" | "listener" | "store";
+
+const PHASE_SUBJECT: Record<McpShutdownPhase, string> = {
+  drain: "admitted requests to settle",
+  transport: "the MCP transport to close",
+  listener: "the HTTP listener to close",
+  store: "the store to close",
+};
+
+/**
+ * Rejection of a stop/EOF shutdown that did not finish within its deadline.
+ *
+ * Typed so a caller can tell "still working, reported, cleanup continues"
+ * apart from a failed teardown step: the abandoned work is aborted but the
+ * store stays open until it actually settles.
+ */
+export class McpShutdownTimeoutError extends Error {
+  /** Stable discriminator for callers that cannot use `instanceof`. */
+  readonly code: "MCP_SHUTDOWN_TIMEOUT";
+  /** The step that outlasted the deadline. */
+  readonly phase: McpShutdownPhase;
+  /** The deadline that expired, in milliseconds. */
+  readonly timeoutMs: number;
+
+  constructor(phase: McpShutdownPhase, timeoutMs: number) {
+    super(`QMD MCP shutdown exceeded its ${timeoutMs} ms deadline while waiting for ${PHASE_SUBJECT[phase]}`);
+    this.name = "McpShutdownTimeoutError";
+    this.code = "MCP_SHUTDOWN_TIMEOUT";
+    this.phase = phase;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Abort reason for an admitted request whose client went away (or whose
+ * shutdown deadline expired). Distinct from a normal completed close so a
+ * route can tell "nobody is listening any more" from "the response is done".
+ */
+export class McpRequestAbortedError extends Error {
+  readonly code: "MCP_REQUEST_ABORTED";
+
+  constructor(message = "The MCP client disconnected before its response completed") {
+    super(message);
+    this.name = "McpRequestAbortedError";
+    this.code = "MCP_REQUEST_ABORTED";
+  }
+}
+
+/**
+ * One deadline for a whole teardown. Every step races the same expiry, so the
+ * request drain, the transport close, the listener close and the store close
+ * share one budget instead of each getting its own fresh one.
+ */
+export type ShutdownDeadline = {
+  /**
+   * The shared expiry promise, rejecting with a {@link McpShutdownTimeoutError}
+   * naming `phase` (the step in progress when the timer fires).
+   */
+  at(phase: McpShutdownPhase): Promise<never>;
+  /** Milliseconds left before the deadline; 0 once it passed. */
+  remainingMs(): number;
+  /** Clears the timer so a finished teardown never holds the process open. */
+  dispose(): void;
+};
+
+export function createShutdownDeadline(timeoutMs: number = MCP_SHUTDOWN_TIMEOUT_MS): ShutdownDeadline {
+  const budget = Number.isFinite(timeoutMs) && timeoutMs >= 0 ? Math.floor(timeoutMs) : MCP_SHUTDOWN_TIMEOUT_MS;
+  const expiresAt = Date.now() + budget;
+  let phase: McpShutdownPhase = "drain";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  // Referenced, deliberately not unref'd: the deadline is the one thing that
+  // must fire even when the only other pending work is a promise that never
+  // settles. An unref'd timer would let a process whose loop has nothing else
+  // queued exit before the timeout can be reported. dispose() clears it as
+  // soon as teardown finishes, so it never delays a healthy exit.
+  const { promise: expiry, reject: expire } = Promise.withResolvers<never>();
+  timer = setTimeout(() => expire(new McpShutdownTimeoutError(phase, budget)), budget);
+  // Steps race this only while one is in progress; claiming the rejection here
+  // keeps a deadline firing between steps from becoming an unhandled rejection.
+  void expiry.catch(() => {});
+
+  return {
+    at(next) {
+      phase = next;
+      return expiry;
+    },
+    remainingMs: () => Math.max(0, expiresAt - Date.now()),
+    dispose: () => {
+      clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
+/**
+ * The irreversible steps of one transport teardown, in the lifecycle order the
+ * safety properties depend on:
+ *
+ *   beginDrain -> beginListenerClose -> drain -> closeTransport ->
+ *   listenerClosed -> closeStore -> finishTeardown
+ *
+ * `closeTransport` and `closeStore` MUST only run once no admitted work is
+ * executing: closing the transport aborts the exchanges it still tracks, and
+ * closing the store disposes the LLM and the database underneath them.
+ */
+export type McpTeardownSteps = {
+  /** `serving -> draining`; false when the lifecycle was already drained. */
+  beginDrain: () => boolean;
+  /** Resolves true once no admitted work runs. Omit the timeout to wait forever. */
+  waitForIdle: (timeoutMs?: number) => Promise<boolean>;
+  /** Tells admitted requests their result can no longer be delivered. */
+  abortWork: (reason: McpShutdownTimeoutError) => void;
+  /** Ends sockets a stalled exchange or a half-sent body is parked on. */
+  severConnections: () => void;
+  /** Stops accepting connections; `listenerClosed` reports the completion. */
+  beginListenerClose: () => void;
+  /** Resolves once the listener closed (every connection ended). */
+  listenerClosed: () => Promise<void>;
+  /** Closes the MCP transport; only valid once the drain is idle. */
+  closeTransport: () => Promise<void>;
+  /** Closes the store, which also disposes the LLM it owns. */
+  closeStore: () => Promise<void>;
+  /** `draining -> stopped`, only once the store actually closed. */
+  finishTeardown: () => boolean;
+};
+
+export type McpTeardownOptions = {
+  /** Overrides {@link MCP_SHUTDOWN_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /** Where step failures and the timeout are reported. */
+  log?: (message: string) => void;
+};
+
+export type McpTeardown = {
+  /**
+   * Starts the teardown on first call; every caller shares one promise.
+   * Resolves when the server stopped cleanly and rejects with a
+   * {@link McpShutdownTimeoutError} at the deadline -- in which case cleanup
+   * continues in the background.
+   */
+  stop: () => Promise<void>;
+  /**
+   * Resolves only when every teardown step actually finished (or could not be
+   * retried), including a cleanup that outlived a reported timeout. Never
+   * rejects. A hung store keeps it pending: "stopped" is never claimed early.
+   */
+  closed: Promise<void>;
+};
+
+/**
+ * Tear down one transport under a single deadline.
+ *
+ * Until the deadline, work admitted before `beginDrain()` may finish: the
+ * listener stops accepting and the drain waits. At the deadline the caller of
+ * `stop()` gets a {@link McpShutdownTimeoutError} immediately, while the
+ * remaining cleanup is *abandoned into the background*: admitted requests are
+ * aborted (their results are undeliverable), the sockets are severed, and then
+ * the unbounded wait for idle, the transport close, the listener close and the
+ * store close run in the same safe order. The store is therefore never closed
+ * under an active operation, and `finishTeardown()` is only reached once
+ * `closeStore()` actually resolved.
+ */
+export function runMcpTeardown(steps: McpTeardownSteps, options: McpTeardownOptions = {}): McpTeardown {
+  const timeoutMs = options.timeoutMs ?? MCP_SHUTDOWN_TIMEOUT_MS;
+  const log = options.log ?? (() => {});
+  const failures: unknown[] = [];
+  const closed = Promise.withResolvers<void>();
+  let storeClosed = false;
+
+  const record = (name: string, error: unknown): void => {
+    failures.push(error);
+    log(
+      `QMD Warning: ${name} failed during shutdown (${
+        error instanceof Error ? error.message : String(error)
+      }); continuing shutdown.`
+    );
+  };
+
+  // One-shot steps: the graceful path and an abandoned cleanup share these, so
+  // a step whose promise never settles is awaited again, never started twice.
+  const once = (run: () => Promise<void>): (() => Promise<void>) => {
+    let started: Promise<void> | null = null;
+    return () => (started ??= Promise.resolve().then(run));
+  };
+  const closeTransport = once(() => steps.closeTransport());
+  const closeStore = once(async () => {
+    await steps.closeStore();
+    storeClosed = true;
+  });
+  let listenerStarted: Promise<void> | null = null;
+  const listenerClosed = (): Promise<void> => (listenerStarted ??= Promise.resolve().then(() => steps.listenerClosed()));
+
+  const finish = (): void => {
+    if (!storeClosed) return;
+    try {
+      steps.finishTeardown();
+    } catch (error) {
+      record("lifecycle teardown", error);
+    }
+  };
+
+  /**
+   * Run one step inside the shared deadline. A timeout propagates (it decides
+   * to abandon); any other failure is recorded and teardown carries on -- the
+   * store must still close.
+   */
+  const bounded = async (
+    deadline: ShutdownDeadline,
+    name: string,
+    phase: McpShutdownPhase,
+    run: () => Promise<void> | void,
+  ): Promise<void> => {
+    let work: Promise<void>;
+    try {
+      work = Promise.resolve().then(run);
+    } catch (error) {
+      record(name, error);
+      return;
+    }
+    try {
+      await Promise.race([work, deadline.at(phase)]);
+    } catch (error) {
+      if (error instanceof McpShutdownTimeoutError) throw error;
+      record(name, error);
+    }
+  };
+
+  /** Report the timeout now, then finish the same chain safely in the background. */
+  const abandon = (timeout: McpShutdownTimeoutError): void => {
+    log(`QMD Warning: ${timeout.message}; aborting the remaining work and finishing the shutdown in the background.`);
+    try {
+      steps.abortWork(timeout);
+    } catch (error) {
+      record("aborting admitted work", error);
+    }
+    try {
+      steps.severConnections();
+    } catch (error) {
+      record("severing connections", error);
+    }
+
+    void (async () => {
+      try {
+        // Unbounded on purpose: the store MUST NOT close while abandoned work
+        // still runs through it. If that work never settles, cleanup stops
+        // here with the store open; only the standalone process's own
+        // non-zero exit ends the process.
+        try {
+          await steps.waitForIdle();
+        } catch (error) {
+          record("in-flight drain", error);
+        }
+        await closeTransport().catch((error) => record("transport close", error));
+        await listenerClosed().catch((error) => record("listener close", error));
+        await closeStore().catch((error) => record("store close", error));
+        finish();
+      } finally {
+        closed.resolve();
+      }
+    })();
+  };
+
+  const graceful = async (deadline: ShutdownDeadline): Promise<void> => {
+    steps.beginDrain();
+
+    // Stop accepting before waiting: nothing can enter behind the drain.
+    try {
+      steps.beginListenerClose();
+    } catch (error) {
+      record("listener close", error);
+    }
+
+    // The only window in which work admitted before beginDrain() may run. The
+    // lifecycle's own timer is unref'd, so the referenced shared deadline is
+    // what guarantees the bound is observed.
+    const idle = await Promise.race([
+      steps.waitForIdle(deadline.remainingMs()),
+      deadline.at("drain"),
+    ]);
+    if (!idle) throw new McpShutdownTimeoutError("drain", timeoutMs);
+
+    await bounded(deadline, "transport close", "transport", () => closeTransport());
+    await bounded(deadline, "listener close", "listener", () => listenerClosed());
+    await bounded(deadline, "store close", "store", () => closeStore());
+    finish();
+    if (failures.length > 0) throw failures[0];
+  };
+
+  let stopped: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopped) return stopped;
+    // The one deadline starts with the first stop(), never at construction: a
+    // server that has been up longer than its budget still gets the whole
+    // budget.
+    const deadline = createShutdownDeadline(timeoutMs);
+    stopped = (async () => {
+      try {
+        await graceful(deadline);
+      } catch (error) {
+        if (error instanceof McpShutdownTimeoutError) {
+          abandon(error);
+          throw error;
+        }
+        throw error;
+      } finally {
+        deadline.dispose();
+      }
+    })();
+    // A caller may fire-and-forget stop() (a signal handler that exits next);
+    // claiming the rejection here keeps it from surfacing as unhandled.
+    void stopped.catch(() => {});
+    void stopped.then(
+      () => closed.resolve(),
+      (error) => {
+        // A reported timeout keeps `closed` pending until the abandoned
+        // cleanup finishes; any other outcome has nothing left to run.
+        if (!(error instanceof McpShutdownTimeoutError)) closed.resolve();
+      },
+    );
+    return stopped;
+  };
+
+  return { stop, closed: closed.promise };
+}
+
+/** Where the standalone termination policy reports and how it ends the process. */
+export type McpTermination = {
+  /** Ends the process (`process.exit` standalone, a spy in tests). */
+  exit: (code: number) => void;
+  /** Where the reason for a non-zero exit is reported. */
+  log: (message: string) => void;
+};
+
+/**
+ * Exit-code policy for a standalone MCP server, called from its signal
+ * handler.
+ *
+ * A clean stop exits 0. A reported timeout exits 1 *immediately*: work is
+ * still running, the process is the only thing that can end it, and the
+ * abandoned cleanup cannot finish before that exit. Any other teardown failure
+ * also exits 1, because the store may not have closed. Embedded hosts do not
+ * use this — they own their own lifetime.
+ */
+export async function terminateMcpServer(stop: () => Promise<void>, termination: McpTermination): Promise<void> {
+  try {
+    await stop();
+    termination.exit(0);
+  } catch (error) {
+    if (error instanceof McpShutdownTimeoutError) {
+      termination.log(`QMD Warning: ${error.message}; work was still running, exiting.`);
+    } else {
+      termination.log(
+        `QMD Warning: shutdown failed (${error instanceof Error ? error.message : String(error)}); exiting.`,
+      );
+    }
+    termination.exit(1);
+  }
+}
+
+/**
+ * Counts running request handlers so shutdown can wait for them to settle
+ * before tearing down their llm/store dependencies, and refuses handlers the
+ * transport dispatches after admission closed. The SDK aborts in-flight
+ * request controllers on close, but qmd's handlers finish their current
+ * store/llm work rather than observing the signal mid-operation.
+ *
+ * The gate owns the lifecycle state, so the admission barrier no longer
+ * depends on the caller remembering to close the transport first: a handler
+ * that arrives after `beginDrain()` throws instead of touching a store that
+ * shutdown is about to close (the client that sent it is gone in that window).
+ */
+export type InflightGate = McpLifecycle & {
+  /** Wraps a handler so the gate admits and counts it while it runs. */
+  track<T extends (...args: never[]) => unknown>(fn: T): T;
+};
+
+export function createInflightGate(lifecycle: McpLifecycle = createMcpLifecycle()): InflightGate {
+  return {
+    state: () => lifecycle.state(),
+    admit: () => lifecycle.admit(),
+    beginDrain: () => lifecycle.beginDrain(),
+    finishTeardown: () => lifecycle.finishTeardown(),
+    waitForIdle: (timeoutMs?: number) => lifecycle.waitForIdle(timeoutMs),
+
+    track(fn) {
+      const wrapped = async (...args: never[]) => {
+        const release = lifecycle.admit();
+        if (!release) {
+          throw new Error("QMD MCP server is shutting down; request refused");
+        }
+        try {
+          return await fn(...args);
+        } finally {
+          release();
+        }
+      };
+      return wrapped as typeof fn;
     },
   };
 }
@@ -883,19 +1349,52 @@ export type StdioShutdownOptions = {
    * embedded process).
    */
   disposeLlm?: () => Promise<void>;
-  /** Waits for in-flight handlers to settle (see InflightGate.waitForIdle). */
-  waitForIdle?: (timeoutMs: number) => Promise<boolean>;
-  /** Deadline for the in-flight wait. Defaults to 5000 ms. */
+  /**
+   * Handler gate shared with the transport (see InflightGate). When given,
+   * shutdown closes its admission — `serving -> draining` — before
+   * closeServer(), so a request the closing transport still dispatches is
+   * refused instead of touching a store that teardown is about to close, and
+   * marks teardown complete (`draining -> stopped`) after closeStore().
+   * Also supplies waitForIdle when the caller does not inject one.
+   */
+  lifecycle?: McpLifecycle;
+  /**
+   * Waits for in-flight handlers to settle (see InflightGate.waitForIdle).
+   * Call it without a timeout for the unbounded post-timeout wait.
+   */
+  waitForIdle?: (timeoutMs?: number) => Promise<boolean>;
+  /** Deadline for the whole teardown. Defaults to {@link MCP_SHUTDOWN_TIMEOUT_MS}. */
   idleTimeoutMs?: number;
   /** Defaults to process.stdin. */
   stdin?: StdioShutdownStdin;
-  /** Defaults to assigning process.exitCode. */
+  /**
+   * Records the outcome. Defaults to a no-op: an embedded host owns its exit
+   * status, so only the standalone stdio entry passes a setter (writing
+   * `process.exitCode`) and, with it, `exitOnTimeout`.
+   */
   setExitCode?: (code: number) => void;
   /** Defaults to reading process.exitCode. */
   getExitCode?: () => number | undefined;
   /** Defaults to process.stderr. */
   stderr?: { write(chunk: string): unknown; on?(event: "error", listener: (err: unknown) => void): unknown };
+  /**
+   * Called after the outcome was recorded as 1 because the deadline expired
+   * with work still running, right before the shutdown promise rejects. Only
+   * the standalone stdio entry passes `process.exit(1)`: after EOF nothing can
+   * consume the abandoned work, so an orphaned process would only leak (the
+   * very failure #751 is about). Embedded callers leave it unset, catch the
+   * rejection, and keep their own lifetime.
+   */
+  exitOnTimeout?: (error: McpShutdownTimeoutError) => void;
 };
+
+/**
+ * The idempotent EOF shutdown plus the promise that only settles once every
+ * teardown step actually finished — including cleanup abandoned after a
+ * reported timeout. `closed` never rejects; the callable rejects with a
+ * {@link McpShutdownTimeoutError} when the deadline expired.
+ */
+export type StdioShutdown = (() => Promise<void>) & { closed: Promise<void> };
 
 /**
  * Shut the stdio MCP server down when stdin reaches EOF (#751).
@@ -906,30 +1405,57 @@ export type StdioShutdownOptions = {
  * loop alive, so the server reparents to PID 1, leaks RAM, and keeps the
  * SQLite index open. stdin EOF means the client is gone, so this treats it as
  * a disconnect: no new requests are accepted and nobody is left to read a
- * response — but handlers that are already running get a bounded window to
- * settle (waitForIdle) before their llm/store dependencies are torn down.
+ * response — but handlers that are already running get the same bounded
+ * window the HTTP transport grants (waitForIdle) before their llm/store
+ * dependencies are torn down.
  *
- * Teardown order matters. Close the transport first so no further requests
- * are dispatched, wait for in-flight handlers, then close the store last —
- * which disposes the store's own llama.cpp instance and then the database, so
- * the dispose path cannot hit an already-closed DB. (disposeLlm is an optional
- * extra step for callers that own a separate instance; the MCP store does
- * not.) Failures are logged best-effort (the parent's death may have closed
- * stderr too) and do not stop the remaining steps. The function sets process.exitCode
- * instead of calling process.exit() so `beforeExit` still fires and
- * node-llama-cpp's auto-dispose runs before libc's static destructors —
+ * Teardown order matters, and it is the lifecycle's transitions.
+ * `serving -> draining` closes handler admission *and* the transport (either
+ * alone is not enough: the transport can still hand us a request it read just
+ * before closing), then in-flight handlers get their bounded window, then the
+ * store is closed last — which disposes the store's own llama.cpp instance and
+ * then the database, so the dispose path cannot hit an already-closed DB —
+ * then `draining -> stopped`. (disposeLlm is an optional extra step for
+ * callers that own a separate instance; the MCP store does not.) Failures are
+ * logged best-effort (the parent's death may have closed stderr too) and do
+ * not stop the remaining steps.
+ *
+ * One deadline (default {@link MCP_SHUTDOWN_TIMEOUT_MS}) bounds the whole
+ * chain: the transport close, the drain, the llama disposal and the store
+ * close. When it expires, the shutdown promise rejects with a
+ * {@link McpShutdownTimeoutError} and the remaining cleanup continues in the
+ * background — unbounded when it has to be, because the store MUST NOT close
+ * underneath an operation that is still running, and the lifecycle is only
+ * marked stopped once it really closed. `closed` is what reports that finish.
+ *
+ * This function never calls process.exit itself, and it only writes
+ * `process.exitCode` through a caller-supplied `setExitCode`. The standalone
+ * entry supplies both (setter plus `exitOnTimeout`), because a process that
+ * outlived its deadline with work remaining can only be ended by itself;
+ * writing the code rather than calling process.exit() lets `beforeExit` fire
+ * and node-llama-cpp's auto-dispose run before libc's static destructors —
  * process.exit() during native-addon unload has caused exit-time crashes
  * before (#59, #129; same rationale as finishSuccessfulCliCommand in the CLI).
  *
  * Returns the idempotent shutdown function: every invocation (manual, "end",
- * "close", or already-ended stdin) shares one promise, and the promise never
- * rejects.
+ * "close", or already-ended stdin) shares one promise. On a reported timeout
+ * that promise REJECTS with {@link McpShutdownTimeoutError} while `closed`
+ * keeps tracking the background cleanup; every other outcome resolves.
+ * Nothing here exits the process and, unless `setExitCode` is supplied, nothing
+ * touches `process.exitCode`: the standalone entry opts into both.
  */
-export function registerStdioEofShutdown(options: StdioShutdownOptions): () => Promise<void> {
+export function registerStdioEofShutdown(options: StdioShutdownOptions): StdioShutdown {
   const stdin = options.stdin ?? process.stdin;
   const stderr = options.stderr ?? process.stderr;
-  const setExitCode = options.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  // Default to doing nothing: an embedded host owns its exit status. The
+  // standalone stdio entry passes an explicit setter.
+  const setExitCode = options.setExitCode ?? (() => {});
   const getExitCode = options.getExitCode ?? (() => (typeof process.exitCode === "number" ? process.exitCode : undefined));
+  const timeoutMs = options.idleTimeoutMs ?? MCP_SHUTDOWN_TIMEOUT_MS;
+  const lifecycle = options.lifecycle;
+  const waitForIdle = options.waitForIdle
+    ?? (lifecycle ? (limit?: number) => lifecycle.waitForIdle(limit) : undefined);
+  const closed = Promise.withResolvers<void>();
   let shutdownPromise: Promise<void> | null = null;
 
   // If the parent died, its stderr pipe may be gone: writes can throw
@@ -952,39 +1478,119 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
       // an exotic stdin may throw on off(); shutdown continues regardless
     }
 
-    // Same stderr breadcrumb style as the HTTP transport's SIGTERM/SIGINT
-    // handlers; also gives tests an observable signal that the EOF path ran.
+    // Close admission before the transport: the transport stops dispatching
+    // once closed, but a request it already read can still reach a handler
+    // afterwards, and by then the store may be closing.
+    lifecycle?.beginDrain();
+
+    // Same breadcrumb style as the HTTP transport's signal handlers; also
+    // gives tests an observable signal that the EOF path ran.
     safeWrite("Shutting down (stdin closed)...\n");
 
-    let failed = false;
-    const step = async (name: string, run: () => void | Promise<void>): Promise<void> => {
+    const deadline = createShutdownDeadline(timeoutMs);
+    const failures: unknown[] = [];
+    let storeClosed = false;
+
+    const record = (name: string, error: unknown): void => {
+      failures.push(error);
+      safeWrite(
+        `QMD Warning: ${name} failed during stdio shutdown (${
+          error instanceof Error ? error.message : String(error)
+        }); continuing shutdown.\n`
+      );
+    };
+
+    // One-shot steps, shared by the graceful chain and an abandoned cleanup, so
+    // a step whose promise never settles is awaited again instead of restarted.
+    const once = (run: () => Promise<void>): (() => Promise<void>) => {
+      let started: Promise<void> | null = null;
+      return () => (started ??= Promise.resolve().then(run));
+    };
+    const closeServerOnce = once(() => options.closeServer());
+    const disposeLlmOnce = once(async () => { await options.disposeLlm?.(); });
+    const closeStoreOnce = once(async () => {
+      await options.closeStore();
+      storeClosed = true;
+    });
+
+    const bounded = async (name: string, phase: McpShutdownPhase, run: () => Promise<void> | void): Promise<void> => {
+      let work: Promise<void>;
       try {
-        await run();
+        work = Promise.resolve().then(run);
       } catch (error) {
-        failed = true;
-        safeWrite(
-          `QMD Warning: ${name} failed during stdio shutdown (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
-        );
+        record(name, error);
+        return;
+      }
+      try {
+        await Promise.race([work, deadline.at(phase)]);
+      } catch (error) {
+        if (error instanceof McpShutdownTimeoutError) throw error;
+        record(name, error);
       }
     };
 
-    await step("server.close()", options.closeServer);
-    if (options.waitForIdle) {
-      await step("in-flight drain", async () => {
-        const idle = await options.waitForIdle!(options.idleTimeoutMs ?? 5000);
-        if (!idle) {
-          safeWrite("QMD Warning: in-flight request did not settle before the shutdown deadline; continuing shutdown.\n");
+    const finish = (): void => {
+      if (!storeClosed) return;
+      // Terminal transition: the store is gone, so nothing is admitted again.
+      try {
+        lifecycle?.finishTeardown();
+      } catch (error) {
+        record("lifecycle teardown", error);
+      }
+    };
+
+    let timedOut: McpShutdownTimeoutError | null = null;
+    try {
+      await bounded("server.close()", "transport", () => closeServerOnce());
+      if (waitForIdle) {
+        // One shared deadline: this wait, the disposal and the store close all
+        // expire together instead of each getting a fresh budget.
+        const idle = await Promise.race([waitForIdle(deadline.remainingMs()), deadline.at("drain")]);
+        if (!idle) throw new McpShutdownTimeoutError("drain", timeoutMs);
+      }
+      if (options.disposeLlm) {
+        await bounded("llama disposal", "transport", () => disposeLlmOnce());
+      }
+      await bounded("store.close()", "store", () => closeStoreOnce());
+      finish();
+    } catch (error) {
+      if (error instanceof McpShutdownTimeoutError) timedOut = error;
+      // Every other failure was already recorded by bounded().
+    } finally {
+      deadline.dispose();
+    }
+
+    if (timedOut) {
+      safeWrite(
+        `QMD Warning: ${timedOut.message}; continuing cleanup in the background with the store still open.\n`
+      );
+      void (async () => {
+        try {
+          // Unbounded on purpose: the store must not close under an operation
+          // that is still running. If that work never settles, cleanup stops
+          // here — the exit code already reported the abandoned state.
+          if (waitForIdle) {
+            try {
+              await waitForIdle();
+            } catch (error) {
+              record("in-flight drain", error);
+            }
+          }
+          await closeServerOnce().catch((error) => record("server.close()", error));
+          if (options.disposeLlm) await disposeLlmOnce().catch((error) => record("llama disposal", error));
+          await closeStoreOnce().catch((error) => record("store.close()", error));
+          finish();
+        } finally {
+          closed.resolve();
         }
-      });
+      })();
+    } else {
+      closed.resolve();
     }
-    if (options.disposeLlm) {
-      await step("llama disposal", options.disposeLlm);
-    }
-    await step("store.close()", options.closeStore);
 
     try {
       const prior = getExitCode();
-      if (failed) {
+      if (timedOut || failures.length > 0) {
         setExitCode(1);
       } else if (prior === undefined || prior === 0) {
         setExitCode(0);
@@ -993,9 +1599,15 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
     } catch {
       // injected setExitCode/getExitCode must not break the shutdown promise
     }
+    if (timedOut) {
+      options.exitOnTimeout?.(timedOut);
+      // The caller gets the typed failure; `closed` already tracks the cleanup
+      // that continues in the background.
+      throw timedOut;
+    }
   };
 
-  const shutdown = (): Promise<void> => (shutdownPromise ??= performShutdown());
+  const shutdown = (() => (shutdownPromise ??= performShutdown())) as StdioShutdown;
   const onStdinEof = (): void => { void shutdown().catch(() => {}); };
 
   stdin.once("end", onStdinEof);
@@ -1007,21 +1619,99 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
     onStdinEof();
   }
 
+  shutdown.closed = closed.promise;
   return shutdown;
 }
 
-export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
+/** Apply the non-interactive local-config trust gate before SDK model selection. */
+async function createMcpStore(options: McpStartupOptions): Promise<QMDStore> {
+  const dbPath = options.dbPath ?? getDefaultDbPath();
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) return createStore({ dbPath });
+
+  // Read once: the approval and store must use the same config snapshot.
+  const config = loadConfig();
+  const snapshot: SensitiveSnapshot = {
+    processors: Object.entries(config.collections)
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
+    hooks: Object.entries(config.collections)
+      .filter(([, col]) => !!col.update)
+      .map(([collection, col]) => ({ collection, command: col.update! })),
+    paths: Object.entries(config.collections).map(([collection, col]) => ({ collection, path: col.path })),
+    models: {
+      embed: config.models?.embed,
+      embedOptions: config.models?.embedOptions,
+      rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
+      generate: config.models?.generate,
+    },
+  };
+  const decision = decideLocalConfigGate({
+    configPath,
+    snapshot,
+    builtins: {
+      embed: DEFAULT_EMBED_MODEL_URI,
+      rerank: DEFAULT_RERANK_MODEL_URI,
+      generate: DEFAULT_GENERATE_MODEL_URI,
+    },
+    isInteractive: false,
+  });
+  const storeConfig = { ...config };
+  // Drop every configured URI and option, not the deliberate process env or
+  // built-in defaults. Never mutate the loaded config or write it back to YAML.
+  if (decision.action !== "run") delete storeConfig.models;
+  // MCP exposes no config mutations, so inline config needs no write-through.
+  return createStore({ dbPath, config: storeConfig });
+}
+
+/** Options for the stdio entry, plus who owns the process lifetime. */
+export type McpStdioServerOptions = McpStartupOptions & {
+  /**
+   * Standalone CLI/server-main only. The EOF shutdown then records its outcome
+   * in `process.exitCode` and forces `process.exit(1)` when the deadline
+   * expires with work still running: after EOF nothing can consume that work,
+   * and a process outliving its deadline is exactly the #751 leak.
+   *
+   * Omitted (embedded), a reported timeout rejects the returned `shutdown`
+   * promise and cleanup continues in the background, while neither
+   * `process.exitCode` nor the process itself is touched.
+   */
+  standalone?: boolean;
+};
+
+/**
+ * What `startMcpServer` hands back so an embedder can follow the lifecycle.
+ */
+export type StdioServerHandle = {
+  /**
+   * The idempotent stdin-EOF shutdown. Rejects with a
+   * {@link McpShutdownTimeoutError} when the deadline expired; resolves for
+   * every other outcome.
+   */
+  shutdown: StdioShutdown;
+  /**
+   * Resolves once every teardown step actually finished, including cleanup
+   * abandoned after a reported timeout. Never rejects.
+   */
+  closed: Promise<void>;
+};
+
+/**
+ * Serve MCP over stdio until stdin reaches EOF.
+ *
+ * Programmatic startup never terminates the caller's process: pass
+ * `standalone: true` only from a process-serving entry (the CLI, this module's
+ * main block), which is the sole owner of `process.exit`.
+ */
+export async function startMcpServer(options: McpStdioServerOptions = {}): Promise<StdioServerHandle> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
   // at the top level flipped the global production flag and broke test
   // isolation for downstream suites that expect the default (development)
   // database path behaviour.
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
+  const store = await createMcpStore(options);
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
@@ -1029,15 +1719,28 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const handle = serveStdio(() => createMcpServer(store, inflight));
 
   // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
-  // and the server must exit instead of orphaning to PID 1 (#751). No
+  // and the server must shut down instead of orphaning to PID 1 (#751). No
   // disposeLlm here — store.close() disposes this store's own LlamaCpp
   // instance, so passing the global disposeDefaultLlamaCpp would only risk
   // tearing down an unrelated instance in an embedded process.
-  registerStdioEofShutdown({
+  const standby = options.standalone === true;
+  const shutdown = registerStdioEofShutdown({
+    // Admission and drain state live in the gate the handlers are wrapped in,
+    // so shutdown closes it before the transport and drains through it.
+    lifecycle: inflight,
     closeServer: () => handle.close(),
-    waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
     closeStore: () => store.close(),
+    // Process ownership is opted into, never implied: an embedded host decides
+    // what a reported timeout or a failed step means for its own exit.
+    ...(standby
+      ? {
+          setExitCode: (code: number) => { process.exitCode = code; },
+          exitOnTimeout: () => process.exit(1),
+        }
+      : {}),
   });
+
+  return { shutdown, closed: shutdown.closed };
 }
 
 // =============================================================================
@@ -1045,9 +1748,56 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
 // =============================================================================
 
 export type HttpServerHandle = {
-  httpServer: import("http").Server;
+  httpServer: Server;
   port: number;
+  /**
+   * Stops the server. Every caller shares one teardown promise. Resolves when
+   * the listener and the store are closed; rejects with a
+   * {@link McpShutdownTimeoutError} at the deadline (default
+   * {@link MCP_SHUTDOWN_TIMEOUT_MS}), in which case the remaining cleanup
+   * continues in the background.
+   *
+   * It never calls process.exit: an embedded host decides what a reported
+   * timeout means for its own lifetime.
+   */
   stop: () => Promise<void>;
+  /**
+   * Resolves once every teardown step actually finished — including cleanup
+   * abandoned after a reported timeout — so it never claims "stopped" before
+   * the store is really closed. Never rejects. A hung store keeps it pending.
+   */
+  closed: Promise<void>;
+};
+
+/** Options for the HTTP transport: the startup options plus listener knobs. */
+export type McpHttpServerOptions = McpStartupOptions & {
+  quiet?: boolean;
+  host?: string;
+  allowedOrigins?: string[];
+  allowedHosts?: string[];
+  /**
+   * How long the whole stop() may take: the drain of already-admitted
+   * requests, the MCP transport close, the listener close and the store close
+   * all share this one deadline. Defaults to {@link MCP_SHUTDOWN_TIMEOUT_MS}.
+   *
+   * Until the deadline, admitted work is allowed to finish. At the deadline
+   * the admitted requests are aborted (their responses can no longer be
+   * delivered), their sockets are severed, and stop() rejects with a
+   * {@link McpShutdownTimeoutError}. The store is NOT closed underneath the
+   * abandoned work: the remaining cleanup continues in the background, in the
+   * same safe order, and the lifecycle only reaches `stopped` once closeStore()
+   * actually resolved. A standalone entry exits non-zero at that point; an
+   * embedded caller keeps running and can await `handle.closed`.
+   */
+  shutdownDrainTimeoutMs?: number;
+  /**
+   * The lifecycle every request is admitted through. Defaults to a fresh one.
+   * Pass a shared lifecycle to drain the listener from an owner that knows
+   * more than the HTTP transport does: after `beginDrain()` the listener
+   * answers 503 instead of touching the store, and stop() still tears down
+   * (the transition is idempotent).
+   */
+  lifecycle?: McpLifecycle;
 };
 
 /**
@@ -1062,23 +1812,43 @@ export type HttpServerHandle = {
  * works as a standalone call; subsequent 2025 methods need a modern envelope
  * or a stdio connection). The previous session reaper (#816) is gone because
  * there are no sessions to reap.
+ *
+ * Every request is admitted through one lifecycle (see createMcpLifecycle),
+ * so `stop()` drains what it admitted before closing the shared store, the
+ * MCP transport, or a socket underneath one.
+ *
+ * `stop()` is bounded end to end. It closes admission and the listener at
+ * once, lets the requests it already admitted finish until the deadline
+ * (default {@link MCP_SHUTDOWN_TIMEOUT_MS}, overridable with
+ * `shutdownDrainTimeoutMs`), and then closes the MCP transport, finishes the
+ * listener and closes the store — all inside that one deadline. A request that
+ * never completes (a client that stalls mid-body, a long-lived
+ * `subscriptions/listen` stream, a hung LLM call) is aborted at the deadline:
+ * `stop()` rejects with a {@link McpShutdownTimeoutError} while the abandoned
+ * cleanup continues in the background, so the store is never closed under live
+ * work and `stop()` never hangs the caller.
+ *
+ * The module installs no process signal handlers and never exits the process:
+ * a standalone entry (`qmd mcp --http`) owns SIGTERM/SIGINT handling and maps a
+ * reported timeout to a non-zero exit, while an embedded host decides for
+ * itself and can await `handle.closed`.
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: McpHttpServerOptions = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
   // callers that only import this module for its exports (e.g. tests).
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
+  const store = await createMcpStore(options);
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
+
+  // One admission/drain barrier for every request on this listener: REST
+  // routes and /mcp alike share the store that stop() closes.
+  const lifecycle = options.lifecycle ?? createMcpLifecycle();
 
   // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
   // responses (matches the previous enableJsonResponse: true). Dual-speaks
@@ -1149,6 +1919,78 @@ export async function startMcpHttpServer(
     return Buffer.concat(chunks).toString();
   }
 
+  /**
+   * Resolve once the response can take more bytes, or once it is gone. Racing
+   * the response's own lifecycle keeps a stalled subscriber from wedging the
+   * write loop after its socket died.
+   */
+  function waitForDrain(nodeRes: ServerResponse, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const settle = (): void => {
+      nodeRes.off("drain", settle);
+      nodeRes.off("close", settle);
+      signal.removeEventListener("abort", settle);
+      resolve();
+    };
+    nodeRes.once("drain", settle);
+    nodeRes.once("close", settle);
+    signal.addEventListener("abort", settle, { once: true });
+    return promise;
+  }
+
+  /**
+   * Copy a web Response onto a Node response with backpressure.
+   *
+   * `await response.arrayBuffer()` cannot be used: for `subscriptions/listen`
+   * the SDK answers with an SSE stream that only ends when the subscription
+   * does, so buffering waits forever and no byte ever reaches the client. Reads
+   * stop as soon as the response is gone or the request is aborted, and a
+   * write that cannot drain waits for 'drain' rather than queuing the rest.
+   */
+  async function writeWebResponse(nodeRes: ServerResponse, response: Response, signal: AbortSignal): Promise<void> {
+    if (nodeRes.destroyed || nodeRes.writableEnded) {
+      await response.body?.cancel(signal.reason).catch(() => {});
+      return;
+    }
+    nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+    if (!response.body) {
+      nodeRes.end();
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const aborted = Promise.withResolvers<null>();
+    const onAbort = (): void => aborted.resolve(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+    let completed = false;
+    try {
+      for (;;) {
+        const chunk = await Promise.race([reader.read(), aborted.promise]);
+        if (chunk === null) break;
+        if (chunk.done) {
+          completed = true;
+          break;
+        }
+        if (nodeRes.destroyed || nodeRes.writableEnded) break;
+        if (!nodeRes.write(Buffer.from(chunk.value))) {
+          await waitForDrain(nodeRes, signal);
+          if (signal.aborted || nodeRes.destroyed) break;
+        }
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (!completed) {
+        // The producer may ignore cancellation; the exchange still has to be
+        // told the stream is no longer wanted.
+        await reader.cancel(signal.reason).catch(() => {});
+      } else {
+        reader.releaseLock();
+      }
+      if (!nodeRes.writableEnded && !nodeRes.destroyed) nodeRes.end();
+    }
+  }
+
   const host = options.host ?? process.env.QMD_HOST ?? "localhost";
   const originGuard = resolveOriginGuard({
     host,
@@ -1156,9 +1998,70 @@ export async function startMcpHttpServer(
     ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
   });
 
+  /**
+   * Abort controllers for the requests this listener admitted. A client that
+   * goes away and a shutdown deadline both abort here, which is what tells a
+   * /mcp exchange (through its web Request's signal) and a REST search (through
+   * store.search's signal) that its result is no longer wanted.
+   */
+  const admitted = new Set<AbortController>();
+  /** True once teardown began closing the listener. */
+  let closingListener = false;
+
+  /**
+   * A connection is only aborted when it closes before its response finished:
+   * `finish` means the bytes were handed to the socket, so a later 'close' is
+   * the normal end of a keep-alive connection rather than a disconnect.
+   * IncomingMessage 'close' is deliberately not observed — it fires as soon as
+   * the request body ends, which would abort a live search.
+   */
+  function watchForDisconnect(nodeRes: ServerResponse, abort: AbortController): void {
+    nodeRes.once("close", () => {
+      if (nodeRes.writableFinished) return;
+      if (abort.signal.aborted) return;
+      abort.abort(new McpRequestAbortedError());
+    });
+  }
+
   const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
     const reqStart = Date.now();
     const pathname = (nodeReq.url || "/").split("?")[0];
+
+    // Admission gate first: once stop() has moved to draining, a request a
+    // socket still delivers (one accepted before the listener closed, or
+    // dispatched while the drain runs) must not read the store that teardown
+    // closes after it. A refused request answers and closes its connection.
+    const release = lifecycle.admit();
+    if (!release) {
+      nodeRes.writeHead(503, { "Content-Type": "application/json", "Connection": "close" });
+      nodeRes.end(JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Server is shutting down" },
+        id: null,
+      }));
+      log(`${ts()} ${nodeReq.method ?? "?"} ${pathname} 503 — shutting down`);
+      return;
+    }
+
+    // The ticket covers the handler's work, not the bytes: the listener-close
+    // step of teardown is what waits for a flushed response, so a slow client
+    // cannot hold the drain (or the store close) hostage, while a response
+    // still flushing is never severed early.
+    const abort = new AbortController();
+    admitted.add(abort);
+    watchForDisconnect(nodeRes, abort);
+    let released = false;
+    const releaseAdmission = (): void => {
+      if (released) return;
+      released = true;
+      admitted.delete(abort);
+      release();
+    };
+    // A finished response makes its keep-alive socket idle; during teardown it
+    // must go, or the listener would wait for it until the deadline.
+    nodeRes.once("finish", () => {
+      if (closingListener) httpServer.closeIdleConnections?.();
+    });
 
     try {
       // DNS-rebinding screen, ahead of routing so REST /query /search are
@@ -1244,7 +2147,11 @@ export async function startMcpHttpServer(
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
+        // The abort signal reaches the embedding/rerank stages, so a client
+        // that hangs up or a shutdown deadline stops paying for work whose
+        // result nobody will read.
         const results = await store.search({
+          signal: abort.signal,
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           filter: restFilter,
@@ -1394,18 +2301,22 @@ export async function startMcpHttpServer(
           : (nodeReq.method || "GET");
         const hostHeader = typeof nodeReq.headers.host === "string" ? nodeReq.headers.host : `localhost:${port}`;
         const url = `http://${hostHeader}${pathname}`;
+        // The signal is what tells the SDK the exchange is cancelled when the
+        // client disconnects or the shutdown deadline aborts this request; it
+        // is also the only way a long-lived subscription stream learns that
+        // nobody is listening any more.
         const request = new Request(url, {
           method: nodeReq.method || "GET",
           headers: nodeHeadersToWeb(nodeReq),
           ...(rawBody !== undefined ? { body: rawBody } : {}),
+          signal: abort.signal,
         });
         const response = await mcpHandler.fetch(
           request,
           parsedBody !== undefined ? { parsedBody } : undefined,
         );
 
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        await writeWebResponse(nodeRes, response, abort.signal);
         log(`${ts()} ${nodeReq.method} /mcp ${label} (${Date.now() - reqStart}ms)`);
         return;
       }
@@ -1413,9 +2324,17 @@ export async function startMcpHttpServer(
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
-      console.error("HTTP handler error:", err);
-      nodeRes.writeHead(500);
-      nodeRes.end("Internal Server Error");
+      // A request whose client disconnected (or that the shutdown deadline
+      // abandoned) has no socket left to answer on; anything else still
+      // deserves a 500.
+      if (!abort.signal.aborted && !nodeRes.headersSent && !nodeRes.writableEnded) {
+        nodeRes.writeHead(500);
+        nodeRes.end("Internal Server Error");
+      }
+    } finally {
+      // The handler's work is done. Bytes still flushing belong to the
+      // listener-close step of teardown, not to the drain.
+      releaseAdmission();
     }
   });
 
@@ -1424,27 +2343,71 @@ export async function startMcpHttpServer(
     httpServer.listen(port, host, () => resolve());
   });
 
-  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
+  const actualPort = (httpServer.address() as AddressInfo).port;
 
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    await mcpHandler.close();
-    httpServer.close();
-    await store.close();
-  };
+  // Listener completion: the callback of httpServer.close() fires once every
+  // connection ended. It is resolved exactly once, by the step that issues the
+  // close, and awaited under the same deadline as everything else.
+  const listenerClosed = Promise.withResolvers<void>();
 
-  process.on("SIGTERM", async () => {
-    console.error("Shutting down (SIGTERM)...");
-    await stop();
-    process.exit(0);
-  });
-  process.on("SIGINT", async () => {
-    console.error("Shutting down (SIGINT)...");
-    await stop();
-    process.exit(0);
-  });
+  /**
+   * Tear the listener and the shared store down exactly once, in lifecycle
+   * order (the order runMcpTeardown enforces):
+   *
+   * 1. `serving -> draining` closes admission, so every request from here on
+   *    — including one a runtime dispatches from a socket it already accepted —
+   *    is answered 503 instead of touching the store.
+   * 2. Close the listener. httpServer.close() stops accepting new connections
+   *    and leaves established ones alone, so an admitted request still runs;
+   *    it also releases the port while that work finishes.
+   * 3. Drain: admitted requests keep running until the single deadline.
+   * 4. Close the MCP transport. mcpHandler.close() aborts the exchanges it
+   *    still tracks, so it MUST come after the drain — closing it first aborted
+   *    admitted /mcp requests, the same bug one layer up.
+   * 5. Finish the listener: idle keep-alive sockets hold its 'close' open, so
+   *    they are swept (again on each flushed response) before waiting.
+   * 6. Close the store, then `draining -> stopped` — only if it really closed.
+   *
+   * On a deadline hit, runMcpTeardown aborts the admitted requests (their web
+   * Request signal cancels the SDK exchange and the REST search), severs the
+   * sockets, and finishes the same chain in the background: the store is never
+   * closed underneath work that is still running, and `closed` only resolves
+   * once it did close. Every concurrent caller shares one stop promise, so a
+   * second stop() cannot close the store twice.
+   */
+  const teardown = runMcpTeardown(
+    {
+      beginDrain: () => lifecycle.beginDrain(),
+      waitForIdle: (timeoutMs) => lifecycle.waitForIdle(timeoutMs),
+      abortWork: (reason) => {
+        for (const abort of admitted) {
+          if (!abort.signal.aborted) abort.abort(reason);
+        }
+      },
+      severConnections: () => httpServer.closeAllConnections?.(),
+      beginListenerClose: () => {
+        closingListener = true;
+        try {
+          httpServer.close(() => listenerClosed.resolve());
+        } catch (error) {
+          listenerClosed.resolve();
+          throw error;
+        } finally {
+          httpServer.closeIdleConnections?.();
+        }
+      },
+      listenerClosed: () => listenerClosed.promise,
+      closeTransport: () => mcpHandler.close(),
+      closeStore: () => store.close(),
+      finishTeardown: () => lifecycle.finishTeardown(),
+    },
+    {
+      ...(options.shutdownDrainTimeoutMs !== undefined ? { timeoutMs: options.shutdownDrainTimeoutMs } : {}),
+      log,
+    },
+  );
+
+  const stop = teardown.stop;
 
   log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   if (originGuard.disabled) {
@@ -1452,10 +2415,10 @@ export async function startMcpHttpServer(
   } else if (!originGuard.enforceHost) {
     log(`Warning: bound to ${host} with no QMD_ALLOWED_HOSTS — Host validation is off and the index is readable by anyone who can reach this port.`);
   }
-  return { httpServer, port: actualPort, stop };
+  return { httpServer, port: actualPort, stop, closed: teardown.closed };
 }
 
 // Run if this is the main module
 if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/server.ts") || process.argv[1]?.endsWith("/server.js")) {
-  startMcpServer().catch(console.error);
+  startMcpServer({ standalone: true }).catch(console.error);
 }

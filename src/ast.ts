@@ -67,8 +67,8 @@ const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string; versio
   typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
   tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm",        version: "0.23.2" },
   javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm", version: "0.23.2" },
-  python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.23.4" },
-  go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.23.4" },
+  python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm",     version: "0.25.0" },
+  go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm",         version: "0.25.0" },
   rust:       { pkg: "tree-sitter-rust",       wasm: "tree-sitter-rust.wasm",       version: "0.24.0" },
 };
 

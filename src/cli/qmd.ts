@@ -1,12 +1,26 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
+import { createCommandProcessor } from "../processors.js";
+import { hasProcessorMode, requireProcessor } from "../processor-store.js";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
-import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
+import {
+  MCP_DAEMON_EXIT_SECTION_BUDGET_MS,
+  claimMcpDaemonPidfile,
+  mcpDaemonStateFiles,
+  pidfileRecordsPid,
+  readMcpDaemonPidState,
+  removeMcpDaemonPidfileIfRecords,
+  removeStaleMcpDaemonPidfile,
+  stopMcpDaemon,
+  waitForDaemonChildIdentity,
+  waitForDaemonPidfileOwnership,
+} from "./mcp-pid.js";
+import { EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
+import type { HttpServerHandle } from "../mcp/server.js";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
 import {
@@ -22,7 +36,10 @@ import {
   getContextForPath,
   listCollections,
   removeCollection,
-  renameCollection,
+  deleteStoreCollection,
+  hasCollectionIndexState,
+  assertRenameTargetAvailable,
+  reconcilePublishedRename,
   findSimilarFiles,
   findDocument,
   resolveCommaListName,
@@ -32,7 +49,7 @@ import {
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
-  hashContent,
+  hashContentSync,
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
@@ -87,8 +104,10 @@ import {
   scanWriteBatch,
   REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
+  EmbedLockBusyError,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
+  invalidateConfigHash,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
@@ -107,6 +126,8 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
+import { RemoteEmbedder, isRemoteEmbedModel } from "../remote-embed.js";
+import { JevReranker, isJevModel } from "../jev.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -128,7 +149,9 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
-  saveConfig,
+  updateConfig,
+  hasPendingRename,
+  withConfigLocked,
   setConfigSource,
   findLocalConfigPath,
   getLocalDbPath,
@@ -171,25 +194,32 @@ let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
-    store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const activeModels = ensureModelsConfiguredForCli();
+    let config: CollectionConfig;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      config = loadConfig();
     } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // Keep diagnostics available for invalid YAML. Valid but unsafe remote
+      // selections already failed above, outside this parse-only catch.
+      store = createStore(storeDbPathOverride);
+      return store;
     }
+    // Untrusted project-local custom model URIs/options must not be loaded;
+    // status still displays the YAML values via resolveModelsForCli (#889).
+    const trusted = localConfigIsFullyTrusted();
+    const modelsForLlm = trusted ? activeModels : resolveModels();
+    const llm = new LlamaCpp({
+      embedModel: modelsForLlm.embed,
+      embedOptions: trusted ? config.models?.embedOptions : undefined,
+      generateModel: modelsForLlm.generate,
+      rerankModel: modelsForLlm.rerank,
+      rerankOptions: trusted ? config.models?.rerankOptions : undefined,
+    });
+    store = createStore(storeDbPathOverride);
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB.
+    withConfigLocked((fresh) => syncConfigToDb(store!.db, fresh));
+    setDefaultLlamaCpp(llm);
+    store.llm = llm;
   }
   return store;
 }
@@ -201,14 +231,10 @@ function getDb(): Database {
 /** Re-sync YAML config into SQLite after CLI mutations (add/remove/rename collection, context changes) */
 function resyncConfig(): void {
   const s = getStore();
-  try {
-    const config = loadConfig();
-    // Clear config hash to force re-sync
-    s.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+  withConfigLocked((config) => {
+    invalidateConfigHash(s.db);
     syncConfigToDb(s.db, config);
-  } catch {
-    // Config may not exist — that's fine
-  }
+  });
 }
 
 function closeDb(): void {
@@ -481,17 +507,20 @@ function initLocalIndex(): void {
   closeDb();
 
   if (!existsSync(configPath)) {
-    saveConfig({
-      collections: {},
-      models: resolveModels(),
+    updateConfig((config) => {
+      config.collections ??= {};
+      config.models ??= resolveModels();
     });
   } else {
     ensureModelsConfiguredForCli();
   }
 
   const localStore = createStore(dbPath);
-  syncConfigToDb(localStore.db, loadConfig());
-  localStore.close();
+  try {
+    withConfigLocked((config) => syncConfigToDb(localStore.db, config));
+  } finally {
+    localStore.close();
+  }
 
   console.log("ready to go with new local index");
 }
@@ -559,16 +588,17 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness; scoped per --index)
+  // MCP daemon status (pidfile identity decides; scoped per --index)
   const { pidPath: mcpPidPath } = mcpDaemonPaths();
-  if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    if (isQmdMcpPid(mcpPid)) {
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
-    } else {
-      try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
-      // Stale / recycled PID file cleaned up silently
-    }
+  const mcpDaemonState = readMcpDaemonPidState(mcpPidPath);
+  if (mcpDaemonState.status === "running") {
+    console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpDaemonState.pid})`);
+  } else if (mcpDaemonState.status === "stale" || mcpDaemonState.status === "malformed") {
+    // Cleaned up silently, but only after re-verifying inside the pidfile
+    // critical section: the read above may be outdated, and a daemon that a
+    // concurrent start published meanwhile must keep its file. An unreadable
+    // pidfile is never touched — it may belong to a live daemon.
+    removeStaleMcpDaemonPidfile(mcpPidPath);
   }
   console.log("");
 
@@ -688,8 +718,8 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
+    console.log(`  Embedding:   ${isRemoteEmbedModel(activeModels.embed) ? "configured remote (not probed; no local download)" : hfLink(activeModels.embed)}`);
+    console.log(`  Reranking:   ${isJevModel(activeModels.rerank) ? "configured remote TypeSafe (not probed; no local download)" : hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
@@ -748,6 +778,9 @@ function builtinModels(): BuiltinModels {
 function collectSensitiveSnapshot(): SensitiveSnapshot {
   const config = loadConfig();
   return {
+    processors: Object.entries(config.collections ?? {})
+      .filter(([, col]) => col.processor !== undefined)
+      .map(([collection, col]) => ({ collection, spec: col.processor! })),
     hooks: Object.entries(config.collections ?? {})
       .filter(([, col]) => !!col.update)
       .map(([name, col]) => ({ collection: name, command: col.update! })),
@@ -757,7 +790,9 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
     })),
     models: {
       embed: config.models?.embed,
+      embedOptions: config.models?.embedOptions,
       rerank: config.models?.rerank,
+      rerankOptions: config.models?.rerankOptions,
       generate: config.models?.generate,
     },
   };
@@ -802,6 +837,13 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 function printGatedItems(gated: GatedItems): void {
+  if (gated.processors?.length) console.log(`${c.yellow}Collection processor commands require approval: ${gated.processors.map(p => p.collection).join(", ")}${c.reset}`);
+  if (gated.rerankOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote rerank options (revision/credential variable name)${c.reset}`);
+  }
+  if (gated.embedOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote embedding options (dimensions/revision/credential variable name)${c.reset}`);
+  }
   if (gated.hooks.length > 0) {
     console.log(`${c.yellow}This project's config defines update commands:${c.reset}`);
     for (const hook of gated.hooks) {
@@ -943,19 +985,33 @@ async function updateCollections(): Promise<void> {
   const hooksAllowed = allowed;
   const configPath = getConfigPath();
 
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
-
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
-
-    // Execute custom update command if specified in YAML
+  // Validate every selected collection before hooks or document writes. Keep the
+  // same config and authorized adapter throughout this update, without rereads.
+  const prepared = collections.map(col => {
     const yamlCol = getCollectionFromYaml(col.name);
     const rawPath = yamlCol?.path ?? col.pwd;
-    if (!hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
+    const skip = !hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)
+      ? "path" : yamlCol?.processor && !hooksAllowed ? "processor" : undefined;
+    const processor = !skip && yamlCol?.processor ? createCommandProcessor(yamlCol.processor, { cwd: col.pwd }) : undefined;
+    if (!skip) requireProcessor(db, col.name, !!yamlCol?.processor, processor);
+    return { col, yamlCol, rawPath, processor, skip };
+  });
+
+  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+
+  for (let i = 0; i < prepared.length; i++) {
+    const entry = prepared[i];
+    if (!entry) continue;
+    const { col, yamlCol, rawPath, processor, skip } = entry;
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+
+    if (skip === "path") {
       console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
       console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
+    if (skip === "processor") {
+      console.log(`${c.yellow}Skipping processor collection '${col.name}' — config is not trusted. Approve with 'qmd trust'.${c.reset}`);
       continue;
     }
     if (yamlCol?.update && hooksAllowed) {
@@ -998,6 +1054,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      processor,
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1907,11 +1964,13 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
     process.exit(1);
   }
 
+  // Typing a path does not approve unrelated processor commands in this config.
+  const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
   // The user just typed this path, so it needs no separate approval (#889).
-  trustCurrentConfig();
+  if (mayRefreshTrust) trustCurrentConfig();
   resyncConfig();
 
   // Create the collection and index files
@@ -1921,20 +1980,44 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
+/** Inspect leftover index state without materializing model defaults in YAML. */
+function hasIndexedCollectionForRecovery(name: string): boolean {
+  if (store) return hasCollectionIndexState(store.db, name);
+  const dbPath = getDbPath();
+  if (!dbPath.startsWith("file:") && !existsSync(dbPath)) return false;
+  const probe = createStore(dbPath);
+  try {
+    return hasCollectionIndexState(probe.db, name);
+  } finally {
+    probe.close();
+  }
+}
+
 function collectionRemove(name: string): void {
-  // Check if collection exists in YAML
-  const coll = getCollectionFromYaml(name);
-  if (!coll) {
+  if (!getCollectionFromYaml(name) && !hasIndexedCollectionForRecovery(name)) {
     console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
     process.exit(1);
   }
-
   const db = getDb();
-  const result = removeCollection(db, name);
-  // Also remove from YAML config
-  yamlRemoveCollectionFn(name);
+  let result = { deletedDocs: 0, cleanedHashes: 0 };
+  const removed = yamlRemoveCollectionFn(name, () => db.transaction(() => {
+    let changed: boolean;
+    if (hasCollectionIndexState(db, name)) {
+      result = removeCollection(db, name);
+      changed = true;
+    } else {
+      changed = deleteStoreCollection(db, name);
+    }
+    invalidateConfigHash(db);
+    return changed;
+  }).immediate());
   closeDb();
+  if (!removed) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
   console.log(`  Deleted ${result.deletedDocs} documents`);
@@ -1944,27 +2027,30 @@ function collectionRemove(name: string): void {
 }
 
 function collectionRename(oldName: string, newName: string): void {
-  // Check if old collection exists in YAML
-  const coll = getCollectionFromYaml(oldName);
-  if (!coll) {
+  const original = getCollectionFromYaml(oldName);
+  if (!original && !hasPendingRename(oldName, newName)) {
     console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
     process.exit(1);
   }
-
-  // Check if new name already exists in YAML
-  const existing = getCollectionFromYaml(newName);
-  if (existing) {
+  if (original && getCollectionFromYaml(newName)) {
     console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
     console.error(`Choose a different name or remove the existing collection first.`);
     process.exit(1);
   }
-
   const db = getDb();
-  renameCollection(db, oldName, newName);
-  // Also rename in YAML config
-  yamlRenameCollectionFn(oldName, newName);
+  assertRenameTargetAvailable(db, newName);
+  const renamed = yamlRenameCollectionFn(oldName, newName, () => db.transaction(() => {
+    const changed = reconcilePublishedRename(db, oldName, newName);
+    invalidateConfigHash(db);
+    return changed;
+  }).immediate());
   closeDb();
+  if (!renamed) {
+    console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
@@ -2106,6 +2192,23 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
   }
 
+  const processorSpec = getCollectionFromYaml(collectionName)?.processor;
+  if (processorSpec || hasProcessorMode(db, collectionName)) {
+    if (processorSpec && !await resolveLocalConfigTrust()) {
+      console.log("Skipping processor collection — config is not trusted. Approve with 'qmd trust'.");
+      closeDb();
+      return;
+    }
+    const processor = processorSpec ? createCommandProcessor(processorSpec, { cwd: resolvedPwd }) : undefined;
+    const result = await reindexCollection(getStore(), resolvedPwd, globPattern, collectionName, { ignorePatterns, processor });
+    console.log(`Indexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
+    reportMetadataErrors(result.metadataErrors);
+    copyVectorsToNewCollections(db, collectionName);
+    closeDb();
+    return;
+  }
+
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
@@ -2181,7 +2284,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       continue;
     }
 
-    const hash = await hashContent(content);
+    // Synchronous on purpose: this scan holds its write batch transaction, so
+    // awaiting anything here would let another writer's statements run inside it.
+    const hash = hashContentSync(content);
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists (also migrates legacy lowercase paths)
@@ -2341,30 +2446,38 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
   return minutes * 60 * 1000;
 }
 
+function resolveAndValidateConfiguredModels(config: CollectionConfig): { embed: string; generate: string; rerank: string } {
+  const models = resolveModels(config.models);
+  const current = config.models ?? {};
+  // Invalid remote selection must fail closed, never fall back to local ML.
+  if (isRemoteEmbedModel(models.embed)) new RemoteEmbedder(models.embed, current.embedOptions);
+  else if (current.embedOptions !== undefined) throw new Error("embedOptions requires a remote embedding URI");
+  if (isJevModel(models.rerank)) new JevReranker(models.rerank, current.rerankOptions);
+  else if (current.rerankOptions !== undefined) throw new Error("rerankOptions requires a typesafe: rerank model");
+  return models;
+}
+
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  let config: CollectionConfig;
   try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    config = loadConfig();
   } catch {
-    return resolveModels();
+    return resolveModels(); // Doctor reports the parse error without loading ML.
   }
+  let models = resolveAndValidateConfiguredModels(config);
+  const current = config.models ?? {};
+  if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+    updateConfig((latest) => {
+      models = resolveAndValidateConfiguredModels(latest);
+      latest.models = { ...latest.models, ...models };
+    });
+  }
+  return models;
 }
 
 export function resolveEmbedModelForCli(): string {
-  return ensureModelsConfiguredForCli().embed;
+  const uri = ensureModelsConfiguredForCli().embed;
+  return isRemoteEmbedModel(uri) ? new RemoteEmbedder(uri, loadConfig().models?.embedOptions).modelName : uri;
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2393,28 +2506,14 @@ async function vectorIndex(
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
-  const db = storeInstance.db;
+  if (isRemoteEmbedModel(model)) model = storeInstance.llm!.embedModelName;
 
-  // Exclusive process lock — concurrent embeds race on vector_rows (#825)
-  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
-  if (!embedLock) {
-    console.log(EMBED_LOCK_BUSY_MESSAGE);
-    closeDb();
-    return;
-  }
 
   try {
     if (force) {
       console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     }
 
-    // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-    if (hashesToEmbed === 0 && !force) {
-      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
-      closeDb();
-      return;
-    }
 
     console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
     if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
@@ -2470,7 +2569,9 @@ async function vectorIndex(
     if (result.chunksCopied > 0) {
       console.log(`${c.green}✓${c.reset} Copied ${formatCount(result.chunksCopied)} vectors into collections that gained already-embedded documents`);
     }
-    if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
+    if (result.nothingToDo) {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    } else if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
       console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
       console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
@@ -2487,8 +2588,12 @@ async function vectorIndex(
     }
 
     closeDb();
-  } finally {
-    embedLock.release();
+  } catch (error) {
+    if (!(error instanceof EmbedLockBusyError)) throw error;
+    progress.clear();
+    cursor.show();
+    console.log(EMBED_LOCK_BUSY_MESSAGE);
+    closeDb();
   }
 }
 
@@ -4109,7 +4214,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const consequence = configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
-    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+    overrides.push({ name, value: key === "embed" && isRemoteEmbedModel(raw) ? "<remote URI>" : envValueForDisplay(raw), consequence });
   };
 
   add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
@@ -4192,7 +4297,8 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
     } else if (check.configured && check.configured !== check.defaultModel) {
       notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
     } else if (envValue && check.active !== envValue) {
-      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
+      const display = check.key === "embed" && isRemoteEmbedModel(envValue) ? "<remote URI>" : envValue;
+      notes.push(`${check.role}: ${check.envName} is set to ${display} but index config uses ${check.active}`);
     }
   }
 
@@ -4212,6 +4318,14 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (role === "reranking" && isJevModel(model)) {
+      doctorCheck("rerank configuration", true, "configured remote TypeSafe (not probed; no local download)");
+      continue;
+    }
+    if (role === "embedding" && isRemoteEmbedModel(model)) {
+      doctorCheck("embedding configuration", true, "configured remote (not probed; no local download)");
+      continue;
+    }
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4449,7 +4563,8 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = resolveEmbedModelForCli();
+  const remoteEmbed = isRemoteEmbedModel(activeModels.embed);
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
@@ -4480,10 +4595,13 @@ async function showDoctor(): Promise<void> {
   checkModelDefaults(activeModels, configModels);
   checkModelCache(activeModels, nextSteps);
 
-  await runDoctorDeviceChecks(nextSteps);
+  if (!remoteEmbed) await runDoctorDeviceChecks(nextSteps);
+  else doctorCheck("device probe", true, "skipped for remote embedding configuration");
 
   try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    const adoption = remoteEmbed
+      ? { checked: false, adopted: 0, reason: "remote embedding identities have no legacy local fingerprint" }
+      : await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
     if (adoption.checked || adoption.adopted > 0) {
       doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
     }
@@ -4542,7 +4660,9 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    const vectorSample = remoteEmbed
+      ? { ok: true, details: "not probed: remote embedding configuration (no HTTP request)" }
+      : await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
@@ -4830,10 +4950,11 @@ if (isMain) {
             console.error(`Collection not found: ${name}`);
             process.exit(1);
           }
+          const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
           updateCollectionSettings(name, { update: cmd });
           // The user just typed this command, so it needs no separate approval;
           // re-record so the digest covers the new hook set (#886).
-          trustCurrentConfig();
+          if (mayRefreshTrust) trustCurrentConfig();
           if (cmd) {
             console.log(`✓ Set update command for '${name}': ${cmd}`);
           } else {
@@ -4998,6 +5119,8 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
+      if (isRemoteEmbedModel(activeModels.embed)) console.log("Embedding: configured remote; no local download (not probed)");
+      if (isJevModel(activeModels.rerank)) console.log("Reranking: configured remote TypeSafe; no local download (not probed)");
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,
@@ -5080,25 +5203,39 @@ if (isMain) {
 
       // Subcommands take priority over flags
       if (sub === "stop") {
-        if (!existsSync(pidPath)) {
-          console.log("Not running (no PID file).");
-          process.exit(0);
+        // The pidfile's identity state drives the transition: only a live,
+        // identity-matched daemon is signalled, and it keeps its pidfile until
+        // its PID is actually gone.
+        const stopped = await stopMcpDaemon(pidPath);
+        let exitCode = 0;
+        switch (stopped.outcome) {
+          case "not-running":
+            console.log("Not running (no PID file).");
+            break;
+          case "unreadable":
+            console.error(`Cannot read PID file ${pidPath} (${stopped.error}); leaving it untouched.`);
+            exitCode = 1;
+            break;
+          case "cleaned-stale":
+            console.log("Cleaned up stale PID file (server was not running).");
+            break;
+          case "stopped":
+            console.log(`Stopped QMD MCP server (PID ${stopped.pid}).`);
+            break;
+          case "timeout":
+            console.error(`PID ${stopped.pid} is still alive after SIGTERM; keeping PID file (retry 'qmd mcp stop').`);
+            exitCode = 1;
+            break;
+          case "unsignalable":
+            console.error(`Cannot signal PID ${stopped.pid} (${stopped.error}); keeping PID file.`);
+            exitCode = 1;
+            break;
+          case "busy":
+            console.error(`PID file ${pidPath} is being updated by another qmd process (${stopped.error}); retry 'qmd mcp stop'.`);
+            exitCode = 1;
+            break;
         }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        if (!isQmdMcpPid(pid)) {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
-          console.log("Cleaned up stale PID file (server was not running).");
-          process.exit(0);
-        }
-        try {
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
-          console.log("Cleaned up stale PID file (server was not running).");
-        }
-        process.exit(0);
+        process.exit(exitCode);
       }
 
       if (cli.values.http) {
@@ -5109,15 +5246,17 @@ if (isMain) {
         const host = cli.values.host ? String(cli.values.host) : undefined;
 
         if (cli.values.daemon) {
-          // Guard: check if already running (identity-checked — recycled PIDs are stale)
-          if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (isQmdMcpPid(existingPid)) {
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
-            }
-            // Stale or recycled PID file — remove and continue
-            try { unlinkSync(pidPath); } catch { /* ignore */ }
+          // Guard: only a pidfile whose identity is "running" blocks a start —
+          // recycled PIDs and dead processes are stale (#806). An unreadable
+          // pidfile fails safe: it may name a live daemon we cannot inspect.
+          const existing = readMcpDaemonPidState(pidPath);
+          if (existing.status === "running") {
+            console.error(`Already running (PID ${existing.pid}). Run 'qmd mcp stop' first.`);
+            process.exit(1);
+          }
+          if (existing.status === "unreadable") {
+            console.error(`Cannot read PID file ${pidPath} (${existing.error}); refusing to start.`);
+            process.exit(1);
           }
 
           mkdirSync(cacheDir, { recursive: true });
@@ -5136,34 +5275,106 @@ if (isMain) {
               // Explicit resolved DB path so the child does not depend on
               // re-parsing --index (and cannot inherit a stale INDEX_PATH).
               INDEX_PATH: getDbPath(),
+              // Tells the child it is a managed daemon: it serves only once
+              // this PID file names it (see the foreground HTTP path below).
+              QMD_MCP_DAEMON_CHILD: "1",
             },
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
 
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
+          const childPid = child.pid;
+          if (childPid === undefined) {
+            console.error(`Failed to start QMD MCP server. See log: ${logPath}`);
+            process.exit(1);
+          }
+
+          // `spawn` returns before the child execs, so for a few milliseconds
+          // it still reports the parent's command line (or none at all).
+          // Publishing that PID would hand a concurrent start/stop/status a
+          // pidfile that classifies as `not-qmd` while this daemon owns it, and
+          // the live daemon would be treated as stale. Wait for the child's own
+          // cmdline first; a child that died in the meantime is reported as a
+          // failure instead of being published.
+          const readiness = await waitForDaemonChildIdentity(childPid, {
+            hasExited: () => child.exitCode !== null || child.signalCode !== null,
+          });
+          if (readiness.status !== "running") {
+            if (readiness.status === "timeout") {
+              // Hung before exec: it can never become the daemon we promised.
+              try { child.kill("SIGKILL"); } catch { /* ignore */ }
+            }
+            const owner = readMcpDaemonPidState(pidPath);
+            if (owner.status === "running" && owner.pid !== childPid) {
+              console.error(`Already running (PID ${owner.pid}). Run 'qmd mcp stop' first.`);
+            } else if (readiness.status === "timeout") {
+              console.error(`Failed to start QMD MCP server (it did not identify itself within the startup window). See log: ${logPath}`);
+            } else {
+              console.error(`Failed to start QMD MCP server. See log: ${logPath}`);
+            }
+            process.exit(1);
+          }
+
+          // Claim the pidfile inside the cross-process critical section: if
+          // another start won the race while this child was starting, that
+          // daemon owns the file and this child must not be left running
+          // untracked.
+          const claim = claimMcpDaemonPidfile(pidPath, childPid);
+          if (!claim.claimed) {
+            try { child.kill("SIGTERM"); } catch { /* ignore */ }
+            if (claim.reason === "running") {
+              console.error(`Already running (PID ${claim.runningPid}). Run 'qmd mcp stop' first.`);
+            } else {
+              console.error(`Could not claim PID file ${pidPath} (${claim.error}). See log: ${logPath}`);
+            }
+            process.exit(1);
+          }
+
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${childPid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
 
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
+        // Foreground HTTP mode — remove top-level cursor handlers so this
+        // process's own shutdown sequence runs instead.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
         // Best-effort: if this process owns the daemon pidfile, unlink on exit
-        // (covers SIGTERM/SIGINT via startMcpHttpServer's process.exit).
+        // (covers the SIGTERM/SIGINT path below). The
+        // cheap file check skips unmanaged foreground servers, and the
+        // check-and-unlink runs inside the pidfile critical section with a zero
+        // budget, so it can neither delete a pidfile another daemon republished
+        // nor block on — and deadlock against — the `stop` that is waiting for
+        // this process to die.
         const unlinkOwnPidfile = () => {
-          try {
-            if (!existsSync(pidPath)) return;
-            const written = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (written === process.pid) unlinkSync(pidPath);
-          } catch { /* ignore */ }
+          if (!pidfileRecordsPid(pidPath, process.pid)) return;
+          removeMcpDaemonPidfileIfRecords(pidPath, process.pid, { budgetMs: MCP_DAEMON_EXIT_SECTION_BUDGET_MS });
         };
         process.on("exit", unlinkOwnPidfile);
-        const { startMcpHttpServer } = await import("../mcp/server.js");
+
+        // A daemon spawned by `qmd mcp --http --daemon` serves only once the
+        // parent has published this PID. The pidfile is the ownership token:
+        // of two concurrent starts exactly one child is named, so only that one
+        // binds the port (the loser exits instead of racing the winner), and a
+        // child whose parent died before publishing never serves untracked.
+        if (process.env.QMD_MCP_DAEMON_CHILD === "1") {
+          const ownership = await waitForDaemonPidfileOwnership(pidPath, process.pid);
+          if (ownership !== "owned") {
+            console.error(
+              ownership === "taken"
+                ? `Another daemon owns ${pidPath}; this one will not start.`
+                : `No PID file was published for this daemon (${pidPath}); not starting untracked.`,
+            );
+            process.exit(1);
+          }
+        }
+
+        // Deliberately lazy: the MCP SDK is a heavy import that the rest of the
+        // CLI must not pay for (see test/cli-lazy-llm-import.test.ts).
+        const { startMcpHttpServer, terminateMcpServer } = await import("../mcp/server.js");
+        let handle: HttpServerHandle;
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          handle = await startMcpHttpServer(port, { dbPath: getDbPath(), host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -5171,10 +5382,26 @@ if (isMain) {
           }
           throw e;
         }
+
+        // Termination belongs to this entry point, not to startMcpHttpServer:
+        // an embedded host must not have its process exited by signal handlers
+        // it never asked for. A standalone server has nobody else to do it, and
+        // a deadline that expired with work still running must be visible as a
+        // non-zero exit — the abandoned cleanup cannot finish here.
+        const terminate = async (signal: NodeJS.Signals): Promise<void> => {
+          console.error(`Shutting down (${signal})...`);
+          await terminateMcpServer(handle.stop, {
+            exit: (code) => process.exit(code),
+            log: (message) => console.error(message),
+          });
+        };
+        process.on("SIGTERM", () => { void terminate("SIGTERM"); });
+        process.on("SIGINT", () => { void terminate("SIGINT"); });
       } else {
-        // Default: stdio transport
+        // Default: stdio transport. This is the process-serving entry, so it
+        // owns termination: EOF timeouts record the exit code and exit non-zero.
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await startMcpServer({ dbPath: getDbPath(), standalone: true });
       }
       break;
     }
