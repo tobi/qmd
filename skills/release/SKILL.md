@@ -134,7 +134,7 @@ The pre-push hook (`scripts/pre-push`) blocks `v*` tag pushes unless:
 
 1. `package.json` version matches the tag
 2. `CHANGELOG.md` has a `## [X.Y.Z] - date` entry for the version
-3. CI passed on GitHub (warns in non-interactive shells, blocks in terminals)
+3. The required CI and Nix workflows passed on GitHub for the tagged commit; missing, pending, failed, or unverifiable checks block the push, including in non-interactive shells.
 
 Hooks are installed silently by the context script. They can also be installed
 manually via `skills/release/scripts/install-hooks.sh` or automatically via

@@ -19,7 +19,9 @@
  * listening HTTP port, none of which a fake clock can advance. Waits are
  * predicate- or event-based (`waitFor`, `child.once("close")`); the only fixed
  * delays are poll intervals and the sampling loop of the "name never
- * disappears" watcher.
+ * disappears" watcher. Helpers live until this process releases them (closing
+ * their stdin) or kills them — never for a set duration — so a stalled runner
+ * cannot expire a holder an assertion still needs to see as alive.
  */
 
 import { afterEach, describe, expect, test } from "vitest";
@@ -40,7 +42,12 @@ const DEAD_PID = 999999999;
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
-const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
+// TypeScript entry points are loaded with `--import`, so each one runs in the
+// process we spawn: SIGKILL reaches the pidfile lock holder. The tsx CLI
+// wrapper would exec a second node that owns the critical section and forward
+// its output, so a kill would orphan the real holder and leave the transaction
+// open — and readiness would arrive one event loop late.
+const tsxImport = join(projectRoot, "node_modules", "tsx", "dist", "esm", "index.mjs");
 const helperScript = join(thisDir, "_helpers", "mcp-daemon-race-helper.ts");
 const isBunRuntime = "Bun" in globalThis;
 
@@ -77,20 +84,24 @@ function pidIsAlive(pid: number): boolean {
 type Helper = {
   proc: ChildProcess;
   output: () => string;
+  /** Close the helper's stdin: it leaves the section/daemon role and exits. */
+  release: () => void;
   waitFor: (needle: string, timeoutMs?: number) => Promise<void>;
   done: Promise<number | null>;
 };
 
-/** Spawn the race helper; trailing qmd tokens make it classify as a daemon. */
+/**
+ * Spawn the race helper; trailing qmd tokens make it classify as a daemon.
+ * The helper lives until `release()` (or a kill), never for a set duration.
+ */
 function spawnHelper(
   mode: "hold" | "claim",
   pidFile: string,
-  durationMs: number,
   options: { barrier?: boolean } = {},
 ): Helper {
   const args = isBunRuntime
-    ? [helperScript, mode, pidFile, String(durationMs), "qmd", "mcp", "--http"]
-    : [tsxCli, helperScript, mode, pidFile, String(durationMs), "qmd", "mcp", "--http"];
+    ? [helperScript, mode, pidFile, "qmd", "mcp", "--http"]
+    : ["--import", tsxImport, helperScript, mode, pidFile, "qmd", "mcp", "--http"];
   const proc = spawn(process.execPath, args, {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...(options.barrier ? { DAEMON_RACE_BARRIER: "1" } : {}) },
@@ -134,7 +145,7 @@ function spawnHelper(
   const { promise: done, resolve: onClose } = Promise.withResolvers<number | null>();
   proc.on("close", (code) => onClose(code));
 
-  return { proc, output: () => output, waitFor: waitForOutput, done };
+  return { proc, output: () => output, release: () => proc.stdin?.end(), waitFor: waitForOutput, done };
 }
 
 /** Throwaway pidfile directory (sync: used to seed files before any await). */
@@ -148,8 +159,7 @@ describe("pidfile critical section", () => {
   test("a held section makes claim and cleanup fail safe, and neither mutates the file", async () => {
     const { pidFile } = tempPidDir();
     writeFileSync(pidFile, String(DEAD_PID)); // stale: cleanup would normally drop it
-    const holder = spawnHelper("hold", pidFile, 15_000);
-
+    const holder = spawnHelper("hold", pidFile);
     try {
       await holder.waitFor("HOLD");
 
@@ -193,7 +203,7 @@ describe("pidfile critical section", () => {
 
     try {
       for (let i = 0; i < contenders; i++) {
-        children.push(spawnHelper("claim", pidFile, 1_500, { barrier: true }));
+        children.push(spawnHelper("claim", pidFile, { barrier: true }));
       }
       await Promise.all(children.map((child) => child.waitFor("READY")));
 
@@ -226,6 +236,11 @@ describe("pidfile critical section", () => {
       for (const loser of losers) {
         expect(loser.output()).toContain(`RUNNING ${winnerPid}`);
       }
+
+      // Every outcome is recorded and every file assertion has run, so the
+      // winner is free to leave: until now it stayed alive exactly so the file
+      // still described a running daemon.
+      winner?.release();
 
       const codes = await Promise.all(children.map((child) => child.done));
       watching = false;
@@ -290,9 +305,12 @@ async function runSandboxQmd(
   sandbox: Sandbox,
   args: string[],
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  // Same single-process launch for the CLI, so three concurrent starters are
+  // three processes racing on the pidfile rather than six (and `--import` takes
+  // an absolute path, since cwd here is the sandbox, not the repo).
   const runner = isBunRuntime
     ? { command: process.execPath, args: [qmdScript, ...args] }
-    : { command: process.execPath, args: [tsxCli, qmdScript, ...args] };
+    : { command: process.execPath, args: ["--import", tsxImport, qmdScript, ...args] };
   const proc = spawn(runner.command, runner.args, {
     cwd: sandbox.cwd,
     env: {
