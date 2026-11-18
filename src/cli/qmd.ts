@@ -4,11 +4,23 @@ import fastGlob from "fast-glob";
 import { createCommandProcessor } from "../processors.js";
 import { hasProcessorMode, requireProcessor } from "../processor-store.js";
 import { spawn as nodeSpawn } from "child_process";
-import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
-import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
+import {
+  MCP_DAEMON_EXIT_SECTION_BUDGET_MS,
+  claimMcpDaemonPidfile,
+  mcpDaemonStateFiles,
+  pidfileRecordsPid,
+  readMcpDaemonPidState,
+  removeMcpDaemonPidfileIfRecords,
+  removeStaleMcpDaemonPidfile,
+  stopMcpDaemon,
+  waitForDaemonChildIdentity,
+  waitForDaemonPidfileOwnership,
+} from "./mcp-pid.js";
+import { EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
+import type { HttpServerHandle } from "../mcp/server.js";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
 import {
@@ -24,7 +36,10 @@ import {
   getContextForPath,
   listCollections,
   removeCollection,
-  renameCollection,
+  deleteStoreCollection,
+  hasCollectionIndexState,
+  assertRenameTargetAvailable,
+  reconcilePublishedRename,
   findSimilarFiles,
   findDocument,
   resolveCommaListName,
@@ -34,7 +49,7 @@ import {
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
-  hashContent,
+  hashContentSync,
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
@@ -89,8 +104,10 @@ import {
   scanWriteBatch,
   REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
+  EmbedLockBusyError,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
+  invalidateConfigHash,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
@@ -132,8 +149,10 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
-  saveConfig,
-  saveModelsConfig,
+  updateConfig,
+  updateModelsConfig,
+  hasPendingRename,
+  withConfigLocked,
   setConfigSource,
   findLocalConfigPath,
   getLocalDbPath,
@@ -199,7 +218,7 @@ function getStore(): ReturnType<typeof createStore> {
     });
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB.
-    syncConfigToDb(store.db, config);
+    withConfigLocked((fresh) => syncConfigToDb(store!.db, fresh));
     setDefaultLlamaCpp(llm);
     store.llm = llm;
   }
@@ -213,14 +232,10 @@ function getDb(): Database {
 /** Re-sync YAML config into SQLite after CLI mutations (add/remove/rename collection, context changes) */
 function resyncConfig(): void {
   const s = getStore();
-  try {
-    const config = loadConfig();
-    // Clear config hash to force re-sync
-    s.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+  withConfigLocked((config) => {
+    invalidateConfigHash(s.db);
     syncConfigToDb(s.db, config);
-  } catch {
-    // Config may not exist — that's fine
-  }
+  });
 }
 
 function closeDb(): void {
@@ -493,17 +508,20 @@ function initLocalIndex(): void {
   closeDb();
 
   if (!existsSync(configPath)) {
-    saveConfig({
-      collections: {},
-      models: resolveModels(),
+    updateConfig((config) => {
+      config.collections ??= {};
+      config.models ??= resolveModels();
     });
   } else {
     ensureModelsConfiguredForCli();
   }
 
   const localStore = createStore(dbPath);
-  syncConfigToDb(localStore.db, loadConfig());
-  localStore.close();
+  try {
+    withConfigLocked((config) => syncConfigToDb(localStore.db, config));
+  } finally {
+    localStore.close();
+  }
 
   console.log("ready to go with new local index");
 }
@@ -571,16 +589,17 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness; scoped per --index)
+  // MCP daemon status (pidfile identity decides; scoped per --index)
   const { pidPath: mcpPidPath } = mcpDaemonPaths();
-  if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    if (isQmdMcpPid(mcpPid)) {
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
-    } else {
-      try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
-      // Stale / recycled PID file cleaned up silently
-    }
+  const mcpDaemonState = readMcpDaemonPidState(mcpPidPath);
+  if (mcpDaemonState.status === "running") {
+    console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpDaemonState.pid})`);
+  } else if (mcpDaemonState.status === "stale" || mcpDaemonState.status === "malformed") {
+    // Cleaned up silently, but only after re-verifying inside the pidfile
+    // critical section: the read above may be outdated, and a daemon that a
+    // concurrent start published meanwhile must keep its file. An unreadable
+    // pidfile is never touched — it may belong to a live daemon.
+    removeStaleMcpDaemonPidfile(mcpPidPath);
   }
   console.log("");
 
@@ -1962,20 +1981,44 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
+/** Inspect leftover index state without materializing model defaults in YAML. */
+function hasIndexedCollectionForRecovery(name: string): boolean {
+  if (store) return hasCollectionIndexState(store.db, name);
+  const dbPath = getDbPath();
+  if (!dbPath.startsWith("file:") && !existsSync(dbPath)) return false;
+  const probe = createStore(dbPath);
+  try {
+    return hasCollectionIndexState(probe.db, name);
+  } finally {
+    probe.close();
+  }
+}
+
 function collectionRemove(name: string): void {
-  // Check if collection exists in YAML
-  const coll = getCollectionFromYaml(name);
-  if (!coll) {
+  if (!getCollectionFromYaml(name) && !hasIndexedCollectionForRecovery(name)) {
     console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
     process.exit(1);
   }
-
   const db = getDb();
-  const result = removeCollection(db, name);
-  // Also remove from YAML config
-  yamlRemoveCollectionFn(name);
+  let result = { deletedDocs: 0, cleanedHashes: 0 };
+  const removed = yamlRemoveCollectionFn(name, () => db.transaction(() => {
+    let changed: boolean;
+    if (hasCollectionIndexState(db, name)) {
+      result = removeCollection(db, name);
+      changed = true;
+    } else {
+      changed = deleteStoreCollection(db, name);
+    }
+    invalidateConfigHash(db);
+    return changed;
+  }).immediate());
   closeDb();
+  if (!removed) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
   console.log(`  Deleted ${result.deletedDocs} documents`);
@@ -1985,27 +2028,30 @@ function collectionRemove(name: string): void {
 }
 
 function collectionRename(oldName: string, newName: string): void {
-  // Check if old collection exists in YAML
-  const coll = getCollectionFromYaml(oldName);
-  if (!coll) {
+  const original = getCollectionFromYaml(oldName);
+  if (!original && !hasPendingRename(oldName, newName)) {
     console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
     console.error(`Run 'qmd collection list' to see available collections.`);
     process.exit(1);
   }
-
-  // Check if new name already exists in YAML
-  const existing = getCollectionFromYaml(newName);
-  if (existing) {
+  if (original && getCollectionFromYaml(newName)) {
     console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
     console.error(`Choose a different name or remove the existing collection first.`);
     process.exit(1);
   }
-
   const db = getDb();
-  renameCollection(db, oldName, newName);
-  // Also rename in YAML config
-  yamlRenameCollectionFn(oldName, newName);
+  assertRenameTargetAvailable(db, newName);
+  const renamed = yamlRenameCollectionFn(oldName, newName, () => db.transaction(() => {
+    const changed = reconcilePublishedRename(db, oldName, newName);
+    invalidateConfigHash(db);
+    return changed;
+  }).immediate());
   closeDb();
+  if (!renamed) {
+    console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
@@ -2239,7 +2285,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       continue;
     }
 
-    const hash = await hashContent(content);
+    // Synchronous on purpose: this scan holds its write batch transaction, so
+    // awaiting anything here would let another writer's statements run inside it.
+    const hash = hashContentSync(content);
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists (also migrates legacy lowercase paths)
@@ -2399,13 +2447,7 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
   return minutes * 60 * 1000;
 }
 
-function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
-  let config: CollectionConfig;
-  try {
-    config = loadConfig();
-  } catch {
-    return resolveModels(); // Doctor reports the parse error without loading ML.
-  }
+function resolveAndValidateConfiguredModels(config: CollectionConfig): { embed: string; generate: string; rerank: string } {
   const models = resolveModels(config.models);
   const current = config.models ?? {};
   // Invalid remote selection must fail closed, never fall back to local ML.
@@ -2413,8 +2455,23 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   else if (current.embedOptions !== undefined) throw new Error("embedOptions requires a remote embedding URI");
   if (isJevModel(models.rerank)) new JevReranker(models.rerank, current.rerankOptions);
   else if (current.rerankOptions !== undefined) throw new Error("rerankOptions requires a typesafe: rerank model");
+  return models;
+}
+
+function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  let config: CollectionConfig;
+  try {
+    config = loadConfig();
+  } catch {
+    return resolveModels(); // Doctor reports the parse error without loading ML.
+  }
+  let models = resolveAndValidateConfiguredModels(config);
+  const current = config.models ?? {};
   if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-    saveModelsConfig(models);
+    updateModelsConfig((latest) => {
+      models = resolveAndValidateConfiguredModels(latest);
+      return models;
+    });
   }
   return models;
 }
@@ -2450,29 +2507,14 @@ async function vectorIndex(
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
-  const db = storeInstance.db;
   if (isRemoteEmbedModel(model)) model = storeInstance.llm!.embedModelName;
 
-  // Exclusive process lock — concurrent embeds race on vector_rows (#825)
-  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
-  if (!embedLock) {
-    console.log(EMBED_LOCK_BUSY_MESSAGE);
-    closeDb();
-    return;
-  }
 
   try {
     if (force) {
       console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     }
 
-    // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-    if (hashesToEmbed === 0 && !force) {
-      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
-      closeDb();
-      return;
-    }
 
     console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
     if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
@@ -2528,7 +2570,9 @@ async function vectorIndex(
     if (result.chunksCopied > 0) {
       console.log(`${c.green}✓${c.reset} Copied ${formatCount(result.chunksCopied)} vectors into collections that gained already-embedded documents`);
     }
-    if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
+    if (result.nothingToDo) {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    } else if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
       console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
       console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
@@ -2545,8 +2589,12 @@ async function vectorIndex(
     }
 
     closeDb();
-  } finally {
-    embedLock.release();
+  } catch (error) {
+    if (!(error instanceof EmbedLockBusyError)) throw error;
+    progress.clear();
+    cursor.show();
+    console.log(EMBED_LOCK_BUSY_MESSAGE);
+    closeDb();
   }
 }
 
@@ -5150,25 +5198,39 @@ if (isMain) {
 
       // Subcommands take priority over flags
       if (sub === "stop") {
-        if (!existsSync(pidPath)) {
-          console.log("Not running (no PID file).");
-          process.exit(0);
+        // The pidfile's identity state drives the transition: only a live,
+        // identity-matched daemon is signalled, and it keeps its pidfile until
+        // its PID is actually gone.
+        const stopped = await stopMcpDaemon(pidPath);
+        let exitCode = 0;
+        switch (stopped.outcome) {
+          case "not-running":
+            console.log("Not running (no PID file).");
+            break;
+          case "unreadable":
+            console.error(`Cannot read PID file ${pidPath} (${stopped.error}); leaving it untouched.`);
+            exitCode = 1;
+            break;
+          case "cleaned-stale":
+            console.log("Cleaned up stale PID file (server was not running).");
+            break;
+          case "stopped":
+            console.log(`Stopped QMD MCP server (PID ${stopped.pid}).`);
+            break;
+          case "timeout":
+            console.error(`PID ${stopped.pid} is still alive after SIGTERM; keeping PID file (retry 'qmd mcp stop').`);
+            exitCode = 1;
+            break;
+          case "unsignalable":
+            console.error(`Cannot signal PID ${stopped.pid} (${stopped.error}); keeping PID file.`);
+            exitCode = 1;
+            break;
+          case "busy":
+            console.error(`PID file ${pidPath} is being updated by another qmd process (${stopped.error}); retry 'qmd mcp stop'.`);
+            exitCode = 1;
+            break;
         }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        if (!isQmdMcpPid(pid)) {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
-          console.log("Cleaned up stale PID file (server was not running).");
-          process.exit(0);
-        }
-        try {
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          try { unlinkSync(pidPath); } catch { /* ignore */ }
-          console.log("Cleaned up stale PID file (server was not running).");
-        }
-        process.exit(0);
+        process.exit(exitCode);
       }
 
       if (cli.values.http) {
@@ -5179,15 +5241,17 @@ if (isMain) {
         const host = cli.values.host ? String(cli.values.host) : undefined;
 
         if (cli.values.daemon) {
-          // Guard: check if already running (identity-checked — recycled PIDs are stale)
-          if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (isQmdMcpPid(existingPid)) {
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
-            }
-            // Stale or recycled PID file — remove and continue
-            try { unlinkSync(pidPath); } catch { /* ignore */ }
+          // Guard: only a pidfile whose identity is "running" blocks a start —
+          // recycled PIDs and dead processes are stale (#806). An unreadable
+          // pidfile fails safe: it may name a live daemon we cannot inspect.
+          const existing = readMcpDaemonPidState(pidPath);
+          if (existing.status === "running") {
+            console.error(`Already running (PID ${existing.pid}). Run 'qmd mcp stop' first.`);
+            process.exit(1);
+          }
+          if (existing.status === "unreadable") {
+            console.error(`Cannot read PID file ${pidPath} (${existing.error}); refusing to start.`);
+            process.exit(1);
           }
 
           mkdirSync(cacheDir, { recursive: true });
@@ -5206,34 +5270,106 @@ if (isMain) {
               // Explicit resolved DB path so the child does not depend on
               // re-parsing --index (and cannot inherit a stale INDEX_PATH).
               INDEX_PATH: getDbPath(),
+              // Tells the child it is a managed daemon: it serves only once
+              // this PID file names it (see the foreground HTTP path below).
+              QMD_MCP_DAEMON_CHILD: "1",
             },
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
 
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
+          const childPid = child.pid;
+          if (childPid === undefined) {
+            console.error(`Failed to start QMD MCP server. See log: ${logPath}`);
+            process.exit(1);
+          }
+
+          // `spawn` returns before the child execs, so for a few milliseconds
+          // it still reports the parent's command line (or none at all).
+          // Publishing that PID would hand a concurrent start/stop/status a
+          // pidfile that classifies as `not-qmd` while this daemon owns it, and
+          // the live daemon would be treated as stale. Wait for the child's own
+          // cmdline first; a child that died in the meantime is reported as a
+          // failure instead of being published.
+          const readiness = await waitForDaemonChildIdentity(childPid, {
+            hasExited: () => child.exitCode !== null || child.signalCode !== null,
+          });
+          if (readiness.status !== "running") {
+            if (readiness.status === "timeout") {
+              // Hung before exec: it can never become the daemon we promised.
+              try { child.kill("SIGKILL"); } catch { /* ignore */ }
+            }
+            const owner = readMcpDaemonPidState(pidPath);
+            if (owner.status === "running" && owner.pid !== childPid) {
+              console.error(`Already running (PID ${owner.pid}). Run 'qmd mcp stop' first.`);
+            } else if (readiness.status === "timeout") {
+              console.error(`Failed to start QMD MCP server (it did not identify itself within the startup window). See log: ${logPath}`);
+            } else {
+              console.error(`Failed to start QMD MCP server. See log: ${logPath}`);
+            }
+            process.exit(1);
+          }
+
+          // Claim the pidfile inside the cross-process critical section: if
+          // another start won the race while this child was starting, that
+          // daemon owns the file and this child must not be left running
+          // untracked.
+          const claim = claimMcpDaemonPidfile(pidPath, childPid);
+          if (!claim.claimed) {
+            try { child.kill("SIGTERM"); } catch { /* ignore */ }
+            if (claim.reason === "running") {
+              console.error(`Already running (PID ${claim.runningPid}). Run 'qmd mcp stop' first.`);
+            } else {
+              console.error(`Could not claim PID file ${pidPath} (${claim.error}). See log: ${logPath}`);
+            }
+            process.exit(1);
+          }
+
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${childPid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
 
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
+        // Foreground HTTP mode — remove top-level cursor handlers so this
+        // process's own shutdown sequence runs instead.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
         // Best-effort: if this process owns the daemon pidfile, unlink on exit
-        // (covers SIGTERM/SIGINT via startMcpHttpServer's process.exit).
+        // (covers the SIGTERM/SIGINT path below). The
+        // cheap file check skips unmanaged foreground servers, and the
+        // check-and-unlink runs inside the pidfile critical section with a zero
+        // budget, so it can neither delete a pidfile another daemon republished
+        // nor block on — and deadlock against — the `stop` that is waiting for
+        // this process to die.
         const unlinkOwnPidfile = () => {
-          try {
-            if (!existsSync(pidPath)) return;
-            const written = parseInt(readFileSync(pidPath, "utf-8").trim());
-            if (written === process.pid) unlinkSync(pidPath);
-          } catch { /* ignore */ }
+          if (!pidfileRecordsPid(pidPath, process.pid)) return;
+          removeMcpDaemonPidfileIfRecords(pidPath, process.pid, { budgetMs: MCP_DAEMON_EXIT_SECTION_BUDGET_MS });
         };
         process.on("exit", unlinkOwnPidfile);
-        const { startMcpHttpServer } = await import("../mcp/server.js");
+
+        // A daemon spawned by `qmd mcp --http --daemon` serves only once the
+        // parent has published this PID. The pidfile is the ownership token:
+        // of two concurrent starts exactly one child is named, so only that one
+        // binds the port (the loser exits instead of racing the winner), and a
+        // child whose parent died before publishing never serves untracked.
+        if (process.env.QMD_MCP_DAEMON_CHILD === "1") {
+          const ownership = await waitForDaemonPidfileOwnership(pidPath, process.pid);
+          if (ownership !== "owned") {
+            console.error(
+              ownership === "taken"
+                ? `Another daemon owns ${pidPath}; this one will not start.`
+                : `No PID file was published for this daemon (${pidPath}); not starting untracked.`,
+            );
+            process.exit(1);
+          }
+        }
+
+        // Deliberately lazy: the MCP SDK is a heavy import that the rest of the
+        // CLI must not pay for (see test/cli-lazy-llm-import.test.ts).
+        const { startMcpHttpServer, terminateMcpServer } = await import("../mcp/server.js");
+        let handle: HttpServerHandle;
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          handle = await startMcpHttpServer(port, { dbPath: getDbPath(), host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -5241,10 +5377,26 @@ if (isMain) {
           }
           throw e;
         }
+
+        // Termination belongs to this entry point, not to startMcpHttpServer:
+        // an embedded host must not have its process exited by signal handlers
+        // it never asked for. A standalone server has nobody else to do it, and
+        // a deadline that expired with work still running must be visible as a
+        // non-zero exit — the abandoned cleanup cannot finish here.
+        const terminate = async (signal: NodeJS.Signals): Promise<void> => {
+          console.error(`Shutting down (${signal})...`);
+          await terminateMcpServer(handle.stop, {
+            exit: (code) => process.exit(code),
+            log: (message) => console.error(message),
+          });
+        };
+        process.on("SIGTERM", () => { void terminate("SIGTERM"); });
+        process.on("SIGINT", () => { void terminate("SIGINT"); });
       } else {
-        // Default: stdio transport
+        // Default: stdio transport. This is the process-serving entry, so it
+        // owns termination: EOF timeouts record the exit code and exit non-zero.
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
+        await startMcpServer({ dbPath: getDbPath(), standalone: true });
       }
       break;
     }

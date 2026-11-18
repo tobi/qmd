@@ -5801,30 +5801,55 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("legacy fingerprint adoption loads one sample body within a 128 MiB SQLite budget", () => {
-    // SQLite's hard heap limit is process-wide and cannot be raised again, so
-    // the fixture runs in a worker. The limit binds only under Bun with an
-    // SQLite that tracks memory (Bun's bundled SQLite on Linux, Homebrew SQLite
-    // on macOS), where the old per-chunk query fails with SQLITE_NOMEM. Apple's
-    // system libsqlite3 and better-sqlite3 are built with
-    // SQLITE_DEFAULT_MEMSTATUS=0, so there this only checks the adoption result.
+  test("legacy fingerprint adoption loads one sample body within a 128 MiB peak-RSS budget", () => {
+    // The fixture runs in a worker because the budget is a process-wide
+    // measurement. Peak RSS is what the kernel records on every Bun SQLite
+    // build, so the old per-chunk query's ~256 MiB of body copies fails it
+    // here, not only where SQLite tracks its own memory. The worker also
+    // proves the probe resolves the budget by materialising a blob twice its
+    // size afterwards, and the adoption result is asserted on every platform.
     const projectRoot = fileURLToPath(new URL("..", import.meta.url));
     const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-sample-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
-    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 20_000 });
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
 
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    const adoption = JSON.parse(result.stdout) as { checked: boolean; adopted: number; reason: string };
+    const out = JSON.parse(result.stdout) as {
+      checked: boolean;
+      adopted: number;
+      reason: string;
+      budgetBytes: number;
+      controlBlobBytes: number;
+      queryGrowthBytes: number | null;
+      controlGrowthBytes: number | null;
+    };
     // 16 documents x 32 legacy chunks, all adopted after one sample matched.
-    expect(adoption).toMatchObject({ checked: true, adopted: 512 });
-    expect(adoption.reason).toMatch(/^sample document-0_0 matched/);
+    expect(out).toMatchObject({ checked: true, adopted: 512 });
+    expect(out.reason).toMatch(/^sample document-0_0 matched/);
+    expect(out.controlBlobBytes).toBe(2 * out.budgetBytes);
+    // Peak RSS is a Linux counter; elsewhere only the adoption result holds.
+    if (out.queryGrowthBytes === null || out.controlGrowthBytes === null) {
+      expect(process.platform).not.toBe("linux");
+      return;
+    }
+    expect(out.queryGrowthBytes).toBeLessThanOrEqual(out.budgetBytes);
+    // No budget claim is meaningful unless the probe resolves one: the blob of
+    // twice the budget has to move the same high-water mark the query is
+    // measured with.
+    expect(out.controlGrowthBytes).toBeGreaterThanOrEqual(out.budgetBytes);
   });
 
-  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
-    // One legacy chunk, so only the active-path count multiplies the body. The
-    // limit binds under Bun only, as in the 128 MiB test above.
+  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 64 MiB peak-RSS budget", () => {
+    // One legacy chunk, so only the active-path count multiplies the body: a
+    // sample query that carries c.doc through its join keeps one 1 MiB copy
+    // live per path, about 200 MiB, while reading the sample by rowid keeps
+    // one. The budget is peak RSS, which the kernel records whatever SQLite
+    // build is in use; PRAGMA hard_heap_limit only binds where SQLite tracks
+    // its own memory. The worker also proves the probe resolves the budget by
+    // materialising a blob twice its size afterwards, and the adoption result
+    // is asserted on every platform.
     const projectRoot = fileURLToPath(new URL("..", import.meta.url));
     const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
@@ -5833,10 +5858,26 @@ describe("Embedding batching", () => {
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    const out = JSON.parse(result.stdout);
+    const out = JSON.parse(result.stdout) as {
+      checked: boolean;
+      adopted: number;
+      budgetBytes: number;
+      controlBlobBytes: number;
+      queryGrowthBytes: number | null;
+      controlGrowthBytes: number | null;
+    };
     expect(out).toMatchObject({ checked: true, adopted: 1 });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    expect(out.controlBlobBytes).toBe(2 * out.budgetBytes);
+    // Peak RSS is a Linux counter; elsewhere only the adoption result holds.
+    if (out.queryGrowthBytes === null || out.controlGrowthBytes === null) {
+      expect(process.platform).not.toBe("linux");
+      return;
+    }
+    expect(out.queryGrowthBytes).toBeLessThanOrEqual(out.budgetBytes);
+    // No budget claim is meaningful unless the probe resolves one: the blob of
+    // twice the budget has to move the same high-water mark the query is
+    // measured with.
+    expect(out.controlGrowthBytes).toBeGreaterThanOrEqual(out.budgetBytes);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {

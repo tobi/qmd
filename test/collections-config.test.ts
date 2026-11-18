@@ -10,7 +10,7 @@ import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, loadConfig, saveModelsConfig, setConfigIndexName, setConfigSource } from "../src/collections.js";
+import { getConfigPath, loadConfig, updateModelsConfig, setConfigIndexName, setConfigSource } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -105,7 +105,7 @@ describe("getConfigDir via getConfigPath", () => {
     }
   });
 
-  test("saveModelsConfig keeps comments and quoting in an existing file", async () => {
+  test("updateModelsConfig keeps comments and quoting in an existing file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-models-config-"));
     const configPath = join(dir, "index.yml");
     try {
@@ -120,7 +120,7 @@ describe("getConfigDir via getConfigPath", () => {
       ].join("\n"));
       setConfigSource({ configPath });
 
-      saveModelsConfig({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+      updateModelsConfig(() => ({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" }));
 
       const written = await readFile(configPath, "utf-8");
       expect(written).toContain("# Load-bearing comment\n");
@@ -136,14 +136,14 @@ describe("getConfigDir via getConfigPath", () => {
   test.each([
     ["an existing models block", "models:\n  # pinned for reproducible embeddings\n  embed: hf:mine\n", "# pinned for reproducible embeddings"],
     ["a bare models key", "models:\n  # embed: hf:later\n", "# embed: hf:later"],
-  ])("saveModelsConfig fills in %s", async (_name, models, kept) => {
+  ])("updateModelsConfig fills in %s", async (_name, models, kept) => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-models-config-"));
     const configPath = join(dir, "index.yml");
     try {
       await writeFile(configPath, `collections: {}\n${models}`);
       setConfigSource({ configPath });
 
-      saveModelsConfig({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });
+      updateModelsConfig(() => ({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" }));
 
       expect(await readFile(configPath, "utf-8")).toContain(kept);
       expect(loadConfig().models).toEqual({ embed: "hf:e", generate: "hf:g", rerank: "hf:r" });

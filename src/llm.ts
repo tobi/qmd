@@ -139,7 +139,8 @@ export function setLlamaDirWritableForTest(writable: boolean | undefined): void 
 export function canWriteLlamaDir(pkgDir?: string): boolean {
   if (llamaDirWritableOverride !== undefined) return llamaDirWritableOverride;
   try {
-    const dir = pkgDir ?? dirname(llamaCppRequire.resolve("node-llama-cpp/package.json"));
+    // Resolve the exported entry point: package.json is not an exported subpath.
+    const dir = pkgDir ?? dirname(dirname(llamaCppRequire.resolve("node-llama-cpp")));
     accessSync(join(dir, "llama"), constants.W_OK);
     return true;
   } catch {
@@ -849,6 +850,205 @@ function isCpuModeRequested(): boolean {
   return resolveLlamaGpuMode() === false;
 }
 
+// =============================================================================
+// Resource lifecycle
+// =============================================================================
+
+/**
+ * Explicit resource lifecycle for one LlamaCpp instance:
+ *
+ *   ready      → models/contexts may be loaded, borrowed and idle-unloaded.
+ *   unloading  → an idle unload is disposing detached contexts; new work parks
+ *                until the real disposal completes.
+ *   disposing  → terminal dispose() is running; new work is rejected and
+ *                already-running operations plus any idle unload finish before
+ *                resources are freed.
+ *   disposed   → terminal; every operation is rejected.
+ *
+ * Entering "unloading"/"disposing" happens synchronously, before the first
+ * await of the routine that owns it. That makes the readiness check and lease
+ * acquisition atomic with respect to each other: a caller either takes a lease
+ * first (and an idle unload then declines), or observes "unloading" and parks
+ * on its completion instead of borrowing a context that is being disposed.
+ */
+export type LlamaCppLifecycleState = "ready" | "unloading" | "disposing" | "disposed";
+
+/**
+ * What a terminal dispose() must wait for before touching native resources:
+ * already-running operations and any idle unload already in progress.
+ */
+type LlamaCppDisposePlan = {
+  pendingOperations: Promise<void>;
+  pendingUnload: Promise<void> | null;
+};
+
+/**
+ * Leases and transitions shared by an instance and every session opened on it.
+ *
+ * Session leases live here rather than in a per-call session manager so that a
+ * session opened through ANY entry point (withLLMSessionForLlm, withLLMSession,
+ * or a direct method call) is visible to the instance's own inactivity timer.
+ */
+class LlmResourceLifecycle {
+  private _state: LlamaCppLifecycleState = "ready";
+  private sessionLeases = 0;
+  private operationLeases = 0;
+  private unloadCompletion: Promise<void> | null = null;
+  private settleOperationDrain: (() => void) | null = null;
+  private disposeCompletion: Promise<void> | null = null;
+  private settleDisposeCompletion: (() => void) | null = null;
+
+  get state(): LlamaCppLifecycleState {
+    return this._state;
+  }
+
+  get isTerminal(): boolean {
+    return this._state === "disposing" || this._state === "disposed";
+  }
+
+  /**
+   * An idle unload may start only when nothing is leased and no transition
+   * already owns the resources.
+   */
+  get canUnload(): boolean {
+    return this._state === "ready" && this.sessionLeases === 0 && this.operationLeases === 0;
+  }
+
+  /** Take a session lease; parks while an idle unload is disposing resources. */
+  async acquireSessionLease(): Promise<void> {
+    await this.acquireLease(() => { this.sessionLeases += 1; });
+  }
+
+  releaseSessionLease(): void {
+    this.sessionLeases = Math.max(0, this.sessionLeases - 1);
+  }
+
+  /** Take an operation lease; parks while an idle unload is disposing resources. */
+  async acquireOperationLease(): Promise<void> {
+    await this.acquireLease(() => { this.operationLeases += 1; });
+  }
+
+  releaseOperationLease(): void {
+    this.operationLeases = Math.max(0, this.operationLeases - 1);
+    // A terminal dispose may be waiting for already-running operations. New
+    // operations are rejected once disposing, so this count only decreases.
+    if (this.operationLeases === 0 && this.settleOperationDrain) {
+      this.settleOperationDrain();
+      this.settleOperationDrain = null;
+    }
+  }
+
+  private async acquireLease(commit: () => void): Promise<void> {
+    for (;;) {
+      if (this._state === "ready") {
+        // Check and commit without awaiting: the state cannot change in between,
+        // so a competing idle unload either sees this lease or we wait for it.
+        commit();
+        return;
+      }
+      if (this._state !== "unloading") {
+        throw new Error("LLM has been disposed");
+      }
+      const completion = this.unloadCompletion;
+      if (completion) await completion;
+    }
+  }
+
+  /**
+   * Enter "unloading" when safe and dispose resources through `dispose`.
+   *
+   * Returns null when work is still leased or a transition owns the resources;
+   * otherwise a promise that resolves once disposal finished. It never rejects:
+   * failures are reported, because every parked caller depends on the
+   * completion resolving and a rejected gate would strand them.
+   * Disposal is awaited to real completion (no timeout), so the gate can never
+   * reopen while a disposed context is still being used by native code.
+   */
+  beginUnload(dispose: () => Promise<void>): Promise<void> | null {
+    if (!this.canUnload) return null;
+
+    this._state = "unloading";
+    const { promise: completion, resolve: settle } = Promise.withResolvers<void>();
+    this.unloadCompletion = completion;
+    void (async () => {
+      try {
+        await dispose();
+      } catch (error) {
+        console.error("Error unloading idle resources:", error);
+      } finally {
+        // A concurrent dispose() owns the terminal state; never reopen it.
+        if (this._state === "unloading") this._state = "ready";
+        this.unloadCompletion = null;
+        settle();
+      }
+    })();
+    return completion;
+  }
+
+  /**
+   * Enter the terminal "disposing" state.
+   *
+   * New sessions and operations are rejected from this moment, synchronously.
+   * Returns the promise that resolves once already-running operation leases
+   * have drained — native contexts/models must not be destroyed under an
+   * operation that still holds one — plus any idle unload already in progress.
+   *
+   * Session leases are deliberately NOT awaited: a session callback is allowed
+   * to call dispose() after its awaited operation without deadlocking itself.
+   *
+   * Returns null when this call did not start the teardown (already disposing
+   * or disposed). Concurrent callers must then await whenDisposed(), so none
+   * of them continues (e.g. closing SQLite) while the first teardown and the
+   * work it is draining are still running.
+   */
+  beginDispose(): LlamaCppDisposePlan | null {
+    if (this.isTerminal) return null;
+    this._state = "disposing";
+
+    const { promise: completion, resolve: settle } = Promise.withResolvers<void>();
+    this.disposeCompletion = completion;
+    this.settleDisposeCompletion = settle;
+
+    if (this.operationLeases === 0) {
+      return { pendingOperations: Promise.resolve(), pendingUnload: this.unloadCompletion };
+    }
+
+    const { promise: pendingOperations, resolve: resolveOperationDrain } = Promise.withResolvers<void>();
+    this.settleOperationDrain = resolveOperationDrain;
+    return { pendingOperations, pendingUnload: this.unloadCompletion };
+  }
+
+  /**
+   * Resolves when the terminal teardown finished; immediately once disposed.
+   * This is the single completion every dispose() caller waits on.
+   */
+  whenDisposed(): Promise<void> {
+    return this.disposeCompletion ?? Promise.resolve();
+  }
+
+  /** Publish the terminal state and the shared completion for all callers. */
+  finishDispose(): void {
+    this._state = "disposed";
+    this.settleDisposeCompletion?.();
+    this.settleDisposeCompletion = null;
+  }
+}
+
+/**
+ * One lifecycle per LlamaCpp instance, keyed by instance so session helpers do
+ * not need to expose lifecycle internals on the public class.
+ */
+const llmLifecycles = new WeakMap<object, LlmResourceLifecycle>();
+
+function lifecycleFor(llm: LlamaCpp): LlmResourceLifecycle {
+  let lifecycle = llmLifecycles.get(llm);
+  if (!lifecycle) {
+    lifecycle = new LlmResourceLifecycle();
+    llmLifecycles.set(llm, lifecycle);
+  }
+  return lifecycle;
+}
+
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
@@ -883,9 +1083,12 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
-  // Track disposal state to prevent double-dispose
-  private disposed = false;
-
+  /**
+   * Guards every resource borrow and disposal for this instance. Shared with
+   * sessions opened through withLLMSession/withLLMSessionForLlm, and with the
+   * inactivity timer, so all of them agree on one lifecycle.
+   */
+  private readonly lifecycle: LlmResourceLifecycle;
 
   constructor(config: LlamaCppConfig = {}) {
     // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
@@ -894,6 +1097,9 @@ export class LlamaCpp implements LLM {
     // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
+
+    this.lifecycle = new LlmResourceLifecycle();
+    llmLifecycles.set(this, this.lifecycle);
 
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     if (isRemoteEmbedModel(this.embedModelUri)) {
@@ -914,12 +1120,17 @@ export class LlamaCpp implements LLM {
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
 
+  /** Current resource lifecycle state (diagnostics and lifecycle tests). */
+  get lifecycleState(): LlamaCppLifecycleState {
+    return this.lifecycle.state;
+  }
+
   get embedModelName(): string {
     return this.remoteEmbedder?.modelName ?? this.embedModelUri;
   }
 
   private async embedRemote(texts: string[], options: EmbedOptions): Promise<EmbeddingResult[]> {
-    if (this.disposed) throw new Error("LLM has been disposed");
+    if (this.lifecycle.isTerminal) throw new Error("LLM has been disposed");
     if (options.model !== undefined && options.model !== this.embedModelName) {
       throw new Error("Remote embedding model override does not match configured space");
     }
@@ -937,33 +1148,41 @@ export class LlamaCpp implements LLM {
 
   /**
    * Reset the inactivity timer. Called after each model operation.
-   * When timer fires, models are unloaded to free memory (if no active sessions).
+   *
+   * The timer only unloads when THIS instance's lifecycle reports no leased
+   * work (sessions and in-flight operations), so a session opened through
+   * withLLMSessionForLlm is as visible as one opened on the default instance.
    */
   private touchActivity(): void {
-    // Clear existing timer
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
 
+    // A transition owns the resources: do not arm a second unload from under it.
+    if (this.lifecycle.state !== "ready") return;
+
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
-      this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
-          // Active sessions/operations - reschedule timer
-          this.touchActivity();
-          return;
-        }
-        this.unloadIdleResources().catch(err => {
-          console.error("Error unloading idle resources:", err);
-        });
-      }, this.inactivityTimeoutMs);
+      this.inactivityTimer = setTimeout(() => this.handleInactivityTimeout(), this.inactivityTimeoutMs);
       // Don't keep process alive just for this timer
       this.inactivityTimer.unref();
     }
+  }
+
+  /**
+   * Inactivity timer callback: unload when nothing is leased, otherwise look
+   * again after another idle window.
+   *
+   * Kept as a named method so lifecycle tests can exercise the exact decision
+   * the timer makes without depending on platform timer APIs.
+   */
+  private handleInactivityTimeout(): void {
+    this.inactivityTimer = null;
+    if (this.startIdleUnload()) return;
+    // Work is still leased (session or in-flight operation): the resources
+    // were not idle, so look again after another full idle window.
+    this.touchActivity();
   }
 
   /**
@@ -974,32 +1193,71 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Unload idle resources but keep the instance alive for future use.
+   * Begin an idle unload when the lifecycle permits it.
    *
-   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
-   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
+   * Returns the completion promise, or null when work is still leased (or a
+   * transition owns the resources). The transition into "unloading" happens
+   * synchronously, so no caller can borrow a pooled context between the
+   * decision and the disposal.
    */
-  async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
-    if (this.disposed) {
-      return;
-    }
-
-    // Clear timer
+  private startIdleUnload(): Promise<void> | null {
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
+    return this.lifecycle.beginUnload(() => this.disposeIdleResources());
+  }
 
-    // Dispose contexts first
-    for (const ctx of this.embedContexts) {
-      await ctx.dispose();
-    }
+  /**
+   * Unload idle resources but keep the instance alive for future use.
+   *
+   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
+   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
+   *
+   * Declines (and resolves) when sessions or operations are leased, or while
+   * another transition already owns the resources: a borrowed context must
+   * never be disposed underneath its user.
+   */
+  async unloadIdleResources(): Promise<void> {
+    const unload = this.startIdleUnload();
+    if (unload) await unload;
+  }
+
+  /**
+   * Detach the current context pools from the instance.
+   *
+   * Nothing can borrow what ensureEmbedContexts()/ensureRerankContexts() no
+   * longer publish, which is what makes the awaits in the disposers safe.
+   */
+  private drainContextPools(): {
+    embed: LlamaEmbeddingContext[];
+    rerank: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[];
+  } {
+    const embed = this.embedContexts;
+    const rerank = this.rerankContexts;
     this.embedContexts = [];
-    for (const ctx of this.rerankContexts) {
+    this.rerankContexts = [];
+    return { embed, rerank };
+  }
+
+  /**
+   * Dispose what an idle unload owns.
+   *
+   * Disposal is awaited to real completion, deliberately without a timeout:
+   * admission reopens only once the contexts (and, when opted in, models) are
+   * actually gone. Letting a timed-out dispose keep running while admission
+   * resumes would allow a fresh borrow to overlap it, or a model teardown to
+   * overlap its context's disposal. This matches the pre-existing idle path.
+   */
+  private async disposeIdleResources(): Promise<void> {
+    const { embed, rerank } = this.drainContextPools();
+
+    for (const ctx of embed) {
       await ctx.dispose();
     }
-    this.rerankContexts = [];
+    for (const ctx of rerank) {
+      await ctx.dispose();
+    }
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
@@ -1024,6 +1282,22 @@ export class LlamaCpp implements LLM {
     }
 
     // Note: We keep llama instance alive - it's lightweight
+  }
+
+  /**
+   * Run a model/context operation under an operation lease.
+   *
+   * The lease keeps an idle unload from starting mid-operation, and admission
+   * parks while an idle unload is already disposing resources instead of
+   * borrowing a context that is about to be (or is being) disposed.
+   */
+  private async withOperationLease<T>(fn: () => Promise<T>): Promise<T> {
+    await this.lifecycle.acquireOperationLease();
+    try {
+      return await fn();
+    } finally {
+      this.lifecycle.releaseOperationLease();
+    }
   }
 
   /**
@@ -1450,11 +1724,13 @@ export class LlamaCpp implements LLM {
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
-    await this.ensureEmbedContext();  // Ensure model is loaded
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.tokenize(text);
+    return this.withOperationLease(async () => {
+      await this.ensureEmbedContext();  // Ensure model is loaded
+      if (!this.embedModel) {
+        throw new Error("Embed model not loaded");
+      }
+      return this.embedModel.tokenize(text);
+    });
   }
 
   /**
@@ -1469,11 +1745,13 @@ export class LlamaCpp implements LLM {
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
-    await this.ensureEmbedContext();
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.detokenize(tokens);
+    return this.withOperationLease(async () => {
+      await this.ensureEmbedContext();
+      if (!this.embedModel) {
+        throw new Error("Embed model not loaded");
+      }
+      return this.embedModel.detokenize(tokens);
+    });
   }
 
   // ==========================================================================
@@ -1513,29 +1791,36 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    if (this.remoteEmbedder) return (await this.embedRemote([text], options))[0]!;
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
-    try {
-      const context = await this.ensureEmbedContext();
-
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
-      }
-
-      const embedding = await context.getEmbeddingFor(safeText);
-
-      return {
-        embedding: Array.from(embedding.vector),
-        model: options.model ?? this.embedModelUri,
-      };
-    } catch (error) {
-      console.error("Embedding error:", error);
-      return null;
+    // Remote embedding is an in-flight operation too: dispose()/close must not
+    // proceed while the HTTP request and its result mapping are pending.
+    if (this.remoteEmbedder) {
+      return this.withOperationLease(async () => (await this.embedRemote([text], options))[0]!);
     }
+
+    return this.withOperationLease(async () => {
+      // Ping activity at start to keep models alive during this operation
+      this.touchActivity();
+
+      try {
+        const context = await this.ensureEmbedContext();
+
+        // Guard: truncate text that exceeds model context window to prevent GGML crash
+        const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+        if (truncated) {
+          console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
+        }
+
+        const embedding = await context.getEmbeddingFor(safeText);
+
+        return {
+          embedding: Array.from(embedding.vector),
+          model: options.model ?? this.embedModelUri,
+        };
+      } catch (error) {
+        console.error("Embedding error:", error);
+        return null;
+      }
+    });
   }
 
   /**
@@ -1543,12 +1828,23 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
-    if (this.remoteEmbedder) return this.embedRemote(texts, options);
+    if (this.remoteEmbedder) return this.withOperationLease(() => this.embedRemote(texts, options));
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    if (texts.length === 0) return [];
+
+    return this.withOperationLease(() => this.embedBatchOnContexts(texts, options));
+  }
+
+  /**
+   * Body of embedBatch, run under an operation lease: the pooled contexts it
+   * borrows cannot be disposed by an idle unload until it returns.
+   */
+  private async embedBatchOnContexts(
+    texts: string[],
+    options: EmbedOptions
+  ): Promise<(EmbeddingResult | null)[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
-
-    if (texts.length === 0) return [];
 
     try {
       const contexts = await this.ensureEmbedContexts();
@@ -1612,6 +1908,11 @@ export class LlamaCpp implements LLM {
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    return this.withOperationLease(() => this.generateOnContext(prompt, options));
+  }
+
+  /** Body of generate(), run under an operation lease. */
+  private async generateOnContext(prompt: string, options: GenerateOptions): Promise<GenerateResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1676,6 +1977,14 @@ export class LlamaCpp implements LLM {
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    return this.withOperationLease(() => this.expandQueryOnContext(query, options));
+  }
+
+  /** Body of expandQuery(), run under an operation lease. */
+  private async expandQueryOnContext(
+    query: string,
+    options: { context?: string, includeLexical?: boolean }
+  ): Promise<Queryable[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1782,18 +2091,27 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
-    if (this.jevReranker) {
-      if (this.disposed) throw new Error("LLM has been disposed");
-      if (options.model !== undefined && options.model !== this.rerankModelName) {
-        throw new Error("TypeSafe rerank model override does not match configured identity");
-      }
-      return this.jevReranker.rerank(query, documents, options.signal);
+    const jevReranker = this.jevReranker;
+    if (jevReranker) {
+      // Same lease discipline as the local path: the pending HTTP request and
+      // its result mapping must finish before dispose() tears anything down.
+      return this.withOperationLease(async () => {
+        if (options.model !== undefined && options.model !== this.rerankModelName) {
+          throw new Error("TypeSafe rerank model override does not match configured identity");
+        }
+        return jevReranker.rerank(query, documents, options.signal);
+      });
     }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    return this.withOperationLease(() => this.rerankOnContexts(query, documents));
+  }
+
+  /** Body of rerank(), run under an operation lease. */
+  private async rerankOnContexts(query: string, documents: RerankDocument[]): Promise<RerankResult> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
-
     const contexts = await this.ensureRerankContexts();
+
     if (contexts.length === 0) {
       return {
         results: documents.map((d, index) => ({ ...d, score: 0.5, index })),
@@ -1896,51 +2214,101 @@ export class LlamaCpp implements LLM {
     vram?: { total: number; used: number; free: number };
     cpuCores: number;
   }> {
-    const llama = await this.ensureLlama(options.allowBuild ?? true);
-    const cpuForced = this.isCpuOffloadForced();
-    const gpuDevices = cpuForced ? [] : await llama.getGpuDeviceNames();
-    let vram: { total: number; used: number; free: number } | undefined;
-    if (!cpuForced && llama.gpu) {
-      try {
-        const state = await llama.getVramState();
-        vram = { total: state.total, used: state.used, free: state.free };
-      } catch { /* no vram info */ }
-    }
-    return {
-      gpu: cpuForced ? false : llama.gpu,
-      gpuOffloading: !cpuForced && llama.supportsGpuOffloading,
-      gpuDevices,
-      vram,
-      cpuCores: llama.cpuMathCores,
-    };
+    return this.withOperationLease(async () => {
+      const llama = await this.ensureLlama(options.allowBuild ?? true);
+      const cpuForced = this.isCpuOffloadForced();
+      const gpuDevices = cpuForced ? [] : await llama.getGpuDeviceNames();
+      let vram: { total: number; used: number; free: number } | undefined;
+      if (!cpuForced && llama.gpu) {
+        try {
+          const state = await llama.getVramState();
+          vram = { total: state.total, used: state.used, free: state.free };
+        } catch { /* no vram info */ }
+      }
+      return {
+        gpu: cpuForced ? false : llama.gpu,
+        gpuOffloading: !cpuForced && llama.supportsGpuOffloading,
+        gpuDevices,
+        vram,
+        cpuCores: llama.cpuMathCores,
+      };
+    });
   }
 
+  /**
+   * Terminate the instance.
+   *
+   * The terminal transition is synchronous and rejects new sessions and
+   * operations. Already-running operations and any idle unload already in
+   * progress are then awaited to ACTUAL completion before their contexts and
+   * models are destroyed, so no native object is torn down while it is still
+   * in use. Resource safety wins over bounded close: a stuck operation or
+   * native disposal can therefore delay termination indefinitely.
+   *
+   * Session leases are deliberately NOT awaited: a session callback may call
+   * dispose() after its awaited operation and must not deadlock itself.
+   *
+   * Concurrent callers share one teardown: the first performs it, every other
+   * caller awaits the same completion, so none of them continues (for example
+   * to close SQLite) while resources are still being drained. Calls after
+   * "disposed" resolve immediately.
+   */
   async dispose(): Promise<void> {
-    // Prevent double-dispose
-    if (this.disposed) {
+    // Terminal transition is synchronous: new sessions/operations are rejected
+    // instead of borrowing resources that are about to be destroyed, and
+    // callers parked on an idle unload wake up to the terminal state.
+    const terminal = this.lifecycle.beginDispose();
+    if (!terminal) {
+      // Another caller owns the teardown. Await the SAME completion instead of
+      // returning early: a second dispose() (e.g. createStore().close()) must
+      // not proceed — closing SQLite, say — while that teardown is still
+      // draining an in-flight search. Calls after "disposed" resolve at once.
+      await this.lifecycle.whenDisposed();
       return;
     }
-    this.disposed = true;
 
+    try {
+      await this.teardownResources(terminal);
+    } finally {
+      // Always publish completion so concurrent/late callers cannot hang.
+      this.lifecycle.finishDispose();
+    }
+  }
+
+  /**
+   * Dispose every native resource in dependency order (terminal path only).
+   * The caller owns the lifecycle transition and publishes its completion.
+   */
+  private async teardownResources(terminal: LlamaCppDisposePlan): Promise<void> {
     // Clear inactivity timer
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
 
+    // Operations that were already running may still be holding contexts and
+    // models; destroying those underneath the operation is what produced the
+    // dispose-vs-operation race (SDK close during a search). New operations
+    // are rejected, so this drains monotonically and is awaited to completion.
+    await terminal.pendingOperations;
+
+    // An idle unload that already detached its resources owns their disposal.
+    // Await it to completion too: timing out here would let this routine
+    // dispose a context/model while the unload is still disposing a related
+    // one, or while a parked caller is about to borrow a fresh context.
+    if (terminal.pendingUnload) await terminal.pendingUnload;
+
     // Explicitly dispose in dependency order: contexts first, then models, then llama.
     // Relying only on llama.dispose() leaves Metal resource sets alive until process
     // finalization on Apple Silicon, where ggml_metal_device_free can abort after
     // otherwise-successful CLI output (#368).
-    for (const ctx of this.embedContexts) {
+    const { embed, rerank } = this.drainContextPools();
+    for (const ctx of embed) {
       await disposeWithTimeout("embedding context", () => ctx.dispose());
     }
-    this.embedContexts = [];
-
-    for (const ctx of this.rerankContexts) {
+    for (const ctx of rerank) {
       await disposeWithTimeout("rerank context", () => ctx.dispose());
     }
-    this.rerankContexts = [];
 
     if (this.embedModel) {
       await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
@@ -1976,56 +2344,6 @@ export class LlamaCpp implements LLM {
 // =============================================================================
 
 /**
- * Manages LLM session lifecycle with reference counting.
- * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
- */
-class LLMSessionManager {
-  private llm: LlamaCpp;
-  private _activeSessionCount = 0;
-  private _inFlightOperations = 0;
-
-  constructor(llm: LlamaCpp) {
-    this.llm = llm;
-  }
-
-  get activeSessionCount(): number {
-    return this._activeSessionCount;
-  }
-
-  get inFlightOperations(): number {
-    return this._inFlightOperations;
-  }
-
-  /**
-   * Returns true only when both session count and in-flight operations are 0.
-   * Used by LlamaCpp to determine if idle unload is safe.
-   */
-  canUnload(): boolean {
-    return this._activeSessionCount === 0 && this._inFlightOperations === 0;
-  }
-
-  acquire(): void {
-    this._activeSessionCount++;
-  }
-
-  release(): void {
-    this._activeSessionCount = Math.max(0, this._activeSessionCount - 1);
-  }
-
-  operationStart(): void {
-    this._inFlightOperations++;
-  }
-
-  operationEnd(): void {
-    this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
-  }
-
-  getLlamaCpp(): LlamaCpp {
-    return this.llm;
-  }
-}
-
-/**
  * Error thrown when an operation is attempted on a released or aborted session.
  */
 export class SessionReleasedError extends Error {
@@ -2038,16 +2356,23 @@ export class SessionReleasedError extends Error {
 /**
  * Scoped LLM session with automatic lifecycle management.
  * Wraps LlamaCpp methods with operation tracking and abort handling.
+ *
+ * The session lease is taken through the instance's lifecycle rather than a
+ * per-call counter, so the instance's own inactivity timer sees every open
+ * session — including one opened with withLLMSessionForLlm — and declines to
+ * unload while the lease is held.
  */
 class LLMSession implements ILLMSession {
-  private manager: LLMSessionManager;
+  private llm: LlamaCpp;
+  private lifecycle: LlmResourceLifecycle;
   private released = false;
   private abortController: AbortController;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
   private name: string;
 
-  constructor(manager: LLMSessionManager, options: LLMSessionOptions = {}) {
-    this.manager = manager;
+  private constructor(llm: LlamaCpp, lifecycle: LlmResourceLifecycle, options: LLMSessionOptions = {}) {
+    this.llm = llm;
+    this.lifecycle = lifecycle;
     this.name = options.name || "unnamed";
     this.abortController = new AbortController();
 
@@ -2070,9 +2395,24 @@ class LLMSession implements ILLMSession {
       }, maxDuration);
       this.maxDurationTimer.unref(); // Don't keep process alive
     }
+  }
 
-    // Acquire session lease
-    this.manager.acquire();
+  /**
+   * Open a session against `llm`.
+   *
+   * Parks while an idle unload is disposing resources, so a lease is only ever
+   * granted on a ready instance, and rejects once the instance terminates.
+   */
+  static async open(llm: LlamaCpp, options: LLMSessionOptions = {}): Promise<LLMSession> {
+    const lifecycle = lifecycleFor(llm);
+    await lifecycle.acquireSessionLease();
+    try {
+      return new LLMSession(llm, lifecycle, options);
+    } catch (error) {
+      // Never leak the lease if wiring the abort timer throws.
+      lifecycle.releaseSessionLease();
+      throw error;
+    }
   }
 
   get isValid(): boolean {
@@ -2084,7 +2424,7 @@ class LLMSession implements ILLMSession {
   }
 
   /**
-   * Release the session and decrement ref count.
+   * Release the session and its lease.
    * Called automatically by withLLMSession when the callback completes.
    */
   release(): void {
@@ -2097,18 +2437,22 @@ class LLMSession implements ILLMSession {
     }
 
     this.abortController.abort(new Error("Session released"));
-    this.manager.release();
+    this.lifecycle.releaseSessionLease();
   }
 
   /**
    * Wrap an operation with tracking and abort checking.
+   *
+   * The operation lease is taken after the abort check and released in the
+   * finally block, so a throwing or aborting operation cannot leak it and
+   * strand the idle unload.
    */
   private async withOperation<T>(fn: () => Promise<T>): Promise<T> {
     if (!this.isValid) {
       throw new SessionReleasedError();
     }
 
-    this.manager.operationStart();
+    await this.lifecycle.acquireOperationLease();
     try {
       // Check abort before starting
       if (this.abortController.signal.aborted) {
@@ -2118,7 +2462,7 @@ class LLMSession implements ILLMSession {
       }
       return await fn();
     } finally {
-      this.manager.operationEnd();
+      this.lifecycle.releaseOperationLease();
     }
   }
 
@@ -2127,18 +2471,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, { ...options, signal: this.operationSignal(options?.signal) }));
+    return this.withOperation(() => this.llm.embed(text, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, { ...options, signal: this.operationSignal(options?.signal) }));
+    return this.withOperation(() => this.llm.embedBatch(texts, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.llm.expandQuery(query, options));
   }
 
   async rerank(
@@ -2146,22 +2490,25 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, { ...options, signal: this.operationSignal(options?.signal) }));
+    return this.withOperation(() => this.llm.rerank(query, documents, { ...options, signal: this.operationSignal(options?.signal) }));
   }
 }
 
-// Session manager for the default LlamaCpp instance
-let defaultSessionManager: LLMSessionManager | null = null;
-
 /**
- * Get the session manager for the default LlamaCpp instance.
+ * Run `fn` with a session opened on `llm`, releasing the lease even when the
+ * callback throws.
  */
-function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
-    defaultSessionManager = new LLMSessionManager(llm);
+async function runWithSession<T>(
+  llm: LlamaCpp,
+  fn: (session: ILLMSession) => Promise<T>,
+  options?: LLMSessionOptions
+): Promise<T> {
+  const session = await LLMSession.open(llm, options);
+  try {
+    return await fn(session);
+  } finally {
+    session.release();
   }
-  return defaultSessionManager;
 }
 
 /**
@@ -2182,42 +2529,30 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
-  const session = new LLMSession(manager, options);
-
-  try {
-    return await fn(session);
-  } finally {
-    session.release();
-  }
+  return runWithSession(getDefaultLlamaCpp(), fn, options);
 }
 
 /**
  * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
  * Unlike withLLMSession, this does not use the global singleton.
+ *
+ * The session is counted on that instance's lifecycle, so its idle timer will
+ * not unload resources while the session is open.
  */
 export async function withLLMSessionForLlm<T>(
   llm: LlamaCpp,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
-  const session = new LLMSession(manager, options);
-
-  try {
-    return await fn(session);
-  } finally {
-    session.release();
-  }
+  return runWithSession(llm, fn, options);
 }
 
 /**
- * Check if idle unload is safe (no active sessions or operations).
- * Used internally by LlamaCpp idle timer.
+ * Check if idle unload is safe for the default LLM instance: no active
+ * sessions, no in-flight operations, and no lifecycle transition in progress.
  */
 export function canUnloadLLM(): boolean {
-  if (!defaultSessionManager) return true;
-  return defaultSessionManager.canUnload();
+  return defaultLlamaCpp === null || lifecycleFor(defaultLlamaCpp).canUnload;
 }
 
 // =============================================================================

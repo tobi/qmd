@@ -4,6 +4,60 @@
 
 ### Fixed
 
+- Filling in default model URIs now updates only the `models` block of the
+  parsed config, so comments and quoting in a committed `.qmd/index.yml`
+  survive (#899).
+
+## [2.9.0] - 2026-11-17
+
+QMD adds document processors, metadata filtering, and remote model support.
+This release also updates llama.cpp and hardens concurrent indexing and MCP
+shutdown.
+
+### Fixed
+
+- Serialize trust-record mutations and atomically publish the trust file, so
+  concurrent approvals and revocations do not overwrite each other.
+- Share a crash-recoverable SQLite sidecar lock across CLI, SDK and direct
+  embedding runs, preventing concurrent partial-vector cleanup from deleting
+  another run's completed vectors.
+- Hold the index's embed lock in `clearAllEmbeddings`, so a clear cannot drop
+  the vector table under a running embed or resurrect vectors it just deleted.
+- Keep SDK configuration sources separate per store. Coordinate LLM sessions,
+  idle unloading and disposal so in-flight operations retain their resources.
+- Wait for admitted SDK operations before closing their store, and reject
+  reentrant closes instead of closing SQLite beneath active work.
+- Bound MCP shutdown to a five-second grace period by default. On timeout,
+  cancel requests and report failure without disposing resources still in use.
+- Stream MCP event responses instead of buffering them indefinitely, and cancel
+  requests when their clients disconnect.
+- Serialize overlapping scans on one connection and make processor publication
+  and embedding retry states explicit.
+- Reconcile document changes made during CJK FTS shadow rebuilding before
+  publishing, so concurrent writes remain searchable.
+- Serialize YAML configuration mutations and publish them atomically, retaining
+  concurrent edits and the permissions and targets of existing config files.
+  Synchronize SQLite against the current locked config snapshot so an older
+  opener cannot remove another process's newly added collection, and publish
+  SDK collection and context changes before mirroring them, so a refused config
+  write leaves no database-only edit or stale `config_hash`. A rename records
+  the old→new pair before publishing, so an interrupted index move is finished
+  by repeating the command and is never inferred from a name that merely exists;
+  repeating a removal finishes it the same way. While that marker is live, a
+  second rename or any change to either name is refused with
+  `PendingRenameError` instead of destroying the only evidence, and an
+  unreadable or malformed marker fails closed with `CorruptPendingRenameError`
+  rather than being read as "no rename".
+- Coordinate MCP daemon PID-file claims and stale recovery between current
+  versions, preventing concurrent starters from displacing a live daemon.
+- Avoid leaking Nix libc to host subprocesses, and use the build target instead
+  of running `uname` to select the Darwin launcher mitigation.
+- Expose the matching C++ runtime in the Linux Nix development shell so Bun can
+  load the packaged llama.cpp backend.
+- Correct the Python and Go grammar repair hints to use their pinned versions.
+- Keep memory-regression coverage effective when Bun's SQLite does not track
+  allocations for `hard_heap_limit`.
+
 - Security: MCP stdio and HTTP startup now enforce project-local config trust
   before selecting models, ignoring all unapproved model URIs and options,
   including remote embedding credential environment variable names.
@@ -16,6 +70,9 @@
   #978 (thanks @naveenspark)
 
 ### Added
+
+- Check bounded TLA+ models for lock, trust, indexing, processor, SDK and
+  server lifecycles in CI, including intentional counterexample controls.
 
 - Per-collection processors turn source files into stable-key Markdown index
   documents through explicit SDK callbacks or trusted argv commands. Bounded
@@ -78,11 +135,13 @@
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
   row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
-- Filling in default model URIs now updates only the `models` block of the
-  parsed config, so comments and quoting in a committed `.qmd/index.yml`
-  survive (#899).
 
 ### Changed
+
+- Update `node-llama-cpp` 3.20.0 → 3.22.3 (llama.cpp v0.9.0), MCP server
+  2.0.0 → 2.4.0, `web-tree-sitter` 0.26.12 → 0.27.2, and other compatible
+  runtime and development dependencies. Refresh Bun, pnpm and Nix dependency
+  metadata; Vitest stays on 3 and TypeScript on 5 for compatibility.
 
 - The MCP server caches its instructions per store for up to 60 seconds instead
   of rebuilding them, with a full index-status scan, for every HTTP request.
@@ -1413,6 +1472,7 @@ notes, journals, and meeting transcripts.
 - CLI: `qmd add`, `qmd embed`, `qmd search`, `qmd vsearch`, `qmd query`,
   `qmd get`. ~1800 lines of TypeScript in a single `qmd.ts` file.
 
-[Unreleased]: https://github.com/tobi/qmd/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/tobi/qmd/compare/v2.9.0...HEAD
+[2.9.0]: https://github.com/tobi/qmd/compare/v2.8.3...v2.9.0
 [1.0.0]: https://github.com/tobi/qmd/releases/tag/v1.0.0
 [0.9.0]: https://github.com/tobi/qmd/compare/v0.8.0...v0.9.0
