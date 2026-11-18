@@ -21,14 +21,39 @@
  */
 import { readSync } from "node:fs";
 import { CollectionConfigScope } from "../../src/collections.ts";
+import { sleepSync } from "../../src/db.ts";
 import { createStore, syncConfigToDb } from "../../src/store.ts";
+
+/**
+ * Transient stdin read failures: no byte buffered yet (`EAGAIN`, with
+ * `EWOULDBLOCK` as its alias), or a signal that interrupted the read.
+ */
+function isTransientReadError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = error.code;
+  return code === "EAGAIN" || code === "EWOULDBLOCK" || code === "EINTR";
+}
 
 /** Block until one line arrives on stdin (or stdin closes). */
 function waitForGoSync(): void {
   const byte = Buffer.alloc(1);
+  let transient = 0;
   for (;;) {
-    const read = readSync(0, byte, 0, 1, null);
-    if (read === 0) return;
+    let read: number;
+    try {
+      read = readSync(0, byte, 0, 1, null);
+    } catch (error) {
+      if (!isTransientReadError(error)) throw error;
+      // Node hands the child a non-blocking stdin pipe, so a byte that has not
+      // landed yet reports EAGAIN instead of waiting. This barrier runs inside
+      // a synchronous callback with no event loop to yield to, so park briefly
+      // between attempts instead of spinning (same backoff as db.ts retries).
+      sleepSync(Math.min(5 + transient, 25));
+      transient++;
+      continue;
+    }
+    transient = 0;
+    if (read === 0) return; // stdin closed: the parent hung up.
     if (byte.toString("utf-8") === "\n") return;
   }
 }

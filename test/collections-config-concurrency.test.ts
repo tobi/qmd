@@ -53,7 +53,11 @@ import {
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const childScript = join(thisDir, "_helpers", "config-mutation-child.ts");
-const tsxCli = join(thisDir, "..", "node_modules", "tsx", "dist", "cli.mjs");
+// Loaded with `--import`, so the helper *is* the process we spawn: SIGKILL
+// reaches the lock holder. The tsx CLI wrapper would exec a second node that
+// owns the config lock and forward its output, so a kill would orphan the real
+// holder with its write transaction still open.
+const tsxImport = join(thisDir, "..", "node_modules", "tsx", "dist", "esm", "index.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
 const tempDirs: string[] = [];
@@ -145,7 +149,7 @@ function spawnChild(
 ): Child {
   const scriptArgs = isBunRuntime
     ? [childScript, configPath, ...args]
-    : [tsxCli, childScript, configPath, ...args];
+    : ["--import", tsxImport, childScript, configPath, ...args];
   const proc = spawn(process.execPath, scriptArgs, {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },

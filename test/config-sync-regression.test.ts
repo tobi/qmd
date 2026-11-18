@@ -60,7 +60,7 @@ import {
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const workerScript = join(thisDir, "_helpers", "config-sync-worker.ts");
 const holderScript = join(thisDir, "_helpers", "config-mutation-child.ts");
-const tsxCli = join(thisDir, "..", "node_modules", "tsx", "dist", "cli.mjs");
+const tsxImport = join(thisDir, "..", "node_modules", "tsx", "dist", "esm", "index.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
 const tempDirs: string[] = [];
@@ -141,7 +141,7 @@ type Child = {
 function spawnChild(scriptArgs: string[], env: Record<string, string> = {}): Child {
   const proc = spawn(
     process.execPath,
-    isBunRuntime ? scriptArgs : [tsxCli, ...scriptArgs],
+    isBunRuntime ? scriptArgs : ["--import", tsxImport, ...scriptArgs],
     { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } },
   );
 
