@@ -44,8 +44,8 @@
         });
 
         nodeModulesHashes = {
-          x86_64-linux = "sha256-jvq2TO0SxEV1BHyT6C32VQ916wMTM/D1nsV2rNcJQSo=";
-          aarch64-darwin = "sha256-9vvR3KLmBc+4bfyWEyyM8FHWg+DfiDzUlwqUlm3NFc8=";
+          x86_64-linux = "sha256-kJxkCAZSLpOnocrhhV+8MK1m+U1WMtp0YGINCgZIts8=";
+          aarch64-darwin = "sha256-qQHOGudhNNgQM10JHEWqz8lXG27g7F3bPReLQLpMRK0=";
 
           # Populate these on first build for additional hosts if/when needed.
           aarch64-linux = pkgs.lib.fakeHash;
@@ -136,11 +136,13 @@
             # (ggml-org/llama.cpp#22593). `--run` fires before bun starts, so
             # the env is in place before the native binding loads. Preserve
             # explicit user values; QMD_METAL_KEEP_RESIDENCY=1 opts back in.
+            # Bun already links Nix libc. Adding libc to LD_LIBRARY_PATH also
+            # affects host subprocesses and can mix incompatible glibc builds.
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/cli/qmd.ts" \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
-              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc.libc.out}/lib:${pkgs.stdenv.cc.cc.lib}/lib"}" \
-              --run 'if [ "$1" = mcp ]; then export LLAMA_LOG_LEVEL="''${LLAMA_LOG_LEVEL:-error}"; export GGML_LOG_LEVEL="''${GGML_LOG_LEVEL:-error}"; export GGML_BACKEND_SILENT="''${GGML_BACKEND_SILENT:-1}"; fi; if [ "$(uname -s)" = Darwin ] && [ "''${QMD_METAL_KEEP_RESIDENCY:-}" != 1 ]; then export GGML_METAL_NO_RESIDENCY="''${GGML_METAL_NO_RESIDENCY:-1}"; fi'
+              --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc.cc.lib}/lib"}" \
+              --run 'if [ "$1" = mcp ]; then export LLAMA_LOG_LEVEL="''${LLAMA_LOG_LEVEL:-error}"; export GGML_LOG_LEVEL="''${GGML_LOG_LEVEL:-error}"; export GGML_BACKEND_SILENT="''${GGML_BACKEND_SILENT:-1}"; fi; if [ "${if pkgs.stdenv.hostPlatform.isDarwin then "1" else "0"}" = 1 ] && [ "''${QMD_METAL_KEEP_RESIDENCY:-}" != 1 ]; then export GGML_METAL_NO_RESIDENCY="''${GGML_METAL_NO_RESIDENCY:-1}"; fi'
           '';
 
           meta = with pkgs.lib; {
@@ -171,6 +173,9 @@
 
           shellHook = ''
             export BREW_PREFIX="''${BREW_PREFIX:-${sqliteWithExtensions.out}}"
+            if [ "${if pkgs.stdenv.hostPlatform.isLinux then "1" else "0"}" = 1 ]; then
+              export LD_LIBRARY_PATH="${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "${pkgs.stdenv.cc.cc.lib}/lib"}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
             echo "QMD development shell"
             echo "Run: bun src/cli/qmd.ts <command>"
           '';

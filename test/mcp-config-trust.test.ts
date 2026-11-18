@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import { createStore, JevReranker, RemoteEmbedder, type CollectionConfig } from "../src/index.js";
-import { findLocalConfigPath, loadConfig, setConfigSource } from "../src/collections.js";
+import { findLocalConfigPath, setConfigSource } from "../src/collections.js";
 import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
@@ -139,7 +139,6 @@ describe("MCP startup config trust (also runs in CI)", () => {
     await handle.stop();
     handle = undefined;
     expect(selected).toEqual([builtins]);
-    expect(loadConfig().models).toBeUndefined();
     expect(readFileSync(configPath, "utf8")).toBe(original);
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
@@ -197,7 +196,6 @@ describe("MCP startup config trust (also runs in CI)", () => {
       ...builtins,
       embed: new RemoteEmbedder(process.env.QMD_EMBED_MODEL!).modelName,
     });
-    expect(loadConfig().models).toBeUndefined();
   });
 
   test("global config remains deliberate without project approval", async () => {

@@ -146,12 +146,17 @@ qmd mcp stop                      # stop via PID file
 qmd status                        # shows "MCP: running (PID ...)" when active
 ```
 
+MCP shutdown allows active requests five seconds to finish. After that it
+cancels them; a standalone server exits nonzero if work remains. Embedded
+callers receive a timeout error while resource cleanup continues safely.
+An external supervisor is still needed if native code blocks the event loop.
+
 The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
-- `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `POST /mcp` — MCP Streamable HTTP (stateless JSON and SSE responses)
 - `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
 - `POST /metadata` — metadata discovery without the MCP protocol. Same body as the `metadata` tool (invalid filters return `400`); see [Metadata Discovery](#metadata-discovery)
 - `GET /health` — liveness check with uptime
@@ -246,6 +251,15 @@ console.log(results.map(r => `${r.title} (${Math.round(r.score * 100)}%)`))
 
 await store.close()
 ```
+
+Each store owns its configuration source. `close()` rejects new SDK operations
+and waits for admitted operations before closing the database; a stuck operation
+can therefore delay shutdown indefinitely. Access through `store.internal`
+bypasses this lifecycle.
+
+SDK `embed()` and the CLI share an exclusive per-index lock. A concurrent SDK
+call rejects with `EmbedLockBusyError`; the CLI reports that embedding is busy.
+Older QMD versions do not use this lock and must not embed concurrently.
 
 #### Store Creation
 
@@ -724,9 +738,11 @@ bun install -g @tobilu/qmd
 ```sh
 git clone https://github.com/tobi/qmd
 cd qmd
-npm install
-npm link
+bun install
+bun link
 ```
+
+On Linux, `nix develop` supplies the C++ runtime needed by Bun's llama backend.
 
 ## Usage
 
@@ -842,6 +858,10 @@ named index uses `{name}.yml` — `qmd --index work …` reads/writes `work.yml`
 A **project-local** index created with `qmd init` lives at `.qmd/index.yml`
 (`.qmd/index.yaml` is also accepted) alongside a project-local `index.sqlite`,
 so config and index stay inside the project instead of `~/.config` / `~/.cache`.
+
+Keep generated `*.lock.sqlite` and `*.pending-rename.json` sidecars out of
+version control. If a collection rename is interrupted, leave its pending
+marker in place and repeat the same rename to finish index recovery.
 
 ```yaml
 # ~/.config/qmd/index.yml

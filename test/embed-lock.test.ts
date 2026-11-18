@@ -1,29 +1,105 @@
 /**
- * Unit tests for embed exclusive lock (#825).
+ * Consumer-contract tests for the exclusive `qmd embed` lock (#825).
+ *
+ * Ownership is an exclusive SQLite write transaction held open on a sidecar
+ * database next to the index (see src/cli/embed-lock.ts), so these tests assert
+ * what a caller observes — who may run, what release hands over, what a crash
+ * leaves behind, how a legacy pidfile is treated — instead of lockfile
+ * internals.
  */
 import { describe, test, expect } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { closeSync, existsSync, openSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import {
+  acquireEmbedLock,
   embedLockPathForDb,
-  tryAcquireEmbedLock,
+  embedLockStatePath,
   isLiveEmbedLockHolder,
+  tryAcquireEmbedLock,
   EMBED_LOCK_BUSY_MESSAGE,
 } from "../src/cli/embed-lock.ts";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
-const projectRoot = join(thisDir, "..");
-const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const holderScript = join(thisDir, "_helpers", "embed-lock-holder.ts");
+const tsxCli = join(thisDir, "..", "node_modules", "tsx", "dist", "cli.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+
+type Child = {
+  proc: ChildProcess;
+  output: () => string;
+  /** Resolves once the child's combined output contains `needle`. */
+  waitFor: (needle: string, timeoutMs?: number) => Promise<void>;
+  done: Promise<number | null>;
+};
+
+/**
+ * Spawn the lock-holder helper on `lockPath`; it reports HOLD / ACQUIRED / BUSY
+ * on stdout. Trailing qmd tokens keep the child's command line looking like qmd.
+ */
+function spawnHolder(lockPath: string, holdMs: number, env: Record<string, string> = {}): Child {
+  const args = isBunRuntime
+    ? [holderScript, lockPath, String(holdMs), "qmd", "embed"]
+    : [tsxCli, holderScript, lockPath, String(holdMs), "qmd", "embed"];
+  const proc = spawn(process.execPath, args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, ...env },
+  });
+
+  let output = "";
+  const waiters = new Set<{ needle: string; resolve: () => void }>();
+  const publish = () => {
+    for (const waiter of waiters) {
+      if (!output.includes(waiter.needle)) continue;
+      waiters.delete(waiter);
+      waiter.resolve();
+    }
+  };
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+    publish();
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+    publish();
+  });
+
+  const waitFor = (needle: string, timeoutMs = 15_000): Promise<void> => {
+    if (output.includes(needle)) return Promise.resolve();
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const waiter = { needle, resolve };
+    waiters.add(waiter);
+    // Failure guard only: it never decides the outcome, it bounds a hung child.
+    const timer = setTimeout(() => {
+      if (!waiters.delete(waiter)) return;
+      reject(new Error(`child never printed ${needle}: ${output}`));
+    }, timeoutMs);
+    void promise.then(
+      () => clearTimeout(timer),
+      () => clearTimeout(timer),
+    );
+    return promise;
+  };
+
+  const { promise: done, resolve: onClose } = Promise.withResolvers<number | null>();
+  proc.on("close", (code) => onClose(code));
+
+  return { proc, output: () => output, waitFor, done };
+}
 
 describe("embedLockPathForDb", () => {
   test("places .qmd-embed.lock next to the index database", () => {
     expect(embedLockPathForDb("/tmp/qmd-cache/index.sqlite")).toBe("/tmp/qmd-cache/.qmd-embed.lock");
     expect(embedLockPathForDb("/var/lib/qmd/custom.sqlite")).toBe("/var/lib/qmd/.qmd-embed.lock");
+  });
+
+  test("carries ownership in a sidecar database beside that path", () => {
+    expect(embedLockStatePath(embedLockPathForDb("/tmp/qmd-cache/index.sqlite"))).toBe(
+      "/tmp/qmd-cache/.qmd-embed.lock.sqlite",
+    );
   });
 });
 
@@ -40,109 +116,199 @@ describe("isLiveEmbedLockHolder", () => {
 });
 
 describe("tryAcquireEmbedLock", () => {
-  test("lock held → second acquire skips; release → acquire proceeds", async () => {
+  test("held → second caller is busy fast; release → acquire proceeds", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-"));
     const lockPath = join(dir, ".qmd-embed.lock");
+    const statePath = embedLockStatePath(lockPath);
     try {
-      const first = tryAcquireEmbedLock(lockPath);
-      expect(first).not.toBeNull();
-      expect(existsSync(lockPath)).toBe(true);
-      expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
+      const first = acquireEmbedLock(lockPath);
+      expect(first.status).toBe("acquired");
+      if (first.status !== "acquired") return;
+      expect(first.handle.statePath).toBe(statePath);
+      // Ownership is materialised next to the index, as a durable artifact.
+      expect(existsSync(statePath)).toBe(true);
 
-      // Same process still holds the lock — second caller must skip.
+      // Same process still holds it — a second caller must skip, and must not
+      // wait out a data-write busy timeout to find that out.
+      const startedAt = Date.now();
+      const second = acquireEmbedLock(lockPath);
+      expect(second).toEqual({ status: "busy", reason: { kind: "sidecar" } });
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
       expect(tryAcquireEmbedLock(lockPath)).toBeNull();
 
-      first!.release();
-      expect(existsSync(lockPath)).toBe(false);
+      first.handle.release();
+      // Ownership artifacts outlive the lock: deleting them would let a
+      // concurrent acquirer create a fresh inode while a straggler still holds
+      // the old one.
+      expect(existsSync(statePath)).toBe(true);
 
       const again = tryAcquireEmbedLock(lockPath);
       expect(again).not.toBeNull();
       again!.release();
-      expect(existsSync(lockPath)).toBe(false);
+      again!.release(); // release is idempotent
+      expect(existsSync(statePath)).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  test("cross-process: live qmd-like holder blocks; release allows proceed", async () => {
+  test("cross-process: live holder blocks; its release allows proceed", async () => {
     const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-xp-"));
     const lockPath = join(dir, ".qmd-embed.lock");
-    const holderTs = join(thisDir, "_helpers", "embed-lock-holder.ts");
-    const holdMs = 1000;
-
-    // Include a bare `qmd` argv token so isQmdMcpPid(child) is true.
-    const args = isBunRuntime
-      ? [holderTs, lockPath, String(holdMs), "qmd", "embed"]
-      : [tsxCli, holderTs, lockPath, String(holdMs), "qmd", "embed"];
-
+    let child: Child | null = null;
     try {
-      const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      child = spawnHolder(lockPath, 1_000);
+      await child.waitFor("HOLD");
 
-      await new Promise<void>((resolve, reject) => {
-        const start = Date.now();
-        const timer = setInterval(() => {
-          if (stdout.includes("HOLD")) {
-            clearInterval(timer);
-            resolve();
-          } else if (Date.now() - start > 8000) {
-            clearInterval(timer);
-            reject(new Error(`child never acquired lock: stdout=${stdout} stderr=${stderr}`));
-          }
-        }, 20);
-      });
+      expect(acquireEmbedLock(lockPath)).toEqual({ status: "busy", reason: { kind: "sidecar" } });
 
+      const exitCode = await child.done;
+      expect(child.output()).toContain("RELEASED");
+      expect(exitCode).toBe(0);
+
+      const after = tryAcquireEmbedLock(lockPath);
+      expect(after).not.toBeNull();
+      after!.release();
+    } finally {
+      child?.proc.kill("SIGKILL");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("crash recovery: a killed holder needs no cleanup or stale detection", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-crash-"));
+    const lockPath = join(dir, ".qmd-embed.lock");
+    const child = spawnHolder(lockPath, 60_000);
+    try {
+      await child.waitFor("HOLD");
       expect(tryAcquireEmbedLock(lockPath)).toBeNull();
 
-      const exitCode = await new Promise<number | null>((resolve) => {
-        child.on("close", (code) => resolve(code));
-      });
-      expect(stderr).toBe("");
-      expect(exitCode).toBe(0);
-      expect(stdout).toContain("RELEASED");
+      // No release runs: the OS drops the holder's lock with the process.
+      child.proc.kill("SIGKILL");
+      await child.done;
 
+      const recovered = tryAcquireEmbedLock(lockPath);
+      expect(recovered).not.toBeNull();
+      recovered!.release();
+    } finally {
+      child.proc.kill("SIGKILL");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("simultaneous contenders: exactly one acquires", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-race-"));
+    const lockPath = join(dir, ".qmd-embed.lock");
+    const contenders = 4;
+    const children: Child[] = [];
+    try {
+      for (let i = 0; i < contenders; i++) {
+        children.push(
+          spawnHolder(lockPath, 1_000, { EMBED_LOCK_TRY_ONCE: "1", EMBED_LOCK_BARRIER: "1" }),
+        );
+      }
+      // Start them together so they collide on acquisition, not on spawn cost.
+      await Promise.all(children.map((child) => child.waitFor("READY")));
+      for (const child of children) child.proc.stdin?.write("go\n");
+
+      const codes = await Promise.all(children.map((child) => child.done));
+      expect(codes.every((code) => code === 0)).toBe(true);
+      const winners = children.filter((child) => /(^|\n)ACQUIRED\n/.test(child.output()));
+      const losers = children.filter((child) => /(^|\n)BUSY\n/.test(child.output()));
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(contenders - 1);
+
+      const after = tryAcquireEmbedLock(lockPath);
+      expect(after).not.toBeNull();
+      after!.release();
+    } finally {
+      for (const child of children) child.proc.kill("SIGKILL");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("legacy .qmd-embed.lock migration", () => {
+  test("stale pidfile from a dead PID is ignored and reclaimed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-stale-"));
+    const lockPath = join(dir, ".qmd-embed.lock");
+    try {
+      writeFileSync(lockPath, "999999999\n");
+      const result = acquireEmbedLock(lockPath);
+      expect(result.status).toBe("acquired");
+      if (result.status !== "acquired") return;
+      expect(existsSync(lockPath)).toBe(false);
+      result.handle.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a live older-version holder is respected, not stolen", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-legacy-live-"));
+    const lockPath = join(dir, ".qmd-embed.lock");
+    try {
+      // The current process counts as a live qmd holder.
+      writeFileSync(lockPath, `${process.pid}\n`);
+      expect(acquireEmbedLock(lockPath)).toEqual({
+        status: "busy",
+        reason: { kind: "legacy", pid: process.pid },
+      });
+      // The advisory file survives, and backing off released the sidecar.
+      expect(existsSync(lockPath)).toBe(true);
+
+      writeFileSync(lockPath, "999999999\n");
       const after = tryAcquireEmbedLock(lockPath);
       expect(after).not.toBeNull();
       after!.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 20_000);
+  });
 
-  test("replaces a stale lock from a dead PID and proceeds", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-stale-"));
+  test("half-written pidfile is treated as owned, then abandoned", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-empty-"));
     const lockPath = join(dir, ".qmd-embed.lock");
     try {
-      writeFileSync(lockPath, "999999999\n");
-      const handle = tryAcquireEmbedLock(lockPath);
-      expect(handle).not.toBeNull();
-      expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
-      handle!.release();
+      // Older qmd between its O_EXCL create and its PID write.
+      writeFileSync(lockPath, "");
+      const startedAt = Date.now();
+      const result = acquireEmbedLock(lockPath);
+      expect(result.status).toBe("acquired");
+      if (result.status !== "acquired") return;
+      // Bounded settle window, not an unbounded wait.
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
       expect(existsSync(lockPath)).toBe(false);
+      result.handle.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  test("release is idempotent and only unlinks owned lock", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-own-"));
+  test("a pidfile cannot unseat the current owner", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-embed-lock-unseat-"));
     const lockPath = join(dir, ".qmd-embed.lock");
     try {
-      const handle = tryAcquireEmbedLock(lockPath);
-      expect(handle).not.toBeNull();
-      handle!.release();
-      handle!.release();
-      expect(existsSync(lockPath)).toBe(false);
+      const first = acquireEmbedLock(lockPath);
+      expect(first.status).toBe("acquired");
+      if (first.status !== "acquired") return;
 
-      const again = tryAcquireEmbedLock(lockPath);
-      expect(again).not.toBeNull();
-      writeFileSync(lockPath, "1\n");
-      again!.release();
-      expect(existsSync(lockPath)).toBe(true);
-      unlinkSync(lockPath);
+      // An older version creating its pidfile — here preempted mid-create, so
+      // the write can land through an unlinked descriptor (the PID is dead, so
+      // nothing is waiting on it) — must not produce a second owner.
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeSync(fd, "999999999\n");
+      } finally {
+        closeSync(fd);
+      }
+
+      expect(acquireEmbedLock(lockPath)).toEqual({ status: "busy", reason: { kind: "sidecar" } });
+      first.handle.release();
+
+      const after = tryAcquireEmbedLock(lockPath);
+      expect(after).not.toBeNull();
+      after!.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

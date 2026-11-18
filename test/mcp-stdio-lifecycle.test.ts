@@ -15,7 +15,13 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { registerStdioEofShutdown, createInflightGate } from "../src/mcp/server.js";
+import {
+  MCP_SHUTDOWN_TIMEOUT_MS,
+  McpShutdownTimeoutError,
+  registerStdioEofShutdown,
+  createInflightGate,
+  type StdioShutdown,
+} from "../src/mcp/server.js";
 
 class FakeStdin extends EventEmitter {
   readableEnded = false;
@@ -27,18 +33,19 @@ type Recorded = {
   calls: string[];
   exitCodes: number[];
   warnings: string[];
-  shutdown: () => Promise<void>;
+  shutdown: StdioShutdown;
 };
 
 function register(overrides: {
   closeServer?: () => Promise<void>;
   disposeLlm?: () => Promise<void>;
   closeStore?: () => void | Promise<void>;
-  waitForIdle?: (timeoutMs: number) => Promise<boolean>;
+  waitForIdle?: (timeoutMs?: number) => Promise<boolean>;
   idleTimeoutMs?: number;
   getExitCode?: () => number | undefined;
   stderrWrite?: (chunk: string) => unknown;
   stdin?: FakeStdin;
+  exitOnTimeout?: (error: McpShutdownTimeoutError) => void;
 } = {}): Recorded {
   const stdin = overrides.stdin ?? new FakeStdin();
   const calls: string[] = [];
@@ -55,6 +62,7 @@ function register(overrides: {
     setExitCode: (code) => { exitCodes.push(code); },
     getExitCode: overrides.getExitCode ?? (() => undefined),
     stderr: { write: overrides.stderrWrite ?? ((chunk: string) => { warnings.push(chunk); return true; }) },
+    ...(overrides.exitOnTimeout ? { exitOnTimeout: overrides.exitOnTimeout } : {}),
   });
 
   return { stdin, calls, exitCodes, warnings, shutdown };
@@ -151,16 +159,88 @@ describe("registerStdioEofShutdown", () => {
     expect(r.exitCodes).toEqual([0]);
   });
 
-  test("a drain deadline miss is logged but does not fail the shutdown", async () => {
-    const r = register({
-      waitForIdle: async () => false,
+  test("the shipped stdio deadline matches the HTTP transport's five seconds", () => {
+    expect(MCP_SHUTDOWN_TIMEOUT_MS).toBe(5000);
+  });
+
+  test("a standalone timeout rejects with the typed error, records exit 1, and keeps cleanup going safely", async () => {
+    const calls: string[] = [];
+    const exitCodes: number[] = [];
+    const exitOnTimeout: McpShutdownTimeoutError[] = [];
+    const work = Promise.withResolvers<void>();
+    const drainWaits: Array<number | undefined> = [];
+    const stdin = new FakeStdin();
+
+    const shutdown = registerStdioEofShutdown({
+      stdin,
+      closeServer: async () => { calls.push("server-close"); },
+      waitForIdle: (timeoutMs?: number) => {
+        drainWaits.push(timeoutMs);
+        // The graceful wait reports "still busy"; the unbounded background
+        // wait is what the abandoned work has to release.
+        return timeoutMs === undefined ? work.promise.then(() => true) : Promise.resolve(false);
+      },
+      closeStore: () => { calls.push("store-close"); },
+      idleTimeoutMs: 50,
+      setExitCode: (code) => { exitCodes.push(code); },
+      getExitCode: () => undefined,
+      stderr: { write: () => true },
+      exitOnTimeout: (error) => { exitOnTimeout.push(error); },
     });
 
-    r.stdin.emit("end");
-    await r.shutdown();
+    stdin.emit("end");
+    const failure = await shutdown().catch((error: unknown) => error);
 
-    expect(r.warnings.join("")).toContain("in-flight request did not settle");
-    expect(r.exitCodes).toEqual([0]);
+    // The caller gets the typed failure (the standalone hook fires first), the
+    // outcome is recorded as 1, and the store has NOT been closed under the
+    // abandoned work.
+    expect(failure).toBeInstanceOf(McpShutdownTimeoutError);
+    expect((failure as McpShutdownTimeoutError).code).toBe("MCP_SHUTDOWN_TIMEOUT");
+    expect(exitCodes).toEqual([1]);
+    expect(exitOnTimeout).toHaveLength(1);
+    const reported = exitOnTimeout[0]!;
+    expect(reported.code).toBe("MCP_SHUTDOWN_TIMEOUT");
+    expect(reported.phase).toBe("drain");
+    expect(drainWaits[0]).toBeGreaterThan(40);
+    expect(drainWaits[0]).toBeLessThanOrEqual(50);
+    expect(calls).toEqual(["server-close"]);
+
+    work.resolve();
+    await shutdown.closed;
+    expect(calls).toEqual(["server-close", "store-close"]);
+  });
+
+  test("an embedded timeout rejects without exiting the process or touching its exitCode", async () => {
+    // The asynchronous contract an embedded host relies on: a rejected
+    // shutdown promise plus a `closed` that tracks the safe cleanup. No
+    // setExitCode and no exitOnTimeout are supplied, so neither the host's
+    // exit status nor its lifetime may change.
+    const hostExitCode = process.exitCode;
+    const calls: string[] = [];
+    const work = Promise.withResolvers<void>();
+    const stdin = new FakeStdin();
+
+    const shutdown = registerStdioEofShutdown({
+      stdin,
+      closeServer: async () => { calls.push("server-close"); },
+      waitForIdle: (timeoutMs?: number) => (
+        timeoutMs === undefined ? work.promise.then(() => true) : Promise.resolve(false)
+      ),
+      closeStore: () => { calls.push("store-close"); },
+      idleTimeoutMs: 30,
+      stderr: { write: () => true },
+    });
+
+    stdin.emit("end");
+    await expect(shutdown()).rejects.toBeInstanceOf(McpShutdownTimeoutError);
+
+    // Reaching this line at all proves process.exit() was not called.
+    expect(process.exitCode).toBe(hostExitCode);
+    expect(calls).toEqual(["server-close"]);
+
+    work.resolve();
+    await shutdown.closed;
+    expect(calls).toEqual(["server-close", "store-close"]);
   });
 
   test("a successful shutdown preserves an earlier nonzero exit code", async () => {

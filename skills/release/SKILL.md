@@ -31,7 +31,7 @@ When the user triggers `/release <version>`:
 
 4. **Check dependency updates** — before cutting the release, check for
    updates to `sqlite-vec` (and platform packages), `node-llama-cpp`,
-   and `better-sqlite3`. Run `pnpm outdated` and report any available
+   and `better-sqlite3`. Run `bun outdated` and report any available
    updates for these packages. If updates exist, bump them (pinned, no
    `^` ranges) and re-run tests before proceeding.
 
