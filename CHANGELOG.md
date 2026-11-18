@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-11-17
+
+QMD adds document processors, metadata filtering, and remote model support.
+This release also updates llama.cpp and hardens concurrent indexing and MCP
+shutdown.
+
 ### Fixed
 
 - Serialize trust-record mutations and atomically publish the trust file, so
@@ -1460,6 +1466,7 @@ notes, journals, and meeting transcripts.
 - CLI: `qmd add`, `qmd embed`, `qmd search`, `qmd vsearch`, `qmd query`,
   `qmd get`. ~1800 lines of TypeScript in a single `qmd.ts` file.
 
-[Unreleased]: https://github.com/tobi/qmd/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/tobi/qmd/compare/v2.9.0...HEAD
+[2.9.0]: https://github.com/tobi/qmd/compare/v2.8.3...v2.9.0
 [1.0.0]: https://github.com/tobi/qmd/releases/tag/v1.0.0
 [0.9.0]: https://github.com/tobi/qmd/compare/v0.8.0...v0.9.0
