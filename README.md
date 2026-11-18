@@ -1002,6 +1002,25 @@ qmd query "user authentication"
 Two aliases exist for the semantic/hybrid modes: `vector-search` (→ `vsearch`)
 and `deep-search` (→ `query`).
 
+### Track changes to matching lines
+
+Save a baseline for a case-sensitive literal phrase in one indexed collection. After editing
+your notes, refresh the index and read what changed since the previous check:
+
+```sh
+qmd track add releases "Release checklist" -c meetings
+qmd update
+qmd track changes releases   # add --json for machine-readable output
+```
+
+Each `changes` call advances the baseline. Text output shows removed lines with their old line
+numbers and added lines with their new numbers. Editing a matching line produces both entries.
+Moving the same text within a file produces no change. An unchanged check prints nothing
+(`[]` with JSON). Tracking reads the index; it does not watch the filesystem or run models.
+
+Use `qmd track list` to inspect saved searches and `qmd track remove releases` to discard one
+and its saved matches. Search names and baselines belong to the selected index.
+
 ### Options
 
 ```sh

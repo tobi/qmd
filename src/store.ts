@@ -1411,6 +1411,17 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tracked_searches (
+      name TEXT PRIMARY KEY, phrase TEXT NOT NULL, collection TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS tracked_search_files (
+      name TEXT NOT NULL REFERENCES tracked_searches(name) ON DELETE CASCADE,
+      path TEXT NOT NULL, hash TEXT NOT NULL, matches TEXT NOT NULL,
+      PRIMARY KEY(name, path)
+    )
+  `);
+
   // Cache table for LLM API calls
   db.exec(`
     CREATE TABLE IF NOT EXISTS llm_cache (
@@ -4801,6 +4812,7 @@ export function hasCollectionIndexState(db: Database, name: string): boolean {
   return (
     hasCollectionDocuments(db, name)
     || hasRow(`SELECT 1 FROM file_sync_state WHERE collection = ? LIMIT 1`)
+    || hasRow(`SELECT 1 FROM tracked_searches WHERE collection = ? LIMIT 1`)
     || hasRow(`SELECT 1 FROM processor_specs WHERE collection = ? LIMIT 1`)
     || hasRow(`SELECT 1 FROM processor_modes WHERE collection = ? LIMIT 1`)
     || hasRow(`SELECT 1 FROM processor_outputs WHERE collection = ? LIMIT 1`)
@@ -4856,6 +4868,7 @@ function moveCollectionNameInIndex(db: Database, oldName: string, newName: strin
   db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(newName);
   db.prepare(`UPDATE file_sync_state SET collection = ? WHERE collection = ?`).run(newName, oldName);
   renameCollectionId(db, oldName, newName);
+  db.prepare('UPDATE tracked_searches SET collection = ? WHERE collection = ?').run(newName, oldName);
   renameProcessorState(db, oldName, newName);
 }
 
@@ -4874,6 +4887,7 @@ export function removeCollection(db: Database, collectionName: string): { delete
 
     const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
     db.prepare(`DELETE FROM file_sync_state WHERE collection = ?`).run(collectionName);
+    db.prepare('DELETE FROM tracked_searches WHERE collection = ?').run(collectionName);
     removeProcessorState(db, collectionName);
 
     const cleanupResult = db.prepare(`

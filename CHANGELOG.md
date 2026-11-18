@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Track a literal phrase in a collection and report added or removed matching lines since the previous check with `qmd track`.
+
 ## [2.9.0] - 2026-11-17
 
 QMD adds document processors, metadata filtering, and remote model support.

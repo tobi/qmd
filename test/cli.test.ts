@@ -3229,3 +3229,80 @@ fi
     }
   });
 });
+
+describe("tracked searches", () => {
+  test("reports literal matching-line changes once and keeps locations current", async () => {
+    const env = await createIsolatedTestEnv("track");
+    const notes = join(testDir, "track-notes");
+    const file = join(notes, "week.md");
+    const run = async (args: string[]) => {
+      const result = await runQmd(args, env);
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    const changes = async () => JSON.parse(await run(["track", "changes", "release", "--json"]));
+    await mkdir(notes);
+    await writeFile(file, "发布：写公告\r\n发布：写公告\r\n");
+    await run(["collection", "add", notes, "--name", "meetings"]);
+    await run(["track", "add", "release", "发布", "-c", "meetings"]);
+    expect((await runQmd(["track", "add", "release", "different", "-c", "meetings"], env)).exitCode).toBe(1);
+    expect(await changes()).toEqual([]);
+
+    await writeFile(file, "# Week\n发布：写公告\n发布：写公告\n发布：打包\n");
+    await run(["update"]);
+    // Two independent CLI processes compete for the same checkpoint.
+    const results = await Promise.all([changes(), changes()]);
+    expect(results.filter(rows => rows.length === 0)).toHaveLength(1);
+    const result = results.find(rows => rows.length > 0);
+    expect(result).toEqual([{ file: "qmd://meetings/week.md", removed: [], added: [{ line: 4, text: "发布：打包" }] }]);
+
+    await writeFile(file, "# Week\n发布：写公告\n发布：签名\n");
+    await run(["update"]);
+    expect(await changes()).toEqual([{
+      file: "qmd://meetings/week.md",
+      removed: [{ line: 3, text: "发布：写公告" }, { line: 4, text: "发布：打包" }],
+      added: [{ line: 3, text: "发布：签名" }],
+    }]);
+
+    await writeFile(file, "# Notes\n# Week\n发布：写公告\n发布：签名\n");
+    await run(["update"]);
+    expect(await run(["track", "changes", "release"])).toBe("");
+    await run(["collection", "rename", "meetings", "weekly"]);
+    expect(JSON.parse(await run(["track", "list", "--json"]))).toEqual([
+      { name: "release", collection: "weekly", phrase: "发布" },
+    ]);
+    await rm(file);
+    await run(["update"]);
+    expect(await changes()).toEqual([{
+      file: "qmd://weekly/week.md",
+      removed: [{ line: 3, text: "发布：写公告" }, { line: 4, text: "发布：签名" }], added: [],
+    }]);
+    expect(await changes()).toEqual([]);
+    await run(["track", "remove", "release"]);
+    expect((await runQmd(["track", "changes", "release"], env)).exitCode).toBe(1);
+    expect(JSON.parse(await run(["track", "list", "--json"]))).toEqual([]);
+  }, 60000);
+
+  test("tracks new files only in the selected collection and discards a removed collection's baseline", async () => {
+    const env = await createIsolatedTestEnv("track-scope");
+    const work = join(testDir, "tracked-work");
+    const other = join(testDir, "untracked-work");
+    await Promise.all([mkdir(work), mkdir(other)]);
+    const run = async (...args: string[]) => {
+      const result = await runQmd(args, env);
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    await run("collection", "add", work, "--name", "work");
+    await run("collection", "add", other, "--name", "personal");
+    await run("track", "add", "tasks", "[TODO]", "-c", "work");
+    await writeFile(join(work, "a.md"), "[TODO] send notes\n[todo] not a literal match\n");
+    await writeFile(join(other, "b.md"), "[TODO] do laundry\n");
+    await run("update");
+    expect((await run("track", "changes", "tasks")).trim()).toBe("+ qmd://work/a.md:1 [TODO] send notes");
+    await run("collection", "remove", "work");
+    expect(JSON.parse(await run("track", "list", "--json"))).toEqual([]);
+    await run("track", "add", "tasks", "[TODO]", "-c", "personal");
+    expect(JSON.parse(await run("track", "changes", "tasks", "--json"))).toEqual([]);
+  }, 60000);
+});

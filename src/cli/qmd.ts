@@ -3989,6 +3989,7 @@ function showHelp(): void {
   console.log("Primary commands:");
   console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
+  console.log("  qmd track <add|changes|list|remove> - Track changes to lines matching a literal phrase");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
@@ -4757,6 +4758,49 @@ if (isMain) {
   }
 
   switch (cli.command) {
+    case "track": {
+      const [action, name, phrase] = cli.args;
+      const json = cli.opts.format === "json";
+      const { addTrack, listTracks, removeTrack, trackChanges } = await import("../tracked-search.js");
+      try {
+        if (!json && cli.opts.format !== "cli") throw new Error("Track supports text or JSON output");
+        if (action !== "add" && cli.opts.collection) throw new Error("Set the collection when adding a tracked search");
+        if (action === "add" && name && phrase && cli.args.length === 3) {
+          if (cli.opts.collection?.length !== 1) throw new Error("Specify one collection with -c");
+          const [collection] = resolveCollectionFilter(cli.opts.collection);
+          const track = { name, phrase, collection: collection! };
+          addTrack(getDb(), track);
+          console.log(json ? JSON.stringify(track) : `Saved baseline for ${name}`);
+        } else if (action === "changes" && name && cli.args.length === 2) {
+          const { collection, changes } = trackChanges(getDb(), name);
+          const index = getActiveIndexName();
+          const result = changes.map(change => ({
+            ...change,
+            file: buildVirtualPath(collection, change.file, index === "index" ? undefined : index),
+          }));
+          if (json) console.log(JSON.stringify(result));
+          else for (const { file, removed, added } of result) {
+            for (const match of removed) console.log(`- ${file}:${match.line} ${match.text}`);
+            for (const match of added) console.log(`+ ${file}:${match.line} ${match.text}`);
+          }
+        } else if (action === "list" && cli.args.length === 1) {
+          const tracks = listTracks(getDb());
+          if (json) console.log(JSON.stringify(tracks));
+          else for (const track of tracks) console.log(`${track.name}\t${track.collection}\t${track.phrase}`);
+        } else if (action === "remove" && name && cli.args.length === 2) {
+          removeTrack(getDb(), name);
+          console.log(json ? JSON.stringify({ removed: name }) : `Removed ${name}`);
+        } else {
+          throw new Error('Usage: qmd track add <name> "<phrase>" -c <collection> | changes <name> | list | remove <name>');
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        closeDb();
+        process.exit(1);
+      }
+      closeDb();
+      break;
+    }
     case "context": {
       const subcommand = cli.args[0];
       if (!subcommand) {
