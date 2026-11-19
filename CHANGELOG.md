@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Respect optional remote embedding request limits for input count and UTF-8
+  input bytes. Report HTTP failure status without exposing response text (#1120).
+
 ## [2.9.0] - 2026-11-17
 
 QMD adds document processors, metadata filtering, and remote model support.

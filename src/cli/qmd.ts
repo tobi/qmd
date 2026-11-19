@@ -2577,7 +2577,7 @@ async function vectorIndex(
       console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
       console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
       if (result.errors > 0) {
-        console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+        console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks failed or were skipped${c.reset}`);
         for (const failure of (result.failures ?? []).slice(0, 8)) {
           console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
         }
