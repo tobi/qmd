@@ -411,6 +411,17 @@ describe("lex query syntax", () => {
       expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
     });
 
+    test("accepts literal hyphens inside double quotes", () => {
+      expect(validateSemanticQuery('"literal -excluded phrase"')).toBeNull();
+      expect(validateSemanticQuery('"-excluded"')).toBeNull();
+      expect(validateSemanticQuery(String.raw`"literal \"quote\" -inside"`)).toBeNull();
+    });
+
+    test("rejects unquoted negation after a quoted phrase", () => {
+      expect(validateSemanticQuery('"literal -inside" -outside')).toContain("Negation");
+      expect(validateSemanticQuery(String.raw`"ends with \\" -outside`)).toContain("Negation");
+    });
+
     test("rejects multiple negations", () => {
       expect(validateSemanticQuery("error handling -java -python")).toContain("Negation");
     });
