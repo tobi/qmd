@@ -233,3 +233,32 @@ describe("negation and semantic-query validation are unaffected", () => {
     expect(validateSemanticQuery('gateway -"cloud-init"')).toContain("Negation");
   });
 });
+
+
+describe("thousands-separated integers (#1087)", () => {
+  test("matches both spellings while preserving conjunctions, exclusions and phrases", async () => {
+    const { store, collection } = await createProbeStore();
+    const bodies = [
+      "edges: 1,031,369",
+      "edges: 1031369",
+      "edges: 10313690",
+      "edges: 1 other 031 other 369",
+      "vertices: 1031369",
+    ];
+    for (const [index, body] of bodies.entries()) {
+      const now = new Date().toISOString();
+      const hash = await hashContent(body);
+      insertContent(store.db, hash, body, now);
+      insertDocument(store.db, collection, `number-${index}.md`, "Counts", hash, now, now);
+    }
+    const count = (query: string) => store.searchFTS(query, 20).length;
+    expect(count('"1,031,369"')).toBe(1);
+    expect(count("1,031,369")).toBe(3);
+    expect(count("edges 1,031,369")).toBe(2);
+    expect(count("edges -1,031,369")).toBe(2);
+    expect(count('edges -"1,031,369"')).toBe(3);
+    expect(count("10,31,369")).toBe(0);
+    expect(count("1031369")).toBe(3);
+    expect(count("-1,031,369")).toBe(0);
+  });
+});
