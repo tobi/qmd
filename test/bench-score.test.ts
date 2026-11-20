@@ -34,12 +34,20 @@ describe("pathsMatch", () => {
     expect(pathsMatch("Docs/README.md", "docs/readme.md")).toBe(true);
   });
 
-  test("suffix match (result is longer)", () => {
+  test("suffix match anchored at a path separator (result is longer)", () => {
     expect(pathsMatch("/full/path/docs/readme.md", "docs/readme.md")).toBe(true);
   });
 
-  test("suffix match (expected is longer)", () => {
-    expect(pathsMatch("readme.md", "docs/readme.md")).toBe(true);
+  test("expected longer than result does not match", () => {
+    expect(pathsMatch("readme.md", "docs/readme.md")).toBe(false);
+  });
+
+  test("basename does not match a longer basename", () => {
+    expect(pathsMatch("qmd://ai-live/Memory/Procedural/Vault Note Standards.md", "Standards.md")).toBe(false);
+  });
+
+  test("suffix must be anchored at a path separator", () => {
+    expect(pathsMatch("docs/api/readme.md", "i/readme.md")).toBe(false);
   });
 
   test("qmd:// prefix handled", () => {
@@ -101,7 +109,7 @@ describe("scoreResults", () => {
 
   test("reports recall@1/3/5 and matched documents", () => {
     const result = scoreResults(
-      ["x.md", "qmd://concepts/a.md", "docs/b.md", "docs/c.md", "docs/d.md"],
+      ["x.md", "qmd://col/concepts/a.md", "docs/b.md", "docs/c.md", "docs/d.md"],
       ["concepts/a.md", "b.md", "missing.md"],
       3,
     );
