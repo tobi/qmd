@@ -23,7 +23,8 @@
 					"command": "qmd",
 					"args": ["mcp"]
 				}
-			}
+			},
+			"strict": false
 		}
 	]
 }
