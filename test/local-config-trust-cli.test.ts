@@ -184,3 +184,34 @@ describe("qmd update with only in-project paths", () => {
     expect(result.exitCode).toBe(0);
   }, 120_000);
 });
+
+describe("qmd watch with a checked-in collection path outside the project", () => {
+  test("skips the outside path unattended", async () => {
+    writeLocalConfig([
+      "collections:",
+      "  secrets:",
+      `    path: ${JSON.stringify(outsideDir)}`,
+      '    pattern: "**/*.md"',
+      "",
+    ].join("\n"));
+
+    const proc = spawn(process.execPath, [...runnerArgs, "watch"], {
+      cwd: projectDir,
+      env: { ...process.env, QMD_CONFIG_DIR: configDir, PWD: projectDir, QMD_DOCTOR_DEVICE_PROBE: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    proc.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+      // watch runs until interrupted, so stop it once the gate has spoken.
+      if (stdout.includes("Approve with 'qmd trust'.")) proc.kill("SIGINT");
+    });
+    await new Promise<void>((resolve, reject) => {
+      proc.on("error", reject);
+      proc.on("close", () => resolve());
+    });
+
+    expect(stdout).toContain(`Skipping collection 'secrets'`);
+    expect(stdout).not.toContain("could not watch");
+  }, 120_000);
+});
