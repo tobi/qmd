@@ -12,6 +12,7 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   LlamaCpp,
   setNodeLlamaCppModuleForTest,
+  resetNodeLlamaCppModuleForTest,
 } from "../src/llm.js";
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.js";
 import { recordTrust, sensitiveDigest, type SensitiveSnapshot } from "../src/trust.js";
@@ -109,7 +110,7 @@ afterEach(async () => {
   await handle?.stop();
   handle = undefined;
   vi.restoreAllMocks();
-  setNodeLlamaCppModuleForTest(null);
+  resetNodeLlamaCppModuleForTest();
   setConfigSource();
   for (const [name, value] of savedEnv) {
     if (value === undefined) delete process.env[name];

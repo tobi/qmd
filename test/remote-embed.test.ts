@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, RemoteEmbedder, type CollectionConfig, type QMDStore } from "../src/index.js";
-import { LlamaCpp, DEFAULT_EMBED_MODEL_URI as DEFAULT_EMBED_MODEL, formatDocForEmbedding, formatQueryForEmbedding, pullModels, setNodeLlamaCppModuleForTest, withLLMSessionForLlm } from "../src/llm.js";
+import { LlamaCpp, DEFAULT_EMBED_MODEL_URI as DEFAULT_EMBED_MODEL, formatDocForEmbedding, formatQueryForEmbedding, pullModels, setNodeLlamaCppModuleForTest, resetNodeLlamaCppModuleForTest, withLLMSessionForLlm } from "../src/llm.js";
 import { getEmbeddingFingerprint, createStore as openInternal } from "../src/store.js";
 import { sensitiveDigest, type SensitiveSnapshot } from "../src/trust.js";
 import { VEC_TABLE } from "../src/vec-layout.js";
@@ -16,7 +16,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   delete process.env.QMD_TEST_SYNTHETIC_AUTH;
   delete process.env.OPENAI_API_KEY;
-  setNodeLlamaCppModuleForTest(null);
+  resetNodeLlamaCppModuleForTest();
   for (const store of stores.splice(0)) await store.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
