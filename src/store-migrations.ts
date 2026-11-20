@@ -4,7 +4,9 @@
  * Version 1 installs the FTS sync triggers. Version 2 moves every vector out
  * of the legacy `vectors_vec` table (one row per chunk, keyed by hash_seq)
  * into the layout `vec-layout.ts` describes: one row per (chunk, active
- * collection) in a vec0 table partitioned by collection id.
+ * collection) in a vec0 table partitioned by collection id. Version 3
+ * reinstalls the FTS sync triggers after documents_ai switched to
+ * INSERT OR REPLACE (#926).
  *
  * The copy walks the legacy table's chunk blobs in chunk_id order, one chunk
  * per IMMEDIATE transaction, and keeps the last copied chunk_id in
@@ -31,6 +33,7 @@ import {
 
 export const FTS_SYNC_TRIGGERS_VERSION = 1;
 export const VECTOR_PARTITION_VERSION = 2;
+export const FTS_INSERT_OR_REPLACE_VERSION = 3;
 
 const CURSOR_KEY = "vector_partition_cursor";
 
@@ -278,17 +281,20 @@ export function runStoreMigrations(db: Database, deps: StoreMigrationDeps): void
   applyVersionedStep(db, FTS_SYNC_TRIGGERS_VERSION, () => deps.installFtsSyncTriggers(db));
   if (getUserVersion(db) < VECTOR_PARTITION_VERSION) {
     migrateVectorLayout(db, deps);
-    return;
-  }
-  // A legacy table on a stamped store came from an older build; copying it
-  // here is a repair, so a failure (a dimension mismatch with the partitioned
-  // table) degrades vector search instead of blocking every open. The embed
-  // path raises the actionable error when it next runs.
-  if (vecLayout(db).kind === "legacy") {
+  } else if (vecLayout(db).kind === "legacy") {
+    // A legacy table on a stamped store came from an older build; copying it
+    // here is a repair, so a failure (a dimension mismatch with the partitioned
+    // table) degrades vector search instead of blocking every open. The embed
+    // path raises the actionable error when it next runs.
     try {
       migrateVectorLayout(db, deps);
     } catch (err) {
       console.warn(`Legacy vector table left in place: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+  // Versions are applied in order: a deferred vector step keeps this one
+  // waiting too, so stamping 3 can never skip version 2.
+  if (getUserVersion(db) >= VECTOR_PARTITION_VERSION) {
+    applyVersionedStep(db, FTS_INSERT_OR_REPLACE_VERSION, () => deps.installFtsSyncTriggers(db));
   }
 }
