@@ -1973,8 +1973,6 @@ async function configureCollection(
     process.exit(1);
   }
 
-  // Typing a path does not approve unrelated processor commands in this config.
-  const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern, settings && {
