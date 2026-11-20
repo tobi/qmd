@@ -705,6 +705,28 @@ describe("LlamaCpp expand context size config", () => {
   });
 });
 
+test("QMD_EXPAND_MAX_TOKENS accepts positive decimal integers and otherwise keeps 600", () => {
+  const previous = process.env.QMD_EXPAND_MAX_TOKENS;
+  const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+  try {
+    delete process.env.QMD_EXPAND_MAX_TOKENS;
+    expect(new LlamaCpp().expandMaxTokens).toBe(600);
+    process.env.QMD_EXPAND_MAX_TOKENS = " 200 ";
+    expect(new LlamaCpp().expandMaxTokens).toBe(200);
+    expect(stderr).not.toHaveBeenCalled();
+    for (const value of ["0", "-1", "1.5", "200junk", "1e2", "9007199254740993"]) {
+      process.env.QMD_EXPAND_MAX_TOKENS = value;
+      expect(new LlamaCpp().expandMaxTokens).toBe(600);
+    }
+    expect(stderr).toHaveBeenCalledTimes(6);
+    expect(String(stderr.mock.calls[0]?.[0])).toContain("QMD_EXPAND_MAX_TOKENS");
+  } finally {
+    stderr.mockRestore();
+    if (previous === undefined) delete process.env.QMD_EXPAND_MAX_TOKENS;
+    else process.env.QMD_EXPAND_MAX_TOKENS = previous;
+  }
+});
+
 describe("LlamaCpp model resolution (config > env > default)", () => {
   const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";

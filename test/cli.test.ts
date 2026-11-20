@@ -893,6 +893,7 @@ describe("CLI Status Command", () => {
       QMD_LLAMA_GPU: "metal",
       QMD_EMBED_PARALLELISM: "2",
       QMD_EXPAND_CONTEXT_SIZE: "4096",
+      QMD_EXPAND_MAX_TOKENS: "200",
       QMD_RERANK_CONTEXT_SIZE: "8192",
       QMD_EMBED_CONTEXT_SIZE: "1024",
       QMD_EDITOR_URI: "vscode://file/{file}:{line}:{col}",
@@ -918,6 +919,7 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("moves the default index cache");
     expect(stdout).toContain("disables real LLM operations");
     expect(stdout).toContain("changes Hugging Face download endpoint");
+    expect(stdout).toContain("limits tokens generated per query expansion");
   }, 20000);
 
   test("qmd doctor flags mixed embedding fingerprints", async () => {

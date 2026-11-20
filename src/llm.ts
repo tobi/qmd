@@ -680,6 +680,7 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+export const DEFAULT_EXPAND_MAX_TOKENS = 600;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
@@ -840,6 +841,21 @@ function resolveExpandContextSize(configValue?: number): number {
     return DEFAULT_EXPAND_CONTEXT_SIZE;
   }
   return parsed;
+}
+
+export function resolveExpandMaxTokens(warnOnInvalid = true): number {
+  const value = process.env.QMD_EXPAND_MAX_TOKENS?.trim();
+  if (!value) return DEFAULT_EXPAND_MAX_TOKENS;
+
+  const parsed = Number(value);
+  if (/^[0-9]+$/.test(value) && Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+
+  if (warnOnInvalid) {
+    process.stderr.write(
+      `QMD Warning: QMD_EXPAND_MAX_TOKENS must be a positive integer, using default ${DEFAULT_EXPAND_MAX_TOKENS}.\n`
+    );
+  }
+  return DEFAULT_EXPAND_MAX_TOKENS;
 }
 
 const failedGpuInitModes = new Set<LlamaGpuMode>();
@@ -1066,6 +1082,7 @@ export class LlamaCpp implements LLM {
   private readonly jevReranker?: JevReranker;
   private modelCacheDir: string;
   private expandContextSize: number;
+  readonly expandMaxTokens: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -1116,6 +1133,7 @@ export class LlamaCpp implements LLM {
     }
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
+    this.expandMaxTokens = resolveExpandMaxTokens();
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -2029,7 +2047,7 @@ export class LlamaCpp implements LLM {
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
         grammar,
-        maxTokens: 600,
+        maxTokens: this.expandMaxTokens,
         temperature: 0.7,
         topK: 20,
         topP: 0.8,

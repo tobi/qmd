@@ -1367,6 +1367,32 @@ describe("Query expansion cache (#818)", () => {
     }
   });
 
+  test("expansion cache separates token limits and invalidates only the active limit", async () => {
+    const store = await createTestStore();
+    const query = "search terms";
+    const regular = vi.fn(async () => [{ type: "lex", text: "regular expansion" }]);
+    const limited = vi.fn(async () => [{ type: "lex", text: "limited expansion" }]);
+    try {
+      store.llm = { expandMaxTokens: 600, expandQuery: regular } as any;
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "regular expansion" }]);
+
+      store.llm = { expandMaxTokens: 200, expandQuery: limited } as any;
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "limited expansion" }]);
+      await store.expandQuery(query);
+      expect(limited).toHaveBeenCalledTimes(1);
+
+      store.invalidateExpansionCache(query);
+      await store.expandQuery(query);
+      expect(limited).toHaveBeenCalledTimes(2);
+
+      store.llm = { expandMaxTokens: 600, expandQuery: regular } as any;
+      expect(await store.expandQuery(query)).toEqual([{ type: "lex", query: "regular expansion" }]);
+      expect(regular).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery drops a cached expansion whose sub-queries contributed nothing", async () => {
     const store = await createTestStore();
     try {
