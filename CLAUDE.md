@@ -6,6 +6,7 @@ Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 
 ```sh
 qmd collection add . --name <n>   # Create/index collection
+qmd setup-collection <path> <name> [context] # Configure + index + embed in one step
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
@@ -41,6 +42,10 @@ qmd collection list
 
 # Create a collection with explicit name
 qmd collection add ~/Documents/notes --name mynotes --mask '**/*.md'
+
+# Configure, index, and embed in one step (context + ignore applied before indexing)
+qmd setup-collection . repo-code --context "Repo source code" \
+  --mask '**/*.{ts,tsx,js,py,go,rs}' --ignore 'dist/**' --exclude --chunk-strategy auto
 
 # Remove a collection
 qmd collection remove mynotes
@@ -169,7 +174,7 @@ bun test --preload ./src/test-preload.ts test/
 
 ## Important: Do NOT run automatically
 
-- Never run `qmd collection add`, `qmd embed`, or `qmd update` automatically
+- Never run `qmd collection add`, `qmd setup-collection`, `qmd embed`, or `qmd update` automatically
 - Never modify the SQLite database directly
 - Write out example commands for the user to run manually
 - Index is stored at `~/.cache/qmd/index.sqlite`

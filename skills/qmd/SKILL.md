@@ -318,6 +318,7 @@ retrieving are safe; collection/index mutation is not a casual first step.
 ```bash
 npm install -g @tobilu/qmd
 qmd collection add ~/notes --name notes
+qmd setup-collection ~/project myproject "Project docs" --mask "**/*.md" --exclude
 qmd update
 qmd embed
 ```
@@ -353,7 +354,7 @@ server configuration.
 - **Do not filter blind.** Run `qmd collection metadata` first and read the
   coverage. A key declared by 388 of 480 documents leaves 92 that no value
   condition on it can reach; only `exists: false` selects them.
-- **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
+- **Do not mutate indexes casually.** `qmd collection add`, `qmd setup-collection`, `qmd update`, and
   `qmd embed` change local state and can be expensive.
 - **Model-backed commands can be environment-sensitive.** If `qmd query`,
   `qmd vsearch`, or reranking fails because local models/GPU are unavailable,

@@ -2116,6 +2116,375 @@ describe("collection ignore patterns", () => {
 });
 
 // =============================================================================
+// Setup-Collection Tests
+// =============================================================================
+
+describe("CLI Setup-Collection Command", () => {
+  async function createEmptyDir(prefix: string): Promise<string> {
+    testCounter++;
+    const dir = join(testDir, `${prefix}-${testCounter}`);
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  test("requires both path and name", async () => {
+    const env = await createIsolatedTestEnv("setup-no-args");
+
+    const noArgs = await runQmd(["setup-collection"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(noArgs.exitCode).toBe(1);
+    expect(noArgs.stderr).toContain("Usage: qmd setup-collection <path> <name> [context]");
+
+    const noName = await runQmd(["setup-collection", "."], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(noName.exitCode).toBe(1);
+    expect(noName.stderr).toContain("Usage: qmd setup-collection <path> <name> [context]");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+  });
+
+  test("rejects a missing path without writing configuration", async () => {
+    const env = await createIsolatedTestEnv("setup-missing-path");
+    const missingPath = join(fixturesDir, "setup-does-not-exist");
+
+    const { stdout, stderr, exitCode } = await runQmd(["setup-collection", missingPath, "setupcoll"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Collection path does not exist");
+    expect(stderr).toContain(`Received: ${missingPath}`);
+    expect(stdout).not.toContain("set up successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+  });
+
+  test("rejects an existing collection name without overwriting it", async () => {
+    const env = await createIsolatedTestEnv("setup-dup-name");
+    const collDir = await createEmptyDir("setup-dup-name");
+    const existingYaml = `collections:
+  setupdup:
+    path: ${collDir}
+    pattern: "**/*.md"
+    context:
+      "/": original context
+`;
+    await writeFile(join(env.configDir, "index.yml"), existingYaml);
+
+    const { stdout, stderr, exitCode } = await runQmd(["setup-collection", collDir, "setupdup"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection 'setupdup' already exists");
+    expect(stdout).not.toContain("set up successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe(existingYaml);
+  });
+
+  test("rejects a duplicate path and pattern like collection add", async () => {
+    const env = await createIsolatedTestEnv("setup-dup-path");
+    const collDir = await createEmptyDir("setup-dup-path");
+
+    const first = await runQmd(["setup-collection", collDir, "firstcoll"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(first.exitCode).toBe(0);
+
+    const second = await runQmd(["setup-collection", collDir, "secondcoll"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(second.exitCode).toBe(1);
+    expect(second.stderr).toContain("A collection already exists for this path and pattern");
+    expect(second.stderr).toContain("firstcoll");
+  });
+
+  test("writes the requested mask into the collection config", async () => {
+    const env = await createIsolatedTestEnv("setup-mask");
+    const collDir = await createEmptyDir("setup-mask");
+
+    const { stdout, exitCode } = await runQmd(
+      ["setup-collection", collDir, "maskcoll", "--mask", "docs/**/*.mdx"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'maskcoll' set up successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).toContain("docs/**/*.mdx");
+  });
+
+  test("stores repeatable --ignore patterns in the collection config", async () => {
+    const env = await createIsolatedTestEnv("setup-ignore-config");
+    const collDir = await createEmptyDir("setup-ignore-config");
+
+    const { stdout, exitCode } = await runQmd(
+      ["setup-collection", collDir, "ignorecoll", "--ignore", "sessions/**", "--ignore", "archive/**"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'ignorecoll' set up successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).toContain("- sessions/**");
+    expect(yaml).toContain("- archive/**");
+  });
+
+  test("writes a root context from --context and from the positional form", async () => {
+    const flagEnv = await createIsolatedTestEnv("setup-context-flag");
+    const flagDir = await createEmptyDir("setup-context-flag");
+    const flagResult = await runQmd(
+      ["setup-collection", flagDir, "ctxflag", "--context", "Repository A documentation"],
+      { dbPath: flagEnv.dbPath, configDir: flagEnv.configDir }
+    );
+    expect(flagResult.exitCode).toBe(0);
+    const flagYaml = readFileSync(join(flagEnv.configDir, "index.yml"), "utf8");
+    expect(flagYaml).toContain("/: Repository A documentation");
+
+    const positionalEnv = await createIsolatedTestEnv("setup-context-positional");
+    const positionalDir = await createEmptyDir("setup-context-positional");
+    const positionalResult = await runQmd(
+      ["setup-collection", positionalDir, "ctxpos", "Repository A documentation"],
+      { dbPath: positionalEnv.dbPath, configDir: positionalEnv.configDir }
+    );
+    expect(positionalResult.exitCode).toBe(0);
+    const positionalYaml = readFileSync(join(positionalEnv.configDir, "index.yml"), "utf8");
+    expect(positionalYaml).toContain("/: Repository A documentation");
+  });
+
+  test("creates the collection without a context when none is given", async () => {
+    const env = await createIsolatedTestEnv("setup-no-context");
+    const collDir = await createEmptyDir("setup-no-context");
+
+    const { stdout, exitCode } = await runQmd(["setup-collection", collDir, "noctx"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'noctx' set up successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).not.toContain("context:");
+  });
+
+  test("does not trust pre-existing gated project configuration", async () => {
+    const env = await createIsolatedTestEnv("setup-untrusted-config");
+    const collDir = await createEmptyDir("setup-untrusted-config");
+    const existingYaml = `collections:
+  external:
+    path: /tmp/qmd-external
+    pattern: "**/*.md"
+    update: "echo compromised"
+`;
+    await writeFile(join(env.configDir, "index.yml"), existingYaml);
+
+    const { stdout, exitCode } = await runQmd(["setup-collection", collDir, "safe"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    const trust = await runQmd(["trust", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(trust.exitCode).toBe(0);
+    expect(trust.stdout).toContain("No trusted project configs");
+  });
+
+  test("rejects --context together with a positional context", async () => {
+    const env = await createIsolatedTestEnv("setup-context-both");
+    const collDir = await createEmptyDir("setup-context-both");
+
+    const { stderr, exitCode } = await runQmd(
+      ["setup-collection", collDir, "ctxboth", "positional context", "--context", "flag context"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("not both");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+  });
+
+  test("leaves the collection included in default searches", async () => {
+    const env = await createIsolatedTestEnv("setup-include-default");
+    const collDir = await createEmptyDir("setup-include-default");
+
+    const { stdout, exitCode } = await runQmd(["setup-collection", collDir, "inccoll"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'inccoll' set up successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).not.toContain("includeByDefault");
+  });
+
+  test("--exclude writes includeByDefault: false", async () => {
+    const env = await createIsolatedTestEnv("setup-exclude");
+    const collDir = await createEmptyDir("setup-exclude");
+
+    const { stdout, exitCode } = await runQmd(["setup-collection", collDir, "exccoll", "--exclude"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'exccoll' set up successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).toContain("includeByDefault: false");
+  });
+
+  test("applies ignore patterns before the first index pass", async () => {
+    const env = await createIsolatedTestEnv("setup-ignore-index");
+    const collDir = join(testDir, `setup-ignore-index-${testCounter}`);
+    await mkdir(join(collDir, "notes"), { recursive: true });
+    await mkdir(join(collDir, "sessions"), { recursive: true });
+    await mkdir(join(collDir, "archive"), { recursive: true });
+    await writeFile(join(collDir, "readme.md"), "# Readme\nThis should be indexed.");
+    await writeFile(join(collDir, "notes", "note1.md"), "# Note 1\nThis is a personal note.");
+    await writeFile(join(collDir, "sessions", "session1.md"), "# Session 1\nThis session should be ignored.");
+    await writeFile(join(collDir, "archive", "old.md"), "# Old stuff\nThis archive file should be ignored.");
+
+    // A missing embed model makes the embed step fail fast without network,
+    // while the index pass still runs to completion first.
+    const missingModel = join(testDir, "setup-missing-model.gguf");
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["setup-collection", collDir, "setupidx", "--ignore", "sessions/**", "--ignore", "archive/**"],
+      {
+        dbPath: env.dbPath,
+        configDir: env.configDir,
+        env: { QMD_EMBED_MODEL: missingModel, QMD_FORCE_CPU: "1" },
+      }
+    );
+
+    // Indexing happened (2 of 5 files), then embedding failed and was surfaced.
+    expect(stdout).toContain("Indexed: 2 new");
+    expect(stderr).toContain("Embedding failed for collection 'setupidx'");
+    expect(exitCode).toBe(1);
+
+    // The ignored files were never indexed; the kept ones are searchable.
+    const search = await runQmd(["search", "session", "-n", "10"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(search.exitCode).toBe(0);
+    expect(search.stdout).not.toContain("session1");
+    expect(search.stdout).not.toContain("old.md");
+
+    const kept = await runQmd(["search", "personal note", "-n", "10"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(kept.stdout).toContain("note1");
+  });
+
+  test("embeds only the new collection", async () => {
+    const env = await createIsolatedTestEnv("setup-scoped-embed");
+    const otherDir = join(testDir, `setup-scoped-other-${testCounter}`);
+    await mkdir(otherDir, { recursive: true });
+    await writeFile(join(otherDir, "other.md"), "# Other\nPending embedding in another collection.");
+
+    // Another collection with pending (unembedded) documents.
+    const add = await runQmd(["collection", "add", otherDir, "--name", "setupother"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(add.exitCode).toBe(0);
+
+    // Setting up an empty collection must not try to embed the other
+    // collection's pending documents; the scoped embed finds nothing to do.
+    const emptyDir = await createEmptyDir("setup-scoped-empty");
+    const { stdout, exitCode } = await runQmd(["setup-collection", emptyDir, "setupempty"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("All content hashes already have embeddings");
+    expect(stdout).toContain("Collection 'setupempty' set up successfully");
+
+    // The other collection's index is untouched and searchable.
+    const search = await runQmd(["search", "pending embedding", "-n", "5"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(search.exitCode).toBe(0);
+    expect(search.stdout).toContain("other.md");
+  });
+
+  test("surfaces embedding failures without hiding the created collection", async () => {
+    const env = await createIsolatedTestEnv("setup-embed-failure");
+    const collDir = join(testDir, `setup-embed-failure-${testCounter}`);
+    await mkdir(collDir, { recursive: true });
+    await writeFile(join(collDir, "hello.md"), "# Hello doc\nScratch content for the setup embed failure test.");
+
+    const missingModel = join(testDir, "setup-failure-model.gguf");
+    const { stdout, stderr, exitCode } = await runQmd(["setup-collection", collDir, "embedfail"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_EMBED_MODEL: missingModel, QMD_FORCE_CPU: "1" },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).toContain("Indexed: 1 new");
+    expect(stderr).toContain("Embedding failed for collection 'embedfail'");
+    expect(stderr).toContain("qmd embed -c embedfail");
+    expect(stdout).not.toContain("set up successfully");
+
+    // The collection is configured and indexed; BM25 search still works.
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).toContain("embedfail");
+    const search = await runQmd(["search", "scratch content", "-n", "5"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(search.exitCode).toBe(0);
+    expect(search.stdout).toContain("hello.md");
+  });
+
+  test("rejects an invalid --chunk-strategy before writing configuration", async () => {
+    const env = await createIsolatedTestEnv("setup-chunk-invalid");
+    const collDir = await createEmptyDir("setup-chunk-invalid");
+
+    const { stderr, exitCode } = await runQmd(
+      ["setup-collection", collDir, "chunkcoll", "--chunk-strategy", "bogus"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--chunk-strategy must be "auto" or "regex"');
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+  });
+
+  test("accepts --chunk-strategy auto for the scoped embed step", async () => {
+    const env = await createIsolatedTestEnv("setup-chunk-auto");
+    const collDir = await createEmptyDir("setup-chunk-auto");
+
+    const { stdout, exitCode } = await runQmd(
+      ["setup-collection", collDir, "chunkcoll", "--chunk-strategy", "auto"],
+      { dbPath: env.dbPath, configDir: env.configDir }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'chunkcoll' set up successfully");
+  });
+
+  test("collection add keeps its existing behavior", async () => {
+    const env = await createIsolatedTestEnv("setup-add-unchanged");
+    const collDir = join(testDir, `setup-add-unchanged-${testCounter}`);
+    await mkdir(collDir, { recursive: true });
+    await writeFile(join(collDir, "doc.md"), "# Manual add\nAdded through collection add.");
+
+    const { stdout, exitCode } = await runQmd(["collection", "add", collDir, "--name", "manualadd"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Collection 'manualadd' created successfully");
+
+    const yaml = readFileSync(join(env.configDir, "index.yml"), "utf8");
+    expect(yaml).toContain("manualadd");
+    expect(yaml).toContain("**/*.md");
+  });
+});
+
+// =============================================================================
 // Output Format Tests - qmd:// URIs, context, and docid
 // =============================================================================
 

@@ -1936,7 +1936,16 @@ function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): stri
   return mask ?? glob ?? DEFAULT_GLOB;
 }
 
-async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+/** Shared configuration step for `collection add` and `setup-collection`:
+ * name derivation, duplicate checks, YAML write, and the SQLite config sync.
+ * Returns the collection name. Indexing/embedding is left
+ * to the caller so setup can apply ignore patterns before the first index. */
+async function configureCollection(
+  pwd: string,
+  globPattern: string,
+  name?: string,
+  settings?: { context?: string; ignore?: string[]; includeByDefault?: boolean },
+): Promise<string> {
   // If name not provided, generate from pwd basename
   let collName = name;
   if (!collName) {
@@ -1964,14 +1973,20 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
     process.exit(1);
   }
 
-  // Typing a path does not approve unrelated processor commands in this config.
-  const mayRefreshTrust = !collectSensitiveSnapshot().processors?.length || localConfigIsFullyTrusted();
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
-  addCollection(collName, pwd, globPattern);
-  // The user just typed this path, so it needs no separate approval (#889).
-  if (mayRefreshTrust) trustCurrentConfig();
+  addCollection(collName, pwd, globPattern, settings && {
+    ...(settings.context ? { context: { "/": settings.context } } : {}),
+    ...(settings.ignore && settings.ignore.length > 0 ? { ignore: settings.ignore } : {}),
+    ...(settings.includeByDefault === false ? { includeByDefault: false } : {}),
+  });
   resyncConfig();
+
+  return collName;
+}
+
+async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+  const collName = await configureCollection(pwd, globPattern, name);
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
@@ -1990,6 +2005,63 @@ function hasIndexedCollectionForRecovery(name: string): boolean {
     return hasCollectionIndexState(probe.db, name);
   } finally {
     probe.close();
+  }
+}
+
+/** Embed options that apply to a single `setup-collection` invocation.
+ * Routed explicitly (not forwarded wholesale) because collection, global,
+ * search, and embed flags have different meanings. */
+interface SetupEmbedOptions {
+  force?: boolean;
+  maxDocsPerBatch?: number;
+  maxBatchBytes?: number;
+  chunkStrategy?: ChunkStrategy;
+  maxDurationMs?: number;
+}
+
+/** `qmd setup-collection`: configure, index, and embed a collection in one
+ * step. Configuration (context, ignore patterns, inclusion) is written before
+ * indexing so ignore rules apply to the first index pass, and embedding is
+ * scoped to the new collection only. */
+async function setupCollection(
+  pwd: string,
+  name: string,
+  options: {
+    globPattern: string;
+    context?: string;
+    ignore?: string[];
+    exclude?: boolean;
+    embed?: SetupEmbedOptions;
+  },
+): Promise<void> {
+  const collName = await configureCollection(pwd, options.globPattern, name, {
+    context: options.context,
+    ignore: options.ignore,
+    includeByDefault: options.exclude === true ? false : undefined,
+  });
+
+  // Index with the just-written ignore patterns already in effect
+  console.log(`Creating collection '${collName}'...`);
+  const newColl = getCollectionFromYaml(collName);
+  await indexFiles(pwd, options.globPattern, collName, true, newColl?.ignore);
+
+  // Embed only the new collection
+  console.log(`Embedding collection '${collName}'...`);
+  try {
+    await resolveLocalConfigTrust();
+    await vectorIndex(resolveModelsForRuntime().embed, !!options.embed?.force, {
+      collection: collName,
+      maxDocsPerBatch: options.embed?.maxDocsPerBatch,
+      maxBatchBytes: options.embed?.maxBatchBytes,
+      chunkStrategy: options.embed?.chunkStrategy,
+      maxDurationMs: options.embed?.maxDurationMs,
+    });
+    console.log(`${c.green}✓${c.reset} Collection '${collName}' set up successfully`);
+  } catch (error) {
+    // The collection stays configured and indexed; only the embed step failed.
+    console.error(`${c.yellow}Embedding failed for collection '${collName}'.${c.reset}`);
+    console.error(`The collection is configured and indexed. Embed it later with 'qmd embed -c ${collName}'`);
+    exitWithError(error);
   }
 }
 
@@ -3465,6 +3537,8 @@ function parseCLI() {
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
       glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
+      ignore: { type: "string", multiple: true },  // setup-collection: repeatable collection ignore pattern
+      exclude: { type: "boolean" },  // setup-collection: exclude the new collection from default searches
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -4001,6 +4075,9 @@ function showHelp(): void {
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
   console.log("  qmd collection metadata [name] [--match J]   - Discover metadata keys and values to filter on");
+  console.log("  qmd setup-collection <path> <name> [context] - Configure, index, and embed in one step");
+  console.log("    --context <text> / --mask <glob> / --ignore <glob> (repeatable) / --exclude");
+  console.log("    Embed options (--chunk-strategy, -f, --max-docs-per-batch, --max-batch-mb, --timeout) apply to this setup only");
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
   console.log("");
@@ -5052,6 +5129,84 @@ if (isMain) {
           printDoctorHint();
           process.exit(1);
       }
+      break;
+    }
+
+    case "setup-collection": {
+      const pathArg = cli.args[0];
+      const nameArg = cli.args[1];
+      if (!pathArg || !nameArg) {
+        console.error("Usage: qmd setup-collection <path> <name> [context] [options]");
+        console.error("  Configure, index, and embed a collection in one step.");
+        console.error("");
+        console.error("Options:");
+        console.error("  --context <text>        Root context for the new collection");
+        console.error("  --mask, --glob <glob>   File pattern (default **/*.md)");
+        console.error("  --ignore <glob>         Ignore pattern; repeatable");
+        console.error("  --exclude               Exclude the collection from default searches");
+        console.error("  --chunk-strategy <auto|regex>  Chunking for the embed step");
+        console.error("  -f, --force             Re-embed the collection's content hashes");
+        console.error("  --max-docs-per-batch <n>, --max-batch-mb <n>, --timeout <minutes>");
+        console.error("");
+        console.error("Examples:");
+        console.error("  qmd setup-collection . repo-docs --context \"Repo docs\" --mask \"**/*.md\"");
+        console.error("  qmd setup-collection . repo-code --exclude --chunk-strategy auto --ignore \"dist/**\"");
+        process.exit(1);
+      }
+
+      // Context can be positional or --context, but not both.
+      const positionalContext = cli.args.length > 2 ? cli.args.slice(2).join(" ") : undefined;
+      const contextFlag = typeof cli.values.context === "string" && cli.values.context.length > 0
+        ? cli.values.context
+        : undefined;
+      if (positionalContext && contextFlag) {
+        console.error(`${c.yellow}Provide the context either as a positional argument or with --context, not both.${c.reset}`);
+        process.exit(1);
+      }
+
+      // Parse and validate embed options before any configuration is written,
+      // so a bad value fails before mutating the config.
+      const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
+      const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
+      const chunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+      const maxDurationMs = parseEmbedTimeoutOption(cli.values.timeout);
+
+      const resolvedPwd = pathArg === '.' ? getPwd() : getRealPath(resolve(pathArg));
+      const globPattern = collectionGlobFromCli(cli.values);
+
+      if (!existsSync(resolvedPwd)) {
+        console.error(`${c.yellow}Collection path does not exist.${c.reset}`);
+        console.error(`  Received: ${pathArg}`);
+        console.error(`  Resolved: ${resolvedPwd}`);
+        console.error("Provide an existing directory and run 'qmd setup-collection <path> <name>' again.");
+        process.exit(1);
+      }
+
+      if (!statSync(resolvedPwd).isDirectory()) {
+        console.error(`${c.yellow}Collection path is not a directory.${c.reset}`);
+        console.error(`  Received: ${pathArg}`);
+        console.error(`  Resolved: ${resolvedPwd}`);
+        console.error("Choose a directory and run 'qmd setup-collection <path> <name>' again.");
+        process.exit(1);
+      }
+
+      const ignoreValues = cli.values.ignore;
+      const ignorePatterns = (Array.isArray(ignoreValues) ? ignoreValues : [ignoreValues])
+        .filter((v): v is string => typeof v === "string" && v.length > 0);
+
+      await setupCollection(resolvedPwd, nameArg, {
+        globPattern,
+        context: contextFlag ?? positionalContext,
+        ignore: ignorePatterns,
+        exclude: !!cli.values.exclude,
+        embed: {
+          force: !!cli.values.force,
+          maxDocsPerBatch,
+          maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
+          chunkStrategy,
+          maxDurationMs,
+        },
+      });
       break;
     }
 

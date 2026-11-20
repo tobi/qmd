@@ -788,6 +788,59 @@ qmd collection update-cmd notes 'git pull --rebase'
 qmd collection update-cmd notes
 ```
 
+#### Set up a collection in one step
+
+`qmd setup-collection` configures, indexes, and embeds a collection in a single
+command, so ignore patterns and context apply before the first index pass:
+
+```sh
+# The simplest form: path, name, and an optional positional context
+qmd setup-collection . mynotes "Personal notes and ideas"
+
+# Documentation collection: markdown only, keep it out of default searches
+qmd setup-collection . repo-a-documentation \
+  --context "Repository A documentation" \
+  --mask "**/*.{md,mdx,txt}" \
+  --ignore "AGENTS.md" \
+  --ignore "**/AGENTS.md" \
+  --exclude
+```
+
+The collection name is the stable identifier used later by `qmd query "..."`
+`-c <name>` and by MCP `collections` filters, so pick it once and keep it.
+
+Options:
+
+| Option | Purpose |
+|--------|---------|
+| `[context]` / `--context <text>` | Root context stored at `/` for the new collection. Provide one form, not both. |
+| `--mask`, `--glob <glob>` | File pattern, same semantics as `qmd collection add` (default `**/*.md`). |
+| `--ignore <glob>` | Collection ignore pattern; repeatable. Written to `index.yml` and applied to this run's index pass. |
+| `--exclude` | Set `includeByDefault: false` (the collection is excluded from default, unscoped searches; explicit `-c` queries still work). |
+| `--chunk-strategy <auto\|regex>` | Chunking mode for this setup's embed step only. |
+| `-f, --force` | Re-embed the collection's content hashes. |
+| `--max-docs-per-batch <n>`, `--max-batch-mb <n>`, `--timeout <minutes>` | Embed batch/memory/session caps for this run. |
+
+Behavior and caveats:
+
+- Setup embeds **only the new collection**; it never touches other collections'
+  vectors.
+- `--chunk-strategy auto` is per invocation, not a persistent collection
+  setting. Later maintenance of a code collection should use:
+
+  ```sh
+  qmd update
+  qmd embed -c <name> --chunk-strategy auto
+  ```
+
+- `--exclude` affects unscoped searches only; a collection in the shared index
+  can still be queried explicitly from any repository. Exclusion is not an
+  access-control boundary.
+- If embedding fails, the error is reported and the command exits non-zero, but
+  the collection stays configured and indexed; embed it later with
+  `qmd embed -c <name>`.
+- Setup does not infer or configure MCP behavior.
+
 ### Generate Vector Embeddings
 
 ```sh
@@ -905,7 +958,7 @@ collections:
 | `models.rerankOptions` | top-level | TypeSafe-only `revision` and `apiKeyEnv` (default variable name `TYPESAFE_API_KEY`). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
-| `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
+| `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. Set via `qmd setup-collection --ignore` (repeatable), or by hand in YAML. Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
 | `collections.<name>.context` | per-collection | Path-prefix → description map; the most specific (longest) matching prefix wins. Set via `qmd context add`. |
