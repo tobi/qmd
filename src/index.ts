@@ -357,6 +357,9 @@ export interface QMDStore {
   /** Expand a query into typed sub-searches (lex/vec/hyde) for manual control */
   expandQuery(query: string, options?: ExpandQueryOptions): Promise<ExpandedQuery[]>;
 
+  /** Find documents semantically similar to a given document using embedding cosine similarity */
+  findSimilarByEmbedding(pathOrDocid: string, limit?: number, collection?: string): Promise<SearchResult[]>;
+
   // ── Document Retrieval ──────────────────────────────────────────────
 
   /** Get a single document by path or docid */
@@ -816,6 +819,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         { signal: opts?.signal, name: "searchVector" });
     }),
     expandQuery: (q) => admit("expandQuery", async () => internal.expandQuery(q)),
+    findSimilarByEmbedding: (pathOrDocid, limit, collection) => admit("findSimilarByEmbedding", async () =>
+      internal.findSimilarByEmbedding(pathOrDocid, limit, collection)),
     get: (pathOrDocid, opts) => admit("get", async () => internal.findDocument(pathOrDocid, opts)),
     getDocumentBody: (pathOrDocid, opts) => admit("getDocumentBody", async () => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });

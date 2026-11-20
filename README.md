@@ -93,6 +93,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Tools exposed:**
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
+- `similar` — Find documents similar to a given path or docid
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info, including each collection's top metadata keys
 - `metadata` — Discover metadata keys, types, and value counts to filter on
