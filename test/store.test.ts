@@ -875,6 +875,19 @@ describe("findCodeFences", () => {
     const fences = findCodeFences(text);
     expect(fences.length).toBe(0);
   });
+
+  test("finds a code fence at the start of the document", () => {
+    const text = "```js\ncode\n```\nAfter";
+    expect(findCodeFences(text)).toEqual([{ start: 0, end: 14 }]);
+  });
+
+  test("keeps pairing fences after one at the start of the document", () => {
+    const text = "```\na\n```\nprose\n```\nb\n```\nend";
+    expect(findCodeFences(text)).toEqual([
+      { start: 0, end: 9 },
+      { start: 15, end: 25 },
+    ]);
+  });
 });
 
 describe("isInsideCodeFence", () => {
@@ -1107,6 +1120,21 @@ describe("chunkDocumentWithBreakPoints", () => {
     for (let i = 0; i < chunksNew.length; i++) {
       expect(chunksNew[i]!.text).toBe(chunksOriginal[i]!.text);
       expect(chunksNew[i]!.pos).toBe(chunksOriginal[i]!.pos);
+    }
+  });
+
+  test("splits prose at paragraph breaks after a code fence that starts the document", () => {
+    const fence = "```bash\nqmd collection add ~/notes\nqmd embed\n```\n\n";
+    const body = Array.from(
+      { length: 120 },
+      (_, i) => `Paragraph ${i} talks about the indexing pipeline and how documents are split into overlapping chunks for embedding.\n\n`,
+    ).join("");
+
+    const chunks = chunkDocument(fence + body);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks.slice(0, -1)) {
+      expect(chunk.text.trimEnd()).toMatch(/for embedding\.$/);
     }
   });
 
