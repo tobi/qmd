@@ -331,6 +331,16 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
   };
 }
 
+export function resolveEmbedContextSize(): number {
+  const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 2048;
+}
+
+export function resolveRerankContextSize(): number {
+  const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 4096;
+}
+
 // Local model cache directory
 const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
@@ -1146,6 +1156,15 @@ export class LlamaCpp implements LLM {
     return this.jevReranker?.modelName ?? this.rerankModelUri;
   }
 
+  // Health must report the module-captured settings, not infer them from today's environment.
+  get embedContextSize(): number {
+    return LlamaCpp.EMBED_CONTEXT_SIZE;
+  }
+
+  get rerankContextSize(): number {
+    return LlamaCpp.RERANK_CONTEXT_SIZE;
+  }
+
   /**
    * Reset the inactivity timer. Called after each model operation.
    *
@@ -1656,15 +1675,9 @@ export class LlamaCpp implements LLM {
   // was insufficient.  4096 comfortably fits the largest real-world chunks
   // while staying well below the 40 960-token auto size.
   // Override with QMD_RERANK_CONTEXT_SIZE env var if you need more headroom.
-  private static readonly RERANK_CONTEXT_SIZE: number = (() => {
-    const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : 4096;
-  })();
+  private static readonly RERANK_CONTEXT_SIZE: number = resolveRerankContextSize();
 
-  private static readonly EMBED_CONTEXT_SIZE: number = (() => {
-    const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : 2048;
-  })();
+  private static readonly EMBED_CONTEXT_SIZE: number = resolveEmbedContextSize();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length > 0) {
       this.touchActivity();

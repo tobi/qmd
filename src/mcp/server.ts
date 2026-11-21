@@ -27,7 +27,6 @@ import {
   parseMetadataMatch,
   type QMDStore,
   type ExpandedQuery,
-  type IndexStatus,
   type DocumentMetadata,
   type MetadataFilter,
   type MetadataMatch,
@@ -35,13 +34,15 @@ import {
   type ListMetadataResult,
   MetadataBindingBudgetError,
   MetadataOptionError,
+  type HealthStatus,
 } from "../index.js";
 import { getConfigPath, loadConfig } from "../collections.js";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../llm.js";
 import { decideLocalConfigGate, type SensitiveSnapshot } from "../trust.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, readStatusSummary } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { resolveIndexContext, type IndexContext } from "../index-context.js";
 
 // =============================================================================
 // Types for structured content
@@ -93,20 +94,7 @@ function readNumberFields(params: Record<string, unknown>, names: string[]): { v
   return { values };
 }
 
-type StatusResult = {
-  totalDocuments: number;
-  needsEmbedding: number;
-  hasVectorIndex: boolean;
-  collections: {
-    name: string;
-    path: string | null;
-    pattern: string | null;
-    documents: number;
-    lastUpdated: string;
-    metadataKeyCount: number;
-    metadataKeys: MetadataKeyOverview[];
-  }[];
-};
+type StatusResult = HealthStatus;
 
 // =============================================================================
 // Helper functions
@@ -156,9 +144,14 @@ function getPackageVersion(): string {
  * searchable without a tool call.
  */
 async function buildInstructions(store: QMDStore): Promise<string> {
-  // Instructions use index facts, not metadata overviews. Do not rank keys on
-  // initialization or on each stateless HTTP request just to discard them.
-  const status = store.internal.getStatusSummary();
+  // Instructions use index facts only; do not compute metadata overviews or
+  // repair a legacy schema while initializing an MCP connection.
+  let status: ReturnType<typeof readStatusSummary>;
+  try {
+    status = readStatusSummary(store.internal.db, store.internal.llm?.embedModelName ?? DEFAULT_EMBED_MODEL_URI);
+  } catch {
+    return "QMD provides local document search and retrieval. Index health metadata is unavailable; do not assume the index is ready. Use the status tool for diagnostics.";
+  }
   const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
 
@@ -250,14 +243,16 @@ function getInstructions(store: QMDStore): Promise<string> {
 /**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
+ * @internal Exported for native protocol fixtures; not part of the SDK entry point.
  */
-async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promise<McpServer> {
+export async function createMcpServer(store: QMDStore, inflight?: InflightGate, indexName?: string): Promise<McpServer> {
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
   // work to settle before disposing the store/llm underneath it.
   const track = inflight?.track ?? (<T,>(fn: T): T => fn);
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     {
+      capabilities: { experimental: { "qmd/healthMetadata": { schemaVersion: 1 } } },
       instructions: await getInstructions(store),
       // tools/list is static for the process lifetime; resources/read stays
       // uncacheable because the index can change under us.
@@ -666,10 +661,15 @@ Intent-aware lex (C++ performance, not sports):
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
       annotations: { readOnlyHint: true, openWorldHint: false },
+      _meta: { "qmd/healthMetadata": 1 },
       inputSchema: z.object({}),
     },
     track(async () => {
-      const status: StatusResult = await store.getStatus();
+      let currentContext: IndexContext | null = null;
+      try {
+        currentContext = resolveIndexContext(indexName);
+      } catch { /* Unprovable selection must not become an affirmative health answer. */ }
+      const status: StatusResult = await store.getHealthSnapshot(currentContext);
 
       const summary = [
         `QMD Index Status:`,
@@ -806,6 +806,8 @@ Every value reported here can be matched with \`{field: '<metadata-key>', operat
 
 export type McpStartupOptions = {
   dbPath?: string;
+  /** Existing CLI --index selection, used only to revalidate metadata ownership. */
+  indexName?: string;
 };
 
 // =============================================================================
@@ -1658,7 +1660,7 @@ async function createMcpStore(options: McpStartupOptions): Promise<QMDStore> {
   // built-in defaults. Never mutate the loaded config or write it back to YAML.
   if (decision.action !== "run") delete storeConfig.models;
   // MCP exposes no config mutations, so inline config needs no write-through.
-  return createStore({ dbPath, config: storeConfig });
+  return createStore({ dbPath, config: storeConfig, configSourcePath: configPath });
 }
 
 /** Options for the stdio entry, plus who owns the process lifetime. */
@@ -1712,7 +1714,7 @@ export async function startMcpServer(options: McpStdioServerOptions = {}): Promi
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
   // stay 2025-only even on SDK 2.x.
-  const handle = serveStdio(() => createMcpServer(store, inflight));
+  const handle = serveStdio(() => createMcpServer(store, inflight, options.indexName));
 
   // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
   // and the server must shut down instead of orphaning to PID 1 (#751). No
@@ -1850,7 +1852,7 @@ export async function startMcpHttpServer(
   // responses (matches the previous enableJsonResponse: true). Dual-speaks
   // 2025-era traffic statelessly by default (`legacy: "stateless"`).
   const mcpHandler = createMcpHandler(
-    () => createMcpServer(store),
+    () => createMcpServer(store, undefined, options.indexName),
     { responseMode: "json" },
   );
 
