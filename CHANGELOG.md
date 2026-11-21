@@ -5,6 +5,8 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- Treat hyphens inside quoted semantic query text as literal while still
+  rejecting unquoted exclusions.
 
 ## [2.9.0] - 2026-11-17
 
