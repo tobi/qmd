@@ -455,6 +455,20 @@ describe("CLI Init Command", () => {
     expect(configText).toContain("models:");
   });
 
+  test("keeps comments and quoting when filling in models for an existing config (#899)", async () => {
+    const projectDir = join(testDir, "init-project-comments");
+    await mkdir(join(projectDir, ".qmd"), { recursive: true });
+    const configPath = join(projectDir, ".qmd", "index.yml");
+    await writeFile(configPath, "# keep me\nglobal_context: \"demo project\"\ncollections: {}\n");
+
+    const { exitCode } = await runQmd(["init"], { cwd: projectDir });
+    expect(exitCode).toBe(0);
+    const configText = readFileSync(configPath, "utf-8");
+    expect(configText).toContain("# keep me");
+    expect(configText).toContain("global_context: \"demo project\"");
+    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
+  });
+
   test("refuses to initialize in HOME", async () => {
     const fakeHome = join(testDir, "init-home");
     await mkdir(fakeHome, { recursive: true });

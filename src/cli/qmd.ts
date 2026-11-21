@@ -150,6 +150,7 @@ import {
   setConfigIndexName,
   loadConfig,
   updateConfig,
+  updateModelsConfig,
   hasPendingRename,
   withConfigLocked,
   setConfigSource,
@@ -2467,9 +2468,9 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   let models = resolveAndValidateConfiguredModels(config);
   const current = config.models ?? {};
   if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-    updateConfig((latest) => {
+    updateModelsConfig((latest) => {
       models = resolveAndValidateConfiguredModels(latest);
-      latest.models = { ...latest.models, ...models };
+      return models;
     });
   }
   return models;

@@ -677,6 +677,29 @@ function writeFileAtomically(filePath: string, data: string): void {
 export type ConfigMirror = (published: CollectionConfig) => boolean | void;
 
 /**
+ * Set model URIs in a YAML document's `models` map and render it. Only those
+ * slots change, so comments, quoting and key order elsewhere survive.
+ */
+function setModelsInYaml(text: string, models: ModelsConfig): string {
+  const doc = YAML.parseDocument(text);
+  // setIn can't descend into a non-map `models`, e.g. a bare `models:` whose entries
+  // are all commented out (a null scalar). Replace it, carrying its comments over.
+  const current = doc.get("models", true);
+  if (!YAML.isMap(current)) {
+    const map = doc.createNode({});
+    if (YAML.isNode(current)) {
+      map.commentBefore = current.commentBefore;
+      map.comment = current.comment;
+    }
+    doc.set("models", map);
+  }
+  for (const [slot, uri] of Object.entries(models)) {
+    if (uri !== undefined) doc.setIn(["models", slot], uri);
+  }
+  return doc.toString({ indent: 2, lineWidth: 0 });
+}
+
+/**
  * One owner of a collection configuration.
  *
  * Every read and write in this module goes through a scope, so the target of
@@ -798,6 +821,30 @@ export class CollectionConfigScope {
     return this.mutateConfig((config) => {
       mutator(config);
       return { value: config, changed: true };
+    }, undefined, { kind: "any" }).value;
+  }
+
+  /**
+   * Set model URIs while holding this scope's lock, like {@link update}.
+   * `resolve` sees the current on-disk config and returns the slots to set;
+   * the returned models are handed back.
+   *
+   * An existing YAML file is edited as a parsed document and only the `models`
+   * slots change, so its comments, quoting and key order survive (yaml still
+   * normalizes whitespace). Inline targets and a missing file are written the
+   * same way {@link update} writes them.
+   */
+  updateModels(resolve: (config: CollectionConfig) => ModelsConfig): ModelsConfig {
+    const isFile = this.openState().kind === "file";
+    const configPath = this.getConfigPath();
+    return this.mutateConfig((config) => {
+      const models = resolve(config);
+      config.models = { ...config.models, ...models };
+      // mutateConfig holds the lock, so this is the text `config` was parsed from.
+      const yaml = isFile && existsSync(configPath)
+        ? setModelsInYaml(readFileSync(configPath, "utf-8"), models)
+        : undefined;
+      return { value: models, changed: true, yaml };
     }, undefined, { kind: "any" }).value;
   }
 
@@ -1159,11 +1206,12 @@ export class CollectionConfigScope {
 
   /**
    * Publish a whole configuration: serialise first, then replace the file under
-   * the lock with an atomic rename. Reentrant with the mutation lock.
+   * the lock with an atomic rename. Reentrant with the mutation lock. `text`,
+   * when given, is the already rendered document for `config`.
    */
-  private publish(configPath: string, config: CollectionConfig): void {
+  private publish(configPath: string, config: CollectionConfig, text?: string): void {
     try {
-      const yaml = YAML.stringify(config, {
+      const yaml = text ?? YAML.stringify(config, {
         indent: 2,
         lineWidth: 0,  // Don't wrap lines
       });
@@ -1190,7 +1238,8 @@ export class CollectionConfigScope {
    * acquisition in this process.
    *
    * `mutator` returns the value to hand back and whether anything changed; an
-   * unchanged result neither publishes nor touches the file. `mirror` runs
+   * unchanged result neither publishes nor touches the file. It may also return
+   * `yaml`, the rendered file to publish in place of serialising the config. `mirror` runs
    * after the publish (after the in-place edit for inline targets) and still
    * under the same lock, whether or not the configuration changed: the derived
    * store must be able to catch up to a file that already holds the change. Its
@@ -1204,7 +1253,7 @@ export class CollectionConfigScope {
    * publication. See {@link CollectionConfigScope.renameCollection}.
    */
   private mutateConfig<T>(
-    mutator: (config: CollectionConfig) => { value: T; changed: boolean },
+    mutator: (config: CollectionConfig) => { value: T; changed: boolean; yaml?: string },
     mirror?: ConfigMirror,
     intent?: ConfigIntent,
   ): { value: T; changed: boolean; mirrored: boolean } {
@@ -1256,14 +1305,14 @@ export class CollectionConfigScope {
         }
         assertRenameEvidenceIntact(pending, intent);
 
-        const { value, changed } = mutator(config);
+        const { value, changed, yaml } = mutator(config);
         if (intent?.kind === "rename" && mirror !== undefined && changed) {
           // Durable intent first: a crash after the publication but before the
           // index half leaves this behind, and it is the only thing that may
           // authorize moving the old name's index state later.
           writePendingRename(configPath, { from: intent.from, to: intent.to });
         }
-        if (changed) this.publish(configPath, config);
+        if (changed) this.publish(configPath, config, yaml);
 
         const evidence =
           intent?.kind !== "rename"
@@ -1338,6 +1387,15 @@ export function saveConfig(config: CollectionConfig): void {
  */
 export function updateConfig(mutator: (config: CollectionConfig) => void): CollectionConfig {
   return defaultScope.update(mutator);
+}
+
+/**
+ * Fill in model URIs in the default scope's config under its exclusive lock
+ * (see {@link CollectionConfigScope.updateModels}). Comments, quoting and key
+ * order elsewhere in a YAML file survive.
+ */
+export function updateModelsConfig(resolve: (config: CollectionConfig) => ModelsConfig): ModelsConfig {
+  return defaultScope.updateModels(resolve);
 }
 
 /**
