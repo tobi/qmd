@@ -148,6 +148,44 @@ afterEach(() => {
   setDefaultLlamaCpp(null);
 });
 
+describe("LlamaCpp embedding batches", () => {
+  test("keeps a full input in one batch in every pooled context", async () => {
+    const configuredSize = Number.parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
+    const expectedSize = configuredSize > 0 ? configuredSize : 2048;
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const state = internals(llm);
+    const contextOptions: Array<{ contextSize: number; batchSize?: number }> = [];
+    state.embedModel = {
+      ...fakeEmbedModel(() => fakeContext([1], [], "pool")),
+      trainContextSize: expectedSize,
+      createEmbeddingContext: async (options: { contextSize: number; batchSize?: number }) => {
+        contextOptions.push(options);
+        return {
+          ...fakeContext([1], [], "pool"),
+          getEmbeddingFor: async (text: string) => {
+            const batchSize = options.batchSize ?? Math.min(options.contextSize, 512);
+            return { vector: Float32Array.of(Math.min(batchSize, text.length)) };
+          },
+        };
+      },
+    };
+    state.computeParallelism = async () => 2;
+    state.threadsPerContext = async () => 4;
+    // Leave room for special tokens in the synthetic sequence.
+    const input = "x".repeat(Math.max(1, expectedSize - 4));
+
+    try {
+      const result = await llm.embed(input);
+      expect(result?.embedding).toEqual([input.length]);
+      expect(contextOptions).toEqual(
+        Array.from({ length: 2 }, () => ({ contextSize: expectedSize, batchSize: expectedSize, threads: 4 })),
+      );
+    } finally {
+      await llm.dispose();
+    }
+  });
+});
+
 describe("LlamaCpp resource lifecycle", () => {
   test("a withLLMSessionForLlm session blocks that instance's own idle unload", async () => {
     const trace: string[] = [];

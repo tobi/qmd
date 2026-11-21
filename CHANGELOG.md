@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
 - Filling in default model URIs now updates only the `models` block of the
   parsed config, so comments and quoting in a committed `.qmd/index.yml`
   survive (#899).
