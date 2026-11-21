@@ -66,12 +66,15 @@ import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  hasDefaultLlamaCpp,
+  resolveExpandMaxTokens,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_EXPAND_MAX_TOKENS,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -3130,7 +3133,7 @@ export function createStore(dbPath?: string): Store {
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
-    invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
+    invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, store.llm),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, signal?: AbortSignal) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
@@ -5925,13 +5928,21 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
   });
 }
 
+function expansionCacheKey(query: string, model: string, llmOverride?: LlamaCpp): string {
+  const llm = llmOverride ?? (hasDefaultLlamaCpp() ? getDefaultLlamaCpp() : undefined);
+  const maxTokens = llm?.expandMaxTokens ?? resolveExpandMaxTokens(false);
+  // Keep existing cache entries readable for the default generation budget.
+  const inputs = maxTokens === DEFAULT_EXPAND_MAX_TOKENS ? { query, model } : { query, model, maxTokens };
+  return getCacheKey("expandQuery", inputs);
+}
+
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
   // with intent meta-language (see LlamaCpp.expandQuery), and keying the
   // cache by intent multiplied the poisoned entries per (query, intent) pair.
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = expansionCacheKey(query, model, llmOverride);
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -5971,8 +5982,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
  * expansion's sub-queries all came back empty — left in place, the dud entry
  * would replay the same misses on every warm repeat of the query.
  */
-export function deleteExpansionCacheEntry(db: Database, query: string, model: string = DEFAULT_QUERY_MODEL): void {
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+export function deleteExpansionCacheEntry(db: Database, query: string, model: string = DEFAULT_QUERY_MODEL, llmOverride?: LlamaCpp): void {
+  const cacheKey = expansionCacheKey(query, model, llmOverride);
   db.prepare(`DELETE FROM llm_cache WHERE hash = ?`).run(cacheKey);
 }
 

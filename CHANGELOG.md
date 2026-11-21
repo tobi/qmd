@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Allow a custom query expansion token budget with `QMD_EXPAND_MAX_TOKENS`, preserving the default of 600.
+
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
