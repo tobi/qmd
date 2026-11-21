@@ -2818,6 +2818,7 @@ async function embedWithIndexLockHeld(
     type FailedChunk = { chunk: ChunkItem; attempts: number; phase: RetryPhase; reason: string };
     const failuresAreRetryable = !model.startsWith("remote-openai:");
     const failedChunks = new Map<string, FailedChunk>();
+    let preflightFailures = 0;
     let successesSinceRetry = 0;
 
     const failureList = (): EmbedFailure[] =>
@@ -2836,8 +2837,13 @@ async function embedWithIndexLockHeld(
     };
     const retryableChunks = (): FailedChunk[] =>
       [...failedChunks.values()].filter((state) => state.phase === "retryable");
-    const recordFailure = (chunk: ChunkItem, reason: string) => {
+    const recordFailure = (chunk: ChunkItem, reason: string, preflight = false) => {
       const key = chunkKey(chunk);
+      if (preflight) {
+        if (!failedChunks.has(key)) preflightFailures++;
+        failedChunks.set(key, { chunk, attempts: 0, phase: "exhausted", reason });
+        return;
+      }
       const attempts = (failedChunks.get(key)?.attempts ?? 0) + 1;
       const phase: RetryPhase = failuresAreRetryable && attempts < MAX_RETRY_ATTEMPTS ? "retryable" : "exhausted";
       failedChunks.set(key, { chunk, attempts, phase, reason });
@@ -2902,6 +2908,7 @@ async function embedWithIndexLockHeld(
 
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
+      let preflightBytes = 0;
       const expectedChunksByHash = new Map<string, number>();
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
@@ -2918,23 +2925,30 @@ async function embedWithIndexLockHeld(
           session.signal,
         );
 
-        for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
-            hash: doc.hash,
-            path: doc.path,
-            title,
-            text: chunks[seq]!.text,
-            seq,
-            pos: chunks[seq]!.pos,
-            tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
-            expectedTotalChunks: chunks.length,
-          });
+        const docChunks = chunks.map((chunk, seq): ChunkItem => ({
+          hash: doc.hash,
+          path: doc.path,
+          title,
+          text: chunk.text,
+          seq,
+          pos: chunk.pos,
+          tokens: chunk.tokens,
+          bytes: encoder.encode(chunk.text).length,
+          expectedTotalChunks: chunks.length,
+        }));
+        totalChunks += docChunks.length;
+        const inputErrors = failuresAreRetryable ? [] : docChunks.map(chunk =>
+          llm.remoteEmbeddingInputBudgetError(formatDocForEmbedding(chunk.text, title, embedModelUri)));
+        if (inputErrors.some(Boolean)) {
+          for (const chunk of docChunks) {
+            recordFailure(chunk, inputErrors[chunk.seq] ?? "Skipped because another chunk in this document exceeds maxBatchInputBytes", true);
+            preflightBytes += chunk.bytes;
+          }
+        } else {
+          for (const chunk of docChunks) batchChunks.push(chunk);
         }
         expectedChunksByHash.set(doc.hash, chunks.length);
       }
-
-      totalChunks += batchChunks.length;
 
       if (batchChunks.length === 0) {
         bytesProcessed += batchBytes;
@@ -2953,8 +2967,8 @@ async function embedWithIndexLockHeld(
         vectorTableInitialized = true;
       }
 
-      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
-      let batchChunkBytesProcessed = 0;
+      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, preflightBytes);
+      let batchChunkBytesProcessed = preflightBytes;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
         // Abort early if session has been invalidated (e.g. max duration exceeded)
@@ -2966,11 +2980,13 @@ async function embedWithIndexLockHeld(
         }
 
         // Abort early if active error rate is too high (>80% of attempted chunks failed)
-        const processed = chunksEmbedded + activeErrorCount();
-        if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
+        // Local input rejections are reported but do not indicate provider health.
+        const attemptedFailures = activeErrorCount() - preflightFailures;
+        const processed = chunksEmbedded + attemptedFailures;
+        if (processed >= BATCH_SIZE && attemptedFailures > processed * 0.8) {
           const remainingChunks = batchChunks.slice(batchStart);
           for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
-          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
+          console.warn(`⚠ Error rate too high (${attemptedFailures}/${processed}), aborting embedding`);
           break;
         }
 

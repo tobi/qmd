@@ -639,6 +639,8 @@ models:
     dimensions: 768             # optional, integer 1..4096
     revision: "deployment-v1"   # optional, nonempty string, at most 256 characters
     apiKeyEnv: EMBEDDING_KEY    # optional environment variable NAME, not a key
+    maxBatchSize: 25           # optional input count per HTTP request
+    maxBatchInputBytes: 8192   # optional UTF-8 input byte budget
 ```
 
 QMD sends `POST /v1/embeddings` with `model`, `input`, `encoding_format: "float"`,
@@ -646,6 +648,17 @@ and `dimensions` when configured. The base may have a different path; QMD append
 `/embeddings`. HTTP and HTTPS are intentional choices; use HTTPS for credentials
 outside a trusted local connection. URL credentials, query strings, control
 characters, endpoint lists, plaintext-key options, and unknown options are rejected.
+`maxBatchSize` accepts integers from 1 to 64. The store still sends groups of
+up to 32 chunks to the embedder, which may split them into smaller requests.
+`maxBatchInputBytes` accepts positive safe integers and defaults to no additional
+budget. It counts the sum of UTF-8 bytes in the formatted inputs, including
+document titles, and excludes JSON overhead. Tune the budget with your provider.
+Provider token limits depend on its tokenizer. If a single input exceeds the
+byte budget, a direct embedding batch rejects before sending any requests.
+During indexing, QMD reports the oversized chunk and skips its entire document.
+Other documents can proceed. Split requests for one logical batch share a 30-second deadline.
+These settings do not change the embedding space identity.
+
 `apiKeyEnv` accepts `[A-Za-z_][A-Za-z0-9_]{0,127}`. Its value is read at each
 request, never saved in the index or shown in errors. Without it, requests are
 keyless: there is **no** `OPENAI_API_KEY` or other ambient auth fallback. A declared
@@ -901,7 +914,7 @@ collections:
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
 | `models.embed` / `.rerank` / `.generate` | top-level | GGUF URIs overriding the built-in defaults per role. `embed` also accepts one HTTP API-base URI with `#model-id`; see [Remote Embeddings](#remote-embeddings). `rerank` also accepts `typesafe:<model>`; see [TypeSafe System One](#remote-reranking-with-typesafe-system-one). |
-| `models.embedOptions` | top-level | Remote-only `dimensions`, `revision`, and `apiKeyEnv` (environment variable name, never a key). |
+| `models.embedOptions` | top-level | Remote-only `dimensions`, `revision`, `apiKeyEnv`, `maxBatchSize`, and `maxBatchInputBytes`. |
 | `models.rerankOptions` | top-level | TypeSafe-only `revision` and `apiKeyEnv` (default variable name `TYPESAFE_API_KEY`). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |

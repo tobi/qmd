@@ -5,7 +5,7 @@
  */
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-const TIMEOUT_MS = 30_000;
+export const REMOTE_MODEL_TIMEOUT_MS = 30_000;
 
 export async function postModelJson(
   url: string,
@@ -29,14 +29,18 @@ export async function postModelJson(
   const signal = callerSignal
     ? AbortSignal.any([callerSignal, controller.signal])
     : controller.signal;
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), REMOTE_MODEL_TIMEOUT_MS);
   timer.unref();
   let cancelBody: (() => Promise<void>) | undefined;
+  let status: number | undefined;
   try {
     signal.throwIfAborted();
     const response = await fetch(url, { method: "POST", headers, body, signal, redirect: "error" });
     signal.throwIfAborted();
-    if (!response.ok) throw new Error();
+    if (!response.ok) {
+      if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599) status = response.status;
+      throw new Error();
+    }
     const length = response.headers.get("content-length");
     if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_RESPONSE_BYTES)) throw new Error();
     if (!response.body) throw new Error();
@@ -56,7 +60,8 @@ export async function postModelJson(
     signal.throwIfAborted();
     return result;
   } catch {
-    throw new Error(signal.aborted ? "Remote model request aborted" : "Remote model request failed");
+    if (signal.aborted) throw new Error("Remote model request aborted");
+    throw new Error(status === undefined ? "Remote model request failed" : `Remote model request failed (HTTP ${status})`);
   } finally {
     clearTimeout(timer);
     // Cancel unread data on failure, including rejected Content-Length headers.

@@ -65,6 +65,7 @@ describe("explicit remote embeddings", () => {
     const f = fixture();
     // Astral characters straddle the fixed character chunk boundary.
     writeFileSync(join(f.docs, "emoji.md"), "# Galaxy\n" + "🌌".repeat(4000));
+    f.config.models!.embedOptions!.maxBatchSize = 1;
     const store = await open(f);
     expect((await store.update()).indexed).toBe(3);
     const result = await store.embed();
@@ -80,6 +81,7 @@ describe("explicit remote embeddings", () => {
     expect(inputs.some(input => input.startsWith("Nebula\n"))).toBe(true);
     expect(inputs.some(input => input.includes("task: search"))).toBe(false);
     expect(http.mock.calls.every(([, init]) => JSON.parse(String(init?.body)).dimensions === 2)).toBe(true);
+    expect(http.mock.calls.every(([, init]) => JSON.parse(String(init?.body)).input.length === 1)).toBe(true);
     expect(native.getLlama).not.toHaveBeenCalled();
     expect(native.resolveModelFile).not.toHaveBeenCalled();
     expect(native.tokenize).not.toHaveBeenCalled();
@@ -261,6 +263,65 @@ describe("explicit remote embeddings", () => {
     expect(store.internal.db.prepare("SELECT COUNT(*) AS n FROM content_vectors").get()).toEqual({ n: 0 });
   });
 
+  test("oversized chunks do not block dimension probing or writes for later valid chunks", async () => {
+    const http = mockEmbeddings();
+    const f = fixture();
+    f.config.models!.embedOptions!.maxBatchInputBytes = 256;
+    for (let index = 0; index < 33; index++) {
+      writeFileSync(join(f.docs, `a-oversized-${index}.md`), `# Oversized ${index}\n${"large ".repeat(100)}`);
+    }
+    const store = await open(f);
+    await store.update();
+    const result = await store.embed({ maxDocsPerBatch: 32 });
+    expect(result.chunksEmbedded).toBe(2);
+    expect(result.errors).toBe(33);
+    expect(result.failures).toHaveLength(33);
+    expect(result.failures!.every(failure => failure.attempts === 0 && failure.reason.includes("maxBatchInputBytes"))).toBe(true);
+    const requests = http.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).input as string[]);
+    expect(requests.map(input => input.length)).toEqual([1, 2]);
+    expect(requests[0]![0]).toBe(requests[1]![0]);
+    expect(requests.flat().every(text => Buffer.byteLength(text, "utf8") <= 256)).toBe(true);
+    expect(store.internal.db.prepare("SELECT COUNT(*) AS n FROM content_vectors").get()).toEqual({ n: 2 });
+    expect(store.internal.db.prepare(`SELECT COUNT(*) AS n FROM ${VEC_TABLE}`).get()).toEqual({ n: 2 });
+  });
+
+  test("a failed second HTTP request does not write or retry the split store batch", async () => {
+    const http = mockEmbeddings();
+    const f = fixture();
+    f.config.models!.embedOptions!.maxBatchSize = 1;
+    const store = await open(f);
+    await store.update();
+    const vector = () => Response.json({ model: "synthetic", data: [{ index: 0, embedding: [1, 0] }] });
+    http.mockResolvedValueOnce(vector()).mockResolvedValueOnce(vector())
+      .mockResolvedValueOnce(new Response("fake secret\nforged log entry", { status: 429 }));
+    const result = await store.embed();
+    expect(http).toHaveBeenCalledTimes(3);
+    expect(result.chunksEmbedded).toBe(0);
+    expect(result.failures?.map(failure => failure.reason)).toEqual(Array(2).fill("batch failed: Remote model request failed (HTTP 429)"));
+    expect(store.internal.db.prepare("SELECT COUNT(*) AS n FROM content_vectors").get()).toEqual({ n: 0 });
+    expect(store.internal.db.prepare(`SELECT COUNT(*) AS n FROM ${VEC_TABLE}`).get()).toEqual({ n: 0 });
+  });
+
+  test("a mixed-size document sends neither chunk while other documents succeed", async () => {
+    const http = mockEmbeddings();
+    const f = fixture();
+    f.config.models!.embedOptions!.maxBatchInputBytes = 1024;
+    writeFileSync(join(f.docs, "a-mixed.md"), "# Mixed\n" + "x".repeat(3700));
+    const store = await open(f);
+    await store.update();
+    const result = await store.embed();
+    expect(result.chunksEmbedded).toBe(2);
+    expect(result.failures?.map(({ path, seq, attempts, reason }) => ({ path, seq, attempts, reason })))
+      .toEqual([
+        { path: "a-mixed.md", seq: 0, attempts: 0, reason: expect.stringContaining("exceeding maxBatchInputBytes") },
+        { path: "a-mixed.md", seq: 1, attempts: 0, reason: "Skipped because another chunk in this document exceeds maxBatchInputBytes" },
+      ]);
+    const requests = http.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).input as string[]);
+    expect(requests.map(input => input.length)).toEqual([1, 2]);
+    expect(requests.flat().every(text => !text.startsWith("Mixed\n"))).toBe(true);
+    expect(store.internal.db.prepare(`SELECT COUNT(*) AS n FROM ${VEC_TABLE}`).get()).toEqual({ n: 2 });
+  });
+
   test("public embed forwards its caller signal before accepting a late response", async () => {
     forbidNative();
     const f = fixture();
@@ -327,6 +388,10 @@ describe("explicit remote embeddings", () => {
     expect(digest).toBe("c19f165773ffb5de8eb51275cb1b5408d51c78c9b7f0137cd7c31bf28c0ac37f");
     const configured = { ...snapshot, models: { embed: uri, embedOptions: { apiKeyEnv: "KEY_ONE", dimensions: 2, revision: "v1" } } };
     const approved = sensitiveDigest(configured, "/project/.qmd/index.yml", builtins);
+    expect(sensitiveDigest({
+      ...configured,
+      models: { ...configured.models, embedOptions: { ...configured.models.embedOptions, maxBatchSize: 25 } },
+    }, "/project/.qmd/index.yml", builtins)).not.toBe(approved);
     for (const embedOptions of [{ apiKeyEnv: "KEY_TWO", dimensions: 2, revision: "v1" }, { apiKeyEnv: "KEY_ONE", dimensions: 3, revision: "v1" }, { apiKeyEnv: "KEY_ONE", dimensions: 2, revision: "v2" }]) {
       expect(sensitiveDigest({ ...configured, models: { embed: uri, embedOptions } }, "/project/.qmd/index.yml", builtins)).not.toBe(approved);
     }

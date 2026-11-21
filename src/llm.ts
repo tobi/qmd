@@ -1129,6 +1129,10 @@ export class LlamaCpp implements LLM {
     return this.remoteEmbedder?.modelName ?? this.embedModelUri;
   }
 
+  remoteEmbeddingInputBudgetError(text: string): string | undefined {
+    return this.remoteEmbedder?.inputBudgetError(text);
+  }
+
   private async embedRemote(texts: string[], options: EmbedOptions): Promise<EmbeddingResult[]> {
     if (this.lifecycle.isTerminal) throw new Error("LLM has been disposed");
     if (options.model !== undefined && options.model !== this.embedModelName) {
