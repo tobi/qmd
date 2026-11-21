@@ -1560,6 +1560,8 @@ export class LlamaCpp implements LLM {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+            // Pooled embeddings need the full sequence in one evaluation batch.
+            batchSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {

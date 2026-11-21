@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
 - Respect optional remote embedding request limits for input count and UTF-8
   input bytes. Report HTTP failure status without exposing response text (#1120).
 
