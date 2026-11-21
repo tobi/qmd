@@ -137,6 +137,7 @@ import {
   type OutputFormat,
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
+import { resolveIndexContext } from "../index-context.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -148,13 +149,12 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  normalizeConfigIndexName,
   loadConfig,
   updateConfig,
   hasPendingRename,
   withConfigLocked,
   setConfigSource,
-  findLocalConfigPath,
-  getLocalDbPath,
   getConfigPath,
   configExists,
   type CollectionConfig,
@@ -265,18 +265,7 @@ function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string 
 }
 
 function setIndexName(name: string | null): void {
-  let normalizedName = name;
-  // Normalize relative paths to prevent malformed database paths. Windows
-  // absolute paths (C:\..., \\server\share) are already absolute -- skip
-  // pathResolve() for those and sanitize `:` and `\` alongside `/`.
-  if (name) {
-    const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\/.test(name);
-    if (isWindowsAbsolute || /[\\/]/.test(name)) {
-      const absolutePath = isWindowsAbsolute ? name : pathResolve(process.cwd(), name);
-      // Replace path separators with underscores to create a valid filename
-      normalizedName = absolutePath.replace(/[:\\/]+/g, '_').replace(/^_+/, '');
-    }
-  }
+  const normalizedName = name ? normalizeConfigIndexName(name) : null;
   currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
@@ -3506,15 +3495,15 @@ function parseCLI() {
   // Select index name (default: "index"). If no explicit --index is supplied,
   // a project-local .qmd/index.yaml overrides the global config/cache paths.
   const indexName = values.index as string | undefined;
+  const selectedIndex = resolveIndexContext(indexName);
   if (indexName) {
     setIndexName(indexName);
     setConfigIndexName(indexName);
     setConfigSource();
   } else {
-    const localConfigPath = findLocalConfigPath();
-    if (localConfigPath) {
-      setConfigSource({ configPath: localConfigPath });
-      storeDbPathOverride = getLocalDbPath(localConfigPath);
+    if (selectedIndex.local) {
+      setConfigSource({ configPath: selectedIndex.configPath });
+      storeDbPathOverride = selectedIndex.dbPath;
       closeDb();
     } else {
       setConfigSource();
@@ -5368,7 +5357,7 @@ if (isMain) {
         const { startMcpHttpServer, terminateMcpServer } = await import("../mcp/server.js");
         let handle: HttpServerHandle;
         try {
-          handle = await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          handle = await startMcpHttpServer(port, { dbPath: getDbPath(), indexName: cli.values.index as string | undefined, host });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -5395,7 +5384,7 @@ if (isMain) {
         // Default: stdio transport. This is the process-serving entry, so it
         // owns termination: EOF timeouts record the exit code and exit non-zero.
         const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath(), standalone: true });
+        await startMcpServer({ dbPath: getDbPath(), indexName: cli.values.index as string | undefined, standalone: true });
       }
       break;
     }

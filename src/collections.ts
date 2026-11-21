@@ -102,20 +102,18 @@ let currentIndexName: string = "index";
  * Set the current index name for config file lookup
  * Config file will be ~/.config/qmd/{indexName}.yml
  */
-export function setConfigIndexName(name: string): void {
-  // Resolve relative paths to absolute paths and sanitize for use as filename.
-  // Windows absolute paths (C:\..., \\server\share) are already absolute --
-  // skip resolve() for those (POSIX path.resolve doesn't recognize a drive
-  // letter as absolute and would wrongly prefix it with cwd) and sanitize
-  // `:` and `\` alongside `/` so the derived filename is valid on Windows.
+export function normalizeConfigIndexName(name: string): string {
+  // POSIX resolve does not recognize Windows drive or UNC paths.
   const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\/.test(name);
   if (isWindowsAbsolute || /[\\/]/.test(name)) {
     const absolutePath = isWindowsAbsolute ? name : resolve(process.cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    currentIndexName = absolutePath.replace(/[:\\/]+/g, '_').replace(/^_+/, '');
-  } else {
-    currentIndexName = name;
+    return absolutePath.replace(/[:\\/]+/g, "_").replace(/^_+/, "");
   }
+  return name;
+}
+
+export function setConfigIndexName(name: string): void {
+  currentIndexName = normalizeConfigIndexName(name);
 }
 
 export function getConfigDir(): string {
@@ -245,7 +243,6 @@ function sourceStateFrom(options?: ConfigSourceOptions): ConfigSourceState {
  * lock by pathname is what makes pidfile locks racy. A writer that cannot take
  * the lock within its budget throws instead of writing unlocked.
  */
-
 /** Suffix of the sidecar database that serialises writers for one config. */
 const LOCK_SUFFIX = ".lock.sqlite";
 /** Budget for taking the write lock; the critical section is one file publish. */

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- SDK `getHealthSnapshot()` and MCP `status` expose versioned, read-only health metadata bound to the active store, current configuration, and embedding model. The catalog includes empty collections; pending counts are bound to the model they describe. Remote embedding and reranking providers do not advertise an affirmative binding in version 1.
+
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.

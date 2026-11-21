@@ -31,6 +31,8 @@ import {
   listCollections as storeListCollections,
   syncConfigToDb,
   invalidateConfigHash,
+  readStatusSummary,
+  statusWithMetadata,
   getStoreCollections,
   getStoreCollection,
   getStoreGlobalContext,
@@ -77,7 +79,13 @@ import {
 import {
   LlamaCpp,
   withLLMSessionForLlm,
+  resolveModels,
+  resolveEmbedContextSize,
+  resolveRerankContextSize,
+  type ModelResolutionConfig,
 } from "./llm.js";
+import { isRemoteEmbedModel } from "./remote-embed.js";
+import { isJevModel } from "./jev.js";
 export { RemoteEmbedder } from "./remote-embed.js";
 export type { RemoteEmbedOptions } from "./remote-embed.js";
 export { JevReranker } from "./jev.js";
@@ -129,6 +137,12 @@ import {
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  environmentIdentity, HEALTH_ENVIRONMENT_NAMES, indexIdentity, metadataIdentity,
+  type IndexContext,
+} from "./index-context.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -197,6 +211,7 @@ export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
 // the index's embed lock to another process instead of retrying blindly.
 export { EmbedLockBusyError };
 export type { ChunkStrategy } from "./store.js";
+export type { IndexContext } from "./index-context.js";
 
 // Re-export the per-store collection config ownership API. Each store binds one
 // scope; consumers can build scopes directly to mirror the CLI's behavior.
@@ -322,6 +337,45 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config owned by this store (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** @internal Origin of an inline snapshot already checked by the MCP trust gate. Not a write target. */
+  configSourcePath?: string;
+}
+
+/** Versioned opaque bindings; only the catalog/count projection, not raw config, is exposed. */
+export interface HealthMetadata {
+  schemaVersion: 1;
+  environment: { names: readonly string[]; digest: string };
+  active: { index: string; configuration: string; embeddingModel: string };
+  current: { index: string; configuration: string; embeddingModel: string };
+  countModel: string;
+  pendingEmbeddings: number;
+  catalog: {
+    complete: true;
+    entries: { name: string; path: string; documents: number }[];
+  };
+}
+
+export type HealthStatus = IndexStatus & {
+  health: HealthMetadata | { schemaVersion: 1; unavailable: true };
+};
+
+function configurationIdentity(
+  models: Required<ModelResolutionConfig>,
+  collections: NamedCollection[],
+  globalContext: string | undefined,
+  embedContextSize: number,
+  rerankContextSize: number,
+): string {
+  return metadataIdentity([
+    models.embed, models.generate, models.rerank,
+    embedContextSize, rerankContextSize,
+    globalContext || null,
+    collections.map(c => [
+      c.name, resolve(c.path), c.pattern || "**/*.md", c.ignore ?? [],
+      c.includeByDefault !== false,
+      Object.entries(c.context ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+    ] as const).sort((a, b) => a[0].localeCompare(b[0])),
+  ]);
 }
 
 /**
@@ -473,6 +527,9 @@ export interface QMDStore {
 
   /** Get index status (document counts, collections, embedding state) */
   getStatus(): Promise<IndexStatus>;
+
+  /** Fresh, non-mutating model-bound health metadata for an existing store. */
+  getHealthSnapshot(currentContext?: IndexContext | null): Promise<HealthStatus>;
 
   /** Get index health info (stale embeddings, etc.) */
   getIndexHealth(): Promise<IndexHealthInfo>;
@@ -754,6 +811,42 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     if (failures.length > 1) throw new AggregateError(failures, "QMD store teardown failed");
   };
 
+  const sourcePath = options.configPath ?? options.configSourcePath;
+  const activeContext: IndexContext = {
+    dbPath: internal.dbPath,
+    ...(sourcePath !== undefined && { configPath: sourcePath }),
+  };
+  const activeEnvironment = environmentIdentity();
+  let activeIndex: string | null = null;
+  try { activeIndex = indexIdentity(activeContext); } catch { /* No file binding, e.g. :memory:. */ }
+
+  const readCurrentConfiguration = (context: IndexContext): CollectionConfig => {
+    if (context.configPath !== undefined) {
+      if (!existsSync(context.configPath)) throw new Error("Health configuration unavailable");
+      return new CollectionConfigScope({ configPath: context.configPath }).load();
+    }
+    return configScope?.load() ?? db.transaction(() => ({
+      collections: Object.fromEntries(getStoreCollections(db).map(c => [c.name, c])),
+      global_context: getStoreGlobalContext(db),
+    }))();
+  };
+
+  const activeModels = {
+    embed: llm.embedModelName,
+    generate: llm.generateModelName,
+    rerank: llm.rerankModelName,
+  };
+  const configuredModels = resolveModels(configuredConfig?.models);
+  const localModels = (models: CollectionConfig["models"]): Required<ModelResolutionConfig> => {
+    const resolved = resolveModels(models);
+    // Version 1 does not bind remote provider options or trust state.
+    if (isRemoteEmbedModel(resolved.embed) || isJevModel(resolved.rerank) ||
+        models?.embedOptions !== undefined || models?.rerankOptions !== undefined) {
+      throw new Error("Unsupported health model binding");
+    }
+    return resolved;
+  };
+
   const store: QMDStore = {
     internal,
     dbPath: internal.dbPath,
@@ -967,6 +1060,84 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Index Health
     getStatus: () => admit("getStatus", async () => internal.getStatus()),
     getIndexHealth: () => admit("getIndexHealth", async () => internal.getIndexHealth()),
+    getHealthSnapshot: (currentContext = activeContext) => admit("getHealthSnapshot", async () => {
+      const currentEnvironment = environmentIdentity();
+      let before: CollectionConfig | undefined;
+      let beforeIdentity: string | undefined;
+      let currentIndex: string | undefined;
+      try {
+        if (currentContext === null) throw new Error("Health context unavailable");
+        before = readCurrentConfiguration(currentContext);
+        beforeIdentity = configurationIdentity(
+          localModels(before.models),
+          Object.entries(before.collections).map(([name, c]) => ({ ...c, name })),
+          before.global_context,
+          resolveEmbedContextSize(), resolveRerankContextSize(),
+        );
+        currentIndex = indexIdentity(currentContext);
+      } catch { /* Keep the normal status available, but refuse health metadata. */ }
+
+      const snapshot = db.transaction(() => {
+        const collections = getStoreCollections(db);
+        return {
+          status: statusWithMetadata(db, readStatusSummary(db, activeModels.embed, collections)),
+          collections,
+          globalContext: getStoreGlobalContext(db),
+        };
+      })();
+      let health: HealthStatus["health"] = { schemaVersion: 1, unavailable: true };
+      try {
+        if (currentContext === null || !before || beforeIdentity === undefined || !activeIndex || !currentIndex) {
+          throw new Error("Health binding unavailable");
+        }
+        const after = readCurrentConfiguration(currentContext);
+        const currentModels = localModels(after.models);
+        const currentCollections = Object.entries(after.collections).map(([name, c]) => ({ ...c, name }));
+        const afterIdentity = configurationIdentity(
+          currentModels, currentCollections, after.global_context,
+          resolveEmbedContextSize(), resolveRerankContextSize(),
+        );
+        if (
+          internal.llm !== llm ||
+          isRemoteEmbedModel(configuredModels.embed) || isJevModel(configuredModels.rerank) ||
+          beforeIdentity !== afterIdentity ||
+          currentIndex !== indexIdentity(currentContext) ||
+          activeEnvironment !== currentEnvironment ||
+          currentEnvironment !== environmentIdentity()
+        ) throw new Error("Health binding changed");
+
+        const embeddingModel = metadataIdentity(activeModels.embed);
+        const documentCounts = new Map(snapshot.status.collections.map(c => [c.name, c.documents]));
+        health = {
+          schemaVersion: 1,
+          environment: { names: HEALTH_ENVIRONMENT_NAMES, digest: activeEnvironment },
+          active: {
+            index: activeIndex,
+            configuration: configurationIdentity(
+              activeModels, snapshot.collections, snapshot.globalContext,
+              llm.embedContextSize, llm.rerankContextSize,
+            ),
+            embeddingModel,
+          },
+          current: {
+            index: currentIndex,
+            configuration: afterIdentity,
+            embeddingModel: metadataIdentity(currentModels.embed),
+          },
+          countModel: embeddingModel,
+          pendingEmbeddings: snapshot.status.needsEmbedding,
+          catalog: {
+            complete: true,
+            entries: currentCollections.map(c => ({
+              name: metadataIdentity(c.name),
+              path: metadataIdentity(resolve(c.path)),
+              documents: documentCounts.get(c.name) ?? 0,
+            })),
+          },
+        };
+      } catch { /* Never expose configuration, environment values, or model URIs. */ }
+      return { ...snapshot.status, health };
+    }),
 
     // Lifecycle
     close: () => lifecycle.close(teardown),

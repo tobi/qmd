@@ -59,6 +59,7 @@ import type { Database, SQLiteValue } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -707,6 +708,13 @@ export function _resetProductionModeForTesting(): void {
   _productionMode = false;
 }
 
+/** Resolve the index location without opening a database or creating directories. */
+export function resolveDefaultDbPath(indexName: string = "index"): string {
+  if (process.env.INDEX_PATH) return process.env.INDEX_PATH;
+  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  return resolve(cacheDir, "qmd", `${indexName}.sqlite`);
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (process.env.INDEX_PATH) {
@@ -721,10 +729,9 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
-  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
-  const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
-  return resolve(qmdCacheDir, `${indexName}.sqlite`);
+  const dbPath = resolveDefaultDbPath(indexName);
+  try { mkdirSync(dirname(dbPath), { recursive: true }); } catch { }
+  return dbPath;
 }
 
 export function getPwd(): string {
@@ -3422,25 +3429,27 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
 }
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+  return withLazyContentVectorMigration(db, () => countHashesNeedingEmbedding(db, collection, model));
+}
+
+function countHashesNeedingEmbedding(db: Database, collection: string | undefined, model: string): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
-  return withLazyContentVectorMigration(db, () => {
-    const stmt = db.prepare(`
-      SELECT COUNT(DISTINCT d.hash) as count
-      FROM documents d
-      LEFT JOIN (
-        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
-        FROM content_vectors
-        WHERE model = ? AND embed_fingerprint = ?
-        GROUP BY hash, model, embed_fingerprint
-      ) v ON d.hash = v.hash
-      WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-        ${collectionFilter}
-    `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
-    return result.count;
-  });
+  const stmt = db.prepare(`
+    SELECT COUNT(DISTINCT d.hash) as count
+    FROM documents d
+    LEFT JOIN (
+      SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+      FROM content_vectors
+      WHERE model = ? AND embed_fingerprint = ?
+      GROUP BY hash, model, embed_fingerprint
+    ) v ON d.hash = v.hash
+    WHERE d.active = 1
+      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+      ${collectionFilter}
+  `);
+  const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+  return result.count;
 }
 
 export type IndexHealthInfo = {
@@ -6628,7 +6637,10 @@ export function findDocuments(
 // =============================================================================
 
 export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexStatus {
-  const statusSummary = getStatusSummary(db, model);
+  return statusWithMetadata(db, getStatusSummary(db, model));
+}
+
+export function statusWithMetadata(db: Database, statusSummary: IndexStatusSummary): IndexStatus {
   const metadataOverviews = listMetadataCollectionSummaries(db, STATUS_METADATA_KEY_LIMIT);
   return {
     ...statusSummary,
@@ -6640,6 +6652,15 @@ export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): In
 }
 
 export function getStatusSummary(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexStatusSummary {
+  return withLazyContentVectorMigration(db, () => readStatusSummary(db, model));
+}
+
+/** Reads index facts without lazily migrating a legacy vector schema. */
+export function readStatusSummary(
+  db: Database,
+  model: string,
+  storeCollections: NamedCollection[] = getStoreCollections(db),
+): IndexStatusSummary {
   // DB is source of truth for collections — config provides supplementary metadata
   const dbCollections = db.prepare(`
     SELECT
@@ -6652,7 +6673,6 @@ export function getStatusSummary(db: Database, model: string = DEFAULT_EMBED_MOD
   `).all() as { name: string; active_count: number; last_doc_update: string | null }[];
 
   // Build a lookup from store_collections for path/pattern metadata
-  const storeCollections = getStoreCollections(db);
   const configLookup = new Map(storeCollections.map(c => [c.name, { path: c.path, pattern: c.pattern }]));
 
   const collections: IndexStatusSummary["collections"] = dbCollections.map(row => {
@@ -6674,7 +6694,7 @@ export function getStatusSummary(db: Database, model: string = DEFAULT_EMBED_MOD
   });
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
+  const needsEmbedding = countHashesNeedingEmbedding(db, undefined, model);
   const hasVectors = hasVectorIndex(db);
 
   return {
