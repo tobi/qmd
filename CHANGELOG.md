@@ -5,6 +5,7 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- Recognize a code fence on the first line of a document, so chunking no longer treats the rest of the document as code and still splits prose at headings and paragraphs (#1113). Run `qmd embed --force` to re-chunk affected documents.
 
 ## [2.9.0] - 2026-11-17
 

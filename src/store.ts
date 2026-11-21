@@ -281,7 +281,8 @@ export function scanBreakPoints(text: string): BreakPoint[] {
  */
 export function findCodeFences(text: string): CodeFenceRegion[] {
   const regions: CodeFenceRegion[] = [];
-  const fencePattern = /\n```/g;
+  // A fence may also open the document, where there is no preceding newline.
+  const fencePattern = /(?:^|\n)```/g;
   let inFence = false;
   let fenceStart = 0;
 
