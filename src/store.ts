@@ -6013,24 +6013,35 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const callOptions = signal ? { model: cacheModel, signal } : { model: cacheModel };
-    const rerankResult = cacheModel.startsWith("remote-typesafe:")
-      ? await withLLMSessionForLlm(llm, session => session.rerank(rerankQuery, uncachedDocs, callOptions), { signal, name: "rerank" })
-      : await llm.rerank(rerankQuery, uncachedDocs, callOptions);
-    signal?.throwIfAborted();
-
-    // Complete scores arrive before any writes. Index, not file, identifies a
-    // chunk: two different chunks can have the same file name.
-    db.transaction(() => {
-      for (const result of rerankResult.results) {
-        signal?.throwIfAborted();
-        const chunk = uncachedDocs[result.index]!.text;
-        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-        setCachedResult(db, cacheKey, result.score.toString());
-        cachedResults.set(chunk, result.score);
-      }
+    try {
+      const callOptions = signal ? { model: cacheModel, signal } : { model: cacheModel };
+      const rerankResult = cacheModel.startsWith("remote-typesafe:")
+        ? await withLLMSessionForLlm(llm, session => session.rerank(rerankQuery, uncachedDocs, callOptions), { signal, name: "rerank" })
+        : await llm.rerank(rerankQuery, uncachedDocs, callOptions);
       signal?.throwIfAborted();
-    })();
+
+      // Complete scores arrive before any writes. Index, not file, identifies a
+      // chunk: two different chunks can have the same file name.
+      db.transaction(() => {
+        for (const result of rerankResult.results) {
+          signal?.throwIfAborted();
+          const chunk = uncachedDocs[result.index]!.text;
+          const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+          setCachedResult(db, cacheKey, result.score.toString());
+          cachedResults.set(chunk, result.score);
+        }
+        signal?.throwIfAborted();
+      })();
+    } catch (error) {
+      process.stderr.write(
+        `QMD Warning: rerank unavailable (${error instanceof Error ? error.message : String(error)}), using retrieval order.\n`
+      );
+
+      const total = Math.max(1, uncachedDocs.length);
+      uncachedDocs.forEach((doc, index) => {
+        cachedResults.set(doc.text, 1 - index / total);
+      });
+    }
   }
 
   // Return all results sorted by score, including a fully cached call.
