@@ -2241,6 +2241,39 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
+  // Every output format must number snippet lines against the source file, not
+  // against the snippet: `line` is the absolute 1-indexed match line, so a
+  // reader can pass it back to `qmd get ...:from` (see CHANGELOG "absolute
+  // source-file line numbers"). md and xml used to restart at 1, which made the
+  // same hit read at three different numbers across formats.
+  test.each(["md", "xml", "csv", "json"])(
+    "search --%s numbers snippet lines with absolute source line numbers",
+    async (format) => {
+      const { stdout, exitCode } = await runQmd(
+        ["search", "Line 7 is here", "--format", format, "-n", "1", "--line-numbers"],
+        { dbPath: localDbPath, configDir: localConfigDir }
+      );
+      expect(exitCode).toBe(0);
+
+      if (format === "json") {
+        const [result] = JSON.parse(stdout);
+        expect(result.file).toMatch(/test1\.md$/);
+        // The match is on line 7; the snippet shows it from line 6.
+        expect(result.line).toBe(7);
+        expect(result.snippet).toMatch(/^@@ -6,3 @@ \(5 before, 0 after\)$/m);
+        expect(result.snippet).toMatch(/^6: Line 6 is here\.$/m);
+        expect(result.snippet).toMatch(/^7: Line 7 is here\.$/m);
+        return;
+      }
+
+      // The `@@` header takes no prefix; body lines carry their source line.
+      expect(stdout).toMatch(/@@ -6,3 @@ \(5 before, 0 after\)/);
+      expect(stdout).toMatch(/^6: Line 6 is here\.$/m);
+      expect(stdout).toMatch(/^7: Line 7 is here\.$/m);
+      expect(stdout).not.toMatch(/^1: /m);
+    }
+  );
+
   test("search --full-path --json swaps qmd:// for absolute realpath when cwd is unrelated", async () => {
     // Use "/" as cwd so the fixtures path (under tmpdir) is NOT a subpath of $PWD.
     const { stdout, exitCode } = await runQmd(

@@ -24,6 +24,7 @@ import {
   structuredSearch,
   extractSnippet,
   addLineNumbers,
+  addSnippetLineNumbers,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   EmbedLockBusyError,
@@ -191,7 +192,7 @@ export { MetadataBindingBudgetError, MetadataOptionError };
 export type { InternalStore };
 
 // Re-export utility functions and types used by frontends
-export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+export { extractSnippet, addLineNumbers, addSnippetLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
 
 // Re-export the embed busy error so SDK callers can recognize a run that lost
 // the index's embed lock to another process instead of retrying blindly.
