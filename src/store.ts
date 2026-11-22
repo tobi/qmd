@@ -6834,6 +6834,20 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
   return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
 
+/**
+ * Number the body of an `extractSnippet` result against the source file.
+ *
+ * The snippet's first line is the `@@ -start,count @@` header, which describes
+ * the range instead of occupying one, so it keeps no prefix. The body below it
+ * starts at source line `linesBefore + 1`, so every prefix equals the line a
+ * reader can hand back to `get ...:from` — the contract `extractSnippet` has
+ * reported since absolute snippet line numbers were introduced.
+ */
+export function addSnippetLineNumbers(snippet: string, linesBefore: number): string {
+  const [header, ...body] = snippet.split('\n');
+  return [header, ...body.map((line, i) => `${linesBefore + 1 + i}: ${line}`)].join('\n');
+}
+
 // =============================================================================
 // Shared search orchestration
 //

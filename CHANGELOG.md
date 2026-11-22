@@ -5,6 +5,7 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- Number snippet lines against the source file in every output format. `search --md`, `--xml`, and `--json` restarted the prefix at 1, and the MCP/REST `query` and CLI snippet prefixes were off by one against the `@@` header, so one hit read as three different lines. A snippet's `@@` header now takes no prefix and its body starts at its own source line, matching the `line` field and `get ...:from`.
 
 ## [2.9.0] - 2026-11-17
 

@@ -1234,7 +1234,11 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const hit = results.find((r: any) => r.file === "docs/absolute-line-fixture.md");
     expect(hit).toBeDefined();
     expect(hit.line).toBe(301);
-    expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
+    // The `@@` header describes the range instead of occupying a line, so it
+    // takes no prefix; the body below it starts at its source line. The match
+    // is on 301 and the snippet opens one line earlier, at 300.
+    expect(hit.snippet).toMatch(/^@@ -300,4 @@ \(299 before/);
+    expect(hit.snippet).toMatch(/^301: .*UNIQUE_KEYWORD_XYZ/m);
   });
 });
 

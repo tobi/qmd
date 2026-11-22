@@ -21,6 +21,7 @@ import {
   createStore,
   extractSnippet,
   addLineNumbers,
+  addSnippetLineNumbers,
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
   parseMetadataFilter,
@@ -486,7 +487,7 @@ Intent-aware lex (C++ performance, not sports):
         || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
+        const { line, snippet, linesBefore } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -495,7 +496,7 @@ Intent-aware lex (C++ performance, not sports):
           context: r.context,
           ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
           line,
-          snippet: addLineNumbers(snippet, line),
+          snippet: addSnippetLineNumbers(snippet, linesBefore),
         };
       });
 
@@ -2164,7 +2165,7 @@ export async function startMcpHttpServer(
           || searches[0]?.query || "";
 
         const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
+          const { line, snippet, linesBefore } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
           return {
             docid: `#${r.docid}`,
             file: `qmd://${encodeQmdPath(r.displayPath)}`,
@@ -2173,7 +2174,7 @@ export async function startMcpHttpServer(
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
             line,
-            snippet: addLineNumbers(snippet, line),
+            snippet: addSnippetLineNumbers(snippet, linesBefore),
           };
         });
 

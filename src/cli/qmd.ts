@@ -88,6 +88,7 @@ import {
   vectorSearchQuery,
   structuredSearch,
   addLineNumbers,
+  addSnippetLineNumbers,
   type ExpandedQuery,
   type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
@@ -2842,7 +2843,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       let snippet = !opts.full ? snippetInfo.snippet : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
-        if (snippet) snippet = addLineNumbers(snippet);
+        if (snippet) snippet = addSnippetLineNumbers(snippet, snippetInfo.linesBefore);
       }
       // With --full-path, omit docid (the on-disk path is the identifier) —
       // unless the path could not be resolved, in which case it is all the
@@ -2880,7 +2881,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
+      const { line, snippet, linesBefore } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -2951,7 +2952,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
 
       // Snippet with highlighting (diff-style header included)
       const content = opts.full ? row.body : snippet;
-      const displayContent = opts.lineNumbers ? addLineNumbers(content, opts.full ? 1 : line) : content;
+      const displayContent = opts.lineNumbers
+        ? (opts.full ? addLineNumbers(content, 1) : addSnippetLineNumbers(content, linesBefore))
+        : content;
       const highlighted = highlightTerms(displayContent, query);
       console.log(highlighted);
 
@@ -2965,9 +2968,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const visiblePath = displayPathFor(row);
       const heading = row.title || visiblePath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
+      const { snippet, linesBefore } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
+      let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
-        content = addLineNumbers(content);
+        content = opts.full ? addLineNumbers(content, 1) : addSnippetLineNumbers(content, linesBefore);
       }
       const fileLine = `**file:** \`${visiblePath}\`\n`;
       // With --full-path the on-disk path is the identifier; drop the docid
@@ -2981,9 +2985,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
+      const { snippet, linesBefore } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
+      let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
-        content = addLineNumbers(content);
+        content = opts.full ? addLineNumbers(content, 1) : addSnippetLineNumbers(content, linesBefore);
       }
       const docidAttr = showDocid(row) ? ` docid="#${docid}"` : "";
       console.log(`<file${docidAttr} name="${displayPathFor(row)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
@@ -2995,10 +3000,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     // (multi-get's CSV already emits the docid column unconditionally.)
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
+      const { line, snippet, linesBefore } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
-        content = addLineNumbers(content, opts.full ? 1 : line);
+        content = opts.full ? addLineNumbers(content, 1) : addSnippetLineNumbers(content, linesBefore);
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const snippetText = content || "";
