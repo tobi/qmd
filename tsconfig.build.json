@@ -2,6 +2,10 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
+    "allowImportingTsExtensions": false,
+    // The published build runs on Node.js and Bun alike: check it against Node.js's types only
+    "types": ["node"],
+    "rootDir": "src",
     "outDir": "dist",
     "declaration": true,
     "noImplicitAny": true

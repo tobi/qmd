@@ -2,6 +2,7 @@
   "compilerOptions": {
     // Environment setup & latest features
     "lib": ["ESNext"],
+    "types": ["node", "bun"],
     "target": "ESNext",
     "module": "nodenext",
     "moduleDetection": "force",
@@ -12,6 +13,9 @@
     "moduleResolution": "nodenext",
     "verbatimModuleSyntax": true,
     "noEmit": true,
+    // Tests and their worker scripts run as TypeScript (vitest, tsx, bun) and
+    // import sources by their .ts paths
+    "allowImportingTsExtensions": true,
 
     // Best practices
     "strict": true,
@@ -24,5 +28,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // Vendored as-is (see its VENDOR.txt); oxlint loads it
+  "exclude": ["node_modules", "dist", "tools/oxlint/anti-slop"]
 }

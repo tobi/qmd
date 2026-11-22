@@ -17,6 +17,7 @@ import {
   LlamaLogLevel,
   type Llama,
   type LlamaModel,
+  type LlamaRankingContext,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
@@ -109,12 +110,13 @@ async function benchmarkConfig(
 
   // Create contexts. On CPU, split threads evenly across contexts.
   const cpuThreads = !llama.gpu ? Math.floor(llama.cpuMathCores / parallelism) : 0;
-  const contexts = [];
+  const contexts: LlamaRankingContext[] = [];
   for (let i = 0; i < parallelism; i++) {
     try {
+      // (no flashAttention here: LlamaRankingContextOptions has none, and node-llama-cpp
+      // ignored it; ranking contexts use the model's defaultContextFlashAttention)
       contexts.push(await model.createRankingContext({
         contextSize: CONTEXT_SIZE,
-        flashAttention: flash,
         ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
       }));
     } catch {

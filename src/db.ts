@@ -62,15 +62,17 @@ if (isBun) {
   _sqliteVecLoad = (db: LoadableSqliteDatabase) => sqliteVec.load(db as Parameters<typeof sqliteVec.load>[0]);
 }
 
-function isBusyError(err: unknown): boolean {
+/** True for SQLite's lock-contention errors (`SQLITE_BUSY*`, "database is locked"). */
+export function isBusyError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
-  const code = (err as { code?: unknown }).code;
+  const code = "code" in err ? err.code : undefined;
   if (code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT") return true;
-  const message = (err as { message?: unknown }).message;
+  const message = "message" in err ? err.message : undefined;
   return typeof message === "string" && /database is locked|database is busy|SQLITE_BUSY/i.test(message);
 }
 
-function sleepSync(ms: number): void {
+/** Synchronous sleep, for callers that must retry without yielding the event loop. */
+export function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
@@ -127,6 +129,8 @@ export function openDatabase(path: string): Database {
  * Common subset of the Database interface used throughout QMD.
  */
 export interface Database {
+  /** Both drivers expose it; true while a transaction or savepoint is open. */
+  readonly inTransaction: boolean;
   exec(sql: string): void;
   prepare(sql: string): Statement;
   loadExtension(path: string): void;

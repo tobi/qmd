@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
-  version: "2.2.0"
+  version: "2.3.0"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
@@ -199,6 +199,73 @@ qmd query "merchant support product reality" -c concepts -c sources -n 10
 
 Omit `-c` to search everything.
 
+## Filter by metadata
+
+Documents can carry typed metadata in a `qmd.metadata` frontmatter block
+(strings, numbers, booleans, or flat arrays). `search`, `vsearch`, and `query`
+accept `--filter` with a recursive JSON AST, and every returned result satisfies
+it. Add a metadata filter when it expresses a constraint the user intends, not
+by default, and check coverage first: a condition on a key's value only sees
+documents that declare that key, and discovery (below) shows how many do.
+
+```bash
+qmd search "authentication" --filter '{"field":"status","operator":"eq","value":"published"}'
+qmd query "dependency injection" --filter '{"operator":"and","operands":[{"field":"topics","operator":"all","value":["typescript"]},{"field":"status","operator":"nin","value":["draft","archived"]}]}'
+```
+
+Nodes are discriminated by `operator`: groups `and`/`or` take `operands`, `not`
+takes one `operand`, and conditions take `field` + `value` with operators
+`eq`/`ne`/`gt`/`gte`/`lt`/`lte` (comparison), `in`/`nin`/`all` (membership),
+`contains`/`prefix`/`suffix` (text), `type` (the value is a `string`, `number`,
+or `boolean`), or `exists` (presence). Matching is typed and exact; missing keys
+do not match `ne`/`nin` (add an `exists: false` branch in an `or` group to
+include them). Conditions with a string value may add `"caseInsensitive": true`,
+which folds ASCII letters. The MCP `query` tool accepts the same AST as a
+`filter` object. JSON output includes each result's `metadata`.
+
+## Discover metadata before filtering
+
+Do not guess keys or values. `qmd collection show <name>` lists the top keys
+with types and a value preview, and `qmd collection metadata` drills in. Same
+metadata, different unit: `--filter` narrows documents (which are counted),
+`--match` narrows the metadata itself (which entries are reported). Both take
+the predicate AST above. In a match, a condition's `field` is `"key"` (the
+entry's key name) or `"value"` (its value), and every operator applies except
+`exists` and `all`:
+
+```bash
+qmd collection metadata notes                                                                # top keys, top values
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}'       # one key in depth
+qmd collection metadata notes --match '{"field":"value","operator":"eq","value":"docs-team"}'  # which keys hold this value
+qmd collection metadata notes --match '{"operator":"and","operands":[{"field":"key","operator":"eq","value":"priority"},{"field":"value","operator":"gte","value":3}]}'
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}' --filter '{"field":"status","operator":"eq","value":"published"}'
+```
+
+The last form shows what a filter leaves behind before you commit to it in a
+query. Read the output like this:
+
+- **The header is the decision.** `topics  string[]  388 of 480 documents
+  1,204 distinct` gives coverage and cardinality. With `--filter`, a
+  `filter: 312 of 480 documents` line opens the output and every count is out
+  of those 312. Counts are documents, not values.
+- **Quotes mark a string that reads like something else.** `"42"` is a string,
+  `42` a number, `""` is empty. Paste a quoted value into a filter as the JSON
+  string it is.
+- **Footers mean windowed.** `N more values` or `N more keys` means the list
+  was cut. Page with `--value-offset`/`--key-offset` or raise
+  `--value-limit`/`--key-limit` rather than assuming the rest.
+- **Numbers print `min`, `median`, `max`**, enough to write a `gt`/`lt`
+  threshold in one call.
+- **`number | string` means documents disagree on type.** Each type reports its
+  own document count. Filter by the type that covers the documents you want.
+
+Every value shown can be matched with `eq` under the same collection scope.
+
+Over MCP, call the `metadata` tool (same options, `collections` as an array)
+and read `totalKeys`, `remainingKeys`, `remainingValues`, and `range` from the
+structured result. Page keys with `keyOffset` and values with `valueOffset`.
+The `status` tool lists each collection's most covered keys, so check it first.
+
 ## MCP Tool: `query`
 
 When using the MCP server, prefer structured searches:
@@ -283,6 +350,9 @@ server configuration.
   have. You expand the query; the model just ranks.
 - **Do not overuse semantic search.** If you know exact titles or terms, BM25 is
   faster and often better.
+- **Do not filter blind.** Run `qmd collection metadata` first and read the
+  coverage. A key declared by 388 of 480 documents leaves 92 that no value
+  condition on it can reach; only `exists: false` selects them.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
   `qmd embed` change local state and can be expensive.
 - **Model-backed commands can be environment-sensitive.** If `qmd query`,

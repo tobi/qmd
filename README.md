@@ -94,7 +94,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
-- `status` — Index health and collection info
+- `status` — Index health and collection info, including each collection's top metadata keys
+- `metadata` — Discover metadata keys, types, and value counts to filter on
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -145,13 +146,19 @@ qmd mcp stop                      # stop via PID file
 qmd status                        # shows "MCP: running (PID ...)" when active
 ```
 
+MCP shutdown allows active requests five seconds to finish. After that it
+cancels them; a standalone server exits nonzero if work remains. Embedded
+callers receive a timeout error while resource cleanup continues safely.
+An external supervisor is still needed if native code blocks the event loop.
+
 The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
-- `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
-- `POST /query` (alias `/search`) — structured search without the MCP protocol
+- `POST /mcp` — MCP Streamable HTTP (stateless JSON and SSE responses)
+- `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
+- `POST /metadata` — metadata discovery without the MCP protocol. Same body as the `metadata` tool (invalid filters return `400`); see [Metadata Discovery](#metadata-discovery)
 - `GET /health` — liveness check with uptime
 
 
@@ -187,6 +194,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 |------|-----------|------|-------|
 | `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. **Required.** First gets 2x weight. |
 | `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
+| `query` | `filter` | object | Metadata filter (recursive `operator`-discriminated JSON AST; see [Metadata Filtering](#metadata-filtering)) |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
@@ -200,6 +208,15 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `multi_get` | `maxBytes` | number | Skip files larger than N (default 10240) |
 | `multi_get` | `maxLines` | number | Limit lines per file |
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
+| `metadata` | `collections` | string[] | Restrict discovery to collection names (default: the collections `query` searches) |
+| `metadata` | `match` | object | Report only metadata entries matching this condition (same AST as `filter`, with `field` naming the entry's `key` or `value`) |
+| `metadata` | `filter` | object | Count only documents matching this filter (same AST as `query`) |
+| `metadata` | `keyLimit` | number | Keys reported (default 50). `totalKeys` and `remainingKeys` describe the rest |
+| `metadata` | `keyOffset` | number | Keys skipped before the window, in report order (default 0) |
+| `metadata` | `valueLimit` | number | Values reported per key and type (default 10). `remainingValues` reports the rest |
+| `metadata` | `valueOffset` | number | Values skipped per key and type before the window, in `sort` order (default 0) |
+| `metadata` | `sort` | string | `count` (default) or `value` |
+| `metadata` | `minCount` | number | Hide values held by fewer documents (default 1) |
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return
@@ -234,6 +251,15 @@ console.log(results.map(r => `${r.title} (${Math.round(r.score * 100)}%)`))
 
 await store.close()
 ```
+
+Each store owns its configuration source. `close()` rejects new SDK operations
+and waits for admitted operations before closing the database; a stuck operation
+can therefore delay shutdown indefinitely. Access through `store.internal`
+bypasses this lifecycle.
+
+SDK `embed()` and the CLI share an exclusive per-index lock. A concurrent SDK
+call rejects with `EmbedLockBusyError`; the CLI reports that embedding is busy.
+Older QMD versions do not use this lock and must not embed concurrently.
 
 #### Store Creation
 
@@ -292,6 +318,20 @@ const results3 = await store.search({
 
 // Skip reranking for faster results
 const fast = await store.search({ query: "auth", rerank: false })
+
+// Metadata filter — every returned result satisfies it (also available on
+// searchLex() and searchVector()); results expose indexed metadata via
+// r.metadata. See "Metadata Filtering" for the full grammar.
+const published = await store.search({
+  query: "authentication flow",
+  filter: {
+    operator: "and",
+    operands: [
+      { field: "topics", operator: "all", value: ["typescript"] },
+      { field: "status", operator: "ne", value: "draft" },
+    ],
+  },
+})
 ```
 
 For direct backend access:
@@ -374,6 +414,8 @@ await store.setGlobalContext(undefined)  // clear global
 ```
 
 #### Indexing
+
+[Collection processors](docs/PROCESSORS.md) optionally turn each source file into multiple stable-key Markdown index documents, through explicit SDK callbacks or trusted CLI commands.
 
 ```typescript
 // Re-index collections by scanning the filesystem
@@ -585,6 +627,104 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Remote Embeddings
+
+Local GGUF defaults are unchanged. To explicitly use an OpenAI-compatible
+embedding server instead, set one API-base URI with a `#model-id` fragment:
+
+```yaml
+models:
+  embed: "http://localhost:1234/v1#my-embedding-model"
+  embedOptions:
+    dimensions: 768             # optional, integer 1..4096
+    revision: "deployment-v1"   # optional, nonempty string, at most 256 characters
+    apiKeyEnv: EMBEDDING_KEY    # optional environment variable NAME, not a key
+```
+
+QMD sends `POST /v1/embeddings` with `model`, `input`, `encoding_format: "float"`,
+and `dimensions` when configured. The base may have a different path; QMD appends
+`/embeddings`. HTTP and HTTPS are intentional choices; use HTTPS for credentials
+outside a trusted local connection. URL credentials, query strings, control
+characters, endpoint lists, plaintext-key options, and unknown options are rejected.
+`apiKeyEnv` accepts `[A-Za-z_][A-Za-z0-9_]{0,127}`. Its value is read at each
+request, never saved in the index or shown in errors. Without it, requests are
+keyless: there is **no** `OPENAI_API_KEY` or other ambient auth fallback. A declared
+but missing/invalid credential fails before HTTP. Changing these options, including
+the credential variable name, re-arms a project-local config's `qmd trust` approval.
+
+```sh
+qmd update
+qmd embed
+# Embedding-only retrieval: no local expansion or reranking model needed.
+qmd query 'vec: your semantic query' --no-rerank
+```
+
+`qmd search` remains lexical. Ordinary free-text `query` and `vsearch` still use
+local query expansion. Reranking uses its separately selected model (local by
+default; see [TypeSafe System One](#remote-reranking-with-typesafe-system-one)).
+Remote embeddings do not replace those models. `qmd pull` skips the remote embedding role but still pulls
+local generation/reranking models. `status` and `doctor` describe remote embedding
+as configured, **not verified**; they do not probe the server or download/load an
+embedding model. Doctor also skips its native device probe in this mode.
+
+The SDK uses the same config, captured per store (later input mutation does not
+change that store's embedding selection):
+
+```typescript
+import { createStore, RemoteEmbedder } from '@tobilu/qmd'
+
+const controller = new AbortController()
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: {
+    collections: { docs: { path: '/path/to/docs', pattern: '**/*.md' } },
+    models: {
+      embed: 'http://localhost:1234/v1#my-embedding-model',
+      embedOptions: { dimensions: 768, revision: 'deployment-v1', apiKeyEnv: 'EMBEDDING_KEY' }
+    }
+  }
+})
+await store.update()
+await store.embed({ signal: controller.signal })
+const results = await store.searchVector('your semantic query', { signal: controller.signal })
+await store.close()
+
+// Standalone embedding client; pass already-formatted text.
+const client = new RemoteEmbedder('http://localhost:1234/v1#my-embedding-model')
+const vectors = await client.embedBatch(['document text'], controller.signal)
+```
+
+Remote input formatting is pinned: raw queries, and `title + "\n" + document`
+when a title exists. Documents use the existing surrogate-safe character chunker
+(3600 UTF-16 units, 540 overlap), never a local tokenizer or token truncation pass.
+The opaque `remote-openai:<sha256>` space identity includes the canonical endpoint,
+model ID, requested dimensions (or server-default marker), revision, and format/
+chunk version. Two hosts advertising the same model ID are **different spaces**.
+Credentials are excluded: change `revision` when an account or deployment changes
+embedding semantics. Re-embed after changing spaces; use `qmd embed --force` when
+switching chunk formats or dimensions. Dimensions never automatically clear a table.
+QMD has one vector table and content-scoped chunk metadata, not independent model
+indexes per collection; a shared content hash is embedded for all its collections.
+
+Vector searches enforce a remote embedding boundary in their selected collection/
+metadata scope before requesting a query embedding: a remote query requires exact
+model/fingerprint matches on every selected vector row; a local query refuses
+selected remote vector rows before loading a local model. Existing local-to-local
+behavior, including legacy empty fingerprints and differing local model labels,
+is unchanged. After HTTP, QMD rechecks the same boundary and reads KNN matches,
+documents, metadata and bodies in one SQLite read snapshot. No read transaction
+is held over the network.
+
+Each HTTP call is one attempt (no redirects, retries, fallback or normalization),
+with a 30-second timeout combined with the caller/session signal. Limits: 64 inputs,
+64 KiB UTF-8 per input, 2 MiB encoded request, 8 MiB streamed response, 4096 dimensions.
+Oversized input is refused, never truncated. Responses must be valid UTF-8 JSON,
+echo the exact model
+and contain exactly one uniquely indexed, uniformly dimensioned, finite nonzero
+Float32-representable vector per input. An invalid/partial batch returns no vectors;
+indexing does not rescue it with individual remote calls. Errors never include
+response bodies, credentials, headers or provider error messages.
+
 ## Installation
 
 ```sh
@@ -598,9 +738,11 @@ bun install -g @tobilu/qmd
 ```sh
 git clone https://github.com/tobi/qmd
 cd qmd
-npm install
-npm link
+bun install
+bun link
 ```
+
+On Linux, `nix develop` supplies the C++ runtime needed by Bun's llama backend.
 
 ## Usage
 
@@ -629,8 +771,13 @@ qmd collection rename myproject my-project
 qmd ls notes
 qmd ls notes/subfolder
 
-# Show collection details (path, glob mask, include status, context count)
+# Show collection details (path, glob mask, include status, context count, top metadata keys)
 qmd collection show notes
+
+# Discover metadata keys, types, and value counts (see Metadata Discovery)
+qmd collection metadata notes
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}'
+qmd collection metadata notes --match '{"field":"value","operator":"eq","value":"docs-team"}'
 
 # Include or exclude a collection from default (unscoped) queries
 qmd collection include notes
@@ -712,6 +859,10 @@ A **project-local** index created with `qmd init` lives at `.qmd/index.yml`
 (`.qmd/index.yaml` is also accepted) alongside a project-local `index.sqlite`,
 so config and index stay inside the project instead of `~/.config` / `~/.cache`.
 
+Keep generated `*.lock.sqlite` and `*.pending-rename.json` sidecars out of
+version control. If a collection rename is interrupted, leave its pending
+marker in place and repeat the same rename to finish index recovery.
+
 ```yaml
 # ~/.config/qmd/index.yml
 
@@ -749,7 +900,9 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.rerank` / `.generate` | top-level | GGUF URIs overriding the built-in defaults per role. `embed` also accepts one HTTP API-base URI with `#model-id`; see [Remote Embeddings](#remote-embeddings). `rerank` also accepts `typesafe:<model>`; see [TypeSafe System One](#remote-reranking-with-typesafe-system-one). |
+| `models.embedOptions` | top-level | Remote-only `dimensions`, `revision`, and `apiKeyEnv` (environment variable name, never a key). |
+| `models.rerankOptions` | top-level | TypeSafe-only `revision` and `apiKeyEnv` (default variable name `TYPESAFE_API_KEY`). |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
@@ -860,6 +1013,7 @@ and `deep-search` (→ `query`).
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)
+--filter <json>    # Metadata filter (recursive JSON AST; see Metadata Filtering)
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
 --no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
@@ -902,6 +1056,258 @@ explicitly with `-c`.
 > **Note:** With multiple `-c` flags, results come from a global top-K pool and are
 > then filtered. If one collection dominates the rankings, matches from smaller
 > collections may not appear at the default limit — raise `-n` or use `--all`.
+
+### Metadata Filtering
+
+Documents can opt into typed metadata through a namespaced frontmatter block. A document without `qmd.metadata` behaves exactly as before, and the frontmatter stays ordinary searchable content (no chunking, embedding, or line-number changes):
+
+```markdown
+---
+qmd:
+  metadata:
+    topics:
+      - typescript
+      - programming
+    status: published
+    priority: 3
+    reviewed: true
+---
+
+# Document body starts here
+```
+
+Supported values are strings, numbers, booleans, and flat homogeneous arrays of one of those. Nested objects, nulls, empty arrays, and mixed-type arrays are rejected (the document still indexes; it is excluded from filtered search until corrected). Metadata keys are user-defined data — `tags`, `topics`, and `labels` are all ordinary keys with no special semantics.
+
+Every search surface (CLI, SDK, MCP, HTTP) accepts the same recursive filter, a JSON AST discriminated by `operator`. A condition is a predicate over one field of the document's metadata: `field` names the metadata key, `operator` says how to compare, and `value` is what to compare against:
+
+```sh
+# One condition
+qmd search "authentication" \
+  --filter '{"field":"status","operator":"eq","value":"published"}'
+
+# Composed conditions — works with search, vsearch, and query
+qmd query "dependency injection" --filter '{
+  "operator": "and",
+  "operands": [
+    { "field": "topics", "operator": "all", "value": ["typescript", "programming"] },
+    { "field": "status", "operator": "nin", "value": ["draft", "archived"] },
+    { "operator": "or", "operands": [
+      { "field": "priority", "operator": "gte", "value": 3 },
+      { "field": "reviewed", "operator": "eq", "value": true }
+    ] },
+    { "field": "topics", "operator": "prefix", "value": "sql", "caseInsensitive": true },
+    { "operator": "not", "operand": { "field": "audience", "operator": "eq", "value": "internal" } }
+  ]
+}'
+```
+
+| Node | Shape |
+|------|-------|
+| Logical group | `{ "operator": "and" \| "or", "operands": […] }` |
+| Negation | `{ "operator": "not", "operand": {…} }` |
+| Comparison | `{ "field", "operator": "eq" \| "ne" \| "gt" \| "gte" \| "lt" \| "lte", "value" }` |
+| Membership | `{ "field", "operator": "in" \| "nin" \| "all", "value": […] }` |
+| Text | `{ "field", "operator": "contains" \| "prefix" \| "suffix", "value": "…" }` |
+| Type | `{ "field", "operator": "type", "value": "string" \| "number" \| "boolean" }` |
+| Presence | `{ "field", "operator": "exists", "value": true \| false }` |
+
+Any condition whose value is a string or an array of strings may add `"caseInsensitive": true`.
+
+Semantics:
+
+- Matching is typed and exact — no string/number/boolean coercion, and a type mismatch never matches (including `ne` and `nin`). Text operators match string values only. `type` matches the stored type of a key's values, which is how a filter reaches one side of a key whose documents disagree on type.
+- Array-valued metadata is a set: a condition matches when any element satisfies it, `all` requires every filter value to be present, and `ne`/`nin` require that no element equals the operand (with at least one element of the operand's type present).
+- Missing keys do not match `ne`/`nin`; combine with `{ "operator": "exists", "value": false }` in an `or` group to include them.
+- Matching is case-sensitive unless a condition sets `caseInsensitive`, which folds ASCII letters on both sides. Non-ASCII letters compare exactly.
+- Multiple conditions require an explicit `and` group — there is no implicit AND, and no `$`-prefixed shorthand.
+
+Guarantees and limits:
+
+- Every returned result satisfies the filter, before RRF fusion and reranking.
+- Highly selective filters can return fewer than `limit` results. Lexical search filters a bounded over-fetch window; vector search scans the filter-eligible set exactly when it holds at most 20,000 chunk vectors, and above that over-fetches and post-filters.
+- Filtered search only considers documents whose metadata has been extracted (run `qmd update` after upgrading; `qmd status` shows the pending count).
+
+JSON output (`--format json`), the SDK, MCP structured results, and the HTTP endpoints include each result's indexed metadata.
+
+### Metadata Discovery
+
+Filtering is only useful if you know what to filter on. Discovery reports the metadata keys, types, and value counts already in the index, so a filter can be written from what is indexed instead of guessed. It reads the same tables filtering reads: no re-indexing, and every value it reports is one an `eq` filter can match.
+
+The command is one sentence: show metadata matching X for documents filtered by Y. `--filter` narrows **documents** by their metadata (same AST as search) and decides which are counted. `--match` narrows **the metadata itself** and decides which entries are reported. It takes the same AST, evaluated against each metadata entry instead of each document: a condition's `field` is `"key"` (the entry's key name) or `"value"` (its value). Every operator applies, including `type`, the text operators, `caseInsensitive`, and `and`/`or`/`not`. Only `exists` and `all` are rejected, as they have no meaning for a single entry.
+
+| `--match` | Question answered |
+|-----------|-------------------|
+| | Which keys exist, with a window of values each |
+| `{"field":"key","operator":"eq","value":"topics"}` | Everything about one key |
+| `{"field":"key","operator":"prefix","value":"mem-"}` | A family of keys |
+| `{"field":"key","operator":"in","value":["tags","topics","labels"]}` | Which of these key names exist |
+| `{"field":"value","operator":"eq","value":"docs-team"}` | Which keys hold this value |
+| `{"field":"value","operator":"prefix","value":"2025-"}` | Which keys hold values shaped like this |
+| `{"field":"value","operator":"type","value":"boolean"}` | Which keys hold booleans |
+| `and` of `key eq priority` and `value gte 3` | Values of one key above a threshold |
+| `and` of `key eq priority` and `value type number` | The numeric side of a key whose documents disagree on type |
+
+Start wide and narrow:
+
+```sh
+# Which keys does this collection use? (`qmd collection show notes` previews the top five)
+qmd collection metadata notes
+
+# Everything about one key: coverage, distinct count, top values
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}'
+
+# Reverse lookup: which keys hold this value
+qmd collection metadata notes --match '{"field":"value","operator":"eq","value":"docs-team"}'
+
+# Values of one key matching a pattern
+qmd collection metadata notes --match '{
+  "operator": "and",
+  "operands": [
+    { "field": "key", "operator": "eq", "value": "topics" },
+    { "field": "value", "operator": "prefix", "value": "sql" }
+  ]
+}'
+
+# What remains after a filter, before committing to it in a query
+qmd collection metadata notes \
+  --match '{"field":"key","operator":"eq","value":"topics"}' \
+  --filter '{"field":"status","operator":"eq","value":"published"}'
+
+# Then search with the filter you just validated
+qmd query "dependency injection" -c notes --filter '{
+  "operator": "and",
+  "operands": [
+    { "field": "status", "operator": "eq", "value": "published" },
+    { "field": "topics", "operator": "all", "value": ["typescript"] }
+  ]
+}'
+```
+
+The drill-down prints one block per key, in coverage order:
+
+```sh
+qmd collection metadata notes
+```
+
+```
+topics  string[]  388 of 480 documents  1,204 distinct
+  typescript    140
+  sqlite         92
+  search         77
+  architecture   61
+  sqlite-vec     44
+  mcp            39
+  embeddings     35
+  agents         31
+  cli            28
+  testing        26
+1,194 more values, use --value-limit <n>, --value-offset <n>, or --all-values
+
+priority  number  205 of 480 documents  5 distinct
+  min 1  median 3  max 5
+  1 (12)  2 (40)  3 (88)  4 (50)  5 (15)
+
+reviewed  boolean  480 of 480 documents
+  true 61  false 419
+```
+
+With `--filter`, the output opens with a `filter:` line stating how many documents pass, and every coverage count is measured against that population rather than the whole collection — the numbers a filtered search would see:
+
+```sh
+qmd collection metadata notes \
+  --match '{"field":"key","operator":"eq","value":"topics"}' \
+  --filter '{"field":"status","operator":"eq","value":"published"}' \
+  --value-limit 5
+```
+
+```
+filter: 312 of 480 documents
+
+topics  string[]  260 of 312 documents  811 distinct
+  typescript    104
+  sqlite         70
+  search         58
+  architecture   40
+  mcp            31
+806 more values, use --value-limit <n>, --value-offset <n>, or --all-values
+```
+
+Two windows page the key and value lists. Each windowed list ends with the exact remainder and the flags that reach it:
+
+```sh
+--key-limit <n>      # Keys reported, in coverage order (default 50)
+--key-offset <n>     # Keys skipped before the window
+--all-keys           # Remove the key window
+--value-limit <n>    # Values reported per key and type (default 10)
+--value-offset <n>   # Values skipped per key and type, in --sort order
+--all-values         # Remove the value window
+--sort count|value   # Order values by document count (default) or by value
+--min-count <n>      # Drop values held by fewer documents
+```
+
+Omitting the collection name covers the default collections, exactly as an unscoped search does.
+
+Reading the output:
+
+- **Counts are documents, not values.** A document with `topics: [a, b]` contributes one to each. Coverage is "documents declaring this key", out of the documents the filter admits when there is one.
+- **A bare string is exactly the value.** A string whose bare form could be read as something else (`"42"`, `""`, `"a, b"`) prints as a JSON string, so paste it into a filter as the JSON string it is.
+- **Numbers report min, median, and max**, plus the enumerated values when they fit, which is enough to write a `gt`/`lt` threshold in one call.
+- **Discovery sees exactly what filtering sees.** Same extraction gate, same active-document rule, same collection scope, and every count in a result comes from one database snapshot. Documents still pending extraction are reported on stderr and excluded until `qmd update` runs.
+- **Type conflicts are reported, not resolved.** Metadata is validated one document at a time, so `priority: 3` in one file and `priority: high` in another both index, within one collection or across several. Discovery splits such a key by type, each with its own document count and (across collections) its contributing collections:
+
+```sh
+qmd collection metadata --match '{"field":"key","operator":"eq","value":"priority"}'
+```
+
+```
+priority  number | string  1,427 of 2,100 documents
+  number    223 docs  min 1  median 3  max 5               notes, work
+  string  1,204 docs  high (700), medium (380), low (124)  work
+```
+
+To report one side only, add a `type` condition on the value field. The filter that reaches exactly those documents is the same condition with the metadata key in `field`:
+
+```sh
+qmd collection metadata --match '{
+  "operator": "and",
+  "operands": [
+    { "field": "key", "operator": "eq", "value": "priority" },
+    { "field": "value", "operator": "type", "value": "number" }
+  ]
+}'
+qmd query "release checklist" --filter '{"field":"priority","operator":"type","value":"number"}'
+```
+
+`qmd collection list` names each collection's top keys, `qmd collection show <name>` details the top five with a value preview, and `qmd status` summarizes how many keys and files carry metadata.
+
+The CLI prints text and rejects unsupported format flags. Structured discovery is available through the SDK, MCP, and HTTP with the same options (`collection`, `match`, `filter`, `keyLimit`, `keyOffset`, `valueLimit`, `valueOffset`, `sort`, `minCount`) and the same result shape:
+
+```typescript
+// SDK: one flat result, keys in coverage order, each split per type
+const discovery = await store.listMetadata({
+  collection: "notes",
+  match: { field: "key", operator: "eq", value: "topics" },
+  valueLimit: 5,
+})
+discovery.documents            // active documents in scope
+discovery.totalKeys            // keys with a matching entry, before the key window
+discovery.remainingKeys        // keys after the window
+discovery.keys[0].types[0]     // { type, multiValued, documents, distinctValues, values, remainingValues, range?, collections }
+
+// Narrowed by a filter: how many documents pass, and what is left to filter on
+const published = await store.listMetadata({
+  collection: "notes",
+  filter: { field: "status", operator: "eq", value: "published" },
+})
+published.filteredDocuments    // the denominator for every coverage count in this result
+
+// Page through a wide vocabulary
+const nextPage = await store.listMetadata({ keyLimit: 50, keyOffset: 50 })
+```
+
+`filter` is a `MetadataFilter` and `match` is a `MetadataMatch`. Both are `MetadataPredicate<Condition>`, the one recursive grammar over the conditions each record admits, so a document-only condition (`exists`, `all`, or a metadata key as the `field`) is a type error in a match as well as a runtime one. An option outside its domain throws `MetadataOptionError`, and a `filter` and `match` that together bind more SQL parameters than one statement allows throw `MetadataBindingBudgetError`.
+
+The MCP `metadata` tool takes the same options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
 
 ### Output Format
 
@@ -1051,7 +1457,7 @@ qmd multi-get "docs/*.md" --max-bytes 20480
 # Output multi-get as JSON for agent processing
 qmd multi-get "docs/*.md" --json
 
-# Clean up cache and orphaned data
+# Drop caches and orphans; repack the vector table when it has holes
 qmd cleanup
 ```
 
@@ -1131,13 +1537,15 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 ### Schema
 
 ```sql
-collections     -- Indexed directories with name and glob patterns
-path_contexts   -- Context descriptions by virtual path (qmd://...)
-documents       -- Markdown content with metadata and docid (6-char hash)
-documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
-vectors_vec     -- sqlite-vec vector index (hash_seq key)
-llm_cache       -- Cached LLM responses (query expansion, rerank scores)
+collections            -- Indexed directories with name and glob patterns
+path_contexts          -- Context descriptions by virtual path (qmd://...)
+documents              -- Markdown content with metadata and docid (6-char hash)
+documents_fts          -- FTS5 full-text index
+content_vectors        -- Embedding chunks (hash, seq, pos, 900 tokens each)
+vector_collection_ids  -- Integer id per collection name (the vector partition key)
+vector_rows            -- Vector rowid to (hash, seq, collection_id)
+vectors_by_collection  -- sqlite-vec vector index, one row per chunk and collection
+llm_cache              -- Cached LLM responses (query expansion, rerank scores)
 ```
 
 ## Environment Variables
@@ -1291,6 +1699,91 @@ Override them per-role without touching source via the `models:` block in
 ### Qwen3-Reranker
 
 Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+
+### Remote reranking with TypeSafe System One
+
+Select `typesafe:<model>` to score each candidate chunk independently through
+TypeSafe's fixed `https://api.typesafe.ai/v1/systemone` endpoint instead of loading
+a local reranker. There is no configurable endpoint, model discovery, local
+fallback or retry. Embeddings and query expansion keep their own selections.
+
+```yaml
+models:
+  rerank: "typesafe:jev-latest"
+  rerankOptions:
+    revision: "deployment-v1"      # optional, nonempty string, at most 256 characters
+    apiKeyEnv: TYPESAFE_API_KEY     # optional variable NAME; this is also the default
+```
+
+Set the named credential in the process environment, never in YAML. Explicit
+TypeSafe selection requires a credential: a missing/invalid named variable fails
+before HTTP, with no fallback to another environment variable. `apiKeyEnv` accepts
+`[A-Za-z_][A-Za-z0-9_]{0,127}`. Unknown options are rejected. Model/revision strings
+must be well-formed, bounded and free of control characters. Options are copied
+and frozen per store; changing their revision or credential variable name re-arms
+project-local `qmd trust` approval. Credential values never enter cache identities,
+status, diagnostics or errors.
+
+The SDK accepts the same model config. For retrieval without local query expansion,
+use pre-expanded queries (also available as `qmd query 'vec: your query'`):
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: {
+    collections: { docs: { path: '/path/to/docs', pattern: '**/*.md' } },
+    models: {
+      embed: 'http://localhost:1234/v1#my-embedding-model',
+      rerank: 'typesafe:jev-latest',
+      rerankOptions: { revision: 'deployment-v1' }
+    }
+  }
+})
+await store.update()
+await store.embed()
+const controller = new AbortController()
+const results = await store.search({
+  queries: [{ type: 'vec', query: 'your semantic query' }],
+  signal: controller.signal
+})
+await store.close()
+```
+
+`SearchOptions.signal` cancels remote embedding and rerank stages, including queued
+requests and fully cached reranks. Existing local inference may finish before
+cancellation is observed. The standalone `JevReranker` export also accepts these
+model/options and a caller signal on `rerank(query, documents, signal)`.
+
+Each document produces its own request: `model`, `state: { query, document }`
+(with `document_title` if supplied), and one `questions.relevant` noul question:
+"Does the document contain information that answers or directly addresses the
+search query?" File identifiers are not sent. Responses must be valid UTF-8 JSON
+with a finite `answers.relevant.noul` score in 0..1, including zero; an optional
+returned model must match the requested model. No normalization or score-zero
+rescue is applied. Results preserve original indexes and sort stably by score.
+
+The opaque `remote-typesafe:<sha256>` rerank identity pins the fixed endpoint,
+model, revision and prompt format. Scores stay independently cached by query and
+chunk text, even for different chunks sharing a file name. Other models/revisions
+cannot reuse them. Credentials are excluded; change `revision` when changing an
+account or deployment's scoring semantics. Local model cache keys are unchanged.
+
+A call has at most two in-flight requests, 64 documents and 2 MiB of aggregate
+encoded request JSON. Queries are limited to 64 KiB UTF-8, titles to 8 KiB and
+logical file identifiers to 4 KiB; input is refused, never silently truncated.
+The whole call, including its queue, has a 30-second deadline combined with
+caller/session cancellation. Each HTTP request also uses the shared byte/stream
+bounds (2 MiB request, 8 MiB response). Failure stops dispatch, aborts and drains
+in-flight work, and returns no partial scores or new score-cache rows.
+
+**These are resource bounds, not a spending cap.** The service can bill per sent
+document; cancellation cannot retract requests already sent. `status` and `doctor`
+report configured remote reranking, not a verified working service, without probes
+or local reranker downloads. `pull` skips this role but still downloads selected
+local models. Remote rerank selection alone does not skip local embedding device
+checks. Free-text query expansion remains local unless bypassed with typed queries.
 
 ### Qwen3 (Query Expansion)
 

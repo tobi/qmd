@@ -118,8 +118,8 @@ describe("skills/release/scripts/release-context.sh (#796)", () => {
 
   test("SKILL.md process steps are uniquely numbered", () => {
     const skill = readFileSync(skillSrc, "utf8");
-    const process = skill.split("## Dependency Policy")[0];
-    const nums = [...process.matchAll(/^(\d+)\. \*\*/gm)].map(m => m[1]);
+    const steps = skill.split("## Dependency Policy")[0]!;
+    const nums = [...steps.matchAll(/^(\d+)\. \*\*/gm)].map(m => m[1]);
     expect(nums).toEqual(["1", "2", "3", "4", "5", "6", "7", "8"]);
   });
 

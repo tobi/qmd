@@ -137,7 +137,7 @@ describe("concurrent store initialization", () => {
     const dbPath = join(dir, "index.sqlite");
     try {
       const [seed] = await openConcurrently(dbPath, 1);
-      expect(seed.code).toBe(0);
+      expect(seed!.code).toBe(0);
 
       const results = await openConcurrently(dbPath, WORKERS);
       expectAllSucceeded(results);
