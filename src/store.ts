@@ -3652,6 +3652,19 @@ export function countOrphanedContent(db: Database): number {
   return row.c;
 }
 
+/**
+ * A vector row (alias `vr`, collection alias `ci`) whose hash no active
+ * document in its collection holds. The unary `+` keeps the collection and
+ * active terms as filters but stops them from choosing an index, so `hash` is
+ * the only indexable term. Without `sqlite_stat1`, SQLite can otherwise pick
+ * idx_documents_collection (collection, active), which matches every active
+ * document in the collection, and the scan then costs documents × vector rows:
+ * minutes inside cleanup's write transaction on a large index.
+ */
+const VECTOR_ROW_IS_ORPHAN_SQL = `NOT EXISTS (
+  SELECT 1 FROM documents d WHERE d.hash = vr.hash AND +d.collection = ci.name AND +d.active = 1
+)`;
+
 const ORPHANED_VECTOR_COUNT_SQL = `
   SELECT COUNT(*) as c FROM content_vectors cv
   WHERE NOT EXISTS (
@@ -3705,9 +3718,7 @@ export function cleanupOrphanedVectors(db: Database): number {
       const orphanRows = db.prepare(`
         SELECT vr.id FROM ${VEC_ROWS_TABLE} vr
         JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
-        WHERE NOT EXISTS (
-          SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
-        )
+        WHERE ${VECTOR_ROW_IS_ORPHAN_SQL}
       `).all() as { id: number }[];
       const orphanedChunks = (db.prepare(ORPHANED_VECTOR_COUNT_SQL).get() as { c: number }).c;
       if (orphanRows.length === 0 && orphanedChunks === 0) {
@@ -3786,7 +3797,7 @@ function vectorRepackPlan(db: Database, dropOrphans: boolean = false): VecRepack
       FROM ${VEC_ROWS_TABLE} vr
       JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
       JOIN ${layout.shadow.rowids} r ON r.rowid = vr.id
-      WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
+      WHERE ${VECTOR_ROW_IS_ORPHAN_SQL}
       GROUP BY r.chunk_id
     `).all() as { chunkId: number; n: number }[];
     for (const row of rows) orphansByChunk.set(row.chunkId, row.n);

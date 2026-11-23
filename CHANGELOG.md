@@ -5,6 +5,7 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- `qmd update` and `qmd cleanup` no longer spend minutes in the orphan-vector scan on large indexes. Without planner statistics, SQLite could look documents up through the collection index, which made the scan cost documents × vector rows while holding the write lock.
 
 ## [2.9.0] - 2026-11-17
 
