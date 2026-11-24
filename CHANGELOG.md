@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Report unknown collection names as errors in MCP and HTTP search and metadata requests (#1141).
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
 
 ## [2.9.0] - 2026-11-17
