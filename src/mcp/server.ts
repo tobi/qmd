@@ -81,6 +81,12 @@ function validateMatchArgument(match: unknown): { match?: MetadataMatch; error?:
   }
 }
 
+/** Check explicit collection names against the live index without counting documents. */
+function getCollectionFilterError(store: QMDStore, collections?: string[]): string | undefined {
+  const unknown = collections?.find(name => !store.internal.getCollectionByName(name));
+  return unknown === undefined ? undefined : `Collection not found: ${unknown}`;
+}
+
 /** Pick the named fields of a JSON body that must be numbers when present. */
 function readNumberFields(params: Record<string, unknown>, names: string[]): { values: Record<string, number>; error?: string } {
   const values: Record<string, number> = {};
@@ -447,9 +453,10 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       const filterValidation = validateFilterArgument(filter);
-      if (filterValidation.error) {
+      const validationError = filterValidation.error ?? getCollectionFilterError(store, collections);
+      if (validationError) {
         return {
-          content: [{ type: "text" as const, text: `Error: ${filterValidation.error}` }],
+          content: [{ type: "text" as const, text: `Error: ${validationError}` }],
           isError: true,
         };
       }
@@ -751,7 +758,7 @@ Every value reported here can be matched with \`{field: '<metadata-key>', operat
     track(async ({ collections, match, filter, keyLimit, keyOffset, valueLimit, valueOffset, sort, minCount }) => {
       const matchValidation = validateMatchArgument(match);
       const filterValidation = validateFilterArgument(filter);
-      const validationError = matchValidation.error ?? filterValidation.error;
+      const validationError = matchValidation.error ?? filterValidation.error ?? getCollectionFilterError(store, collections);
       if (validationError) {
         return {
           content: [{ type: "text" as const, text: `Error: ${validationError}` }],
@@ -2140,8 +2147,14 @@ export async function startMcpHttpServer(
           restFilter = filterValidation.filter;
         }
 
-        // Use default collections if none specified
-        const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
+        const collections = Array.isArray(params.collections) ? params.collections.map(String) : undefined;
+        const collectionError = getCollectionFilterError(store, collections);
+        if (collectionError) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: collectionError }));
+          return;
+        }
+        const effectiveCollections = collections ?? defaultCollectionNames;
 
         // The abort signal reaches the embedding/rerank stages, so a client
         // that hangs up or a shutdown deadline stops paying for work whose
@@ -2255,8 +2268,14 @@ export async function startMcpHttpServer(
           return;
         }
 
-        // Use default collections if none specified
-        const effectiveCollections = params.collections ? params.collections.map(String) : defaultCollectionNames;
+        const collections = params.collections?.map(String);
+        const collectionError = getCollectionFilterError(store, collections);
+        if (collectionError) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: collectionError }));
+          return;
+        }
+        const effectiveCollections = collections ?? defaultCollectionNames;
 
         let result: ListMetadataResult;
         try {

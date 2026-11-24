@@ -215,7 +215,10 @@ describe("MCP and HTTP metadata filter", () => {
     await seedDoc(internal.db, "tagged.md", "# Tagged\n\nhttp keyword body", { status: "archived", topics: ["sqlite", "search"], priority: 3 });
 
     const testConfig: CollectionConfig = {
-      collections: { docs: { path: "/test/docs", pattern: "**/*.md" } },
+      collections: {
+        docs: { path: "/test/docs", pattern: "**/*.md" },
+        empty: { path: "/test/empty", pattern: "**/*.md", includeByDefault: false },
+      },
     };
     syncConfigToDb(internal.db, testConfig);
     internal.close();
@@ -400,6 +403,35 @@ describe("MCP and HTTP metadata filter", () => {
     expect(status).toBe(200);
     expect(json.result.isError).toBe(true);
     expect(json.result.content[0].text).toMatch(/non-empty 'operands'/);
+  });
+
+  test.each(["query", "metadata"])("MCP %s rejects an unknown collection", async (name) => {
+    const args = name === "query"
+      ? { searches: [{ type: "lex", query: "http keyword" }], rerank: false }
+      : {};
+    const { status, json } = await callTool(name, { ...args, collections: ["missing"] });
+    expect(status).toBe(200);
+    expect(json.result.isError).toBe(true);
+    expect(json.result.content[0].text).toBe("Error: Collection not found: missing");
+  });
+
+  test.each(["/query", "/search", "/metadata"])("POST %s rejects an unknown collection in a mixed list", async (path) => {
+    const args = path === "/metadata"
+      ? {}
+      : { searches: [{ type: "lex", query: "http keyword" }], rerank: false };
+    const { status, json } = await postJson(path, { ...args, collections: ["docs", "missing"] });
+    expect(status).toBe(400);
+    expect(json.error).toBe("Collection not found: missing");
+  });
+
+  test("MCP and REST query accept an empty registered collection", async () => {
+    const args = { searches: [{ type: "lex", query: "http keyword" }], rerank: false, collections: ["empty"] };
+    const mcp = await callQueryTool(args);
+    expect(mcp.json.result.isError).toBeFalsy();
+    expect(mcp.json.result.structuredContent.results).toEqual([]);
+    const rest = await postJson("/query", args);
+    expect(rest.status).toBe(200);
+    expect(rest.json.results).toEqual([]);
   });
 
   test("MCP metadata tool returns key summaries as structured content and CLI-shaped text", async () => {
