@@ -178,11 +178,3 @@ export function parseVhExpansionResponse(
   if (diagnostics.length > 0) return { output: [], diagnostics };
   return { output, diagnostics };
 }
-
-export function defaultExpansionFallback(query: string): GeneratedExpansion[] {
-  return [
-    ["hyde", `Information about ${query}`],
-    ["lex", query],
-    ["vec", query],
-  ];
-}

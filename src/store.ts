@@ -5467,9 +5467,8 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
-  // feeding caller intent to the expansion model contaminates sub-queries
-  // with intent meta-language (see LlamaCpp.expandQuery), and keying the
-  // cache by intent multiplied the poisoned entries per (query, intent) pair.
+  // the expansion prompt takes only the query (see LlamaCpp.expandQuery),
+  // so keying the cache by intent would only multiply identical entries.
   const cacheKey = getCacheKey("expandQuery", { query, model });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
@@ -6549,10 +6548,12 @@ export async function executeHybridRetrieval(
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
-  // Step 2: Expand query (or skip if strong signal / caller pinned expansions)
+  // Step 2: Expand query (or skip if strong signal / caller pinned expansions).
+  // Generated expansions are hyde/vec only, so a store without vectors could
+  // run none of them — skip generation there.
   hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = options.expansions ?? (hasStrongSignal
+  const expanded = options.expansions ?? (hasStrongSignal || !hasVectors
     ? []
     : await store.expandQuery(query));
 

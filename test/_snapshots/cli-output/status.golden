@@ -34,4 +34,4 @@ Examples
 Models
   Embedding:   https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF
   Reranking:   https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF
-  Generation:  https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf
+  Generation:  https://huggingface.co/TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf

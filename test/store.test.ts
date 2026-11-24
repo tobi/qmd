@@ -1380,6 +1380,11 @@ describe("Query expansion cache (#818)", () => {
         title: "Alpha Bravo",
         body: "# Alpha\n\nalpha bravo charlie content.",
       });
+      const embedModel = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+      // Expansion only runs on stores with vectors; stub the vector side.
+      store.db.exec(`CREATE TABLE ${VEC_TABLE} (collection_id INTEGER, embedding BLOB)`);
+      store.llm = { embedModelName: embedModel, embedBatch: vi.fn(async (texts: string[]) => texts.map(() => ({ embedding: [1, 2, 3], model: embedModel }))) } as any;
+      store.searchVec = vi.fn(async () => [] as SearchResult[]) as any;
       const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
       store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "zzzqqq wwwuuu" }]));
@@ -1404,6 +1409,11 @@ describe("Query expansion cache (#818)", () => {
         title: "Alpha Bravo",
         body: "# Alpha\n\nalpha bravo charlie content.",
       });
+      const embedModel = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+      // Expansion only runs on stores with vectors; stub the vector side.
+      store.db.exec(`CREATE TABLE ${VEC_TABLE} (collection_id INTEGER, embedding BLOB)`);
+      store.llm = { embedModelName: embedModel, embedBatch: vi.fn(async (texts: string[]) => texts.map(() => ({ embedding: [1, 2, 3], model: embedModel }))) } as any;
+      store.searchVec = vi.fn(async () => [] as SearchResult[]) as any;
       const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
       store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "charlie" }]));

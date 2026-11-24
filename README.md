@@ -586,7 +586,7 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 |-------|---------|------|
 | `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
-| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
+| `qmd-query-expansion-vh-1.7B-q8_0` | Query expansion (fine-tuned, emits `hyde`/`vec`) | ~1.8GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
@@ -760,7 +760,7 @@ editor_uri: "vscode://file{path}:{line}:{col}"
 models:
   embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
   rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
-  generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+  generate: "hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf"
 
 # One entry per collection. The key is the collection name.
 collections:
@@ -1431,11 +1431,12 @@ qmd bench finetune/benchmarks/qmd-expansion-scifact-v1 --check-index
 qmd bench finetune/benchmarks/qmd-expansion-scifact-v1 --run raw
 
 # Generate one frozen expansion artifact per model. Generation is sequential
-# and resumes from a validated .partial file after interruption.
+# and resumes from a validated .partial file after interruption. `--model`
+# uses the production expansion prompt, grammar, and decoding.
 npm run bench:expand -- \
   --benchmark finetune/benchmarks/qmd-expansion-scifact-v1 \
-  --run upstream-qmd \
-  --model hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  --run default-vh \
+  --model hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf
 
 npm run bench:expand -- \
   --benchmark finetune/benchmarks/qmd-expansion-scifact-v1 \
@@ -1444,8 +1445,8 @@ npm run bench:expand -- \
 
 # Each named run reads expansions/<run-name>.jsonl.
 qmd bench finetune/benchmarks/qmd-expansion-scifact-v1 \
-  --run upstream-qmd \
-  --model hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  --run default-vh \
+  --model hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf
 qmd bench finetune/benchmarks/qmd-expansion-scifact-v1 \
   --run qwen-1.7b-base --model <qwen-base-model-id>
 qmd bench finetune/benchmarks/qmd-expansion-scifact-v1 \
@@ -1605,12 +1606,18 @@ The default models are defined in `src/llm.ts` as HuggingFace URIs:
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+const DEFAULT_GENERATE_MODEL = "hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf";
 ```
 
 Override them per-role without touching source via the `models:` block in
 `index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
 `QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
+
+The query-expansion prompt, grammar, and greedy decoding are fixed in
+`src/query-expansion-vh.ts` and match the training format of the default
+generate model. A different `generate` model only works if it was trained on
+the same format; otherwise expansion fails its format check and `qmd query`
+falls back to the original query alone.
 
 ### EmbeddingGemma Prompt Format
 

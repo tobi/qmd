@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the default query-expansion model is now the v2-VH SFT
+  (`qmd-query-expansion-vh-1.7B`, Q8_0, ~1.8GB download instead of ~1.1GB), and
+  the expansion prompt, grammar, empty system prompt, and greedy decoding are
+  fixed to the format it was trained and evaluated on
+  (`src/query-expansion-vh.ts`). Expansions are one `hyde` line plus one or two
+  `vec` lines — no `lex` lines. A response that is truncated or breaks that
+  format now yields no expansions (search runs the original query alone)
+  instead of the old `Information about …` fallback. A custom
+  `models.generate` model trained on the old `Expand this search query`
+  format will fail that check; it is reported on stderr. `--intent` no longer
+  enters the expansion prompt (it still shapes reranking and snippet
+  selection). Hybrid queries on an index without vectors skip expansion,
+  since its `hyde`/`vec` output could not run there. `npm run bench:expand
+  -- --model` follows the same production prompt.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,

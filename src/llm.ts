@@ -31,7 +31,7 @@ type NodeLlamaCppModule = {
     model: string,
     optionsOrDirectory?: string | { directory?: string; cli?: boolean },
   ) => Promise<string>;
-  LlamaChatSession: new (options: { contextSequence: unknown }) => {
+  LlamaChatSession: new (options: { contextSequence: unknown; systemPrompt?: string }) => {
     prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
     promptWithMeta: (
       prompt: string,
@@ -92,10 +92,14 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 import { createRequire } from "node:module";
+import { parseVhExpansionResponse } from "./query-expansion-parser.js";
 import {
-  defaultExpansionFallback,
-  parseGeneratedExpansionLines,
-} from "./query-expansion-parser.js";
+  VH_GRAMMAR,
+  VH_MAX_TOKENS,
+  VH_PROMPT_TEMPLATE,
+  VH_SAMPLING,
+  VH_SYSTEM_PROMPT,
+} from "./query-expansion-vh.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -281,29 +285,6 @@ export type Queryable = {
   text: string;
 };
 
-export function parseProductionExpansion(
-  _query: string,
-  rawOutput: string,
-  includeLexical: boolean = true,
-): { output: Queryable[]; fallbackUsed: boolean } {
-  const parsed = parseGeneratedExpansionLines(rawOutput);
-  const usable = parsed.output
-    .map(([type, text]) => ({ type: type as QueryType, text }));
-  const filtered = includeLexical
-    ? usable
-    : usable.filter(item => item.type !== "lex");
-  if (filtered.length > 0) return { output: filtered, fallbackUsed: false };
-
-  const fallback = defaultExpansionFallback(_query)
-    .map(([type, text]) => ({ type: type as QueryType, text }));
-  return {
-    output: includeLexical
-      ? fallback
-      : fallback.filter(item => item.type !== "lex"),
-    fallbackUsed: true,
-  };
-}
-
 /**
  * Document to rerank
  */
@@ -322,8 +303,10 @@ export type RerankDocument = {
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-// const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+// v2-VH SFT Q8_0 (sha256 0b939b9cce52765065b6a94be35f9d8430462f94fc5db157e3b1c0dd891af8f2).
+// It only works with the prompt/grammar/decoding in query-expansion-vh.ts.
+// TODO(vh-default-expansion): replace with the published HF repo URI.
+const DEFAULT_GENERATE_MODEL = "hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf";
 
 // Alternative generation models for query expansion:
 // LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
@@ -1674,12 +1657,11 @@ export class LlamaCpp implements LLM {
   async generateQueryExpansionWithMeta(
     query: string,
     options: {
-      intent?: string;
       promptTemplate?: string;
       grammar?: string;
       seed?: number;
       maxTokens?: number;
-      /** Omit to keep node-llama-cpp's default system prompt. */
+      /** Defaults to VH_SYSTEM_PROMPT (""): no system turn. */
       systemPrompt?: string;
       sampling?: {
         temperature: number;
@@ -1696,20 +1678,11 @@ export class LlamaCpp implements LLM {
 
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
-    // Callers may pin a full prompt template (e.g. the V2-VH serving profile);
-    // {query} is replaced when the template contains it.
-    const prompt = options.promptTemplate
-      ? options.promptTemplate.replace("{query}", query)
-      : options.intent
-        ? `/no_think Expand this search query: ${query}\nQuery intent: ${options.intent}`
-        : `/no_think Expand this search query: ${query}`;
+    // Defaults are the v2-VH serving contract (query-expansion-vh.ts); bench
+    // callers may pin a profile's template/grammar/sampling instead.
+    const prompt = (options.promptTemplate ?? VH_PROMPT_TEMPLATE).replace("{query}", query);
     const grammar = await llama.createGrammar({
-      grammar: options.grammar ?? `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `,
+      grammar: options.grammar ?? VH_GRAMMAR,
     });
     const context = await this.generateModel!.createContext({
       contextSize: this.expandContextSize,
@@ -1721,10 +1694,9 @@ export class LlamaCpp implements LLM {
       const { LlamaChatSession } = await loadNodeLlamaCpp();
       const session = new LlamaChatSession({
         contextSequence,
-        ...(options.systemPrompt !== undefined && { systemPrompt: options.systemPrompt }),
+        systemPrompt: options.systemPrompt ?? VH_SYSTEM_PROMPT,
       });
-      const sampling = options.sampling
-        ?? { temperature: 0.7, topK: 20, topP: 0.8, presencePenalty: 0.5, lastTokens: 64 };
+      const sampling = options.sampling ?? VH_SAMPLING;
       // Count tokens actually sampled by the engine, including any trailing
       // EOG token: onToken and re-tokenizing responseText both miss it. The
       // meter's output count is one per sampling step on this fresh sequence.
@@ -1732,7 +1704,7 @@ export class LlamaCpp implements LLM {
       const start = performance.now();
       const result = await session.promptWithMeta(prompt, {
         grammar,
-        maxTokens: options.maxTokens ?? 600,
+        maxTokens: options.maxTokens ?? VH_MAX_TOKENS,
         temperature: sampling.temperature,
         topK: sampling.topK,
         topP: sampling.topP,
@@ -1760,15 +1732,12 @@ export class LlamaCpp implements LLM {
    * fallback. Benchmark artifact generation uses this to preserve the exact
    * model output and classify failures outside the production search path.
    */
-  async generateQueryExpansionRaw(
-    query: string,
-    options: { intent?: string } = {},
-  ): Promise<string> {
-    const { text } = await this.generateQueryExpansionWithMeta(query, options);
+  async generateQueryExpansionRaw(query: string): Promise<string> {
+    const { text } = await this.generateQueryExpansionWithMeta(query);
     return text;
   }
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1777,24 +1746,30 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
 
-    // The expansion prompt consumes ONLY the query text. Caller intent is
-    // free-form meta-language that the expansion model would reproduce verbatim
-    // as lex/vec sub-queries — degenerate terms that match nothing. Intent
-    // shapes retrieval where it belongs: the reranker query prefix and
-    // keyword-based chunk/snippet selection (see generateQueryExpansionWithMeta,
-    // which ignores options.intent when building the prompt template).
+    // The expansion prompt consumes ONLY the query text (the v2-VH training
+    // prompt has no intent slot). Intent shapes retrieval where it belongs:
+    // the reranker query prefix and keyword-based chunk/snippet selection.
+    //
+    // Any failure — generation error, truncation, or a response that breaks
+    // the VH contract — yields no expansions, so search runs the raw query
+    // alone (the evaluated "empty_expansions_raw_query" policy).
     try {
-      const result = await this.generateQueryExpansionRaw(query, { intent: options.intent });
-
-      return parseProductionExpansion(query, result, includeLexical).output;
+      const { text, meta } = await this.generateQueryExpansionWithMeta(query);
+      if (meta.stop_reason !== "eogToken") {
+        console.error(`Query expansion stopped early (${meta.stop_reason}); searching with the original query only.`);
+        return [];
+      }
+      const parsed = parseVhExpansionResponse(text);
+      if (parsed.diagnostics.length > 0) {
+        console.error(`Query expansion output is malformed (${parsed.diagnostics[0]!.code}); searching with the original query only.`);
+        return [];
+      }
+      const output = parsed.output.map(([type, text]) => ({ type: type as QueryType, text }));
+      return includeLexical ? output : output.filter(item => item.type !== "lex");
     } catch (error) {
       console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return [];
     }
   }
 

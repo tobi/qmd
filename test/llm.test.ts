@@ -695,7 +695,7 @@ describe("LlamaCpp expand context size config", () => {
 describe("LlamaCpp model resolution (config > env > default)", () => {
   const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-  const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+  const HARDCODED_GENERATE = "hf:TODO-hf-org/qmd-query-expansion-vh-1.7B-gguf/qmd-query-expansion-vh-1.7B-q8_0.gguf";
 
   test("uses hardcoded default when no config or env is set", () => {
     const prev = process.env.QMD_EMBED_MODEL;
@@ -1282,12 +1282,13 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     test("returns query expansions with correct types", async () => {
       const result = await llm.expandQuery("test query");
 
-      // Result is Queryable[] containing lex, vec, and/or hyde entries
-      expect(result.length).toBeGreaterThanOrEqual(1);
+      // VH contract: one hyde line, then one or two vec lines
+      expect(result[0]?.type).toBe("hyde");
+      expect(result.length).toBeGreaterThanOrEqual(2);
+      expect(result.length).toBeLessThanOrEqual(3);
 
-      // Each result should have a valid type
-      for (const q of result) {
-        expect(["lex", "vec", "hyde"]).toContain(q.type);
+      for (const q of result.slice(1)) {
+        expect(q.type).toBe("vec");
         expect(q.text.length).toBeGreaterThan(0);
       }
     }, 30000); // 30s timeout for model loading
