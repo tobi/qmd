@@ -14,8 +14,41 @@ import {
   type DocumentProcessor, type ProcessorDocument,
 } from "./processors.js";
 
+const PROCESSOR_SCHEMA_OBJECTS = [
+  "processor_specs",
+  "processor_modes",
+  "processor_sources",
+  "processor_outputs",
+  "idx_processor_outputs_source",
+] as const;
+
+/**
+ * True when every object initializeProcessorSchema creates is already
+ * present. The probe is a read, so it does not contend in WAL mode.
+ */
+function processorSchemaIsCurrent(db: Database): boolean {
+  const rows = db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name IN (?, ?, ?, ?, ?)`
+    )
+    .all(...PROCESSOR_SCHEMA_OBJECTS) as { name: string }[];
+  const names = new Set(rows.map((row) => row.name));
+  return PROCESSOR_SCHEMA_OBJECTS.every((name) => names.has(name));
+}
+
 export function initializeProcessorSchema(db: Database): void {
-  db.transaction(() => db.exec(`
+  // Fast path: the schema is already current, so skip the IMMEDIATE
+  // transaction. BEGIN IMMEDIATE takes the write lock even when every table
+  // already exists, which made read-only opens (status/search/query) wait
+  // out busy_timeout and fail with "database is locked" while `qmd update`
+  // or `qmd embed` was writing (#1133).
+  if (processorSchemaIsCurrent(db)) return;
+  db.transaction(() => {
+    // Double-checked read, matching ensureDocumentsFtsSchema: two first-open
+    // processes can both observe a missing schema, and the loser skips once
+    // any process has published it.
+    if (processorSchemaIsCurrent(db)) return;
+    db.exec(`
     CREATE TABLE IF NOT EXISTS processor_specs (collection TEXT PRIMARY KEY, spec TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS processor_modes (collection TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS processor_sources (
@@ -27,7 +60,8 @@ export function initializeProcessorSchema(db: Database): void {
       PRIMARY KEY(collection, path)
     );
     CREATE INDEX IF NOT EXISTS idx_processor_outputs_source ON processor_outputs(collection, source);
-  `)).immediate();
+  `);
+  }).immediate();
 }
 
 export function hasProcessorMode(db: Database, collection: string): boolean {

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Open an already-initialized store without taking the write lock, so read-only commands (`status`, `search`, `get`, `query`) and MCP startup no longer wait out `busy_timeout` and fail while `qmd update` or `qmd embed` is writing (#1133).
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
 
 ## [2.9.0] - 2026-11-17
