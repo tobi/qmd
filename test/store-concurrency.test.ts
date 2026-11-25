@@ -13,6 +13,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { openDatabase } from "../src/db.ts";
+import { createStore } from "../src/store.ts";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
@@ -142,6 +143,42 @@ describe("concurrent store initialization", () => {
       const results = await openConcurrently(dbPath, WORKERS);
       expectAllSucceeded(results);
       expectSchemaIntact(dbPath);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("opening an initialized store does not take the write lock (#1133)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-store-1133-"));
+    const dbPath = join(dir, "index.sqlite");
+    try {
+      // Seed: the first open initializes the schema.
+      const seed = createStore(dbPath);
+      seed.close();
+
+      // Hold the write lock from a second connection, as `qmd update` does.
+      const writer = openDatabase(dbPath);
+      writer.exec("BEGIN IMMEDIATE");
+      writer.prepare(`INSERT INTO llm_cache (hash, result, created_at) VALUES ('x', 'y', 'z')`).run();
+      try {
+        // A read-only open must not wait for the writer: the schema is current.
+        process.env.QMD_SQLITE_BUSY_TIMEOUT = "3000";
+        try {
+          const started = Date.now();
+          const store = createStore(dbPath);
+          try {
+            expect(Date.now() - started).toBeLessThan(3000);
+            expect(store.getStatusSummary().totalDocuments).toBe(0);
+          } finally {
+            store.close();
+          }
+        } finally {
+          delete process.env.QMD_SQLITE_BUSY_TIMEOUT;
+        }
+      } finally {
+        writer.exec("ROLLBACK");
+        writer.close();
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
