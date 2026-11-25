@@ -1647,21 +1647,36 @@ export function invalidateConfigHash(db: Database): void {
  * Sync external config (YAML/inline) into SQLite store_collections.
  * External config always wins. Skips sync if config hash hasn't changed.
  *
- * The whole mirror is one immediate transaction, so a reader never observes a
- * half-applied config and the hash commits with the rows it certifies. Callers
- * that read the config from a file must read it under the file's lock and call
- * this while still holding it — see `CollectionConfigScope.withLockedConfig` —
- * otherwise a mutation another process published between the read and this
- * call is deleted from `store_collections` and the stale hash is stamped over
- * it. Cross-resource atomicity is not claimed: a crash between the file
- * publish and this commit leaves the database behind the file, and the
- * `config_hash` mismatch makes the next sync repair it.
+ * The hash is read before opening the transaction: when it already matches,
+ * no write lock is taken at all, so read-only commands (status, search) can
+ * open a store while another process writes. The hash is stamped last, after
+ * the rows it certifies, so a matching hash means the mirror is already
+ * current. The whole mirror is one immediate transaction when it does change,
+ * so a reader never observes a half-applied config and the hash commits with
+ * the rows it certifies. Callers that read the config from a file must read
+ * it under the file's lock and call this while still holding it — see
+ * `CollectionConfigScope.withLockedConfig` — otherwise a mutation another
+ * process published between the read and this call is deleted from
+ * `store_collections` and the stale hash is stamped over it. Cross-resource
+ * atomicity is not claimed: a crash between the file publish and this commit
+ * leaves the database behind the file, and the `config_hash` mismatch makes
+ * the next sync repair it.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   // Config sync is also used on externally seeded databases before Store opens.
   initializeProcessorSchema(db);
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
+
+  // Fast path: the stored hash already certifies this config, so return
+  // without opening a transaction (no write lock). apply() re-checks the hash
+  // inside the transaction, so a config published between this read and the
+  // transaction still syncs — the same double-checked pattern as
+  // initializeProcessorSchema.
+  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
+  if (existingHash != null && existingHash.value === hash) {
+    return;
+  }
 
   const apply = (): void => {
     // Check config hash — skip sync if unchanged

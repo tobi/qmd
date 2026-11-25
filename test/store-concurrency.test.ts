@@ -7,13 +7,15 @@
  */
 import { describe, test, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { openDatabase } from "../src/db.ts";
-import { createStore } from "../src/store.ts";
+import { createStore, syncConfigToDb } from "../src/store.ts";
+import type { CollectionConfig } from "../src/collections.ts";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
@@ -171,6 +173,50 @@ describe("concurrent store initialization", () => {
             expect(store.getStatusSummary().totalDocuments).toBe(0);
           } finally {
             store.close();
+          }
+        } finally {
+          delete process.env.QMD_SQLITE_BUSY_TIMEOUT;
+        }
+      } finally {
+        writer.exec("ROLLBACK");
+        writer.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("syncing an unchanged config does not take the write lock (#1144)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-store-1144-"));
+    const dbPath = join(dir, "index.sqlite");
+    const config: CollectionConfig = { collections: {} };
+    try {
+      // Seed: the first open initializes the schema, then stamp the config
+      // hash the way the CLI's getStore() does (createStore + syncConfigToDb).
+      const seed = createStore(dbPath);
+      syncConfigToDb(seed.db, config);
+      seed.close();
+
+      // Hold the write lock from a second connection, as `qmd update` does.
+      const writer = openDatabase(dbPath);
+      writer.exec("BEGIN IMMEDIATE");
+      writer.prepare(`INSERT INTO llm_cache (hash, result, created_at) VALUES ('x', 'y', 'z')`).run();
+      try {
+        // The stored hash already matches this config, so syncing it must not
+        // wait for the writer: no transaction is needed at all.
+        process.env.QMD_SQLITE_BUSY_TIMEOUT = "3000";
+        try {
+          const started = Date.now();
+          const db = openDatabase(dbPath);
+          try {
+            syncConfigToDb(db, config);
+            expect(Date.now() - started).toBeLessThan(3000);
+            const row = db
+              .prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`)
+              .get() as { value: string };
+            expect(row.value).toBe(createHash("sha256").update(JSON.stringify(config)).digest("hex"));
+          } finally {
+            db.close();
           }
         } finally {
           delete process.env.QMD_SQLITE_BUSY_TIMEOUT;
