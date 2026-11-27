@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- CLI commands no longer write an empty `index.yml` (or config lock file) or
+  delete `store_collections` rows when the config file is missing, and
+  `qmd update` refuses to run without the config when the index has collections (#1048).
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
 
 ## [2.9.0] - 2026-11-17
