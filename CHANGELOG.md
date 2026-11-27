@@ -5,6 +5,10 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- Reranked search (`hybridQuery`, `structuredSearch`) now orders results by reranker
+  score and breaks ties by RRF rank. The tiered position blend was not monotonic in
+  rank: at reranker score 1.0 a rank-11 candidate scored 0.636 and a rank-3
+  candidate 0.500 (#1031).
 
 ## [2.9.0] - 2026-11-17
 
