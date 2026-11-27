@@ -217,7 +217,14 @@ function getStore(): ReturnType<typeof createStore> {
     });
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB.
-    withConfigLocked((fresh) => syncConfigToDb(store!.db, fresh));
+    // A missing config file is not an empty config: syncing one would delete
+    // every collection row, and taking the config lock would create a lock
+    // sidecar in the missing config folder.
+    if (configExists()) {
+      withConfigLocked((fresh) => {
+        if (configExists()) syncConfigToDb(store!.db, fresh);
+      });
+    }
     setDefaultLlamaCpp(llm);
     store.llm = llm;
   }
@@ -977,6 +984,14 @@ async function updateCollections(): Promise<void> {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
     closeDb();
     return;
+  }
+
+  // Ignore patterns, update commands, and processors are read from the config
+  // file, so indexing without it could add excluded files or skip hooks.
+  if (!configExists()) {
+    console.error(`No config file at ${getConfigPath()}`);
+    closeDb();
+    process.exit(1);
   }
 
   // A project-local .qmd/index.yml travels with a `git clone`, so its `update:`
@@ -2458,6 +2473,12 @@ function resolveAndValidateConfiguredModels(config: CollectionConfig): { embed: 
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  // Without a config file, resolve and validate the defaults in memory.
+  // Writing the file here would turn "no config" into "no collections" for
+  // the next command.
+  if (!configExists()) {
+    return resolveAndValidateConfiguredModels({ collections: {} });
+  }
   let config: CollectionConfig;
   try {
     config = loadConfig();
