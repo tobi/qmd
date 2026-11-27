@@ -1411,6 +1411,35 @@ describe("Query expansion cache (#818)", () => {
     }
   });
 
+  test("hybridQuery rerank order is monotonic in RRF rank when reranker scores tie", async () => {
+    const store = await createTestStore();
+    try {
+      for (let i = 0; i < 14; i++) {
+        await insertTestDocument(store.db, "docs", {
+          name: `doc${i}`,
+          title: `Doc ${i}`,
+          body: `# Doc ${i}\n\n` + "alpha ".repeat(14 - i) + "filler words ".repeat(i),
+        });
+      }
+      // Seed a cached expansion so the (disabled-in-CI) expansion model is never consulted.
+      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      store.setCachedResult(getCacheKey("expandQuery", { query: "alpha", model }), JSON.stringify([{ type: "lex", query: "alpha" }]));
+      const opts = { limit: 14, minScore: 0, intent: "unrelated meta commentary" };
+      const baseline = await hybridQuery(store, "alpha", { ...opts, skipRerank: true });
+      expect(baseline.length).toBeGreaterThan(11);
+
+      // Equal reranker scores: the old tiered blend lifted rank 11+ above rank 4-10.
+      vi.spyOn(store, "rerank").mockImplementation(async (_q, docs) =>
+        docs.map(d => ({ file: d.file, score: 1 })));
+      const reranked = await hybridQuery(store, "alpha", opts);
+
+      expect(reranked.map(r => r.file)).toEqual(baseline.map(r => r.file));
+    } finally {
+      vi.restoreAllMocks();
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery embeds each distinct cached expansion once (#921)", async () => {
     const store = await createTestStore();
     const embedModel = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
