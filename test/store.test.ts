@@ -4069,6 +4069,43 @@ describe("cleanupOrphanedVectors atomicity", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("uses idx_documents_hash_collection_active covering index and preserves active shared-hash partitions", async () => {
+    const store = await createTestStore();
+    try {
+      const db = store.db;
+      const colA = await createTestCollection({ name: "col-a", pwd: "/test/col-a" });
+      const colB = await createTestCollection({ name: "col-b", pwd: "/test/col-b" });
+      const now = new Date().toISOString();
+
+      store.ensureVecTable(3);
+      await insertTestDocument(db, colA, { displayPath: "a1.md", hash: "sharedhash" });
+      await insertTestDocument(db, colA, { displayPath: "a2.md", hash: "sharedhash" });
+      await insertTestDocument(db, colB, { displayPath: "b1.md", hash: "sharedhash" });
+      store.insertEmbedding("sharedhash", 0, 0, new Float32Array([1, 2, 3]), "test-model", now, 1);
+
+      const plan = db.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT vr.id FROM ${VEC_ROWS_TABLE} vr
+        JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+        LEFT JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
+        WHERE d.id IS NULL
+      `).all() as { detail: string }[];
+      const details = plan.map((row) => row.detail).join("\n");
+      expect(details).toContain("idx_documents_hash_collection_active");
+      expect(details).not.toContain("idx_documents_collection");
+
+      // Deactivate one copy in colA and the only copy in colB: colA still has
+      // an active document for sharedhash, so only colB's partition row is removed.
+      expect(db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = 'a1.md'`).run(colA).changes).toBe(1);
+      expect(db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = 'b1.md'`).run(colB).changes).toBe(1);
+
+      expect(cleanupOrphanedVectors(db)).toBe(1);
+      expect(vecCounts(db)).toEqual({ vec: 1, meta: 1 });
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 // =============================================================================
