@@ -5,6 +5,7 @@
 ### Fixed
 
 - Keep local embedding inputs in a single evaluation batch so pooled embeddings cover the full input (#1121). Run `qmd embed --force` to refresh existing vectors.
+- Prefer complete quoted phrases when selecting search passages and source lines, without replacing the existing word-overlap and intent scoring.
 
 ## [2.9.0] - 2026-11-17
 
