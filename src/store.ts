@@ -1410,6 +1410,11 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+  // Covering index for (hash, collection, active) lookups in cleanupOrphanedVectors,
+  // vectorRepackPlan, ORPHANED_VECTOR_COUNT_SQL, and activeCollectionsOfHash.
+  // Without it, SQLite 3.54.1's planner picks idx_documents_collection(collection, active)
+  // over idx_documents_hash(hash) when sqlite_stat1 is absent, turning O(V log D) into O(V * D).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash_collection_active ON documents(hash, collection, active)`);
 
   // Cache table for LLM API calls
   db.exec(`
@@ -3705,9 +3710,8 @@ export function cleanupOrphanedVectors(db: Database): number {
       const orphanRows = db.prepare(`
         SELECT vr.id FROM ${VEC_ROWS_TABLE} vr
         JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
-        WHERE NOT EXISTS (
-          SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
-        )
+        LEFT JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
+        WHERE d.id IS NULL
       `).all() as { id: number }[];
       const orphanedChunks = (db.prepare(ORPHANED_VECTOR_COUNT_SQL).get() as { c: number }).c;
       if (orphanRows.length === 0 && orphanedChunks === 0) {
@@ -3786,7 +3790,8 @@ function vectorRepackPlan(db: Database, dropOrphans: boolean = false): VecRepack
       FROM ${VEC_ROWS_TABLE} vr
       JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
       JOIN ${layout.shadow.rowids} r ON r.rowid = vr.id
-      WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
+      LEFT JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
+      WHERE d.id IS NULL
       GROUP BY r.chunk_id
     `).all() as { chunkId: number; n: number }[];
     for (const row of rows) orphansByChunk.set(row.chunkId, row.n);
