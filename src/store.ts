@@ -6736,6 +6736,42 @@ export function extractIntentTerms(intent: string): string[] {
     .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
 }
 
+// Match adjacent source tokens, with QMD's CJK segmentation, without
+// attempting to reproduce SQLite's stemming or diacritic folding.
+function normalizePassagePhrase(text: string): string {
+  return normalizeCjkForFTS(text).replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function makePassageScorer(query: string, minWordLength: number, intent: string | undefined, intentWeight: number): (text: string) => number {
+  const lowerQuery = query.toLowerCase();
+  // Keep the original overlap score even if no complete phrase is recognized.
+  const words = lowerQuery.split(/\s+/).filter(word => word.length >= minWordLength);
+  const phrases: string[] = [];
+  if (lowerQuery.includes('"')) {
+    for (const match of lowerQuery.matchAll(/(-?)"([^"]*)(?:"|$)|[^\s"]+/g)) {
+      const phrase = match[2];
+      if (phrase === undefined || match[1]) continue;
+      const tokens = normalizePassagePhrase(phrase);
+      if (tokens) phrases.push(` ${tokens} `);
+    }
+  }
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
+  // A complete quoted phrase beats a passage that matches only loose words or intent.
+  const phraseWeight = words.length + intentTerms.length * intentWeight + 1;
+
+  return text => {
+    const lower = text.toLowerCase();
+    let score = 0;
+    for (const word of words) if (lower.includes(word)) score += 1;
+    for (const term of intentTerms) if (lower.includes(term)) score += intentWeight;
+    if (phrases.length > 0) {
+      const tokens = ` ${normalizePassagePhrase(lower)} `;
+      for (const phrase of phrases) if (tokens.includes(phrase)) return score + phraseWeight;
+    }
+    return score;
+  };
+}
+
 export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
@@ -6754,19 +6790,11 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   }
 
   const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-  const intentTerms = intent ? extractIntentTerms(intent) : [];
+  const scorePassage = makePassageScorer(query, 1, intent, INTENT_WEIGHT_SNIPPET);
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
-    const lineLower = (lines[i] ?? "").toLowerCase();
-    let score = 0;
-    for (const term of queryTerms) {
-      if (lineLower.includes(term)) score += 1.0;
-    }
-    for (const term of intentTerms) {
-      if (lineLower.includes(term)) score += INTENT_WEIGHT_SNIPPET;
-    }
+    const score = scorePassage(lines[i] ?? "");
     if (score > bestScore) {
       bestScore = score;
       bestLine = i;
@@ -6781,9 +6809,8 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
       return extractSnippet(body, query, maxLen, undefined, undefined, intent);
     }
     // For chunkPos > 0 the reranker actively picked this chunk. Tokens failing to
-    // match literally is most likely a tokenizer limitation (quoted phrases, FTS5
-    // syntax, HYDE passages, semantic hits), so anchor on the chunk start rather
-    // than disregarding the reranker's pick.
+    // match literally can happen with FTS5 syntax, HyDE passages, or semantic
+    // hits, so anchor on the chunk start rather than ignoring the reranker's pick.
     const contextStart = Math.max(0, chunkPos - 100);
     bestLine = chunkPos > contextStart
       ? searchBody.slice(0, chunkPos - contextStart).split('\n').length - 1
@@ -7094,8 +7121,7 @@ export async function hybridQuery(
 
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const intentTerms = intent ? extractIntentTerms(intent) : [];
+  const scorePassage = makePassageScorer(query, 3, intent, INTENT_WEIGHT_CHUNK);
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
   const chunkStrategy = options?.chunkStrategy;
@@ -7110,11 +7136,7 @@ export async function hybridQuery(
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
+      const score = scorePassage(chunks[i]!.text);
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
@@ -7505,8 +7527,7 @@ export async function structuredSearch(
   const primaryQuery = searches.find(s => s.type === 'lex')?.query
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
-  const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const intentTerms = intent ? extractIntentTerms(intent) : [];
+  const scorePassage = makePassageScorer(primaryQuery, 3, intent, INTENT_WEIGHT_CHUNK);
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
   const ssChunkStrategy = options?.chunkStrategy;
 
@@ -7521,11 +7542,7 @@ export async function structuredSearch(
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
+      const score = scorePassage(chunks[i]!.text);
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 

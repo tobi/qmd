@@ -2863,10 +2863,8 @@ describe("Snippet Extraction", () => {
   });
 
   test("extractSnippet anchors on chunkPos when lexical scoring finds no match", () => {
-    // The snippet tokenizer does not strip FTS5 syntax, so a quoted-phrase query
-    // tokenises into terms with embedded quotes that never appear in body text.
-    // bestScore stays at 0 even though the reranker correctly identified a chunk;
-    // the fallback should anchor on chunkPos rather than defaulting to line 1.
+    // Without a literal match, the snippet should stay near the chosen chunk
+    // rather than defaulting to line 1.
     const padLine = "Lorem ipsum dolor sit amet\n";
     const padding = padLine.repeat(100);
     const body = padding + "chunk content here\nmore chunk content\n" + padding;

@@ -1062,6 +1062,76 @@ describe("CLI Search Command", () => {
   });
 });
 
+describe("CLI quoted search phrases", () => {
+  test.each([
+    {
+      name: "whole source tokens",
+      args: ["search", '"silver gasket"'],
+      evidence: "Install the silver gasket as the replacement.",
+      fillerLines: 0,
+    },
+    {
+      name: "punctuation in a later chunk",
+      args: ["query", 'lex: service "silver gasket"', "--no-rerank"],
+      evidence: "Install the silver-gasket as the replacement.",
+      fillerLines: 240,
+    },
+    {
+      name: "CJK tokens separated by a space",
+      args: ["query", 'lex: "月底报销"', "--no-rerank"],
+      evidence: "决定：月底 报销仅需提交电子单据。",
+      fillerLines: 0,
+    },
+    {
+      name: "legacy word overlap on a stemmed match in a later chunk",
+      args: ["query", 'lex: "install bronze gasket"', "--no-rerank"],
+      evidence: "Installed bronze gaskets during assembly.",
+      fillerLines: 240,
+    },
+    {
+      name: "legacy word overlap on an accent-folded match",
+      args: ["search", '"inspect yellow cover"'],
+      evidence: "Inspect yellow cóver before assembly.",
+      fillerLines: 0,
+    },
+    {
+      name: "legacy word overlap breaks ties between lines with quoted phrases",
+      args: ["search", 'service "grid panel" "iron bus"'],
+      evidence: "Service the grid panel next.",
+      competingLine: "The grid panel and iron bus are linked.",
+      fillerLines: 0,
+    },
+  ])("locates quoted phrases in the source line: $name", async ({ args, evidence, competingLine, fillerLines }) => {
+    const env = await createIsolatedTestEnv("quoted-phrase");
+    const root = join(env.configDir, "manuals");
+    await mkdir(root);
+    const prefix = [
+      "# Service manual",
+      "Keep the silver seal away from the gasket.",
+      "The quicksilver gasket is a different part.",
+      "",
+      "## Replacement",
+      ...Array<string>(fillerLines).fill("Follow the ordinary maintenance checklist."),
+      ...(competingLine ? [competingLine, "", "", "", ""] : []),
+    ];
+    await writeFile(join(root, "manual.md"), [...prefix, evidence].join("\n"));
+    await writeFile(join(root, "decoy.md"), "# Service note\nA silver seal is not a gasket.\n");
+    const added = await runQmd(["collection", "add", root, "--name", "manuals"], env);
+    expect(added.exitCode, added.stderr).toBe(0);
+
+    const result = await runQmd([...args, "--json"], env);
+    expect(result.exitCode, result.stderr).toBe(0);
+    const hits: unknown = JSON.parse(result.stdout);
+    expect(hits).toEqual([
+      expect.objectContaining({
+        file: "qmd://manuals/manual.md",
+        line: prefix.length + 1,
+        snippet: expect.stringContaining(evidence),
+      }),
+    ]);
+  });
+});
+
 describe("CLI Get Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files

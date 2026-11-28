@@ -298,7 +298,7 @@ describe("extractSnippet intent weight behavior", () => {
 // =============================================================================
 
 describe("intent keyword extraction logic", () => {
-  // Mirrors the chunk selection scoring in hybridQuery, using the shared
+  // Model the intent weights for these unquoted queries using the shared
   // extractIntentTerms helper and INTENT_WEIGHT_CHUNK constant.
   function scoreChunk(text: string, query: string, intent?: string): number {
     const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
